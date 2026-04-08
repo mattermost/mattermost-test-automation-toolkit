@@ -409,17 +409,27 @@ jobs:
               ' "${ANALYSIS_FILE}" 2>/dev/null || true)
             fi
 
-            # Build collapsible Analysis details section from remaining content
+            # Build collapsible More details section from remaining content
             DETAILS_SECTION=""
             if [ -n "$REMAINING_CONTENT" ]; then
               if [ "${#REMAINING_CONTENT}" -le "$MAX_DETAIL_CHARS" ]; then
-                DETAILS_SECTION=$'\n<details>\n<summary>Analysis details</summary>\n\n'
+                DETAILS_SECTION=$'\n<details>\n<summary>More details</summary>\n\n'
                 DETAILS_SECTION+="${REMAINING_CONTENT}"
                 DETAILS_SECTION+=$'\n\n</details>'
               else
                 TRUNCATED="${REMAINING_CONTENT:0:$MAX_DETAIL_CHARS}"
-                DETAILS_SECTION=$'\n<details>\n<summary>Analysis details (truncated)</summary>\n\n'
+                # Close any <details> tags left unclosed by truncation so the
+                # wrapper's </details> balances correctly and nothing leaks out.
+                OPEN_COUNT=$(echo "$TRUNCATED" | grep -o '<details>' | wc -l | tr -d ' ')
+                CLOSE_COUNT=$(echo "$TRUNCATED" | grep -o '</details>' | wc -l | tr -d ' ')
+                UNCLOSED=$((OPEN_COUNT - CLOSE_COUNT))
+                EXTRA_CLOSES=""
+                for ((i=0; i<UNCLOSED; i++)); do
+                  EXTRA_CLOSES+=$'\n</details>'
+                done
+                DETAILS_SECTION=$'\n<details>\n<summary>More details (truncated)</summary>\n\n'
                 DETAILS_SECTION+="${TRUNCATED}"
+                DETAILS_SECTION+="${EXTRA_CLOSES}"
                 DETAILS_SECTION+=$'\n\n...truncated. [View full analysis details]('"${RUN_URL}"')'
                 DETAILS_SECTION+=$'\n\n</details>'
               fi
