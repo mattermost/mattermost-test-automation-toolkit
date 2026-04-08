@@ -19,7 +19,7 @@ name: PR Test Analysis
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - master
       - main
@@ -46,11 +46,13 @@ jobs:
       pull-requests: write
       statuses: write
       id-token: write
-    # pull_request: skip when the PR branch is from a fork (those runs do not receive this repo’s Actions secrets).
+    # pull_request: skip drafts and forks (drafts are not ready for analysis;
+    # fork runs do not receive this repo's Actions secrets).
     # workflow_dispatch: always allowed — runs in this repo with secrets, so you can pass a fork PR number manually.
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      (github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     # Pin to a full commit SHA from the toolkit repo — replace the value after @ with yours. Avoid @main unless you want CI to float on every default-branch update.
     uses: mattermost/mattermost-test-automation-toolkit/.github/workflows/pr-test-analysis.yml@0123456789abcdef0123456789abcdef01234567
     with:
@@ -62,8 +64,8 @@ jobs:
       # When target_repo is this repo, github.token is enough (see Secrets below).
       GH_TOKEN: ${{ github.token }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      # Optional: omit to use the default webhook configured in mattermost-test-automation-toolkit (see below).
-      # WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      # Optional: pass a webhook URL for Mattermost notifications.
+      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL_TEST_PR_ANALYSIS_HUB }}
 ```
 
 **`PR_TEST_ANALYSIS_DRY_RUN`** is **not** a field in this workflow file. Set it as a **repository variable** on the **calling** repository (see [Repository Environment Variables](#repository-environment-variables)); defaults apply if you skip them. **`CLAUDE_MODEL`** works the same way for `pull_request` runs and is already combined in `with.claude_model` above.
@@ -89,41 +91,9 @@ GitHub resolves the `uses` ref when the workflow runs.
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `GH_TOKEN` | Yes | Credential for `gh`/GitHub API against `target_repo`. Use **`${{ github.token }}`** when the caller passes `target_repo: ${{ github.repository }}` (same repo as the workflow). Use a **PAT** in **`secrets.GH_TOKEN`** only when `target_repo` is a *different* repository—the default `GITHUB_TOKEN` is limited to the caller repo and cannot act on another repo’s PRs, statuses, or labels. |
+| `GH_TOKEN` | Yes | Credential for `gh`/GitHub API against `target_repo`. Use **`${{ github.token }}`** when the caller passes `target_repo: ${{ github.repository }}` (same repo as the workflow). Use a **PAT** in **`secrets.GH_TOKEN`** only when `target_repo` is a *different* repository—the default `GITHUB_TOKEN` is limited to the caller repo and cannot act on another repo's PRs, statuses, or labels. |
 | `ANTHROPIC_API_KEY` | Yes | Anthropic API key for Claude analysis. Must be provided by the caller. |
-| `WEBHOOK_URL` | No | Optional Mattermost webhook from the **caller**. If omitted or empty, the workflow uses **`PR_TEST_ANALYSIS_HUB_WEBHOOK_URL`** from the toolkit environment (see [Toolkit environment](#toolkit-environment-pr-test-analysis-hub)). |
-
-### Toolkit environment `pr-test-analysis-hub`
-
-This reusable workflow’s **`analyze`** job is declared with:
-
-```yaml
-environment: pr-test-analysis-hub
-```
-
-(in [`.github/workflows/pr-test-analysis.yml`](pr-test-analysis.yml) on the `analyze` job.)
-
-#### Why a GitHub Environment is used
-
-When repository **A** calls a reusable workflow defined in **B** (`mattermost-test-automation-toolkit`), GitHub does **not** expose **B**’s ordinary **repository** secrets to that run. A job-level [**environment**](https://docs.github.com/en/actions/deployment/targeting-different-environments/managing-environments-for-deployment) on **B** makes its secrets available as `secrets.*`. This is how the workflow provides an optional default Mattermost webhook without every caller defining it.
-
-#### Creating and configuring the environment (toolkit maintainers)
-
-1. Open **mattermost-test-automation-toolkit** on GitHub → **Settings** → **Environments**.
-2. **New environment** → name it exactly **`pr-test-analysis-hub`** (must match the workflow).
-3. Under **Environment secrets**, add the secrets in the table below.
-
-**Protection rules:** You can leave this environment without deployment protection so PR analysis runs immediately. If you add **required reviewers**, **wait timers**, or **deployment branches**, those rules apply to **every** run of this job—use only if you intend to gate analysis that way.
-
-#### Secrets on `pr-test-analysis-hub`
-
-| Secret | Required | Purpose |
-|--------|----------|---------|
-| **`PR_TEST_ANALYSIS_HUB_WEBHOOK_URL`** | No | Default Mattermost incoming webhook when the caller does not pass **`WEBHOOK_URL`**. |
-
-#### Callers
-
-Callers **must** pass **`ANTHROPIC_API_KEY`** — the toolkit does not store an API key. Callers may optionally pass **`WEBHOOK_URL`** to override the default webhook.
+| `WEBHOOK_URL` | No | Optional Mattermost webhook URL for notifications. If omitted, no webhook notification is sent. |
 
 ## Repository Environment Variables
 
@@ -152,9 +122,10 @@ These are configured via **Settings > Environments** or **Settings > Secrets and
 
 ### Dry Run Mode (`PR_TEST_ANALYSIS_DRY_RUN=true`)
 
-- Runs the full AI analysis but commit status is always `success` (analysis never blocks merges).
+- Commit status is always `success` (analysis never blocks merges).
 - No PR comments are posted.
 - Full analysis results are available in the **GitHub Actions Job Summary**.
+- Webhook notification is still sent to the configured channel.
 - Useful for initial rollout and observation before enforcing.
 
 ## Verdicts

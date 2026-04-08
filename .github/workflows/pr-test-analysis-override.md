@@ -22,6 +22,9 @@ jobs:
   override:
     permissions:
       statuses: write
+      pull-requests: read
+      contents: read
+      issues: write
     if: >-
       github.event.issue.pull_request &&
       startsWith(github.event.comment.body, '/test-analysis-override') &&
@@ -35,8 +38,8 @@ jobs:
       sender: ${{ github.event.comment.user.login }}
     secrets:
       GH_TOKEN: ${{ github.token }}
-      # Optional: omit to use the default webhook configured in mattermost-test-automation-toolkit.
-      # WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      # Optional: pass a webhook URL for Mattermost notifications.
+      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL_TEST_PR_ANALYSIS_HUB }}
 ```
 
 Replace the placeholder SHA after `@` with a real commit from [mattermost-test-automation-toolkit](https://github.com/mattermost/mattermost-test-automation-toolkit). Use the same ref as your `pr-test-analysis.yml` caller to keep the two workflows in sync.
@@ -67,7 +70,7 @@ The original source workflow extracted the reason in a shell step; for the reusa
 | Secret | Required | Description |
 |--------|----------|-------------|
 | `GH_TOKEN` | Yes | Same rules as [PR Test Analysis secrets](pr-test-analysis.md#secrets). |
-| `WEBHOOK_URL` | No | Optional Mattermost webhook from the caller. Falls back to toolkit environment secret `PR_TEST_ANALYSIS_HUB_WEBHOOK_URL`. |
+| `WEBHOOK_URL` | No | Optional Mattermost webhook URL for notifications. If omitted, no webhook notification is sent. |
 
 ## What It Does
 
@@ -84,6 +87,9 @@ The caller job needs:
 ```yaml
 permissions:
   statuses: write
+  pull-requests: read
+  contents: read
+  issues: write
 ```
 
 ## Who Can Override

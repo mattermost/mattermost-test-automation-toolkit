@@ -29,11 +29,14 @@ on:
         description: "GitHub token for API against target_repo"
         required: true
       WEBHOOK_URL:
-        description: "Optional caller webhook URL; if empty, uses secrets.PR_TEST_ANALYSIS_HUB_WEBHOOK_URL from this workflow repo (GitHub Environment pr-test-analysis-hub)"
+        description: "Optional Mattermost webhook URL for notifications"
         required: false
 
 permissions:
   statuses: write
+  pull-requests: read
+  contents: read
+  issues: write
 
 env:
   VERIFIED_PREFIX: "(override)"
@@ -43,7 +46,6 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    environment: pr-test-analysis-hub
     steps:
       - name: ci/resolve-pr-info
         id: pr-info
@@ -97,7 +99,7 @@ jobs:
 
       - name: ci/notify-channel
         env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL || secrets.PR_TEST_ANALYSIS_HUB_WEBHOOK_URL }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           PR_NUMBER: ${{ inputs.pr_number }}
           COMMIT_SHA: ${{ steps.pr-info.outputs.commit_sha }}
           SENDER: ${{ inputs.sender }}
@@ -132,4 +134,13 @@ jobs:
               attachments: [{color: "#0066CC", text: $attachment_text}]
             }')
 
-          curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK_URL"
+          if ! curl --fail --silent --show-error \
+            --max-time 10 \
+            --retry 2 \
+            --retry-delay 2 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$WEBHOOK_URL"; then
+            echo "Webhook delivery failed — continuing"
+          fi
