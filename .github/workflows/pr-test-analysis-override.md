@@ -33,7 +33,7 @@ jobs:
     with:
       pr_number: ${{ github.event.issue.number }}
       target_repo: ${{ github.repository }}
-      reason: ${{ github.event.comment.body }}
+      comment_body: ${{ github.event.comment.body }}
       comment_id: ${{ github.event.comment.id }}
       sender: ${{ github.event.comment.user.login }}
     secrets:
@@ -46,14 +46,7 @@ Replace the placeholder SHA after `@` with a real commit from [mattermost-test-a
 
 ### Reason extraction
 
-The `reason` input receives the full comment body. The reusable workflow uses it as-is. If you want to strip the command prefix before passing it, you can do so in the caller:
-
-```yaml
-    with:
-      reason: ${{ ... }} # custom extraction logic
-```
-
-The original source workflow extracted the reason in a shell step; for the reusable version, the full body is passed for simplicity. The webhook notification displays whatever string is provided.
+The `comment_body` input accepts the full comment body. The reusable workflow automatically strips the `/test-analysis-override` prefix and validates that a non-empty reason was provided. If no reason is given, the workflow fails with an error message.
 
 ## Inputs
 
@@ -61,7 +54,7 @@ The original source workflow extracted the reason in a shell step; for the reusa
 |-------|----------|-------------|
 | `pr_number` | Yes | PR number to override |
 | `target_repo` | Yes | Full repo name (e.g., `mattermost/mattermost`) |
-| `reason` | Yes | Override reason provided by the reviewer |
+| `comment_body` | Yes | Full comment body (the `/test-analysis-override` prefix is stripped automatically) |
 | `comment_id` | Yes | ID of the slash-command comment (for +1 reaction) |
 | `sender` | Yes | GitHub login of the user who posted the override |
 
@@ -74,11 +67,12 @@ The original source workflow extracted the reason in a shell step; for the reusa
 
 ## What It Does
 
-1. Resolves the PR's head commit SHA.
-2. Reads the current `Tests/analysis` commit status and prepends `(override)` to its description.
-3. Posts a `success` status, overriding any previous failure.
-4. Reacts with :+1: to the slash-command comment.
-5. Sends a webhook notification with `#override-test-analysis` and `#<repo>-pr-<number>` hashtags.
+1. Extracts and validates the override reason (strips `/test-analysis-override` prefix, fails if empty).
+2. Resolves the PR's head commit SHA.
+3. Reads the current `Tests/analysis` commit status and prepends `(override)` to its description.
+4. Posts a `success` status, overriding any previous failure.
+5. Reacts with :+1: to the slash-command comment.
+6. Sends a webhook notification with `#override-test-analysis` and `#<repo>-pr-<number>` hashtags.
 
 ## Permissions
 

@@ -12,8 +12,8 @@ on:
         description: "Full repo name (e.g., mattermost/mattermost)"
         required: true
         type: string
-      reason:
-        description: "Override reason provided by the reviewer"
+      comment_body:
+        description: "Full comment body (the /test-analysis-override prefix is stripped automatically)"
         required: true
         type: string
       comment_id:
@@ -39,6 +39,7 @@ permissions:
   issues: write
 
 env:
+  SLASH_COMMAND: "/test-analysis-override"
   VERIFIED_PREFIX: "(override)"
   STATUS_CONTEXT: "Tests/analysis"
   TARGET_REPO: ${{ inputs.target_repo }}
@@ -47,6 +48,22 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     steps:
+      - name: ci/extract-reason
+        id: extract
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          COMMENT_BODY: ${{ inputs.comment_body }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          REASON=$(echo "$COMMENT_BODY" | sed "s|^${SLASH_COMMAND}\s*||" | head -1 | xargs)
+          if [ -z "$REASON" ]; then
+            gh api "repos/${{ env.TARGET_REPO }}/issues/${PR_NUMBER}/comments" \
+              -f body="A reason is required. Usage: \`${SLASH_COMMAND} <reason>\`"
+            echo "::error::No reason provided. Usage: ${SLASH_COMMAND} <reason>"
+            exit 1
+          fi
+          echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+
       - name: ci/resolve-pr-info
         id: pr-info
         env:
@@ -103,7 +120,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           COMMIT_SHA: ${{ steps.pr-info.outputs.commit_sha }}
           SENDER: ${{ inputs.sender }}
-          REASON: ${{ inputs.reason }}
+          REASON: ${{ steps.extract.outputs.reason }}
         run: |
           if [ -z "$WEBHOOK_URL" ]; then
             echo "No webhook URL configured — skipping notification"
