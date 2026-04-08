@@ -1,0 +1,146 @@
+---
+name: PR Test Analysis Override (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "PR number to override"
+        required: true
+        type: number
+      target_repo:
+        description: "Full repo name (e.g., mattermost/mattermost)"
+        required: true
+        type: string
+      reason:
+        description: "Override reason provided by the reviewer"
+        required: true
+        type: string
+      comment_id:
+        description: "ID of the slash-command comment (for +1 reaction)"
+        required: true
+        type: number
+      sender:
+        description: "GitHub login of the user who posted the override command"
+        required: true
+        type: string
+    secrets:
+      GH_TOKEN:
+        description: "GitHub token for API against target_repo"
+        required: true
+      WEBHOOK_URL:
+        description: "Optional Mattermost webhook URL for notifications"
+        required: false
+
+permissions:
+  statuses: write
+  pull-requests: read
+  contents: read
+  issues: write
+
+env:
+  VERIFIED_PREFIX: "(override)"
+  STATUS_CONTEXT: "Tests/analysis"
+  TARGET_REPO: ${{ inputs.target_repo }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: ci/resolve-pr-info
+        id: pr-info
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          COMMIT_SHA=$(gh pr view "$PR_NUMBER" --repo "${{ env.TARGET_REPO }}" --json headRefOid --jq '.headRefOid')
+          echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: ci/post-override-status
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          COMMIT_SHA: ${{ steps.pr-info.outputs.commit_sha }}
+        run: |
+          # Read current commit status to preserve description
+          STATUS_JSON=$(gh api "repos/${{ env.TARGET_REPO }}/commits/${COMMIT_SHA}/statuses" \
+            --jq "[.[] | select(.context == \"${STATUS_CONTEXT}\")] | first // empty")
+
+          CURRENT_DESC=""
+          CURRENT_URL=""
+          if [ -n "$STATUS_JSON" ]; then
+            CURRENT_DESC=$(echo "$STATUS_JSON" | jq -r '.description // ""')
+            CURRENT_URL=$(echo "$STATUS_JSON" | jq -r '.target_url // ""')
+          fi
+
+          # Strip any existing prefix to avoid stacking on repeated runs
+          ESCAPED_PREFIX=$(echo "$VERIFIED_PREFIX" | sed 's/[()]/\\&/g')
+          CLEAN_DESC=$(echo "$CURRENT_DESC" | sed "s/^${ESCAPED_PREFIX} *//")
+          if [ -n "$CLEAN_DESC" ]; then
+            NEW_DESC="${VERIFIED_PREFIX} ${CLEAN_DESC}"
+          else
+            NEW_DESC="${VERIFIED_PREFIX}"
+          fi
+
+          gh api "repos/${{ env.TARGET_REPO }}/statuses/${COMMIT_SHA}" \
+            -f state=success \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="${NEW_DESC:0:140}" \
+            -f target_url="${CURRENT_URL:-${{ github.server_url }}/${{ env.TARGET_REPO }}/actions/runs/${{ github.run_id }}}"
+
+          echo "Verified: ${NEW_DESC}"
+
+      - name: ci/post-ack-reaction
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          COMMENT_ID: ${{ inputs.comment_id }}
+        run: |
+          gh api "repos/${{ env.TARGET_REPO }}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content='+1' 2>/dev/null || true
+
+      - name: ci/notify-channel
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          COMMIT_SHA: ${{ steps.pr-info.outputs.commit_sha }}
+          SENDER: ${{ inputs.sender }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "No webhook URL configured — skipping notification"
+            exit 0
+          fi
+
+          PR_URL="${{ github.server_url }}/${{ env.TARGET_REPO }}/pull/${PR_NUMBER}"
+
+          # Derive repo short name (without org) for hashtag
+          REPO_SHORT=$(echo "${{ env.TARGET_REPO }}" | cut -d'/' -f2)
+
+          RESULT_TAG="#override-test-analysis"
+          PR_TAG="#${REPO_SHORT}-pr-${PR_NUMBER}"
+
+          TEXT_BODY=":large_blue_circle: ${RESULT_TAG} ${PR_TAG}"
+          TEXT_BODY+=$'\n'"By: \`@${SENDER}\`"
+          TEXT_BODY+=$'\n'"Reason: ${REASON}"
+
+          ATTACHMENT_TEXT=":github: [${{ env.TARGET_REPO }}#${PR_NUMBER}](${PR_URL}) | commit: \`${COMMIT_SHA:0:7}\`"
+
+          PAYLOAD=$(jq -n \
+            --arg text "$TEXT_BODY" \
+            --arg attachment_text "$ATTACHMENT_TEXT" \
+            '{
+              username: "PR Test Analysis",
+              icon_url: "https://mattermost.com/wp-content/uploads/2022/02/icon_WS.png",
+              text: $text,
+              attachments: [{color: "#0066CC", text: $attachment_text}]
+            }')
+
+          if ! curl --fail --silent --show-error \
+            --max-time 10 \
+            --retry 2 \
+            --retry-delay 2 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$WEBHOOK_URL"; then
+            echo "Webhook delivery failed — continuing"
+          fi
