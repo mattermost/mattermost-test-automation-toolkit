@@ -38,6 +38,7 @@ env:
   CLAUDE_MODEL: ${{ inputs.claude_model || vars.CLAUDE_MODEL || 'claude-sonnet-4-6' }}
   STATUS_CONTEXT: "Tests/analysis"
   ANALYSIS_FILE: "pr-test-analysis-result.txt"
+  OVERRIDE_COMMAND: "/test-analysis-override"
   TARGET_REPO: ${{ inputs.target_repo }}
   # Repo-level environment variable. When true: always post success status, no PR comment, results in Job Summary only.
   # When false or not set: enforce analysis — failure verdict marks CI as failed and posts a PR comment.
@@ -429,15 +430,19 @@ jobs:
               FILES_NOTE_LINE="> Note: ${FILES_NOTE}"
             fi
 
-            # Build comment body — Suggestions first, then Analysis details
+            # Build comment body — collapsible details first, then suggestions visible at the bottom
             COMMENT_BODY='<!-- pr-test-analysis -->'$'\n'
             COMMENT_BODY+="**Test check [${COMMIT_SHA:0:7}](${COMMIT_LINK})** — action needed"$'\n\n'
             COMMENT_BODY+="${SHORT_SUMMARY}"$'\n'
             COMMENT_BODY+="${RECOMMENDATION}"$'\n'
             [ -n "$FILES_NOTE_LINE" ] && COMMENT_BODY+="${FILES_NOTE_LINE}"$'\n'
-            [ -n "$SUGGESTIONS_SECTION" ] && COMMENT_BODY+=$'\n'"${SUGGESTIONS_SECTION}"$'\n'
             [ -n "$DETAILS_SECTION" ] && COMMENT_BODY+="${DETAILS_SECTION}"$'\n'
-            COMMENT_BODY+=$'\n*To override, comment `/test-analysis-override <reason>` after verifying tests are adequate or not required.*'
+            if [ -n "$SUGGESTIONS_SECTION" ]; then
+              # Strip <details>/<summary> wrapper to show suggestions inline
+              SUGGESTIONS_CONTENT=$(echo "$SUGGESTIONS_SECTION" | sed '/<details>/d;/<\/details>/d;/<summary>/d' | sed '/^$/d')
+              [ -n "$SUGGESTIONS_CONTENT" ] && COMMENT_BODY+=$'\n'"**Suggestions**"$'\n'"${SUGGESTIONS_CONTENT}"$'\n'
+            fi
+            COMMENT_BODY+=$'\n*To override, comment `'"${OVERRIDE_COMMAND}"' <reason>` after verifying tests are adequate or not required.*'
 
             if [ -n "$EXISTING_COMMENT_ID" ]; then
               gh api "repos/${{ env.TARGET_REPO }}/issues/comments/${EXISTING_COMMENT_ID}" \
