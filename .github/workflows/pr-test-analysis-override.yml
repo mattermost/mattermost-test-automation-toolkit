@@ -55,7 +55,7 @@ jobs:
           COMMENT_BODY: ${{ inputs.comment_body }}
           PR_NUMBER: ${{ inputs.pr_number }}
         run: |
-          REASON=$(echo "$COMMENT_BODY" | sed "s|^${SLASH_COMMAND}\s*||" | head -1 | xargs)
+          REASON=$(echo "$COMMENT_BODY" | sed "s|^${SLASH_COMMAND}\s*||" | head -1 | xargs -d '\n')
           if [ -z "$REASON" ]; then
             gh api "repos/${{ env.TARGET_REPO }}/issues/${PR_NUMBER}/comments" \
               -f body="A reason is required. Usage: \`${SLASH_COMMAND} <reason>\`"
