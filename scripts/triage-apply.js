@@ -256,6 +256,10 @@ async function main() {
         // Overlap is asserted by the caller from the diff, not inferred by the
         // model about its own verdict.
         diffOverlapsFailure: arg('diff-overlaps', 'false') === 'true',
+
+        // Set by the rerun stage. A cluster that failed every repetition is
+        // deterministic, and no model verdict may waive it.
+        reproducedOnRerun: Boolean(clusterByIndex[i] && clusterByIndex[i].reproduced_on_rerun),
     }));
     // The run's shape decides what "no decisions" means. A passing suite has
     // nothing to triage and must go green; a suite that produced no reports at

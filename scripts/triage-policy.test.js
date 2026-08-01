@@ -225,3 +225,34 @@ test('the run carries the confidence of the decision it reports', () => {
     assert.equal(red.confidence, 0.91);
     assert.ok(!statusDescription(green).includes('(?)'), 'status must show a real confidence');
 });
+
+// ---------- rerun evidence overrules model inference ----------
+
+test('a failure that reproduced on every rerun cannot be waived as flaky', () => {
+    const reproduced = decideCluster(verdict({confidence: 0.99}), {
+        ...assist,
+        reproducedOnRerun: true,
+    });
+
+    assert.equal(reproduced.state, 'failure', 'measurement beats interpretation');
+    assert.match(reproduced.reason, /reproduced on every rerun/);
+});
+
+test('rerun evidence does not interfere with a red verdict', () => {
+    const red = decideCluster(verdict({verdict: 'PR_REGRESSION', confidence: 0.9}), {
+        ...assist,
+        reproducedOnRerun: true,
+    });
+
+    assert.equal(red.state, 'failure');
+    assert.equal(red.verdict, 'PR_REGRESSION', 'the verdict stands; only waivers are blocked');
+});
+
+test('a cluster that cleared on rerun is still waivable', () => {
+    const cleared = decideCluster(verdict({confidence: 0.9}), {
+        ...assist,
+        reproducedOnRerun: false,
+    });
+
+    assert.equal(cleared.state, 'success');
+});

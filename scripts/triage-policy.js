@@ -52,6 +52,7 @@ function decideCluster(verdictRecord, context = {}) {
         runType = 'PR',
         amnestyExhausted = false,
         diffOverlapsFailure = false,
+        reproducedOnRerun = false,
         mode = 'shadow',
     } = context;
 
@@ -75,6 +76,19 @@ function decideCluster(verdictRecord, context = {}) {
 
     if (!wantsGreen) {
         return red(verdict, confidence, verdictRecord.root_cause || verdict);
+    }
+
+    // The measurement overrules the inference. A failure that reproduced on every
+    // rerun repetition is deterministic by definition, so no amount of model
+    // confidence about the error text makes it flakiness. This is the strongest
+    // single guard against a false green, because it is evidence rather than
+    // interpretation.
+    if (reproducedOnRerun) {
+        return red(
+            verdict,
+            confidence,
+            `${verdict} rejected — reproduced on every rerun, so it is deterministic`,
+        );
     }
 
     // Main and release health must reflect reality. Auto-greening a flake on the
