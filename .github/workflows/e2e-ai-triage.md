@@ -82,7 +82,8 @@ adjudicate:
   secrets:
     GH_TOKEN: ${{ secrets.GH_TOKEN }}
     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-    TSIO_TOKEN: ${{ secrets.TSIO_TOKEN }}
+    # Optional — without it the ledger write uses a minted OIDC token.
+    TSIO_API_KEY: ${{ secrets.TSIO_API_KEY }}
     WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
 ```
 
