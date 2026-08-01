@@ -126,7 +126,11 @@ function renderComment(runDecision, decisions, verdicts, opts) {
         runDecision.reason,
         '',
     );
-    if (runDecision.state === 'success') {
+    // Only a waiver gets the waiver sentence. A run that passed is green because
+    // nothing failed, and telling the author their failures were excused when
+    // they had none is both confusing and quietly erodes trust in the waivers
+    // that are real.
+    if (runDecision.waived) {
         lines.push(
             `These failures were classified as not caused by this change, so the E2E checks were waived with \`${AI_WAIVED_LABEL}\`.`,
             '',
@@ -155,10 +159,45 @@ function renderComment(runDecision, decisions, verdicts, opts) {
     return lines.join('\n');
 }
 
-async function recordLedger({tsioUrl, token, batch}) {
+/**
+ * Mint a GitHub Actions OIDC token for TSIO.
+ *
+ * TSIO's authenticated routes accept either an `X-API-Key` or an OIDC bearer it
+ * verifies against the GitHub Actions issuer — a static secret presented as a
+ * bearer is rejected. This mirrors what detox/utils/tsio-report-status.js already
+ * does for report uploads, so the ledger write authenticates the same way the
+ * rest of the pipeline does and needs no additional shared secret.
+ *
+ * Requires `permissions: id-token: write` on the job. Without it the request env
+ * vars are absent and the ledger write is skipped rather than failing the run.
+ */
+async function mintOidcToken(audience) {
+    const url = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+    const bearer = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+    if (!url || !bearer) {
+        return null;
+    }
+    const sep = url.includes('?') ? '&' : '?';
+    const res = await fetch(`${url}${sep}audience=${encodeURIComponent(audience)}`, {
+        headers: {Authorization: `bearer ${bearer}`, Accept: 'application/json; api-version=2.0'},
+    });
+    if (!res.ok) {
+        throw new Error(`OIDC mint failed: ${res.status}`);
+    }
+    const body = await res.json();
+    return body.value || null;
+}
+
+async function recordLedger({tsioUrl, token, apiKey, batch}) {
+    const headers = {'Content-Type': 'application/json'};
+    if (apiKey) {
+        headers['X-API-Key'] = apiKey;
+    } else {
+        headers.Authorization = `Bearer ${token}`;
+    }
     const res = await fetch(`${tsioUrl}/api/v1/triage/verdicts`, {
         method: 'POST',
-        headers: {'Content-Type': 'application/json', Authorization: `Bearer ${token}`},
+        headers,
         body: JSON.stringify(batch),
     });
     if (!res.ok) {
@@ -177,7 +216,9 @@ async function main() {
     const mode = arg('mode', 'shadow');
     const model = arg('model', '');
     const tsioUrl = arg('tsio-url', 'https://test-io.test.mattermost.com');
-    const tsioToken = process.env.TSIO_TOKEN || '';
+    // Optional. When absent the ledger authenticates with a minted OIDC token,
+    // which is the path CI actually uses — no shared secret required.
+    const tsioApiKey = process.env.TSIO_API_KEY || '';
     const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
     const runUrl = arg('run-url', '');
 
@@ -216,7 +257,13 @@ async function main() {
         // model about its own verdict.
         diffOverlapsFailure: arg('diff-overlaps', 'false') === 'true',
     }));
-    const runDecision = decideRun(decisions);
+    // The run's shape decides what "no decisions" means. A passing suite has
+    // nothing to triage and must go green; a suite that produced no reports at
+    // all must go red. Both look like an empty decision list from here.
+    const runDecision = decideRun(decisions, {
+        failureCount: evidence.summary ? evidence.summary.failed : null,
+        reportsFound: evidence.summary ? evidence.summary.reportsFound : null,
+    });
 
     console.log(JSON.stringify({runDecision, decisions}, null, 2));
 
@@ -229,45 +276,82 @@ async function main() {
     });
 
     // 2. Label, only when policy actually waived (never in shadow mode).
-    if (runDecision.waived && prNumber) {
+    //
+    // The removal branch matters as much as the application one. The label is
+    // sticky across pushes and the status reporter honours it unconditionally, so
+    // a waiver granted for one commit would keep greening every later commit —
+    // including one that introduces a genuine regression. Any run that does not
+    // waive must clear it.
+    if (prNumber) {
         try {
-            await gh(token, 'POST', `/repos/${repo}/issues/${prNumber}/labels`, {
-                labels: [AI_WAIVED_LABEL],
-            });
+            if (runDecision.waived) {
+                await gh(token, 'POST', `/repos/${repo}/issues/${prNumber}/labels`, {
+                    labels: [AI_WAIVED_LABEL],
+                });
+            } else {
+                await gh(token, 'DELETE',
+                    `/repos/${repo}/issues/${prNumber}/labels/${encodeURIComponent(AI_WAIVED_LABEL)}`);
+                console.log(`cleared ${AI_WAIVED_LABEL} — this run was not waived`);
+            }
         } catch (err) {
-            // A failed label write means the platform contexts will stay red.
-            // That is the safe direction, so log and continue.
-            console.error(`could not apply ${AI_WAIVED_LABEL}: ${err.message}`);
+            // Applying can fail (contexts stay red — the safe direction). Removing
+            // can 404 when the label was not set, which is the common case and not
+            // an error worth surfacing.
+            if (runDecision.waived || !/→ 404/.test(err.message)) {
+                console.error(`could not update ${AI_WAIVED_LABEL}: ${err.message}`);
+            }
         }
     }
 
     // 3. PR comment, updated in place rather than appended.
+    //
+    // A clean run posts nothing — a comment on every passing PR is noise and the
+    // commit status already carries the result — but it does clear a stale one
+    // from an earlier push, so the thread never shows failures the latest run no
+    // longer has.
     if (prNumber) {
         try {
-            const body = renderComment(runDecision, decisions, verdicts, {
-                commitSha,
-                commitUrl: `https://github.com/${repo}/commit/${commitSha}`,
-                tier: evidence.tier,
-                tierReason: evidence.tier_reason,
-            });
             const comments = await gh(token, 'GET', `/repos/${repo}/issues/${prNumber}/comments?per_page=100`);
             const existing = (comments || []).find((c) => c.body && c.body.includes(COMMENT_MARKER));
-            if (existing) {
-                await gh(token, 'PATCH', `/repos/${repo}/issues/comments/${existing.id}`, {body});
+
+            if (decisions.length === 0) {
+                if (existing) {
+                    await gh(token, 'DELETE', `/repos/${repo}/issues/comments/${existing.id}`);
+                    console.log('removed stale triage comment — this run had nothing to triage');
+                }
             } else {
-                await gh(token, 'POST', `/repos/${repo}/issues/${prNumber}/comments`, {body});
+                const body = renderComment(runDecision, decisions, verdicts, {
+                    commitSha,
+                    commitUrl: `https://github.com/${repo}/commit/${commitSha}`,
+                    tier: evidence.tier,
+                    tierReason: evidence.tier_reason,
+                });
+                if (existing) {
+                    await gh(token, 'PATCH', `/repos/${repo}/issues/comments/${existing.id}`, {body});
+                } else {
+                    await gh(token, 'POST', `/repos/${repo}/issues/${prNumber}/comments`, {body});
+                }
             }
         } catch (err) {
-            console.error(`could not post triage comment: ${err.message}`);
+            console.error(`could not update triage comment: ${err.message}`);
         }
     }
 
     // 4. Ledger. Best-effort: a missing ledger row costs a metric, not a gate.
-    if (tsioToken) {
+    let ledgerToken = null;
+    if (!tsioApiKey) {
+        try {
+            ledgerToken = await mintOidcToken(arg('tsio-audience', 'mattermost-test-system-io'));
+        } catch (err) {
+            console.error(`OIDC mint failed (skipping ledger): ${err.message}`);
+        }
+    }
+    if (tsioApiKey || ledgerToken) {
         try {
             const result = await recordLedger({
                 tsioUrl,
-                token: tsioToken,
+                token: ledgerToken,
+                apiKey: tsioApiKey,
                 batch: {
                     repository: repo,
                     branch: arg('branch', ''),
@@ -295,7 +379,7 @@ async function main() {
             console.error(`ledger write failed (continuing): ${err.message}`);
         }
     } else {
-        console.log('no TSIO token — skipping ledger write');
+        console.log('no TSIO credential (no API key, no OIDC) — skipping ledger write');
     }
 
     if (process.env.GITHUB_OUTPUT) {
@@ -328,4 +412,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = {assembleVerdicts, renderComment, AI_WAIVED_LABEL, STATUS_CONTEXT};
+module.exports = {assembleVerdicts, renderComment, mintOidcToken, AI_WAIVED_LABEL, STATUS_CONTEXT};

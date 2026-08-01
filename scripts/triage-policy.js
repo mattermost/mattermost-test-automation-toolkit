@@ -141,13 +141,46 @@ function red(verdict, confidence, reason) {
  * nine waived ones is still an unexplained failure, and greening the run because
  * the majority was flaky is precisely the failure mode that would make this
  * system untrustworthy.
+ *
+ * `context` carries the run's shape, which is what separates the three very
+ * different reasons there might be no decisions:
+ *
+ *   - the suite passed          → success. There was nothing to triage.
+ *   - no reports were produced  → red. Nothing can be concluded either way.
+ *   - failures exist but nothing decided them → red. Fail closed.
+ *
+ * Collapsing those into one "no decisions → red" is wrong in the most damaging
+ * direction: it reds every passing run, which would make the check worthless and
+ * train everyone to ignore it.
  */
-function decideRun(decisions) {
+function decideRun(decisions, context = {}) {
+    const {failureCount = null, reportsFound = null} = context;
+
     if (decisions.length === 0) {
+        if (reportsFound === 0) {
+            return {
+                state: 'failure',
+                waived: false,
+                reason: 'no usable test results were produced — nothing could be triaged',
+                green_clusters: 0,
+                red_clusters: 0,
+            };
+        }
+        if (failureCount === 0) {
+            return {
+                state: 'success',
+                waived: false,
+                reason: 'no failures to triage',
+                green_clusters: 0,
+                red_clusters: 0,
+            };
+        }
         return {
             state: 'failure',
             waived: false,
-            reason: 'triage produced no decisions',
+            reason: failureCount === null ?
+                'triage produced no decisions' :
+                `triage produced no decisions for ${failureCount} failure(s)`,
             green_clusters: 0,
             red_clusters: 0,
         };
@@ -163,6 +196,7 @@ function decideRun(decisions) {
                 worst.reason :
                 `${reds.length} unwaived cluster(s); most confident: ${worst.reason}`,
             verdict: worst.verdict,
+            confidence: worst.confidence,
             green_clusters: decisions.length - reds.length,
             red_clusters: reds.length,
         };
@@ -176,6 +210,7 @@ function decideRun(decisions) {
             lowest.reason :
             `${decisions.length} clusters all waived; weakest: ${lowest.reason}`,
         verdict: lowest.verdict,
+        confidence: lowest.confidence,
         green_clusters: decisions.length,
         red_clusters: 0,
     };
@@ -187,9 +222,13 @@ function decideRun(decisions) {
  * text is cut.
  */
 function statusDescription(runDecision) {
-    const prefix = runDecision.verdict ?
-        `${runDecision.verdict.toLowerCase().replace(/_/g, '-')} (${runDecision.confidence ?? '?'})` :
-        'inconclusive';
+    if (!runDecision.verdict) {
+        // No verdict at all: on a passing run the reason ("no failures to
+        // triage") is the whole message, and prefixing it with "inconclusive"
+        // would read as a problem where there is none.
+        return String(runDecision.reason || 'triage did not complete').slice(0, 140);
+    }
+    const prefix = `${runDecision.verdict.toLowerCase().replace(/_/g, '-')} (${runDecision.confidence ?? '?'})`;
     return `${prefix}: ${runDecision.reason}`.slice(0, 140);
 }
 

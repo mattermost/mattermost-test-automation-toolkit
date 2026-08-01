@@ -181,3 +181,47 @@ test('status description fits the GitHub limit and leads with the verdict', () =
     assert.ok(desc.length <= 140);
     assert.ok(desc.startsWith('flaky-infra (0.93)'));
 });
+
+// ---------- run shape: the three reasons there might be no decisions ----------
+
+test('a passing suite is green, not red', () => {
+    const run = decideRun([], {failureCount: 0, reportsFound: 4});
+
+    assert.equal(run.state, 'success', 'reddening every passing run would make the check worthless');
+    assert.equal(run.waived, false, 'nothing was waived — there was nothing to waive');
+    assert.match(run.reason, /no failures/);
+});
+
+test('a run that produced no reports is red even though it also has no decisions', () => {
+    const run = decideRun([], {failureCount: 0, reportsFound: 0});
+
+    assert.equal(run.state, 'failure');
+    assert.match(run.reason, /no usable test results/);
+});
+
+test('failures with no decisions stay red', () => {
+    const run = decideRun([], {failureCount: 7, reportsFound: 4});
+
+    assert.equal(run.state, 'failure');
+    assert.match(run.reason, /7 failure/);
+});
+
+test('status description for a passing run does not read as a problem', () => {
+    const desc = statusDescription(decideRun([], {failureCount: 0, reportsFound: 4}));
+
+    assert.equal(desc, 'no failures to triage');
+    assert.ok(!desc.includes('inconclusive'));
+});
+
+test('the run carries the confidence of the decision it reports', () => {
+    const green = decideRun([
+        decideCluster(verdict({confidence: 0.99}), assist),
+        decideCluster(verdict({verdict: 'FLAKY_SERVER', confidence: 0.88}), assist),
+    ]);
+    const red = decideRun([decideCluster(verdict({verdict: 'PR_REGRESSION', confidence: 0.91}), assist)]);
+
+    // The weakest waived cluster is what the run is only as good as.
+    assert.equal(green.confidence, 0.88);
+    assert.equal(red.confidence, 0.91);
+    assert.ok(!statusDescription(green).includes('(?)'), 'status must show a real confidence');
+});
