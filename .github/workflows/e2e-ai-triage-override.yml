@@ -1,0 +1,83 @@
+---
+# Human override of an automated triage verdict.
+#
+# Corrections are the only ground truth this system gets — everything else is the
+# triage grading its own homework. A maintainer saying "that was actually a real
+# bug" is the one input that can prove a waiver wrong, and it is exactly what the
+# false-green metric counts.
+#
+# The correction is recorded in the TSIO ledger *and* the checks are brought into
+# line with what the human said. If the ledger write fails the checks are still
+# updated — the maintainer's intent must be honoured — but the reply says so,
+# because an unrecorded correction is a data point permanently lost.
+name: E2E AI Triage Override (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      target_repo:
+        description: "Full repo name the PR and statuses belong to"
+        required: true
+        type: string
+      pr_number:
+        required: true
+        type: string
+      comment_body:
+        description: "Raw comment body, parsed for /e2e-triage-override <verdict> <reason>"
+        required: true
+        type: string
+      comment_id:
+        description: "Comment to react to, so the author sees it was picked up"
+        required: false
+        type: string
+        default: ""
+      sender:
+        description: "Who issued the override — recorded as corrected_by"
+        required: true
+        type: string
+      tsio_url:
+        required: false
+        type: string
+        default: "https://test-io.test.mattermost.com"
+    secrets:
+      GH_TOKEN:
+        description: "Token for statuses, labels, and comments on target_repo"
+        required: true
+      TSIO_API_KEY:
+        description: "Optional. Without it the ledger write uses a minted OIDC token."
+        required: false
+
+permissions:
+  contents: read
+  # The ledger write authenticates with a minted OIDC token by default.
+  id-token: write
+
+jobs:
+  override:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '22'
+
+      - name: ci/apply-override
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          TSIO_API_KEY: ${{ secrets.TSIO_API_KEY }}
+          # Passed through the environment, never interpolated into the script
+          # arguments: a comment body is attacker-controlled text and must not be
+          # able to reach a shell as anything but data.
+          COMMENT_BODY: ${{ inputs.comment_body }}
+        run: |
+          set -euo pipefail
+          node scripts/triage-override.js \
+            --repo='${{ inputs.target_repo }}' \
+            --pr='${{ inputs.pr_number }}' \
+            --actor='${{ inputs.sender }}' \
+            --comment-id='${{ inputs.comment_id }}' \
+            --tsio-url='${{ inputs.tsio_url }}' \
+            --run-url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

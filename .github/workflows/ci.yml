@@ -33,7 +33,12 @@ jobs:
         # Files are listed explicitly rather than passing the directory: node's
         # directory runner also executes non-test sources, which turns a plain
         # `require` into a spurious failure.
-        run: node --test scripts/triage-policy.test.js scripts/triage-apply.test.js
+        run: |
+          node --test \
+            scripts/triage-policy.test.js \
+            scripts/triage-apply.test.js \
+            scripts/triage-override.test.js \
+            scripts/triage-blame.test.js
 
   actionlint:
     name: Workflow lint

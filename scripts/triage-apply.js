@@ -25,6 +25,7 @@
 const fs = require('fs');
 
 const {decideCluster, decideRun, parseModelOutput, statusDescription} = require('./triage-policy');
+const {attribute, blameCandidates, formatCallout} = require('./triage-blame');
 
 const AI_WAIVED_LABEL = 'E2E/AI-Waived';
 const STATUS_CONTEXT = 'e2e-test/ai-triage';
@@ -117,6 +118,52 @@ function assembleVerdicts(evidence, modelVerdicts) {
     });
 }
 
+/**
+ * Resolve who broke the baseline, when triage concluded MAIN_REGRESSION.
+ *
+ * The PR under test is innocent, but somebody's change did break main and
+ * nobody is being told. TSIO already knows the last commit where the test passed
+ * and the first where it failed, so the suspect range is whatever landed
+ * between — no bisect, no builds, usually a single commit.
+ *
+ * Entirely best-effort: a failed compare call costs a callout, not a verdict.
+ */
+async function resolveBlame({token, repo, evidence, decisions}) {
+    const candidates = blameCandidates(evidence, decisions);
+    if (candidates.length === 0) {
+        return null;
+    }
+
+    // One callout per distinct range: several tests broken by one commit is the
+    // normal shape, and repeating the same accusation per test is just noise.
+    const byRange = new Map();
+    for (const c of candidates) {
+        const key = `${c.range.lastPass}...${c.range.failingSince}`;
+        if (!byRange.has(key)) {
+            byRange.set(key, {range: c.range, testIds: []});
+        }
+        byRange.get(key).testIds.push(c.testId);
+    }
+
+    const callouts = [];
+    for (const {range, testIds} of byRange.values()) {
+        try {
+            const compare = await gh(token, 'GET',
+                `/repos/${repo}/compare/${range.lastPass}...${range.failingSince}`);
+            const attribution = attribute(compare.commits || []);
+            callouts.push({
+                range,
+                testIds,
+                attribution,
+                text: formatCallout({repo, testIds, range, attribution}),
+            });
+        } catch (err) {
+            console.error(`blame compare failed for ${range.lastPass}...${range.failingSince}: ${err.message}`);
+        }
+    }
+    return callouts.length > 0 ? callouts : null;
+}
+
 function renderComment(runDecision, decisions, verdicts, opts) {
     const lines = [COMMENT_MARKER];
     const icon = runDecision.state === 'success' ? ':white_check_mark:' : ':red_circle:';
@@ -150,6 +197,9 @@ function renderComment(runDecision, decisions, verdicts, opts) {
             '',
         ].join(' | ').trim());
     });
+    for (const callout of opts.blame || []) {
+        lines.push('', '---', '', callout.text);
+    }
     lines.push(
         '',
         `_Tier ${opts.tier} — ${opts.tierReason}_`,
@@ -271,6 +321,21 @@ async function main() {
 
     console.log(JSON.stringify({runDecision, decisions}, null, 2));
 
+    // Resolved before the comment is rendered so the callout travels with it.
+    let blame = null;
+    try {
+        blame = await resolveBlame({token, repo, evidence, decisions});
+        if (blame) {
+            for (const b of blame) {
+                console.log(`blame: ${b.attribution.confident ?
+                    `suspect ${b.attribution.suspect.sha} (@${b.attribution.suspect.author})` :
+                    b.attribution.reason}`);
+            }
+        }
+    } catch (err) {
+        console.error(`blame resolution failed (continuing): ${err.message}`);
+    }
+
     // 1. Own status, always posted.
     await gh(token, 'POST', `/repos/${repo}/statuses/${commitSha}`, {
         state: runDecision.state,
@@ -329,6 +394,7 @@ async function main() {
                     commitUrl: `https://github.com/${repo}/commit/${commitSha}`,
                     tier: evidence.tier,
                     tierReason: evidence.tier_reason,
+                    blame,
                 });
                 if (existing) {
                     await gh(token, 'PATCH', `/repos/${repo}/issues/comments/${existing.id}`, {body});
@@ -392,6 +458,11 @@ async function main() {
             `waived=${runDecision.waived}`,
             `verdict=${runDecision.verdict || 'INCONCLUSIVE'}`,
             `description=${statusDescription(runDecision)}`,
+            `blame_confident=${Boolean(blame && blame.some((b) => b.attribution.confident))}`,
+            `blame_suspects=${(blame || [])
+                .filter((b) => b.attribution.confident)
+                .map((b) => `${b.attribution.suspect.sha.slice(0, 7)}:${b.attribution.suspect.author || 'unknown'}`)
+                .join(',')}`,
             '',
         ].join('\n'));
     }
@@ -416,4 +487,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = {assembleVerdicts, renderComment, mintOidcToken, AI_WAIVED_LABEL, STATUS_CONTEXT};
+module.exports = {assembleVerdicts, renderComment, resolveBlame, mintOidcToken, AI_WAIVED_LABEL, STATUS_CONTEXT};

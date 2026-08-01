@@ -87,3 +87,45 @@ test('a partly-adjudicated run stays red because of the unexplained cluster', ()
     assert.equal(run.red_clusters, 1);
     assert.equal(run.green_clusters, 1);
 });
+
+// ---------- blame reaches the comment ----------
+
+const {renderComment} = require('./triage-apply');
+const {attribute} = require('./triage-blame');
+
+test('a resolved main-regression callout is rendered into the PR comment', () => {
+    const body = renderComment(
+        {state: 'success', waived: true, reason: 'pre-existing on main'},
+        [{verdict: 'MAIN_REGRESSION', confidence: 0.9, reason: 'pre-existing on main'}],
+        [{cluster_signature: 'sig', member_count: 1, source: 'model'}],
+        {
+            commitSha: 'abcdef1234567890',
+            commitUrl: 'https://github.com/o/r/commit/abcdef1234567890',
+            tier: 1,
+            tierReason: '1 failure',
+            blame: [{
+                attribution: attribute([{
+                    sha: 'deadbeef123',
+                    author: {login: 'alice'},
+                    commit: {message: 'refactor the channel list'},
+                    parents: [{sha: 'p'}],
+                }]),
+                text: '### Main regression detected\n\n**Author:** @alice',
+            }],
+        },
+    );
+
+    assert.match(body, /Main regression detected/);
+    assert.match(body, /@alice/, 'the person who can actually fix it has to be named');
+});
+
+test('a comment without blame renders unchanged', () => {
+    const body = renderComment(
+        {state: 'failure', waived: false, reason: 'nope'},
+        [{verdict: 'PR_REGRESSION', confidence: 0.9, reason: 'nope'}],
+        [{cluster_signature: 'sig', member_count: 1, source: 'model'}],
+        {commitSha: 'abcdef1234567890', commitUrl: 'x', tier: 1, tierReason: '1 failure'},
+    );
+
+    assert.ok(!/Main regression detected/.test(body));
+});

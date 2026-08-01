@@ -141,6 +141,43 @@ not causes.
 \* only when `diff_overlaps_failure` is false. If the PR touches the same area,
 attribution is ambiguous and ambiguity is red.
 
+## Human override
+
+`/e2e-triage-override <verdict> <reason>` on the PR, from an OWNER, MEMBER, or
+COLLABORATOR. Handled by `e2e-ai-triage-override.yml`.
+
+The verdict is case- and dash-insensitive (`flaky-infra` and `FLAKY_INFRA` both
+work). A reason is mandatory — the correction's value is as a labelled example,
+and a bare verdict records that triage was wrong while discarding the only part
+that says how.
+
+Correcting to a waivable verdict greens the check and applies the waiver label;
+correcting to anything else reds it and **withdraws** the label. The withdrawal
+matters: the label is sticky across pushes and the status reporter honours it
+unconditionally, so leaving it applied would keep greening later commits.
+
+The correction is written to the ledger first, because that is the part that
+outlives the PR. If the ledger write fails the checks are still updated — the
+maintainer's intent is honoured — but the reply says so explicitly, since an
+unrecorded correction is a data point permanently lost.
+
+## Main-regression blame
+
+When triage concludes `MAIN_REGRESSION` the PR is innocent, but someone's change
+did break the baseline. TSIO already knows the last commit where the test passed
+and the first where it failed, so the suspect range is whatever landed between —
+no bisect, no builds.
+
+- **One commit in the range** → that is attribution, and the author is named in
+  the PR comment and the channel notification.
+- **Two to eight** → candidates are listed, nobody is singled out.
+- **More than eight** → not attributed at all.
+
+Naming the wrong author is worse than naming nobody: it burns the one thing the
+callout needs, which is people trusting it enough to look. Merge commits are
+excluded, and only `MAIN_REGRESSION` clusters are blamed — attributing a flake to
+a commit is a false accusation.
+
 ## Metrics
 
 Every verdict is recorded in the TSIO ledger. `GET /api/v1/triage/accuracy`

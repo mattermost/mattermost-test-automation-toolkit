@@ -320,6 +320,7 @@ jobs:
           STATE: ${{ steps.apply.outputs.state }}
           VERDICT: ${{ steps.apply.outputs.verdict }}
           DESCRIPTION: ${{ steps.apply.outputs.description }}
+          BLAME_SUSPECTS: ${{ steps.apply.outputs.blame_suspects }}
         run: |
           set -uo pipefail
           if [ "${STATE:-failure}" = "success" ]; then
@@ -336,6 +337,12 @@ jobs:
           # leading spaces inside the webhook payload.
           TEXT=$(printf '%s %s `%s`\n%s' \
             "${ICON}" "${TAG}" "${VERDICT:-INCONCLUSIVE}" "${DESCRIPTION:-triage did not complete}")
+          # A main regression that nobody is told about is a verdict nobody acts
+          # on. When the suspect range is a single commit the author is named
+          # here, because the channel is where main-health is actually watched.
+          if [ -n "${BLAME_SUSPECTS:-}" ]; then
+            TEXT=$(printf '%s\n:mag: Suspect commit(s) on the baseline: `%s`' "$TEXT" "$BLAME_SUSPECTS")
+          fi
           ATTACH=$(printf ':github: [%s%s](%s/%s%s) | commit `%s` | [triage run](%s) | model `%s`' \
             "${TARGET}" "${PR_REF:+#$PR_REF}" \
             "${SERVER}" "${TARGET}" "${PR_REF:+/pull/$PR_REF}" \
