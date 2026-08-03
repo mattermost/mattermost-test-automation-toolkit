@@ -304,3 +304,58 @@ test('a status description is a single line even when the model supplies newline
     assert.ok(!/[\r\n]/.test(desc), 'description must not contain a line break');
     assert.ok(desc.includes('state=success'), 'the text is kept, just flattened');
 });
+
+test('a run that produced no reports is red even when a suite rule explains it', () => {
+    // The catalogue calls "every shard died" FLAKY_INFRA at 0.95, which is a
+    // waivable verdict. A change that broke the build well enough to stop the
+    // tests running would otherwise be waived green with no test evidence in
+    // existence. The reportsFound guard used to sit behind a decisions.length
+    // check that the suite path walks straight past.
+    const suite = decideCluster({
+        verdict: 'FLAKY_INFRA',
+        confidence: 0.95,
+        evidence: [{kind: 'suite-rule'}, {kind: 'suite-shape'}],
+        root_cause: 'no shard produced a usable report',
+    }, assist);
+    const run = decideRun([suite], {failureCount: 0, reportsFound: 0});
+
+    assert.equal(run.state, 'failure');
+    assert.equal(run.waived, false);
+    assert.match(run.reason, /no usable test results/);
+});
+
+test('a non-numeric confidence is malformed, not maximally confident', () => {
+    // Number(true) is 1, which clears the green bar outright.
+    for (const bad of [true, '0.99', null, {}, []]) {
+        const d = decideCluster({
+            verdict: 'FLAKY_INFRA',
+            confidence: bad,
+            evidence: [{a: 1}, {b: 2}],
+        }, assist);
+        assert.equal(d.waived, false, `confidence ${JSON.stringify(bad)} must not waive`);
+        assert.equal(d.verdict, 'INCONCLUSIVE');
+    }
+});
+
+test('a waiver needs two citations whatever produced the verdict', () => {
+    // The bar lived only in parseModelOutput, so rule-decided and suite verdicts
+    // reached decideCluster having never been checked.
+    const oneCite = decideCluster({
+        verdict: 'FLAKY_INFRA', confidence: 0.99, evidence: [{kind: 'signature', ref: 'x'}],
+    }, assist);
+    assert.equal(oneCite.waived, false);
+    assert.match(oneCite.reason, /cites 1 independent item/);
+
+    // Two copies of the same citation is one observation written twice.
+    const dupCites = decideCluster({
+        verdict: 'FLAKY_INFRA', confidence: 0.99,
+        evidence: [{kind: 'log', ref: 'same'}, {kind: 'log', ref: 'same'}],
+    }, assist);
+    assert.equal(dupCites.waived, false, 'duplicate citations are not corroboration');
+
+    const twoCites = decideCluster({
+        verdict: 'FLAKY_INFRA', confidence: 0.99,
+        evidence: [{kind: 'log', ref: 'a'}, {kind: 'history', ref: 'b'}],
+    }, assist);
+    assert.equal(twoCites.waived, true);
+});

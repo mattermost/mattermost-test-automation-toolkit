@@ -28,7 +28,11 @@ test('a decided suite verdict replaces per-cluster adjudication entirely', () =>
 
     assert.equal(verdicts.length, 1, 'clusters are symptoms of the suite failure, not separate causes');
     assert.equal(verdicts[0].source, 'rules');
-    assert.equal(verdicts[0].cluster_signature, null);
+
+    // Keyed on the rule rather than left null: TSIO requires one of
+    // external_test_id or cluster_signature, so a null/null row was rejected and
+    // the one verdict class that can waive a whole run never reached the ledger.
+    assert.equal(verdicts[0].cluster_signature, 'suite:suite.no-results');
 });
 
 test('rule-decided clusters never consult the model output', () => {
@@ -76,7 +80,15 @@ test('a model verdict is matched to its cluster by signature', () => {
 test('a partly-adjudicated run stays red because of the unexplained cluster', () => {
     const verdicts = assembleVerdicts(evidence({
         clusters: [
-            {signature_hash: 'a', needs_ai: false, rule_verdict: 'FLAKY_INFRA', confidence: 0.95, reason: 'adb', member_count: 9, matched_signatures: []},
+            // Two matched signatures, because a waiver needs two independent
+            // citations whatever produced it — a rule verdict is not exempt.
+            {signature_hash: 'a',
+                needs_ai: false,
+                rule_verdict: 'FLAKY_INFRA',
+                confidence: 0.95,
+                reason: 'adb',
+                member_count: 9,
+                matched_signatures: [{id: 'device.adb-offline'}, {id: 'infra.runner-oom'}]},
             {signature_hash: 'b', needs_ai: true, member_count: 1, matched_signatures: []},
         ],
     }), []);

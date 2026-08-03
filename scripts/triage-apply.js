@@ -77,7 +77,13 @@ function assembleVerdicts(evidence, modelVerdicts) {
     // from it.
     if (evidence.suite_verdict) {
         return [{
-            cluster_signature: null,
+            // Synthetic, but not arbitrary: TSIO requires one of
+            // external_test_id or cluster_signature, so a null/null suite row was
+            // rejected with a 400 and swallowed as a log line — meaning the one
+            // verdict class that can waive a whole run was never recorded, and
+            // the false-green metric could not see it. Keyed on the rule id so
+            // re-triaging the same run updates its row instead of appending.
+            cluster_signature: `suite:${evidence.suite_verdict.rule_id || 'unknown'}`,
             member_count: evidence.summary ? evidence.summary.failed : 0,
             verdict: evidence.suite_verdict.verdict,
             confidence: evidence.suite_verdict.confidence,
@@ -302,18 +308,35 @@ async function main() {
     }
 
     const verdicts = assembleVerdicts(evidence, parsed.verdicts);
-    const clusterByIndex = evidence.suite_verdict ? [] : (evidence.clusters || []);
+
+    // A suite verdict is one decision covering every cluster, so there is no
+    // cluster to line up with it by index. Reading `clusterByIndex[0]` would pick
+    // an arbitrary cluster; reading nothing at all (the previous behaviour) threw
+    // away the two facts that are allowed to overrule a waiver. Neither is
+    // acceptable, so the suite case aggregates instead: if *any* cluster in the
+    // run reproduced on rerun or has spent its amnesty, that applies to the
+    // verdict that covers them all.
+    const clusters = evidence.clusters || [];
+    const suiteFacts = evidence.suite_verdict ? {
+        amnestyExhausted: clusters.some((c) => c && c.amnesty_exhausted),
+        reproducedOnRerun: clusters.some((c) => c && c.reproduced_on_rerun),
+    } : null;
+
     const decisions = verdicts.map((v, i) => decideCluster(v, {
         runType,
         mode,
-        amnestyExhausted: Boolean(clusterByIndex[i] && clusterByIndex[i].amnesty_exhausted),
+        amnestyExhausted: suiteFacts ?
+            suiteFacts.amnestyExhausted :
+            Boolean(clusters[i] && clusters[i].amnesty_exhausted),
         // Overlap is asserted by the caller from the diff, not inferred by the
         // model about its own verdict.
         diffOverlapsFailure: arg('diff-overlaps', 'false') === 'true',
 
         // Set by the rerun stage. A cluster that failed every repetition is
         // deterministic, and no model verdict may waive it.
-        reproducedOnRerun: Boolean(clusterByIndex[i] && clusterByIndex[i].reproduced_on_rerun),
+        reproducedOnRerun: suiteFacts ?
+            suiteFacts.reproducedOnRerun :
+            Boolean(clusters[i] && clusters[i].reproduced_on_rerun),
     }));
     // The run's shape decides what "no decisions" means. A passing suite has
     // nothing to triage and must go green; a suite that produced no reports at

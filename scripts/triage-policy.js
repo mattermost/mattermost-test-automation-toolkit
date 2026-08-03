@@ -57,7 +57,14 @@ function decideCluster(verdictRecord, context = {}) {
     } = context;
 
     const verdict = verdictRecord && verdictRecord.verdict;
-    const confidence = Number(verdictRecord && verdictRecord.confidence);
+
+    // typeof before Number(). Number(true) is 1, which clears the 0.85 green bar
+    // outright, so a model emitting `"confidence": true` — or any non-number the
+    // coercion happens to land inside [0,1] — bought itself a maximum-confidence
+    // waiver. A confidence that is not a number is not a low confidence, it is a
+    // malformed record.
+    const rawConfidence = verdictRecord && verdictRecord.confidence;
+    const confidence = typeof rawConfidence === 'number' ? rawConfidence : NaN;
 
     // Range, not just finiteness. Number.isFinite rejects NaN and Infinity but
     // happily admits 5, which clears the 0.85 green bar and waives — a model
@@ -71,6 +78,24 @@ function decideCluster(verdictRecord, context = {}) {
 
     const wantsGreen = WAIVABLE.has(verdict);
     const bar = wantsGreen ? GREEN_CONFIDENCE_BAR : RED_CONFIDENCE_BAR;
+
+    // The two-citation rule is enforced here, not only in parseModelOutput.
+    // Living in the parser it applied only to verdicts the model produced, so a
+    // rule-decided cluster (needs_ai: false) and a suite verdict could waive on a
+    // single citation — the invariant read as absolute but was model-only.
+    // Citations must also be distinct: two copies of the same reference are one
+    // observation written twice, and corroboration is the whole point.
+    if (wantsGreen) {
+        const cites = Array.isArray(verdictRecord.evidence) ? verdictRecord.evidence : [];
+        const distinct = new Set(cites.map((c) => JSON.stringify(c)));
+        if (distinct.size < 2) {
+            return red(
+                'INCONCLUSIVE',
+                confidence,
+                `${verdict} cites ${distinct.size} independent item(s) — a waiver needs 2`,
+            );
+        }
+    }
 
     if (confidence < bar) {
         return red(
@@ -175,6 +200,25 @@ function red(verdict, confidence, reason) {
  */
 function decideRun(decisions, context = {}) {
     const {failureCount = null, reportsFound = null} = context;
+
+    // A run that produced no usable report is red whatever the decisions say.
+    //
+    // This guard used to sit inside the `decisions.length === 0` branch, which
+    // the suite path walks straight past: a run where every shard died produces
+    // exactly one decision (the suite verdict), and the catalogue classifies that
+    // shape as FLAKY_INFRA at 0.95 — so a change that broke the build well enough
+    // to stop the tests running was waived green, with literally no test evidence
+    // in existence. "No reports" cannot be a waiver at any confidence, because
+    // there is nothing to be confident about.
+    if (reportsFound === 0) {
+        return {
+            state: 'failure',
+            waived: false,
+            reason: 'no usable test results were produced — nothing could be triaged',
+            green_clusters: 0,
+            red_clusters: decisions.length,
+        };
+    }
 
     if (decisions.length === 0) {
         if (reportsFound === 0) {
@@ -303,12 +347,13 @@ function parseModelOutput(raw) {
         }
         const v = entry;
         const evidence = Array.isArray(v.evidence) ? v.evidence : [];
-        const confidence = Number(v.confidence);
+        const confidence = typeof v.confidence === 'number' ? v.confidence : NaN;
         const valid = VERDICTS.has(v.verdict) &&
             Number.isFinite(confidence) && confidence >= 0 && confidence <= 1 &&
             // Two independent evidence items minimum. A verdict with one citation
             // is an assertion; the whole design rests on corroboration.
-            (evidence.length >= 2 || v.verdict === 'INCONCLUSIVE');
+            (new Set(evidence.map((e) => JSON.stringify(e))).size >= 2 ||
+                v.verdict === 'INCONCLUSIVE');
         return valid ?
             {...v, confidence: Number(v.confidence), evidence} :
             {
