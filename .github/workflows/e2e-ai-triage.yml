@@ -118,9 +118,32 @@ jobs:
       HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
       HAS_WEBHOOK: ${{ secrets.WEBHOOK_URL != '' }}
     steps:
+      # Check out THIS repository, not the caller's.
+      #
+      # In a reusable workflow `github.repository` is the *caller* — so a bare
+      # checkout here cloned mattermost-mobile and the next step ran
+      # `node scripts/triage-apply.js` against a tree that has no such file.
+      # MODULE_NOT_FOUND kills the job before triage-apply can post its red
+      # fallback, so the run ends with no `e2e-test/ai-triage` status at all.
+      # Absent is not fail-closed; it is silence.
+      #
+      # The ref is taken from github.workflow_ref (".../file.yml@refs/heads/x")
+      # so the scripts always match the workflow version the caller pinned,
+      # including while a caller is testing against an unmerged branch.
+      - name: ci/resolve-toolkit-ref
+        id: toolkit-ref
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          echo "ref=${WORKFLOW_REF##*@}" >> "$GITHUB_OUTPUT"
+          echo "toolkit ref: ${WORKFLOW_REF##*@}"
+
       - name: ci/checkout-toolkit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          repository: mattermost/mattermost-test-automation-toolkit
+          ref: ${{ steps.toolkit-ref.outputs.ref }}
           persist-credentials: false
 
       # continue-on-error is load-bearing: when the caller's plan job died there is
