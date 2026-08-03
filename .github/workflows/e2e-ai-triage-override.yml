@@ -39,6 +39,17 @@ on:
         required: false
         type: string
         default: "https://test-io.test.mattermost.com"
+      toolkit_ref:
+        description: >-
+          Ref of THIS repository to check out for the scripts. Defaults to main.
+          It cannot be derived: inside a called reusable workflow the `github`
+          context — including workflow_ref and workflow_sha — describes the
+          *caller*, so resolving from it would try to check this repo out at the
+          caller's branch. Callers testing an unmerged toolkit change must pass
+          the same ref they pinned `uses:` to.
+        required: false
+        type: string
+        default: "main"
     secrets:
       GH_TOKEN:
         description: "Token for statuses, labels, and comments on target_repo"
@@ -58,30 +69,20 @@ jobs:
     steps:
       # Check out THIS repository, not the caller's.
       #
-      # In a reusable workflow `github.repository` is the *caller* — so a bare
-      # checkout here cloned mattermost-mobile and the next step ran
-      # `node scripts/triage-apply.js` against a tree that has no such file.
-      # MODULE_NOT_FOUND kills the job before triage-apply can post its red
-      # fallback, so the run ends with no `e2e-test/ai-triage` status at all.
-      # Absent is not fail-closed; it is silence.
+      # In a reusable workflow `github.repository` is the *caller*, so a bare
+      # checkout cloned mattermost-mobile and the next step ran
+      # `node scripts/...` against a tree with no such file. MODULE_NOT_FOUND
+      # kills the job before the red fallback can post, so the run ends with no
+      # status at all — and absent is not fail-closed, it is silence.
       #
-      # The ref is taken from github.workflow_ref (".../file.yml@refs/heads/x")
-      # so the scripts always match the workflow version the caller pinned,
-      # including while a caller is testing against an unmerged branch.
-      - name: ci/resolve-toolkit-ref
-        id: toolkit-ref
-        env:
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-        run: |
-          set -euo pipefail
-          echo "ref=${WORKFLOW_REF##*@}" >> "$GITHUB_OUTPUT"
-          echo "toolkit ref: ${WORKFLOW_REF##*@}"
-
+      # The ref comes from an input rather than from github.workflow_ref: that
+      # context also describes the caller, so deriving from it would ask for this
+      # repository at the caller's branch, which does not exist here.
       - name: ci/checkout-toolkit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: mattermost/mattermost-test-automation-toolkit
-          ref: ${{ steps.toolkit-ref.outputs.ref }}
+          ref: ${{ inputs.toolkit_ref }}
           persist-credentials: false
 
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
@@ -102,6 +103,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TARGET_REPO: ${{ inputs.target_repo }}
           SENDER: ${{ inputs.sender }}
+          COMMENT_ID: ${{ inputs.comment_id }}
+          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
           if [ -z "${SENDER}" ]; then
@@ -118,6 +121,58 @@ jobs:
               exit 1
               ;;
           esac
+
+          # Confirm the sender against the comment itself, rather than believing
+          # the caller. The permission check above already keeps outsiders out,
+          # but sender is still a caller-supplied string, so one collaborator
+          # could be recorded as having overturned a verdict another collaborator
+          # actually overturned. Attribution that can be chosen by the caller is
+          # not attribution — the same reason corrected_by is taken from the
+          # authenticated principal rather than the request body.
+          if [ -z "${COMMENT_ID}" ]; then
+            echo "::error::comment_id is required — the override cannot be traced to a comment without it"
+            exit 1
+          fi
+          COMMENT=$(gh api "repos/${TARGET_REPO}/issues/comments/${COMMENT_ID}" 2>/dev/null || echo '')
+          if [ -z "${COMMENT}" ]; then
+            echo "::error::comment ${COMMENT_ID} not found on ${TARGET_REPO}"
+            exit 1
+          fi
+          COMMENT_AUTHOR=$(printf '%s' "${COMMENT}" | jq -r '.user.login // ""')
+          if [ "${COMMENT_AUTHOR}" != "${SENDER}" ]; then
+            echo "::error::comment ${COMMENT_ID} was written by '${COMMENT_AUTHOR}', not '${SENDER}'"
+            exit 1
+          fi
+          # And that the comment belongs to the PR being overridden, so a comment
+          # from an unrelated issue cannot authorise a change here.
+          COMMENT_ISSUE=$(printf '%s' "${COMMENT}" | jq -r '.issue_url // ""')
+          if [ "${COMMENT_ISSUE##*/}" != "${PR_NUMBER}" ]; then
+            echo "::error::comment ${COMMENT_ID} belongs to ${COMMENT_ISSUE##*/}, not PR ${PR_NUMBER}"
+            exit 1
+          fi
+          echo "verified: ${SENDER} wrote comment ${COMMENT_ID} on PR ${PR_NUMBER}"
+
+      # Validate the TSIO origin before any credential can be sent to it.
+      #
+      # tsio_url is a caller-supplied string, and the next step sends TSIO_API_KEY
+      # — or a minted OIDC token — to whatever host it names. Unvalidated, that is
+      # a credential-exfiltration primitive rather than a wrong endpoint: a caller
+      # passing https://attacker.example gets the ledger token posted to it. Exact
+      # origins only, no suffix matching, because "endswith mattermost.com" is
+      # satisfied by evil-mattermost.com.
+      - name: ci/validate-tsio-origin
+        env:
+          TSIO_URL: ${{ inputs.tsio_url }}
+        run: |
+          set -euo pipefail
+          case "${TSIO_URL}" in
+            https://test-io.test.mattermost.com|https://staging-test-io.test.mattermost.com) ;;
+            *)
+              echo "::error::tsio_url is not an approved TSIO origin: ${TSIO_URL}"
+              exit 1
+              ;;
+          esac
+          echo "TSIO origin approved: ${TSIO_URL}"
 
       - name: ci/apply-override
         env:
