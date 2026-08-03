@@ -134,3 +134,19 @@ test('a MAIN_REGRESSION with unusable history produces no candidate', () => {
 
     assert.deepEqual(blameCandidates(evidence, [{verdict: 'MAIN_REGRESSION'}]), []);
 });
+
+test('a suite verdict blames nobody', () => {
+    // assembleVerdicts collapses a suite verdict to a single decision, so
+    // decisions[0] describes the whole run while clusters[0] is one arbitrary
+    // cluster. Zipping them would name an author picked essentially at random.
+    const evidence = {
+        suite_verdict: {verdict: 'MAIN_REGRESSION', confidence: 0.9},
+        clusters: [{
+            history: [{
+                test_id: 'MM-T1',
+                history: {last_pass_commit: 'aaa', failing_since_commit: 'bbb'},
+            }],
+        }],
+    };
+    assert.deepEqual(blameCandidates(evidence, [{verdict: 'MAIN_REGRESSION'}]), []);
+});

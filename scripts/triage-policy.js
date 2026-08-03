@@ -59,7 +59,13 @@ function decideCluster(verdictRecord, context = {}) {
     const verdict = verdictRecord && verdictRecord.verdict;
     const confidence = Number(verdictRecord && verdictRecord.confidence);
 
-    if (!VERDICTS.has(verdict) || !Number.isFinite(confidence)) {
+    // Range, not just finiteness. Number.isFinite rejects NaN and Infinity but
+    // happily admits 5, which clears the 0.85 green bar and waives — a model
+    // that emits a confidence on a 0-100 scale, or a corrupted record copied
+    // through assembleVerdicts, would silently buy itself a green. Confidence is
+    // defined as a probability, so anything outside [0,1] is not a low-confidence
+    // answer, it is an unusable one.
+    if (!VERDICTS.has(verdict) || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
         return red('INCONCLUSIVE', 0, 'triage produced no usable verdict');
     }
 
@@ -240,10 +246,28 @@ function statusDescription(runDecision) {
         // No verdict at all: on a passing run the reason ("no failures to
         // triage") is the whole message, and prefixing it with "inconclusive"
         // would read as a problem where there is none.
-        return String(runDecision.reason || 'triage did not complete').slice(0, 140);
+        return singleLine(runDecision.reason || 'triage did not complete').slice(0, 140);
     }
     const prefix = `${runDecision.verdict.toLowerCase().replace(/_/g, '-')} (${runDecision.confidence ?? '?'})`;
-    return `${prefix}: ${runDecision.reason}`.slice(0, 140);
+    return singleLine(`${prefix}: ${runDecision.reason}`).slice(0, 140);
+}
+
+/**
+ * Flatten text to a single line with no control characters.
+ *
+ * A status description is one line by definition, but the reason it is built
+ * from carries the model's root_cause — untrusted text. This value reaches
+ * GITHUB_OUTPUT as `description=<text>`, where a newline starts a new
+ * `key=value` assignment and the last assignment for a key wins. A root_cause
+ * containing "\nstate=success\nwaived=true" would therefore have overwritten the
+ * run's own state and turned a red run green, comfortably within 140 characters.
+ */
+function singleLine(text) {
+    // eslint-disable-next-line no-control-regex -- stripping control characters is the point
+    return String(text ?? '').
+        replace(/[\u0000-\u001F\u007F]+/g, ' ').
+        replace(/\s+/g, ' ').
+        trim();
 }
 
 /**
@@ -263,10 +287,25 @@ function parseModelOutput(raw) {
     if (!doc || !Array.isArray(doc.verdicts)) {
         return {ok: false, error: 'model output has no verdicts array', verdicts: []};
     }
-    const verdicts = doc.verdicts.map((v) => {
+    const verdicts = doc.verdicts.map((entry) => {
+        // The model's output is untrusted JSON, so an entry need not be an
+        // object. `verdicts: [null]` would throw on the first property read and
+        // take down the whole adjudication, turning one malformed element into
+        // no verdict at all rather than one rejected verdict.
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+            return {
+                cluster_signature: null,
+                verdict: 'INCONCLUSIVE',
+                confidence: 0,
+                evidence: [],
+                root_cause: 'rejected: verdict entry is not an object',
+            };
+        }
+        const v = entry;
         const evidence = Array.isArray(v.evidence) ? v.evidence : [];
+        const confidence = Number(v.confidence);
         const valid = VERDICTS.has(v.verdict) &&
-            Number.isFinite(Number(v.confidence)) &&
+            Number.isFinite(confidence) && confidence >= 0 && confidence <= 1 &&
             // Two independent evidence items minimum. A verdict with one citation
             // is an assertion; the whole design rests on corroboration.
             (evidence.length >= 2 || v.verdict === 'INCONCLUSIVE');

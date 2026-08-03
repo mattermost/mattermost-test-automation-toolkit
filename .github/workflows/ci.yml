@@ -51,7 +51,16 @@ jobs:
       - name: ci/actionlint
         run: |
           set -euo pipefail
-          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          # Pinned by commit, not by branch. `.../main/scripts/...` re-fetches
+          # whatever that branch holds at the moment CI runs, so this step used to
+          # pipe a mutable remote script straight into bash on a runner holding
+          # the workflow token. The commit ref is immutable, and the version the
+          # script then downloads is fixed rather than "latest".
+          INSTALLER_REF=3795ba2f6cb243eeca54c9d22e5c531cb9dcfb4a
+          ACTIONLINT_VERSION=1.7.12
+          curl -fsSL -o download-actionlint.bash \
+            "https://raw.githubusercontent.com/rhysd/actionlint/${INSTALLER_REF}/scripts/download-actionlint.bash"
+          bash download-actionlint.bash "${ACTIONLINT_VERSION}"
           # shellcheck is not installed on the runner image by default; the
           # workflow-level checks are what matter here.
           ./actionlint -shellcheck= .github/workflows/*.yml

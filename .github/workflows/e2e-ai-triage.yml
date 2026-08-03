@@ -142,6 +142,12 @@ jobs:
       # results, or clusters the signature catalogue already resolved.
       - name: ci/decide-whether-to-adjudicate
         id: gate
+        # A malformed evidence.json makes jq exit non-zero, and under `set -e`
+        # that failed this step and skipped ci/apply-verdicts with it — so no
+        # status was posted at all. "No check" is not fail-closed, it is silence.
+        # Continuing lets apply run with no model verdict, where the policy engine
+        # resolves the unexplained clusters red, which is the intended behaviour.
+        continue-on-error: true
         run: |
           set -euo pipefail
           if [ ! -f triage-out/evidence.json ]; then
@@ -271,6 +277,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TSIO_API_KEY: ${{ secrets.TSIO_API_KEY }}
           AI_OUTCOME: ${{ steps.ai.outcome }}
+          # Every caller-supplied value arrives as an environment variable rather
+          # than being pasted into the script text. `branch` is the one that makes
+          # this mandatory: a branch name is attacker-chosen on a fork PR, and a
+          # single quote in it ends the quoting and starts a command.
+          TARGET_REPO: ${{ inputs.target_repo }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BRANCH: ${{ inputs.branch }}
+          RUN_TYPE: ${{ inputs.run_type }}
+          MODE: ${{ inputs.mode }}
+          TSIO_URL: ${{ inputs.tsio_url }}
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+          DIFF_OVERLAPS: ${{ inputs.diff_overlaps_failure }}
         run: |
           set -uo pipefail
           # A model step that errored or timed out leaves no verdict file. The
@@ -285,28 +304,39 @@ jobs:
           node scripts/triage-apply.js \
             --evidence=triage-out/evidence.json \
             --model-output="${MODEL_OUTPUT_FILE}" \
-            --repo='${{ inputs.target_repo }}' \
-            --commit='${{ inputs.commit_sha }}' \
-            --pr='${{ inputs.pr_number }}' \
-            --branch='${{ inputs.branch }}' \
-            --run-type='${{ inputs.run_type }}' \
-            --mode='${{ inputs.mode }}' \
+            --repo="${TARGET_REPO}" \
+            --commit="${COMMIT_SHA}" \
+            --pr="${PR_NUMBER}" \
+            --branch="${BRANCH}" \
+            --run-type="${RUN_TYPE}" \
+            --mode="${MODE}" \
             --model="${CLAUDE_MODEL}" \
-            --tsio-url='${{ inputs.tsio_url }}' \
-            --run-id='${{ inputs.evidence_run_id }}' \
+            --tsio-url="${TSIO_URL}" \
+            --run-id="${EVIDENCE_RUN_ID}" \
             --run-url="${RUN_URL}" \
-            --diff-overlaps='${{ inputs.diff_overlaps_failure }}'
+            --diff-overlaps="${DIFF_OVERLAPS}"
 
       - name: ci/job-summary
         if: always()
+        # DESCRIPTION is built from the model's root_cause. Interpolated into the
+        # script it would be evaluated by the shell, so a root_cause containing a
+        # backtick or $(...) would run as a command on the runner. As an
+        # environment variable it is only ever data.
+        env:
+          MODE: ${{ inputs.mode }}
+          RUN_TYPE: ${{ inputs.run_type }}
+          GATE_REASON: ${{ steps.gate.outputs.reason }}
+          AI_OUTCOME: ${{ steps.ai.outcome }}
+          APPLY_STATE: ${{ steps.apply.outputs.state }}
+          DESCRIPTION: ${{ steps.apply.outputs.description }}
         run: |
           {
             echo "## E2E AI triage"
             echo ""
-            echo "- mode: \`${{ inputs.mode }}\` (run type \`${{ inputs.run_type }}\`)"
-            echo "- gate: ${{ steps.gate.outputs.reason }}"
-            echo "- model step: ${{ steps.ai.outcome || 'skipped' }}"
-            echo "- result: **${{ steps.apply.outputs.state || 'failure' }}** — ${{ steps.apply.outputs.description || 'triage did not complete' }}"
+            echo "- mode: \`${MODE}\` (run type \`${RUN_TYPE}\`)"
+            echo "- gate: ${GATE_REASON}"
+            echo "- model step: ${AI_OUTCOME:-skipped}"
+            echo "- result: **${APPLY_STATE:-failure}** — ${DESCRIPTION:-triage did not complete}"
             echo ""
             if [ -f triage-out/summary.md ]; then
               cat triage-out/summary.md
@@ -321,6 +351,10 @@ jobs:
           VERDICT: ${{ steps.apply.outputs.verdict }}
           DESCRIPTION: ${{ steps.apply.outputs.description }}
           BLAME_SUSPECTS: ${{ steps.apply.outputs.blame_suspects }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          SERVER_URL: ${{ github.server_url }}
         run: |
           set -uo pipefail
           if [ "${STATE:-failure}" = "success" ]; then
@@ -328,10 +362,10 @@ jobs:
           else
             ICON=":red_circle:"; COLOR="#CC0000"; TAG="#e2e-triage-red"
           fi
-          PR_REF='${{ inputs.pr_number }}'
-          TARGET='${{ inputs.target_repo }}'
-          SHA='${{ inputs.commit_sha }}'
-          SERVER='${{ github.server_url }}'
+          PR_REF="${PR_NUMBER}"
+          TARGET="${TARGET_REPO}"
+          SHA="${COMMIT_SHA}"
+          SERVER="${SERVER_URL}"
           # printf rather than an embedded newline in a double-quoted string:
           # YAML block scalars re-indent continuation lines, which would put
           # leading spaces inside the webhook payload.

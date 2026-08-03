@@ -163,28 +163,40 @@ async function recordCorrections({tsioUrl, credential, repo, prNumber, parsed, a
         {Authorization: `Bearer ${credential.token}`};
 
     const listUrl = `${tsioUrl}/api/v1/triage/verdicts?repo=${encodeURIComponent(repo)}&pr=${prNumber}&limit=200`;
-    const listRes = await fetch(listUrl);
+
+    // Credentials on the read too. It is a public endpoint today, so this is not
+    // required — but the read and the writes that follow it are one operation,
+    // and leaving the read anonymous means putting the endpoint behind auth later
+    // breaks override rather than being a no-op.
+    const listRes = await fetch(listUrl, {headers});
     if (!listRes.ok) {
         throw new Error(`could not list verdicts: ${listRes.status}`);
     }
     const {verdicts} = await listRes.json();
     if (!verdicts || verdicts.length === 0) {
-        return {corrected: 0, note: 'no recorded verdicts for this PR'};
+        return {ok: false, corrected: 0, total: 0, note: 'no recorded verdicts for this PR'};
     }
 
     // Only the newest run's verdicts: older ones describe commits that are no
-    // longer what the checks reflect.
-    const newestCommit = verdicts[0].commit_sha;
-    const targets = verdicts.filter((v) => v.commit_sha === newestCommit);
+    // longer what the checks reflect. Newest is resolved from created_at rather
+    // than by trusting the response order — the endpoint happens to sort
+    // newest-first, but correcting the wrong commit's verdicts is silent and
+    // permanent, which is too much to stake on an ordering nobody promised.
+    const newest = verdicts.reduce((a, b) =>
+        (new Date(b.created_at) > new Date(a.created_at) ? b : a));
+    const targets = verdicts.filter((v) => v.commit_sha === newest.commit_sha);
 
     let corrected = 0;
     for (const v of targets) {
         const res = await fetch(`${tsioUrl}/api/v1/triage/verdicts/${v.id}/correction`, {
             method: 'POST',
             headers: {...headers, 'Content-Type': 'application/json'},
+            // corrected_by is not sent: TSIO derives attribution from the
+            // authenticated principal, because a body-supplied name could be
+            // anyone's. The maintainer is named in the PR comment below, under
+            // GitHub's own authentication.
             body: JSON.stringify({
                 corrected_verdict: parsed.verdict,
-                corrected_by: actor,
                 corrected_reason: parsed.reason,
             }),
         });
@@ -194,7 +206,12 @@ async function recordCorrections({tsioUrl, credential, repo, prNumber, parsed, a
             console.error(`correction for ${v.id} failed: ${res.status} ${await res.text()}`);
         }
     }
-    return {corrected, total: targets.length, commit: newestCommit};
+    // ok is what the caller reports on, rather than the shape of the note. A run
+    // where every correction POST failed still produces "0/5 verdict(s)
+    // corrected", which reads as success to anything matching on that phrasing —
+    // and claiming a correction was recorded when none was is a false claim of
+    // accountability in the one place accountability is the product.
+    return {ok: corrected > 0, corrected, total: targets.length, commit: newest.commit_sha};
 }
 
 function arg(name, dflt = '') {
@@ -239,6 +256,7 @@ async function main() {
 
     // 1. Record first — this is the part that outlives the PR.
     let ledgerNote = 'not recorded';
+    let recordedCleanly = false;
     try {
         const apiKey = process.env.TSIO_API_KEY || '';
         const oidc = apiKey ? null : await mintOidcToken(arg('tsio-audience', 'mattermost-test-system-io'));
@@ -252,6 +270,7 @@ async function main() {
                 actor,
             });
             ledgerNote = result.note || `${result.corrected}/${result.total} verdict(s) corrected`;
+            recordedCleanly = Boolean(result.ok);
         } else {
             ledgerNote = 'no TSIO credential available';
         }
@@ -285,7 +304,6 @@ async function main() {
         await gh(token, 'POST', `/repos/${repo}/issues/comments/${commentId}/reactions`, {content: '+1'});
     }
 
-    const recordedCleanly = /verdict\(s\) corrected/.test(ledgerNote);
     await gh(token, 'POST', `/repos/${repo}/issues/${prNumber}/comments`, {
         body: [
             `:white_check_mark: **Triage override applied by @${actor}**`,

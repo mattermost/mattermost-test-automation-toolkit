@@ -64,6 +64,37 @@ jobs:
         with:
           node-version: '22'
 
+      # Verify the sender here rather than trusting the caller to have done it.
+      #
+      # `sender` is just a string input: this workflow is reusable, so whether it
+      # was gated upstream is a property of each caller, not of this file. A
+      # caller that forgets — or one that passes github.actor from a trigger that
+      # any user can fire — would let an outside contributor overturn a red E2E
+      # verdict and apply E2E/AI-Waived to their own PR. The permission is
+      # therefore checked against the repository the override targets, before
+      # anything is written.
+      - name: ci/verify-sender-can-write
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          SENDER: ${{ inputs.sender }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SENDER}" ]; then
+            echo "::error::sender is empty — refusing to apply an unattributed override"
+            exit 1
+          fi
+          PERM=$(gh api "repos/${TARGET_REPO}/collaborators/${SENDER}/permission" \
+            --jq '.permission' 2>/dev/null || echo "none")
+          echo "sender ${SENDER} has '${PERM}' on ${TARGET_REPO}"
+          case "${PERM}" in
+            admin|maintain|write) ;;
+            *)
+              echo "::error::${SENDER} needs write access to ${TARGET_REPO} to override a triage verdict (has '${PERM}')"
+              exit 1
+              ;;
+          esac
+
       - name: ci/apply-override
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -72,12 +103,20 @@ jobs:
           # arguments: a comment body is attacker-controlled text and must not be
           # able to reach a shell as anything but data.
           COMMENT_BODY: ${{ inputs.comment_body }}
+          # Same reasoning for the rest: sender is a GitHub login and the others
+          # are caller-supplied, so none of them are pasted into the script text.
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          SENDER: ${{ inputs.sender }}
+          COMMENT_ID: ${{ inputs.comment_id }}
+          TSIO_URL: ${{ inputs.tsio_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           node scripts/triage-override.js \
-            --repo='${{ inputs.target_repo }}' \
-            --pr='${{ inputs.pr_number }}' \
-            --actor='${{ inputs.sender }}' \
-            --comment-id='${{ inputs.comment_id }}' \
-            --tsio-url='${{ inputs.tsio_url }}' \
-            --run-url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            --repo="${TARGET_REPO}" \
+            --pr="${PR_NUMBER}" \
+            --actor="${SENDER}" \
+            --comment-id="${COMMENT_ID}" \
+            --tsio-url="${TSIO_URL}" \
+            --run-url="${RUN_URL}"

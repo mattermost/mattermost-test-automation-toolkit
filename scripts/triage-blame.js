@@ -156,6 +156,18 @@ function formatCallout({repo, testIds, range, attribution}) {
  */
 function blameCandidates(evidence, decisions) {
     const out = [];
+
+    // A suite verdict covers the entire run, and assembleVerdicts collapses it to
+    // a single decision — so decisions[0] describes the whole suite while
+    // clusters[0] is one arbitrary cluster. Zipping them below would read a
+    // MAIN_REGRESSION off the suite and then pull the suspect range out of a
+    // cluster that had nothing to do with it, naming an author picked
+    // essentially at random. A whole suite dying is infrastructure, not one
+    // commit, so there is nothing here to attribute.
+    if (evidence.suite_verdict) {
+        return out;
+    }
+
     (evidence.clusters || []).forEach((cluster, i) => {
         const decision = decisions[i];
         if (!decision || decision.verdict !== 'MAIN_REGRESSION') {

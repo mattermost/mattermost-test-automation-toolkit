@@ -158,7 +158,7 @@ matters: the label is sticky across pushes and the status reporter honours it
 unconditionally, so leaving it applied would keep greening later commits.
 
 The correction is written to the ledger first, because that is the part that
-outlives the PR. If the ledger write fails the checks are still updated — the
+outlives the PR. If the ledger write fails, the checks are still updated — the
 maintainer's intent is honoured — but the reply says so explicitly, since an
 unrecorded correction is a data point permanently lost.
 
@@ -194,5 +194,6 @@ over time.
 ## Testing
 
 ```bash
-node --test scripts/triage-policy.test.js scripts/triage-apply.test.js
+node --test scripts/triage-policy.test.js scripts/triage-apply.test.js \
+  scripts/triage-override.test.js scripts/triage-blame.test.js
 ```

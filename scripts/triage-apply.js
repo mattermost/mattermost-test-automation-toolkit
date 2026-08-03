@@ -193,7 +193,11 @@ function renderComment(runDecision, decisions, verdicts, opts) {
             d.confidence,
             v.source,
             v.member_count,
-            String(d.reason || '').replace(/\|/g, '\\|').slice(0, 160),
+            // Newlines collapse before the pipe escaping: a reason carrying one
+            // ends the table row early, so every later cell shifts into the
+            // wrong column and the rest of the table renders as body text.
+            String(d.reason || '').replace(/\s+/g, ' ').trim().replace(/\|/g, '\\|').
+                slice(0, 160),
             '',
         ].join(' | ').trim());
     });
@@ -453,16 +457,27 @@ async function main() {
     }
 
     if (process.env.GITHUB_OUTPUT) {
+        // Every value is flattened to one line. In this file a newline is not
+        // cosmetic: GITHUB_OUTPUT is parsed as `key=value` per line and the last
+        // assignment for a key wins, so a value carrying "\nstate=success" would
+        // overwrite the run's own state. Two of these are outside our control —
+        // the description is built from the model's root_cause, and the suspect
+        // author comes from git — which is exactly why the sanitising happens
+        // here, at the boundary, rather than being assumed upstream.
+        // eslint-disable-next-line no-control-regex -- stripping control characters is the point
+        const line = (v) => String(v ?? '').
+            replace(/[\u0000-\u001F\u007F]+/g, ' ').
+            trim();
         fs.appendFileSync(process.env.GITHUB_OUTPUT, [
-            `state=${runDecision.state}`,
-            `waived=${runDecision.waived}`,
-            `verdict=${runDecision.verdict || 'INCONCLUSIVE'}`,
-            `description=${statusDescription(runDecision)}`,
+            `state=${line(runDecision.state)}`,
+            `waived=${line(runDecision.waived)}`,
+            `verdict=${line(runDecision.verdict || 'INCONCLUSIVE')}`,
+            `description=${line(statusDescription(runDecision))}`,
             `blame_confident=${Boolean(blame && blame.some((b) => b.attribution.confident))}`,
-            `blame_suspects=${(blame || [])
+            `blame_suspects=${line((blame || [])
                 .filter((b) => b.attribution.confident)
                 .map((b) => `${b.attribution.suspect.sha.slice(0, 7)}:${b.attribution.suspect.author || 'unknown'}`)
-                .join(',')}`,
+                .join(','))}`,
             '',
         ].join('\n'));
     }
