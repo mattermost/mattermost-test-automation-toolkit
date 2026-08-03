@@ -4,7 +4,12 @@
 const assert = require('node:assert/strict');
 const {test} = require('node:test');
 
-const {decideAfterOverride, parseCommand} = require('./triage-override');
+const {
+    STATUS_DESCRIPTION_LIMIT,
+    clampDescription,
+    decideAfterOverride,
+    parseCommand,
+} = require('./triage-override');
 
 // ---------- parsing ----------
 
@@ -88,9 +93,30 @@ test('INCONCLUSIVE is treated as unresolved, so it reds', () => {
     assert.equal(d.applyLabel, false);
 });
 
-test('the description carries the human reason and fits the status limit', () => {
-    const d = decideAfterOverride(parseCommand(`/e2e-triage-override FLAKY_TEST ${'x'.repeat(400)}`));
+test('the description carries the verdict and the human reason in full', () => {
+    // Unsliced on purpose. The previous assertion checked
+    // `d.description.slice(0, 140).length <= 140`, which is true of every string
+    // and so asserted nothing — and it checked truncation on the one function
+    // that deliberately does not truncate. decideAfterOverride returns the whole
+    // reason because the PR comment prints all of it; only the commit status is
+    // capped, and that happens at the status call.
+    const reason = 'x'.repeat(400);
+    const d = decideAfterOverride(parseCommand(`/e2e-triage-override FLAKY_TEST ${reason}`));
 
-    assert.ok(d.description.slice(0, 140).length <= 140);
     assert.match(d.description, /flaky-test/);
+    assert.ok(d.description.includes(reason), 'the maintainer reason must survive intact');
+});
+
+test('the commit-status description is capped at the GitHub limit', () => {
+    // The cap GitHub enforces silently. Asserting it here rather than at the
+    // network call keeps it a tested rule instead of a bare slice.
+    const long = decideAfterOverride(parseCommand(`/e2e-triage-override FLAKY_TEST ${'x'.repeat(400)}`));
+    const clamped = clampDescription(long.description);
+
+    assert.equal(clamped.length, STATUS_DESCRIPTION_LIMIT);
+    assert.ok(clamped.startsWith('human override: flaky-test'), 'the verdict must survive truncation');
+
+    // Short descriptions pass through untouched.
+    const short = decideAfterOverride(parseCommand('/e2e-triage-override FLAKY_TEST it flakes'));
+    assert.equal(clampDescription(short.description), short.description);
 });

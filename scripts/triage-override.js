@@ -102,6 +102,16 @@ function parseCommand(body) {
  * saying the opposite, and the waiver must be withdrawn — including the label,
  * which is sticky and would otherwise keep greening later commits.
  */
+// GitHub silently truncates a commit-status description at 140 characters.
+// decideAfterOverride deliberately returns the maintainer's reason in full — the
+// PR comment prints all of it — so the clamp belongs at the status call, and is
+// named here so it is one tested rule rather than a bare slice at the call site.
+const STATUS_DESCRIPTION_LIMIT = 140;
+
+function clampDescription(text) {
+    return String(text ?? '').slice(0, STATUS_DESCRIPTION_LIMIT);
+}
+
 function decideAfterOverride(parsed) {
     if (parsed.waivable) {
         return {
@@ -283,7 +293,7 @@ async function main() {
     await gh(token, 'POST', `/repos/${repo}/statuses/${headSha}`, {
         state: decision.state,
         context: STATUS_CONTEXT,
-        description: decision.description.slice(0, 140),
+        description: clampDescription(decision.description),
         target_url: arg('run-url', ''),
     });
 
@@ -327,4 +337,13 @@ if (require.main === module) {
     });
 }
 
-module.exports = {parseCommand, decideAfterOverride, VERDICTS, WAIVABLE, AI_WAIVED_LABEL, STATUS_CONTEXT};
+module.exports = {
+    parseCommand,
+    decideAfterOverride,
+    clampDescription,
+    STATUS_DESCRIPTION_LIMIT,
+    VERDICTS,
+    WAIVABLE,
+    AI_WAIVED_LABEL,
+    STATUS_CONTEXT,
+};
