@@ -9,6 +9,8 @@ const {
     clampDescription,
     decideAfterOverride,
     parseCommand,
+    AI_WAIVED_LABEL,
+    HUMAN_OVERRIDE_LABEL,
 } = require('./triage-override');
 
 // ---------- parsing ----------
@@ -105,6 +107,15 @@ test('the description carries the verdict and the human reason in full', () => {
 
     assert.match(d.description, /flaky-test/);
     assert.ok(d.description.includes(reason), 'the maintainer reason must survive intact');
+});
+
+// ---------- AI vs human overrides stay distinguishable ----------
+
+test('a human waiver wears a distinct label from an AI waiver', () => {
+    assert.notEqual(AI_WAIVED_LABEL, HUMAN_OVERRIDE_LABEL,
+        'conflating them makes the false-green metric uncomputable');
+    assert.equal(AI_WAIVED_LABEL, 'E2E/AI-Waived');
+    assert.equal(HUMAN_OVERRIDE_LABEL, 'E2E/Override');
 });
 
 test('the commit-status description is capped at the GitHub limit', () => {

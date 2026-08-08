@@ -4,19 +4,19 @@
 /* eslint-disable no-console */
 
 /**
- * Apply triage verdicts: decide, post, record.
+ * Apply triage verdicts: decide, record, post.
  *
  * Reads the deterministic evidence bundle plus (optionally) the model's verdict
- * file, runs them through the policy engine, and then does the three things that
- * have side effects:
+ * file, runs them through the policy engine, and then does the things that have
+ * side effects. The order is load-bearing:
  *
- *   1. posts the `e2e-test/ai-triage` commit status
- *   2. applies the E2E/AI-Waived label when policy waived the run
- *   3. records every verdict in the TSIO ledger
- *
- * Ordering matters: the ledger write happens last and is best-effort, but the
- * label is applied *before* the platform contexts get re-posted, because the
- * re-post reads the label to decide whether to downgrade a failure to success.
+ *   1. record every verdict in the TSIO ledger — a successful flaky outcome must
+ *      be recorded before the check is allowed to go green, and a ledger failure
+ *      turns the whole run into TRIAGE_FAILED
+ *   2. apply the E2E/AI-Waived label (PR only), verifying the PR head before and
+ *      after — a waiver that lands on a pushed-to PR would green untriaged commits
+ *   3. post the `status_context` commit status, reflecting the final outcome
+ *   4. post the PR comment
  *
  * Every failure path here ends in a red status. If this script cannot do its job,
  * the run must look exactly as it did before triage existed.
@@ -24,11 +24,11 @@
 
 const fs = require('fs');
 
-const {decideCluster, decideRun, parseModelOutput, statusDescription} = require('./triage-policy');
+const {decideCluster, decideRun, parseModelOutput, statusDescription, OUTCOMES} = require('./triage-policy');
 const {attribute, blameCandidates, formatCallout} = require('./triage-blame');
 
 const AI_WAIVED_LABEL = 'E2E/AI-Waived';
-const STATUS_CONTEXT = 'e2e-test/ai-triage';
+const DEFAULT_STATUS_CONTEXT = 'e2e-test/ai-triage';
 const COMMENT_MARKER = '<!-- e2e-ai-triage -->';
 
 function arg(name, dflt = '') {
@@ -189,13 +189,14 @@ function renderComment(runDecision, decisions, verdicts, opts) {
             '',
         );
     }
-    lines.push('| Cluster | Verdict | Conf | Source | Tests | Why |', '|---|---|---:|---|---:|---|');
+    lines.push('| Cluster | Verdict | Outcome | Conf | Source | Tests | Why |', '|---|---|---|---:|---|---:|---|');
     verdicts.forEach((v, i) => {
         const d = decisions[i];
         lines.push([
             '',
             v.cluster_signature ? `\`${v.cluster_signature}\`` : '_suite_',
             d.verdict,
+            d.operational_outcome || '—',
             d.confidence,
             v.source,
             v.member_count,
@@ -212,7 +213,7 @@ function renderComment(runDecision, decisions, verdicts, opts) {
     }
     lines.push(
         '',
-        `_Tier ${opts.tier} — ${opts.tierReason}_`,
+        `**Outcome:** \`${runDecision.operational_outcome || 'PASS'}\``,
         '',
         '*Wrong? Comment `/e2e-triage-override <verdict> <reason>`. Corrections are recorded and are the only ground truth this system gets.*',
     );
@@ -229,7 +230,8 @@ function renderComment(runDecision, decisions, verdicts, opts) {
  * rest of the pipeline does and needs no additional shared secret.
  *
  * Requires `permissions: id-token: write` on the job. Without it the request env
- * vars are absent and the ledger write is skipped rather than failing the run.
+ * vars are absent and the mint fails — which is now a ledger failure and turns
+ * the run TRIAGE_FAILED, so a missing permission is loud rather than silent.
  */
 async function mintOidcToken(audience) {
     const url = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
@@ -266,6 +268,31 @@ async function recordLedger({tsioUrl, token, apiKey, batch}) {
     return res.json();
 }
 
+/**
+ * Turn a green run into a triage failure. Used when the ledger or the PR-head
+ * verification refuses to underwrite a waiver: the verdicts may say flaky, but
+ * the run cannot be allowed to go green, so the outcome becomes TRIAGE_FAILED.
+ */
+function markTriageFailed(runDecision, reason) {
+    return {
+        ...runDecision,
+        state: 'failure',
+        operational_outcome: OUTCOMES.TRIAGE_FAILED,
+        waived: false,
+        reason: `triage could not complete safely: ${reason}`,
+    };
+}
+
+/**
+ * Fetch the current PR head SHA. The waiver label is sticky across pushes and the
+ * caller's status reporter honours it unconditionally, so applying it when the
+ * PR has moved on would green commits that were never triaged.
+ */
+async function prHeadSha(token, repo, prNumber) {
+    const pr = await gh(token, 'GET', `/repos/${repo}/pulls/${prNumber}`);
+    return pr.head.sha;
+}
+
 async function main() {
     const evidenceFile = arg('evidence', 'triage-out/evidence.json');
     const modelFile = arg('model-output', '');
@@ -276,6 +303,7 @@ async function main() {
     const mode = arg('mode', 'shadow');
     const model = arg('model', '');
     const tsioUrl = arg('tsio-url', 'https://test-io.test.mattermost.com');
+    const statusContext = arg('status-context', DEFAULT_STATUS_CONTEXT);
     // Optional. When absent the ledger authenticates with a minted OIDC token,
     // which is the path CI actually uses — no shared secret required.
     const tsioApiKey = process.env.TSIO_API_KEY || '';
@@ -286,17 +314,23 @@ async function main() {
         throw new Error('GH_TOKEN is required');
     }
 
+    const postStatus = (state, description) => gh(token, 'POST', `/repos/${repo}/statuses/${commitSha}`, {
+        state,
+        context: statusContext,
+        description,
+        target_url: runUrl,
+    });
+
     const evidence = readJson(evidenceFile);
     if (!evidence) {
         // No evidence means triage did not run. Post red and stop — silence here
         // would leave a required check pending forever.
-        await gh(token, 'POST', `/repos/${repo}/statuses/${commitSha}`, {
-            state: 'failure',
-            context: STATUS_CONTEXT,
-            description: 'triage produced no evidence bundle — manual triage required',
-            target_url: runUrl,
-        });
+        await postStatus('failure', 'triage produced no evidence bundle — manual triage required');
         console.log('no evidence bundle; posted red');
+        writeOutputs({state: 'failure', waived: false, verdict: 'INCONCLUSIVE',
+            operational_outcome: OUTCOMES.TRIAGE_FAILED,
+            description: 'triage produced no evidence bundle — manual triage required',
+            triage_url: runUrl, blame: null});
         return;
     }
 
@@ -310,12 +344,11 @@ async function main() {
     const verdicts = assembleVerdicts(evidence, parsed.verdicts);
 
     // A suite verdict is one decision covering every cluster, so there is no
-    // cluster to line up with it by index. Reading `clusterByIndex[0]` would pick
-    // an arbitrary cluster; reading nothing at all (the previous behaviour) threw
-    // away the two facts that are allowed to overrule a waiver. Neither is
-    // acceptable, so the suite case aggregates instead: if *any* cluster in the
-    // run reproduced on rerun or has spent its amnesty, that applies to the
-    // verdict that covers them all.
+    // cluster to line up with it by index. Reading `clusters[i]` against
+    // `decisions[i]` would pair the suite decision with an arbitrary cluster;
+    // the suite case aggregates instead: if *any* cluster in the run reproduced
+    // on rerun or has spent its amnesty, that applies to the verdict that covers
+    // them all.
     const clusters = evidence.clusters || [];
     const suiteFacts = evidence.suite_verdict ? {
         amnestyExhausted: clusters.some((c) => c && c.amnesty_exhausted),
@@ -331,7 +364,6 @@ async function main() {
         // Overlap is asserted by the caller from the diff, not inferred by the
         // model about its own verdict.
         diffOverlapsFailure: arg('diff-overlaps', 'false') === 'true',
-
         // Set by the rerun stage. A cluster that failed every repetition is
         // deterministic, and no model verdict may waive it.
         reproducedOnRerun: suiteFacts ?
@@ -341,7 +373,7 @@ async function main() {
     // The run's shape decides what "no decisions" means. A passing suite has
     // nothing to triage and must go green; a suite that produced no reports at
     // all must go red. Both look like an empty decision list from here.
-    const runDecision = decideRun(decisions, {
+    let runDecision = decideRun(decisions, {
         failureCount: evidence.summary ? evidence.summary.failed : null,
         reportsFound: evidence.summary ? evidence.summary.reportsFound : null,
     });
@@ -363,27 +395,114 @@ async function main() {
         console.error(`blame resolution failed (continuing): ${err.message}`);
     }
 
-    // 1. Own status, always posted.
-    await gh(token, 'POST', `/repos/${repo}/statuses/${commitSha}`, {
-        state: runDecision.state,
-        context: STATUS_CONTEXT,
-        description: statusDescription(runDecision),
-        target_url: runUrl,
-    });
-
-    // 2. Label, only when policy actually waived (never in shadow mode).
+    // 1. Ledger. A successful flaky outcome must be recorded before the check is
+    //    allowed to go green, and a ledger failure turns the whole run into
+    //    TRIAGE_FAILED. This is no longer best-effort: the ledger write is the
+    //    authority for the green, so a missing credential or a failed POST costs
+    //    the gate, not just a metric.
     //
-    // The removal branch matters as much as the application one. The label is
-    // sticky across pushes and the status reporter honours it unconditionally, so
-    // a waiver granted for one commit would keep greening every later commit —
-    // including one that introduces a genuine regression. Any run that does not
-    // waive must clear it.
+    //    Ledger rows are mapped to clusters by signature, not by index. The old
+    //    code read `clusterByIndex[i]`, which was never defined — so every row
+    //    threw on the member_test_ids lookup and the catch swallowed it as a log
+    //    line, meaning no verdict ever reached TSIO and the false-green metric
+    //    was permanently blind. A suite verdict has no cluster to map to, so its
+    //    external_test_id stays null (TSIO accepts a signature in its place).
+    if (verdicts.length > 0) {
+        const clusterBySignature = new Map(
+            (evidence.clusters || [])
+                .filter((c) => c && c.signature_hash)
+                .map((c) => [c.signature_hash, c]),
+        );
+        let ledgerToken = null;
+        let credentialReady = false;
+        if (tsioApiKey) {
+            credentialReady = true;
+        } else {
+            try {
+                ledgerToken = await mintOidcToken(arg('tsio-audience', 'mattermost-test-system-io'));
+                credentialReady = Boolean(ledgerToken);
+            } catch (err) {
+                runDecision = markTriageFailed(runDecision, `OIDC mint failed — ${err.message}`);
+                console.error(runDecision.reason);
+            }
+        }
+        if (credentialReady) {
+            try {
+                const result = await recordLedger({
+                    tsioUrl,
+                    token: ledgerToken,
+                    apiKey: tsioApiKey,
+                    batch: {
+                        repository: repo,
+                        branch: arg('branch', ''),
+                        commit_sha: commitSha,
+                        gh_run_id: arg('run-id', ''),
+                        gh_pr_number: prNumber,
+                        model: model || null,
+                        tier: evidence.tier,
+                        verdicts: verdicts.map((v, i) => {
+                            const d = decisions[i];
+                            const cluster = clusterBySignature.get(v.cluster_signature);
+                            const testIds = cluster && cluster.member_test_ids;
+                            return {
+                                external_test_id: (testIds && testIds[0]) || null,
+                                cluster_signature: v.cluster_signature,
+                                member_count: v.member_count,
+                                verdict: d.verdict,
+                                operational_outcome: d.operational_outcome,
+                                confidence: d.confidence,
+                                root_cause: d.reason,
+                                evidence: v.evidence,
+                                check_state: d.state,
+                                waived: d.waived,
+                            };
+                        }),
+                    },
+                });
+                console.log(`recorded ${result.count} verdict(s) in the triage ledger`);
+            } catch (err) {
+                runDecision = markTriageFailed(runDecision, `ledger recording failed — ${err.message}`);
+                console.error(runDecision.reason);
+            }
+        } else if (runDecision.state !== 'failure') {
+            // No credential and no token, and the mint did not already fail
+            // (which would have set TRIAGE_FAILED above). A green run with no way
+            // to record it cannot be allowed to stand.
+            runDecision = markTriageFailed(runDecision, 'no TSIO credential available to record the verdict');
+            console.error(runDecision.reason);
+        }
+    }
+
+    // 2. Label, only when policy actually waived (never in shadow mode, never on
+    //    a baseline branch). The PR head is verified before and after: the label
+    //    is sticky across pushes and the status reporter honours it
+    //    unconditionally, so a waiver granted for one commit would keep greening
+    //    every later commit — including one that introduces a genuine regression.
+    //    Any run that does not waive must clear it.
     if (prNumber) {
         try {
             if (runDecision.waived) {
-                await gh(token, 'POST', `/repos/${repo}/issues/${prNumber}/labels`, {
-                    labels: [AI_WAIVED_LABEL],
-                });
+                const headBefore = await prHeadSha(token, repo, prNumber);
+                if (headBefore !== commitSha) {
+                    runDecision = markTriageFailed(runDecision,
+                        `PR head moved to ${headBefore.slice(0, 7)} before the waiver could be applied`);
+                    console.error(runDecision.reason);
+                } else {
+                    await gh(token, 'POST', `/repos/${repo}/issues/${prNumber}/labels`, {
+                        labels: [AI_WAIVED_LABEL],
+                    });
+                    // Re-verify immediately: a push between the two GETs would
+                    // leave the label applied to a PR whose head was never
+                    // triaged. Withdraw it and fail closed.
+                    const headAfter = await prHeadSha(token, repo, prNumber);
+                    if (headAfter !== commitSha) {
+                        await gh(token, 'DELETE',
+                            `/repos/${repo}/issues/${prNumber}/labels/${encodeURIComponent(AI_WAIVED_LABEL)}`);
+                        runDecision = markTriageFailed(runDecision,
+                            `PR head moved to ${headAfter.slice(0, 7)} immediately after the waiver was applied`);
+                        console.error(runDecision.reason);
+                    }
+                }
             } else {
                 await gh(token, 'DELETE',
                     `/repos/${repo}/issues/${prNumber}/labels/${encodeURIComponent(AI_WAIVED_LABEL)}`);
@@ -392,14 +511,23 @@ async function main() {
         } catch (err) {
             // Applying can fail (contexts stay red — the safe direction). Removing
             // can 404 when the label was not set, which is the common case and not
-            // an error worth surfacing.
+            // an error worth surfacing. A failed apply on a waived run must not
+            // leave a green check with no label, so downgrade.
             if (runDecision.waived || !/→ 404/.test(err.message)) {
                 console.error(`could not update ${AI_WAIVED_LABEL}: ${err.message}`);
+                if (runDecision.waived) {
+                    runDecision = markTriageFailed(runDecision,
+                        `could not apply ${AI_WAIVED_LABEL} — ${err.message}`);
+                }
             }
         }
     }
 
-    // 3. PR comment, updated in place rather than appended.
+    // 3. Own status, always posted, reflecting the final outcome (which the
+    //    ledger and head verification may have turned red).
+    await postStatus(runDecision.state, statusDescription(runDecision));
+
+    // 4. PR comment, updated in place rather than appended.
     //
     // A clean run posts nothing — a comment on every passing PR is noise and the
     // commit status already carries the result — but it does clear a stale one
@@ -434,76 +562,43 @@ async function main() {
         }
     }
 
-    // 4. Ledger. Best-effort: a missing ledger row costs a metric, not a gate.
-    let ledgerToken = null;
-    if (!tsioApiKey) {
-        try {
-            ledgerToken = await mintOidcToken(arg('tsio-audience', 'mattermost-test-system-io'));
-        } catch (err) {
-            console.error(`OIDC mint failed (skipping ledger): ${err.message}`);
-        }
-    }
-    if (tsioApiKey || ledgerToken) {
-        try {
-            const result = await recordLedger({
-                tsioUrl,
-                token: ledgerToken,
-                apiKey: tsioApiKey,
-                batch: {
-                    repository: repo,
-                    branch: arg('branch', ''),
-                    commit_sha: commitSha,
-                    gh_run_id: arg('run-id', ''),
-                    gh_pr_number: prNumber,
-                    model: model || null,
-                    tier: evidence.tier,
-                    verdicts: verdicts.map((v, i) => ({
-                        external_test_id: (clusterByIndex[i] && clusterByIndex[i].member_test_ids &&
-                            clusterByIndex[i].member_test_ids[0]) || null,
-                        cluster_signature: v.cluster_signature,
-                        member_count: v.member_count,
-                        verdict: decisions[i].verdict,
-                        confidence: decisions[i].confidence,
-                        root_cause: decisions[i].reason,
-                        evidence: v.evidence,
-                        check_state: decisions[i].state,
-                        waived: decisions[i].waived,
-                    })),
-                },
-            });
-            console.log(`recorded ${result.count} verdict(s) in the triage ledger`);
-        } catch (err) {
-            console.error(`ledger write failed (continuing): ${err.message}`);
-        }
-    } else {
-        console.log('no TSIO credential (no API key, no OIDC) — skipping ledger write');
-    }
+    writeOutputs({state: runDecision.state, waived: runDecision.waived,
+        verdict: runDecision.verdict, operational_outcome: runDecision.operational_outcome,
+        description: statusDescription(runDecision), triage_url: runUrl, blame});
+}
 
-    if (process.env.GITHUB_OUTPUT) {
-        // Every value is flattened to one line. In this file a newline is not
-        // cosmetic: GITHUB_OUTPUT is parsed as `key=value` per line and the last
-        // assignment for a key wins, so a value carrying "\nstate=success" would
-        // overwrite the run's own state. Two of these are outside our control —
-        // the description is built from the model's root_cause, and the suspect
-        // author comes from git — which is exactly why the sanitising happens
-        // here, at the boundary, rather than being assumed upstream.
-        // eslint-disable-next-line no-control-regex -- stripping control characters is the point
-        const line = (v) => String(v ?? '').
-            replace(/[\u0000-\u001F\u007F]+/g, ' ').
-            trim();
-        fs.appendFileSync(process.env.GITHUB_OUTPUT, [
-            `state=${line(runDecision.state)}`,
-            `waived=${line(runDecision.waived)}`,
-            `verdict=${line(runDecision.verdict || 'INCONCLUSIVE')}`,
-            `description=${line(statusDescription(runDecision))}`,
-            `blame_confident=${Boolean(blame && blame.some((b) => b.attribution.confident))}`,
-            `blame_suspects=${line((blame || [])
-                .filter((b) => b.attribution.confident)
-                .map((b) => `${b.attribution.suspect.sha.slice(0, 7)}:${b.attribution.suspect.author || 'unknown'}`)
-                .join(','))}`,
-            '',
-        ].join('\n'));
+/**
+ * Write the workflow outputs. Every value is flattened to one line — in this
+ * file a newline is not cosmetic: GITHUB_OUTPUT is parsed as `key=value` per
+ * line and the last assignment for a key wins, so a value carrying
+ * "\nstate=success" would overwrite the run's own state. Two of these are
+ * outside our control — the description is built from the model's root_cause,
+ * and the suspect author comes from git — which is exactly why the sanitising
+ * happens here, at the boundary, rather than being assumed upstream.
+ */
+function writeOutputs({state, waived, verdict, operational_outcome, description, triage_url, blame}) {
+    if (!process.env.GITHUB_OUTPUT) {
+        return;
     }
+    // eslint-disable-next-line no-control-regex -- stripping control characters is the point
+    const line = (v) => String(v ?? '').
+        replace(/[\u0000-\u001F\u007F]+/g, ' ').
+        trim();
+    const confidentSuspects = (blame || [])
+        .filter((b) => b.attribution.confident)
+        .map((b) => `${b.attribution.suspect.sha.slice(0, 7)}:${b.attribution.suspect.author || 'unknown'}`)
+        .join(',');
+    fs.appendFileSync(process.env.GITHUB_OUTPUT, [
+        `state=${line(state)}`,
+        `waived=${line(waived)}`,
+        `verdict=${line(verdict || 'INCONCLUSIVE')}`,
+        `operational_outcome=${line(operational_outcome || '')}`,
+        `description=${line(description)}`,
+        `triage_url=${line(triage_url)}`,
+        `blame_confident=${Boolean(blame && blame.some((b) => b.attribution.confident))}`,
+        `blame_suspects=${line(confidentSuspects)}`,
+        '',
+    ].join('\n'));
 }
 
 if (require.main === module) {
@@ -514,7 +609,7 @@ if (require.main === module) {
             await gh(process.env.GH_TOKEN || process.env.GITHUB_TOKEN, 'POST',
                 `/repos/${arg('repo')}/statuses/${arg('commit')}`, {
                     state: 'failure',
-                    context: STATUS_CONTEXT,
+                    context: arg('status-context', DEFAULT_STATUS_CONTEXT),
                     description: 'triage errored — manual triage required',
                     target_url: arg('run-url', ''),
                 });
@@ -525,4 +620,12 @@ if (require.main === module) {
     });
 }
 
-module.exports = {assembleVerdicts, renderComment, resolveBlame, mintOidcToken, AI_WAIVED_LABEL, STATUS_CONTEXT};
+module.exports = {
+    assembleVerdicts,
+    renderComment,
+    resolveBlame,
+    mintOidcToken,
+    markTriageFailed,
+    AI_WAIVED_LABEL,
+    DEFAULT_STATUS_CONTEXT,
+};

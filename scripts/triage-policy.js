@@ -11,11 +11,28 @@
  * must be reviewable, diffable, and unit-tested. A model is never allowed to
  * decide its own authority.
  *
+ * Two layers keep the concerns separate:
+ *
+ *  - the **stored verdict** — what was concluded about the failure
+ *    (PR_REGRESSION, FLAKY_INFRA, …, INCONCLUSIVE). This is the record TSIO
+ *    keeps and the accuracy metrics grade. Its enum is stable and never renamed
+ *    by policy.
+ *  - the **operational outcome** — what the check does about it. Exactly three
+ *    values, each mapping to a check state and a user-facing headline:
+ *
+ *      FLAKY_CONFIRMED → success  — confirmed flaky failures
+ *      REGRESSION      → failure  — genuine test or product failure
+ *      TRIAGE_FAILED   → failure  — triage could not complete safely
+ *
+ * The outcome is the headline a human reads. The confidence bar and tier are
+ * policy internals and never appear as the lead.
+ *
  * Two rules do most of the work:
  *
  *  1. Fail closed. Anything unexpected — missing verdict, unparseable model
- *     output, unknown verdict class, confidence below bar, triage itself
- *     erroring — resolves to red. There is no path where "we don't know"
+ *     output, unknown verdict class, confidence below bar, missing or
+ *     incomplete citation, an unknown run type, triage itself erroring —
+ *     resolves to TRIAGE_FAILED. There is no path where "we don't know"
  *     produces green.
  *
  *  2. Asymmetric bars. A verdict that produces green needs materially more
@@ -36,6 +53,30 @@ const VERDICTS = new Set([
     'TEST_DEBT',
     'INCONCLUSIVE',
 ]);
+
+const OUTCOMES = {
+    FLAKY_CONFIRMED: 'FLAKY_CONFIRMED',
+    REGRESSION: 'REGRESSION',
+    TRIAGE_FAILED: 'TRIAGE_FAILED',
+};
+
+// The headline is the user-facing language. The verdict and confidence never
+// lead the status — a reader needs the outcome, not the model's self-grading.
+const OUTCOME_HEADLINES = {
+    [OUTCOMES.FLAKY_CONFIRMED]: 'confirmed flaky failures',
+    [OUTCOMES.REGRESSION]: 'genuine test or product failure',
+    [OUTCOMES.TRIAGE_FAILED]: 'triage could not complete safely',
+};
+
+// Run types that represent a protected branch rather than a PR. Confirmed flakes
+// succeed here too — recorded in the ledger, but no PR label, because there is no
+// PR. Regressions and triage failures fail. MAIN_REGRESSION on a baseline branch
+// is itself a regression and must fail.
+const BASELINE_RUN_TYPES = new Set(['MAIN', 'MASTER', 'RELEASE', 'CMT']);
+const KNOWN_RUN_TYPES = new Set(['PR', ...BASELINE_RUN_TYPES]);
+
+// Verdicts whose meaning is "a genuine failure" — never waivable, always red.
+const REGRESSION_VERDICTS = new Set(['PR_REGRESSION', 'BUILD_OR_ENV_ERROR', 'TEST_DEBT']);
 
 // Verdicts whose meaning is "this failure is not attributable to the change".
 const WAIVABLE = new Set(['FLAKY_TEST', 'FLAKY_INFRA', 'FLAKY_SERVER', 'MAIN_REGRESSION']);
@@ -66,6 +107,13 @@ function decideCluster(verdictRecord, context = {}) {
     const rawConfidence = verdictRecord && verdictRecord.confidence;
     const confidence = typeof rawConfidence === 'number' ? rawConfidence : NaN;
 
+    // An unknown run type cannot be acted on safely. The policy for PR and for
+    // each baseline branch differs, so a run type policy does not recognise is
+    // not a missing default, it is a request to do something undefined.
+    if (!KNOWN_RUN_TYPES.has(runType)) {
+        return triageFailed(confidence, `unknown run type "${runType}"`);
+    }
+
     // Range, not just finiteness. Number.isFinite rejects NaN and Infinity but
     // happily admits 5, which clears the 0.85 green bar and waives — a model
     // that emits a confidence on a 0-100 scale, or a corrupted record copied
@@ -73,119 +121,160 @@ function decideCluster(verdictRecord, context = {}) {
     // defined as a probability, so anything outside [0,1] is not a low-confidence
     // answer, it is an unusable one.
     if (!VERDICTS.has(verdict) || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
-        return red('INCONCLUSIVE', 0, 'triage produced no usable verdict');
+        return triageFailed(confidence, 'triage produced no usable verdict');
     }
 
-    const wantsGreen = WAIVABLE.has(verdict);
-    const bar = wantsGreen ? GREEN_CONFIDENCE_BAR : RED_CONFIDENCE_BAR;
+    const isBaseline = BASELINE_RUN_TYPES.has(runType);
 
-    // The two-citation rule is enforced here, not only in parseModelOutput.
-    // Living in the parser it applied only to verdicts the model produced, so a
-    // rule-decided cluster (needs_ai: false) and a suite verdict could waive on a
-    // single citation — the invariant read as absolute but was model-only.
-    // Citations must also be distinct: two copies of the same reference are one
-    // observation written twice, and corroboration is the whole point.
-    if (wantsGreen) {
-        const cites = Array.isArray(verdictRecord.evidence) ? verdictRecord.evidence : [];
-        const distinct = new Set(cites.map((c) => JSON.stringify(c)));
-        if (distinct.size < 2) {
-            return red(
-                'INCONCLUSIVE',
-                confidence,
-                `${verdict} cites ${distinct.size} independent item(s) — a waiver needs 2`,
-            );
+    // MAIN_REGRESSION is special: it excuses an unrelated PR, but on a baseline
+    // branch it IS the regression and must fail. Overlap with the PR diff makes
+    // attribution ambiguous, and ambiguity is triage failure, not a waiver.
+    if (verdict === 'MAIN_REGRESSION') {
+        if (isBaseline) {
+            if (confidence < RED_CONFIDENCE_BAR) {
+                return triageFailed(confidence,
+                    `MAIN_REGRESSION at ${confidence} is below the red bar of ${RED_CONFIDENCE_BAR}`);
+            }
+            return regression(verdict, confidence,
+                verdictRecord.root_cause || 'already failing on the baseline branch');
         }
+        if (diffOverlapsFailure) {
+            return triageFailed(confidence,
+                'pre-existing on main, but this PR touches the same area — cannot attribute cleanly');
+        }
+        // PR, unrelated: a MAIN_REGRESSION excuses the PR. It still has to clear
+        // the waiver bar — a low-confidence "it's main's fault" is not authority
+        // to waive — but flake amnesty does not apply to a baseline break.
+        return waiveOrConfirm(verdictRecord, confidence, {isBaseline, isFlake: false, mode,
+            amnestyExhausted, reproducedOnRerun});
     }
 
-    if (confidence < bar) {
-        return red(
-            'INCONCLUSIVE',
-            confidence,
-            `${verdict} at ${confidence} is below the ${wantsGreen ? 'green' : 'red'} bar of ${bar}`,
-        );
+    if (WAIVABLE.has(verdict)) {
+        return waiveOrConfirm(verdictRecord, confidence, {isBaseline, isFlake: true, mode,
+            amnestyExhausted, reproducedOnRerun});
     }
 
-    if (!wantsGreen) {
-        return red(verdict, confidence, verdictRecord.root_cause || verdict);
+    // Genuine-failure verdicts. Below the red bar the conclusion is too weak to
+    // act on, which is triage failure, not a silent green.
+    if (REGRESSION_VERDICTS.has(verdict)) {
+        if (confidence < RED_CONFIDENCE_BAR) {
+            return triageFailed(confidence,
+                `${verdict} at ${confidence} is below the red bar of ${RED_CONFIDENCE_BAR}`);
+        }
+        return regression(verdict, confidence, verdictRecord.root_cause || verdict);
+    }
+
+    // INCONCLUSIVE and anything else: the honest outcome is that triage could
+    // not complete safely, and that is red.
+    return triageFailed(confidence,
+        (verdictRecord && verdictRecord.root_cause) || 'triage could not complete safely');
+}
+
+/**
+ * The waivable path: FLAKY_TEST / FLAKY_INFRA / FLAKY_SERVER (and a
+ * MAIN_REGRESSION excusing an unrelated PR) become FLAKY_CONFIRMED only when
+ * every condition holds. Failing any one is triage failure; failing the
+ * "deterministic" or "out of budget" checks is a regression, because those make
+ * the failure genuine rather than flaky.
+ */
+function waiveOrConfirm(verdictRecord, confidence, opts) {
+    const {isBaseline, isFlake, mode, amnestyExhausted, reproducedOnRerun} = opts;
+    const verdict = verdictRecord.verdict;
+
+    if (confidence < GREEN_CONFIDENCE_BAR) {
+        return triageFailed(confidence,
+            `${verdict} at ${confidence} is below the green bar of ${GREEN_CONFIDENCE_BAR}`);
+    }
+
+    // Citations must be distinct: two copies of the same reference are one
+    // observation written twice, and corroboration is the whole point. This is
+    // enforced here, not only in parseModelOutput, so a rule-decided cluster and
+    // a suite verdict are checked too — the invariant reads as absolute, not
+    // model-only.
+    const cites = Array.isArray(verdictRecord.evidence) ? verdictRecord.evidence : [];
+    const distinct = new Set(cites.map((c) => JSON.stringify(c)));
+    if (distinct.size < 2) {
+        return triageFailed(confidence,
+            `${verdict} cites ${distinct.size} independent item(s) — a waiver needs 2`);
+    }
+
+    // Complete evidence: every citation is an object that says what kind of
+    // evidence it is. A citation without a kind is a blank reference — present
+    // in count but not in substance — and "missing citation" is triage failure.
+    if (!cites.every((c) => c && typeof c === 'object' && !Array.isArray(c) && c.kind)) {
+        return triageFailed(confidence,
+            `${verdict} evidence is incomplete — every citation needs a kind`);
     }
 
     // The measurement overrules the inference. A failure that reproduced on every
     // rerun repetition is deterministic by definition, so no amount of model
-    // confidence about the error text makes it flakiness. This is the strongest
-    // single guard against a false green, because it is evidence rather than
-    // interpretation.
+    // confidence about the error text makes it flakiness. It is a genuine
+    // failure, not a triage failure: the strongest single guard against a false
+    // green, because it is evidence rather than interpretation.
     if (reproducedOnRerun) {
-        return red(
-            verdict,
-            confidence,
-            `${verdict} rejected — reproduced on every rerun, so it is deterministic`,
-        );
+        return regression(verdict, confidence,
+            `${verdict} rejected — reproduced on every rerun, so it is deterministic`);
     }
 
-    // Main and release health must reflect reality. Auto-greening a flake on the
-    // baseline branch would hide exactly the signal the baseline exists to give,
-    // and it is also the branch every PR's baseline comparison is drawn from.
-    if (runType !== 'PR') {
-        return red(
-            verdict,
-            confidence,
-            `${verdict} on ${runType} stays red — baseline health must reflect reality`,
-        );
-    }
-
-    // A test out of waiver budget is no longer noise, it is unmaintained.
-    if (amnestyExhausted) {
-        return red(
-            verdict,
-            confidence,
-            'flake amnesty exhausted — fix or quarantine explicitly',
-        );
-    }
-
-    // A main regression only excuses *this* PR if the PR is not touching the same
-    // area. Overlap means attribution is genuinely ambiguous, and ambiguity is red.
-    if (verdict === 'MAIN_REGRESSION' && diffOverlapsFailure) {
-        return red(
-            'INCONCLUSIVE',
-            confidence,
-            'pre-existing on main, but this PR touches the same area — cannot attribute cleanly',
-        );
+    // A flaky test out of waiver budget is no longer noise, it is unmaintained —
+    // a genuine problem that must be fixed or quarantined, not waived. Amnesty is
+    // a flake concept; a MAIN_REGRESSION has no flake budget to exhaust.
+    if (isFlake && amnestyExhausted) {
+        return regression(verdict, confidence,
+            'flake amnesty exhausted — fix or quarantine explicitly');
     }
 
     // Shadow mode observes without acting: it posts its own context but never
-    // waives, so accuracy can be measured before any authority is granted.
+    // waives, so accuracy can be measured before any authority is granted. The
+    // outcome it *would* produce is recorded, but the check stays red.
     if (mode === 'shadow') {
         return {
             state: 'failure',
             verdict,
             confidence,
+            operational_outcome: OUTCOMES.FLAKY_CONFIRMED,
             waived: false,
             shadow: true,
             reason: `${verdict} — would waive, but triage is in shadow mode`,
         };
     }
 
+    // All conditions met: a confirmed flake. On a PR the waiver is applied
+    // (waived: true → E2E/AI-Waived label). On a baseline branch the outcome is
+    // recorded as success but no label is applied, because there is no PR to
+    // label — the ledger record is the durable part.
     return {
         state: 'success',
         verdict,
         confidence,
-        waived: true,
+        operational_outcome: OUTCOMES.FLAKY_CONFIRMED,
+        waived: !isBaseline,
         shadow: false,
         reason: verdictRecord.root_cause || verdict,
     };
 }
 
-function red(verdict, confidence, reason) {
-    return {state: 'failure', verdict, confidence, waived: false, shadow: false, reason};
+function regression(verdict, confidence, reason) {
+    return {state: 'failure', verdict, confidence,
+        operational_outcome: OUTCOMES.REGRESSION, waived: false, shadow: false, reason};
+}
+
+// A rejected verdict is stored as INCONCLUSIVE — no usable conclusion was
+// reached — while the operational outcome TRIAGE_FAILED is what the check
+// reports. Keeping the stored enum stable means TSIO records and the accuracy
+// query keep working; the outcome is the new surface.
+function triageFailed(confidence, reason) {
+    return {state: 'failure', verdict: 'INCONCLUSIVE', confidence,
+        operational_outcome: OUTCOMES.TRIAGE_FAILED, waived: false, shadow: false, reason};
 }
 
 /**
  * Roll per-cluster decisions into the run's outcome.
  *
- * A run is only waivable if *every* cluster is. One unexplained cluster among
- * nine waived ones is still an unexplained failure, and greening the run because
- * the majority was flaky is precisely the failure mode that would make this
- * system untrustworthy.
+ * A run is only green if *every* cluster is a confirmed flake. One regression or
+ * triage-failed cluster among nine confirmed ones is still a failure, and
+ * greening the run because the majority was flaky is precisely the failure mode
+ * that would make this system untrustworthy.
  *
  * `context` carries the run's shape, which is what separates the three very
  * different reasons there might be no decisions:
@@ -211,89 +300,103 @@ function decideRun(decisions, context = {}) {
     // in existence. "No reports" cannot be a waiver at any confidence, because
     // there is nothing to be confident about.
     if (reportsFound === 0) {
-        return {
-            state: 'failure',
-            waived: false,
-            reason: 'no usable test results were produced — nothing could be triaged',
-            green_clusters: 0,
-            red_clusters: decisions.length,
-        };
+        return runFailure(OUTCOMES.TRIAGE_FAILED,
+            'no usable test results were produced — nothing could be triaged',
+            {green_clusters: 0, red_clusters: decisions.length});
     }
 
     if (decisions.length === 0) {
-        if (reportsFound === 0) {
-            return {
-                state: 'failure',
-                waived: false,
-                reason: 'no usable test results were produced — nothing could be triaged',
-                green_clusters: 0,
-                red_clusters: 0,
-            };
-        }
         if (failureCount === 0) {
+            // A clean pass has no outcome — there was nothing to triage. The
+            // description carries that; no verdict or headline is invented.
             return {
                 state: 'success',
+                operational_outcome: '',
+                verdict: undefined,
+                confidence: undefined,
                 waived: false,
                 reason: 'no failures to triage',
                 green_clusters: 0,
                 red_clusters: 0,
             };
         }
-        return {
-            state: 'failure',
-            waived: false,
-            reason: failureCount === null ?
+        return runFailure(OUTCOMES.TRIAGE_FAILED,
+            failureCount === null ?
                 'triage produced no decisions' :
                 `triage produced no decisions for ${failureCount} failure(s)`,
-            green_clusters: 0,
-            red_clusters: 0,
-        };
+            {green_clusters: 0, red_clusters: 0});
     }
+
+    // One regression or triage-failed cluster fails the complete run. Regression
+    // outranks triage-failed in the headline: a genuine failure is a stronger
+    // statement than "we could not tell", and it is the one a reader must act on.
+    const hasRegression = decisions.some((d) => d.operational_outcome === OUTCOMES.REGRESSION);
+    const hasTriageFailed = decisions.some((d) => d.operational_outcome === OUTCOMES.TRIAGE_FAILED);
+    const outcome = hasRegression ? OUTCOMES.REGRESSION :
+        hasTriageFailed ? OUTCOMES.TRIAGE_FAILED : OUTCOMES.FLAKY_CONFIRMED;
 
     const reds = decisions.filter((d) => d.state !== 'success');
     if (reds.length > 0) {
         const worst = reds.sort((a, b) => b.confidence - a.confidence)[0];
         return {
             state: 'failure',
+            operational_outcome: outcome,
+            verdict: worst.verdict,
+            confidence: worst.confidence,
             waived: false,
             reason: reds.length === 1 ?
                 worst.reason :
                 `${reds.length} unwaived cluster(s); most confident: ${worst.reason}`,
-            verdict: worst.verdict,
-            confidence: worst.confidence,
             green_clusters: decisions.length - reds.length,
             red_clusters: reds.length,
         };
     }
 
     const lowest = decisions.reduce((a, b) => (a.confidence <= b.confidence ? a : b));
+    // waived is true only when every cluster was waived (PR, label applied). A
+    // baseline success has confirmed flakes but waived=false on each cluster, so
+    // the run is green without a label — exactly the baseline contract.
     return {
         state: 'success',
-        waived: true,
+        operational_outcome: outcome,
+        verdict: lowest.verdict,
+        confidence: lowest.confidence,
+        waived: decisions.every((d) => d.waived),
         reason: decisions.length === 1 ?
             lowest.reason :
             `${decisions.length} clusters all waived; weakest: ${lowest.reason}`,
-        verdict: lowest.verdict,
-        confidence: lowest.confidence,
         green_clusters: decisions.length,
         red_clusters: 0,
     };
 }
 
+function runFailure(outcome, reason, extra) {
+    return {
+        state: 'failure',
+        operational_outcome: outcome,
+        verdict: undefined,
+        confidence: undefined,
+        waived: false,
+        reason,
+        ...extra,
+    };
+}
+
 /**
  * Build the commit-status description. GitHub truncates at 140 characters, so
- * the verdict and confidence go first — they are what a reader needs when the
- * text is cut.
+ * the operational outcome's headline goes first — it is what a reader needs when
+ * the text is cut. The confidence bar and tier are policy internals and never
+ * lead; a clean pass has no headline, just its reason.
  */
 function statusDescription(runDecision) {
-    if (!runDecision.verdict) {
-        // No verdict at all: on a passing run the reason ("no failures to
-        // triage") is the whole message, and prefixing it with "inconclusive"
-        // would read as a problem where there is none.
+    const headline = OUTCOME_HEADLINES[runDecision.operational_outcome];
+    if (!headline) {
+        // No outcome: on a passing run the reason ("no failures to triage") is the
+        // whole message, and prefixing it with a failure headline would read as a
+        // problem where there is none.
         return singleLine(runDecision.reason || 'triage did not complete').slice(0, 140);
     }
-    const prefix = `${runDecision.verdict.toLowerCase().replace(/_/g, '-')} (${runDecision.confidence ?? '?'})`;
-    return singleLine(`${prefix}: ${runDecision.reason}`).slice(0, 140);
+    return singleLine(`${headline}: ${runDecision.reason}`).slice(0, 140);
 }
 
 /**
@@ -319,7 +422,8 @@ function singleLine(text) {
  *
  * Anything that is not exactly the expected shape becomes INCONCLUSIVE rather
  * than a best-effort interpretation: guessing at a malformed verdict is how a
- * garbled response turns into an unearned green.
+ * garbled response turns into an unearned green. INCONCLUSIVE then resolves to
+ * TRIAGE_FAILED in decideCluster, so a garbled response cannot green a run.
  */
 function parseModelOutput(raw) {
     let doc;
@@ -371,6 +475,11 @@ module.exports = {
     GREEN_CONFIDENCE_BAR,
     RED_CONFIDENCE_BAR,
     VERDICTS,
+    OUTCOMES,
+    OUTCOME_HEADLINES,
+    BASELINE_RUN_TYPES,
+    KNOWN_RUN_TYPES,
+    REGRESSION_VERDICTS,
     WAIVABLE,
     decideCluster,
     decideRun,

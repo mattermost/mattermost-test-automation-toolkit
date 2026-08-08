@@ -24,8 +24,12 @@
  * a data point permanently lost.
  */
 
+// AI waivers and human overrides must stay distinguishable: the false-green
+// metric counts AI waivers that a human later reclassifies, so a human
+// correction can never wear the AI label. The status reporter honours both.
 const AI_WAIVED_LABEL = 'E2E/AI-Waived';
-const STATUS_CONTEXT = 'e2e-test/ai-triage';
+const HUMAN_OVERRIDE_LABEL = 'E2E/Override';
+const DEFAULT_STATUS_CONTEXT = 'e2e-test/ai-triage';
 
 const VERDICTS = new Set([
     'PR_REGRESSION',
@@ -235,6 +239,7 @@ async function main() {
     const actor = arg('actor');
     const commentId = arg('comment-id');
     const tsioUrl = arg('tsio-url', 'https://test-io.test.mattermost.com');
+    const statusContext = arg('status-context', DEFAULT_STATUS_CONTEXT);
     const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
     const body = process.env.COMMENT_BODY || '';
 
@@ -289,20 +294,26 @@ async function main() {
         console.error(ledgerNote);
     }
 
-    // 2. Bring the checks into line with the human's decision.
+    // 2. Bring the checks into line with the human's decision. A human waiver
+    //    wears the human label, never the AI one — conflating them makes the
+    //    false-green metric uncomputable. Withdrawing a waiver removes both, so a
+    //    correction to a real bug clears whichever label was carrying the green.
     await gh(token, 'POST', `/repos/${repo}/statuses/${headSha}`, {
         state: decision.state,
-        context: STATUS_CONTEXT,
+        context: statusContext,
         description: clampDescription(decision.description),
         target_url: arg('run-url', ''),
     });
 
     try {
         if (decision.applyLabel) {
-            await gh(token, 'POST', `/repos/${repo}/issues/${prNumber}/labels`, {labels: [AI_WAIVED_LABEL]});
+            await gh(token, 'POST', `/repos/${repo}/issues/${prNumber}/labels`,
+                {labels: [HUMAN_OVERRIDE_LABEL]});
         } else {
-            await gh(token, 'DELETE',
-                `/repos/${repo}/issues/${prNumber}/labels/${encodeURIComponent(AI_WAIVED_LABEL)}`);
+            for (const label of [AI_WAIVED_LABEL, HUMAN_OVERRIDE_LABEL]) {
+                await gh(token, 'DELETE',
+                    `/repos/${repo}/issues/${prNumber}/labels/${encodeURIComponent(label)}`);
+            }
         }
     } catch (err) {
         if (decision.applyLabel || !/→ 404/.test(err.message)) {
@@ -318,7 +329,7 @@ async function main() {
         body: [
             `:white_check_mark: **Triage override applied by @${actor}**`,
             '',
-            `\`${STATUS_CONTEXT}\` is now **${decision.state}** — \`${parsed.verdict}\`: ${parsed.reason}`,
+            `\`${statusContext}\` is now **${decision.state}** — \`${parsed.verdict}\`: ${parsed.reason}`,
             '',
             recordedCleanly ?
                 `_Correction recorded (${ledgerNote}). It counts toward the triage accuracy metrics._` :
@@ -345,5 +356,6 @@ module.exports = {
     VERDICTS,
     WAIVABLE,
     AI_WAIVED_LABEL,
-    STATUS_CONTEXT,
+    HUMAN_OVERRIDE_LABEL,
+    DEFAULT_STATUS_CONTEXT,
 };

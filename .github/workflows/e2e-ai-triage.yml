@@ -74,6 +74,11 @@ on:
         required: false
         type: string
         default: ""
+      status_context:
+        description: "Commit-status context for every status write"
+        required: false
+        type: string
+        default: "e2e-test/ai-triage"
       tsio_url:
         description: "Test System IO base URL for the verdict ledger"
         required: false
@@ -106,6 +111,28 @@ on:
       WEBHOOK_URL:
         description: "Optional Mattermost webhook for triage notifications"
         required: false
+    # Exposed to callers that pin this workflow with `uses:`. The apply step
+    # writes every one of these to GITHUB_OUTPUT; declaring them here lets the
+    # caller read `${{ needs.adjudicate.outputs.operational_outcome }}` etc.
+    outputs:
+      state:
+        description: "Final check state (success | failure)"
+        value: ${{ jobs.adjudicate.outputs.state }}
+      waived:
+        description: "Whether the E2E/AI-Waived label was applied"
+        value: ${{ jobs.adjudicate.outputs.waived }}
+      verdict:
+        description: "Stored verdict enum for the representative cluster"
+        value: ${{ jobs.adjudicate.outputs.verdict }}
+      operational_outcome:
+        description: "FLAKY_CONFIRMED | REGRESSION | TRIAGE_FAILED (empty for a clean pass)"
+        value: ${{ jobs.adjudicate.outputs.operational_outcome }}
+      description:
+        description: "Single-line commit-status description"
+        value: ${{ jobs.adjudicate.outputs.description }}
+      triage_url:
+        description: "URL of this triage workflow run"
+        value: ${{ jobs.adjudicate.outputs.triage_url }}
 
 permissions:
   contents: read
@@ -128,6 +155,13 @@ jobs:
       # hoisted to job env here and the steps branch on that.
       HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
       HAS_WEBHOOK: ${{ secrets.WEBHOOK_URL != '' }}
+    outputs:
+      state: ${{ steps.apply.outputs.state }}
+      waived: ${{ steps.apply.outputs.waived }}
+      verdict: ${{ steps.apply.outputs.verdict }}
+      operational_outcome: ${{ steps.apply.outputs.operational_outcome }}
+      description: ${{ steps.apply.outputs.description }}
+      triage_url: ${{ steps.apply.outputs.triage_url }}
     steps:
       # Check out THIS repository, not the caller's.
       #
@@ -334,6 +368,7 @@ jobs:
           RUN_TYPE: ${{ inputs.run_type }}
           MODE: ${{ inputs.mode }}
           TSIO_URL: ${{ inputs.tsio_url }}
+          STATUS_CONTEXT: ${{ inputs.status_context }}
           EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
           DIFF_OVERLAPS: ${{ inputs.diff_overlaps_failure }}
         run: |
@@ -358,6 +393,7 @@ jobs:
             --mode="${MODE}" \
             --model="${CLAUDE_MODEL}" \
             --tsio-url="${TSIO_URL}" \
+            --status-context="${STATUS_CONTEXT}" \
             --run-id="${EVIDENCE_RUN_ID}" \
             --run-url="${RUN_URL}" \
             --diff-overlaps="${DIFF_OVERLAPS}"
@@ -374,6 +410,7 @@ jobs:
           GATE_REASON: ${{ steps.gate.outputs.reason }}
           AI_OUTCOME: ${{ steps.ai.outcome }}
           APPLY_STATE: ${{ steps.apply.outputs.state }}
+          OPERATIONAL_OUTCOME: ${{ steps.apply.outputs.operational_outcome }}
           DESCRIPTION: ${{ steps.apply.outputs.description }}
         run: |
           {
@@ -383,6 +420,7 @@ jobs:
             echo "- gate: ${GATE_REASON}"
             echo "- model step: ${AI_OUTCOME:-skipped}"
             echo "- result: **${APPLY_STATE:-failure}** — ${DESCRIPTION:-triage did not complete}"
+            echo "- outcome: \`${OPERATIONAL_OUTCOME:-}\`"
             echo ""
             if [ -f triage-out/summary.md ]; then
               cat triage-out/summary.md
@@ -395,6 +433,7 @@ jobs:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           STATE: ${{ steps.apply.outputs.state }}
           VERDICT: ${{ steps.apply.outputs.verdict }}
+          OPERATIONAL_OUTCOME: ${{ steps.apply.outputs.operational_outcome }}
           DESCRIPTION: ${{ steps.apply.outputs.description }}
           BLAME_SUSPECTS: ${{ steps.apply.outputs.blame_suspects }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -415,8 +454,17 @@ jobs:
           # printf rather than an embedded newline in a double-quoted string:
           # YAML block scalars re-indent continuation lines, which would put
           # leading spaces inside the webhook payload.
+          # The headline is the operational outcome — the user-facing language —
+          # not the stored verdict or confidence bar.
+          OUTCOME="${OPERATIONAL_OUTCOME:-}"
+          case "${OUTCOME}" in
+            FLAKY_CONFIRMED) HEADLINE="confirmed flaky failures" ;;
+            REGRESSION) HEADLINE="genuine test or product failure" ;;
+            TRIAGE_FAILED) HEADLINE="triage could not complete safely" ;;
+            *) HEADLINE="triage complete" ;;
+          esac
           TEXT=$(printf '%s %s `%s`\n%s' \
-            "${ICON}" "${TAG}" "${VERDICT:-INCONCLUSIVE}" "${DESCRIPTION:-triage did not complete}")
+            "${ICON}" "${TAG}" "${HEADLINE}" "${DESCRIPTION:-triage did not complete}")
           # A main regression that nobody is told about is a verdict nobody acts
           # on. When the suspect range is a single commit the author is named
           # here, because the channel is where main-health is actually watched.

@@ -21,8 +21,27 @@ this workflow.
 These are what make an automated green trustworthy. Change them deliberately.
 
 **Fail closed.** No evidence bundle, unparseable model output, unknown verdict,
-confidence under the bar, API error, job timeout — all resolve red. There is no
-path where "we don't know" produces green.
+confidence under the bar, missing or incomplete citation, an unknown run type, an
+API error, a ledger failure, a job timeout — all resolve to `TRIAGE_FAILED`. There
+is no path where "we don't know" produces green.
+
+**Operational outcomes.** The stored verdict (what was concluded) and the
+operational outcome (what the check does) are separate. The outcome is the
+headline a human reads; the confidence bar and tier are policy internals and
+never lead. Exactly three:
+
+| Outcome | Check | Meaning |
+|---|---|---|
+| `FLAKY_CONFIRMED` | success | confirmed flaky failures |
+| `REGRESSION` | failure | genuine test or product failure |
+| `TRIAGE_FAILED` | failure | triage could not complete safely |
+
+`FLAKY_TEST`, `FLAKY_INFRA`, and `FLAKY_SERVER` become `FLAKY_CONFIRMED` only
+with confidence ≥ 0.85, at least two distinct evidence citations, complete
+evidence, not reproduced on every rerun, and amnesty not exhausted. A
+reproduced-on-rerun or amnesty-exhausted flake is a `REGRESSION`, not a flake.
+`MAIN_REGRESSION` excuses an unrelated PR only; on a baseline branch it is a
+`REGRESSION`.
 
 **Asymmetric bars.** A verdict that would waive a failure needs 0.85 confidence;
 one that keeps it red needs 0.7. The errors are not symmetric: a false red costs
@@ -36,16 +55,32 @@ citation is an assertion, not corroboration.
 deterministic, unit-tested policy engine in `scripts/triage-policy.js` decides
 what that means for the merge button. The model never calls the status API.
 
-**One unwaived cluster keeps the run red.** A run is green only when *every*
-cluster is waived. Greening because the majority was flaky is exactly the failure
-mode that would make the system untrustworthy.
+**One regression or triage-failed cluster keeps the run red.** A run is green
+only when *every* cluster is a confirmed flake. Greening because the majority was
+flaky is exactly the failure mode that would make the system untrustworthy.
 
-**Baseline branches never auto-waive.** On `MAIN` and `RELEASE` runs, a flake
-verdict is recorded but stays red. Baseline health has to reflect reality — it is
-also the comparison every PR's verdict is drawn from.
+**Baseline branches confirm flakes without a label.** On `MAIN`, `MASTER`,
+`RELEASE`, and `CMT` runs a confirmed flake succeeds — recorded in the ledger so
+baseline health stays measurable — but no PR label is applied, because there is no
+PR. Regressions and triage failures fail. (On `MAIN` and `RELEASE` the previous
+design reddened every flake; that hid exactly the signal the baseline exists to
+give.)
 
-**AI waivers are labelled separately.** `E2E/AI-Waived`, never the human
-`E2E/Override`. Conflating them makes the false-green metric uncomputable.
+**The ledger is the authority for a green.** A successful flaky outcome must be
+recorded in TSIO before the check can go green. A ledger failure — missing
+credential, failed POST, mint error — turns the whole run into `TRIAGE_FAILED`.
+The ledger rows are mapped to clusters by signature, not by index.
+
+**The PR head is verified before and after a waiver.** The `E2E/AI-Waived` label
+is sticky across pushes and the caller's status reporter honours it
+unconditionally, so a waiver is applied only when the PR head still matches the
+triaged commit, and withdrawn immediately if it moves — otherwise the label would
+green commits that were never triaged.
+
+**AI waivers are labelled separately.** AI waivers apply `E2E/AI-Waived`; a
+human `/e2e-triage-override` applies `E2E/Override`, never the AI label.
+Conflating them makes the false-green metric uncomputable. Both labels are
+withdrawn when a correction turns the check red.
 
 ## Modes
 
@@ -78,6 +113,7 @@ adjudicate:
     evidence_artifact: e2e-triage-evidence-${{ github.run_id }}
     evidence_run_id: ${{ github.run_id }}
     mode: ${{ vars.E2E_AI_TRIAGE_MODE || 'shadow' }}
+    status_context: e2e-test/ai-triage
     diff_overlaps_failure: ${{ needs.plan.outputs.diff_overlaps == 'true' }}
   secrets:
     GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -152,8 +188,9 @@ work). A reason is mandatory — the correction's value is as a labelled example
 and a bare verdict records that triage was wrong while discarding the only part
 that says how.
 
-Correcting to a waivable verdict greens the check and applies the waiver label;
-correcting to anything else reds it and **withdraws** the label. The withdrawal
+Correcting to a waivable verdict greens the check and applies the human
+`E2E/Override` label (never the AI `E2E/AI-Waived`); correcting to anything else
+reds it and **withdraws** both labels. The withdrawal
 matters: the label is sticky across pushes and the status reporter honours it
 unconditionally, so leaving it applied would keep greening later commits.
 

@@ -6,6 +6,7 @@ const {test} = require('node:test');
 
 const {
     GREEN_CONFIDENCE_BAR,
+    OUTCOMES,
     decideCluster,
     decideRun,
     parseModelOutput,
@@ -36,6 +37,39 @@ test('a non-numeric confidence resolves red', () => {
     assert.equal(decideCluster(verdict({confidence: 'very'}), assist).state, 'failure');
 });
 
+// ---------- operational outcomes ----------
+
+test('a confirmed flake is FLAKY_CONFIRMED and succeeds', () => {
+    const d = decideCluster(verdict(), assist);
+
+    assert.equal(d.state, 'success');
+    assert.equal(d.operational_outcome, OUTCOMES.FLAKY_CONFIRMED);
+    assert.equal(d.waived, true, 'PR waivers apply the label');
+});
+
+test('a genuine failure is REGRESSION', () => {
+    const d = decideCluster(verdict({verdict: 'PR_REGRESSION', confidence: 0.9}), assist);
+
+    assert.equal(d.state, 'failure');
+    assert.equal(d.operational_outcome, OUTCOMES.REGRESSION);
+    assert.equal(d.verdict, 'PR_REGRESSION', 'the stored verdict is preserved');
+});
+
+test('INCONCLUSIVE is TRIAGE_FAILED, not a silent red', () => {
+    const d = decideCluster(verdict({verdict: 'INCONCLUSIVE', confidence: 0.9}), assist);
+
+    assert.equal(d.state, 'failure');
+    assert.equal(d.operational_outcome, OUTCOMES.TRIAGE_FAILED);
+});
+
+test('an unknown run type is TRIAGE_FAILED', () => {
+    const d = decideCluster(verdict(), {mode: 'assist', runType: 'HOTFIX'});
+
+    assert.equal(d.state, 'failure');
+    assert.equal(d.operational_outcome, OUTCOMES.TRIAGE_FAILED);
+    assert.match(d.reason, /unknown run type/);
+});
+
 // ---------- asymmetric confidence bars ----------
 
 test('green needs a higher bar than red', () => {
@@ -43,9 +77,10 @@ test('green needs a higher bar than red', () => {
     const weakRed = decideCluster(verdict({verdict: 'PR_REGRESSION', confidence: 0.8}), assist);
 
     assert.equal(weakGreen.state, 'failure', '0.8 is under the green bar');
-    assert.equal(weakGreen.verdict, 'INCONCLUSIVE');
+    assert.equal(weakGreen.operational_outcome, OUTCOMES.TRIAGE_FAILED);
     assert.equal(weakRed.state, 'failure');
     assert.equal(weakRed.verdict, 'PR_REGRESSION', '0.8 clears the red bar, so the verdict stands');
+    assert.equal(weakRed.operational_outcome, OUTCOMES.REGRESSION);
 });
 
 test('a waivable verdict at the bar exactly is waived', () => {
@@ -55,19 +90,38 @@ test('a waivable verdict at the bar exactly is waived', () => {
     assert.equal(atBar.waived, true);
 });
 
-// ---------- branch and amnesty guards ----------
+test('a red verdict below the red bar is triage failure, not a silent green', () => {
+    const d = decideCluster(verdict({verdict: 'PR_REGRESSION', confidence: 0.5}), assist);
 
-test('flakes are never auto-greened on the baseline branch', () => {
-    const onMain = decideCluster(verdict(), {mode: 'assist', runType: 'MAIN'});
-
-    assert.equal(onMain.state, 'failure');
-    assert.match(onMain.reason, /baseline health/);
+    assert.equal(d.state, 'failure');
+    assert.equal(d.operational_outcome, OUTCOMES.TRIAGE_FAILED, 'low confidence is triage failure');
+    assert.equal(d.verdict, 'INCONCLUSIVE', 'the untrusted verdict is rejected');
 });
 
-test('a test out of waiver budget stops being waivable', () => {
+// ---------- branch and amnesty guards ----------
+
+test('confirmed flakes on the baseline branch succeed without a label', () => {
+    for (const runType of ['MAIN', 'MASTER', 'RELEASE', 'CMT']) {
+        const onBaseline = decideCluster(verdict(), {mode: 'assist', runType});
+
+        assert.equal(onBaseline.state, 'success', `${runType} confirms flakes`);
+        assert.equal(onBaseline.operational_outcome, OUTCOMES.FLAKY_CONFIRMED);
+        assert.equal(onBaseline.waived, false, 'baseline success is recorded, not labelled');
+    }
+});
+
+test('a low-confidence flake on the baseline branch is triage failure', () => {
+    const onMain = decideCluster(verdict({confidence: 0.5}), {mode: 'assist', runType: 'MAIN'});
+
+    assert.equal(onMain.state, 'failure');
+    assert.equal(onMain.operational_outcome, OUTCOMES.TRIAGE_FAILED);
+});
+
+test('a test out of waiver budget is a regression, not a flake', () => {
     const exhausted = decideCluster(verdict(), {...assist, amnestyExhausted: true});
 
     assert.equal(exhausted.state, 'failure');
+    assert.equal(exhausted.operational_outcome, OUTCOMES.REGRESSION);
     assert.match(exhausted.reason, /amnesty exhausted/);
 });
 
@@ -82,8 +136,23 @@ test('a main regression excuses the PR only when the PR is elsewhere', () => {
     );
 
     assert.equal(unrelated.state, 'success');
+    assert.equal(unrelated.operational_outcome, OUTCOMES.FLAKY_CONFIRMED);
     assert.equal(overlapping.state, 'failure');
+    assert.equal(overlapping.operational_outcome, OUTCOMES.TRIAGE_FAILED);
     assert.equal(overlapping.verdict, 'INCONCLUSIVE');
+});
+
+test('a main regression on a baseline branch is itself a regression', () => {
+    for (const runType of ['MAIN', 'MASTER', 'RELEASE', 'CMT']) {
+        const d = decideCluster(
+            verdict({verdict: 'MAIN_REGRESSION', confidence: 0.9}),
+            {mode: 'assist', runType},
+        );
+
+        assert.equal(d.state, 'failure', `${runType} must fail a main regression`);
+        assert.equal(d.operational_outcome, OUTCOMES.REGRESSION);
+        assert.equal(d.verdict, 'MAIN_REGRESSION', 'the stored verdict is preserved');
+    }
 });
 
 // ---------- shadow mode ----------
@@ -94,6 +163,7 @@ test('shadow mode records what it would have done without doing it', () => {
     assert.equal(shadow.state, 'failure');
     assert.equal(shadow.waived, false);
     assert.equal(shadow.shadow, true);
+    assert.equal(shadow.operational_outcome, OUTCOMES.FLAKY_CONFIRMED, 'it records what it would be');
     assert.match(shadow.reason, /shadow mode/);
 });
 
@@ -106,8 +176,19 @@ test('one unwaived cluster keeps the whole run red', () => {
     ]);
 
     assert.equal(run.state, 'failure');
+    assert.equal(run.operational_outcome, OUTCOMES.REGRESSION);
     assert.equal(run.green_clusters, 1);
     assert.equal(run.red_clusters, 1);
+});
+
+test('one triage-failed cluster keeps the whole run red as triage failure', () => {
+    const run = decideRun([
+        decideCluster(verdict(), assist),
+        decideCluster(verdict({confidence: 0.5}), assist), // below green bar → TRIAGE_FAILED
+    ]);
+
+    assert.equal(run.state, 'failure');
+    assert.equal(run.operational_outcome, OUTCOMES.TRIAGE_FAILED);
 });
 
 test('a run is green only when every cluster is waived', () => {
@@ -118,8 +199,20 @@ test('a run is green only when every cluster is waived', () => {
 
     assert.equal(run.state, 'success');
     assert.equal(run.waived, true);
+    assert.equal(run.operational_outcome, OUTCOMES.FLAKY_CONFIRMED);
     // The weakest link is what gets reported, not the most flattering one.
     assert.match(run.reason, /weakest/);
+});
+
+test('a baseline run is green without being waived', () => {
+    const run = decideRun([
+        decideCluster(verdict(), {mode: 'assist', runType: 'MAIN'}),
+        decideCluster(verdict({verdict: 'FLAKY_SERVER', confidence: 0.9}), {mode: 'assist', runType: 'MAIN'}),
+    ]);
+
+    assert.equal(run.state, 'success');
+    assert.equal(run.waived, false, 'no label on a baseline branch');
+    assert.equal(run.operational_outcome, OUTCOMES.FLAKY_CONFIRMED);
 });
 
 test('no decisions at all is red', () => {
@@ -171,15 +264,39 @@ test('a well-formed verdict survives parsing intact', () => {
 
 // ---------- status description ----------
 
-test('status description fits the GitHub limit and leads with the verdict', () => {
+test('status description leads with the operational outcome, not the confidence', () => {
     const desc = statusDescription({
+        operational_outcome: OUTCOMES.FLAKY_CONFIRMED,
         verdict: 'FLAKY_INFRA',
         confidence: 0.93,
         reason: 'x'.repeat(400),
     });
 
     assert.ok(desc.length <= 140);
-    assert.ok(desc.startsWith('flaky-infra (0.93)'));
+    assert.ok(desc.startsWith('confirmed flaky failures'), 'the headline leads');
+    assert.ok(!desc.startsWith('flaky-infra'), 'no confidence-bar jargon as the headline');
+});
+
+test('a regression headline leads the regression description', () => {
+    const desc = statusDescription({
+        operational_outcome: OUTCOMES.REGRESSION,
+        verdict: 'PR_REGRESSION',
+        confidence: 0.9,
+        reason: 'the change broke channel list rendering',
+    });
+
+    assert.ok(desc.startsWith('genuine test or product failure'));
+});
+
+test('a triage-failed headline leads the triage-failure description', () => {
+    const desc = statusDescription({
+        operational_outcome: OUTCOMES.TRIAGE_FAILED,
+        verdict: 'INCONCLUSIVE',
+        confidence: 0,
+        reason: 'no usable verdict',
+    });
+
+    assert.ok(desc.startsWith('triage could not complete safely'));
 });
 
 // ---------- run shape: the three reasons there might be no decisions ----------
@@ -189,6 +306,7 @@ test('a passing suite is green, not red', () => {
 
     assert.equal(run.state, 'success', 'reddening every passing run would make the check worthless');
     assert.equal(run.waived, false, 'nothing was waived — there was nothing to waive');
+    assert.equal(run.operational_outcome, '', 'a clean pass has no triage outcome');
     assert.match(run.reason, /no failures/);
 });
 
@@ -196,6 +314,7 @@ test('a run that produced no reports is red even though it also has no decisions
     const run = decideRun([], {failureCount: 0, reportsFound: 0});
 
     assert.equal(run.state, 'failure');
+    assert.equal(run.operational_outcome, OUTCOMES.TRIAGE_FAILED);
     assert.match(run.reason, /no usable test results/);
 });
 
@@ -203,6 +322,7 @@ test('failures with no decisions stay red', () => {
     const run = decideRun([], {failureCount: 7, reportsFound: 4});
 
     assert.equal(run.state, 'failure');
+    assert.equal(run.operational_outcome, OUTCOMES.TRIAGE_FAILED);
     assert.match(run.reason, /7 failure/);
 });
 
@@ -210,7 +330,7 @@ test('status description for a passing run does not read as a problem', () => {
     const desc = statusDescription(decideRun([], {failureCount: 0, reportsFound: 4}));
 
     assert.equal(desc, 'no failures to triage');
-    assert.ok(!desc.includes('inconclusive'));
+    assert.ok(!desc.includes('triage could not complete'));
 });
 
 test('the run carries the confidence of the decision it reports', () => {
@@ -228,13 +348,14 @@ test('the run carries the confidence of the decision it reports', () => {
 
 // ---------- rerun evidence overrules model inference ----------
 
-test('a failure that reproduced on every rerun cannot be waived as flaky', () => {
+test('a failure that reproduced on every rerun is a regression, not a flake', () => {
     const reproduced = decideCluster(verdict({confidence: 0.99}), {
         ...assist,
         reproducedOnRerun: true,
     });
 
     assert.equal(reproduced.state, 'failure', 'measurement beats interpretation');
+    assert.equal(reproduced.operational_outcome, OUTCOMES.REGRESSION);
     assert.match(reproduced.reason, /reproduced on every rerun/);
 });
 
@@ -264,6 +385,7 @@ test('a confidence outside 0-1 is unusable, not merely low', () => {
         const d = decideCluster(verdict({confidence: bad}), assist);
         assert.equal(d.state, 'failure', `confidence ${bad} must not waive`);
         assert.equal(d.verdict, 'INCONCLUSIVE');
+        assert.equal(d.operational_outcome, OUTCOMES.TRIAGE_FAILED);
         assert.equal(d.waived, false);
     }
 });
@@ -297,6 +419,7 @@ test('a status description is a single line even when the model supplies newline
     // starts a new key=value assignment and the last assignment wins — so an
     // embedded "state=success" would have overwritten the run's own verdict.
     const desc = statusDescription({
+        operational_outcome: OUTCOMES.TRIAGE_FAILED,
         verdict: 'FLAKY_TEST',
         confidence: 0.9,
         reason: 'boom\nstate=success\nwaived=true',
@@ -321,6 +444,7 @@ test('a run that produced no reports is red even when a suite rule explains it',
 
     assert.equal(run.state, 'failure');
     assert.equal(run.waived, false);
+    assert.equal(run.operational_outcome, OUTCOMES.TRIAGE_FAILED);
     assert.match(run.reason, /no usable test results/);
 });
 
@@ -344,6 +468,7 @@ test('a waiver needs two citations whatever produced the verdict', () => {
         verdict: 'FLAKY_INFRA', confidence: 0.99, evidence: [{kind: 'signature', ref: 'x'}],
     }, assist);
     assert.equal(oneCite.waived, false);
+    assert.equal(oneCite.operational_outcome, OUTCOMES.TRIAGE_FAILED);
     assert.match(oneCite.reason, /cites 1 independent item/);
 
     // Two copies of the same citation is one observation written twice.
@@ -358,4 +483,17 @@ test('a waiver needs two citations whatever produced the verdict', () => {
         evidence: [{kind: 'log', ref: 'a'}, {kind: 'history', ref: 'b'}],
     }, assist);
     assert.equal(twoCites.waived, true);
+});
+
+test('incomplete evidence — a citation without a kind — is triage failure', () => {
+    // Two distinct citations, but one is a blank reference. Present in count, not
+    // in substance: "missing citation" is triage failure.
+    const d = decideCluster({
+        verdict: 'FLAKY_INFRA', confidence: 0.99,
+        evidence: [{kind: 'log', ref: 'a'}, {ref: 'b'}],
+    }, assist);
+
+    assert.equal(d.waived, false);
+    assert.equal(d.operational_outcome, OUTCOMES.TRIAGE_FAILED);
+    assert.match(d.reason, /incomplete/);
 });

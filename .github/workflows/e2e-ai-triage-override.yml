@@ -26,6 +26,11 @@ on:
         description: "Raw comment body, parsed for /e2e-triage-override <verdict> <reason>"
         required: true
         type: string
+      status_context:
+        description: "Commit-status context to write, matching the triage workflow"
+        required: false
+        type: string
+        default: "e2e-test/ai-triage"
       comment_id:
         description: "Comment to react to, so the author sees it was picked up"
         required: false
@@ -189,6 +194,7 @@ jobs:
           SENDER: ${{ inputs.sender }}
           COMMENT_ID: ${{ inputs.comment_id }}
           TSIO_URL: ${{ inputs.tsio_url }}
+          STATUS_CONTEXT: ${{ inputs.status_context }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -198,4 +204,5 @@ jobs:
             --actor="${SENDER}" \
             --comment-id="${COMMENT_ID}" \
             --tsio-url="${TSIO_URL}" \
+            --status-context="${STATUS_CONTEXT}" \
             --run-url="${RUN_URL}"

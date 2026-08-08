@@ -4,8 +4,8 @@
 const assert = require('node:assert/strict');
 const {test} = require('node:test');
 
-const {assembleVerdicts} = require('./triage-apply');
-const {decideCluster, decideRun} = require('./triage-policy');
+const {assembleVerdicts, renderComment, markTriageFailed} = require('./triage-apply');
+const {decideCluster, decideRun, OUTCOMES} = require('./triage-policy');
 
 const assist = {mode: 'assist', runType: 'PR'};
 
@@ -69,7 +69,7 @@ test('a model verdict is matched to its cluster by signature', () => {
             {signature_hash: 'b', needs_ai: true, member_count: 1, matched_signatures: []},
         ],
     }), [
-        {cluster_signature: 'b', verdict: 'FLAKY_TEST', confidence: 0.9, evidence: [{}, {}]},
+        {cluster_signature: 'b', verdict: 'FLAKY_TEST', confidence: 0.9, evidence: [{kind: 'log'}, {kind: 'rerun'}]},
     ]);
 
     assert.equal(verdicts[0].verdict, 'INCONCLUSIVE', 'cluster a had no model verdict');
@@ -100,15 +100,54 @@ test('a partly-adjudicated run stays red because of the unexplained cluster', ()
     assert.equal(run.green_clusters, 1);
 });
 
+// ---------- the ledger maps rows to clusters by signature, not by index ----------
+
+test('ledger evidence is not the old undefined clusterByIndex lookup', () => {
+    // The previous code read `clusterByIndex[i].member_test_ids`, but
+    // clusterByIndex was never defined — so the lookup threw and the catch
+    // swallowed it, and no verdict ever reached TSIO. assembleVerdicts now keeps
+    // the cluster_signature on every row so the caller can map by signature.
+    const verdicts = assembleVerdicts(evidence({
+        clusters: [{
+            signature_hash: 'sig-abc',
+            needs_ai: true,
+            member_count: 3,
+            member_test_ids: ['MM-T1_1', 'MM-T1_2', 'MM-T1_3'],
+            matched_signatures: [],
+        }],
+    }), [{cluster_signature: 'sig-abc', verdict: 'FLAKY_TEST', confidence: 0.9,
+        evidence: [{kind: 'log'}, {kind: 'rerun'}]}]);
+
+    assert.equal(verdicts[0].cluster_signature, 'sig-abc');
+    assert.equal(verdicts[0].member_count, 3);
+});
+
+// ---------- markTriageFailed downgrades a green run ----------
+
+test('markTriageFailed turns a green run red with the triage-failed outcome', () => {
+    const green = decideRun([decideCluster({
+        verdict: 'FLAKY_INFRA', confidence: 0.95,
+        evidence: [{kind: 'log'}, {kind: 'rerun'}],
+    }, assist)]);
+
+    assert.equal(green.state, 'success');
+
+    const failed = markTriageFailed(green, 'ledger recording failed — 503');
+
+    assert.equal(failed.state, 'failure');
+    assert.equal(failed.operational_outcome, OUTCOMES.TRIAGE_FAILED);
+    assert.equal(failed.waived, false);
+    assert.match(failed.reason, /ledger recording failed/);
+});
+
 // ---------- blame reaches the comment ----------
 
-const {renderComment} = require('./triage-apply');
 const {attribute} = require('./triage-blame');
 
 test('a resolved main-regression callout is rendered into the PR comment', () => {
     const body = renderComment(
-        {state: 'success', waived: true, reason: 'pre-existing on main'},
-        [{verdict: 'MAIN_REGRESSION', confidence: 0.9, reason: 'pre-existing on main'}],
+        {state: 'success', waived: true, operational_outcome: OUTCOMES.FLAKY_CONFIRMED, reason: 'pre-existing on main'},
+        [{verdict: 'MAIN_REGRESSION', confidence: 0.9, operational_outcome: OUTCOMES.FLAKY_CONFIRMED, reason: 'pre-existing on main'}],
         [{cluster_signature: 'sig', member_count: 1, source: 'model'}],
         {
             commitSha: 'abcdef1234567890',
@@ -129,15 +168,17 @@ test('a resolved main-regression callout is rendered into the PR comment', () =>
 
     assert.match(body, /Main regression detected/);
     assert.match(body, /@alice/, 'the person who can actually fix it has to be named');
+    assert.match(body, /Outcome:\*\* `FLAKY_CONFIRMED`/);
 });
 
 test('a comment without blame renders unchanged', () => {
     const body = renderComment(
-        {state: 'failure', waived: false, reason: 'nope'},
-        [{verdict: 'PR_REGRESSION', confidence: 0.9, reason: 'nope'}],
+        {state: 'failure', waived: false, operational_outcome: OUTCOMES.REGRESSION, reason: 'nope'},
+        [{verdict: 'PR_REGRESSION', confidence: 0.9, operational_outcome: OUTCOMES.REGRESSION, reason: 'nope'}],
         [{cluster_signature: 'sig', member_count: 1, source: 'model'}],
         {commitSha: 'abcdef1234567890', commitUrl: 'x', tier: 1, tierReason: '1 failure'},
     );
 
     assert.ok(!/Main regression detected/.test(body));
+    assert.match(body, /Outcome:\*\* `REGRESSION`/);
 });
