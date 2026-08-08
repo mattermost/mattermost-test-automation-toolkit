@@ -4,7 +4,10 @@
 const assert = require('node:assert/strict');
 const {test} = require('node:test');
 
-const {assembleVerdicts, renderComment, markTriageFailed} = require('./triage-apply');
+const {
+    assembleVerdicts, renderComment, markTriageFailed,
+    computePlatformOutcomes, platformOutcomesLine, normalizePlatform, decisionClassification,
+} = require('./triage-apply');
 const {decideCluster, decideRun, OUTCOMES} = require('./triage-policy');
 
 const assist = {mode: 'assist', runType: 'PR'};
@@ -181,4 +184,282 @@ test('a comment without blame renders unchanged', () => {
 
     assert.ok(!/Main regression detected/.test(body));
     assert.match(body, /Outcome:\*\* `REGRESSION`/);
+});
+// ---------- per-platform outcomes ----------
+
+// Build a real decideCluster decision for a verdict, so the platform mapping is
+// exercised against the actual operational outcomes the policy emits.
+function decision(verdict, context = {}) {
+    return decideCluster({
+        verdict,
+        confidence: 0.95,
+        root_cause: `${verdict} on shard`,
+        // Two distinct citations so a waivable verdict actually clears the bar.
+        evidence: [{kind: 'log', ref: 'a'}, {kind: 'rerun', ref: 'b'}],
+    }, {mode: 'assist', runType: 'PR', ...context});
+}
+
+// Run computePlatformOutcomes against a list of {signature, platform, verdict, ctx}
+// entries, mapping each to a verdict row + decision. Clusters are emitted in the
+// order given; verdict rows follow `verdictOrder` (a list of signatures) when
+// provided, so a positional lookup would misattribute platforms to verdicts.
+function outcomesFor(entries, {verdictOrder, ledgerRecorded = true, suite, shards} = {}) {
+    const bySig = new Map(entries.map((e) => [e.signature, e]));
+    const order = verdictOrder || entries.map((e) => e.signature);
+    const verdicts = order.map((sig) => ({cluster_signature: sig, member_count: 1, source: 'model'}));
+    const decisions = order.map((sig) => {
+        const e = bySig.get(sig);
+        return decision(e.verdict, e.ctx || {});
+    });
+    const evidenceObj = suite ?
+        {suite_verdict: suite, summary: {shards: shards || []}, clusters: []} :
+        {clusters: entries.map((e) => ({signature_hash: e.signature, platforms: e.platform}))};
+    return computePlatformOutcomes({evidence: evidenceObj, decisions, verdicts,
+        ledgerRecorded});
+}
+
+test('ipad is normalised to ios before any aggregation', () => {
+    assert.equal(normalizePlatform('ipad'), 'ios');
+    assert.equal(normalizePlatform('ios'), 'ios');
+    assert.equal(normalizePlatform('android'), 'android');
+
+    const o = outcomesFor([{signature: 'a', platform: ['ipad'], verdict: 'FLAKY_INFRA'}]);
+    assert.deepEqual(Object.keys(o), ['ios'], 'ipad collapses into ios, not its own platform');
+});
+
+// ---------- the verdict → classification mapping ----------
+
+test('FLAKY_CONFIRMED → FLAKY / success', () => {
+    const o = outcomesFor([{signature: 'a', platform: ['ios'], verdict: 'FLAKY_INFRA'}]);
+    assert.equal(o.ios.classification, 'FLAKY');
+    assert.equal(o.ios.state, 'success');
+    assert.equal(o.ios.suffix, 'verified to be flaky');
+});
+
+test('REGRESSION + TEST_DEBT → TEST_BUG / failure', () => {
+    const o = outcomesFor([{signature: 'a', platform: ['ios'], verdict: 'TEST_DEBT'}]);
+    assert.equal(o.ios.classification, 'TEST_BUG');
+    assert.equal(o.ios.state, 'failure');
+    assert.equal(o.ios.suffix, 'verified to be a test bug');
+});
+
+test('REGRESSION + deterministic FLAKY_TEST → TEST_BUG / failure', () => {
+    const o = outcomesFor([{
+        signature: 'a', platform: ['ios'], verdict: 'FLAKY_TEST',
+        ctx: {reproducedOnRerun: true},
+    }]);
+    assert.equal(o.ios.classification, 'TEST_BUG',
+        'a flake that reproduced on every rerun is a test bug, not a waivable flake');
+    assert.equal(o.ios.state, 'failure');
+});
+
+test('REGRESSION + FLAKY_INFRA / FLAKY_SERVER → INFRASTRUCTURE_FAILURE / failure', () => {
+    const infra = outcomesFor([{
+        signature: 'a', platform: ['ios'], verdict: 'FLAKY_INFRA',
+        ctx: {reproducedOnRerun: true},
+    }]);
+    assert.equal(infra.ios.classification, 'INFRASTRUCTURE_FAILURE');
+    assert.equal(infra.ios.suffix, 'verified to be an infrastructure failure');
+
+    const server = outcomesFor([{
+        signature: 'b', platform: ['ios'], verdict: 'FLAKY_SERVER',
+        ctx: {reproducedOnRerun: true},
+    }]);
+    assert.equal(server.ios.classification, 'INFRASTRUCTURE_FAILURE');
+});
+
+test('other REGRESSION (PR_REGRESSION) → PRODUCT_BUG / failure', () => {
+    const o = outcomesFor([{signature: 'a', platform: ['ios'], verdict: 'PR_REGRESSION'}]);
+    assert.equal(o.ios.classification, 'PRODUCT_BUG');
+    assert.equal(o.ios.state, 'failure');
+    assert.equal(o.ios.suffix, 'verified to be a product bug');
+});
+
+test('BUILD_OR_ENV_ERROR is a PRODUCT_BUG, not infrastructure', () => {
+    // Looks like infra but is a code problem — the mapping must not lump it with
+    // FLAKY_INFRA just because it is environment-shaped.
+    const o = outcomesFor([{signature: 'a', platform: ['ios'], verdict: 'BUILD_OR_ENV_ERROR'}]);
+    assert.equal(o.ios.classification, 'PRODUCT_BUG');
+});
+
+test('TRIAGE_FAILED → TRIAGE_FAILED / failure', () => {
+    // An INCONCLUSIVE verdict resolves to TRIAGE_FAILED in the policy engine.
+    const o = outcomesFor([{signature: 'a', platform: ['ios'], verdict: 'INCONCLUSIVE'}]);
+    assert.equal(o.ios.classification, 'TRIAGE_FAILED');
+    assert.equal(o.ios.state, 'failure');
+    assert.equal(o.ios.suffix, 'triage could not classify safely');
+});
+
+test('a low-confidence flake is TRIAGE_FAILED, not a green flake', () => {
+    const d = decision('FLAKY_INFRA', {reproducedOnRerun: false});
+    // Override confidence below the green bar directly: decideCluster below 0.85
+    // returns TRIAGE_FAILED for a waivable verdict.
+    const lowConf = decideCluster({
+        verdict: 'FLAKY_INFRA', confidence: 0.5,
+        evidence: [{kind: 'log'}, {kind: 'rerun'}],
+    }, assist);
+    assert.equal(lowConf.operational_outcome, OUTCOMES.TRIAGE_FAILED);
+    assert.equal(decisionClassification(lowConf), 'TRIAGE_FAILED');
+});
+
+// ---------- mixed platforms and severity ----------
+
+test('each platform is resolved independently', () => {
+    const o = outcomesFor([
+        {signature: 'a', platform: ['ios'], verdict: 'FLAKY_INFRA'},
+        {signature: 'b', platform: ['android'], verdict: 'PR_REGRESSION'},
+    ]);
+    assert.equal(o.ios.classification, 'FLAKY');
+    assert.equal(o.ios.state, 'success');
+    assert.equal(o.android.classification, 'PRODUCT_BUG');
+    assert.equal(o.android.state, 'failure');
+});
+
+test('a spans-platforms cluster attributes its decision to every platform listed', () => {
+    const o = outcomesFor([{signature: 'a', platform: ['ios', 'android'], verdict: 'PR_REGRESSION'}]);
+    assert.equal(o.ios.classification, 'PRODUCT_BUG');
+    assert.equal(o.android.classification, 'PRODUCT_BUG');
+});
+
+test('a platform is green only when every failure on it is confirmed flaky', () => {
+    const o = outcomesFor([
+        {signature: 'a', platform: ['ios'], verdict: 'FLAKY_INFRA'},
+        {signature: 'b', platform: ['ios'], verdict: 'PR_REGRESSION'},
+    ]);
+    assert.equal(o.ios.state, 'failure', 'one real bug among nine flakes is still red');
+    // Severity: PRODUCT_BUG outranks FLAKY.
+    assert.equal(o.ios.classification, 'PRODUCT_BUG');
+});
+
+test('mixed-platform severity: PRODUCT_BUG > TEST_BUG > INFRASTRUCTURE_FAILURE > TRIAGE_FAILED > FLAKY', () => {
+    const o = outcomesFor([
+        {signature: 'a', platform: ['ios'], verdict: 'TEST_DEBT'},          // TEST_BUG
+        {signature: 'b', platform: ['ios'], verdict: 'PR_REGRESSION'},      // PRODUCT_BUG
+        {signature: 'c', platform: ['ios'], verdict: 'FLAKY_INFRA'},         // FLAKY
+    ]);
+    assert.equal(o.ios.classification, 'PRODUCT_BUG');
+
+    const o2 = outcomesFor([
+        {signature: 'a', platform: ['ios'], verdict: 'FLAKY_INFRA',
+            ctx: {reproducedOnRerun: true}},                                  // INFRASTRUCTURE_FAILURE
+        {signature: 'b', platform: ['ios'], verdict: 'TEST_DEBT'},           // TEST_BUG
+    ]);
+    assert.equal(o2.ios.classification, 'TEST_BUG', 'TEST_BUG outranks INFRASTRUCTURE_FAILURE');
+
+    const o3 = outcomesFor([
+        {signature: 'a', platform: ['ios'], verdict: 'INCONCLUSIVE'},        // TRIAGE_FAILED
+        {signature: 'b', platform: ['ios'], verdict: 'FLAKY_INFRA',
+            ctx: {reproducedOnRerun: true}},                                  // INFRASTRUCTURE_FAILURE
+    ]);
+    assert.equal(o3.ios.classification, 'INFRASTRUCTURE_FAILURE',
+        'INFRASTRUCTURE_FAILURE outranks TRIAGE_FAILED');
+
+    const o4 = outcomesFor([
+        {signature: 'a', platform: ['ios'], verdict: 'FLAKY_INFRA'},         // FLAKY
+        {signature: 'b', platform: ['ios'], verdict: 'INCONCLUSIVE'},        // TRIAGE_FAILED
+    ]);
+    assert.equal(o4.ios.classification, 'TRIAGE_FAILED',
+        'TRIAGE_FAILED outranks FLAKY');
+});
+
+// ---------- signature-based mapping, never array position ----------
+
+test('clusters are matched to verdicts by signature, not array position', () => {
+    // Clusters emitted in [sig-a, sig-b] order in the evidence; verdict rows
+    // deliberately reversed, so a positional `clusters[i]` lookup would attribute
+    // sig-a's platform to sig-b's verdict.
+    const o = outcomesFor(
+        [
+            {signature: 'sig-a', platform: ['ios'], verdict: 'FLAKY_INFRA'},
+            {signature: 'sig-b', platform: ['android'], verdict: 'PR_REGRESSION'},
+        ],
+        {verdictOrder: ['sig-b', 'sig-a']},
+    );
+    assert.equal(o.ios.classification, 'FLAKY', 'sig-a is the flake, regardless of verdict order');
+    assert.equal(o.android.classification, 'PRODUCT_BUG', 'sig-b is the regression');
+});
+
+// ---------- suite verdicts apply to every platform in summary shards ----------
+
+test('a suite verdict is attributed to every platform the run spanned', () => {
+    const suite = {verdict: 'FLAKY_INFRA', confidence: 0.95,
+        reason: 'no shard produced results', rule_id: 'suite.no-results'};
+    const shards = [{platform: 'ios'}, {platform: 'android'}, {platform: 'ipad'}];
+    const verdicts = assembleVerdicts(
+        {suite_verdict: suite, summary: {shards}, clusters: [{signature_hash: 'a', needs_ai: true, member_count: 40}]},
+        [],
+    );
+    const decisions = verdicts.map((v) => decideCluster(v, assist));
+
+    const o = computePlatformOutcomes({evidence: {suite_verdict: suite, summary: {shards},
+        clusters: []}, decisions, verdicts, ledgerRecorded: true});
+
+    assert.deepEqual(Object.keys(o).sort(), ['android', 'ios'],
+        'ipad normalises into ios; android stays distinct');
+    assert.equal(o.ios.classification, 'FLAKY', 'the suite verdict was a confirmed flake');
+    assert.equal(o.ios.state, 'success');
+    assert.equal(o.android.state, 'success');
+});
+
+// ---------- the ledger gate ----------
+
+test('a flaky platform goes green only when the ledger recorded successfully', () => {
+    const o = outcomesFor([{signature: 'a', platform: ['ios'], verdict: 'FLAKY_INFRA'}],
+        {ledgerRecorded: true});
+    assert.equal(o.ios.classification, 'FLAKY');
+    assert.equal(o.ios.state, 'success');
+});
+
+test('a ledger failure converts a flaky platform to TRIAGE_FAILED', () => {
+    const o = outcomesFor([{signature: 'a', platform: ['ios'], verdict: 'FLAKY_INFRA'}],
+        {ledgerRecorded: false});
+    assert.equal(o.ios.classification, 'TRIAGE_FAILED');
+    assert.equal(o.ios.state, 'failure');
+    assert.equal(o.ios.suffix, 'triage could not classify safely');
+});
+
+test('a ledger failure does not change an already-red platform', () => {
+    // PRODUCT_BUG is red regardless of the ledger; only flaky platforms depend on it.
+    const o = outcomesFor([{signature: 'a', platform: ['ios'], verdict: 'PR_REGRESSION'}],
+        {ledgerRecorded: false});
+    assert.equal(o.ios.classification, 'PRODUCT_BUG');
+    assert.equal(o.ios.state, 'failure');
+});
+
+test('a mixed run with a ledger failure flips only the flaky platform', () => {
+    const o = outcomesFor([
+        {signature: 'a', platform: ['ios'], verdict: 'FLAKY_INFRA'},
+        {signature: 'b', platform: ['android'], verdict: 'PR_REGRESSION'},
+    ], {ledgerRecorded: false});
+    assert.equal(o.ios.classification, 'TRIAGE_FAILED', 'flaky ios loses its waiver');
+    assert.equal(o.ios.state, 'failure');
+    assert.equal(o.android.classification, 'PRODUCT_BUG', 'android was already red');
+});
+
+// ---------- output-injection safety ----------
+
+test('platform_outcomes serializes as one sanitized single line', () => {
+    const o = {ios: {classification: 'FLAKY', state: 'success', suffix: 'verified to be flaky'}};
+    const line = platformOutcomesLine(o);
+    assert.equal(line.split('\n').length, 1, 'no raw newlines — one GITHUB_OUTPUT assignment');
+    assert.equal(line, JSON.stringify(o));
+    // The exact string written to GITHUB_OUTPUT is one line.
+    const written = `platform_outcomes=${line}`;
+    assert.equal(written.split('\n').length, 1);
+});
+
+test('a malicious platform name cannot inject a GITHUB_OUTPUT assignment', () => {
+    // A platform key is caller-supplied (it comes from the evidence bundle), so a
+    // value containing a newline + a forged assignment must not survive into the
+    // output line. JSON.stringify escapes the newline; the sanitizer strips any
+    // raw control char that slipped through.
+    const o = outcomesFor(
+        [{signature: 'a', platform: ['ios\nstate=success\nwaived=true'], verdict: 'FLAKY_INFRA'}],
+    );
+    const line = platformOutcomesLine(o);
+    assert.ok(!line.includes('\n'), 'no raw newline reaches the output line');
+    // The forged assignment does not appear as its own key=value line.
+    assert.ok(!line.includes('\nwaived=true'));
+    // And the line still parses back to valid JSON.
+    JSON.parse(line);
 });

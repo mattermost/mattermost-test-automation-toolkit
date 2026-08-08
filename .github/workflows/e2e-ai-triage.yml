@@ -133,6 +133,13 @@ on:
       triage_url:
         description: "URL of this triage workflow run"
         value: ${{ jobs.adjudicate.outputs.triage_url }}
+      platform_outcomes:
+        description: >-
+          Single-line JSON of per-platform triage outcomes, e.g.
+          {"ios":{"classification":"FLAKY","state":"success","suffix":"verified to be flaky"},"android":{...}}.
+          A platform is success only when every failure on it was confirmed flaky
+          and recorded in the ledger.
+        value: ${{ jobs.adjudicate.outputs.platform_outcomes }}
 
 permissions:
   contents: read
@@ -162,6 +169,7 @@ jobs:
       operational_outcome: ${{ steps.apply.outputs.operational_outcome }}
       description: ${{ steps.apply.outputs.description }}
       triage_url: ${{ steps.apply.outputs.triage_url }}
+      platform_outcomes: ${{ steps.apply.outputs.platform_outcomes }}
     steps:
       # Check out THIS repository, not the caller's.
       #

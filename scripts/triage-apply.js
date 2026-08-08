@@ -284,6 +284,188 @@ function markTriageFailed(runDecision, reason) {
 }
 
 /**
+ * Per-platform triage outcomes.
+ *
+ * The global run outcome is one verdict for one merge button; the per-platform
+ * view answers "is iOS green, is Android green" — which is what a mobile team
+ * actually needs, because a flaky simulator does not block Android and a real
+ * code regression on one platform should not be waived for both. Each cluster's
+ * decision is attributed to the platforms its failures ran on, and a platform
+ * is green only when every failure on it was a confirmed flake.
+ */
+
+// An iPad runs the iOS app on an iPad device/simulator; the platform that has to
+// be green is iOS, so the label is normalised before any aggregation.
+function normalizePlatform(p) {
+    return p === 'ipad' ? 'ios' : p;
+}
+
+// A REGRESSION's stored verdict says *what kind* of regression it is, and that
+// refines the platform classification. A deterministic flake (FLAKY_TEST that
+// reproduced on every rerun) and TEST_DEBT are both "the test is wrong, not the
+// app" → TEST_BUG; a deterministic infra/server flake is still infra →
+// INFRASTRUCTURE_FAILURE; everything else (PR_REGRESSION, BUILD_OR_ENV_ERROR,
+// MAIN_REGRESSION on a baseline, an amnesty-exhausted PR_REGRESSION) is a
+// PRODUCT_BUG. FLAKY_CONFIRMED and TRIAGE_FAILED map directly off the outcome.
+const TEST_BUG_VERDICTS = new Set(['TEST_DEBT', 'FLAKY_TEST']);
+const INFRA_VERDICTS = new Set(['FLAKY_INFRA', 'FLAKY_SERVER']);
+
+// Mixed-platform severity: when one platform carries both a product bug and a
+// flake, the platform reports the worst of its verdicts — a confirmed flake
+// next to a real bug is still a red platform. Ordered highest → lowest.
+const PLATFORM_SEVERITY = {
+    PRODUCT_BUG: 4,
+    TEST_BUG: 3,
+    INFRASTRUCTURE_FAILURE: 2,
+    TRIAGE_FAILED: 1,
+    FLAKY: 0,
+};
+
+const PLATFORM_SUFFIXES = {
+    FLAKY: 'verified to be flaky',
+    TEST_BUG: 'verified to be a test bug',
+    PRODUCT_BUG: 'verified to be a product bug',
+    INFRASTRUCTURE_FAILURE: 'verified to be an infrastructure failure',
+    TRIAGE_FAILED: 'triage could not classify safely',
+};
+
+function decisionClassification(decision) {
+    if (decision.operational_outcome === OUTCOMES.FLAKY_CONFIRMED) {
+        return 'FLAKY';
+    }
+    if (decision.operational_outcome === OUTCOMES.TRIAGE_FAILED) {
+        return 'TRIAGE_FAILED';
+    }
+    // REGRESSION: the stored verdict refines the platform classification.
+    const v = decision.verdict;
+    if (TEST_BUG_VERDICTS.has(v)) {
+        return 'TEST_BUG';
+    }
+    if (INFRA_VERDICTS.has(v)) {
+        return 'INFRASTRUCTURE_FAILURE';
+    }
+    return 'PRODUCT_BUG';
+}
+
+function platformOutcomeFor(decisions) {
+    const classes = decisions.map(decisionClassification);
+    // A platform is green only when every failure on it was a confirmed flake;
+    // one genuine bug or untriaged cluster among nine flakes is still red.
+    if (classes.every((c) => c === 'FLAKY')) {
+        return {classification: 'FLAKY', state: 'success',
+            suffix: PLATFORM_SUFFIXES.FLAKY};
+    }
+    const worst = classes.reduce((a, b) =>
+        PLATFORM_SEVERITY[b] > PLATFORM_SEVERITY[a] ? b : a, 'FLAKY');
+    return {classification: worst, state: 'failure',
+        suffix: PLATFORM_SUFFIXES[worst]};
+}
+
+/**
+ * The distinct platforms a run spanned, from its per-shard summary.
+ *
+ * A suite verdict is one decision covering the whole run, so the platforms it
+ * applies to come from summary.shards (each shard ran on one platform) — the
+ * individual clusters are symptoms of the suite failure and may not list
+ * platforms at all. Shards are the authoritative source of "which platforms
+ * this run touched".
+ */
+function runPlatforms(evidence) {
+    const shards = (evidence.summary && Array.isArray(evidence.summary.shards)) ?
+        evidence.summary.shards : [];
+    const platforms = new Set();
+    for (const s of shards) {
+        if (!s) {
+            continue;
+        }
+        if (s.platform) {
+            platforms.add(normalizePlatform(s.platform));
+        }
+        if (Array.isArray(s.platforms)) {
+            s.platforms.forEach((p) => platforms.add(normalizePlatform(p)));
+        }
+    }
+    return platforms;
+}
+
+/**
+ * Build the per-platform outcome map.
+ *
+ * Clusters are matched to verdicts by `cluster_signature`, never array
+ * position: a reordered model file must not misattribute a platform. A suite
+ * verdict is attributed to every platform the run spanned instead.
+ *
+ * `ledgerRecorded` is whether the TSIO ledger write succeeded (or was vacuous —
+ * nothing to record). A flaky platform can only go green once its verdict is
+ * durably recorded; a ledger failure means the waiver is unbacked, so the
+ * platform becomes TRIAGE_FAILED. Non-flaky platforms are already red and are
+ * unaffected.
+ */
+function computePlatformOutcomes({evidence, decisions, verdicts, ledgerRecorded}) {
+    const byPlatform = new Map();
+
+    if (evidence.suite_verdict) {
+        let platforms = runPlatforms(evidence);
+        if (platforms.size === 0) {
+            for (const c of evidence.clusters || []) {
+                (c && c.platforms || []).forEach((p) => platforms.add(normalizePlatform(p)));
+            }
+        }
+        const decision = decisions[0];
+        for (const p of platforms) {
+            if (!byPlatform.has(p)) {
+                byPlatform.set(p, []);
+            }
+            byPlatform.get(p).push(decision);
+        }
+    } else {
+        const clusterBySignature = new Map(
+            (evidence.clusters || [])
+                .filter((c) => c && c.signature_hash)
+                .map((c) => [c.signature_hash, c]),
+        );
+        for (let i = 0; i < verdicts.length; i++) {
+            const cluster = clusterBySignature.get(verdicts[i].cluster_signature);
+            const platforms = (cluster && cluster.platforms) || [];
+            for (const p of platforms) {
+                const np = normalizePlatform(p);
+                if (!byPlatform.has(np)) {
+                    byPlatform.set(np, []);
+                }
+                byPlatform.get(np).push(decisions[i]);
+            }
+        }
+    }
+
+    const outcomes = {};
+    for (const platform of [...byPlatform.keys()].sort()) {
+        const outcome = platformOutcomeFor(byPlatform.get(platform));
+        if (outcome.classification === 'FLAKY' && !ledgerRecorded) {
+            outcomes[platform] = {classification: 'TRIAGE_FAILED', state: 'failure',
+                suffix: PLATFORM_SUFFIXES.TRIAGE_FAILED};
+        } else {
+            outcomes[platform] = outcome;
+        }
+    }
+    return outcomes;
+}
+
+/**
+ * Serialize the platform outcomes as one sanitized GITHUB_OUTPUT line.
+ *
+ * GITHUB_OUTPUT is parsed as `key=value` per line, so a value carrying a newline
+ * would start a new assignment — and `platform_outcomes` is built from fixed
+ * enum strings, but the same single-line sanitiser used for the run outputs is
+ * applied here so the invariant reads as absolute at the boundary.
+ */
+function platformOutcomesLine(outcomes) {
+    // eslint-disable-next-line no-control-regex -- stripping control characters is the point
+    return String(JSON.stringify(outcomes || {}))
+        .replace(/[\u0000-\u001F\u007F]+/g, ' ')
+        .trim();
+}
+
+/**
  * Fetch the current PR head SHA. The waiver label is sticky across pushes and the
  * caller's status reporter honours it unconditionally, so applying it when the
  * PR has moved on would green commits that were never triaged.
@@ -330,7 +512,7 @@ async function main() {
         writeOutputs({state: 'failure', waived: false, verdict: 'INCONCLUSIVE',
             operational_outcome: OUTCOMES.TRIAGE_FAILED,
             description: 'triage produced no evidence bundle — manual triage required',
-            triage_url: runUrl, blame: null});
+            triage_url: runUrl, blame: null, platform_outcomes: {}});
         return;
     }
 
@@ -407,6 +589,11 @@ async function main() {
     //    line, meaning no verdict ever reached TSIO and the false-green metric
     //    was permanently blind. A suite verdict has no cluster to map to, so its
     //    external_test_id stays null (TSIO accepts a signature in its place).
+    // ledgerRecorded drives the per-platform gate: a flaky platform can only
+    // go green once its verdict is durably recorded. Vacuously true when there
+    // was nothing to record; set false on every failure path below and true
+    // only after a successful write.
+    let ledgerRecorded = verdicts.length === 0;
     if (verdicts.length > 0) {
         const clusterBySignature = new Map(
             (evidence.clusters || [])
@@ -460,6 +647,7 @@ async function main() {
                     },
                 });
                 console.log(`recorded ${result.count} verdict(s) in the triage ledger`);
+                ledgerRecorded = true;
             } catch (err) {
                 runDecision = markTriageFailed(runDecision, `ledger recording failed — ${err.message}`);
                 console.error(runDecision.reason);
@@ -472,6 +660,12 @@ async function main() {
             console.error(runDecision.reason);
         }
     }
+
+    // Per-platform outcomes are resolved after the ledger gate so they honour
+    // ledgerRecorded: a flaky platform whose verdict was not recorded cannot go
+    // green.
+    const platformOutcomes = computePlatformOutcomes(
+        {evidence, decisions, verdicts, ledgerRecorded});
 
     // 2. Label, only when policy actually waived (never in shadow mode, never on
     //    a baseline branch). The PR head is verified before and after: the label
@@ -564,7 +758,8 @@ async function main() {
 
     writeOutputs({state: runDecision.state, waived: runDecision.waived,
         verdict: runDecision.verdict, operational_outcome: runDecision.operational_outcome,
-        description: statusDescription(runDecision), triage_url: runUrl, blame});
+        description: statusDescription(runDecision), triage_url: runUrl, blame,
+        platform_outcomes: platformOutcomes});
 }
 
 /**
@@ -576,7 +771,7 @@ async function main() {
  * and the suspect author comes from git — which is exactly why the sanitising
  * happens here, at the boundary, rather than being assumed upstream.
  */
-function writeOutputs({state, waived, verdict, operational_outcome, description, triage_url, blame}) {
+function writeOutputs({state, waived, verdict, operational_outcome, description, triage_url, blame, platform_outcomes}) {
     if (!process.env.GITHUB_OUTPUT) {
         return;
     }
@@ -597,6 +792,7 @@ function writeOutputs({state, waived, verdict, operational_outcome, description,
         `triage_url=${line(triage_url)}`,
         `blame_confident=${Boolean(blame && blame.some((b) => b.attribution.confident))}`,
         `blame_suspects=${line(confidentSuspects)}`,
+        `platform_outcomes=${platformOutcomesLine(platform_outcomes)}`,
         '',
     ].join('\n'));
 }
@@ -626,6 +822,10 @@ module.exports = {
     resolveBlame,
     mintOidcToken,
     markTriageFailed,
+    computePlatformOutcomes,
+    platformOutcomesLine,
+    normalizePlatform,
+    decisionClassification,
     AI_WAIVED_LABEL,
     DEFAULT_STATUS_CONTEXT,
 };
