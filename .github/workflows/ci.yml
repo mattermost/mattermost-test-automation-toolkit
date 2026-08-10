@@ -38,7 +38,8 @@ jobs:
             scripts/triage-policy.test.js \
             scripts/triage-apply.test.js \
             scripts/triage-override.test.js \
-            scripts/triage-blame.test.js
+            scripts/triage-blame.test.js \
+            scripts/triage-candidates.test.js
 
   actionlint:
     name: Workflow lint

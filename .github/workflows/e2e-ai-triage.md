@@ -127,6 +127,79 @@ adjudicate:
 reusable workflow cannot escalate past its caller, and a missing scope makes the
 nested step no-op silently rather than fail.
 
+## Candidate stage (analysis-only)
+
+`e2e-ai-triage-candidates.yml` is an optional, side-effect-free stage that runs
+*before* mobile targeted reruns. The model nominates which failing clusters are
+likely flaky, so the rerun stage only re-runs those candidates instead of the
+whole failure set. It uploads one `candidates.json` artifact and does nothing
+else — no status, label, comment, notification, or ledger row, and no waiver.
+
+```yaml
+candidates:
+  uses: mattermost/mattermost-test-automation-toolkit/.github/workflows/e2e-ai-triage-candidates.yml@main
+  permissions:
+    contents: read
+    actions: read
+    id-token: write
+  with:
+    target_repo: ${{ github.repository }}
+    commit_sha: ${{ inputs.commit_sha }}
+    evidence_artifact: e2e-triage-evidence-${{ github.run_id }}
+    evidence_run_id: ${{ github.run_id }}
+    candidate_artifact: e2e-ai-triage-candidates-${{ github.run_id }}
+  secrets:
+    GH_TOKEN: ${{ secrets.GH_TOKEN }}
+    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+The candidate artifact has schema version 2:
+
+```jsonc
+{
+  "schema_version": 2,
+  "available": true,            // false when AI was skipped or validation failed
+  "verdicts": [{                 // the COMPLETE validated model result
+    "cluster_signature": "...", "verdict": "...", "confidence": 0.0,
+    "root_cause": "...", "evidence": [{"kind": "...", "ref": "...", "supports": "..."}]
+  }],
+  "candidates": [{              // only FLAKY_TEST/FLAKY_INFRA/FLAKY_SERVER at confidence >= 0.85
+    "cluster_signature": "...", "verdict": "FLAKY_TEST", "confidence": 0.93,
+    "root_cause": "...", "citations": [{"kind": "...", "ref": "...", "supports": "..."}]
+  }]
+}
+```
+
+`verdicts` is the complete validated model result the final policy consumes;
+`candidates` is only the flaky subset the mobile rerun stage selects from.
+Product/test/build verdicts are preserved in `verdicts` but never nominated for a
+flaky rerun. An unavailable artifact carries `available: false`, a `reason`, and
+empty arrays.
+
+### Consuming candidates in the final workflow
+
+Pass `candidate_artifact` and `candidate_run_id` to the final workflow. It
+downloads the artifact, re-validates it with `triage-candidates.js --mode=consume`,
+and reconstructs the standard model-output JSON from the artifact's `verdicts` —
+Claude is **not** invoked a second time. The deterministic policy then runs as
+usual against the post-rerun evidence, with rerun reproduction flags and history
+overriding any pre-rerun flaky nomination:
+
+- AI says flaky, but every rerun fails → `REGRESSION`.
+- AI says flaky, but the rerun is incomplete → `TRIAGE_FAILED`.
+- AI says product/test bug → `REGRESSION` without a rerun.
+- A candidate whose cluster passed rerun is absent from the final evidence and
+  simply drops out — it does not block.
+- A malformed or unavailable artifact → fail closed (no model verdicts;
+  unresolved clusters resolve red).
+- No `candidate_artifact` supplied → the existing workflow behaviour is
+  preserved exactly (Claude adjudicates the residue inline).
+
+The existing rules are not weakened: the flaky confidence bar (≥ 0.85), the
+two-distinct-citation requirement, the deterministic-rerun override, amnesty
+exhaustion, the ledger-before-green requirement, and one-regression-fails-the-run
+all still hold.
+
 ## `evidence.json` contract
 
 ```jsonc
@@ -232,5 +305,6 @@ over time.
 
 ```bash
 node --test scripts/triage-policy.test.js scripts/triage-apply.test.js \
-  scripts/triage-override.test.js scripts/triage-blame.test.js
+  scripts/triage-override.test.js scripts/triage-blame.test.js \
+  scripts/triage-candidates.test.js
 ```
