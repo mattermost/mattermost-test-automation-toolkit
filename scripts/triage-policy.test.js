@@ -405,6 +405,92 @@ test('rerun evidence never turns a regression green', () => {
     }
 });
 
+// mattermost-mobile#9996 run 31874108751: a PR touching only .github/ and
+// detox/triage/ was told a markdown-table scroll gesture was its regression, and
+// the iOS platform context was labelled "verified to be a product bug". The
+// failure was real — it reproduced on both reruns — but a CI-config diff cannot
+// reach a rendering path, so the attribution was the part triage got wrong.
+test('PR_REGRESSION is not attributable when the diff touches no app code', () => {
+    const unattributable = decideCluster(verdict({verdict: 'PR_REGRESSION', confidence: 0.9}), {
+        ...assist,
+        diffOverlapsFailure: false,
+        reproducedOnRerun: true,
+    });
+
+    assert.equal(unattributable.state, 'failure', 'still red — the failure is genuine');
+    assert.equal(unattributable.operational_outcome, OUTCOMES.TRIAGE_FAILED);
+    assert.match(unattributable.reason, /changes no app code/);
+});
+
+test('PR_REGRESSION stands when the diff does touch app code', () => {
+    const attributed = decideCluster(verdict({verdict: 'PR_REGRESSION', confidence: 0.9}), {
+        ...assist,
+        diffOverlapsFailure: true,
+    });
+
+    assert.equal(attributed.operational_outcome, OUTCOMES.REGRESSION);
+    assert.equal(attributed.verdict, 'PR_REGRESSION');
+});
+
+test('an absent diff-overlap signal does not downgrade PR_REGRESSION', () => {
+    // The destructured default is false, which is permissive for MAIN_REGRESSION
+    // and would be the opposite here. Absence is not evidence of non-overlap.
+    const stands = decideCluster(verdict({verdict: 'PR_REGRESSION', confidence: 0.9}), assist);
+
+    assert.equal(stands.operational_outcome, OUTCOMES.REGRESSION);
+});
+
+test('a baseline PR_REGRESSION is unaffected by diff overlap', () => {
+    for (const runType of ['MAIN', 'MASTER', 'RELEASE']) {
+        const baseline = decideCluster(verdict({verdict: 'PR_REGRESSION', confidence: 0.9}), {
+            ...assist, runType, diffOverlapsFailure: false,
+        });
+        assert.equal(baseline.operational_outcome, OUTCOMES.REGRESSION, runType);
+    }
+});
+
+test('the run quotes a cluster that produced its headline', () => {
+    // The exact shape of run 31874108751: one regression at 0.6 alongside two
+    // clusters triage could not classify, the most confident of which sat at
+    // 0.75. Ranking every red by confidence quoted the 0.75 TRIAGE_FAILED under
+    // a REGRESSION headline, which read as three product bugs.
+    const run = decideRun([
+        {state: 'success', verdict: 'FLAKY_TEST', confidence: 0.95,
+            operational_outcome: OUTCOMES.FLAKY_CONFIRMED, waived: true, reason: 'rerun passed'},
+        {state: 'failure', verdict: 'PR_REGRESSION', confidence: 0.6,
+            operational_outcome: OUTCOMES.REGRESSION, waived: false, reason: 'reproduced on every rerun'},
+        {state: 'success', verdict: 'FLAKY_TEST', confidence: 0.95,
+            operational_outcome: OUTCOMES.FLAKY_CONFIRMED, waived: true, reason: 'rerun passed'},
+        {state: 'failure', verdict: 'INCONCLUSIVE', confidence: 0.65,
+            operational_outcome: OUTCOMES.TRIAGE_FAILED, waived: false, reason: 'below the red bar of 0.7'},
+        {state: 'failure', verdict: 'INCONCLUSIVE', confidence: 0.75,
+            operational_outcome: OUTCOMES.TRIAGE_FAILED, waived: false, reason: 'below the green bar of 0.85'},
+    ]);
+
+    assert.equal(run.operational_outcome, OUTCOMES.REGRESSION);
+    assert.equal(run.verdict, 'PR_REGRESSION', 'the quoted cluster must be the deciding one');
+    assert.equal(run.confidence, 0.6);
+    assert.match(run.reason, /reproduced on every rerun/);
+    assert.doesNotMatch(run.reason, /green bar/, 'must not quote a cluster of a different outcome');
+    assert.match(run.reason, /1 regression, 2 unclassified/);
+    assert.equal(run.green_clusters, 2);
+    assert.equal(run.red_clusters, 3);
+});
+
+test('an all-unclassified run does not claim a regression', () => {
+    const run = decideRun([
+        {state: 'failure', verdict: 'INCONCLUSIVE', confidence: 0.65,
+            operational_outcome: OUTCOMES.TRIAGE_FAILED, waived: false, reason: 'below the red bar'},
+        {state: 'failure', verdict: 'INCONCLUSIVE', confidence: 0.75,
+            operational_outcome: OUTCOMES.TRIAGE_FAILED, waived: false, reason: 'below the green bar'},
+    ]);
+
+    assert.equal(run.operational_outcome, OUTCOMES.TRIAGE_FAILED);
+    assert.equal(run.confidence, 0.75, 'ranking still applies within the deciding outcome');
+    assert.match(run.reason, /2 unclassified/);
+    assert.doesNotMatch(run.reason, /regression/);
+});
+
 test('a cluster that cleared on rerun is still waivable', () => {
     const cleared = decideCluster(verdict({confidence: 0.9}), {
         ...assist,

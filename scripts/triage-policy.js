@@ -154,6 +154,32 @@ function decideCluster(verdictRecord, context = {}) {
             amnestyExhausted, reproducedOnRerun});
     }
 
+    // PR_REGRESSION means "this change broke it", which is a claim about the
+    // diff, not about the error text. Upstream, diff_overlaps_failure is false
+    // only when the files API succeeded, returned a complete list, and nothing
+    // in it touched app/, libraries/, or share_extension/; anything unknown maps
+    // to true. So an explicit false is established fact.
+    //
+    // Read off context directly rather than the destructured binding above,
+    // which defaults to false. That default is permissive for the
+    // MAIN_REGRESSION branch and would be the opposite here — absent would read
+    // as "proven unrelated" and downgrade every PR_REGRESSION from a caller that
+    // never supplied the field. Only an explicit false is evidence.
+    //
+    // A change confined to CI config, docs, or the test tree cannot break a
+    // rendering or gesture path in the app. Accepting the verdict anyway
+    // classified the platform PRODUCT_BUG and told the author their change broke
+    // a test it could not reach. The failure may well be real — this keeps it
+    // red — but the attribution is what triage got wrong, so the honest outcome
+    // is that it could not be attributed, not a bug report against this PR.
+    //
+    // Deliberately not applied to TEST_DEBT or BUILD_OR_ENV_ERROR: neither
+    // blames the diff, so neither needs the diff to corroborate it.
+    if (verdict === 'PR_REGRESSION' && !isBaseline && context.diffOverlapsFailure === false) {
+        return triageFailed(confidence,
+            'PR_REGRESSION, but this PR changes no app code — the failure is real, the attribution is not');
+    }
+
     // Genuine-failure verdicts. Below the red bar the conclusion is too weak to
     // act on, which is triage failure, not a silent green.
     if (REGRESSION_VERDICTS.has(verdict)) {
@@ -357,7 +383,33 @@ function decideRun(decisions, context = {}) {
 
     const reds = decisions.filter((d) => d.state !== 'success');
     if (reds.length > 0) {
-        const worst = reds.sort((a, b) => b.confidence - a.confidence)[0];
+        // The cluster we quote has to be one that actually produced the headline.
+        // Sorting every red by confidence and taking the top could pair a
+        // REGRESSION headline with a TRIAGE_FAILED cluster's reason, and did:
+        // "genuine test or product failure: 3 unwaived cluster(s); most
+        // confident: FLAKY_INFRA at 0.75 is below the green bar" described one
+        // regression using a different cluster's sub-threshold flake, and read as
+        // three product bugs. Narrow to the deciding outcome first, then rank.
+        const deciding = reds.filter((d) => d.operational_outcome === outcome);
+        const worst = (deciding.length > 0 ? deciding : reds)
+            .slice()
+            .sort((a, b) => b.confidence - a.confidence)[0];
+
+        // Name the composition rather than a bare total. "3 unwaived cluster(s)"
+        // invites the reader to assume three of whatever the headline says; one
+        // genuine failure alongside two the system could not classify is a
+        // materially different situation and a different next action.
+        const regressions = reds.filter(
+            (d) => d.operational_outcome === OUTCOMES.REGRESSION).length;
+        const unclassified = reds.length - regressions;
+        const parts = [];
+        if (regressions > 0) {
+            parts.push(`${regressions} regression`);
+        }
+        if (unclassified > 0) {
+            parts.push(`${unclassified} unclassified`);
+        }
+
         return {
             state: 'failure',
             operational_outcome: outcome,
@@ -366,7 +418,7 @@ function decideRun(decisions, context = {}) {
             waived: false,
             reason: reds.length === 1 ?
                 worst.reason :
-                `${reds.length} unwaived cluster(s); most confident: ${worst.reason}`,
+                `${parts.join(', ')}; ${worst.reason}`,
             green_clusters: decisions.length - reds.length,
             red_clusters: reds.length,
         };
