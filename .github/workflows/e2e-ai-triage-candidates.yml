@@ -179,14 +179,26 @@ jobs:
               - `history[]` — per-test TSIO history: `failure_rate`, `flake_rate`,
                 `flips`, `last_pass_commit`, `failing_since_commit`,
                 `failing_elsewhere`, and amnesty state
-              - `all_failing_on_baseline`, `any_failing_elsewhere`, `amnesty_exhausted`
+              - `baseline_status` — `failing` | `passing` | `unknown`
+              - `concurrent_failure` — `elsewhere` | `isolated` | `unknown`
+              - `determinism` — `reproduced` | `cleared` | `not_measured`
+              - `amnesty_exhausted`
 
             ## How to weigh the evidence
 
-            The measurements outrank your reading of the error text:
-            - `all_failing_on_baseline` true → the failure predates this change.
-            - `any_failing_elsewhere` true → the same test is failing on unrelated PRs
-              right now, so it is not this PR's change.
+            The measurements outrank your reading of the error text. The
+            `unknown`-shaped value on each field below means nobody measured, and
+            is never a synonym for the negative:
+            - `baseline_status` `failing` → the failure predates this change.
+              `passing` → it does not. `unknown` → no baseline record exists; this
+              does NOT mean the test is green on the baseline.
+            - `concurrent_failure` `elsewhere` → the same test is failing on
+              unrelated PRs right now, so it is not this PR's change. `isolated` →
+              it is not. `unknown` → the query did not answer.
+            - `determinism` `reproduced` → deterministic, so not flakiness.
+              `cleared` → the rerun passed. `not_measured` → no rerun ran; this is
+              the permanent state of every Maestro cluster and must not be read as
+              `cleared`.
             - `spans_platforms` true → far more likely a real code regression than an
               environment quirk; a wedged runner does not fail both iOS and Android.
             - A cluster confined to one shard while other shards passed is an

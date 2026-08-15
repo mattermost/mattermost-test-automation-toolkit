@@ -318,16 +318,35 @@ jobs:
               - `history[]` — per-test TSIO history: `failure_rate`, `flake_rate`,
                 `flips`, `last_pass_commit`, `failing_since_commit`,
                 `failing_elsewhere`, and amnesty state
-              - `all_failing_on_baseline`, `any_failing_elsewhere`, `amnesty_exhausted`
+              - `baseline_status` — `failing` | `passing` | `unknown`
+              - `concurrent_failure` — `elsewhere` | `isolated` | `unknown`
+              - `determinism` — `reproduced` | `cleared` | `not_measured`
+              - `amnesty_exhausted`
 
             Adjudicate ONLY the clusters where `needs_ai` is true. The rest are decided.
 
             ## How to weigh the evidence
 
-            The measurements outrank your reading of the error text:
-            - `all_failing_on_baseline` true → the failure predates this change.
-            - `any_failing_elsewhere` true → the same test is failing on unrelated PRs
-              right now, so it is not this PR's change.
+            The measurements outrank your reading of the error text. Each of the
+            three fields below has an `unknown`-shaped value, and it is never a
+            synonym for the negative — it means nobody measured, so nothing may be
+            concluded from it in either direction:
+            - `baseline_status` `failing` → the failure predates this change.
+              `passing` → it does not, which is what makes PR_REGRESSION credible.
+              `unknown` → this test has no baseline record at all. It does NOT mean
+              the test is green on the baseline. A PR_REGRESSION resting on
+              `unknown` is asserting a measurement nobody took; prefer INCONCLUSIVE
+              and say the baseline is unrecorded.
+            - `concurrent_failure` `elsewhere` → the same test is failing on
+              unrelated PRs right now, so it is not this PR's change. `isolated` →
+              it is not. `unknown` → the query did not answer; this neither
+              supports nor opposes attribution.
+            - `determinism` `reproduced` → it failed on every rerun repetition, so
+              it is deterministic and cannot be flakiness. `cleared` → the rerun
+              passed, which is positive evidence of flakiness. `not_measured` → no
+              rerun ran, so there is no reproduction evidence either way. Do not
+              read `not_measured` as `cleared`: every Maestro cluster carries it
+              permanently, because Maestro has no per-flow rerun.
             - `spans_platforms` true → far more likely a real code regression than an
               environment quirk; a wedged runner does not fail both iOS and Android.
             - A cluster confined to one shard while other shards passed is an
