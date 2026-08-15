@@ -369,6 +369,42 @@ test('rerun evidence does not interfere with a red verdict', () => {
     assert.equal(red.verdict, 'PR_REGRESSION', 'the verdict stands; only waivers are blocked');
 });
 
+test('a sub-threshold regression that reproduced on every rerun is still a regression', () => {
+    const measured = decideCluster(verdict({verdict: 'PR_REGRESSION', confidence: 0.6}), {
+        ...assist,
+        reproducedOnRerun: true,
+    });
+
+    // The confidence bar guards the assertion of a *cause*. REGRESSION only
+    // claims a genuine failure exists, and reproducing on every fresh-device
+    // repetition establishes exactly that without the model. Reporting this as
+    // "triage could not complete safely" said the pipeline gave up, when it had
+    // in fact measured the failure twice.
+    assert.equal(measured.operational_outcome, OUTCOMES.REGRESSION);
+    assert.equal(measured.verdict, 'PR_REGRESSION');
+    assert.match(measured.reason, /reproduced on every rerun/);
+});
+
+test('a sub-threshold regression with no rerun evidence is still triage failure', () => {
+    const unmeasured = decideCluster(verdict({verdict: 'PR_REGRESSION', confidence: 0.6}), assist);
+
+    assert.equal(unmeasured.operational_outcome, OUTCOMES.TRIAGE_FAILED);
+    assert.equal(unmeasured.verdict, 'INCONCLUSIVE');
+    assert.match(unmeasured.reason, /below the red bar/);
+});
+
+test('rerun evidence never turns a regression green', () => {
+    for (const v of ['PR_REGRESSION', 'BUILD_OR_ENV_ERROR', 'TEST_DEBT']) {
+        for (const confidence of [0, 0.3, 0.6, 0.69, 0.7, 0.99]) {
+            const decided = decideCluster(verdict({verdict: v, confidence}), {
+                ...assist,
+                reproducedOnRerun: true,
+            });
+            assert.equal(decided.state, 'failure', `${v} at ${confidence} must stay red`);
+        }
+    }
+});
+
 test('a cluster that cleared on rerun is still waivable', () => {
     const cleared = decideCluster(verdict({confidence: 0.9}), {
         ...assist,

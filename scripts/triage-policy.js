@@ -157,9 +157,29 @@ function decideCluster(verdictRecord, context = {}) {
     // Genuine-failure verdicts. Below the red bar the conclusion is too weak to
     // act on, which is triage failure, not a silent green.
     if (REGRESSION_VERDICTS.has(verdict)) {
-        if (confidence < RED_CONFIDENCE_BAR) {
+        // Unless the rerun already measured it. The confidence bar exists to stop
+        // the system asserting a *cause* it is unsure of, but REGRESSION only
+        // claims "this is a genuine failure" — and a failure that reproduced on
+        // every fresh-device repetition is deterministic by measurement, which is
+        // that claim established independently of the model.
+        //
+        // The same measurement is already trusted to override a FLAKY_TEST at
+        // 0.95 in waiveOrConfirm. Letting it override there but not here was
+        // incoherent: it meant the strongest evidence the pipeline produces could
+        // only ever push toward red inside the waivable branch, and a reproduced
+        // PR_REGRESSION at 0.6 was reported as "triage could not complete safely"
+        // when triage had in fact completed and measured the thing twice.
+        //
+        // Safe in one direction only: both outcomes are already `state: failure`,
+        // so this cannot green a run. It changes the headline a reviewer reads
+        // and the platform classification from TRIAGE_FAILED to PRODUCT_BUG.
+        if (confidence < RED_CONFIDENCE_BAR && !reproducedOnRerun) {
             return triageFailed(confidence,
                 `${verdict} at ${confidence} is below the red bar of ${RED_CONFIDENCE_BAR}`);
+        }
+        if (confidence < RED_CONFIDENCE_BAR) {
+            return regression(verdict, confidence,
+                `${verdict} below the confidence bar but reproduced on every rerun`);
         }
         return regression(verdict, confidence, verdictRecord.root_cause || verdict);
     }

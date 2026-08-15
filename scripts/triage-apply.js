@@ -265,6 +265,19 @@ async function recordLedger({tsioUrl, token, apiKey, batch}) {
     if (!res.ok) {
         throw new Error(`ledger write failed: ${res.status} ${await res.text()}`);
     }
+
+    // A TSIO deployment without the triage routes serves its single-page app on
+    // every unmatched path, so the miss arrives as 200 text/html rather than a
+    // 404. res.ok is true, res.json() then dies on the doctype, and the run is
+    // reported as `Unexpected token '<'` — which reads as a triage bug rather
+    // than a missing endpoint. Checking the content type turns the most likely
+    // deployment mistake into a message that names itself.
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('json')) {
+        throw new Error(
+            `ledger endpoint returned ${res.status} ${contentType || 'no content-type'} — ` +
+            `POST ${tsioUrl}/api/v1/triage/verdicts is not served by this TSIO deployment`);
+    }
     return res.json();
 }
 
@@ -272,6 +285,12 @@ async function recordLedger({tsioUrl, token, apiKey, batch}) {
  * Turn a green run into a triage failure. Used when the ledger or the PR-head
  * verification refuses to underwrite a waiver: the verdicts may say flaky, but
  * the run cannot be allowed to go green, so the outcome becomes TRIAGE_FAILED.
+ *
+ * The reason carries only the cause. statusDescription() prefixes the
+ * TRIAGE_FAILED headline itself, and spelling it out here too produced
+ * "triage could not complete safely: triage could not complete safely: …",
+ * which spent 35 of the 140 available characters restating the headline and
+ * truncated the actual error mid-word.
  */
 function markTriageFailed(runDecision, reason) {
     return {
@@ -279,7 +298,7 @@ function markTriageFailed(runDecision, reason) {
         state: 'failure',
         operational_outcome: OUTCOMES.TRIAGE_FAILED,
         waived: false,
-        reason: `triage could not complete safely: ${reason}`,
+        reason,
     };
 }
 

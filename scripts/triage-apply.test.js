@@ -8,7 +8,7 @@ const {
     assembleVerdicts, renderComment, markTriageFailed,
     computePlatformOutcomes, platformOutcomesLine, normalizePlatform, decisionClassification,
 } = require('./triage-apply');
-const {decideCluster, decideRun, OUTCOMES} = require('./triage-policy');
+const {decideCluster, decideRun, statusDescription, OUTCOMES} = require('./triage-policy');
 
 const assist = {mode: 'assist', runType: 'PR'};
 
@@ -141,6 +141,17 @@ test('markTriageFailed turns a green run red with the triage-failed outcome', ()
     assert.equal(failed.operational_outcome, OUTCOMES.TRIAGE_FAILED);
     assert.equal(failed.waived, false);
     assert.match(failed.reason, /ledger recording failed/);
+
+    // statusDescription owns the headline. Spelling it out in the reason too
+    // produced "triage could not complete safely: triage could not complete
+    // safely: …", spending 35 of the 140 characters GitHub allows on a repeat
+    // and truncating the actual cause mid-word.
+    const description = statusDescription(failed);
+    assert.equal(
+        description.match(/triage could not complete safely/g).length, 1,
+        'the headline must appear exactly once',
+    );
+    assert.match(description, /ledger recording failed — 503$/, 'the cause must survive intact');
 });
 
 // ---------- blame reaches the comment ----------
