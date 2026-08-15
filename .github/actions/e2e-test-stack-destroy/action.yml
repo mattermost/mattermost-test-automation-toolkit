@@ -23,6 +23,12 @@ outputs:
   state:
     description: "'destroyed', or 'gone' when the batch had already been taken."
     value: ${{ steps.invoke.outputs.state }}
+  sites:
+    description: >
+      JSON array of the sites this batch had, one per instance, so a caller can
+      check they stopped serving. Empty for an instance that never launched, and
+      empty overall for a batch that was already gone.
+    value: ${{ steps.invoke.outputs.sites }}
 
 runs:
   using: composite
@@ -86,7 +92,10 @@ runs:
         # control plane returns it as a value, so repeating a teardown over
         # stale ids passes.
         state=$(jq -r '.batch.state // "destroyed"' "$response")
-        echo "state=${state}" >> "$GITHUB_OUTPUT"
+        {
+          echo "state=${state}"
+          echo "sites=$(jq -c '.sites // []' "$response")"
+        } >> "$GITHUB_OUTPUT"
         echo "${BATCH_ID}: ${state}"
 
     # What the batch cost. The only place it is reported: a destroyed batch
