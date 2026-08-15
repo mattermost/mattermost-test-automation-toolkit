@@ -1,0 +1,150 @@
+---
+name: E2E Test Stack Credentials
+description: >
+  Reads one instance's site URL and admin credentials from a leased batch, for
+  the job that runs tests against it.
+
+# Credentials stay inside the job that uses them. ::add-mask:: applies to the
+# job that set it, so a value handed to another job arrives unmasked.
+#
+# Uses the credentials the job holds: run aws-actions/configure-aws-credentials
+# once in the job first.
+
+inputs:
+  batch_id:
+    description: "Batch to read, as returned by e2e-test-stack-create.yml."
+    required: true
+  index:
+    description: "Which instance of the batch, in creation order. A shard index."
+    required: true
+  lambda_alias:
+    description: "Leave as 'v1' unless the batch was created with 'edge'. Must match whatever created it."
+    required: false
+    default: "v1"
+
+outputs:
+  site_url:
+    description: "HTTPS address of this instance."
+    value: ${{ steps.fetch.outputs.site_url }}
+  admin_username:
+    description: "Admin account created on this instance."
+    value: ${{ steps.fetch.outputs.admin_username }}
+  admin_email:
+    description: "Email of that account."
+    value: ${{ steps.fetch.outputs.admin_email }}
+  admin_password:
+    description: "Password for that account. Masked in this job's logs; pass it on through env, never inside a run body."
+    value: ${{ steps.fetch.outputs.admin_password }}
+  credentials:
+    description: >
+      Every other service credential this instance generated, as a JSON object
+      keyed "<service>.<key>" - postgres.password, keycloak.admin_password,
+      minio.access_key, minio.secret_key, azurite.account_key,
+      openldap.admin_password, opensearch.admin_password. Which keys exist
+      follows the services the stack was created with. Read one with fromJSON.
+    value: ${{ steps.fetch.outputs.credentials }}
+
+runs:
+  using: composite
+  steps:
+    - name: ci/fetch-credentials
+      id: fetch
+      shell: bash
+      env:
+        BATCH_ID: ${{ inputs.batch_id }}
+        INDEX: ${{ inputs.index }}
+        LAMBDA_ALIAS: ${{ inputs.lambda_alias }}
+      run: |
+        set -euo pipefail
+
+        # required: true is advisory on an action input - the runner does not
+        # enforce it. The index must be present and a whole number.
+        case "$INDEX" in
+          '')
+            echo "::error::index is required; pass the shard index, or 0 for a single instance"
+            exit 1
+            ;;
+          *[!0-9]*)
+            echo "::error::index must be a whole number, got '${INDEX}'"
+            exit 1
+            ;;
+        esac
+
+        case "$LAMBDA_ALIAS" in
+          v1 | edge) ;;
+          *)
+            echo "::error::lambda_alias must be 'v1' or 'edge', got '${LAMBDA_ALIAS}'"
+            exit 1
+            ;;
+        esac
+
+        payload="${RUNNER_TEMP}/e2e-fetch-payload.json"
+        response="${RUNNER_TEMP}/e2e-fetch-response.json"
+        invoke="${RUNNER_TEMP}/e2e-fetch-invoke.json"
+
+        jq -nc --arg batch_id "$BATCH_ID" \
+          '{action: "fetch", batch_id: $batch_id}' > "$payload"
+
+        set +e
+        aws lambda invoke \
+          --function-name "e2e-test-stack:${LAMBDA_ALIAS}" \
+          --cli-read-timeout 120 \
+          --cli-connect-timeout 60 \
+          --cli-binary-format raw-in-base64-out \
+          --payload "file://${payload}" \
+          "$response" > "$invoke"
+        invoke_status=$?
+        set -e
+
+        if [ $invoke_status -ne 0 ]; then
+          echo "::error::the invocation itself failed"
+          cat "$invoke" 2>/dev/null || true
+          exit 1
+        fi
+        if jq -e 'has("FunctionError")' "$invoke" > /dev/null; then
+          echo "::error::the control plane returned an error"
+          jq -r '.error // "no reason given"' "$response"
+          exit 1
+        fi
+
+        # Masked before anything else reads it, and before it reaches
+        # GITHUB_OUTPUT, so an accidental echo anywhere later in this job is
+        # redacted rather than published. Everything under credentials except the
+        # postgres user and database name, which are not secret and would be
+        # redacted from every line that mentions them. Named the other way round
+        # so a service added later is masked without being listed.
+        for secret in $(jq -r '
+            [ (.batch.instances[]? | select(. != null) | .admin.password),
+              (.batch.instances[]? | select(. != null) | .credentials // {} | to_entries[]
+                 | select(.key | IN("postgres.user", "postgres.database") | not)
+                    | .value) ]
+            | map(select(. != null and . != "")) | unique | .[]' "$response"); do
+          echo "::add-mask::${secret}"
+        done
+
+        instance=$(jq -c --argjson i "$INDEX" '.batch.instances[$i] // empty' "$response")
+        if [ -z "$instance" ]; then
+          echo "::error::batch ${BATCH_ID} has no instance at index ${INDEX}; it holds $(jq -r '.batch.instances | length' "$response")"
+          exit 1
+        fi
+
+        # A stack that is not ready has no admin to log in as, so this fails
+        # here rather than as an authentication error inside the suite.
+        state=$(jq -r '.state // "unknown"' <<< "$instance")
+        if [ "$state" != "ready" ]; then
+          echo "::error::instance ${INDEX} of ${BATCH_ID} is '${state}', not ready"
+          exit 1
+        fi
+
+        {
+          echo "site_url=$(jq -r '.site_url' <<< "$instance")"
+          echo "admin_username=$(jq -r '.admin.username' <<< "$instance")"
+          echo "admin_email=$(jq -r '.admin.email' <<< "$instance")"
+          echo "admin_password=$(jq -r '.admin.password' <<< "$instance")"
+
+          # One object, because which keys exist follows the services the
+          # batch was created with.
+          echo "credentials=$(jq -c '.credentials // {}' <<< "$instance")"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "instance ${INDEX} of ${BATCH_ID}: $(jq -r '.site_url' <<< "$instance")"

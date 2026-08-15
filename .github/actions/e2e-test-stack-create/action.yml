@@ -1,0 +1,288 @@
+---
+name: E2E Test Stack Create
+description: >
+  Leases remote E2E test servers - isolated, short-lived Mattermost stacks,
+  each reachable over HTTPS.
+
+# Runs in the consuming job and uses the credentials that job holds. Assumes
+# none itself: run aws-actions/configure-aws-credentials once in the job first.
+
+inputs:
+  instance_key:
+    description: "Names the stack, and its hostname - 'pr-1234', 'main'. Lowercase letters, digits and hyphens, 24 characters or fewer. It prefixes every hostname the stack answers on."
+    required: true
+  server_image:
+    description: "Mattermost server image on Docker Hub, by tag, e.g. mattermostdevelopment/mattermost-enterprise-edition:master. Name it without a registry host, and do not pin by digest - both are refused. This is what is under test."
+    required: true
+  count:
+    description: "Instances to create, from 1 to 40. They are created concurrently, so a batch takes about as long as one."
+    required: false
+    default: "1"
+  lambda_alias:
+    description: "Leave as 'v1', the promoted build, unless you are proving a new build of the stack tooling itself - then use 'edge', the newest published. The agent comes with whichever is named."
+    required: false
+    default: "v1"
+  services:
+    description: "Comma-separated optional services, e.g. 'keycloak,minio'. One or more of: minio or azurite, elasticsearch or opensearch, keycloak, openldap. Each 'or' pair sets the same boot setting, so only one of each may run. Empty runs Postgres, Inbucket and the server alone. Everything at once is 'minio,elasticsearch,keycloak,openldap'."
+    required: false
+    default: ""
+  ttl:
+    description: "How long the stack lives before the reaper takes it - '90m', '4h'. The control plane's ceiling is 4h."
+    required: false
+    default: "1h"
+  os:
+    description: "Operating system the stack runs on: 'ubuntu-24.04' or 'ubuntu-26.04'."
+    required: false
+    default: "ubuntu-24.04"
+  license:
+    description: "Licence SKU to apply: 'enterprise-advanced'. Empty runs unlicensed, leaving the server to request a trial. The set is provisioned per deployment, so an unknown SKU is refused with the list that exists."
+    required: false
+    default: ""
+  wait_for_migrations:
+    description: "Wait for server migrations to finish before reporting ready."
+    required: false
+    default: "false"
+  shared_admin_password:
+    description: "Give every instance in the batch the same admin password."
+    required: false
+    default: "false"
+
+outputs:
+  batch_id:
+    description: "Handle that addresses this batch."
+    value: ${{ steps.invoke.outputs.batch_id }}
+  sites:
+    description: "JSON array of site URLs, one per instance, in the order they were created."
+    value: ${{ steps.invoke.outputs.sites }}
+  ready:
+    description: "How many instances came up ready."
+    value: ${{ steps.invoke.outputs.ready }}
+
+runs:
+  using: composite
+  steps:
+    - name: ci/check-inputs
+      shell: bash
+      env:
+        INSTANCE_KEY: ${{ inputs.instance_key }}
+        LAMBDA_ALIAS: ${{ inputs.lambda_alias }}
+        SERVER_IMAGE: ${{ inputs.server_image }}
+        COUNT: ${{ inputs.count }}
+        WAIT_FOR_MIGRATIONS: ${{ inputs.wait_for_migrations }}
+        SHARED_ADMIN_PASSWORD: ${{ inputs.shared_admin_password }}
+      run: |
+        # required: true is advisory on an action input - the runner does not
+        # enforce it - so what must be present is checked here.
+        case "$LAMBDA_ALIAS" in
+          v1 | edge) ;;
+          *)
+            echo "::error::lambda_alias must be 'v1' or 'edge', got '${LAMBDA_ALIAS}'"
+            exit 1
+            ;;
+        esac
+
+        if [ -z "$INSTANCE_KEY" ]; then
+          echo "::error::instance_key is required; it names the stack, e.g. pr-1234"
+          exit 1
+        fi
+
+        # Shorter than the control plane allows: the key prefixes every hostname,
+        # and a long one makes every URL in a test report unreadable.
+        if [ "${#INSTANCE_KEY}" -gt 24 ]; then
+          echo "::error::instance_key is ${#INSTANCE_KEY} characters; keep it to 24 or fewer"
+          exit 1
+        fi
+
+        if [ -z "$SERVER_IMAGE" ]; then
+          echo "::error::server_image is empty; name the image under test, e.g. mattermostdevelopment/mattermost-enterprise-edition:master"
+          exit 1
+        fi
+
+        case "$COUNT" in
+          '' | *[!0-9]*)
+            echo "::error::count must be a whole number, got '${COUNT}'"
+            exit 1
+            ;;
+        esac
+        if [ "$COUNT" -lt 1 ]; then
+          echo "::error::count must be at least 1, got ${COUNT}"
+          exit 1
+        fi
+        if [ "$COUNT" -gt 40 ]; then
+          echo "::error::count is above the ceiling of 40, got ${COUNT}"
+          exit 1
+        fi
+
+        # An action input is a string whatever the caller wrote, and these two
+        # reach the payload as JSON booleans. Anything else is either not JSON,
+        # which fails while naming jq instead of the input, or is JSON that jq
+        # reads as true.
+        case "$WAIT_FOR_MIGRATIONS" in
+          true | false) ;;
+          *)
+            echo "::error::wait_for_migrations must be 'true' or 'false', got '${WAIT_FOR_MIGRATIONS}'"
+            exit 1
+            ;;
+        esac
+
+        case "$SHARED_ADMIN_PASSWORD" in
+          true | false) ;;
+          *)
+            echo "::error::shared_admin_password must be 'true' or 'false', got '${SHARED_ADMIN_PASSWORD}'"
+            exit 1
+            ;;
+        esac
+
+    - name: ci/invoke-create
+      id: invoke
+      shell: bash
+      env:
+        INSTANCE_KEY: ${{ inputs.instance_key }}
+        COUNT: ${{ inputs.count }}
+        SERVER_IMAGE: ${{ inputs.server_image }}
+        SERVICES: ${{ inputs.services }}
+        TTL: ${{ inputs.ttl }}
+        OS_VARIANT: ${{ inputs.os }}
+        LICENSE: ${{ inputs.license }}
+        WAIT_FOR_MIGRATIONS: ${{ inputs.wait_for_migrations }}
+        SHARED_ADMIN_PASSWORD: ${{ inputs.shared_admin_password }}
+        LAMBDA_ALIAS: ${{ inputs.lambda_alias }}
+      run: |
+        set -euo pipefail
+
+        # Under RUNNER_TEMP, not the workspace: the response carries an admin
+        # password per instance, and a workspace is what a consumer checks out,
+        # uploads and archives.
+        payload="${RUNNER_TEMP}/e2e-create-payload.json"
+        response="${RUNNER_TEMP}/e2e-create-response.json"
+        invoke="${RUNNER_TEMP}/e2e-create-invoke.json"
+        echo "response=${response}" >> "$GITHUB_OUTPUT"
+
+        # jq builds the payload, so an input carrying a quote cannot change its
+        # shape. Empty strings are dropped, leaving the control plane to apply
+        # its own defaults.
+        jq -nc \
+          --arg instance_key "$INSTANCE_KEY" \
+          --argjson count "$COUNT" \
+          --arg server_image "$SERVER_IMAGE" \
+          --arg services "$SERVICES" \
+          --arg ttl "$TTL" \
+          --arg os "$OS_VARIANT" \
+          --arg license "$LICENSE" \
+          --argjson wait_for_migrations "$WAIT_FOR_MIGRATIONS" \
+          --argjson shared_admin_password "$SHARED_ADMIN_PASSWORD" \
+          '{action: "create", instance_key: $instance_key, count: $count,
+            server_image: $server_image}
+           + (if $services == "" then {} else {services: ($services | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != "")))} end)
+           + (if $ttl == "" then {} else {ttl: $ttl} end)
+           + (if $os == "" then {} else {os: $os} end)
+           + (if $license == "" then {} else {license: $license} end)
+           + (if $wait_for_migrations then {wait_for_migrations: true} else {} end)
+           + (if $shared_admin_password then {shared_admin_password: true} else {} end)' \
+          > "$payload"
+
+        echo "Payload:"
+        jq . "$payload"
+
+        # botocore gives up after 60 seconds by default, on a call that is still
+        # working. This is above the function's own ceiling, so the CLI never
+        # abandons a create that is still running.
+        set +e
+        aws lambda invoke \
+          --function-name "e2e-test-stack:${LAMBDA_ALIAS}" \
+          --cli-read-timeout 960 \
+          --cli-connect-timeout 60 \
+          --cli-binary-format raw-in-base64-out \
+          --payload "file://${payload}" \
+          "$response" > "$invoke"
+        invoke_status=$?
+        set -e
+
+        if [ $invoke_status -ne 0 ]; then
+          echo "::error::the invocation itself failed"
+          cat "$invoke" 2>/dev/null || true
+          exit 1
+        fi
+
+        # Masked before anything reads the response: it carries an admin
+        # password per instance, and a consuming repository's logs may be
+        # public. Everything under credentials except the postgres user and
+        # database name, which are not secret and would be redacted from every
+        # line that mentions them. Named the other way round so a service added
+        # later is masked without being listed.
+        for secret in $(jq -r '
+            [ (.batch.instances[]? | select(. != null) | .admin.password),
+              (.batch.instances[]? | select(. != null) | .credentials // {} | to_entries[]
+                 | select(.key | IN("postgres.user", "postgres.database") | not)
+                 | .value) ]
+            | map(select(. != null and . != "")) | unique | .[]' "$response"); do
+          echo "::add-mask::${secret}"
+        done
+
+        batch_id=$(jq -r '.batch_id // ""' "$response")
+        {
+          echo "batch_id=${batch_id}"
+          echo "sites=$(jq -c '.sites // []' "$response")"
+          echo "ready=$(jq -r '.batch.ready // 0' "$response")"
+        } >> "$GITHUB_OUTPUT"
+
+        # A handler error is not an invocation error: the CLI exits 0 and says
+        # so here instead. Reported after the outputs are set, so a partial
+        # create still hands back the batch id its instances need to be
+        # destroyed by.
+        if jq -e 'has("FunctionError")' "$invoke" > /dev/null; then
+          echo "::error::the control plane returned an error"
+          jq -r '.error // "no reason given"' "$response"
+          exit 1
+        fi
+        if [ -n "$(jq -r '.error // ""' "$response")" ]; then
+          echo "::error::$(jq -r .error "$response")"
+          exit 1
+        fi
+        if [ -z "$batch_id" ]; then
+          echo "::error::no batch id in the response"
+          exit 1
+        fi
+
+    # Time to ready per instance, so a slow member of a batch is visible without
+    # reading the response.
+    - name: ci/summary
+      if: always() && steps.invoke.outputs.batch_id != ''
+      shell: bash
+      env:
+        RESPONSE: ${{ steps.invoke.outputs.response }}
+      run: |
+        set -euo pipefail
+        cat > "${RUNNER_TEMP}/e2e-create-summary.jq" <<'SUMMARY'
+        def secs: if . == null then "—" else (. * 10 | round / 10 | tostring) + "s" end;
+
+        . as $r
+        | [ .batch.instances[]? | select(. != null) ] as $live
+                | $live[0] as $first
+        |
+        "### E2E test stack — " + ($r.batch.state // "unknown"),
+        "",
+        "| | |",
+        "|---|---|",
+        "| Batch | `" + ($r.batch_id // "—") + "` |",
+        "| Ready | " + (($live | map(select(.state == "ready")) | length) | tostring)
+                     + " of " + (($r.batch.instances | length) | tostring) + " |",
+        "| Wall clock | " + ($r.batch.timing.total_seconds | secs) + " |",
+        "| Expires | " + ($r.batch.expires_at // "—") + " |",
+        "",
+        "#### Time to ready",
+        "",
+        "| Instance | Ready in |",
+        "|---|---|",
+        ( $live[] | "| `" + .instance_id + "` | " + (.timing.total_seconds | secs) + " |" ),
+        "",
+        "#### Server image",
+        "",
+        "`" + (($first.server_image.digest // "—")[0:26]) + "…` ("
+            + ($first.server_image.age // "unknown age") + ")",
+        "",
+        "#### Sites",
+        "",
+        ( $r.sites[]? | "- " + . )
+        SUMMARY
+        jq -r -f "${RUNNER_TEMP}/e2e-create-summary.jq" "$RESPONSE" >> "$GITHUB_STEP_SUMMARY"

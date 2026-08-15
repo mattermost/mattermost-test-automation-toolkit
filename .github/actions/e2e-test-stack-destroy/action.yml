@@ -1,0 +1,134 @@
+---
+name: E2E Test Stack Destroy
+description: >
+  Releases a batch leased by e2e-test-stack-create, and reports what it cost.
+
+# Run it with if: always() so a failed test step still releases what it leased.
+# A batch that is already gone is not an error, so a teardown over stale ids is
+# safe to repeat.
+#
+# Uses the credentials the job holds: run aws-actions/configure-aws-credentials
+# once in the job first.
+
+inputs:
+  batch_id:
+    description: "Batch to destroy, as returned by e2e-test-stack-create."
+    required: true
+  lambda_alias:
+    description: "Leave as 'v1' unless the batch was created with 'edge'. Must match whatever created it."
+    required: false
+    default: "v1"
+
+outputs:
+  state:
+    description: "'destroyed', or 'gone' when the batch had already been taken."
+    value: ${{ steps.invoke.outputs.state }}
+
+runs:
+  using: composite
+  steps:
+    - name: ci/invoke-destroy
+      id: invoke
+      shell: bash
+      env:
+        BATCH_ID: ${{ inputs.batch_id }}
+        LAMBDA_ALIAS: ${{ inputs.lambda_alias }}
+      run: |
+        set -euo pipefail
+
+        case "$LAMBDA_ALIAS" in
+          v1 | edge) ;;
+          *)
+            echo "::error::lambda_alias must be 'v1' or 'edge', got '${LAMBDA_ALIAS}'"
+            exit 1
+            ;;
+        esac
+
+        # An empty batch id means the create never got far enough to report one.
+        # Nothing to destroy, and whatever it launched is left to its TTL.
+        if [ -z "$BATCH_ID" ]; then
+          echo "::error::batch_id is empty; nothing to destroy, and any instances created are left to their TTL"
+          exit 1
+        fi
+
+        payload="${RUNNER_TEMP}/e2e-destroy-payload.json"
+        response="${RUNNER_TEMP}/e2e-destroy-response.json"
+        invoke="${RUNNER_TEMP}/e2e-destroy-invoke.json"
+        echo "response=${response}" >> "$GITHUB_OUTPUT"
+
+        jq -nc --arg batch_id "$BATCH_ID" \
+          '{action: "destroy", batch_id: $batch_id}' > "$payload"
+
+        set +e
+        aws lambda invoke \
+          --function-name "e2e-test-stack:${LAMBDA_ALIAS}" \
+          --cli-read-timeout 960 \
+          --cli-connect-timeout 60 \
+          --cli-binary-format raw-in-base64-out \
+          --payload "file://${payload}" \
+          "$response" > "$invoke"
+        invoke_status=$?
+        set -e
+
+        if [ $invoke_status -ne 0 ]; then
+          echo "::error::the invocation itself failed; ${BATCH_ID} may still be running"
+          cat "$invoke" 2>/dev/null || true
+          exit 1
+        fi
+
+        if jq -e 'has("FunctionError")' "$invoke" > /dev/null; then
+          echo "::error::the control plane returned an error; ${BATCH_ID} may still be running"
+          jq -r '.error // "no reason given"' "$response"
+          exit 1
+        fi
+
+        # 'gone' means another destroy, or the reaper, got there first. The
+        # control plane returns it as a value, so repeating a teardown over
+        # stale ids passes.
+        state=$(jq -r '.batch.state // "destroyed"' "$response")
+        echo "state=${state}" >> "$GITHUB_OUTPUT"
+        echo "${BATCH_ID}: ${state}"
+
+    # What the batch cost. The only place it is reported: a destroyed batch
+    # leaves no other trace a consumer can see.
+    - name: ci/summary
+      if: always() && steps.invoke.outputs.state != ''
+      shell: bash
+      env:
+        RESPONSE: ${{ steps.invoke.outputs.response }}
+      run: |
+        set -euo pipefail
+        cat > "${RUNNER_TEMP}/e2e-destroy-summary.jq" <<'SUMMARY'
+        def money: if . == null then "—" else (. * 10000 | round / 10000 | tostring) end;
+        def secs: if . == null then "—" else (. * 10 | round / 10 | tostring) + "s" end;
+
+        . as $r
+        | [ .batch.instances[]? | select(. != null) ] as $live
+        | .batch.cost as $c
+        |
+        "### E2E test stack released",
+        "",
+        "| | |",
+        "|---|---|",
+        "| Batch | `" + ($r.batch_id // "—") + "` |",
+        "| State | " + ($r.batch.state // "unknown") + " |",
+        "| Instances | " + (($r.batch.instances // [] | length) | tostring) + " |",
+        "| Leased for | " + (if $c.hours then (($c.hours * 60 * 10 | round / 10) | tostring) + " min" else "—" end) + " |",
+        ( if $c == null then "| Cost | — |"
+          else
+            ( "| Cost | **" + ($c.total | money) + " " + ($c.currency // "USD") + "**"
+              + (if $c.estimated then " (estimated)" else "" end) + " |" )
+          end ),
+        "",
+        ( if $c == null then "Nothing was running to price." else empty end ),
+        ( if ($live | length) == 0 then empty
+          else
+            ( "#### Instances",
+              "",
+              "| Instance | Ready in | Cost |",
+              "|---|---|---|",
+              ( $live[] | "| `" + .instance_id + "` | "
+                  + (.timing.total_seconds | secs) + " | " + (.cost.total | money) + " |" ) )
+          end )
+        SUMMARY
+        jq -r -f "${RUNNER_TEMP}/e2e-destroy-summary.jq" "$RESPONSE" >> "$GITHUB_STEP_SUMMARY"
