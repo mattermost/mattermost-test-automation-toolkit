@@ -570,6 +570,18 @@ async function main() {
         reproducedOnRerun: suiteFacts ?
             suiteFacts.reproducedOnRerun :
             Boolean(clusters[i] && clusters[i].reproduced_on_rerun),
+
+        // Whether this failure is a lone assertion or the shape of something
+        // systemic. It is what makes the "the diff cannot reach it" argument
+        // safe: a change to the harness — a workflow input, a device flag, a
+        // server URL — breaks tests broadly, so one failing assertion beside
+        // hundreds of passes on the same platform is not a harness change
+        // expressing itself. A suite verdict is systemic by definition and never
+        // qualifies.
+        isolatedFailure: !suiteFacts && Boolean(clusters[i]) &&
+            clusters[i].member_count === 1 &&
+            !clusters[i].spans_shards &&
+            !clusters[i].spans_platforms,
     }));
     // The run's shape decides what "no decisions" means. A passing suite has
     // nothing to triage and must go green; a suite that produced no reports at

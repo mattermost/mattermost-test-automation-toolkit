@@ -58,6 +58,12 @@ const OUTCOMES = {
     FLAKY_CONFIRMED: 'FLAKY_CONFIRMED',
     REGRESSION: 'REGRESSION',
     TRIAGE_FAILED: 'TRIAGE_FAILED',
+
+    // A real failure that this pull request provably did not cause. Distinct
+    // from FLAKY_CONFIRMED (which claims the failure is not real) and from
+    // MAIN_REGRESSION (which needs baseline history to establish). This one is
+    // established from the diff, so it is reachable when no history exists.
+    NOT_ATTRIBUTABLE: 'NOT_ATTRIBUTABLE',
 };
 
 // The headline is the user-facing language. The verdict and confidence never
@@ -66,6 +72,7 @@ const OUTCOME_HEADLINES = {
     [OUTCOMES.FLAKY_CONFIRMED]: 'confirmed flaky failures',
     [OUTCOMES.REGRESSION]: 'genuine test or product failure',
     [OUTCOMES.TRIAGE_FAILED]: 'triage could not complete safely',
+    [OUTCOMES.NOT_ATTRIBUTABLE]: 'real failure, but not caused by this change',
 };
 
 // Run types that represent a protected branch rather than a PR. Confirmed flakes
