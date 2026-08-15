@@ -509,8 +509,32 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Notify only when a human has something to do about it.
+      #
+      # This fired on every run, which was harmless only because WEBHOOK_URL was
+      # never a defined secret and the step was therefore always skipped. Wiring
+      # a real channel in makes the condition load-bearing: a message per PR E2E
+      # run, most of them "confirmed flaky, nothing to see", trains the channel
+      # to ignore the one that matters.
+      #
+      # Two cases are worth a notification:
+      #
+      #   - A confident blame. Triage narrowed the breakage to a single commit
+      #     and can name its author, so the callout is addressed to the person
+      #     who can actually act. This is the case that unblocks a PR author who
+      #     is otherwise stuck behind somebody else's regression.
+      #   - A baseline run that went red. Main or release is broken, and that is
+      #     the channel's business whether or not anyone can be named yet.
+      #
+      # A routine PR run is neither — its outcome already lives on the PR, which
+      # is where the person who cares is looking.
       - name: ci/notify-channel
-        if: always() && env.HAS_WEBHOOK == 'true'
+        if: >-
+          always() && env.HAS_WEBHOOK == 'true' &&
+          (
+            steps.apply.outputs.blame_confident == 'true' ||
+            (inputs.run_type != 'PR' && steps.apply.outputs.state != 'success')
+          )
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           STATE: ${{ steps.apply.outputs.state }}
