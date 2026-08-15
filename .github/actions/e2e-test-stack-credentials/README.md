@@ -78,6 +78,24 @@ not just test data.
 | `admin_email` | Email of that account. |
 | `admin_password` | Password for that account. Masked. |
 | `credentials` | Every other service credential, as a JSON object. |
+| `instances` | Every ready instance in the batch, as a JSON array of `site_url`, `admin_username` and `admin_password`. |
+
+### Reaching every instance
+
+`index` names one instance, which is what a sharded job wants. A job checking the
+whole batch takes `instances` instead — every ready instance with its own admin, so it
+holds whether or not the batch was created with `shared_admin_password`:
+
+```yaml
+      - env:
+          INSTANCES: ${{ steps.creds.outputs.instances }}
+        run: |
+          while read -r entry; do
+            jq -r '.site_url' <<< "$entry"
+          done < <(jq -c '.[]' <<< "$INSTANCES")
+```
+
+Instances that never came up are left out: they have no admin to reach them with.
 
 ### Other services
 

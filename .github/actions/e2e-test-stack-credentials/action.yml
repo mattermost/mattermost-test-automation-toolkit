@@ -35,6 +35,12 @@ outputs:
   admin_password:
     description: "Password for that account. Masked in this job's logs; pass it on through env, never inside a run body."
     value: ${{ steps.fetch.outputs.admin_password }}
+  instances:
+    description: >
+      Every ready instance in the batch as a JSON array, each with site_url,
+      admin_username and admin_password, so a caller can reach all of them
+      rather than the one named by index. Every password in it is masked.
+    value: ${{ steps.fetch.outputs.instances }}
   credentials:
     description: >
       Every other service credential this instance generated, as a JSON object
@@ -145,6 +151,12 @@ runs:
           # One object, because which keys exist follows the services the
           # batch was created with.
           echo "credentials=$(jq -c '.credentials // {}' <<< "$instance")"
+
+          # The whole batch, for a caller checking every instance. Only the
+          # ready ones: the rest have no admin to reach them with.
+          echo "instances=$(jq -c '[ .batch.instances[]? | select(. != null)
+            | select(.state == "ready")
+            | {site_url, admin_username: .admin.username, admin_password: .admin.password} ]' "$response")"
         } >> "$GITHUB_OUTPUT"
 
         echo "instance ${INDEX} of ${BATCH_ID}: $(jq -r '.site_url' <<< "$instance")"
