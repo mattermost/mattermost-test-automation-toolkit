@@ -66,7 +66,7 @@ not just test data.
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `batch_id` | Yes | — | Batch to read, as returned by `e2e-test-stack-create`. |
-| `index` | Yes | — | Which instance of the batch, in creation order. A shard index; pass `0` for a single-instance batch. Validated in the action, since `required` is advisory on action inputs and the runner does not enforce it. |
+| `index` | No | `0` | Which instance the `site_url` and `admin_*` outputs describe, in creation order — a shard index. A job checking the whole batch reads `instances` and can leave this alone. |
 | `lambda_alias` | No | `v1` | Control plane to invoke — `v1` or `edge`. Match whatever created the batch. |
 
 ## Outputs
