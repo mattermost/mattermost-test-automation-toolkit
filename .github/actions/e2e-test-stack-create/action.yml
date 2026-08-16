@@ -34,6 +34,10 @@ inputs:
     description: "Operating system the stack runs on: 'ubuntu-24.04' or 'ubuntu-26.04'."
     required: false
     default: "ubuntu-24.04"
+  postgres:
+    description: "Postgres major version or release to run: '14', '15', '16', '17', '18'. Empty uses the pin's default (currently 16). Refused if the version has no mirror."
+    required: false
+    default: ""
   license:
     description: "Licence SKU to apply: 'enterprise-advanced'. Empty runs unlicensed, leaving the server to request a trial. The set is provisioned per deployment, so an unknown SKU is refused with the list that exists."
     required: false
@@ -75,6 +79,7 @@ runs:
         WAIT_FOR_MIGRATIONS: ${{ inputs.wait_for_migrations }}
         SHARED_ADMIN_PASSWORD: ${{ inputs.shared_admin_password }}
         SERVER_ENV: ${{ inputs.server_env }}
+        POSTGRES_TAG: ${{ inputs.postgres }}
       run: |
         # required: true is advisory on an action input - the runner does not
         # enforce it - so what must be present is checked here.
@@ -147,6 +152,13 @@ runs:
           fi
         fi
 
+        if [ -n "$POSTGRES_TAG" ]; then
+          if ! echo "$POSTGRES_TAG" | grep -qE '^[0-9]+(\.[0-9]+)*$'; then
+            echo "::error::postgres must be a version like '16' or '16.14', got '${POSTGRES_TAG}'"
+            exit 1
+          fi
+        fi
+
     - name: ci/invoke-create
       id: invoke
       shell: bash
@@ -161,6 +173,7 @@ runs:
         WAIT_FOR_MIGRATIONS: ${{ inputs.wait_for_migrations }}
         SHARED_ADMIN_PASSWORD: ${{ inputs.shared_admin_password }}
         SERVER_ENV: ${{ inputs.server_env }}
+        POSTGRES_TAG: ${{ inputs.postgres }}
         LAMBDA_ALIAS: ${{ inputs.lambda_alias }}
       run: |
         set -euo pipefail
@@ -183,6 +196,7 @@ runs:
           --arg services "$SERVICES" \
           --arg ttl "$TTL" \
           --arg os "$OS_VARIANT" \
+          --arg postgres "$POSTGRES_TAG" \
           --arg license "$LICENSE" \
           --argjson wait_for_migrations "$WAIT_FOR_MIGRATIONS" \
           --argjson shared_admin_password "$SHARED_ADMIN_PASSWORD" \
@@ -192,6 +206,7 @@ runs:
            + (if $services == "" then {} else {services: ($services | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != "")))} end)
            + (if $ttl == "" then {} else {ttl: $ttl} end)
            + (if $os == "" then {} else {os: $os} end)
+           + (if $postgres == "" then {} else {postgres: $postgres} end)
            + (if $license == "" then {} else {license: $license} end)
            + (if $wait_for_migrations then {wait_for_migrations: true} else {} end)
            + (if $server_env == null then {} else {server_env: $server_env} end)
@@ -382,3 +397,43 @@ runs:
         ( $r.sites[]? | "- " + . )
         SUMMARY
         jq -r -f "${RUNNER_TEMP}/e2e-create-summary.jq" "$RESPONSE" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: ci/redact-response
+      id: redact-response
+      if: always() && steps.invoke.outputs.batch_id != ''
+      shell: bash
+      env:
+        RESPONSE: ${{ steps.invoke.outputs.response }}
+        BATCH_ID: ${{ steps.invoke.outputs.batch_id }}
+      run: |
+        set -euo pipefail
+        redacted="${RUNNER_TEMP}/e2e-create-${BATCH_ID}-response.json"
+        # Mirrors the mask loop: passwords and all service credentials except
+        # the postgres username and database name, which are not secret.
+        jq '
+          .batch.instances |= map(
+            if . == null then .
+            else
+              .admin.password = "***"
+              | .credentials |= (
+                  if . == null then .
+                  else
+                    to_entries | map(
+                      if .key | IN("postgres.user", "postgres.database") then .
+                      else .value = "***"
+                      end
+                    ) | from_entries
+                  end
+                )
+            end
+          )
+        ' "$RESPONSE" > "$redacted"
+        echo "path=${redacted}" >> "$GITHUB_OUTPUT"
+
+    - name: ci/upload-response
+      if: always() && steps.redact-response.outputs.path != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: e2e-create-${{ steps.invoke.outputs.batch_id }}
+        path: ${{ steps.redact-response.outputs.path }}
+        if-no-files-found: warn
