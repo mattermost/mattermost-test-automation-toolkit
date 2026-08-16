@@ -1,0 +1,178 @@
+---
+name: E2E Test Stack Logs
+description: >
+  Collects one instance's container logs and reports where they were put.
+
+# Separate from destroy, and run before it: the stack has to be up to read from,
+# and reading can outlast terminating it.
+#
+# One instance at a time. A batch of forty rarely needs forty logs, and the
+# instance that failed is the one worth the wait.
+#
+# Uses the credentials the job holds: run aws-actions/configure-aws-credentials
+# once in the job first.
+
+inputs:
+  batch_id:
+    description: "Batch the instance belongs to, as returned by e2e-test-stack-create."
+    required: true
+  index:
+    description: "Which instance of the batch, in creation order - a shard index."
+    required: false
+    default: "0"
+  lambda_alias:
+    description: "Leave as 'v1' unless the batch was created with 'edge'. Must match whatever created it."
+    required: false
+    default: "v1"
+
+outputs:
+  path:
+    description: >
+      What the response carried, written to the runner. Under RUNNER_TEMP rather
+      than the workspace: server output carries admin addresses and session
+      tokens, and a workspace is what a consumer checks out and uploads.
+    value: ${{ steps.collect.outputs.path }}
+  full_path:
+    description: >
+      The whole log, downloaded when the response could not carry it. Empty when
+      path already holds everything, and when the download failed.
+    value: ${{ steps.collect.outputs.full_path }}
+  truncated:
+    description: "'true' when the response carried only part of the log, which is when full_path is worth reading."
+    value: ${{ steps.collect.outputs.truncated }}
+  uri:
+    description: "The whole log in S3, whatever came back inline."
+    value: ${{ steps.collect.outputs.uri }}
+  key:
+    description: "Its key within the artifacts bucket."
+    value: ${{ steps.collect.outputs.key }}
+  bucket:
+    description: "Bucket holding it."
+    value: ${{ steps.collect.outputs.bucket }}
+  containers:
+    description: >
+      JSON array naming what the file holds, in order. The agent writes
+      "===== <container> =====" before each, so the server and each service are
+      identifiable within the one object.
+    value: ${{ steps.collect.outputs.containers }}
+
+runs:
+  using: composite
+  steps:
+    - name: ci/collect-logs
+      id: collect
+      shell: bash
+      env:
+        BATCH_ID: ${{ inputs.batch_id }}
+        INDEX: ${{ inputs.index }}
+        LAMBDA_ALIAS: ${{ inputs.lambda_alias }}
+      run: |
+        set -euo pipefail
+
+        case "$LAMBDA_ALIAS" in
+          v1 | edge) ;;
+          *)
+            echo "::error::lambda_alias must be 'v1' or 'edge', got '${LAMBDA_ALIAS}'"
+            exit 1
+            ;;
+        esac
+        case "$INDEX" in
+          *[!0-9]*)
+            echo "::error::index must be a whole number, got '${INDEX}'"
+            exit 1
+            ;;
+        esac
+        if [ -z "$BATCH_ID" ]; then
+          echo "::error::batch_id is required"
+          exit 1
+        fi
+
+        payload="${RUNNER_TEMP}/e2e-logs-payload.json"
+        response="${RUNNER_TEMP}/e2e-logs-response.json"
+        invoke="${RUNNER_TEMP}/e2e-logs-invoke.json"
+
+        jq -nc --arg batch_id "$BATCH_ID" --argjson index "$INDEX" \
+          '{action: "logs", batch_id: $batch_id, index: $index}' > "$payload"
+
+        # Reading a stack's logs is slower than asking for them, so this waits
+        # like a create rather than like a lookup.
+        set +e
+        aws lambda invoke \
+          --function-name "e2e-test-stack:${LAMBDA_ALIAS}" \
+          --cli-read-timeout 960 \
+          --cli-connect-timeout 60 \
+          --cli-binary-format raw-in-base64-out \
+          --payload "file://${payload}" \
+          "$response" > "$invoke"
+        invoke_status=$?
+        set -e
+
+        if [ $invoke_status -ne 0 ]; then
+          echo "::error::the invocation itself failed"
+          cat "$invoke" 2>/dev/null || true
+          exit 1
+        fi
+        # A handler that returns an error answers with {"errorMessage": ...}
+        # from the Go runtime, not the response read below, so both are tried.
+        if jq -e 'has("FunctionError")' "$invoke" > /dev/null; then
+          echo "::error::the control plane returned an error"
+          jq -r '.errorMessage // .error // "no reason given"' "$response"
+          exit 1
+        fi
+
+        key=$(jq -r '.logs.key // ""' "$response")
+        if [ -z "$key" ]; then
+          echo "::error::no logs were written: $(jq -r '.errorMessage // .error // "no reason given"' "$response")"
+          exit 1
+        fi
+
+        bucket=$(jq -r '.logs.bucket // ""' "$response")
+        instance=$(jq -r '.logs.instance_id' "$response")
+        path="${RUNNER_TEMP}/e2e-logs-${instance}.log"
+        truncated=$(jq -r '.logs.truncated // false' "$response")
+
+        # The response carries the log, so a log that fits reaches S3 not at
+        # all. Gzipped and base64 encoded, because JSON escaping grows log text
+        # where compression shrinks it.
+        if ! jq -r '.logs.content_gzip // ""' "$response" | base64 -d | gunzip > "$path"; then
+          echo "::error::the response carried logs that could not be decoded"
+          exit 1
+        fi
+
+        # Too large to return is exactly when the rest is wanted, so it is
+        # fetched. To its own file: what the response carried stays where it was
+        # written, and the two are never confused for one another.
+        uri=$(jq -r '.logs.uri // ""' "$response")
+        full_path=""
+        if [ "$truncated" = true ]; then
+          full_path="${RUNNER_TEMP}/e2e-logs-${instance}-full.log"
+          if ! aws s3 cp --only-show-errors "$uri" "$full_path"; then
+            full_path=""
+            echo "::warning::the whole log could not be downloaded; it is at ${uri}"
+          fi
+        fi
+
+        {
+          echo "path=${path}"
+          echo "full_path=${full_path}"
+          echo "uri=${uri}"
+          echo "key=${key}"
+          echo "bucket=${bucket}"
+          echo "truncated=${truncated}"
+          echo "containers=$(jq -c '.logs.containers // []' "$response")"
+        } >> "$GITHUB_OUTPUT"
+
+        # Not printed, and not uploaded. Server output carries admin addresses
+        # and session tokens, and a consuming repository's logs and artifacts may
+        # be public - attaching it is the caller's decision to make.
+        echo "instance ${instance}: $(wc -l < "$path") line(s) at ${path}"
+        if [ "$truncated" = true ]; then
+          jq -r '.logs |
+            "  \(.content_bytes) of \(.bytes) bytes came back inline"
+            + " (\((.content_bytes * 100 / .bytes) | floor)%),"
+            + " which is what fits a \(.limit) byte response"' "$response"
+          if [ -n "$full_path" ]; then
+            echo "  the whole log is at ${full_path}, $(wc -l < "$full_path") line(s)"
+          fi
+        fi
+        jq -r '.logs.containers // [] | .[] | "  holds " + .' "$response"

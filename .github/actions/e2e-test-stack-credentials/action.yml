@@ -14,13 +14,13 @@ inputs:
   batch_id:
     description: "Batch to read, as returned by e2e-test-stack-create.yml."
     required: true
-  index:
+  indexes:
     description: >
-      Which instance the site_url, admin_username and admin_password outputs
-      describe, in creation order - a shard index. A job checking the whole batch
-      reads instances instead and can leave this alone.
+      Which instances to fetch at all, comma separated - "0" or "0,3". Empty
+      fetches the batch, which a job checking all of them wants. Narrowing this
+      keeps the other instances' admin passwords out of the response entirely.
     required: false
-    default: "0"
+    default: ""
   lambda_alias:
     description: "Leave as 'v1' unless the batch was created with 'edge'. Must match whatever created it."
     required: false
@@ -28,7 +28,7 @@ inputs:
 
 outputs:
   site_url:
-    description: "HTTPS address of this instance."
+    description: "HTTPS address of the first instance fetched, which is the only one when indexes named one."
     value: ${{ steps.fetch.outputs.site_url }}
   admin_username:
     description: "Admin account created on this instance."
@@ -62,17 +62,10 @@ runs:
       shell: bash
       env:
         BATCH_ID: ${{ inputs.batch_id }}
-        INDEX: ${{ inputs.index }}
+        INDEXES: ${{ inputs.indexes }}
         LAMBDA_ALIAS: ${{ inputs.lambda_alias }}
       run: |
         set -euo pipefail
-
-        case "$INDEX" in
-          *[!0-9]*)
-            echo "::error::index must be a whole number, got '${INDEX}'"
-            exit 1
-            ;;
-        esac
 
         case "$LAMBDA_ALIAS" in
           v1 | edge) ;;
@@ -86,8 +79,20 @@ runs:
         response="${RUNNER_TEMP}/e2e-fetch-response.json"
         invoke="${RUNNER_TEMP}/e2e-fetch-invoke.json"
 
-        jq -nc --arg batch_id "$BATCH_ID" \
-          '{action: "fetch", batch_id: $batch_id}' > "$payload"
+        # Empty asks for the batch; a list asks for those and nothing else.
+        if [ -n "$INDEXES" ]; then
+          if ! indexes=$(jq -ce 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != "") | tonumber)' \
+              -R <<< "$INDEXES"); then
+            echo "::error::indexes must be whole numbers, comma separated, got '${INDEXES}'"
+            exit 1
+          fi
+        else
+          indexes='[]'
+        fi
+
+        jq -nc --arg batch_id "$BATCH_ID" --argjson indexes "$indexes" \
+          '{action: "fetch", batch_id: $batch_id}
+           + (if ($indexes | length) == 0 then {} else {indexes: $indexes} end)' > "$payload"
 
         set +e
         aws lambda invoke \
@@ -105,9 +110,11 @@ runs:
           cat "$invoke" 2>/dev/null || true
           exit 1
         fi
+        # A handler that returns an error answers with {"errorMessage": ...}
+        # from the Go runtime, not the response read below, so both are tried.
         if jq -e 'has("FunctionError")' "$invoke" > /dev/null; then
           echo "::error::the control plane returned an error"
-          jq -r '.error // "no reason given"' "$response"
+          jq -r '.errorMessage // .error // "no reason given"' "$response"
           exit 1
         fi
 
@@ -126,9 +133,12 @@ runs:
           echo "::add-mask::${secret}"
         done
 
-        instance=$(jq -c --argjson i "$INDEX" '.batch.instances[$i] // empty' "$response")
+        # The first that came back, which is the only one when indexes named
+        # one. Holes are the instances not asked for, and the ones that never
+        # launched.
+        instance=$(jq -c 'first(.batch.instances[]? | select(. != null)) // empty' "$response")
         if [ -z "$instance" ]; then
-          echo "::error::batch ${BATCH_ID} has no instance at index ${INDEX}; it holds $(jq -r '.batch.instances | length' "$response")"
+          echo "::error::batch ${BATCH_ID} returned no instance for indexes '${INDEXES:-all}'"
           exit 1
         fi
 
@@ -136,7 +146,7 @@ runs:
         # here rather than as an authentication error inside the suite.
         state=$(jq -r '.state // "unknown"' <<< "$instance")
         if [ "$state" != "ready" ]; then
-          echo "::error::instance ${INDEX} of ${BATCH_ID} is '${state}', not ready"
+          echo "::error::instance $(jq -r '.instance_id' <<< "$instance") is '${state}', not ready"
           exit 1
         fi
 
@@ -157,4 +167,4 @@ runs:
             | {site_url, admin_username: .admin.username, admin_password: .admin.password} ]' "$response")"
         } >> "$GITHUB_OUTPUT"
 
-        echo "instance ${INDEX} of ${BATCH_ID}: $(jq -r '.site_url' <<< "$instance")"
+        echo "$(jq -r '.instance_id' <<< "$instance"): $(jq -r '.site_url' <<< "$instance")"

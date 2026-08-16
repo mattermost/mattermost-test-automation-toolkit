@@ -38,6 +38,10 @@ inputs:
     description: "Licence SKU to apply: 'enterprise-advanced'. Empty runs unlicensed, leaving the server to request a trial. The set is provisioned per deployment, so an unknown SKU is refused with the list that exists."
     required: false
     default: ""
+  server_env:
+    description: "Server settings to override at boot, as a JSON object - '{\"MM_FEATUREFLAGS_TESTFEATURE\":\"true\"}'. Merged over the baseline; settings the stack computes for itself cannot be overridden."
+    required: false
+    default: ""
   wait_for_migrations:
     description: "Wait for server migrations to finish before reporting ready."
     required: false
@@ -70,6 +74,7 @@ runs:
         COUNT: ${{ inputs.count }}
         WAIT_FOR_MIGRATIONS: ${{ inputs.wait_for_migrations }}
         SHARED_ADMIN_PASSWORD: ${{ inputs.shared_admin_password }}
+        SERVER_ENV: ${{ inputs.server_env }}
       run: |
         # required: true is advisory on an action input - the runner does not
         # enforce it - so what must be present is checked here.
@@ -133,6 +138,15 @@ runs:
             ;;
         esac
 
+        # Reaches the payload as an object, so it is checked here where the
+        # message can name the input.
+        if [ -n "$SERVER_ENV" ]; then
+          if ! jq -e 'type == "object"' <<< "$SERVER_ENV" > /dev/null 2>&1; then
+            echo "::error::server_env must be a JSON object, e.g. {\"MM_FEATUREFLAGS_TESTFEATURE\":\"true\"}"
+            exit 1
+          fi
+        fi
+
     - name: ci/invoke-create
       id: invoke
       shell: bash
@@ -146,6 +160,7 @@ runs:
         LICENSE: ${{ inputs.license }}
         WAIT_FOR_MIGRATIONS: ${{ inputs.wait_for_migrations }}
         SHARED_ADMIN_PASSWORD: ${{ inputs.shared_admin_password }}
+        SERVER_ENV: ${{ inputs.server_env }}
         LAMBDA_ALIAS: ${{ inputs.lambda_alias }}
       run: |
         set -euo pipefail
@@ -171,6 +186,7 @@ runs:
           --arg license "$LICENSE" \
           --argjson wait_for_migrations "$WAIT_FOR_MIGRATIONS" \
           --argjson shared_admin_password "$SHARED_ADMIN_PASSWORD" \
+          --argjson server_env "${SERVER_ENV:-null}" \
           '{action: "create", instance_key: $instance_key, count: $count,
             server_image: $server_image}
            + (if $services == "" then {} else {services: ($services | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != "")))} end)
@@ -178,6 +194,7 @@ runs:
            + (if $os == "" then {} else {os: $os} end)
            + (if $license == "" then {} else {license: $license} end)
            + (if $wait_for_migrations then {wait_for_migrations: true} else {} end)
+           + (if $server_env == null then {} else {server_env: $server_env} end)
            + (if $shared_admin_password then {shared_admin_password: true} else {} end)' \
           > "$payload"
 
@@ -230,9 +247,11 @@ runs:
         # so here instead. Reported after the outputs are set, so a partial
         # create still hands back the batch id its instances need to be
         # destroyed by.
+        # A handler that returns an error answers with {"errorMessage": ...}
+        # from the Go runtime, not the response read below, so both are tried.
         if jq -e 'has("FunctionError")' "$invoke" > /dev/null; then
           echo "::error::the control plane returned an error"
-          jq -r '.error // "no reason given"' "$response"
+          jq -r '.errorMessage // .error // "no reason given"' "$response"
           exit 1
         fi
         if [ -n "$(jq -r '.error // ""' "$response")" ]; then
@@ -254,11 +273,25 @@ runs:
       run: |
         set -euo pipefail
         cat > "${RUNNER_TEMP}/e2e-create-summary.jq" <<'SUMMARY'
-        def secs: if . == null then "—" else (. * 10 | round / 10 | tostring) + "s" end;
+        def secs: if . == null then "—" else (. * 100 | round / 100 | tostring) + "s" end;
+        # The registry host embeds the account id, and the cache namespace is noise.
+        def image: gsub("[a-z0-9.-]*\\.amazonaws\\.com/(dockerhub/)?"; "");
+        # A connection string carries the password it connects with. Masking covers the
+        # log and not this file, so it is taken out here.
+        def nocreds: gsub("://(?<u>[^:/@]+):[^@]+@"; "://\(.u):***@");
+        # One cell, whatever the shape: a list joins, an object reads as pairs.
+        def show:
+          (if type == "array" then join(", ")
+           elif type == "object" then
+             (to_entries | map(.key + "=" + (.value | tostring)) | join(", "))
+           else tostring end)
+          | image | nocreds;
 
         . as $r
         | [ .batch.instances[]? | select(. != null) ] as $live
-                | $live[0] as $first
+        | [ $live[].timing.phases[]? | .name ] | unique as $phases
+        | [ $live[].service_seconds // {} | keys[] ] | unique as $services
+        | $live[0] as $first
         |
         "### E2E test stack — " + ($r.batch.state // "unknown"),
         "",
@@ -269,17 +302,80 @@ runs:
                      + " of " + (($r.batch.instances | length) | tostring) + " |",
         "| Wall clock | " + ($r.batch.timing.total_seconds | secs) + " |",
         "| Expires | " + ($r.batch.expires_at // "—") + " |",
+        "| Instance | " + ($live | map(.instance_type) | unique | join(", ")) + " |",
+        "| Image | `" + ($live | map(.ami_name // .ami) | unique | join(", ")) + "` |",
+        "| Image built | " + ($first.ami_built_at // "unknown") + " |",
+        "| Licensed | " + (($live | map(.licensed) | all) | tostring) + " |",
+        "| Build | `" + ($r.deployment.build // "—") + "` |",
+        "",
+        ( if $r.request_payload == null then empty
+          else
+            ( "#### Requested",
+              "",
+              "| Field | Sent | Resolved |",
+              "|---|---|---|",
+              ( ( [ $r.request_payload // {} | keys[] ]
+                  + [ $r.request_resolved // {} | keys[] ] | unique )[]
+                | select(. != "action")
+                | . as $k
+                | ($r.request_payload[$k]) as $sent
+                | ($r.request_resolved[$k]) as $got
+                | "| `" + $k + "` | "
+                  + (if $sent == null then "—" else "`" + ($sent | show) + "`" end)
+                  + " | "
+                  + (if $got == null then "—" else "`" + ($got | show) + "`" end)
+                  + " |" ),
+              "",
+              "A dash under Sent is a default the control plane filled in." )
+          end ),
         "",
         "#### Time to ready",
         "",
-        "| Instance | Ready in |",
-        "|---|---|",
-        ( $live[] | "| `" + .instance_id + "` | " + (.timing.total_seconds | secs) + " |" ),
+        "| Instance | Ready in | Critical path | Decided by |",
+        "|---|---|---|---|",
+        ( $live[] | "| `" + .instance_id + "` | " + (.timing.total_seconds | secs) + " | "
+            + ((.critical_path.chain // []) | join(" → ")) + " | "
+            + (.critical_path.decided_by // "—") + " at " + (.critical_path.seconds | secs) + " |" ),
+        "",
+        "#### Time by phase",
+        "",
+        "| Phase | Fastest | Slowest |",
+        "|---|---|---|",
+        ( $phases[] as $p
+          | [ $live[].timing.phases[]? | select(.name == $p) | .seconds ] as $v
+          | "| " + $p + " | " + ($v | min | secs) + " | " + ($v | max | secs) + " |" ),
+        "",
+        "#### Services",
+        "",
+        "| Service | Fastest | Slowest |",
+        "|---|---|---|",
+        ( $services[] as $s
+          | [ $live[].service_seconds[$s] // empty ] as $v
+          | "| " + $s + " | " + ($v | min | secs) + " | " + ($v | max | secs) + " |" ),
         "",
         "#### Server image",
         "",
-        "`" + (($first.server_image.digest // "—")[0:26]) + "…` ("
-            + ($first.server_image.age // "unknown age") + ")",
+        "| | |",
+        "|---|---|",
+        "| Reference | `" + (($first.server_image.ref // "—") | image) + "` |",
+        "| Digest | `" + (($first.server_image.digest // "—")[0:26]) + "…` |",
+        "| Built | " + ($first.server_image.age // "unknown") + " |",
+        "| Pulled in | " + (($live | map(.image_pull_seconds) | max) | secs)
+            + (if ($live | map(.image_pulled) | any) then "" else " (cached)" end) + " |",
+        "",
+        "#### Containers",
+        "",
+        ( ($first.containers // [])[] | "- `" + (. | image) + "`" ),
+        "",
+        "#### Server environment",
+        "",
+        "<details><summary>" + (($first.server_env // {} | length) | tostring) + " settings</summary>",
+        "",
+        "| Setting | Value |",
+        "|---|---|",
+        ( $first.server_env // {} | to_entries[] | "| `" + .key + "` | `" + (.value | image | nocreds) + "` |" ),
+        "",
+        "</details>",
         "",
         "#### Sites",
         "",

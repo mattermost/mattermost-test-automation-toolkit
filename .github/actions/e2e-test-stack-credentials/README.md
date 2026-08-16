@@ -52,7 +52,7 @@ not just test data.
         id: creds
         with:
           batch_id: ${{ needs.stack.outputs.batch_id }}
-          index: ${{ matrix.shard }}
+          indexes: ${{ matrix.shard }}
 
       - run: npm run test:e2e
         env:
@@ -66,7 +66,7 @@ not just test data.
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `batch_id` | Yes | — | Batch to read, as returned by `e2e-test-stack-create`. |
-| `index` | No | `0` | Which instance the `site_url` and `admin_*` outputs describe, in creation order — a shard index. A job checking the whole batch reads `instances` and can leave this alone. |
+| `indexes` | No | — | Which instances to fetch, comma separated — `0` or `0,3`. Empty fetches the batch. Narrowing it keeps the other instances' admin passwords out of the response entirely. |
 | `lambda_alias` | No | `v1` | Control plane to invoke — `v1` or `edge`. Match whatever created the batch. |
 
 ## Outputs
@@ -82,8 +82,8 @@ not just test data.
 
 ### Reaching every instance
 
-`index` names one instance, which is what a sharded job wants. A job checking the
-whole batch takes `instances` instead — every ready instance with its own admin, so it
+`indexes` names which instances to fetch, which is what a sharded job narrows. A job
+checking the whole batch leaves it empty and takes `instances` — every ready instance with its own admin, so it
 holds whether or not the batch was created with `shared_admin_password`:
 
 ```yaml
@@ -134,7 +134,7 @@ control plane later is masked without anyone remembering to update this action.
 
 Fails, rather than returning something unusable, when:
 
-- the batch has no instance at `index` — the message says how many it holds
+- nothing came back for the `indexes` asked for
 - that instance is not `ready` — otherwise the suite would hit an authentication error
   instead of a clear one
 - `aws lambda invoke` succeeded but the handler failed, which the CLI reports as
