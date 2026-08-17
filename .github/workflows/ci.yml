@@ -1,11 +1,8 @@
 ---
 # CI for the toolkit's own scripts.
 #
-# The policy engine in scripts/triage-policy.js decides whether an E2E failure
-# blocks a merge across every repo that calls the reusable workflow. Shipping it
-# without its tests running would mean a regression in "when is a red allowed to
-# turn green" reaches consumers silently — which is the one failure mode the
-# whole design is built to prevent.
+# Override is the only triage script left here — adjudication moved to
+# mattermost-test-system-io's test-system-io-ai-triage action.
 name: CI
 
 on:
@@ -30,16 +27,9 @@ jobs:
           node-version: '22'
 
       - name: ci/test
-        # Files are listed explicitly rather than passing the directory: node's
-        # directory runner also executes non-test sources, which turns a plain
-        # `require` into a spurious failure.
         run: |
           node --test \
-            scripts/triage-policy.test.js \
-            scripts/triage-apply.test.js \
-            scripts/triage-override.test.js \
-            scripts/triage-blame.test.js \
-            scripts/triage-candidates.test.js
+            scripts/triage-override.test.js
 
   actionlint:
     name: Workflow lint
@@ -52,16 +42,9 @@ jobs:
       - name: ci/actionlint
         run: |
           set -euo pipefail
-          # Pinned by commit, not by branch. `.../main/scripts/...` re-fetches
-          # whatever that branch holds at the moment CI runs, so this step used to
-          # pipe a mutable remote script straight into bash on a runner holding
-          # the workflow token. The commit ref is immutable, and the version the
-          # script then downloads is fixed rather than "latest".
           INSTALLER_REF=3795ba2f6cb243eeca54c9d22e5c531cb9dcfb4a
           ACTIONLINT_VERSION=1.7.12
           curl -fsSL -o download-actionlint.bash \
             "https://raw.githubusercontent.com/rhysd/actionlint/${INSTALLER_REF}/scripts/download-actionlint.bash"
           bash download-actionlint.bash "${ACTIONLINT_VERSION}"
-          # shellcheck is not installed on the runner image by default; the
-          # workflow-level checks are what matter here.
           ./actionlint -shellcheck= .github/workflows/*.yml
