@@ -65,6 +65,9 @@ outputs:
   ready:
     description: "How many instances came up ready."
     value: ${{ steps.invoke.outputs.ready }}
+  response_artifact:
+    description: "Name of the uploaded artifact holding the full create response. Download it in a later job to read site URLs, admin credentials, and service credentials without a separate fetch call."
+    value: e2e-create-${{ steps.invoke.outputs.batch_id }}
 
 runs:
   using: composite
@@ -236,21 +239,6 @@ runs:
           exit 1
         fi
 
-        # Masked before anything reads the response: it carries an admin
-        # password per instance, and a consuming repository's logs may be
-        # public. Everything under credentials except the postgres user and
-        # database name, which are not secret and would be redacted from every
-        # line that mentions them. Named the other way round so a service added
-        # later is masked without being listed.
-        for secret in $(jq -r '
-            [ (.batch.instances[]? | select(. != null) | .admin.password),
-              (.batch.instances[]? | select(. != null) | .credentials // {} | to_entries[]
-                 | select(.key | IN("postgres.user", "postgres.database") | not)
-                 | .value) ]
-            | map(select(. != null and . != "")) | unique | .[]' "$response"); do
-          echo "::add-mask::${secret}"
-        done
-
         batch_id=$(jq -r '.batch_id // ""' "$response")
         {
           echo "batch_id=${batch_id}"
@@ -398,42 +386,10 @@ runs:
         SUMMARY
         jq -r -f "${RUNNER_TEMP}/e2e-create-summary.jq" "$RESPONSE" >> "$GITHUB_STEP_SUMMARY"
 
-    - name: ci/redact-response
-      id: redact-response
-      if: always() && steps.invoke.outputs.batch_id != ''
-      shell: bash
-      env:
-        RESPONSE: ${{ steps.invoke.outputs.response }}
-        BATCH_ID: ${{ steps.invoke.outputs.batch_id }}
-      run: |
-        set -euo pipefail
-        redacted="${RUNNER_TEMP}/e2e-create-${BATCH_ID}-response.json"
-        # Mirrors the mask loop: passwords and all service credentials except
-        # the postgres username and database name, which are not secret.
-        jq '
-          .batch.instances |= map(
-            if . == null then .
-            else
-              .admin.password = "***"
-              | .credentials |= (
-                  if . == null then .
-                  else
-                    to_entries | map(
-                      if .key | IN("postgres.user", "postgres.database") then .
-                      else .value = "***"
-                      end
-                    ) | from_entries
-                  end
-                )
-            end
-          )
-        ' "$RESPONSE" > "$redacted"
-        echo "path=${redacted}" >> "$GITHUB_OUTPUT"
-
     - name: ci/upload-response
-      if: always() && steps.redact-response.outputs.path != ''
+      if: always() && steps.invoke.outputs.batch_id != ''
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: e2e-create-${{ steps.invoke.outputs.batch_id }}
-        path: ${{ steps.redact-response.outputs.path }}
+        path: ${{ steps.invoke.outputs.response }}
         if-no-files-found: warn
