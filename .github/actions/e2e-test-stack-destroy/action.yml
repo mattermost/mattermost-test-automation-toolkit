@@ -18,6 +18,14 @@ inputs:
     description: "Leave as 'v1' unless the batch was created with 'edge'. Must match whatever created it."
     required: false
     default: "v1"
+  caller_repository:
+    description: "Repository that created the batch (github.repository from that run). Defaults to this job's repository. Required when destroy runs in a different repository than create."
+    required: false
+    default: ""
+  caller_run_id:
+    description: "github.run_id of the create workflow. Defaults to this job's run id (same-run teardown). Required when destroy is a separate workflow_dispatch."
+    required: false
+    default: ""
 
 outputs:
   state:
@@ -39,6 +47,8 @@ runs:
       env:
         BATCH_ID: ${{ inputs.batch_id }}
         LAMBDA_ALIAS: ${{ inputs.lambda_alias }}
+        CALLER_REPOSITORY: ${{ inputs.caller_repository != '' && inputs.caller_repository || github.repository }}
+        CALLER_RUN_ID: ${{ inputs.caller_run_id != '' && inputs.caller_run_id || github.run_id }}
       run: |
         set -euo pipefail
 
@@ -62,8 +72,13 @@ runs:
         invoke="${RUNNER_TEMP}/e2e-destroy-invoke.json"
         echo "response=${response}" >> "$GITHUB_OUTPUT"
 
-        jq -nc --arg batch_id "$BATCH_ID" \
-          '{action: "destroy", batch_id: $batch_id}' > "$payload"
+        jq -nc \
+          --arg batch_id "$BATCH_ID" \
+          --arg caller_repository "$CALLER_REPOSITORY" \
+          --arg caller_run_id "$CALLER_RUN_ID" \
+          '{action: "destroy", batch_id: $batch_id,
+            caller_repository: $caller_repository, caller_run_id: $caller_run_id}' \
+          > "$payload"
 
         set +e
         aws lambda invoke \

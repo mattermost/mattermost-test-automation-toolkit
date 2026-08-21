@@ -24,6 +24,14 @@ inputs:
     description: "Leave as 'v1' unless the batch was created with 'edge'. Must match whatever created it."
     required: false
     default: "v1"
+  caller_repository:
+    description: "Repository that created the batch. Defaults to this job's repository."
+    required: false
+    default: ""
+  caller_run_id:
+    description: "github.run_id of the create workflow. Defaults to this job's run id. Required when logs run in a separate workflow."
+    required: false
+    default: ""
 
 outputs:
   path:
@@ -66,6 +74,8 @@ runs:
         BATCH_ID: ${{ inputs.batch_id }}
         INDEX: ${{ inputs.index }}
         LAMBDA_ALIAS: ${{ inputs.lambda_alias }}
+        CALLER_REPOSITORY: ${{ inputs.caller_repository != '' && inputs.caller_repository || github.repository }}
+        CALLER_RUN_ID: ${{ inputs.caller_run_id != '' && inputs.caller_run_id || github.run_id }}
       run: |
         set -euo pipefail
 
@@ -91,8 +101,14 @@ runs:
         response="${RUNNER_TEMP}/e2e-logs-response.json"
         invoke="${RUNNER_TEMP}/e2e-logs-invoke.json"
 
-        jq -nc --arg batch_id "$BATCH_ID" --argjson index "$INDEX" \
-          '{action: "logs", batch_id: $batch_id, index: $index}' > "$payload"
+        jq -nc \
+          --arg batch_id "$BATCH_ID" \
+          --argjson index "$INDEX" \
+          --arg caller_repository "$CALLER_REPOSITORY" \
+          --arg caller_run_id "$CALLER_RUN_ID" \
+          '{action: "logs", batch_id: $batch_id, index: $index,
+            caller_repository: $caller_repository, caller_run_id: $caller_run_id}' \
+          > "$payload"
 
         # Reading a stack's logs is slower than asking for them, so this waits
         # like a create rather than like a lookup.

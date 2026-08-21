@@ -25,6 +25,14 @@ inputs:
     description: "Leave as 'v1' unless the batch was created with 'edge'. Must match whatever created it."
     required: false
     default: "v1"
+  caller_repository:
+    description: "Repository that created the batch. Defaults to this job's repository."
+    required: false
+    default: ""
+  caller_run_id:
+    description: "github.run_id of the create workflow. Defaults to this job's run id. Required when fetch runs in a separate workflow."
+    required: false
+    default: ""
 
 outputs:
   site_url:
@@ -64,6 +72,8 @@ runs:
         BATCH_ID: ${{ inputs.batch_id }}
         INDEXES: ${{ inputs.indexes }}
         LAMBDA_ALIAS: ${{ inputs.lambda_alias }}
+        CALLER_REPOSITORY: ${{ inputs.caller_repository != '' && inputs.caller_repository || github.repository }}
+        CALLER_RUN_ID: ${{ inputs.caller_run_id != '' && inputs.caller_run_id || github.run_id }}
       run: |
         set -euo pipefail
 
@@ -90,9 +100,15 @@ runs:
           indexes='[]'
         fi
 
-        jq -nc --arg batch_id "$BATCH_ID" --argjson indexes "$indexes" \
-          '{action: "fetch", batch_id: $batch_id}
-           + (if ($indexes | length) == 0 then {} else {indexes: $indexes} end)' > "$payload"
+        jq -nc \
+          --arg batch_id "$BATCH_ID" \
+          --argjson indexes "$indexes" \
+          --arg caller_repository "$CALLER_REPOSITORY" \
+          --arg caller_run_id "$CALLER_RUN_ID" \
+          '{action: "fetch", batch_id: $batch_id,
+            caller_repository: $caller_repository, caller_run_id: $caller_run_id}
+           + (if ($indexes | length) == 0 then {} else {indexes: $indexes} end)' \
+          > "$payload"
 
         set +e
         aws lambda invoke \

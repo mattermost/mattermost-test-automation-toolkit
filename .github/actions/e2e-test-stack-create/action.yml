@@ -59,6 +59,12 @@ outputs:
   batch_id:
     description: "Handle that addresses this batch."
     value: ${{ steps.invoke.outputs.batch_id }}
+  caller_repository:
+    description: "Repository tagged on the batch. Pass to destroy/logs/fetch when those run in another workflow."
+    value: ${{ github.repository }}
+  caller_run_id:
+    description: "Run id tagged on the batch. Pass to destroy/logs/fetch when those run in another workflow."
+    value: ${{ github.run_id }}
   sites:
     description: "JSON array of site URLs, one per instance, in the order they were created."
     value: ${{ steps.invoke.outputs.sites }}
@@ -178,6 +184,8 @@ runs:
         SERVER_ENV: ${{ inputs.server_env }}
         POSTGRES_TAG: ${{ inputs.postgres }}
         LAMBDA_ALIAS: ${{ inputs.lambda_alias }}
+        CALLER_REPOSITORY: ${{ github.repository }}
+        CALLER_RUN_ID: ${{ github.run_id }}
       run: |
         set -euo pipefail
 
@@ -204,8 +212,11 @@ runs:
           --argjson wait_for_migrations "$WAIT_FOR_MIGRATIONS" \
           --argjson shared_admin_password "$SHARED_ADMIN_PASSWORD" \
           --argjson server_env "${SERVER_ENV:-null}" \
+          --arg caller_repository "$CALLER_REPOSITORY" \
+          --arg caller_run_id "$CALLER_RUN_ID" \
           '{action: "create", instance_key: $instance_key, count: $count,
-            server_image: $server_image}
+            server_image: $server_image,
+            caller_repository: $caller_repository, caller_run_id: $caller_run_id}
            + (if $services == "" then {} else {services: ($services | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != "")))} end)
            + (if $ttl == "" then {} else {ttl: $ttl} end)
            + (if $os == "" then {} else {os: $os} end)
