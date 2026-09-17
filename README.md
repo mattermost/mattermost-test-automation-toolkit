@@ -25,3 +25,4 @@ mattermost-test-automation-toolkit/
 
 1. Reusable workflow [`pr-test-analysis.yml`](.github/workflows/pr-test-analysis.yml). Documentation: [PR Test Analysis](.github/workflows/pr-test-analysis.md).
 2. Reusable workflow [`pr-test-analysis-override.yml`](.github/workflows/pr-test-analysis-override.yml). Documentation: [PR Test Analysis Override](.github/workflows/pr-test-analysis-override.md).
+3. Composite action [`actions/e2e-triage`](actions/e2e-triage): is a red E2E run the PR's fault? History rules plus a second judge, publishing the required status and a PR comment with the evidence. Documentation: [E2E triage](actions/e2e-triage/README.md).
