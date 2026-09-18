@@ -412,6 +412,7 @@ export async function fetchRun(fetchImpl, base, id) {
  */
 export async function fetchHistory(fetchImpl, base, repository, tests, until, windowDays, warn = () => {}) {
   const byTest = new Map();
+  byTest.truncated = false;
   const files = [...new Set(tests.map((t) => t.file).filter(Boolean))].slice(0, HISTORY_MAX_FILES);
   if (files.length === 0) return byTest;
   const wanted = new Set(tests.map((t) => `${t.file}\n${t.title}`));
@@ -429,8 +430,13 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, wi
       byTest.get(k).push(o);
     }
     if (!hasMore) break;
-    if (page === HISTORY_MAX_PAGES)
-      warn(`history for ${files.length} file(s) hit the ${HISTORY_MAX_PAGES}-page cap with more to come; verdicts are based on partial history`);
+    if (page === HISTORY_MAX_PAGES) {
+      // Partial history cannot clear anything: the rows never fetched are
+      // exactly the ones that might have shown a failure on trunk, or shown that
+      // a recurrence was not a recurrence at all.
+      byTest.truncated = true;
+      warn(`history for ${files.length} file(s) hit the ${HISTORY_MAX_PAGES}-page cap with more to come; nothing will be cleared on partial history`);
+    }
   }
   return byTest;
 }
@@ -493,6 +499,12 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       const files = (compare.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
       const changed = files.map((f) => f.filename);
       result.findings = run.failing.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], changed, cfg, prNumber, laneOf(id.name), { isTrunkRun, groupId: run.group_id }));
+      if (history.truncated) {
+        // Fail closed rather than judge on a partial view of trunk.
+        result.historyTruncated = true;
+        for (const f of result.findings)
+          if (!f.blocking) Object.assign(f, { blocking: true, decision: "history_truncated", reason: `${f.reason} History was truncated at the page cap, so this could not be confirmed.` });
+      }
       if (env.ANTHROPIC_API_KEY && prNumber) {
         const others = result.findings.map((f) => ({ class: f.class, title: f.title.slice(0, 80) }));
         const pr = { number: prNumber, repository: id.repository, title: pull.title ?? "", lane: env.LANE || id.name };

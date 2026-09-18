@@ -234,6 +234,22 @@ test("history is asked for spec files, not test titles, and every page is walked
   assert.equal(history.has("specs/a.spec.ts\nsome other test in the same file"), false);
   assert.equal(history.get("specs/a.spec.ts\nt2"), undefined, "a title with no rows stays unknown, so it stays blocking");
 });
+test("partial history clears nothing", async () => {
+  // If the page cap is hit, the rows never fetched are exactly the ones that
+  // might have shown a failure on trunk. Nothing may be cleared on that view.
+  const page = { observations: [obs({ gh_pr_number: 1, status: "failed" }), ...trunkPasses(8)], has_more: true };
+  const fetchImpl = fakeFetch([
+    ...runRoutes([spec("t1", "failed")]),
+    ["/reports/history", () => Response.json(page)],
+    ["/compare/", () => Response.json({ files: [{ filename: "app/login.ts", patch: "@@" }] })],
+    ["/pulls/5", () => Response.json({ title: "x" })],
+    ["/issues/5/comments", (init) => (init.method === "POST" ? Response.json({ id: 1 }) : Response.json([]))],
+  ]);
+  const result = await triage({ env: { ...env, MODE: "report-only", ANTHROPIC_API_KEY: "" }, fetchImpl, log: () => {} });
+  assert.equal(result.historyTruncated, true);
+  assert.equal(result.verdict, "FAILURE");
+  assert.equal(result.findings.every((f) => f.blocking), true, "nothing may be cleared on partial history");
+});
 test("end to end: a regression the judge clears with cross-PR evidence turns the status green", async () => {
   const history = [...trunkPasses(8), obs({ gh_pr_number: 1, status: "failed" })].map((o) => ({ ...o }));
   const fetchImpl = fakeFetch([
