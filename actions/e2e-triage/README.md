@@ -63,6 +63,32 @@ The job needs `statuses: write` and `pull-requests: write`. Start with
 `report-only` (comment and job summary only), read a week of comments, then set
 the repository variable `E2E_TRIAGE_MODE=enforce`.
 
+## On trunk runs
+
+The action also runs on `main`/`master`, detected by the absence of a PR number
+in the composite identity. There the question is not "is this the PR's fault"
+but "is trunk noisy or actually broken", so the rules change:
+
+| Finding | Meaning | Status |
+| --- | --- | --- |
+| `BROKEN_ON_TRUNK` | the previous trunk run failed this test too | **blocking** |
+| `FLAKY_ON_TRUNK` | intermittent, and the previous run passed | cleared |
+| `REGRESSION` | passed in every previous run in the window | blocking |
+| `INSUFFICIENT_DATA` | too few earlier runs to tell | blocking |
+
+The important difference is `BROKEN_ON_TRUNK`. On a PR it exonerates, because a
+test already failing on trunk is not the PR's doing. On trunk it does the
+opposite: it means the failure is still there from last time, and greening a
+standing breakage is exactly how a broken trunk becomes permanent and invisible.
+A streak stays red however often that test has flaked before.
+
+A run is also excluded from its own history by group id. Without that, a trunk
+run has no PR number, lands in its own trunk history, and reads its own failure
+as proof that trunk was already broken.
+
+Trunk runs have no PR to comment on, so the outcome goes to the job summary and,
+under `enforce`, to the commit status.
+
 ## Replay against history
 
 The same script scores itself against labeled past runs without posting

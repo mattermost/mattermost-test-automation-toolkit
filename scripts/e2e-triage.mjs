@@ -31,6 +31,13 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 
 export const FAILED_STATUSES = new Set(["failed", "timedOut", "interrupted"]);
 export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
+// On a trunk run there is no PR to exonerate, so the question changes from "is
+// this the PR's fault" to "is this noise or is trunk actually broken". Only
+// intermittency answers that. BROKEN_ON_TRUNK deliberately does NOT clear here:
+// on trunk it means the failure is still there from last time, and greening a
+// standing breakage is how a broken trunk becomes permanent and invisible.
+export const EXONERATED_ON_TRUNK = new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
+export const exoneratedSet = (isTrunkRun) => (isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED);
 export const BORDERLINE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
 // The history endpoint pages; ask for its maximum page so a busy spec file is a
 // handful of requests rather than a hundred, and stop after enough pages that a
@@ -70,9 +77,15 @@ export const laneOf = (name) =>
 // ---------------------------------------------------------------- history rules
 
 /** Classify one failing test from its history and the PR's changed files. */
-export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = null, lane = null) {
+export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = null, lane = null, opts = {}) {
+  const { isTrunkRun = false, groupId = null } = opts;
   const own = new Set(changedFiles);
-  const inLane = lane == null ? observations : observations.filter((o) => o.name == null || laneOf(o.name) === lane);
+  // A run must never be part of its own history. On a PR run its group carries
+  // the PR number and drops out below, but on a trunk run it would land in
+  // `trunk` and the test would be reported as failing on trunk because of the
+  // very run being judged.
+  const seen = groupId == null ? observations : observations.filter((o) => o.group_id !== groupId);
+  const inLane = lane == null ? seen : seen.filter((o) => o.name == null || laneOf(o.name) === lane);
   // PR numbers arrive as numbers from TSIO but as strings from a composite
   // identity built with jq, so compare them as numbers. A strict mismatch would
   // file this PR's own runs under "other PRs", where enough of them satisfy
@@ -100,7 +113,22 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
     },
   };
   const out = (cls, reason, blocking) => ({ ...test, class: cls, reason, blocking, ...stats });
-  if (own.has(test.file)) return out("OWNED_BY_PR", `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
+  if (own.has(test.file))
+    return out("OWNED_BY_PR", isTrunkRun
+      ? `This commit changes ${test.file}; a failure in a spec the commit edits is not noise.`
+      : `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
+  // Trunk runs answer a different question, so they get their own order: a
+  // failure that was already there last time is a streak, not a flake, and stays
+  // red however often it has flaked before.
+  if (isTrunkRun) {
+    if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status))
+      return out("BROKEN_ON_TRUNK", `Still failing: the previous ${lane ?? "trunk"} run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}) failed this test too. That is a streak, not a flake.`, true);
+    if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0)
+      return out("FLAKY_ON_TRUNK", `Intermittent on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the previous ${trunk.length} runs, and the last one passed.`, false);
+    if (trunk.length < cfg.minTrunkRuns)
+      return out("INSUFFICIENT_DATA", `Only ${trunk.length} earlier trunk runs (need ${cfg.minTrunkRuns}); cannot tell a flake from a new break.`, true);
+    return out("REGRESSION", `New on trunk: passed in all ${trunk.length} previous runs.`, true);
+  }
   if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status))
     return out("BROKEN_ON_TRUNK", `Trunk's latest run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}, ${latestTrunk.created_at?.slice(0, 10) ?? "unknown date"}) fails this test too.`, false);
   const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
@@ -231,31 +259,33 @@ export function parseAnswer(text) {
 }
 
 /** The decision matrix: what a judge answer may change. Citations must name evidence in the pack. */
-export function decide(cls, answer, pack, cfg = DEFAULTS) {
-  if (!answer) return { blocking: !EXONERATED.has(cls), decision: "unavailable", answer: null };
+export function decide(cls, answer, pack, cfg = DEFAULTS, isTrunkRun = false) {
+  const EXON = exoneratedSet(isTrunkRun);
+  if (!answer) return { blocking: !EXON.has(cls), decision: "unavailable", answer: null };
   const known = new Set(evidenceIds(pack));
   const cited = answer.cited_evidence.filter((c) => known.has(c));
   const a = { ...answer, cited_evidence: cited };
   const hunk = cited.some((c) => c.startsWith("hunk_"));
   const cross = cited.includes("cross_pr");
-  if (EXONERATED.has(cls)) {
+  if (EXON.has(cls)) {
     if (a.cause === "caused_by_pr" && a.confidence >= cfg.vetoMin && hunk) return { blocking: true, decision: "adjudicator_veto", answer: a };
     return { blocking: false, decision: "engine", answer: a };
   }
   if (BORDERLINE.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && (cross || hunk || a.cause === "bug_on_master"))
     return { blocking: false, decision: "adjudicator_unblock", answer: a };
-  return { blocking: !EXONERATED.has(cls), decision: "engine", answer: a };
+  return { blocking: !EXON.has(cls), decision: "engine", answer: a };
 }
 
 /** Ask the judge about the findings that can still change the outcome; at most cfg.maxJudged, cfg.concurrency at a time. */
-export async function judge(findings, packs, ask, cfg = DEFAULTS, warn = () => {}) {
-  const queue = findings.map((f, i) => ({ f, pack: packs[i] })).filter((x) => x.pack && (BORDERLINE.has(x.f.class) || EXONERATED.has(x.f.class))).slice(0, cfg.maxJudged);
+export async function judge(findings, packs, ask, cfg = DEFAULTS, warn = () => {}, isTrunkRun = false) {
+  const EXON = exoneratedSet(isTrunkRun);
+  const queue = findings.map((f, i) => ({ f, pack: packs[i] })).filter((x) => x.pack && (BORDERLINE.has(x.f.class) || EXON.has(x.f.class))).slice(0, cfg.maxJudged);
   const workers = Array.from({ length: cfg.concurrency }, async () => {
     for (;;) {
       const item = queue.shift();
       if (!item) return;
       try {
-        const d = decide(item.f.class, await ask(item.pack), item.pack, cfg);
+        const d = decide(item.f.class, await ask(item.pack), item.pack, cfg, isTrunkRun);
         Object.assign(item.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
       } catch (e) {
         warn(`judge unavailable for "${item.f.title}": ${String(e).slice(0, 200)}`);
@@ -390,6 +420,10 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
   const cfg = { ...DEFAULTS, minConfidence: Number(env.MIN_CONFIDENCE || DEFAULTS.minConfidence), model: env.CLAUDE_MODEL || DEFAULTS.model };
   const id = JSON.parse(env.COMPOSITE_IDENTITY);
   const prNumber = Number(id.gh_pr_number || env.PR_NUMBER || 0) || null;
+  // No PR number means this is a trunk run. The question then is not "is this
+  // the PR's fault" but "is trunk noisy or actually broken", which changes which
+  // findings may clear; see EXONERATED_ON_TRUNK.
+  const isTrunkRun = prNumber == null;
   const base = (env.TSIO_BASE_URL || "https://test-io.test.mattermost.com").replace(/\/$/, "");
   const api = gh(fetchImpl, env.GITHUB_TOKEN);
   const run = await fetchRun(fetchImpl, base, id);
@@ -404,12 +438,12 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       ]);
       const files = (compare.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
       const changed = files.map((f) => f.filename);
-      result.findings = run.failing.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], changed, cfg, prNumber, laneOf(id.name)));
+      result.findings = run.failing.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], changed, cfg, prNumber, laneOf(id.name), { isTrunkRun, groupId: run.group_id }));
       if (env.ANTHROPIC_API_KEY && prNumber) {
         const others = result.findings.map((f) => ({ class: f.class, title: f.title.slice(0, 80) }));
         const pr = { number: prNumber, repository: id.repository, title: pull.title ?? "", lane: env.LANE || id.name };
         const packs = result.findings.map((f) => (f.class === "OWNED_BY_PR" ? null : buildPack(f, files, pr, others)));
-        await judge(result.findings, packs, (pack) => askModel(fetchImpl, env.ANTHROPIC_API_KEY, cfg.model, pack), cfg, log);
+        await judge(result.findings, packs, (pack) => askModel(fetchImpl, env.ANTHROPIC_API_KEY, cfg.model, pack), cfg, log, isTrunkRun);
       }
     }
   }

@@ -6,6 +6,7 @@ import {
   buildPack,
   classify,
   laneOf,
+  EXONERATED_ON_TRUNK,
   decide,
   fetchHistory,
   infraVerdict,
@@ -48,6 +49,41 @@ test("the PR's own runs never count as other PRs, even when TSIO sends string id
   const f = classify(failing, [...trunkPasses(8), ...own], [], undefined, "5");
   assert.notEqual(f.class, "FLAKY_CROSS_PR");
   assert.equal(f.cross_pr.prs.length, 0, "the PR's own failures must not be listed as other PRs");
+  assert.equal(f.blocking, true);
+});
+test("on trunk, a failure that was already failing last run is a streak and stays red", () => {
+  // The dangerous case: without this, a standing breakage on main clears itself
+  // as BROKEN_ON_TRUNK every run and trunk stays green while genuinely broken.
+  const history = [obs({ commit_sha: "prev", status: "failed" }), ...trunkPasses(8)];
+  const f = classify(failing, history, [], undefined, null, null, { isTrunkRun: true });
+  assert.equal(f.class, "BROKEN_ON_TRUNK");
+  assert.equal(f.blocking, true, "a streak on trunk must never go green");
+  assert.equal(EXONERATED_ON_TRUNK.has("BROKEN_ON_TRUNK"), false);
+});
+test("on trunk, an intermittent failure whose last run passed is a flake and clears", () => {
+  const history = [obs({ commit_sha: "prev", status: "passed" }), obs({ commit_sha: "old", status: "failed" }), ...trunkPasses(6)];
+  const f = classify(failing, history, [], undefined, null, null, { isTrunkRun: true });
+  assert.equal(f.class, "FLAKY_ON_TRUNK");
+  assert.equal(f.blocking, false);
+});
+test("a run is never part of its own history", () => {
+  // On a trunk run the current group carries no PR number, so it would land in
+  // trunk history and the run would read its own failure as proof that trunk was
+  // already broken. The contrast is the whole point: same history, and only the
+  // group id changes the answer.
+  const history = [obs({ group_id: "self", status: "failed" }), ...trunkPasses(8)];
+  const contaminated = classify(failing, history, [], undefined, null, null, { isTrunkRun: true });
+  assert.equal(contaminated.class, "BROKEN_ON_TRUNK", "without the guard the run sees itself");
+  assert.equal(contaminated.trunk.runs, 9);
+
+  const f = classify(failing, history, [], undefined, null, null, { isTrunkRun: true, groupId: "self" });
+  assert.equal(f.class, "REGRESSION", "excluded, it is a genuinely new failure over 8 clean runs");
+  assert.equal(f.blocking, true);
+  assert.equal(f.trunk.runs, 8);
+});
+test("on trunk, too little history cannot tell a flake from a new break", () => {
+  const f = classify(failing, trunkPasses(3), [], undefined, null, null, { isTrunkRun: true });
+  assert.equal(f.class, "INSUFFICIENT_DATA");
   assert.equal(f.blocking, true);
 });
 test("history from another lane does not count", () => {
