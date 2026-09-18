@@ -40,6 +40,16 @@ test("failing on three other PRs while trunk is green clears the PR; this PR's o
   assert.equal(classify(failing, hist, [], undefined, 9).class, "FLAKY_CROSS_PR");
   assert.equal(classify(failing, hist.slice(0, 8), [], undefined, 9).class, "REGRESSION");
 });
+test("the PR's own runs never count as other PRs, even when TSIO sends string ids", () => {
+  // A composite identity built with jq carries gh_pr_number as a string. If the
+  // comparison were strict, PR 5's own three failures would look like three
+  // other PRs and clear the failure on the strength of its own history.
+  const own = [1, 2, 3].map((i) => obs({ gh_pr_number: "5", status: "failed", commit_sha: `own${i}` }));
+  const f = classify(failing, [...trunkPasses(8), ...own], [], undefined, "5");
+  assert.notEqual(f.class, "FLAKY_CROSS_PR");
+  assert.equal(f.cross_pr.prs.length, 0, "the PR's own failures must not be listed as other PRs");
+  assert.equal(f.blocking, true);
+});
 test("history from another lane does not count", () => {
   const ios = (o) => obs({ ...o, name: o.gh_pr_number ? "mobile-pr-detox-ios" : "mobile-main-detox-ios" });
   const android = (o) => obs({ ...o, name: o.gh_pr_number ? "mobile-pr-detox-android" : "mobile-main-detox-android" });

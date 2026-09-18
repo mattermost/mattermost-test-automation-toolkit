@@ -73,13 +73,19 @@ export const laneOf = (name) =>
 export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = null, lane = null) {
   const own = new Set(changedFiles);
   const inLane = lane == null ? observations : observations.filter((o) => o.name == null || laneOf(o.name) === lane);
-  const trunk = inLane.filter((o) => o.gh_pr_number == null);
-  const others = inLane.filter((o) => o.gh_pr_number != null && o.gh_pr_number !== prNumber);
+  // PR numbers arrive as numbers from TSIO but as strings from a composite
+  // identity built with jq, so compare them as numbers. A strict mismatch would
+  // file this PR's own runs under "other PRs", where enough of them satisfy
+  // FLAKY_CROSS_PR and clear a failure on the strength of its own history.
+  const prOf = (o) => (o.gh_pr_number == null || o.gh_pr_number === "" ? null : Number(o.gh_pr_number));
+  const currentPR = prNumber == null ? null : Number(prNumber);
+  const trunk = inLane.filter((o) => prOf(o) == null);
+  const others = inLane.filter((o) => prOf(o) != null && prOf(o) !== currentPR);
   const trunkFails = trunk.filter((o) => FAILED_STATUSES.has(o.status)).length;
   const trunkFlaky = trunk.filter((o) => o.status === "flaky").length;
   const trunkPasses = trunk.filter((o) => o.status === "passed").length;
   const latestTrunk = trunk[0];
-  const failedPRs = [...new Set(others.filter((o) => FAILED_STATUSES.has(o.status)).map((o) => o.gh_pr_number))];
+  const failedPRs = [...new Set(others.filter((o) => FAILED_STATUSES.has(o.status)).map(prOf))];
   const otherPasses = others.filter((o) => o.status === "passed" || o.status === "flaky").length;
   const stats = {
     trunk: { runs: trunk.length, fails: trunkFails, flaky: trunkFlaky, passes: trunkPasses, latest: latestTrunk?.status ?? "" },
@@ -87,16 +93,16 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
       prs: failedPRs,
       examples: others
         .filter((o) => FAILED_STATUSES.has(o.status))
-        .filter((o, i, all) => all.findIndex((x) => x.gh_pr_number === o.gh_pr_number) === i)
+        .filter((o, i, all) => all.findIndex((x) => prOf(x) === prOf(o)) === i)
         .slice(0, 12)
-        .map((o) => `PR ${o.gh_pr_number} (${o.commit_sha.slice(0, 7)}, ${o.created_at.slice(5, 10)})`),
+        .map((o) => `PR ${prOf(o)} (${o.commit_sha?.slice(0, 7) ?? "unknown"}, ${o.created_at?.slice(5, 10) ?? "?"})`),
       passes: otherPasses,
     },
   };
   const out = (cls, reason, blocking) => ({ ...test, class: cls, reason, blocking, ...stats });
   if (own.has(test.file)) return out("OWNED_BY_PR", `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
   if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status))
-    return out("BROKEN_ON_TRUNK", `Trunk's latest run (${latestTrunk.commit_sha.slice(0, 7)}, ${latestTrunk.created_at.slice(0, 10)}) fails this test too.`, false);
+    return out("BROKEN_ON_TRUNK", `Trunk's latest run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}, ${latestTrunk.created_at?.slice(0, 10) ?? "unknown date"}) fails this test too.`, false);
   const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
   if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0 && laplace >= cfg.pMin && latestTrunk?.status !== "failed")
     return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in ${trunk.length} runs over ${cfg.windowDays} days.`, false);
@@ -417,8 +423,15 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
   const enforce = (env.MODE || "enforce") === "enforce";
   if (prNumber && (run.failing.length || env.ALWAYS_COMMENT === "true")) {
     const marker = `<!-- e2e-triage:${context} -->`;
-    const comments = await api("GET", `/repos/${id.repository}/issues/${prNumber}/comments?per_page=100`);
-    const mine = comments.find((c) => c.body?.startsWith(marker));
+    // Comments come back oldest first, 100 to a page. On a long-running PR the
+    // sticky comment is not on the first page, and failing to find it posts a
+    // second one on every run instead of updating the one already there.
+    let mine = null;
+    for (let page = 1; page <= 20 && !mine; page++) {
+      const comments = await api("GET", `/repos/${id.repository}/issues/${prNumber}/comments?per_page=100&page=${page}`);
+      mine = comments.find((c) => c.body?.startsWith(marker)) ?? null;
+      if (comments.length < 100) break;
+    }
     if (mine) await api("PATCH", `/repos/${id.repository}/issues/comments/${mine.id}`, { body: comment });
     else await api("POST", `/repos/${id.repository}/issues/${prNumber}/comments`, { body: comment });
   }
