@@ -7,6 +7,7 @@ import {
   classify,
   laneOf,
   decide,
+  fetchHistory,
   infraVerdict,
   judge,
   parseAnswer,
@@ -127,6 +128,28 @@ const env = {
   TSIO_BASE_URL: "http://tsio",
 };
 
+test("history is asked for spec files, not test titles, and every page is walked", async () => {
+  const pages = [
+    { observations: [obs({ commit_sha: "p1" }), obs({ title: "some other test in the same file", commit_sha: "x" })], has_more: true },
+    { observations: [obs({ commit_sha: "p2" })], has_more: false },
+    { observations: [obs({ commit_sha: "never" })], has_more: false },
+  ];
+  const sent = [];
+  const fetchImpl = fakeFetch([["/reports/history", (init) => { sent.push(JSON.parse(init.body)); return Response.json(pages[sent.length - 1]); }]]);
+  const history = await fetchHistory(fetchImpl, "http://tsio", "o/r", [failing, { ...failing, title: "t2" }], "2026-09-17T00:00:00Z", 14);
+
+  // One file, deduplicated from two failing tests, and no titles in the request.
+  assert.deepEqual(sent[0].files, ["specs/a.spec.ts"]);
+  assert.equal(sent[0].tests, undefined);
+  assert.equal(sent.length, 2, "stopped as soon as has_more was false");
+  assert.deepEqual([sent[0].page, sent[1].page], [1, 2]);
+  assert.equal(sent[0].since, "2026-09-03T00:00:00.000Z");
+
+  // Rows for tests the caller never asked about are dropped.
+  assert.deepEqual(history.get("specs/a.spec.ts\nt1").map((o) => o.commit_sha), ["p1", "p2"]);
+  assert.equal(history.has("specs/a.spec.ts\nsome other test in the same file"), false);
+  assert.equal(history.get("specs/a.spec.ts\nt2"), undefined, "a title with no rows stays unknown, so it stays blocking");
+});
 test("end to end: a regression the judge clears with cross-PR evidence turns the status green", async () => {
   const history = [...trunkPasses(8), obs({ gh_pr_number: 1, status: "failed" })].map((o) => ({ ...o }));
   const fetchImpl = fakeFetch([

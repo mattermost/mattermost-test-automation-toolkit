@@ -32,6 +32,12 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 export const FAILED_STATUSES = new Set(["failed", "timedOut", "interrupted"]);
 export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 export const BORDERLINE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
+// The history endpoint pages; ask for its maximum page so a busy spec file is a
+// handful of requests rather than a hundred, and stop after enough pages that a
+// pathological file cannot stall the job.
+const HISTORY_MAX_FILES = 50;
+const HISTORY_PER_PAGE = 2000;
+const HISTORY_MAX_PAGES = 25;
 export const DEFAULTS = {
   windowDays: 14,
   minTrunkRuns: 5,
@@ -325,17 +331,37 @@ export async function fetchRun(fetchImpl, base, id) {
   }
   return { group_id: group.id, failing, counts: { total: byTest.size, failed, flaky } };
 }
+/**
+ * Past executions of the failing tests, as a map keyed `file\ntitle`.
+ *
+ * TSIO is asked for whole spec files rather than for named tests: a title is
+ * reworded far more often than the file it lives in, so a request keyed on the
+ * title would lose a test's history the moment somebody fixed a typo in it. The
+ * response therefore carries every test in those files and the rows are matched
+ * back here, which keeps the matching rule on this side where it can change
+ * without a server deploy. The rule today is an exact file and title match, so a
+ * renamed test finds nothing, is reported as INSUFFICIENT_DATA and stays
+ * blocking, which is the safe direction.
+ */
 export async function fetchHistory(fetchImpl, base, repository, tests, until, windowDays) {
-  const body = { repository, until, tests: tests.slice(0, 50).map((t) => ({ file: t.file, title: t.title })) };
-  if (windowDays) body.since = new Date(Date.parse(until) - windowDays * 86400000).toISOString();
-  const res = await fetchImpl(`${base}/api/v1/reports/history`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(120000) });
-  if (!res.ok) throw new Error(`TSIO history ${res.status}`);
-  const { observations } = await res.json();
   const byTest = new Map();
-  for (const o of observations) {
-    const k = `${o.file}\n${o.title}`;
-    if (!byTest.has(k)) byTest.set(k, []);
-    byTest.get(k).push(o);
+  const files = [...new Set(tests.map((t) => t.file).filter(Boolean))].slice(0, HISTORY_MAX_FILES);
+  if (files.length === 0) return byTest;
+  const wanted = new Set(tests.map((t) => `${t.file}\n${t.title}`));
+  const since = windowDays ? new Date(Date.parse(until) - windowDays * 86400000).toISOString() : undefined;
+  for (let page = 1; page <= HISTORY_MAX_PAGES; page++) {
+    const body = { repository, until, files, page, per_page: HISTORY_PER_PAGE };
+    if (since) body.since = since;
+    const res = await fetchImpl(`${base}/api/v1/reports/history`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(120000) });
+    if (!res.ok) throw new Error(`TSIO history ${res.status}`);
+    const { observations = [], has_more: hasMore } = await res.json();
+    for (const o of observations) {
+      const k = `${o.file}\n${o.title}`;
+      if (!wanted.has(k)) continue;
+      if (!byTest.has(k)) byTest.set(k, []);
+      byTest.get(k).push(o);
+    }
+    if (!hasMore) break;
   }
   return byTest;
 }

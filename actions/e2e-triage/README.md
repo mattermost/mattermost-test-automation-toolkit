@@ -12,8 +12,14 @@ One script, no dependencies: [`scripts/e2e-triage.mjs`](../../scripts/e2e-triage
 
 1. Reads the run's consolidated results from TSIO. Tests that passed on retry
    are not failures.
-2. Asks TSIO for the last 14 days of history of every failing test
-   (`POST /api/v1/reports/history`): trunk runs and other PRs' runs.
+2. Asks TSIO for the last 14 days of history of the spec files those failures
+   live in (`POST /api/v1/reports/history`, paged): trunk runs and other PRs'
+   runs. The request names files rather than tests because a test title is
+   reworded far more often than the file it lives in, so a title-keyed request
+   would lose a test's history to a typo fix. Rows are matched back to the
+   failing tests in the action, on an exact file and title match today; a
+   renamed test therefore finds no history and stays blocking, and a looser rule
+   can be tried here without a TSIO deploy.
 3. Applies the rules, in order:
 
    | Finding | Meaning | Status |
