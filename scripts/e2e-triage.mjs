@@ -45,6 +45,7 @@ export const BORDERLINE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
 const HISTORY_MAX_FILES = 50;
 const HISTORY_PER_PAGE = 2000;
 const HISTORY_MAX_PAGES = 25;
+const COMPARE_MAX_PAGES = 30;
 export const DEFAULTS = {
   windowDays: 14,
   minTrunkRuns: 5,
@@ -142,7 +143,9 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
   const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
   if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0 && laplace >= cfg.pMin && latestTrunk?.status !== "failed")
     return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in ${trunk.length} runs over ${cfg.windowDays} days.`, false);
-  if (failedPRs.length >= cfg.crossPRMinPRs && trunkFails === 0 && (trunkPasses > 0 || otherPasses > 0))
+  // trunkFails === 0 is vacuously true when trunk was never observed, so require
+  // real trunk passes before claiming trunk stayed green.
+  if (failedPRs.length >= cfg.crossPRMinPRs && trunkFails === 0 && trunkPasses > 0)
     return out("FLAKY_CROSS_PR", `Failed on ${failedPRs.length} other PRs in ${cfg.windowDays} days (${stats.cross_pr.examples.slice(0, 3).join(", ")}) while trunk stayed green.`, false);
   if (trunk.length < cfg.minTrunkRuns)
     return out("INSUFFICIENT_DATA", `Only ${trunk.length} trunk runs in ${cfg.windowDays} days (need ${cfg.minTrunkRuns}); history cannot clear it.`, true);
@@ -209,7 +212,10 @@ export function buildPack(finding, compareFiles, pr, others) {
     const base = f.filename.split("/").pop() ?? "";
     const stem = base.split(".")[0] ?? "";
     const named = f.filename === finding.file || (stem.length > 3 && text.includes(stem.toLowerCase())) || finding.error.includes(base);
-    if ((named || small) && f.patch) hunks.push({ id: `hunk_${hunks.length}`, file: f.filename, patch: f.patch.slice(0, named ? 4000 : 2500) });
+    // `related` means the diff actually touches the failing spec or is named in
+    // the error. On a small PR every hunk is shown for context, but only a
+    // related one may be cited as proof.
+    if ((named || small) && f.patch) hunks.push({ id: `hunk_${hunks.length}`, file: f.filename, related: named, patch: f.patch.slice(0, named ? 4000 : 2500) });
     if (hunks.length >= 8) break;
   }
   return {
@@ -223,7 +229,19 @@ export function buildPack(finding, compareFiles, pr, others) {
     other_failures_in_same_run: others.slice(0, 12),
   };
 }
-export const evidenceIds = (pack) => ["test", "error", "engine", "trunk_history_14d", "cross_pr", "pr.changed_files", ...pack.diff_hunks_of_files_named_in_error.map((h) => h.id)];
+// Ids a citation may name. Evidence with no content is deliberately absent: a
+// model citing "cross_pr" on a finding with no other failing PRs, or a hunk from
+// a diff unrelated to the failure, would otherwise pass validation and clear the
+// failure while pointing at nothing a reviewer could open.
+export const evidenceIds = (pack) => [
+  "test",
+  "error",
+  "engine",
+  "trunk_history_14d",
+  ...(pack.cross_pr_failures_14d?.other_prs_where_this_test_failed?.length ? ["cross_pr"] : []),
+  "pr.changed_files",
+  ...pack.diff_hunks_of_files_named_in_error.filter((h) => h.related).map((h) => h.id),
+];
 export const packKey = (model, pack) => createHash("sha256").update(model + "\n" + JSON.stringify(pack)).digest("hex");
 
 export async function askModel(fetchImpl, apiKey, model, pack, timeoutMs = 60000) {
@@ -416,6 +434,27 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, wi
   }
   return byTest;
 }
+/**
+ * Every changed file, not just the first hundred. OWNED_BY_PR is the rule that
+ * keeps a PR responsible for a spec it edited, so a diff truncated at page one
+ * would let a PR that edits the failing spec at file 101 be cleared instead.
+ */
+export async function fetchCompare(api, id, baseRef, log = () => {}) {
+  const files = [];
+  try {
+    for (let page = 1; page <= COMPARE_MAX_PAGES; page++) {
+      const res = await api("GET", `/repos/${id.repository}/compare/${encodeURIComponent(baseRef)}...${id.commit_sha}?per_page=100&page=${page}`);
+      const batch = res.files ?? [];
+      files.push(...batch);
+      if (batch.length < 100) return { files };
+    }
+    log(`compare stopped at ${COMPARE_MAX_PAGES} pages; ownership is based on the first ${files.length} files`);
+  } catch (e) {
+    log(String(e));
+    return { files: [] };
+  }
+  return { files };
+}
 export function gh(fetchImpl, token) {
   return async (method, path, body) => {
     const res = await fetchImpl(`https://api.github.com${path}`, {
@@ -448,7 +487,7 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
     if (!result.infra) {
       const [history, compare, pull] = await Promise.all([
         fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg.windowDays, log),
-        env.BASE_REF ? api("GET", `/repos/${id.repository}/compare/${encodeURIComponent(env.BASE_REF)}...${id.commit_sha}?per_page=100`).catch((e) => (log(String(e)), { files: [] })) : { files: [] },
+        env.BASE_REF ? fetchCompare(api, id, env.BASE_REF, log) : { files: [] },
         prNumber ? api("GET", `/repos/${id.repository}/pulls/${prNumber}`).catch(() => ({})) : {},
       ]);
       const files = (compare.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));

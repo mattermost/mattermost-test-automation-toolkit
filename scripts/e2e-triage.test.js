@@ -8,6 +8,7 @@ import {
   laneOf,
   EXONERATED_ON_TRUNK,
   decide,
+  evidenceIds,
   fetchHistory,
   infraVerdict,
   judge,
@@ -19,6 +20,8 @@ import {
 
 const obs = (over) => ({ file: "specs/a.spec.ts", title: "t1", status: "passed", retry_count: 0, gh_pr_number: null, commit_sha: "abcdef0123", created_at: "2026-09-10T10:00:00Z", branch: "master", ...over });
 const failing = { file: "specs/a.spec.ts", title: "t1", error: "Error: expected visible" };
+// Other PRs that failed the same test, so cross_pr evidence has real content.
+const crossPR = (...prs) => prs.map((n) => obs({ gh_pr_number: n, status: "failed", commit_sha: `x${n}` }));
 const trunkPasses = (n) => Array.from({ length: n }, (_, i) => obs({ commit_sha: `c${i}`, created_at: `2026-09-${String(10 - (i % 9)).padStart(2, "0")}T00:00:00Z` }));
 
 test("spec changed by the PR is the PR's problem, whatever history says", () => {
@@ -121,8 +124,8 @@ test("infra call needs a majority of infra signatures or a storm", () => {
   assert.ok(infraVerdict(Array.from({ length: 30 }, () => failing)));
 });
 test("decision matrix: unblock needs confidence plus a checkable citation; unknown citations are dropped", () => {
-  const f = classify(failing, trunkPasses(8), []);
-  const pack = buildPack(f, [{ filename: "app/x.ts", patch: "@@" }], { number: 1, repository: "o/r", title: "", lane: "l" }, []);
+  const f = classify(failing, [...trunkPasses(8), ...crossPR(11, 12)], [], undefined, 1);
+  const pack = buildPack(f, [{ filename: "specs/a.spec.ts", patch: "@@" }], { number: 1, repository: "o/r", title: "", lane: "l" }, []);
   const ok = { cause: "flaky_environment", confidence: 0.9, cited_evidence: ["cross_pr"], explanation: "recurs" };
   assert.equal(decide("REGRESSION", ok, pack).decision, "adjudicator_unblock");
   assert.equal(decide("REGRESSION", { ...ok, confidence: 0.8 }, pack).blocking, true);
@@ -134,12 +137,21 @@ test("decision matrix: unblock needs confidence plus a checkable citation; unkno
   assert.equal(decide("FLAKY_CROSS_PR", { cause: "caused_by_pr", confidence: 0.95, cited_evidence: ["error"], explanation: "" }, pack).blocking, false);
   assert.equal(decide("OWNED_BY_PR", ok, pack).blocking, true);
   assert.equal(decide("REGRESSION", null, pack).decision, "unavailable");
+
+  // Evidence with no content must not be citable. Without this, a model naming
+  // "cross_pr" on a finding where no other PR failed clears it while pointing at
+  // an empty list, which is the whole guarantee gone.
+  const alone = classify(failing, trunkPasses(8), []);
+  const emptyPack = buildPack(alone, [{ filename: "docs/readme.md", patch: "@@" }], { number: 1, repository: "o/r", title: "", lane: "l" }, []);
+  assert.equal(evidenceIds(emptyPack).includes("cross_pr"), false, "no other PR failed, so cross_pr is not citable");
+  assert.equal(decide("REGRESSION", ok, emptyPack).blocking, true, "citing empty cross_pr must not unblock");
+  assert.equal(decide("REGRESSION", { ...ok, cited_evidence: ["hunk_0"] }, emptyPack).blocking, true, "an unrelated hunk must not unblock");
 });
 test("a claim that master is broken cannot unblock on its own", () => {
   // The rules only escalate a REGRESSION when trunk history was clean, so a model
   // asserting bug_on_master is arguing against the data. Without a citation a
   // reviewer can open, it must not clear the failure.
-  const pack = buildPack(classify(failing, trunkPasses(8), []), [{ filename: "app/x.ts", patch: "@@" }], { number: 1, repository: "o/r", title: "", lane: "l" }, [{ gh_pr_number: 2, commit_sha: "c", created_at: "2026-09-10T00:00:00Z", status: "failed" }]);
+  const pack = buildPack(classify(failing, [...trunkPasses(8), ...crossPR(21, 22)], [], undefined, 1), [{ filename: "specs/a.spec.ts", patch: "@@" }], { number: 1, repository: "o/r", title: "", lane: "l" }, []);
   const noCitation = decide("REGRESSION", { cause: "bug_on_master", confidence: 0.99, cited_evidence: [], explanation: "x" }, pack);
   assert.equal(noCitation.blocking, true, "bug_on_master with no citation must stay blocking");
   const invented = decide("REGRESSION", { cause: "bug_on_master", confidence: 0.99, cited_evidence: ["made_up"], explanation: "x" }, pack);
@@ -148,7 +160,7 @@ test("a claim that master is broken cannot unblock on its own", () => {
   assert.equal(real.blocking, false, "a checkable citation still clears it");
 });
 test("judge caps the number of findings and survives outages", async () => {
-  const findings = Array.from({ length: 10 }, (_, i) => classify({ ...failing, title: `t${i}` }, trunkPasses(8), []));
+  const findings = Array.from({ length: 10 }, (_, i) => classify({ ...failing, title: `t${i}` }, [...trunkPasses(8), ...crossPR(31, 32)], [], undefined, 1));
   const packs = findings.map((f) => buildPack(f, [], { number: 1, repository: "o/r", title: "", lane: "l" }, []));
   let calls = 0;
   await judge(findings, packs, async () => {
