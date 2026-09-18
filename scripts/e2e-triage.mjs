@@ -69,10 +69,18 @@ export const isInfraError = (text) => INFRA_RE.test(text ?? "");
  * vs playwright-full-enterprise-master). History is compared within a lane:
  * an Android flake says nothing about iOS.
  */
+// A lane is a report name with its run type removed, so a PR run and a trunk run
+// of the same suite compare against each other. Repos spell the run type
+// differently: mobile puts it in the middle ("mobile-pr-detox-ios"), desktop
+// makes it the whole suffix ("desktop-pr" vs "desktop-master"), and the server
+// repo appends it ("playwright-full-enterprise" vs "...-master"). Getting this
+// wrong does not fail loudly: the PR and trunk names simply land in different
+// lanes, no trunk history is ever found, and every failure reports as
+// INSUFFICIENT_DATA and stays blocking.
 export const laneOf = (name) =>
   String(name ?? "")
-    .replace(/^mobile-(pr|main)-/, "")
-    .replace(/-(master|main|release(-cut)?)$/, "");
+    .replace(/^(mobile|desktop)-(pr|main|master)(-|$)/, "")
+    .replace(/-(master|main|release(-cut)?)$/, "") || "default";
 
 // ---------------------------------------------------------------- history rules
 
@@ -271,7 +279,12 @@ export function decide(cls, answer, pack, cfg = DEFAULTS, isTrunkRun = false) {
     if (a.cause === "caused_by_pr" && a.confidence >= cfg.vetoMin && hunk) return { blocking: true, decision: "adjudicator_veto", answer: a };
     return { blocking: false, decision: "engine", answer: a };
   }
-  if (BORDERLINE.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && (cross || hunk || a.cause === "bug_on_master"))
+  // An unblock always needs a citation that survived validation against the pack.
+  // "bug_on_master" used to qualify on its own, which was a hole: the rules only
+  // reach here when trunk history was clean, so a model asserting the test is
+  // broken on master is contradicting the data, and it could clear a regression
+  // while citing nothing a reviewer could open.
+  if (BORDERLINE.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && (cross || hunk))
     return { blocking: false, decision: "adjudicator_unblock", answer: a };
   return { blocking: !EXON.has(cls), decision: "engine", answer: a };
 }
@@ -379,7 +392,7 @@ export async function fetchRun(fetchImpl, base, id) {
  * renamed test finds nothing, is reported as INSUFFICIENT_DATA and stays
  * blocking, which is the safe direction.
  */
-export async function fetchHistory(fetchImpl, base, repository, tests, until, windowDays) {
+export async function fetchHistory(fetchImpl, base, repository, tests, until, windowDays, warn = () => {}) {
   const byTest = new Map();
   const files = [...new Set(tests.map((t) => t.file).filter(Boolean))].slice(0, HISTORY_MAX_FILES);
   if (files.length === 0) return byTest;
@@ -398,6 +411,8 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, wi
       byTest.get(k).push(o);
     }
     if (!hasMore) break;
+    if (page === HISTORY_MAX_PAGES)
+      warn(`history for ${files.length} file(s) hit the ${HISTORY_MAX_PAGES}-page cap with more to come; verdicts are based on partial history`);
   }
   return byTest;
 }
@@ -432,7 +447,7 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
     result.infra = infraVerdict(run.failing, cfg);
     if (!result.infra) {
       const [history, compare, pull] = await Promise.all([
-        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg.windowDays),
+        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg.windowDays, log),
         env.BASE_REF ? api("GET", `/repos/${id.repository}/compare/${encodeURIComponent(env.BASE_REF)}...${id.commit_sha}?per_page=100`).catch((e) => (log(String(e)), { files: [] })) : { files: [] },
         prNumber ? api("GET", `/repos/${id.repository}/pulls/${prNumber}`).catch(() => ({})) : {},
       ]);

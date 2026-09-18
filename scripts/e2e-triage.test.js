@@ -86,6 +86,19 @@ test("on trunk, too little history cannot tell a flake from a new break", () => 
   assert.equal(f.class, "INSUFFICIENT_DATA");
   assert.equal(f.blocking, true);
 });
+test("lane names line up between PR and trunk runs in every repo", () => {
+  // If a PR run and a trunk run of the same suite land in different lanes, no
+  // trunk history is ever found and every failure stays blocking, silently.
+  for (const [pr, trunk] of [
+    ["mobile-pr-detox-ios", "mobile-main-detox-ios"],
+    ["mobile-pr-maestro-android-e2e", "mobile-main-maestro-android-e2e"],
+    ["desktop-pr", "desktop-master"],
+    ["playwright-full-enterprise", "playwright-full-enterprise-master"],
+  ])
+    assert.equal(laneOf(pr), laneOf(trunk), `${pr} and ${trunk} must share a lane`);
+  // Different suites must still separate.
+  assert.notEqual(laneOf("mobile-pr-detox-ios"), laneOf("mobile-pr-detox-android"));
+});
 test("history from another lane does not count", () => {
   const ios = (o) => obs({ ...o, name: o.gh_pr_number ? "mobile-pr-detox-ios" : "mobile-main-detox-ios" });
   const android = (o) => obs({ ...o, name: o.gh_pr_number ? "mobile-pr-detox-android" : "mobile-main-detox-android" });
@@ -115,11 +128,24 @@ test("decision matrix: unblock needs confidence plus a checkable citation; unkno
   assert.equal(decide("REGRESSION", { ...ok, confidence: 0.8 }, pack).blocking, true);
   assert.equal(decide("REGRESSION", { ...ok, cited_evidence: ["error"] }, pack).blocking, true);
   assert.equal(decide("REGRESSION", { ...ok, cited_evidence: ["hunk_7"] }, pack).blocking, true);
-  assert.equal(decide("REGRESSION", { ...ok, cause: "bug_on_master", cited_evidence: ["engine"] }, pack).blocking, false);
+  // "bug_on_master" no longer unblocks on its own; it still needs cross_pr or a hunk.
+  assert.equal(decide("REGRESSION", { ...ok, cause: "bug_on_master", cited_evidence: ["engine"] }, pack).blocking, true);
   assert.equal(decide("FLAKY_CROSS_PR", { cause: "caused_by_pr", confidence: 0.95, cited_evidence: ["hunk_0"], explanation: "" }, pack).decision, "adjudicator_veto");
   assert.equal(decide("FLAKY_CROSS_PR", { cause: "caused_by_pr", confidence: 0.95, cited_evidence: ["error"], explanation: "" }, pack).blocking, false);
   assert.equal(decide("OWNED_BY_PR", ok, pack).blocking, true);
   assert.equal(decide("REGRESSION", null, pack).decision, "unavailable");
+});
+test("a claim that master is broken cannot unblock on its own", () => {
+  // The rules only escalate a REGRESSION when trunk history was clean, so a model
+  // asserting bug_on_master is arguing against the data. Without a citation a
+  // reviewer can open, it must not clear the failure.
+  const pack = buildPack(classify(failing, trunkPasses(8), []), [{ filename: "app/x.ts", patch: "@@" }], { number: 1, repository: "o/r", title: "", lane: "l" }, [{ gh_pr_number: 2, commit_sha: "c", created_at: "2026-09-10T00:00:00Z", status: "failed" }]);
+  const noCitation = decide("REGRESSION", { cause: "bug_on_master", confidence: 0.99, cited_evidence: [], explanation: "x" }, pack);
+  assert.equal(noCitation.blocking, true, "bug_on_master with no citation must stay blocking");
+  const invented = decide("REGRESSION", { cause: "bug_on_master", confidence: 0.99, cited_evidence: ["made_up"], explanation: "x" }, pack);
+  assert.equal(invented.blocking, true, "an invented citation is filtered, so it cannot unblock");
+  const real = decide("REGRESSION", { cause: "bug_on_master", confidence: 0.99, cited_evidence: ["cross_pr"], explanation: "x" }, pack);
+  assert.equal(real.blocking, false, "a checkable citation still clears it");
 });
 test("judge caps the number of findings and survives outages", async () => {
   const findings = Array.from({ length: 10 }, (_, i) => classify({ ...failing, title: `t${i}` }, trunkPasses(8), []));
