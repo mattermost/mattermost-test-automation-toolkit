@@ -45,7 +45,7 @@ export const BORDERLINE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
 const HISTORY_MAX_FILES = 50;
 const HISTORY_PER_PAGE = 2000;
 const HISTORY_MAX_PAGES = 25;
-const COMPARE_MAX_PAGES = 30;
+const CHANGED_FILES_MAX_PAGES = 30;
 export const DEFAULTS = {
   windowDays: 14,
   minTrunkRuns: 5,
@@ -441,25 +441,36 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, wi
   return byTest;
 }
 /**
- * Every changed file, not just the first hundred. OWNED_BY_PR is the rule that
- * keeps a PR responsible for a spec it edited, so a diff truncated at page one
- * would let a PR that edits the failing spec at file 101 be cleared instead.
+ * The files this run is answerable for, and whether we actually know them.
+ *
+ * A PR's files come from the pull-request endpoint, which pages properly. The
+ * compare endpoint returns `files` on the first page only and caps the whole
+ * comparison at 300, so paging it buys nothing. A trunk run has no PR, so the
+ * question becomes what this commit itself changed.
+ *
+ * `ok` matters as much as the list. OWNED_BY_PR is the rule that keeps a change
+ * answerable for a spec it edited, so an empty list from a failed request looks
+ * exactly like "touched nothing" and would let history rules clear a failure the
+ * change caused. Callers must refuse to clear anything when ok is false.
  */
-export async function fetchCompare(api, id, baseRef, log = () => {}) {
-  const files = [];
+export async function fetchChangedFiles(api, id, prNumber, log = () => {}) {
   try {
-    for (let page = 1; page <= COMPARE_MAX_PAGES; page++) {
-      const res = await api("GET", `/repos/${id.repository}/compare/${encodeURIComponent(baseRef)}...${id.commit_sha}?per_page=100&page=${page}`);
-      const batch = res.files ?? [];
-      files.push(...batch);
-      if (batch.length < 100) return { files };
+    if (prNumber) {
+      const files = [];
+      for (let page = 1; page <= CHANGED_FILES_MAX_PAGES; page++) {
+        const batch = await api("GET", `/repos/${id.repository}/pulls/${prNumber}/files?per_page=100&page=${page}`);
+        files.push(...(batch ?? []));
+        if (!batch || batch.length < 100) return { files, ok: true };
+      }
+      log(`stopped after ${CHANGED_FILES_MAX_PAGES} pages of changed files; ownership covers the first ${files.length}`);
+      return { files, ok: true };
     }
-    log(`compare stopped at ${COMPARE_MAX_PAGES} pages; ownership is based on the first ${files.length} files`);
+    const commit = await api("GET", `/repos/${id.repository}/commits/${id.commit_sha}`);
+    return { files: commit.files ?? [], ok: true };
   } catch (e) {
-    log(String(e));
-    return { files: [] };
+    log(`changed files unavailable: ${String(e).slice(0, 200)}`);
+    return { files: [], ok: false };
   }
-  return { files };
 }
 export function gh(fetchImpl, token) {
   return async (method, path, body) => {
@@ -491,21 +502,26 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
   if (run.failing.length) {
     result.infra = infraVerdict(run.failing, cfg);
     if (!result.infra) {
-      const [history, compare, pull] = await Promise.all([
+      const [history, diff, pull] = await Promise.all([
         fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg.windowDays, log),
-        env.BASE_REF ? fetchCompare(api, id, env.BASE_REF, log) : { files: [] },
+        fetchChangedFiles(api, id, prNumber, log),
         prNumber ? api("GET", `/repos/${id.repository}/pulls/${prNumber}`).catch(() => ({})) : {},
       ]);
-      const files = (compare.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
+      const files = (diff.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
       const changed = files.map((f) => f.filename);
       result.findings = run.failing.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], changed, cfg, prNumber, laneOf(id.name), { isTrunkRun, groupId: run.group_id }));
-      if (history.truncated) {
-        // Fail closed rather than judge on a partial view of trunk.
-        result.historyTruncated = true;
+      // Two ways the evidence can be incomplete, and neither may clear anything.
+      // The judge is skipped rather than merely overridden: it reads the same
+      // incomplete pack, and letting it run would hand back a non-blocking
+      // decision that silently undoes this.
+      const blind = history.truncated ? "History was truncated at the page cap" : !diff.ok ? "The list of changed files could not be read" : null;
+      if (blind) {
+        result.historyTruncated = Boolean(history.truncated);
+        result.ownershipUnknown = !diff.ok;
         for (const f of result.findings)
-          if (!f.blocking) Object.assign(f, { blocking: true, decision: "history_truncated", reason: `${f.reason} History was truncated at the page cap, so this could not be confirmed.` });
+          if (!f.blocking) Object.assign(f, { blocking: true, decision: "evidence_incomplete", reason: `${f.reason} ${blind}, so this could not be confirmed.` });
       }
-      if (env.ANTHROPIC_API_KEY && prNumber) {
+      if (!blind && env.ANTHROPIC_API_KEY && prNumber) {
         const others = result.findings.map((f) => ({ class: f.class, title: f.title.slice(0, 80) }));
         const pr = { number: prNumber, repository: id.repository, title: pull.title ?? "", lane: env.LANE || id.name };
         const packs = result.findings.map((f) => (f.class === "OWNED_BY_PR" ? null : buildPack(f, files, pr, others)));

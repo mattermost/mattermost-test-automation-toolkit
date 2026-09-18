@@ -11,10 +11,6 @@ inputs:
   status-context:
     description: Required commit-status context to write the final verdict to (e.g. e2e-test/playwright-full/enterprise)
     required: true
-  base-ref:
-    description: Base branch of the PR (used for the diff that decides ownership and feeds the judge)
-    required: false
-    default: ""
   github-token:
     description: Token for the diff, the PR comment and the commit status; never sent to TSIO or Anthropic
     required: true
@@ -63,7 +59,6 @@ runs:
       env:
         COMPOSITE_IDENTITY: ${{ inputs.composite-identity }}
         STATUS_CONTEXT: ${{ inputs.status-context }}
-        BASE_REF: ${{ inputs.base-ref }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
         CLAUDE_MODEL: ${{ inputs.claude-model }}

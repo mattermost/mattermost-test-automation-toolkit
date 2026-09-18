@@ -234,6 +234,38 @@ test("history is asked for spec files, not test titles, and every page is walked
   assert.equal(history.has("specs/a.spec.ts\nsome other test in the same file"), false);
   assert.equal(history.get("specs/a.spec.ts\nt2"), undefined, "a title with no rows stays unknown, so it stays blocking");
 });
+test("an unreadable diff clears nothing, and never reaches the model", async () => {
+  // An empty file list from a failed request looks exactly like "touched
+  // nothing", which would let history rules clear a failure the PR caused.
+  const asked = [];
+  const fetchImpl = fakeFetch([
+    ...runRoutes([spec("t1", "failed")]),
+    ["/reports/history", () => Response.json({ observations: [...trunkPasses(8), obs({ gh_pr_number: 1, status: "failed" }), obs({ gh_pr_number: 2, status: "failed" }), obs({ gh_pr_number: 3, status: "failed" })] })],
+    ["/pulls/5/files", () => new Response("nope", { status: 500 })],
+    ["/pulls/5", () => Response.json({ title: "x" })],
+    ["api.anthropic.com", () => (asked.push(1), Response.json({ stop_reason: "end_turn", content: [{ type: "text", text: "{}" }] }))],
+    ["/issues/5/comments", (init) => (init.method === "POST" ? Response.json({ id: 1 }) : Response.json([]))],
+  ]);
+  const result = await triage({ env: { ...env, MODE: "report-only" }, fetchImpl, log: () => {} });
+  assert.equal(result.ownershipUnknown, true);
+  assert.equal(result.verdict, "FAILURE", "cross-PR history must not clear a failure when ownership is unknown");
+  assert.equal(result.findings.every((f) => f.blocking), true);
+  assert.equal(asked.length, 0, "the model sees the same incomplete pack, so it is skipped");
+});
+test("a trunk run is judged on what its own commit changed", async () => {
+  // BASE_REF...commit is empty for a trunk commit, so ownership has to come from
+  // the commit itself or a commit that edits its own failing spec looks innocent.
+  const id = { repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "mobile-main-detox-ios", branch: "main" };
+  const fetchImpl = fakeFetch([
+    ...runRoutes([spec("t1", "failed")]),
+    ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
+    ["/commits/abc", () => Response.json({ files: [{ filename: "specs/a.spec.ts", patch: "@@" }] })],
+  ]);
+  const result = await triage({ env: { ...env, COMPOSITE_IDENTITY: JSON.stringify(id), MODE: "report-only" }, fetchImpl, log: () => {} });
+  assert.equal(result.findings[0].class, "OWNED_BY_PR");
+  assert.equal(result.verdict, "FAILURE");
+  assert.ok(fetchImpl.calls.some((c) => c.url.includes("/commits/abc")), "trunk ownership comes from the commit");
+});
 test("partial history clears nothing", async () => {
   // If the page cap is hit, the rows never fetched are exactly the ones that
   // might have shown a failure on trunk. Nothing may be cleared on that view.
@@ -241,7 +273,7 @@ test("partial history clears nothing", async () => {
   const fetchImpl = fakeFetch([
     ...runRoutes([spec("t1", "failed")]),
     ["/reports/history", () => Response.json(page)],
-    ["/compare/", () => Response.json({ files: [{ filename: "app/login.ts", patch: "@@" }] })],
+    ["/pulls/5/files", () => Response.json([{ filename: "app/login.ts", patch: "@@" }])],
     ["/pulls/5", () => Response.json({ title: "x" })],
     ["/issues/5/comments", (init) => (init.method === "POST" ? Response.json({ id: 1 }) : Response.json([]))],
   ]);
@@ -255,7 +287,7 @@ test("end to end: a regression the judge clears with cross-PR evidence turns the
   const fetchImpl = fakeFetch([
     ...runRoutes([spec("t1", "failed"), spec("t2", "passed"), spec("t3", "passed", 1)]),
     ["/reports/history", () => Response.json({ observations: history })],
-    ["/compare/", () => Response.json({ files: [{ filename: "app/login.ts", patch: "@@ -1 +1 @@" }] })],
+    ["/pulls/5/files", () => Response.json([{ filename: "app/login.ts", patch: "@@ -1 +1 @@" }])],
     ["/pulls/5", () => Response.json({ title: "Fix login" })],
     ["api.anthropic.com", (init) => {
       assert.ok(JSON.parse(init.body).messages[0].content.includes("hunk_0"));
@@ -282,7 +314,7 @@ test("end to end: report-only never posts a status, and an owned spec is never j
   const fetchImpl = fakeFetch([
     ...runRoutes([spec("t1", "failed")]),
     ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
-    ["/compare/", () => Response.json({ files: [{ filename: "specs/a.spec.ts", patch: "@@" }] })],
+    ["/pulls/5/files", () => Response.json([{ filename: "specs/a.spec.ts", patch: "@@" }])],
     ["/pulls/5", () => Response.json({ title: "x" })],
     ["/issues/5/comments", (init) => (init.method === "POST" ? Response.json({ id: 1 }) : Response.json([]))],
   ]);
