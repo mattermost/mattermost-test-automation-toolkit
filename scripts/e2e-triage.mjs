@@ -373,9 +373,14 @@ export async function fetchRun(fetchImpl, base, id) {
   };
   const q = new URLSearchParams({ repository: id.repository, commit: id.commit_sha, name: id.name, limit: "20" });
   const { reports: groups = [] } = await get(`/reports?${q}`);
+  // Never trust the server to have applied the filters. A deployment without
+  // them answers the same query with an unfiltered list, and taking the first
+  // row means triaging a different repository's run and reporting its result as
+  // this one's — silently, and in the direction of a green status.
+  const mine = groups.filter((g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name);
   const attempt = String(id.gh_run_attempt ?? "");
-  const group = groups.find((g) => attempt && String(g.gh_run_attempt) === attempt) ?? groups[0];
-  if (!group) throw new Error(`TSIO has no report group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name}`);
+  const group = mine.find((g) => attempt && String(g.gh_run_attempt) === attempt) ?? mine[0];
+  if (!group) throw new Error(`TSIO returned no group matching ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} (of ${groups.length} row(s) returned; the deployment may predate the list filters)`);
   const [{ suites = [] }, cases] = await Promise.all([get(`/reports/${group.id}/suites`), get(`/reports/${group.id}/cases`)]);
   const fileOf = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
   const byTest = new Map();

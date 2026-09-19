@@ -10,6 +10,7 @@ import {
   decide,
   evidenceIds,
   fetchHistory,
+  fetchRun,
   infraVerdict,
   judge,
   parseAnswer,
@@ -198,8 +199,10 @@ function fakeFetch(routes) {
 // TSIO run fixtures: one group, one suite per spec, one case row per attempt.
 const caseRow = (title, status, retry = 0, suite = "s1") => ({ suite_id: suite, title, status, retry_count: retry, ordinal: 0, error_message: status === "passed" ? null : "Error: expected visible", error_stack: null });
 const spec = (title, status, retries = 0) => [...Array.from({ length: retries }, (_, i) => caseRow(title, "failed", i)), caseRow(title, status, retries)];
-const runRoutes = (specs) => [
-  ["/reports?", () => Response.json({ reports: [{ id: "g1", gh_run_attempt: "1" }], total: 1 })],
+const runRoutes = (specs, name = "playwright-full") => [
+  // The group carries its identity because fetchRun verifies it belongs to the
+  // run being triaged rather than trusting the server to have filtered.
+  ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name, gh_run_attempt: "1" }], total: 1 })],
   ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
   ["/reports/g1/cases", () => Response.json(specs.flat())],
 ];
@@ -257,7 +260,7 @@ test("a trunk run is judged on what its own commit changed", async () => {
   // the commit itself or a commit that edits its own failing spec looks innocent.
   const id = { repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "mobile-main-detox-ios", branch: "main" };
   const fetchImpl = fakeFetch([
-    ...runRoutes([spec("t1", "failed")]),
+    ...runRoutes([spec("t1", "failed")], "mobile-main-detox-ios"),
     ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
     ["/commits/abc", () => Response.json({ files: [{ filename: "specs/a.spec.ts", patch: "@@" }] })],
   ]);
@@ -265,6 +268,24 @@ test("a trunk run is judged on what its own commit changed", async () => {
   assert.equal(result.findings[0].class, "OWNED_BY_PR");
   assert.equal(result.verdict, "FAILURE");
   assert.ok(fetchImpl.calls.some((c) => c.url.includes("/commits/abc")), "trunk ownership comes from the commit");
+});
+test("a run refuses to read another run's results", async () => {
+  // A deployment without the list filters answers the query with an unfiltered
+  // list. Taking the first row would report an unrelated repository's result as
+  // this run's, and it would look like a clean pass.
+  const id = { repository: "o/r", commit_sha: "abc", name: "lane-a", gh_run_attempt: "1" };
+  const other = { id: "g9", repository: "other/repo", commit: "zzz", name: "something-else", gh_run_attempt: "1" };
+  const unfiltered = fakeFetch([["/reports?", () => Response.json({ reports: [other], total: 19659 })]]);
+  await assert.rejects(() => fetchRun(unfiltered, "http://tsio", id), /no group matching/);
+
+  const correct = { id: "g1", repository: "o/r", commit: "abc", name: "lane-a", gh_run_attempt: "1" };
+  const filtered = fakeFetch([
+    ["/reports?", () => Response.json({ reports: [other, correct], total: 2 })],
+    ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+    ["/reports/g1/cases", () => Response.json(spec("t1", "passed"))],
+  ]);
+  const run = await fetchRun(filtered, "http://tsio", id);
+  assert.equal(run.group_id, "g1", "it picks its own group even when others come back alongside");
 });
 test("partial history clears nothing", async () => {
   // If the page cap is hit, the rows never fetched are exactly the ones that
