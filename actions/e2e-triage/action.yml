@@ -1,0 +1,69 @@
+name: E2E triage
+description: >
+  After an E2E run reported to Test System IO, decide whether its failures are the
+  PR's fault, ask Claude about the borderline ones with checkable evidence, and
+  publish the outcome as the required commit status plus a sticky PR comment.
+author: Mattermost
+inputs:
+  composite-identity:
+    description: JSON with repository, commit_sha, gh_run_id, gh_run_attempt, name, branch and gh_pr_number (the same object the TSIO begin/summary actions receive)
+    required: true
+  status-context:
+    description: Required commit-status context to write the final verdict to (e.g. e2e-test/playwright-full/enterprise)
+    required: true
+  github-token:
+    description: Token for the diff, the PR comment and the commit status; never sent to TSIO or Anthropic
+    required: true
+  anthropic-api-key:
+    description: Anthropic API key for the second judge; without it only the history rules run
+    required: false
+    default: ""
+  claude-model:
+    description: Model for the second judge
+    required: false
+    default: claude-haiku-4-5
+  min-confidence:
+    description: Minimum judge confidence (0.5-1) to clear a borderline failure; vetoes always need 0.9 plus a cited hunk
+    required: false
+    default: "0.85"
+  mode:
+    description: enforce writes the commit status; report-only posts the comment and job summary only
+    required: false
+    default: enforce
+  tsio-base-url:
+    description: Test System IO base URL
+    required: false
+    default: https://test-io.test.mattermost.com
+  lane:
+    description: Optional lane label shown to the judge (defaults to the run name)
+    required: false
+    default: ""
+outputs:
+  verdict:
+    description: SUCCESS, FAILURE or ACTION_REQUIRED (infrastructure)
+    value: ${{ steps.triage.outputs.verdict }}
+  blocking:
+    description: Number of failures attributed to the PR
+    value: ${{ steps.triage.outputs.blocking }}
+  exonerated:
+    description: Number of failures cleared by history or the judge
+    value: ${{ steps.triage.outputs.exonerated }}
+  description:
+    description: The commit-status description that was (or would be) written
+    value: ${{ steps.triage.outputs.description }}
+runs:
+  using: composite
+  steps:
+    - id: triage
+      shell: bash
+      env:
+        COMPOSITE_IDENTITY: ${{ inputs.composite-identity }}
+        STATUS_CONTEXT: ${{ inputs.status-context }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        CLAUDE_MODEL: ${{ inputs.claude-model }}
+        MIN_CONFIDENCE: ${{ inputs.min-confidence }}
+        MODE: ${{ inputs.mode }}
+        TSIO_BASE_URL: ${{ inputs.tsio-base-url }}
+        LANE: ${{ inputs.lane }}
+      run: node "${{ github.action_path }}/../../scripts/e2e-triage.mjs"
