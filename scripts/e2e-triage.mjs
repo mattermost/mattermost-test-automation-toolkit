@@ -493,9 +493,13 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
  * renamed test finds nothing, is reported as INSUFFICIENT_DATA and stays
  * blocking, which is the safe direction.
  */
-export async function fetchHistory(fetchImpl, base, repository, tests, until, cfg = DEFAULTS, trunkBranch = null, warn = () => {}) {
+export async function fetchHistory(fetchImpl, base, repository, tests, until, cfg = DEFAULTS, trunkBranch = null, reportName = null, warn = () => {}) {
   const byTest = new Map();
   byTest.truncated = false;
+  // Set when a report was asked for but the rows cannot say which report they
+  // came from -- an endpoint that predates report identity. History from another
+  // platform then cannot be ruled out, so nothing may be cleared on it.
+  byTest.reportUnknown = false;
   const files = [...new Set(tests.map((t) => t.file).filter(Boolean))].slice(0, HISTORY_MAX_FILES);
   if (files.length === 0) return byTest;
   const wanted = new Set(tests.map((t) => `${t.file}\n${t.title}`));
@@ -513,12 +517,18 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
   for (const q of queries) {
     for (let page = 1; page <= HISTORY_MAX_PAGES; page++) {
       const body = { repository, until, files, page, per_page: HISTORY_PER_PAGE, ...q };
+      if (reportName) body.report = reportName;
       const res = await fetchImpl(`${base}/api/v1/reports/history`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(120000) });
       if (!res.ok) throw new Error(`TSIO history ${res.status}`);
       const { observations = [], has_more: hasMore } = await res.json();
       for (const o of observations) {
         const k = `${o.file}\n${o.title}`;
         if (!wanted.has(k)) continue;
+        if (reportName) {
+          // Trust the filter only when the row can prove it was applied.
+          if (o.report_name == null) byTest.reportUnknown = true;
+          else if (!String(o.report_name).startsWith(reportName)) continue;
+        }
         if (dedupe && o.group_id != null) {
           const rowKey = `${o.group_id}\n${k}\n${o.retry_count}\n${o.ordinal ?? 0}`;
           if (seen.has(rowKey)) continue;
@@ -641,7 +651,7 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       const trunkBranch = isTrunkRun ? id.branch : (pull?.base?.ref ?? null);
       if (!isTrunkRun && !trunkBranch) baseUnknown = true;
       const [history, diff] = await Promise.all([
-        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, log),
+        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log),
         fetchChangedFiles(api, id, prNumber, log),
       ]);
       const files = (diff.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
@@ -660,7 +670,7 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
         : !diff.ok ? "The list of changed files could not be read in full"
         : testRoot == null ? "No test root is configured, so whether this PR edits the failing spec cannot be determined"
         : baseUnknown ? "The pull request's base branch could not be read, so trunk history cannot be told from another branch's"
-        : reportName ? "History does not identify which report a past run came from, so another platform's history cannot be ruled out"
+        : history.reportUnknown ? "History does not identify which report a past run came from, so another platform's history cannot be ruled out"
         : null;
       if (blind) {
         result.historyTruncated = Boolean(history.truncated);
@@ -738,7 +748,7 @@ export async function replay({ runsPath, answersPath, comparePath, base, outPath
     let findings = [];
     if (run.failing.length && !infra) {
       const until = new Date(Date.parse(r.run_at) + 5 * 60000).toISOString();
-      const history = await fetchHistory(fetchImpl, base, r.repository, run.failing, until, cfg, r.pr ? (r.base_ref ?? null) : r.branch);
+      const history = await fetchHistory(fetchImpl, base, r.repository, run.failing, until, cfg, r.pr ? (r.base_ref ?? null) : r.branch, null);
       const cmp = compares[`${r.repository}:${r.commit_sha}`] ?? compares[`${r.repository}:${r.commit_sha.slice(0, 7)}`] ?? {};
       const files = (cmp.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
       findings = run.failing.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], files.map((f) => f.filename), cfg, r.pr, laneOf(r.name), { trunkBranch: r.pr ? (r.base_ref ?? null) : r.branch }));

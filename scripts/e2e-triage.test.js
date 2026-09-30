@@ -386,6 +386,35 @@ test("a diff that could not be read in full is not ownership evidence", async ()
   assert.ok(pages.length > 1, "pagination is followed rather than reading page one");
   assert.ok(pages.every((p) => p.includes("page=")), "every request names its page");
 });
+test("history from another platform cannot answer for this one", async () => {
+  const tests = [failing];
+  const rows = (extra) => ({ observations: [obs({ commit_sha: "a", group_id: "g1", ...extra })] });
+
+  // A server that identifies the report: the filter is sent, and rows that came
+  // from a different report are dropped even if the server ignored it.
+  const sent = [];
+  const good = fakeFetch([["/reports/history", (init) => {
+    sent.push(JSON.parse(init.body));
+    return Response.json({ observations: [
+      obs({ commit_sha: "mine", group_id: "g1", report_name: "e2e-on-windows-2022-1.0" }),
+      obs({ commit_sha: "theirs", group_id: "g2", report_name: "e2e-on-ubuntu-latest-1.0" }),
+    ] });
+  }]]);
+  const scoped = await fetchHistory(good, "http://tsio", "o/r", tests, "2026-09-17T00:00:00Z", DEFAULTS, "master", "e2e-on-windows");
+  assert.equal(sent[0].report, "e2e-on-windows", "the filter is sent to the server");
+  assert.deepEqual(scoped.get("specs/a.spec.ts\nt1").map((o) => o.commit_sha), ["mine"], "the other platform's row is dropped");
+  assert.equal(scoped.reportUnknown, false);
+
+  // A server that predates report identity: rows cannot prove which platform
+  // they came from, so nothing may be cleared on them.
+  const old = fakeFetch([["/reports/history", () => Response.json(rows({}))]]);
+  const blindly = await fetchHistory(old, "http://tsio", "o/r", tests, "2026-09-17T00:00:00Z", DEFAULTS, "master", "e2e-on-windows");
+  assert.equal(blindly.reportUnknown, true, "an unprovable lane is not a usable one");
+
+  // Unscoped runs are unaffected.
+  const plain = await fetchHistory(fakeFetch([["/reports/history", () => Response.json(rows({}))]]), "http://tsio", "o/r", tests, "2026-09-17T00:00:00Z", DEFAULTS, "master", null);
+  assert.equal(plain.reportUnknown, false);
+});
 test("an unreadable diff clears nothing, and never reaches the model", async () => {
   // An empty file list from a failed request looks exactly like "touched
   // nothing", which would let history rules clear a failure the PR caused.
