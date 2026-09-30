@@ -79,6 +79,14 @@ export const isInfraError = (text) => INFRA_RE.test(text ?? "");
  * repository-relative, otherwise the prefix to prepend. Null means the consumer
  * did not configure one, and ownership is then unknowable rather than false.
  */
+/**
+ * The key a test's history is filed under. The ancestor-prefixed title when the
+ * server supplies one, because two suites in a file can share a leaf title and a
+ * leaf key then names both -- storing them under it lets the second overwrite
+ * the first, and both then read whichever survived.
+ */
+export const identityKey = (t) => `${t.file}\n${t.full_title || t.title}`;
+
 export const repoPath = (testRoot, file) => {
   if (testRoot == null || testRoot === "") return null;
   const root = String(testRoot).replace(/^\.?\/*/, "").replace(/\/+$/, "");
@@ -258,7 +266,7 @@ export function buildPack(finding, compareFiles, pr, others) {
     if (hunks.length >= 8) break;
   }
   return {
-    test: { title: finding.title, file: finding.file, lane: pr.lane },
+    test: { title: finding.title, full_title: finding.full_title ?? null, suite: finding.suite_title ?? null, file: finding.file, lane: pr.lane },
     error: finding.error.slice(0, 2500),
     engine: { class: finding.class, reason: finding.reason },
     trunk_history_14d: { runs: finding.trunk.runs, fails: finding.trunk.fails, flaky: finding.trunk.flaky, latest: finding.trunk.latest },
@@ -324,8 +332,11 @@ export function parseAnswer(text) {
 }
 
 /** The decision matrix: what a judge answer may change. Citations must name evidence in the pack. */
-export function decide(cls, answer, pack, cfg = DEFAULTS, isTrunkRun = false) {
+export function decide(cls, answer, pack, cfg = DEFAULTS, isTrunkRun = false, identityUnresolved = false) {
   const EXON = exoneratedSet(isTrunkRun);
+  // Defence at the boundary: whatever reaches here, a finding whose history
+  // cannot be tied to it may not be cleared by an opinion about that history.
+  if (identityUnresolved) return { blocking: true, decision: "evidence_incomplete", answer: answer ?? null };
   if (!answer) return { blocking: !EXON.has(cls), decision: "unavailable", answer: null };
   const known = new Set(evidenceIds(pack));
   const cited = answer.cited_evidence.filter((c) => known.has(c));
@@ -355,7 +366,7 @@ export async function judge(findings, packs, ask, cfg = DEFAULTS, warn = () => {
       const item = queue.shift();
       if (!item) return;
       try {
-        const d = decide(item.f.class, await ask(item.pack), item.pack, cfg, isTrunkRun);
+        const d = decide(item.f.class, await ask(item.pack), item.pack, cfg, isTrunkRun, Boolean(item.f.identity_unresolved));
         Object.assign(item.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
       } catch (e) {
         warn(`judge unavailable for "${item.f.title}": ${String(e).slice(0, 200)}`);
@@ -538,7 +549,14 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
   byTest.ambiguous = new Set();
   const files = [...new Set(tests.map((t) => t.file).filter(Boolean))].slice(0, HISTORY_MAX_FILES);
   if (files.length === 0) return byTest;
-  const byLeaf = new Map(tests.map((t) => [`${t.file}\n${t.title}`, t]));
+  // A leaf key can name several tests, so hold all of them: picking one would
+  // silently give its history to the others.
+  const byLeaf = new Map();
+  for (const t of tests) {
+    const leaf = `${t.file}\n${t.title}`;
+    if (!byLeaf.has(leaf)) byLeaf.set(leaf, []);
+    byLeaf.get(leaf).push(t);
+  }
   const queries = [];
   if (trunkBranch) queries.push({ branch: trunkBranch, runs: cfg.trunkRuns });
   queries.push({ runs: cfg.crossPRRuns });
@@ -558,18 +576,29 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
       if (!res.ok) throw new Error(`TSIO history ${res.status}`);
       const { observations = [], has_more: hasMore } = await res.json();
       for (const o of observations) {
-        const k = `${o.file}\n${o.title}`;
-        const test = byLeaf.get(k);
-        if (!test) continue;
+        const leaf = `${o.file}\n${o.title}`;
+        const candidates = byLeaf.get(leaf);
+        if (!candidates) continue;
         // Full titles carry suite ancestry, so when both sides have one they
-        // settle which test an execution belonged to. When the test is known to
-        // share its leaf title with another suite and the rows cannot say, the
-        // key names more than one test and none of its history may be used.
-        if (test.full_title && o.full_title != null) {
-          if (o.full_title !== test.full_title) continue;
-        } else if (test.identity_ambiguous) {
-          byTest.ambiguous.add(k);
+        // settle which test an execution belonged to. Without them a leaf key
+        // that names more than one test cannot be attributed, and none of those
+        // tests may use it.
+        let test = null;
+        const comparable = o.full_title != null && candidates.some((c) => c.full_title);
+        if (comparable) {
+          // Both sides name their ancestry, so this row belongs to exactly one
+          // test -- or to a sibling this run never asked about, which is simply
+          // not ours to read.
+          test = candidates.find((c) => c.full_title === o.full_title) ?? null;
+          if (!test) continue;
+        } else if (candidates.length > 1 || candidates[0].identity_ambiguous) {
+          // The row cannot be attributed and the key names more than one test.
+          for (const c of candidates) byTest.ambiguous.add(identityKey(c));
+          continue;
+        } else {
+          test = candidates[0];
         }
+        const k = identityKey(test);
         if (reportName) {
           // Trust the filter only when the row can prove it was applied.
           if (o.report_name == null) byTest.reportUnknown = true;
@@ -703,9 +732,9 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       const files = (diff.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
       const changed = files.map((f) => f.filename);
       const withPaths = run.failing.map((t) => ({ ...t, repo_path: repoPath(testRoot, t.file) }));
-      const unresolved = (t) => history.ambiguous?.has(`${t.file}\n${t.title}`) ?? false;
+      const unresolved = (t) => history.ambiguous?.has(identityKey(t)) ?? false;
       result.findings = withPaths.map((t) =>
-        classify(unresolved(t) ? { ...t, identity_unresolved: true } : t, history.get(`${t.file}\n${t.title}`) ?? [], changed, cfg, prNumber, laneOf(id.name), {
+        classify(unresolved(t) ? { ...t, identity_unresolved: true } : t, history.get(identityKey(t)) ?? [], changed, cfg, prNumber, laneOf(id.name), {
           isTrunkRun,
           groupId: run.group_id,
           trunkBranch,
@@ -734,7 +763,10 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       if (!blind && env.ANTHROPIC_API_KEY && prNumber) {
         const others = result.findings.map((f) => ({ class: f.class, title: f.title.slice(0, 80) }));
         const pr = { number: prNumber, repository: id.repository, title: pull.title ?? "", lane: env.LANE || id.name };
-        const packs = result.findings.map((f) => (f.class === "OWNED_BY_PR" ? null : buildPack(f, files, pr, others)));
+        // Neither an owned spec nor an unresolvable identity is a question the
+        // model can answer: one is settled by the diff, the other has no evidence
+        // that belongs to this test.
+        const packs = result.findings.map((f) => (f.class === "OWNED_BY_PR" || f.identity_unresolved ? null : buildPack(f, files, pr, others)));
         await judge(result.findings, packs, (pack) => askModel(fetchImpl, env.ANTHROPIC_API_KEY, cfg.model, pack), cfg, log, isTrunkRun);
       }
     }
@@ -798,13 +830,27 @@ export async function replay({ runsPath, answersPath, comparePath, base, outPath
   const compares = comparePath ? JSON.parse(readFileSync(comparePath, "utf8")) : {};
   const cfg = { ...DEFAULTS, model: env.CLAUDE_MODEL || DEFAULTS.model };
   const results = [];
+  const skipped = [];
   for (const [i, r] of runs.entries()) {
-    const id = { repository: r.repository, branch: r.branch, commit_sha: r.commit_sha, name: r.name };
+    const id = {
+      repository: r.repository,
+      branch: r.branch,
+      commit_sha: r.commit_sha,
+      name: r.name,
+      gh_run_id: r.gh_run_id ?? r.run_id ?? null,
+      gh_run_attempt: r.gh_run_attempt ?? r.run_attempt ?? null,
+    };
+    if (!id.gh_run_id || !id.gh_run_attempt) {
+      skipped.push({ ...r, why: "corpus row has no gh_run_id/gh_run_attempt, and a run cannot be identified without them" });
+      log(`[${i + 1}/${runs.length}] skipped: ${r.repository} ${r.commit_sha?.slice(0, 7)} ${r.name} has no run identity`);
+      continue;
+    }
     let run;
     try {
       run = await fetchRun(fetchImpl, base, id);
     } catch (e) {
       log(`[${i + 1}/${runs.length}] ${r.pr} ${r.name} ${r.commit_sha.slice(0, 7)}: ${e}`);
+      skipped.push({ ...r, why: String(e).slice(0, 200) });
       continue;
     }
     const infra = infraVerdict(run.failing, cfg);
@@ -814,7 +860,7 @@ export async function replay({ runsPath, answersPath, comparePath, base, outPath
       const history = await fetchHistory(fetchImpl, base, r.repository, run.failing, until, cfg, r.pr ? (r.base_ref ?? null) : r.branch, null);
       const cmp = compares[`${r.repository}:${r.commit_sha}`] ?? compares[`${r.repository}:${r.commit_sha.slice(0, 7)}`] ?? {};
       const files = (cmp.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
-      findings = run.failing.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], files.map((f) => f.filename), cfg, r.pr, laneOf(r.name), { trunkBranch: r.pr ? (r.base_ref ?? null) : r.branch }));
+      findings = run.failing.map((t) => classify(t, history.get(identityKey(t)) ?? [], files.map((f) => f.filename), cfg, r.pr, laneOf(r.name), { trunkBranch: r.pr ? (r.base_ref ?? null) : r.branch }));
       const others = findings.map((f) => ({ class: f.class, title: f.title.slice(0, 80) }));
       const pr = { number: r.pr, repository: r.repository, title: cmp.pr_title ?? "", lane: r.name };
       const packs = findings.map((f) => (f.class === "OWNED_BY_PR" ? null : buildPack(f, files, pr, others)));
@@ -842,7 +888,11 @@ export async function replay({ runsPath, answersPath, comparePath, base, outPath
     results.push({ ...r, verdict, infra: Boolean(infra), classes: findings.map((f) => f.class), decisions: findings.map((f) => ({ title: f.title, class: f.class, blocking: f.blocking, decision: f.decision ?? "engine", judge: f.judge ?? null })) });
     log(`[${i + 1}/${runs.length}] PR ${r.pr} ${r.name} ${r.commit_sha.slice(0, 7)} ${r.truth}: ${verdict} ${findings.map((f) => f.class).join(",")}`);
   }
-  if (outPath) writeFileSync(outPath, JSON.stringify(results, null, 1));
+  if (outPath) writeFileSync(outPath, JSON.stringify({ evaluated: results.length, skipped, results }, null, 1));
+  // An evaluation that quietly dropped most of its corpus is not calibration.
+  console.log(`evaluated ${results.length} of ${runs.length} run(s); skipped ${skipped.length}`);
+  for (const sk of skipped.slice(0, 10)) console.log(`  skipped ${sk.repository ?? "?"} ${String(sk.commit_sha ?? "").slice(0, 7)} ${sk.name ?? "?"}: ${sk.why}`);
+  if (results.length === 0 && runs.length > 0) console.log("NO RUNS EVALUATED -- these results say nothing about the rules");
   const truths = [...new Set(results.map((r) => r.truth))].sort();
   const table = ["| Ground truth | runs | green |", "|---|---|---|"];
   for (const t of truths) {
