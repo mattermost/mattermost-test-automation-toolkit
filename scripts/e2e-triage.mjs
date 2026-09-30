@@ -48,6 +48,10 @@ const HISTORY_MAX_PAGES = 25;
 const CHANGED_FILES_MAX_PAGES = 30;
 export const DEFAULTS = {
   windowDays: 14,
+  // How many runs each half of the history request asks for. Counts, not days:
+  // see fetchHistory for why a window cannot answer either question.
+  trunkRuns: 30,
+  crossPRRuns: 200,
   minTrunkRuns: 5,
   pMin: 0.05,
   crossPRMinPRs: 3,
@@ -142,13 +146,13 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
     return out("BROKEN_ON_TRUNK", `Trunk's latest run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}, ${latestTrunk.created_at?.slice(0, 10) ?? "unknown date"}) fails this test too.`, false);
   const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
   if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0 && laplace >= cfg.pMin && latestTrunk?.status !== "failed")
-    return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in ${trunk.length} runs over ${cfg.windowDays} days.`, false);
+    return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the last ${trunk.length} trunk runs.`, false);
   // trunkFails === 0 is vacuously true when trunk was never observed, so require
   // real trunk passes before claiming trunk stayed green.
   if (failedPRs.length >= cfg.crossPRMinPRs && trunkFails === 0 && trunkPasses > 0)
-    return out("FLAKY_CROSS_PR", `Failed on ${failedPRs.length} other PRs in ${cfg.windowDays} days (${stats.cross_pr.examples.slice(0, 3).join(", ")}) while trunk stayed green.`, false);
+    return out("FLAKY_CROSS_PR", `Failed on ${failedPRs.length} other PRs in the last ${cfg.crossPRRuns} runs (${stats.cross_pr.examples.slice(0, 3).join(", ")}) while trunk stayed green.`, false);
   if (trunk.length < cfg.minTrunkRuns)
-    return out("INSUFFICIENT_DATA", `Only ${trunk.length} trunk runs in ${cfg.windowDays} days (need ${cfg.minTrunkRuns}); history cannot clear it.`, true);
+    return out("INSUFFICIENT_DATA", `Only ${trunk.length} trunk runs found (need ${cfg.minTrunkRuns}); history cannot clear it.`, true);
   return out("REGRESSION", `Fails here, passes on trunk (${trunkPasses}/${trunk.length}) and was not failing on other PRs enough to call it flaky (${failedPRs.length}).`, true);
 }
 
@@ -415,34 +419,54 @@ export async function fetchRun(fetchImpl, base, id) {
  * renamed test finds nothing, is reported as INSUFFICIENT_DATA and stays
  * blocking, which is the safe direction.
  */
-export async function fetchHistory(fetchImpl, base, repository, tests, until, windowDays, warn = () => {}) {
+export async function fetchHistory(fetchImpl, base, repository, tests, until, cfg = DEFAULTS, trunkBranch = null, warn = () => {}) {
   const byTest = new Map();
   byTest.truncated = false;
   const files = [...new Set(tests.map((t) => t.file).filter(Boolean))].slice(0, HISTORY_MAX_FILES);
   if (files.length === 0) return byTest;
   const wanted = new Set(tests.map((t) => `${t.file}\n${t.title}`));
-  const since = windowDays ? new Date(Date.parse(until) - windowDays * 86400000).toISOString() : undefined;
-  for (let page = 1; page <= HISTORY_MAX_PAGES; page++) {
-    const body = { repository, until, files, page, per_page: HISTORY_PER_PAGE };
-    if (since) body.since = since;
-    const res = await fetchImpl(`${base}/api/v1/reports/history`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(120000) });
-    if (!res.ok) throw new Error(`TSIO history ${res.status}`);
-    const { observations = [], has_more: hasMore } = await res.json();
-    for (const o of observations) {
-      const k = `${o.file}\n${o.title}`;
-      if (!wanted.has(k)) continue;
-      if (!byTest.has(k)) byTest.set(k, []);
-      byTest.get(k).push(o);
-    }
-    if (!hasMore) break;
-    if (page === HISTORY_MAX_PAGES) {
-      // Partial history cannot clear anything: the rows never fetched are
-      // exactly the ones that might have shown a failure on trunk, or shown that
-      // a recurrence was not a recurrence at all.
-      byTest.truncated = true;
-      warn(`history for ${files.length} file(s) hit the ${HISTORY_MAX_PAGES}-page cap with more to come; nothing will be cleared on partial history`);
+  const queries = [];
+  if (trunkBranch) queries.push({ branch: trunkBranch, runs: cfg.trunkRuns });
+  queries.push({ runs: cfg.crossPRRuns });
+  // The trunk request is a subset of the unscoped one, so a row arrives twice and
+  // would be counted twice. Deduplicate only when that overlap is actually
+  // possible, and only on a key that identifies the row: a run is its group, and
+  // a test appears in it once per attempt. Without a group id there is nothing to
+  // match on, and dropping a row we cannot identify would quietly shrink the very
+  // history the rules count.
+  const seen = new Set();
+  const dedupe = queries.length > 1;
+  for (const q of queries) {
+    for (let page = 1; page <= HISTORY_MAX_PAGES; page++) {
+      const body = { repository, until, files, page, per_page: HISTORY_PER_PAGE, ...q };
+      const res = await fetchImpl(`${base}/api/v1/reports/history`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(120000) });
+      if (!res.ok) throw new Error(`TSIO history ${res.status}`);
+      const { observations = [], has_more: hasMore } = await res.json();
+      for (const o of observations) {
+        const k = `${o.file}\n${o.title}`;
+        if (!wanted.has(k)) continue;
+        if (dedupe && o.group_id != null) {
+          const rowKey = `${o.group_id}\n${k}\n${o.retry_count}\n${o.ordinal ?? 0}`;
+          if (seen.has(rowKey)) continue;
+          seen.add(rowKey);
+        }
+        if (!byTest.has(k)) byTest.set(k, []);
+        byTest.get(k).push(o);
+      }
+      if (!hasMore) break;
+      if (page === HISTORY_MAX_PAGES) {
+        // Partial history cannot clear anything: the rows never fetched are
+        // exactly the ones that might have shown a failure on trunk, or shown that
+        // a recurrence was not a recurrence at all.
+        byTest.truncated = true;
+        warn(`history for ${files.length} file(s) hit the ${HISTORY_MAX_PAGES}-page cap with more to come; nothing will be cleared on partial history`);
+      }
     }
   }
+  // classify() reads trunk[0] as the latest trunk run, and rows merged from two
+  // requests are not in order.
+  const at = (o) => Date.parse(o.created_at) || 0;
+  for (const rows of byTest.values()) rows.sort((a, b) => at(b) - at(a));
   return byTest;
 }
 /**
@@ -507,10 +531,14 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
   if (run.failing.length) {
     result.infra = infraVerdict(run.failing, cfg);
     if (!result.infra) {
-      const [history, diff, pull] = await Promise.all([
-        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg.windowDays, log),
+      // The trunk half of the history request is scoped to the trunk branch, so
+      // that branch has to be known first: from the pull request on a PR run,
+      // and from the run itself on a trunk run.
+      const pull = prNumber ? await api("GET", `/repos/${id.repository}/pulls/${prNumber}`).catch(() => ({})) : {};
+      const trunkBranch = isTrunkRun ? id.branch : (pull?.base?.ref ?? null);
+      const [history, diff] = await Promise.all([
+        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, log),
         fetchChangedFiles(api, id, prNumber, log),
-        prNumber ? api("GET", `/repos/${id.repository}/pulls/${prNumber}`).catch(() => ({})) : {},
       ]);
       const files = (diff.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
       const changed = files.map((f) => f.filename);
@@ -596,7 +624,7 @@ export async function replay({ runsPath, answersPath, comparePath, base, outPath
     let findings = [];
     if (run.failing.length && !infra) {
       const until = new Date(Date.parse(r.run_at) + 5 * 60000).toISOString();
-      const history = await fetchHistory(fetchImpl, base, r.repository, run.failing, until, cfg.windowDays);
+      const history = await fetchHistory(fetchImpl, base, r.repository, run.failing, until, cfg, r.pr ? (r.base_ref ?? null) : r.branch);
       const cmp = compares[`${r.repository}:${r.commit_sha}`] ?? compares[`${r.repository}:${r.commit_sha.slice(0, 7)}`] ?? {};
       const files = (cmp.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
       findings = run.failing.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], files.map((f) => f.filename), cfg, r.pr, laneOf(r.name)));

@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  DEFAULTS,
   buildPack,
   classify,
   laneOf,
@@ -215,27 +216,51 @@ const env = {
   TSIO_BASE_URL: "http://tsio",
 };
 
-test("history is asked for spec files, not test titles, and every page is walked", async () => {
-  const pages = [
-    { observations: [obs({ commit_sha: "p1" }), obs({ title: "some other test in the same file", commit_sha: "x" })], has_more: true },
-    { observations: [obs({ commit_sha: "p2" })], has_more: false },
-    { observations: [obs({ commit_sha: "never" })], has_more: false },
-  ];
+test("history is asked by run count, not by title or by window, and both queries are walked", async () => {
   const sent = [];
-  const fetchImpl = fakeFetch([["/reports/history", (init) => { sent.push(JSON.parse(init.body)); return Response.json(pages[sent.length - 1]); }]]);
-  const history = await fetchHistory(fetchImpl, "http://tsio", "o/r", [failing, { ...failing, title: "t2" }], "2026-09-17T00:00:00Z", 14);
+  const responses = [
+    // trunk query, paged
+    { observations: [obs({ commit_sha: "p1", group_id: "g1" }), obs({ title: "some other test in the same file", commit_sha: "x", group_id: "g1" })], has_more: true },
+    { observations: [obs({ commit_sha: "p2", group_id: "g2" })], has_more: false },
+    // cross-PR query: repeats g1, and carries a row the trunk query cannot see
+    { observations: [obs({ commit_sha: "p1", group_id: "g1" }), obs({ commit_sha: "p3", group_id: "g3", gh_pr_number: 7, status: "failed", created_at: "2026-09-11T00:00:00Z" })], has_more: false },
+  ];
+  const fetchImpl = fakeFetch([["/reports/history", (init) => { sent.push(JSON.parse(init.body)); return Response.json(responses[sent.length - 1]); }]]);
+  const history = await fetchHistory(fetchImpl, "http://tsio", "o/r", [failing, { ...failing, title: "t2" }], "2026-09-17T00:00:00Z", DEFAULTS, "master");
 
   // One file, deduplicated from two failing tests, and no titles in the request.
   assert.deepEqual(sent[0].files, ["specs/a.spec.ts"]);
   assert.equal(sent[0].tests, undefined);
-  assert.equal(sent.length, 2, "stopped as soon as has_more was false");
-  assert.deepEqual([sent[0].page, sent[1].page], [1, 2]);
-  assert.equal(sent[0].since, "2026-09-03T00:00:00.000Z");
+  // A window is what overran the page cap on a busy repository, so neither query sends one.
+  assert.equal(sent.every((b) => b.since === undefined), true, "no query asks for a time window");
+  assert.equal(sent[0].branch, "master", "trunk history is scoped to the trunk branch");
+  assert.equal(sent[0].runs, DEFAULTS.trunkRuns);
+  assert.equal(sent[2].branch, undefined, "cross-PR evidence is not branch scoped");
+  assert.equal(sent[2].runs, DEFAULTS.crossPRRuns);
+  assert.equal(sent.length, 3, "each query pages until has_more is false");
+  assert.deepEqual([sent[0].page, sent[1].page, sent[2].page], [1, 2, 1]);
 
+  // Merged newest-first, because classify() reads trunk[0] as the latest trunk run.
+  const rows = history.get("specs/a.spec.ts\nt1");
+  assert.deepEqual(rows.map((o) => o.commit_sha), ["p3", "p1", "p2"], "g1 is counted once even though both queries returned it");
   // Rows for tests the caller never asked about are dropped.
-  assert.deepEqual(history.get("specs/a.spec.ts\nt1").map((o) => o.commit_sha), ["p1", "p2"]);
   assert.equal(history.has("specs/a.spec.ts\nsome other test in the same file"), false);
   assert.equal(history.get("specs/a.spec.ts\nt2"), undefined, "a title with no rows stays unknown, so it stays blocking");
+});
+test("deduplication never drops a row it cannot identify", async () => {
+  // Rows that share file, title and attempt but come from different runs are the
+  // normal case, and rows may arrive without a group id at all. An over-eager key
+  // collapsed all of these into one, which shrank trunk history to a single run
+  // and made the rules report INSUFFICIENT_DATA on a test with plenty of history.
+  const noIds = Array.from({ length: 6 }, (_, i) => { const o = obs({ commit_sha: `c${i}` }); delete o.group_id; return o; });
+  const single = fakeFetch([["/reports/history", () => Response.json({ observations: noIds })]]);
+  const one = await fetchHistory(single, "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, null);
+  assert.equal(one.get("specs/a.spec.ts\nt1").length, 6, "one query cannot overlap itself, so nothing is deduplicated");
+
+  const shared = [obs({ commit_sha: "a", group_id: "g1" }), obs({ commit_sha: "b", group_id: "g2" }), obs({ commit_sha: "c", group_id: "g3" })];
+  const both = fakeFetch([["/reports/history", () => Response.json({ observations: shared })]]);
+  const two = await fetchHistory(both, "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, "master");
+  assert.equal(two.get("specs/a.spec.ts\nt1").length, 3, "distinct runs survive the overlap between the two queries");
 });
 test("an unreadable diff clears nothing, and never reaches the model", async () => {
   // An empty file list from a failed request looks exactly like "touched
