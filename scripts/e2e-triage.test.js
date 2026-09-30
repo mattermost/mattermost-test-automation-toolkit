@@ -262,6 +262,23 @@ test("deduplication never drops a row it cannot identify", async () => {
   const two = await fetchHistory(both, "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, "master");
   assert.equal(two.get("specs/a.spec.ts\nt1").length, 3, "distinct runs survive the overlap between the two queries");
 });
+test("a branch with no pull request is not trunk", () => {
+  // Pushing a branch without an open PR yields rows with no PR number, which is
+  // indistinguishable from a trunk run unless the branch is checked. On a real
+  // desktop spec such a branch supplied 15 of 41 supposed trunk rows.
+  const rows = [
+    ...trunkPasses(6),
+    obs({ commit_sha: "f1", branch: "fix/something", status: "failed", created_at: "2026-09-12T00:00:00Z" }),
+    obs({ commit_sha: "f2", branch: "fix/something", status: "failed", created_at: "2026-09-11T00:00:00Z" }),
+  ];
+  const loose = classify(failing, rows, [], DEFAULTS, 5, null, {});
+  assert.equal(loose.trunk.runs, 8, "without a trunk branch every branchless row counts, which is the old behaviour");
+
+  const scoped = classify(failing, rows, [], DEFAULTS, 5, null, { trunkBranch: "master" });
+  assert.equal(scoped.trunk.runs, 6, "the feature branch is excluded");
+  assert.equal(scoped.trunk.fails, 0, "and so are its failures");
+  assert.notEqual(scoped.class, "BROKEN_ON_TRUNK", "a feature branch cannot make trunk look broken");
+});
 test("an unreadable diff clears nothing, and never reaches the model", async () => {
   // An empty file list from a failed request looks exactly like "touched
   // nothing", which would let history rules clear a failure the PR caused.

@@ -91,7 +91,7 @@ export const laneOf = (name) =>
 
 /** Classify one failing test from its history and the PR's changed files. */
 export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = null, lane = null, opts = {}) {
-  const { isTrunkRun = false, groupId = null } = opts;
+  const { isTrunkRun = false, groupId = null, trunkBranch = null } = opts;
   const own = new Set(changedFiles);
   // A run must never be part of its own history. On a PR run its group carries
   // the PR number and drops out below, but on a trunk run it would land in
@@ -105,7 +105,12 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
   // FLAKY_CROSS_PR and clear a failure on the strength of its own history.
   const prOf = (o) => (o.gh_pr_number == null || o.gh_pr_number === "" ? null : Number(o.gh_pr_number));
   const currentPR = prNumber == null ? null : Number(prNumber);
-  const trunk = inLane.filter((o) => prOf(o) == null);
+  // A row with no PR number is not automatically trunk. A branch pushed without
+  // an open pull request produces exactly that, and counting it as trunk lets an
+  // unrelated feature branch's breakage answer "is this broken on trunk" -- it
+  // was contributing 15 of 41 supposed trunk rows on a desktop spec. When the
+  // trunk branch is known, a row has to be on it.
+  const trunk = inLane.filter((o) => prOf(o) == null && (trunkBranch == null || o.branch === trunkBranch));
   const others = inLane.filter((o) => prOf(o) != null && prOf(o) !== currentPR);
   const trunkFails = trunk.filter((o) => FAILED_STATUSES.has(o.status)).length;
   const trunkFlaky = trunk.filter((o) => o.status === "flaky").length;
@@ -542,7 +547,7 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       ]);
       const files = (diff.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
       const changed = files.map((f) => f.filename);
-      result.findings = run.failing.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], changed, cfg, prNumber, laneOf(id.name), { isTrunkRun, groupId: run.group_id }));
+      result.findings = run.failing.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], changed, cfg, prNumber, laneOf(id.name), { isTrunkRun, groupId: run.group_id, trunkBranch }));
       // Two ways the evidence can be incomplete, and neither may clear anything.
       // The judge is skipped rather than merely overridden: it reads the same
       // incomplete pack, and letting it run would hand back a non-blocking
@@ -627,7 +632,7 @@ export async function replay({ runsPath, answersPath, comparePath, base, outPath
       const history = await fetchHistory(fetchImpl, base, r.repository, run.failing, until, cfg, r.pr ? (r.base_ref ?? null) : r.branch);
       const cmp = compares[`${r.repository}:${r.commit_sha}`] ?? compares[`${r.repository}:${r.commit_sha.slice(0, 7)}`] ?? {};
       const files = (cmp.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
-      findings = run.failing.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], files.map((f) => f.filename), cfg, r.pr, laneOf(r.name)));
+      findings = run.failing.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], files.map((f) => f.filename), cfg, r.pr, laneOf(r.name), { trunkBranch: r.pr ? (r.base_ref ?? null) : r.branch }));
       const others = findings.map((f) => ({ class: f.class, title: f.title.slice(0, 80) }));
       const pr = { number: r.pr, repository: r.repository, title: cmp.pr_title ?? "", lane: r.name };
       const packs = findings.map((f) => (f.class === "OWNED_BY_PR" ? null : buildPack(f, files, pr, others)));
