@@ -60,7 +60,11 @@ export const DEFAULTS = {
   maxJudged: 8,
   concurrency: 4,
   infraMinFailures: 30,
-  model: "claude-haiku-4-5",
+  // A dated snapshot, not the alias. The 0.85 clear and 0.90 veto thresholds are
+  // policy tuned against one model's behaviour; an alias can be repointed at a
+  // different model without any change here, and the thresholds would then be
+  // applied to judgements they were never tuned for.
+  model: "claude-haiku-4-5-20251001",
 };
 const INFRA_RE =
   /server (?:is )?not healthy|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)/i;
@@ -293,15 +297,37 @@ export const evidenceIds = (pack) => [
   "pr.changed_files",
   ...pack.diff_hunks_of_files_named_in_error.filter((h) => h.related).map((h) => h.id),
 ];
+// Models that accept a non-default temperature. Newer models return a 400 for
+// it, so this is an allowlist: an unrecognised model gets the API default rather
+// than a request that fails. Zero narrows the spread between runs; it does not
+// make the model deterministic.
+const TEMPERATURE_MODELS = ["claude-haiku-4-5", "claude-opus-4-6", "claude-sonnet-4-6"];
+export const samplingFor = (model) =>
+  TEMPERATURE_MODELS.some((m) => model === m || String(model).startsWith(`${m}-`)) ? { temperature: 0 } : {};
+
+// Whether the model that answered is the one asked for. A dated request must be
+// answered by exactly that snapshot. An alias request may be answered by one of
+// that alias's own dated snapshots -- that is what an alias is -- but by nothing
+// else.
+const isSnapshot = (model) => /-\d{8}$/.test(String(model));
+// The alias followed directly by the date and nothing else. A prefix test is not
+// enough: claude-haiku-4-5-20251001 starts with "claude-haiku-4-", which would
+// let a request for one model accept an answer from another.
+const snapshotOf = (alias, served) => served.length === alias.length + 9 && served.startsWith(`${alias}-`) && isSnapshot(served);
+export const servedMatches = (requested, served) =>
+  typeof served === "string" && (served === requested || (!isSnapshot(requested) && snapshotOf(requested, served)));
+
 export const packKey = (model, pack) => createHash("sha256").update(model + "\n" + JSON.stringify(pack)).digest("hex");
 
 export async function askModel(fetchImpl, apiKey, model, pack, timeoutMs = 60000) {
+  const sampling = samplingFor(model);
   const body = {
     model,
     max_tokens: 2000,
     system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
     messages: [{ role: "user", content: `Evidence pack (JSON). Valid evidence ids to cite: ${evidenceIds(pack).join(", ")}\n\n${JSON.stringify(pack, null, 1)}` }],
     output_config: { format: { type: "json_schema", schema: SCHEMA }, ...(model.startsWith("claude-haiku") ? {} : { effort: "medium" }) },
+    ...sampling,
   };
   let last;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -319,20 +345,42 @@ export async function askModel(fetchImpl, apiKey, model, pack, timeoutMs = 60000
         continue;
       }
       const msg = await res.json();
-      if (msg.stop_reason !== "end_turn" && msg.stop_reason !== "stop_sequence") throw new Error(`stop_reason=${msg.stop_reason}`);
-      return parseAnswer(msg.content?.find((b) => b.type === "text")?.text ?? "");
+      // The request sets no stop sequences, so end_turn is the only way a
+      // complete answer ends.
+      if (msg.stop_reason !== "end_turn") throw new Error(`stop_reason=${msg.stop_reason}`);
+      // An answer from a model other than the one asked for is not used, and is
+      // not retried either: the next attempt would be served the same way. The
+      // finding then keeps its deterministic outcome.
+      if (!servedMatches(model, msg.model)) {
+        const err = new Error(`served model ${JSON.stringify(msg.model)} is not the requested ${model}; its answer is not used`);
+        err.noRetry = true;
+        throw err;
+      }
+      const answer = parseAnswer(msg.content?.find((b) => b.type === "text")?.text ?? "");
+      return {
+        ...answer,
+        provenance: { requested_model: model, served_model: msg.model, temperature: sampling.temperature ?? null, pack_hash: packKey(model, pack) },
+      };
     } catch (e) {
       last = e;
-      if (String(e).startsWith("Error: anthropic 4")) throw e;
+      if (e?.noRetry || String(e).startsWith("Error: anthropic 4")) throw e;
     }
   }
   throw last;
 }
 export function parseAnswer(text) {
   const a = JSON.parse(text);
-  if (!SCHEMA.properties.cause.enum.includes(a.cause) || typeof a.confidence !== "number" || !Array.isArray(a.cited_evidence) || typeof a.explanation !== "string")
-    throw new Error("answer failed validation");
-  return { cause: a.cause, confidence: Math.max(0, Math.min(1, a.confidence)), cited_evidence: a.cited_evidence.map(String).slice(0, 6), explanation: a.explanation.slice(0, 900) };
+  if (!SCHEMA.properties.cause.enum.includes(a.cause)) throw new Error("answer failed validation: unknown cause");
+  // A confidence outside [0, 1] is a malformed answer, not an emphatic one. It
+  // used to be clamped, so a confidence of 7 became 1 -- the most trust the
+  // decision matrix can give -- and cleared a regression on the strength of a
+  // number that meant nothing. NaN and Infinity are rejected for the same reason.
+  if (typeof a.confidence !== "number" || !Number.isFinite(a.confidence) || a.confidence < 0 || a.confidence > 1)
+    throw new Error(`answer failed validation: confidence ${JSON.stringify(a.confidence)} is not a number in [0, 1]`);
+  if (!Array.isArray(a.cited_evidence) || !a.cited_evidence.every((c) => typeof c === "string"))
+    throw new Error("answer failed validation: cited_evidence must be a list of evidence ids");
+  if (typeof a.explanation !== "string") throw new Error("answer failed validation: explanation must be a string");
+  return { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence.slice(0, 6), explanation: a.explanation.slice(0, 900) };
 }
 
 /** The decision matrix: what a judge answer may change. Citations must name evidence in the pack. */
@@ -409,7 +457,10 @@ export function renderComment({ context, verdict, findings, infra, model, runURL
       lines.push(`| ${md(f.full_title || f.title)} — ${md(f.file)} | ${f.blocking ? "🔴" : "🟢"} ${f.class} | ${f.trunk.runs} / ${f.trunk.fails} / ${f.trunk.flaky} | ${f.cross_pr.prs.length} | ${md(f.reason)} |`);
     const judged = findings.filter((f) => f.judge);
     if (judged.length) {
-      lines.push("", `### Second judge (${md(model)})`, "", "Confidence is the model's assessment, not a measured accuracy rate.", "");
+      // Name the model that answered, not the one asked for: they differ exactly
+      // when an alias has been repointed, which is when a reader needs to know.
+      const served = [...new Set(judged.map((f) => f.judge?.provenance?.served_model).filter(Boolean))];
+      lines.push("", `### Second judge (${md(served.length ? served.join(", ") : model)})`, "", "Confidence is the model's assessment, not a measured accuracy rate.", "");
       for (const f of judged) {
         const mark = f.decision === "adjudicator_unblock" ? "unblocked" : f.decision === "adjudicator_veto" ? "vetoed" : f.blocking ? "still blocking" : "agreed";
         lines.push(`- **${md(f.full_title || f.title)}** — ${CAUSE[f.judge.cause] ?? md(f.judge.cause)} (${Math.round(f.judge.confidence * 100)}%, ${mark}; cites ${md(f.judge.cited_evidence.join(", ") || "nothing checkable")}): ${md(f.judge.explanation)}`);
@@ -915,7 +966,7 @@ export async function replay({ runsPath, answersPath, comparePath, base, outPath
         ask: async (pack) => {
           // Legacy leaf-title answers cannot prove which test or evidence the
           // model saw. Cache the full pack and system prompt, not a display name.
-          const key = `v2:${packKey(cfg.model + "\n" + SYSTEM, pack)}`;
+          const key = `v3:${packKey(cfg.model + "\n" + JSON.stringify(samplingFor(cfg.model)) + "\n" + SYSTEM, pack)}`;
           if (answers[key]) return parseAnswer(JSON.stringify(answers[key]));
           if (!env.ANTHROPIC_API_KEY) throw new Error("no answer for this evidence pack");
           const answer = await askModel(fetchImpl, env.ANTHROPIC_API_KEY, cfg.model, pack);

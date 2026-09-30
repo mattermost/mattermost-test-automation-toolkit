@@ -20,9 +20,16 @@ inputs:
     required: false
     default: ""
   claude-model:
-    description: Model for the second judge
+    description: >
+      Model for the second judge. Defaults to a dated snapshot rather than an
+      alias, because the confidence thresholds are tuned against one model's
+      behaviour and an alias can be repointed underneath them. An answer from any
+      model other than the one requested is discarded and the deterministic
+      verdict stands. Temperature is set to 0 only for models that accept it
+      (Haiku 4.5, Opus 4.6, Sonnet 4.6); newer models reject it, so they run at
+      the API default.
     required: false
-    default: claude-haiku-4-5
+    default: claude-haiku-4-5-20251001
   min-confidence:
     description: Minimum judge confidence (0.5-1) to clear a borderline failure; vetoes always need 0.9 plus a cited hunk
     required: false

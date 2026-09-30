@@ -3,10 +3,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  DEFAULTS,
+  parseAnswer,
+  renderComment,
+  judge,
+  samplingFor,
+  servedMatches,
+  askModel,
   identityKey,
   fetchChangedFiles,
   repoPath,
-  DEFAULTS,
   buildPack,
   classify,
   laneOf,
@@ -16,9 +22,6 @@ import {
   fetchHistory,
   fetchRun,
   infraVerdict,
-  judge,
-  parseAnswer,
-  renderComment,
   triage,
   verdictOf,
 } from "./e2e-triage.mjs";
@@ -180,9 +183,21 @@ test("judge caps the number of findings and survives outages", async () => {
   assert.equal(findings.slice(8).every((f) => f.blocking && !f.decision), true);
   assert.equal(verdictOf(findings, null), "FAILURE");
 });
-test("parseAnswer rejects unknown causes and clamps confidence", () => {
-  assert.throws(() => parseAnswer(JSON.stringify({ cause: "nope", confidence: 1, cited_evidence: [], explanation: "" })));
-  assert.equal(parseAnswer(JSON.stringify({ cause: "test_bug", confidence: 7, cited_evidence: ["a"], explanation: "e" })).confidence, 1);
+test("parseAnswer rejects anything it would otherwise have to repair", () => {
+  const ok = { cause: "test_bug", confidence: 0.5, cited_evidence: ["a"], explanation: "e" };
+  assert.throws(() => parseAnswer(JSON.stringify({ ...ok, cause: "vibes" })), /unknown cause/);
+  // A confidence outside [0, 1] used to be clamped: 7 became 1, the most trust
+  // the decision matrix can give, and cleared a regression. It is now rejected,
+  // so the finding keeps its deterministic outcome.
+  for (const bad of [7, -0.1, 1.0001, "0.9", null, true])
+    assert.throws(() => parseAnswer(JSON.stringify({ ...ok, confidence: bad })), /confidence/, `confidence ${JSON.stringify(bad)}`);
+  // NaN and Infinity cannot survive JSON, so test them past the parse.
+  assert.throws(() => parseAnswer('{"cause":"test_bug","confidence":1e400,"cited_evidence":["a"],"explanation":"e"}'), /confidence/, "Infinity");
+  assert.throws(() => parseAnswer(JSON.stringify({ ...ok, cited_evidence: ["a", 7] })), /cited_evidence/);
+  assert.throws(() => parseAnswer(JSON.stringify({ ...ok, explanation: 3 })), /explanation/);
+  // The boundaries themselves are valid.
+  assert.equal(parseAnswer(JSON.stringify({ ...ok, confidence: 0 })).confidence, 0);
+  assert.equal(parseAnswer(JSON.stringify({ ...ok, confidence: 1 })).confidence, 1);
 });
 test("comment names the evidence and escapes markdown", () => {
   const f = { ...classify({ ...failing, title: "a | b" }, trunkPasses(8), []), judge: { cause: "flaky_environment", confidence: 0.9, cited_evidence: ["cross_pr"], explanation: "recurs <x>" }, decision: "adjudicator_unblock", blocking: false };
@@ -618,7 +633,7 @@ test("end to end: a regression the judge clears with cross-PR evidence turns the
     ["api.anthropic.com", (init) => {
       assert.ok(JSON.parse(init.body).messages[0].content.includes("hunk_0"));
       assert.equal(init.headers["x-api-key"], "AK");
-      return Response.json({ stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify({ cause: "flaky_environment", confidence: 0.9, cited_evidence: ["cross_pr", "error"], explanation: "recurs on PR 1" }) }] });
+      return Response.json({ model: JSON.parse(init.body).model, stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify({ cause: "flaky_environment", confidence: 0.9, cited_evidence: ["cross_pr", "error"], explanation: "recurs on PR 1" }) }] });
     }],
     ["/issues/5/comments", (init) => (init.method === "POST" ? Response.json({ id: 1 }) : Response.json([]))],
     ["/statuses/abc", (init) => {
@@ -668,4 +683,83 @@ test("end to end: green run posts success and no comment", async () => {
   const result = await triage({ env, fetchImpl, log: () => {} });
   assert.equal(result.verdict, "SUCCESS");
   assert.ok(!fetchImpl.calls.some((c) => c.url.includes("/comments")));
+});
+
+// ---- judge provenance, sampling and strict answers ----
+const answerText = (over = {}) => JSON.stringify({ cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "x", ...over });
+const judgePack = { cross_pr_failures_14d: { other_prs_where_this_test_failed: ["PR 1"] }, diff_hunks_of_files_named_in_error: [], test: {}, error: "", engine: {}, trunk_history_14d: {}, pr: {} };
+function fakeModel(served, { text = answerText(), stop = "end_turn" } = {}) {
+  const calls = [];
+  const impl = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(body);
+    return Response.json({ model: typeof served === "function" ? served(body.model) : served, stop_reason: stop, content: [{ type: "text", text }] });
+  };
+  impl.calls = calls;
+  return impl;
+}
+
+test("the judge is pinned to a dated snapshot", () => {
+  assert.match(DEFAULTS.model, /^claude-haiku-4-5-\d{8}$/, "an alias can be repointed underneath the thresholds");
+});
+
+test("an answer from a model other than the one requested is discarded, once", async () => {
+  const f = fakeModel("claude-haiku-4-5-20991231");
+  await assert.rejects(() => askModel(f, "k", "claude-haiku-4-5-20251001", judgePack), /is not the requested/);
+  assert.equal(f.calls.length, 1, "a mismatch is deterministic, so it is not retried");
+
+  const missing = fakeModel(undefined);
+  await assert.rejects(() => askModel(missing, "k", "claude-haiku-4-5-20251001", judgePack), /is not the requested/, "an answer that cannot name its model is not used");
+});
+
+test("an alias may be answered by its own snapshot and by nothing else", () => {
+  assert.equal(servedMatches("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"), true);
+  assert.equal(servedMatches("claude-haiku-4-5-20251001", "claude-haiku-4-5-20991231"), false, "a dated request needs exactly that snapshot");
+  assert.equal(servedMatches("claude-haiku-4-5", "claude-haiku-4-5-20251001"), true, "that is what an alias is");
+  assert.equal(servedMatches("claude-haiku-4-5", "claude-haiku-4-5-latest"), false, "not a dated snapshot");
+  assert.equal(servedMatches("claude-haiku-4-5", "claude-sonnet-4-6-20251001"), false, "a different model entirely");
+  assert.equal(servedMatches("claude-haiku-4", "claude-haiku-4-5-20251001"), false, "a prefix of a longer name is not the same alias");
+});
+
+test("provenance is recorded with the answer and named in the comment", async () => {
+  const a = await askModel(fakeModel((m) => m), "k", "claude-haiku-4-5-20251001", judgePack);
+  assert.equal(a.provenance.requested_model, "claude-haiku-4-5-20251001");
+  assert.equal(a.provenance.served_model, "claude-haiku-4-5-20251001");
+  assert.equal(a.provenance.temperature, 0);
+  assert.match(a.provenance.pack_hash, /^[0-9a-f]{64}$/);
+
+  const f = { ...classify(failing, trunkPasses(8), []), judge: { ...a, cited_evidence: ["cross_pr"] }, decision: "adjudicator_unblock", blocking: false };
+  const c = renderComment({ context: "c", verdict: "SUCCESS", findings: [f], infra: null, model: "claude-haiku-4-5", runURL: "u", counts: { failed: 1 } });
+  assert.ok(c.includes("Second judge (claude-haiku-4-5-20251001)"), "the header names the model that answered, not the alias that was asked for");
+});
+
+test("temperature is sent only to models that accept it", async () => {
+  for (const m of ["claude-haiku-4-5-20251001", "claude-haiku-4-5", "claude-opus-4-6", "claude-sonnet-4-6"]) {
+    const f = fakeModel((x) => (m.endsWith("20251001") ? m : `${m}-20251001`));
+    await askModel(f, "k", m, judgePack);
+    assert.equal(f.calls[0].temperature, 0, `${m} accepts temperature`);
+  }
+  // Newer models return a 400 for any non-default temperature, and an unknown
+  // model is treated the same way: better the API default than a failed request.
+  for (const m of ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "some-future-model"]) {
+    const f = fakeModel(m);
+    await askModel(f, "k", m, judgePack);
+    assert.equal("temperature" in f.calls[0], false, `${m} must not be sent a temperature`);
+  }
+});
+
+test("a malformed confidence cannot clear a regression, end to end", async () => {
+  // The reproduction: confidence 7 used to be clamped to 1 and clear the finding.
+  const f = fakeModel((m) => m, { text: answerText({ confidence: 7 }) });
+  const findings = [classify(failing, trunkPasses(8), [])];
+  assert.equal(findings[0].class, "REGRESSION");
+  const packs = [judgePack];
+  await judge(findings, packs, (pack) => askModel(f, "k", "claude-haiku-4-5-20251001", pack), DEFAULTS, () => {});
+  assert.equal(findings[0].blocking, true, "a malformed answer leaves the deterministic verdict in place");
+  assert.notEqual(findings[0].decision, "adjudicator_unblock");
+});
+
+test("only a complete answer is used", async () => {
+  for (const stop of ["max_tokens", "stop_sequence", "refusal", "tool_use"])
+    await assert.rejects(() => askModel(fakeModel((m) => m, { stop }), "k", "claude-haiku-4-5-20251001", judgePack), /stop_reason/, stop);
 });

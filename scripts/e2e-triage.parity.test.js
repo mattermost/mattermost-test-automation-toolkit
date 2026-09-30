@@ -35,7 +35,8 @@ function fixture() {
     if (p.includes("/comments") || p.includes("/statuses/")) return Response.json({ id: 1 });
     if (u.hostname === "api.anthropic.com") {
       f.modelCalls++;
-      return Response.json({ stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify({ cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "Recurs elsewhere" }) }] });
+      // The real API names the model that answered; echo the one requested.
+      return Response.json({ model: JSON.parse(init.body).model, stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify({ cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "Recurs elsewhere" }) }] });
     }
     throw new Error(`unexpected fake route ${p}`);
   };
