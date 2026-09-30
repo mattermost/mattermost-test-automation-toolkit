@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  identityKey,
   fetchChangedFiles,
   repoPath,
   DEFAULTS,
@@ -248,11 +249,11 @@ test("history is asked by run count, not by title or by window, and both queries
   assert.deepEqual([sent[0].page, sent[1].page, sent[2].page], [1, 2, 1]);
 
   // Merged newest-first, because classify() reads trunk[0] as the latest trunk run.
-  const rows = history.get("specs/a.spec.ts\nt1");
+  const rows = history.get(identityKey(failing));
   assert.deepEqual(rows.map((o) => o.commit_sha), ["p3", "p1", "p2"], "g1 is counted once even though both queries returned it");
   // Rows for tests the caller never asked about are dropped.
-  assert.equal(history.has("specs/a.spec.ts\nsome other test in the same file"), false);
-  assert.equal(history.get("specs/a.spec.ts\nt2"), undefined, "a title with no rows stays unknown, so it stays blocking");
+  assert.equal(history.has(identityKey({ ...failing, title: "some other test in the same file" })), false);
+  assert.equal(history.get(identityKey({ ...failing, title: "t2" })), undefined, "a title with no rows stays unknown, so it stays blocking");
 });
 test("deduplication never drops a row it cannot identify", async () => {
   // Rows that share file, title and attempt but come from different runs are the
@@ -262,12 +263,12 @@ test("deduplication never drops a row it cannot identify", async () => {
   const noIds = Array.from({ length: 6 }, (_, i) => { const o = obs({ commit_sha: `c${i}` }); delete o.group_id; return o; });
   const single = fakeFetch([["/reports/history", () => Response.json({ observations: noIds })]]);
   const one = await fetchHistory(single, "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, null);
-  assert.equal(one.get("specs/a.spec.ts\nt1").length, 6, "one query cannot overlap itself, so nothing is deduplicated");
+  assert.equal(one.get(identityKey(failing)).length, 6, "one query cannot overlap itself, so nothing is deduplicated");
 
   const shared = [obs({ commit_sha: "a", group_id: "g1" }), obs({ commit_sha: "b", group_id: "g2" }), obs({ commit_sha: "c", group_id: "g3" })];
   const both = fakeFetch([["/reports/history", () => Response.json({ observations: shared })]]);
   const two = await fetchHistory(both, "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, "master");
-  assert.equal(two.get("specs/a.spec.ts\nt1").length, 3, "distinct runs survive the overlap between the two queries");
+  assert.equal(two.get(identityKey(failing)).length, 3, "distinct runs survive the overlap between the two queries");
 });
 test("a branch with no pull request is not trunk", () => {
   // Pushing a branch without an open PR yields rows with no PR number, which is
@@ -406,7 +407,7 @@ test("history from another platform cannot answer for this one", async () => {
   }]]);
   const scoped = await fetchHistory(good, "http://tsio", "o/r", tests, "2026-09-17T00:00:00Z", DEFAULTS, "master", "e2e-on-windows");
   assert.equal(sent[0].report, "e2e-on-windows", "the filter is sent to the server");
-  assert.deepEqual(scoped.get("specs/a.spec.ts\nt1").map((o) => o.commit_sha), ["mine"], "the other platform's row is dropped");
+  assert.deepEqual(scoped.get(identityKey(failing)).map((o) => o.commit_sha), ["mine"], "the other platform's row is dropped");
   assert.equal(scoped.reportUnknown, false);
 
   // A server that predates report identity: rows cannot prove which platform

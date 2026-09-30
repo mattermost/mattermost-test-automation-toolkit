@@ -2,7 +2,8 @@ name: E2E triage
 description: >
   After an E2E run reported to Test System IO, decide whether its failures are the
   PR's fault, ask Claude about the borderline ones with checkable evidence, and
-  publish the outcome as the required commit status plus a sticky PR comment.
+  publish a job summary and structured verdict. Commit statuses require enforce
+  mode; sticky PR comments are opt-in.
 author: Mattermost
 inputs:
   composite-identity:
@@ -28,13 +29,18 @@ inputs:
     default: "0.85"
   mode:
     description: >
-      enforce writes the commit status; report-only posts the comment and job
-      summary only. Report-only is the default: an omitted mode, or a repository
+      enforce writes the commit status; report-only writes the job summary.
+      PR comments are controlled separately by post-pr-comment.
+      Report-only is the default: an omitted mode, or a repository
       variable that failed to expand, must not be the difference between
       describing a run and writing the status that gates merging. Enforcement is
       something a repository opts into explicitly.
     required: false
     default: report-only
+  post-pr-comment:
+    description: Set to true to create or update the optional sticky PR comment; disabled by default in both modes
+    required: false
+    default: "false"
   tsio-base-url:
     description: Test System IO base URL
     required: false
@@ -64,10 +70,10 @@ inputs:
     default: ""
 outputs:
   verdict:
-    description: SUCCESS, FAILURE or ACTION_REQUIRED (infrastructure)
+    description: SUCCESS, FAILURE or ACTION_REQUIRED (run-level investigation)
     value: ${{ steps.triage.outputs.verdict }}
   blocking:
-    description: Number of failures attributed to the PR
+    description: Number of unresolved failures, including insufficient evidence; not a count of proven PR regressions
     value: ${{ steps.triage.outputs.blocking }}
   exonerated:
     description: Number of failures cleared by history or the judge
@@ -88,6 +94,7 @@ runs:
         CLAUDE_MODEL: ${{ inputs.claude-model }}
         MIN_CONFIDENCE: ${{ inputs.min-confidence }}
         MODE: ${{ inputs.mode }}
+        POST_PR_COMMENT: ${{ inputs.post-pr-comment }}
         TSIO_BASE_URL: ${{ inputs.tsio-base-url }}
         TEST_ROOT: ${{ inputs.test-root }}
         REPORT_NAME: ${{ inputs.report-name }}

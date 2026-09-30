@@ -1,134 +1,179 @@
 # E2E triage
 
-Runs after an E2E job has reported its results to Test System IO (TSIO) and
-answers the question a developer asks first when the check is red: **is this
-failure mine?** It writes the answer as the required commit status and as a
-sticky PR comment that names the evidence, so a run whose failures are all
-trunk's or the environment's goes green without anyone applying a label.
+Reads Test System IO (TSIO) evidence after an E2E run and returns `SUCCESS`,
+`FAILURE`, or `ACTION_REQUIRED`. The default is **report-only**, with a concise
+GitHub job summary and structured outputs. It does not change the required
+commit status or post a PR comment by default.
 
 One script, no dependencies: [`scripts/e2e-triage.mjs`](../../scripts/e2e-triage.mjs).
+The three producer repositories use this shared implementation; TSIO remains the
+source of run and historical test data.
 
-## What it does
+## Decisions
 
-1. Reads the run's consolidated results from TSIO. Tests that passed on retry
-   are not failures.
-2. Asks TSIO for the last 14 days of history of the spec files those failures
-   live in (`POST /api/v1/reports/history`, paged): trunk runs and other PRs'
-   runs. The request names files rather than tests because a test title is
-   reworded far more often than the file it lives in, so a title-keyed request
-   would lose a test's history to a typo fix. Rows are matched back to the
-   failing tests in the action, on an exact file and title match today; a
-   renamed test therefore finds no history and stays blocking, and a looser rule
-   can be tried here without a TSIO deploy.
-3. Applies the rules, in order:
+Tests that passed on retry are not failures. For failed tests the action reads
+trunk and cross-PR history, then applies these rules in order:
 
-   | Finding | Meaning | Status |
-   | --- | --- | --- |
-   | `INFRA` | most failures share an infrastructure signature, or 30+ tests failed | red, nobody blamed, rerun |
-   | `OWNED_BY_PR` | the PR changed the failing spec | red, never judged |
-   | `BROKEN_ON_TRUNK` | trunk's latest run fails this test too | cleared |
-   | `FLAKY_ON_TRUNK` | the test flakes on trunk in the window | cleared |
-   | `FLAKY_CROSS_PR` | failed on 3+ other PRs while trunk stayed green | cleared |
-   | `INSUFFICIENT_DATA`, `REGRESSION` | history cannot settle it | second judge |
+| Finding | Meaning | Outcome on a PR |
+| --- | --- | --- |
+| `INFRA` | Many infrastructure signatures, or 30+ failures | `ACTION_REQUIRED`; investigate, never cleared |
+| `OWNED_BY_PR` | The PR changed the failing spec | Blocking; never sent to the model |
+| `BROKEN_ON_TRUNK` | The latest trunk observation fails this test too | Cleared |
+| `FLAKY_ON_TRUNK` | This test is intermittent on trunk | Cleared |
+| `FLAKY_CROSS_PR` | At least three other PRs fail this test and trunk has actually passed it | Cleared |
+| `INSUFFICIENT_DATA`, `REGRESSION` | History cannot clear the failure | Blocking unless the model supplies qualifying evidence |
 
-4. For findings the rules cannot settle, asks Claude with an evidence pack
-   (error, trunk history, cross-PR recurrence, the PR's changed files and the
-   diff hunks of files named in the error). The judge may clear a finding only
-   with confidence ≥ `min-confidence` **and** a citation a reviewer can check
-   (cross-PR recurrence or a diff hunk), or a bug-on-trunk call. It may veto a
-   cleared finding only at ≥ 0.9 with a cited hunk. Model outage keeps the rule
-   outcome. At most 8 findings per run are judged.
-5. Publishes: the commit status for `status-context` (`enforce` mode) and a
-   comment with the table of findings and the judge's explanations.
+A widespread failure can be a product bug as well as an environment problem.
+`ACTION_REQUIRED` is not proof that the PR is innocent. Likewise, an unresolved
+failure is not automatically proof that the PR caused it.
 
-The repository's existing override label keeps precedence: it is applied by a
-human after this step and nothing here removes it.
+Claude receives one evidence pack per finding, at most eight per run. Clearing
+requires confidence at least `min-confidence` (default 0.85) and a validated
+citation to actual cross-PR evidence or a related diff hunk. A model claiming
+`bug_on_master` without qualifying evidence cannot clear anything. Vetoing a
+history-cleared finding requires confidence at least 0.9 and a related hunk.
+Model failure preserves the deterministic outcome. Model confidence is not a
+measured accuracy rate.
 
-## Usage (mattermost, Playwright template)
+Incomplete changed files, unknown test root or trunk branch, truncated history,
+or unprovable report scope block clearing and skip the model. A test with
+unresolved identity also stays blocking and is never sent to the model.
+
+## Identity and report scope
+
+Runs require exact repository, commit, name, GitHub run ID and run attempt.
+Incomplete groups, missing suite file paths and empty runs fail closed.
+
+Tests are matched by file and full ancestor-qualified title, within the configured
+report scope. Same-leaf siblings cannot borrow each other's history or hide a
+failure with another sibling's pass. Qualified current titles cannot be matched
+to legacy history missing their ancestry. TSIO must serve full titles in both
+current cases and historical observations for that comparison to be possible.
+
+`report-name` is a producer-supplied prefix, such as `e2e-on-windows-2022-`.
+This keeps desktop history within one OS while allowing version suffixes to
+change. Without an explicit prefix, worker/shard names are not guessed into
+lanes. Duplicate identities across reports in one group, conflicting duplicate
+observations and ambiguous legacy identities remain blocking. A renamed test
+has no matching history; this action does not fuzzy-match names.
+
+## Usage
 
 ```yaml
       - name: ci/e2e-triage
         if: always() && steps.summary.outcome != 'skipped'
-        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-triage@<full sha>
+        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-triage@<published full sha>
         with:
           composite-identity: ${{ needs.prepare-run.outputs.composite-identity-json }}
           status-context: ${{ inputs.context_name }}
-          base-ref: ${{ inputs.ref_branch || 'master' }}
+          test-root: e2e-tests/playwright
           github-token: ${{ github.token }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           mode: ${{ vars.E2E_TRIAGE_MODE || 'report-only' }}
+          post-pr-comment: "false"
 ```
 
-The job needs `statuses: write` and `pull-requests: write`. Start with
-`report-only` (comment and job summary only), read a week of comments, then set
-the repository variable `E2E_TRIAGE_MODE=enforce`.
+Set `test-root` to the repository-relative root of this producer's specs, or `.`
+if TSIO already returns repository-relative paths. Desktop also supplies its
+per-OS `report-name`. The PR base branch is read from GitHub metadata.
 
-## On trunk runs
+Outputs are `verdict`, `blocking`, `exonerated`, and `description`. `blocking`
+counts unresolved failures, including missing evidence and run-level infra
+failures. Consumers must use `verdict`, not parse summary text, to gate jobs.
+Existing consumer workflows retain their manual override handling.
 
-The action also runs on `main`/`master`, detected by the absence of a PR number
-in the composite identity. There the question is not "is this the PR's fault"
-but "is trunk noisy or actually broken", so the rules change:
+- **report-only (default):** job summary and outputs only; required status unchanged.
+- **enforce:** also writes success only for `SUCCESS`, otherwise failure, on the
+  configured commit-status context. The consumer remains responsible for its
+  job assertion and manual override ordering.
+- **post-pr-comment: "true":** separately opts into a sticky comment, in either
+  mode. It contains the same compact summary with collapsed evidence. Otherwise
+  no comment is read, created, updated or deleted. Existing comments are left alone.
 
-| Finding | Meaning | Status |
-| --- | --- | --- |
-| `BROKEN_ON_TRUNK` | the previous trunk run failed this test too | **blocking** |
-| `FLAKY_ON_TRUNK` | intermittent, and the previous run passed | cleared |
-| `REGRESSION` | passed in every previous run in the window | blocking |
-| `INSUFFICIENT_DATA` | too few earlier runs to tell | blocking |
+GitHub read access is needed for PR metadata and files. `statuses: write` is
+needed for enforce; `pull-requests: write` is needed only for optional comments.
+The workflow token is used only with GitHub, never sent to TSIO or Anthropic.
+Only the exact mode `enforce` (with surrounding whitespace ignored) enables
+status writes. Unknown modes are logged and treated as report-only.
 
-The important difference is `BROKEN_ON_TRUNK`. On a PR it exonerates, because a
-test already failing on trunk is not the PR's doing. On trunk it does the
-opposite: it means the failure is still there from last time, and greening a
-standing breakage is exactly how a broken trunk becomes permanent and invisible.
-A streak stays red however often that test has flaked before.
+## Trunk runs
 
-A run is also excluded from its own history by group id. Without that, a trunk
-run has no PR number, lands in its own trunk history, and reads its own failure
-as proof that trunk was already broken.
-
-Trunk runs have no PR to comment on, so the outcome goes to the job summary and,
-under `enforce`, to the commit status.
+Without a PR number the action evaluates the trunk commit's changed files.
+A previous failure of the same test is `BROKEN_ON_TRUNK` and **stays blocking**.
+Only intermittency with a prior passing run may clear. The current group is
+excluded from its own history and the model is not called on trunk runs.
+Master repair automation is separate from triage: a repeated master failure
+is evidence to investigate and fix, not a reason to permanently green trunk.
 
 ## Replay against history
 
-The same script scores itself against labeled past runs without posting
-anything, which is how every rule and threshold change is accepted:
+Replay uses the same `evaluateRun` path as live triage, including ownership,
+report scope, ambiguity, evidence completeness and trunk rules. It never calls
+GitHub or publishes comments/statuses. With `ANTHROPIC_API_KEY` it may call the
+model; without it only answers for exact cached evidence packs are used.
 
 ```sh
 node scripts/e2e-triage.mjs --replay runs.json --compare compares.json \
   --answers answers.json --tsio http://localhost:8080 --out results.json
 ```
 
-`runs.json` rows: `{repository, pr, name, commit_sha, branch, run_at, truth,
-base_ref}`; `compares.json`: `{"<repo>:<sha>": {files: [{filename, patch}],
-pr_title}}`; `answers.json` caches judge answers keyed `pr|name|sha7|title` (with
-`ANTHROPIC_API_KEY` set, missing answers are asked and cached). The output
-table counts green verdicts per ground-truth bucket; runs that were later fixed
-by their author must stay red.
+A `runs.json` row carries:
 
-## Tests
-
-```sh
-node --test scripts/e2e-triage.test.js
+```json
+{
+  "repository": "mattermost/desktop",
+  "pr": 123,
+  "name": "desktop-pr",
+  "commit_sha": "full-commit-sha",
+  "gh_run_id": "123456",
+  "gh_run_attempt": "1",
+  "branch": "pr-123",
+  "base_ref": "master",
+  "run_at": "2026-09-30T12:00:00Z",
+  "test_root": "e2e/specs",
+  "report_name": "e2e-on-windows-2022-",
+  "truth": "REGRESSION"
+}
 ```
 
-## Validation (2026-09-17)
+`run_at` is the historical evaluation cutoff; later observations are not requested.
+For trunk, omit `pr` and supply the trunk `branch`. `test_root` and `report_name`
+may also come from `TEST_ROOT` and `REPORT_NAME` environment variables.
 
-Replayed over 370 labeled production PR runs (mattermost-mobile Aug 18 to
-Sep 16, mattermost webapp newest 200), history scoped to each run's lane and
-anchored at the run's own time. Judge answers came from the cached Claude Haiku
-4.5 responses of the earlier evaluation; findings without a cached answer kept
-the rule outcome, so the judge's contribution is a lower bound here.
+`compares.json` maps **repository:full-commit-sha** to
+`{"complete": true, "files": [{"filename": "...", "patch": "..."}], "pr_title": "..."}`.
+Only mark it complete after capturing all pages of the PR diff (or trunk commit
+files) at the evaluated revision. Missing or partial captures cannot clear tests.
 
-| Ground truth | runs | green |
-| --- | --- | --- |
-| LIKELY_REGRESSION (failing test unique to the PR, later fixed by the author) | 143 | 3 |
-| RECURRING_ELSEWHERE (same tests failed on other PRs, later passed) | 157 | 67 |
-| WAIVED by a maintainer (`E2E/Verified`) | 32 | 20 |
-| RERUN_PASSED (same commit passed on rerun) | 15 | 11 |
-| FIXED_BY_AUTHOR, webapp (proxy label: a later commit passed) | 23 | 3 |
+Answers are keyed by model, system prompt and the complete evidence pack,
+including qualified test identity and report scope. Old leaf-title answer keys
+are deliberately ignored; they cannot establish which test was judged.
 
-The three likely-regression greens are tests that trunk itself was failing or
-flaking on at the time (`BROKEN_ON_TRUNK`, `FLAKY_ON_TRUNK`); the three webapp
-greens are the same pattern. No run whose failing test was unique to the PR
-was cleared.
+Output is `{evaluated, skipped, results}`. Skipped entries include reasons and
+are reported alongside the ground-truth table. An empty or entirely skipped
+corpus exits nonzero. Partial coverage must be investigated before using a replay
+as calibration; it is not evidence of safety for the skipped population.
+
+## Validation and rollout
+
+```sh
+node --test scripts/e2e-triage*.test.js
+```
+
+The tests use fake HTTP responses, including live/replay parity, ambiguous
+identity, ownership, incomplete evidence, cache separation and comment opt-in.
+CI runs all triage test files. These tests do not establish production accuracy.
+
+The old 370-run replay used earlier rules and leaf-title cached model answers.
+Its percentages do **not** calibrate this implementation. Before enabling
+`E2E_TRIAGE_MODE=enforce` in any consumer:
+
+1. Deploy the required TSIO history/case identity fields and validate per-OS scope.
+2. Publish a reviewed toolkit commit and pin consumers to that reachable full SHA.
+3. Demonstrate `OWNED_BY_PR` on a controlled real report-only run.
+4. Replay an identity-aware corpus with complete captured diffs and inspect false
+   clearances, missing data and coverage, then review report-only outcomes with the team.
+
+Keep report-only until those checks are reviewed. TSIO credentials, rollout
+variables, master repair triggers and branch protection are outside this action's
+configuration changes.
