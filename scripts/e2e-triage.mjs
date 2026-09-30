@@ -50,7 +50,7 @@ export const DEFAULTS = {
   windowDays: 14,
   // How many runs each half of the history request asks for. Counts, not days:
   // see fetchHistory for why a window cannot answer either question.
-  trunkRuns: 30,
+  trunkRuns: 50,
   crossPRRuns: 200,
   minTrunkRuns: 5,
   pMin: 0.05,
