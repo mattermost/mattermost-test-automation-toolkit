@@ -26,6 +26,7 @@ const obs = (over) => ({ file: "specs/a.spec.ts", title: "t1", status: "passed",
 const failing = { file: "specs/a.spec.ts", title: "t1", error: "Error: expected visible" };
 // Other PRs that failed the same test, so cross_pr evidence has real content.
 const crossPR = (...prs) => prs.map((n) => obs({ gh_pr_number: n, status: "failed", commit_sha: `x${n}` }));
+const trunkFailsAll = (n) => Array.from({ length: n }, (_, i) => obs({ commit_sha: `f${i}`, status: "failed", created_at: `2026-09-${String(10 - (i % 9)).padStart(2, "0")}T00:00:00Z` }));
 const trunkPasses = (n) => Array.from({ length: n }, (_, i) => obs({ commit_sha: `c${i}`, created_at: `2026-09-${String(10 - (i % 9)).padStart(2, "0")}T00:00:00Z` }));
 
 test("spec changed by the PR is the PR's problem, whatever history says", () => {
@@ -213,6 +214,9 @@ const env = {
   COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "playwright-full", branch: "pr-5", gh_pr_number: 5 }),
   STATUS_CONTEXT: "e2e-test/playwright",
   TEST_ROOT: ".",
+  // Explicit: report-only is the default, so a test that expects a status write
+  // has to ask for enforcement.
+  MODE: "enforce",
   BASE_REF: "master",
   GITHUB_TOKEN: "GH",
   ANTHROPIC_API_KEY: "AK",
@@ -414,6 +418,111 @@ test("history from another platform cannot answer for this one", async () => {
   // Unscoped runs are unaffected.
   const plain = await fetchHistory(fakeFetch([["/reports/history", () => Response.json(rows({}))]]), "http://tsio", "o/r", tests, "2026-09-17T00:00:00Z", DEFAULTS, "master", null);
   assert.equal(plain.reportUnknown, false);
+});
+test("only an explicit, valid enforce mode writes a commit status", async () => {
+  const routes = (statuses) => [
+    ...runRoutes([spec("t1", "failed")]),
+    ["/reports/history", () => Response.json({ observations: trunkFailsAll(8) })],
+    ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+    ["/issues/5/comments", (i) => (i.method === "POST" ? Response.json({ id: 1 }) : Response.json([]))],
+    ["/statuses/abc", (i) => { statuses.push(JSON.parse(i.body)); return Response.json({}); }],
+  ];
+  for (const mode of [undefined, "", "report-only", "Enforce ", "enforced", "true", "ENFORCE_ME"]) {
+    const statuses = [];
+    const e = { ...env, ANTHROPIC_API_KEY: "" };
+    if (mode === undefined) delete e.MODE; else e.MODE = mode;
+    await triage({ env: e, fetchImpl: fakeFetch(routes(statuses)), log: () => {} });
+    assert.deepEqual(statuses, [], `mode ${JSON.stringify(mode)} must not write a status`);
+  }
+  // The one spelling that may.
+  const written = [];
+  await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "" }, fetchImpl: fakeFetch(routes(written)), log: () => {} });
+  assert.equal(written.length, 1, "explicit enforce still writes exactly one status");
+  assert.equal(written[0].context, "e2e-test/playwright");
+});
+test("a sibling suite's trunk failure cannot clear this suite's failure", async () => {
+  // One spec, two suites, both with a test called "same leaf". Suite A fails on
+  // this PR and Suite B passes; trunk history holds a failure of Suite B's copy.
+  // Keyed on file and leaf title those are one test, so Suite B's trunk failure
+  // read as BROKEN_ON_TRUNK for Suite A and cleared it.
+  const suites = [
+    { id: "s-a", file_path: "specs/a.spec.ts", title: "Suite A", report_name: "e2e-on-windows-2022-1.0" },
+    { id: "s-b", file_path: "specs/a.spec.ts", title: "Suite B", report_name: "e2e-on-windows-2022-1.0" },
+  ];
+  const cases = [
+    { suite_id: "s-a", title: "same leaf", status: "failed", retry_count: 0, ordinal: 0, error_message: "boom", error_stack: null },
+    { suite_id: "s-b", title: "same leaf", status: "passed", retry_count: 0, ordinal: 1, error_message: null, error_stack: null },
+  ];
+  // Trunk history, as the deployed endpoint returns it: suite and report named,
+  // but no ancestor-prefixed title to tie a row to one of the two suites.
+  const history = Array.from({ length: 8 }, (_, i) => obs({
+    commit_sha: `t${i}`, group_id: `gt${i}`, title: "same leaf", status: "failed",
+    suite_title: "Suite B", report_name: "e2e-on-windows-2022-1.0",
+    created_at: `2026-09-${String(10 - (i % 9)).padStart(2, "0")}T00:00:00Z`,
+  }));
+  const routes = [
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "desktop-pr", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }] })],
+    ["/reports/g1/suites", () => Response.json({ suites })],
+    ["/reports/g1/cases", () => Response.json(cases)],
+    ["/reports/history", () => Response.json({ observations: history })],
+    ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+    ["/issues/5/comments", (i) => (i.method === "POST" ? Response.json({ id: 1 }) : Response.json([]))],
+    ["/statuses/abc", () => Response.json({})],
+  ];
+  const e = {
+    ...env,
+    COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "desktop-pr", branch: "pr-5", gh_pr_number: 5 }),
+    REPORT_NAME: "e2e-on-windows-2022",
+    ANTHROPIC_API_KEY: "",
+  };
+  const result = await triage({ env: e, fetchImpl: fakeFetch(routes), log: () => {} });
+
+  assert.equal(result.counts.failed, 1, "Suite B passing does not erase Suite A's failure");
+  assert.equal(result.findings.length, 1);
+  const f = result.findings[0];
+  assert.notEqual(f.class, "BROKEN_ON_TRUNK", "Suite B's history is not Suite A's history");
+  assert.equal(f.blocking, true, "an unresolvable identity may not be cleared");
+  assert.equal(result.verdict, "FAILURE");
+});
+test("a fully qualified title ties history to the right suite", async () => {
+  // With ancestor-prefixed titles on both sides the same run resolves properly:
+  // Suite A's own trunk history is read, and Suite B's is ignored.
+  const suites = [
+    { id: "s-a", file_path: "specs/a.spec.ts", title: "Suite A", report_name: "r1" },
+    { id: "s-b", file_path: "specs/a.spec.ts", title: "Suite B", report_name: "r1" },
+  ];
+  const cases = [
+    { suite_id: "s-a", title: "same leaf", full_title: "Suite A > same leaf", status: "failed", retry_count: 0, ordinal: 0, error_message: "boom", error_stack: null },
+    { suite_id: "s-b", title: "same leaf", full_title: "Suite B > same leaf", status: "passed", retry_count: 0, ordinal: 1, error_message: null, error_stack: null },
+  ];
+  const history = [
+    ...Array.from({ length: 8 }, (_, i) => obs({ commit_sha: `b${i}`, group_id: `gb${i}`, title: "same leaf", full_title: "Suite B > same leaf", status: "failed", report_name: "r1", created_at: `2026-09-0${(i % 8) + 1}T00:00:00Z` })),
+    ...Array.from({ length: 8 }, (_, i) => obs({ commit_sha: `a${i}`, group_id: `ga${i}`, title: "same leaf", full_title: "Suite A > same leaf", status: "passed", report_name: "r1", created_at: `2026-09-1${i % 8}T00:00:00Z` })),
+  ];
+  const routes = [
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "desktop-pr", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }] })],
+    ["/reports/g1/suites", () => Response.json({ suites })],
+    ["/reports/g1/cases", () => Response.json(cases)],
+    ["/reports/history", () => Response.json({ observations: history })],
+    ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+    ["/issues/5/comments", (i) => (i.method === "POST" ? Response.json({ id: 1 }) : Response.json([]))],
+    ["/statuses/abc", () => Response.json({})],
+  ];
+  const e = {
+    ...env,
+    COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "desktop-pr", branch: "pr-5", gh_pr_number: 5 }),
+    REPORT_NAME: "r1",
+    ANTHROPIC_API_KEY: "",
+  };
+  const result = await triage({ env: e, fetchImpl: fakeFetch(routes), log: () => {} });
+  const f = result.findings[0];
+  assert.equal(f.trunk.fails, 0, "Suite B's failures are not counted against Suite A");
+  assert.equal(f.trunk.passes, 8, "Suite A's own history is what is read");
+  assert.equal(f.class, "REGRESSION", "it fails here and passes on trunk, which is the truth");
+  assert.equal(f.blocking, true);
 });
 test("an unreadable diff clears nothing, and never reaches the model", async () => {
   // An empty file list from a failed request looks exactly like "touched

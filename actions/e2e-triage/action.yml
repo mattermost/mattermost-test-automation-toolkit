@@ -27,9 +27,14 @@ inputs:
     required: false
     default: "0.85"
   mode:
-    description: enforce writes the commit status; report-only posts the comment and job summary only
+    description: >
+      enforce writes the commit status; report-only posts the comment and job
+      summary only. Report-only is the default: an omitted mode, or a repository
+      variable that failed to expand, must not be the difference between
+      describing a run and writing the status that gates merging. Enforcement is
+      something a repository opts into explicitly.
     required: false
-    default: enforce
+    default: report-only
   tsio-base-url:
     description: Test System IO base URL
     required: false

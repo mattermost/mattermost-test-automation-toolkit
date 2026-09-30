@@ -155,6 +155,15 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
     return out("OWNED_BY_PR", isTrunkRun
       ? `This commit changes ${test.file}; a failure in a spec the commit edits is not noise.`
       : `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
+  // Ownership is decided above on the diff alone, so it still holds. Everything
+  // below reads history, and history that names more than one test cannot clear
+  // any of them.
+  if (test.identity_unresolved)
+    return out(
+      "INSUFFICIENT_DATA",
+      `Another suite in ${test.file} contains a test called "${test.title}", and the history available cannot tell them apart; nothing here can clear it.`,
+      true,
+    );
   // Trunk runs answer a different question, so they get their own order: a
   // failure that was already there last time is a streak, not a flake, and stays
   // red however often it has flaked before.
@@ -442,6 +451,7 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
     throw new Error(`group ${group.id} is ${group.status}, not completed; an unfinished upload cannot show whether the run passed`);
   const [{ suites = [] }, cases] = await Promise.all([get(`/reports/${group.id}/suites`), get(`/reports/${group.id}/cases`)]);
   const fileOf = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
+  const suiteTitleOf = new Map(suites.map((s) => [s.id, s.title ?? ""]));
   // Narrowing to one report is what makes a per-OS verdict possible. A filter
   // that matches nothing must not look like a run with no failures: that would
   // report SUCCESS and, under enforce, write a green status for an operating
@@ -462,6 +472,18 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
     if (!byTest.has(k)) byTest.set(k, []);
     byTest.get(k).push(c);
   }
+  // History is keyed on file and title. When two suites in the same file and the
+  // same report both carry a test of this name, that key names more than one
+  // test, and another test's history would answer for this one. Detect it here
+  // rather than assume it cannot happen: full_title resolves it when the server
+  // supplies it, and until then an ambiguous test may not be cleared.
+  const suitesPerLeaf = new Map();
+  for (const k of byTest.keys()) {
+    const [suiteId, title] = k.split("\n");
+    const leaf = `${fileOf.get(suiteId) ?? ""}\n${title}`;
+    if (!suitesPerLeaf.has(leaf)) suitesPerLeaf.set(leaf, new Set());
+    suitesPerLeaf.get(leaf).add(suiteId);
+  }
   // Cases that arrived but belong to no suite we can place cannot be judged.
   const placeable = [...byTest.keys()].every((k) => fileOf.has(k.split("\n")[0]));
   if (!placeable) throw new Error(`group ${group.id} has case rows whose suite is not in the suite list; the run cannot be read reliably`);
@@ -476,7 +498,17 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
     if (FAILED_STATUSES.has(last.status)) {
       failed++;
       const [suiteId, title] = k.split("\n");
-      failing.push({ file: fileOf.get(suiteId) ?? "", title, error: [last.error_message, last.error_stack].filter(Boolean).join("\n") });
+      const file = fileOf.get(suiteId) ?? "";
+      failing.push({
+        file,
+        title,
+        // The ancestor-prefixed path, when the server serves it. It is what makes
+        // two suites of the same name in one file distinguishable in history.
+        full_title: last.full_title ?? null,
+        suite_title: suiteTitleOf.get(suiteId) ?? null,
+        identity_ambiguous: (suitesPerLeaf.get(`${file}\n${title}`)?.size ?? 1) > 1,
+        error: [last.error_message, last.error_stack].filter(Boolean).join("\n"),
+      });
     } else if (last.status === "flaky" || attempts.some((a) => FAILED_STATUSES.has(a.status))) flaky++;
   }
   return { group_id: group.id, failing, counts: { total: byTest.size, failed, flaky } };
@@ -500,9 +532,13 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
   // came from -- an endpoint that predates report identity. History from another
   // platform then cannot be ruled out, so nothing may be cleared on it.
   byTest.reportUnknown = false;
+  // Keys whose rows could not be tied to one test: another suite in the same
+  // file carries a test of this name, and nothing in the rows says which of them
+  // an execution belonged to.
+  byTest.ambiguous = new Set();
   const files = [...new Set(tests.map((t) => t.file).filter(Boolean))].slice(0, HISTORY_MAX_FILES);
   if (files.length === 0) return byTest;
-  const wanted = new Set(tests.map((t) => `${t.file}\n${t.title}`));
+  const byLeaf = new Map(tests.map((t) => [`${t.file}\n${t.title}`, t]));
   const queries = [];
   if (trunkBranch) queries.push({ branch: trunkBranch, runs: cfg.trunkRuns });
   queries.push({ runs: cfg.crossPRRuns });
@@ -523,7 +559,17 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
       const { observations = [], has_more: hasMore } = await res.json();
       for (const o of observations) {
         const k = `${o.file}\n${o.title}`;
-        if (!wanted.has(k)) continue;
+        const test = byLeaf.get(k);
+        if (!test) continue;
+        // Full titles carry suite ancestry, so when both sides have one they
+        // settle which test an execution belonged to. When the test is known to
+        // share its leaf title with another suite and the rows cannot say, the
+        // key names more than one test and none of its history may be used.
+        if (test.full_title && o.full_title != null) {
+          if (o.full_title !== test.full_title) continue;
+        } else if (test.identity_ambiguous) {
+          byTest.ambiguous.add(k);
+        }
         if (reportName) {
           // Trust the filter only when the row can prove it was applied.
           if (o.report_name == null) byTest.reportUnknown = true;
@@ -657,7 +703,14 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       const files = (diff.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
       const changed = files.map((f) => f.filename);
       const withPaths = run.failing.map((t) => ({ ...t, repo_path: repoPath(testRoot, t.file) }));
-      result.findings = withPaths.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], changed, cfg, prNumber, laneOf(id.name), { isTrunkRun, groupId: run.group_id, trunkBranch }));
+      const unresolved = (t) => history.ambiguous?.has(`${t.file}\n${t.title}`) ?? false;
+      result.findings = withPaths.map((t) =>
+        classify(unresolved(t) ? { ...t, identity_unresolved: true } : t, history.get(`${t.file}\n${t.title}`) ?? [], changed, cfg, prNumber, laneOf(id.name), {
+          isTrunkRun,
+          groupId: run.group_id,
+          trunkBranch,
+        }),
+      );
       // Two ways the evidence can be incomplete, and neither may clear anything.
       // The judge is skipped rather than merely overridden: it reads the same
       // incomplete pack, and letting it run would hand back a non-blocking
@@ -693,7 +746,17 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
   const description = statusDescription(result.verdict, result.findings, result.infra, run.counts);
   if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `verdict=${result.verdict}\nblocking=${result.findings.filter((f) => f.blocking).length}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\n`);
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, comment + "\n");
-  const enforce = (env.MODE || "enforce") === "enforce";
+  // Report-only unless the caller explicitly and validly asks otherwise. An
+  // omitted mode, a typo, or a variable that failed to expand must never be the
+  // difference between describing a run and writing the status that gates it.
+  // Surrounding whitespace is transport noise and is ignored; casing is not.
+  // "enforce" is the documented spelling, and anything else -- a typo, a
+  // different case, a variable that did not expand -- is reported and treated as
+  // report-only rather than guessed at.
+  const mode = String(env.MODE ?? "").trim();
+  if (mode && mode !== "enforce" && mode !== "report-only")
+    log(`unrecognised mode ${JSON.stringify(mode)}; the only value that enforces is "enforce", so this run is report-only`);
+  const enforce = mode === "enforce";
   if (prNumber && (run.failing.length || env.ALWAYS_COMMENT === "true")) {
     const marker = `<!-- e2e-triage:${context} -->`;
     // Comments come back oldest first, 100 to a page. On a long-running PR the
