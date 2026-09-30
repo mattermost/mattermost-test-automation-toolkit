@@ -374,7 +374,17 @@ export function statusDescription(verdict, findings, infra, counts) {
 
 // ------------------------------------------------------------------ data access
 
-export async function fetchRun(fetchImpl, base, id) {
+/**
+ * The run's results, optionally narrowed to one report inside the group.
+ *
+ * A desktop run uploads one report per operating system into a single group, so
+ * without narrowing there is nothing to attribute a failure to and the verdict
+ * can only ever be written to one status covering all of them. `reportName`
+ * matches a report by prefix -- the names carry a version suffix
+ * (e2e-on-ubuntu-latest-12.0.0-rc2) that changes every release, so callers pass
+ * the stable part.
+ */
+export async function fetchRun(fetchImpl, base, id, reportName = null) {
   const get = async (path) => {
     const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(60000) });
     if (!res.ok) throw new Error(`TSIO GET ${path}: ${res.status}`);
@@ -392,8 +402,18 @@ export async function fetchRun(fetchImpl, base, id) {
   if (!group) throw new Error(`TSIO returned no group matching ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} (of ${groups.length} row(s) returned; the deployment may predate the list filters)`);
   const [{ suites = [] }, cases] = await Promise.all([get(`/reports/${group.id}/suites`), get(`/reports/${group.id}/cases`)]);
   const fileOf = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
+  // Narrowing to one report is what makes a per-OS verdict possible. A filter
+  // that matches nothing must not look like a run with no failures: that would
+  // report SUCCESS and, under enforce, write a green status for an operating
+  // system whose results were never read.
+  const scoped = reportName
+    ? new Set(suites.filter((s) => String(s.report_name ?? "").startsWith(reportName)).map((s) => s.id))
+    : null;
+  if (scoped && scoped.size === 0)
+    throw new Error(`no report in group ${group.id} has a name starting with "${reportName}" (of ${new Set(suites.map((s) => s.report_name)).size} report name(s) present)`);
   const byTest = new Map();
   for (const c of cases) {
+    if (scoped && !scoped.has(c.suite_id)) continue;
     const k = `${fileOf.get(c.suite_id) ?? ""}\n${c.title}`;
     if (!byTest.has(k)) byTest.set(k, []);
     byTest.get(k).push(c);
@@ -531,7 +551,7 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
   const isTrunkRun = prNumber == null;
   const base = (env.TSIO_BASE_URL || "https://test-io.test.mattermost.com").replace(/\/$/, "");
   const api = gh(fetchImpl, env.GITHUB_TOKEN);
-  const run = await fetchRun(fetchImpl, base, id);
+  const run = await fetchRun(fetchImpl, base, id, env.REPORT_NAME || null);
   const result = { verdict: "SUCCESS", findings: [], infra: null, counts: run.counts };
   if (run.failing.length) {
     result.infra = infraVerdict(run.failing, cfg);

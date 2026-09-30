@@ -34,6 +34,15 @@ inputs:
     description: Test System IO base URL
     required: false
     default: https://test-io.test.mattermost.com
+  report-name:
+    description: >
+      Narrow the run to one report inside the group, matched as a prefix of the
+      report name. A run that uploads one report per operating system needs this
+      to attribute a failure, and to write a status per OS rather than one status
+      covering all of them. A prefix matching no report fails the step rather than
+      reporting a clean run.
+    required: false
+    default: ""
   lane:
     description: Optional lane label shown to the judge (defaults to the run name)
     required: false
@@ -65,5 +74,6 @@ runs:
         MIN_CONFIDENCE: ${{ inputs.min-confidence }}
         MODE: ${{ inputs.mode }}
         TSIO_BASE_URL: ${{ inputs.tsio-base-url }}
+        REPORT_NAME: ${{ inputs.report-name }}
         LANE: ${{ inputs.lane }}
       run: node "${{ github.action_path }}/../../scripts/e2e-triage.mjs"

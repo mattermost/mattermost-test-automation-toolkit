@@ -279,6 +279,41 @@ test("a branch with no pull request is not trunk", () => {
   assert.equal(scoped.trunk.fails, 0, "and so are its failures");
   assert.notEqual(scoped.class, "BROKEN_ON_TRUNK", "a feature branch cannot make trunk look broken");
 });
+test("a run can be narrowed to one report, and a filter that matches nothing fails closed", async () => {
+  // A desktop run uploads one report per operating system into one group. Without
+  // narrowing, every OS shares a single verdict and a single status.
+  const suites = [
+    { id: "s-linux", file_path: "specs/a.spec.ts", report_name: "e2e-on-ubuntu-latest-12.0.0-rc2" },
+    { id: "s-mac", file_path: "specs/a.spec.ts", report_name: "e2e-on-macos-26-12.0.0-rc2" },
+  ];
+  const cases = [
+    { suite_id: "s-linux", title: "t1", status: "failed", retry_count: 0, ordinal: 0, error_message: "boom", error_stack: null },
+    { suite_id: "s-mac", title: "t2", status: "passed", retry_count: 0, ordinal: 0, error_message: null, error_stack: null },
+  ];
+  const routes = [
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "desktop-pr", gh_run_attempt: "1" }] })],
+    ["/reports/g1/suites", () => Response.json({ suites })],
+    ["/reports/g1/cases", () => Response.json(cases)],
+  ];
+  const id = { repository: "o/r", commit_sha: "abc", name: "desktop-pr", gh_run_attempt: "1" };
+
+  const all = await fetchRun(fakeFetch(routes), "http://tsio", id);
+  assert.equal(all.counts.total, 2, "unfiltered, every operating system is in one bucket");
+
+  const linux = await fetchRun(fakeFetch(routes), "http://tsio", id, "e2e-on-ubuntu-latest");
+  assert.equal(linux.counts.total, 1);
+  assert.deepEqual(linux.failing.map((f) => f.title), ["t1"], "only this OS's results");
+
+  const mac = await fetchRun(fakeFetch(routes), "http://tsio", id, "e2e-on-macos");
+  assert.equal(mac.failing.length, 0, "the other OS passed");
+
+  // The dangerous case: a name that matches nothing would otherwise look like a
+  // clean run and, under enforce, write a green status for results never read.
+  await assert.rejects(
+    () => fetchRun(fakeFetch(routes), "http://tsio", id, "e2e-on-windows"),
+    /no report in group g1 has a name starting with/,
+  );
+});
 test("an unreadable diff clears nothing, and never reaches the model", async () => {
   // An empty file list from a failed request looks exactly like "touched
   // nothing", which would let history rules clear a failure the PR caused.
