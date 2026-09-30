@@ -34,6 +34,16 @@ inputs:
     description: Test System IO base URL
     required: false
     default: https://test-io.test.mattermost.com
+  test-root:
+    description: >
+      Where this producer's specs live relative to the repository root, or "."
+      when TSIO already records repository-relative paths. TSIO stores a spec
+      path relative to the test root while GitHub reports changed files relative
+      to the repository, so without this the two never match and a pull request
+      that edits the failing spec is not recognised as owning it. Leaving it
+      unset makes ownership unknown, and nothing is cleared.
+    required: false
+    default: ""
   report-name:
     description: >
       Narrow the run to one report inside the group, matched as a prefix of the
@@ -74,6 +84,7 @@ runs:
         MIN_CONFIDENCE: ${{ inputs.min-confidence }}
         MODE: ${{ inputs.mode }}
         TSIO_BASE_URL: ${{ inputs.tsio-base-url }}
+        TEST_ROOT: ${{ inputs.test-root }}
         REPORT_NAME: ${{ inputs.report-name }}
         LANE: ${{ inputs.lane }}
       run: node "${{ github.action_path }}/../../scripts/e2e-triage.mjs"

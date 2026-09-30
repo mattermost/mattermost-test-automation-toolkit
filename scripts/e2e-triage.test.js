@@ -3,6 +3,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  fetchChangedFiles,
+  repoPath,
   DEFAULTS,
   buildPack,
   classify,
@@ -203,13 +205,14 @@ const spec = (title, status, retries = 0) => [...Array.from({ length: retries },
 const runRoutes = (specs, name = "playwright-full") => [
   // The group carries its identity because fetchRun verifies it belongs to the
   // run being triaged rather than trusting the server to have filtered.
-  ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name, gh_run_attempt: "1" }], total: 1 })],
+  ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name, gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
   ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
   ["/reports/g1/cases", () => Response.json(specs.flat())],
 ];
 const env = {
   COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "playwright-full", branch: "pr-5", gh_pr_number: 5 }),
   STATUS_CONTEXT: "e2e-test/playwright",
+  TEST_ROOT: ".",
   BASE_REF: "master",
   GITHUB_TOKEN: "GH",
   ANTHROPIC_API_KEY: "AK",
@@ -291,11 +294,11 @@ test("a run can be narrowed to one report, and a filter that matches nothing fai
     { suite_id: "s-mac", title: "t2", status: "passed", retry_count: 0, ordinal: 0, error_message: null, error_stack: null },
   ];
   const routes = [
-    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "desktop-pr", gh_run_attempt: "1" }] })],
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "desktop-pr", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }] })],
     ["/reports/g1/suites", () => Response.json({ suites })],
     ["/reports/g1/cases", () => Response.json(cases)],
   ];
-  const id = { repository: "o/r", commit_sha: "abc", name: "desktop-pr", gh_run_attempt: "1" };
+  const id = { repository: "o/r", commit_sha: "abc", name: "desktop-pr", gh_run_id: "12", gh_run_attempt: "1" };
 
   const all = await fetchRun(fakeFetch(routes), "http://tsio", id);
   assert.equal(all.counts.total, 2, "unfiltered, every operating system is in one bucket");
@@ -313,6 +316,75 @@ test("a run can be narrowed to one report, and a filter that matches nothing fai
     () => fetchRun(fakeFetch(routes), "http://tsio", id, "e2e-on-windows"),
     /no report in group g1 has a name starting with/,
   );
+});
+test("ownership compares repository paths, not TSIO's test-root-relative ones", () => {
+  // TSIO stores calls/x.test.ts where the desktop repository says
+  // e2e/specs/calls/x.test.ts. Compared directly they never match, so a PR that
+  // edits the failing spec was being cleared by trunk history instead.
+  assert.equal(repoPath("e2e/specs", "calls/x.test.ts"), "e2e/specs/calls/x.test.ts");
+  assert.equal(repoPath(".", "detox/e2e/test/a.e2e.ts"), "detox/e2e/test/a.e2e.ts");
+  assert.equal(repoPath(null, "calls/x.test.ts"), null, "an unconfigured root is unknown, not repo-relative");
+
+  const tsioPath = "calls/x.test.ts";
+  const changed = ["e2e/specs/calls/x.test.ts"];
+  const raw = classify({ file: tsioPath, title: "t", error: "e" }, trunkPasses(8), changed, DEFAULTS, 5, null, { trunkBranch: "master" });
+  assert.notEqual(raw.class, "OWNED_BY_PR", "the bug: TSIO's path never matches the diff");
+
+  const canonical = { file: tsioPath, title: "t", error: "e", repo_path: repoPath("e2e/specs", tsioPath) };
+  const owned = classify(canonical, trunkPasses(8), changed, DEFAULTS, 5, null, { trunkBranch: "master" });
+  assert.equal(owned.class, "OWNED_BY_PR", "the PR edited this spec, so it answers for it");
+  assert.equal(owned.blocking, true);
+});
+test("an incomplete or empty run is not a passing run", async () => {
+  const group = (over) => ({ id: "g1", repository: "o/r", commit: "abc", name: "n", gh_run_id: "12", gh_run_attempt: "1", status: "completed", ...over });
+  const id = { repository: "o/r", commit_sha: "abc", name: "n", gh_run_id: "12", gh_run_attempt: "1" };
+  const routes = (g, suites, cases) => [
+    ["/reports?", () => Response.json({ reports: [g] })],
+    ["/reports/g1/suites", () => Response.json({ suites })],
+    ["/reports/g1/cases", () => Response.json(cases)],
+  ];
+  const suite = [{ id: "s1", file_path: "specs/a.spec.ts", report_name: "e2e-on-windows-2022-1.0" }];
+
+  await assert.rejects(
+    () => fetchRun(fakeFetch(routes(group({ status: "processing" }), suite, [])), "http://tsio", id),
+    /not completed/, "an unfinished upload cannot show whether the run passed");
+
+  await assert.rejects(
+    () => fetchRun(fakeFetch(routes(group(), suite, [])), "http://tsio", id, "e2e-on-windows"),
+    /no test cases/, "a report with a matching suite but no cases is not a green run");
+});
+test("two describe blocks sharing a leaf title are different tests", async () => {
+  // Keyed on file and title their rows merge, sort as if they were retries of
+  // one test, and the last status wins -- so the passing block erases the
+  // failing one and the run reports clean.
+  const suites = [
+    { id: "s-a", file_path: "specs/a.spec.ts", title: "describe A", report_name: "r1" },
+    { id: "s-b", file_path: "specs/a.spec.ts", title: "describe B", report_name: "r1" },
+  ];
+  const cases = [
+    { suite_id: "s-a", title: "same leaf", status: "failed", retry_count: 0, ordinal: 0, error_message: "boom", error_stack: null },
+    { suite_id: "s-b", title: "same leaf", status: "passed", retry_count: 0, ordinal: 1, error_message: null, error_stack: null },
+  ];
+  const run = await fetchRun(fakeFetch([
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "n", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }] })],
+    ["/reports/g1/suites", () => Response.json({ suites })],
+    ["/reports/g1/cases", () => Response.json(cases)],
+  ]), "http://tsio", { repository: "o/r", commit_sha: "abc", name: "n", gh_run_id: "12", gh_run_attempt: "1" });
+  assert.equal(run.counts.failed, 1, "the failure in describe A survives");
+  assert.deepEqual(run.failing.map((f) => f.file), ["specs/a.spec.ts"]);
+});
+test("a diff that could not be read in full is not ownership evidence", async () => {
+  // GitHub paginates a commit's file list and caps the comparison. Reading one
+  // page of a large commit makes an edited spec look untouched.
+  const pages = [];
+  const api = async (_m, path) => {
+    pages.push(path);
+    return { files: Array.from({ length: 100 }, (_, i) => ({ filename: `f${pages.length}-${i}.ts`, patch: "@@" })) };
+  };
+  const out = await fetchChangedFiles(api, { repository: "o/r", commit_sha: "abc" }, null, () => {});
+  assert.equal(out.ok, false, "a capped commit diff cannot claim complete ownership coverage");
+  assert.ok(pages.length > 1, "pagination is followed rather than reading page one");
+  assert.ok(pages.every((p) => p.includes("page=")), "every request names its page");
 });
 test("an unreadable diff clears nothing, and never reaches the model", async () => {
   // An empty file list from a failed request looks exactly like "touched
@@ -350,14 +422,31 @@ test("a run refuses to read another run's results", async () => {
   // A deployment without the list filters answers the query with an unfiltered
   // list. Taking the first row would report an unrelated repository's result as
   // this run's, and it would look like a clean pass.
-  const id = { repository: "o/r", commit_sha: "abc", name: "lane-a", gh_run_attempt: "1" };
+  const id = { repository: "o/r", commit_sha: "abc", name: "lane-a", gh_run_id: "12", gh_run_attempt: "1" };
   const other = { id: "g9", repository: "other/repo", commit: "zzz", name: "something-else", gh_run_attempt: "1" };
   const unfiltered = fakeFetch([["/reports?", () => Response.json({ reports: [other], total: 19659 })]]);
-  await assert.rejects(() => fetchRun(unfiltered, "http://tsio", id), /no group matching/);
+  await assert.rejects(() => fetchRun(unfiltered, "http://tsio", id), /no group for/);
 
-  const correct = { id: "g1", repository: "o/r", commit: "abc", name: "lane-a", gh_run_attempt: "1" };
+  // The dangerous sibling: same repository, commit, name and attempt, different
+  // workflow run. A rerun or a repeated dispatch produces exactly this, and the
+  // older one may be green.
+  const sibling = { id: "g8", repository: "o/r", commit: "abc", name: "lane-a", gh_run_id: "11", gh_run_attempt: "1", status: "completed" };
+  const ambiguous = fakeFetch([
+    ["/reports?", () => Response.json({ reports: [sibling], total: 1 })],
+    ["/reports/g8/suites", () => Response.json({ suites: [{ id: "s9", file_path: "specs/a.spec.ts" }] })],
+    ["/reports/g8/cases", () => Response.json(spec("t1", "passed"))],
+  ]);
+  await assert.rejects(() => fetchRun(ambiguous, "http://tsio", id), /no group for/, "another run of the same commit is not this run");
+
+  // And an identity that cannot name its run may not be resolved by guesswork.
+  await assert.rejects(
+    () => fetchRun(ambiguous, "http://tsio", { repository: "o/r", commit_sha: "abc", name: "lane-a" }),
+    /missing gh_run_id or gh_run_attempt/,
+  );
+
+  const correct = { id: "g1", repository: "o/r", commit: "abc", name: "lane-a", gh_run_id: "12", gh_run_attempt: "1", status: "completed" };
   const filtered = fakeFetch([
-    ["/reports?", () => Response.json({ reports: [other, correct], total: 2 })],
+    ["/reports?", () => Response.json({ reports: [other, sibling, correct], total: 3 })],
     ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
     ["/reports/g1/cases", () => Response.json(spec("t1", "passed"))],
   ]);
@@ -386,7 +475,7 @@ test("end to end: a regression the judge clears with cross-PR evidence turns the
     ...runRoutes([spec("t1", "failed"), spec("t2", "passed"), spec("t3", "passed", 1)]),
     ["/reports/history", () => Response.json({ observations: history })],
     ["/pulls/5/files", () => Response.json([{ filename: "app/login.ts", patch: "@@ -1 +1 @@" }])],
-    ["/pulls/5", () => Response.json({ title: "Fix login" })],
+    ["/pulls/5", () => Response.json({ title: "Fix login", base: { ref: "master" } })],
     ["api.anthropic.com", (init) => {
       assert.ok(JSON.parse(init.body).messages[0].content.includes("hunk_0"));
       assert.equal(init.headers["x-api-key"], "AK");

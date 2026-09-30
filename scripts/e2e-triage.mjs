@@ -68,6 +68,24 @@ const INFRA_RE =
 export const isInfraError = (text) => INFRA_RE.test(text ?? "");
 
 /**
+ * TSIO stores a spec path relative to the producer's test root; GitHub reports
+ * changed files relative to the repository root. They are different namespaces:
+ * TSIO says `calls/calls_functionality.test.ts` where the desktop repository
+ * says `e2e/specs/calls/calls_functionality.test.ts`. Comparing them directly
+ * never matches, so OWNED_BY_PR -- the rule that keeps a pull request
+ * answerable for a spec it edited -- silently never fires.
+ *
+ * `testRoot` is the producer's root: "." when TSIO's paths are already
+ * repository-relative, otherwise the prefix to prepend. Null means the consumer
+ * did not configure one, and ownership is then unknowable rather than false.
+ */
+export const repoPath = (testRoot, file) => {
+  if (testRoot == null || testRoot === "") return null;
+  const root = String(testRoot).replace(/^\.?\/*/, "").replace(/\/+$/, "");
+  return root === "" ? file : `${root}/${file}`;
+};
+
+/**
  * Lane of a run name: the same spec set on the same platform. PR and trunk
  * runs of one lane differ only by producer prefix/suffix
  * (mobile-pr-detox-ios vs mobile-main-detox-ios; playwright-full-enterprise
@@ -131,7 +149,9 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
     },
   };
   const out = (cls, reason, blocking) => ({ ...test, class: cls, reason, blocking, ...stats });
-  if (own.has(test.file))
+  // repo_path is the canonical repository-relative path; test.file is TSIO's.
+  // Comparing the wrong one against the diff never matches.
+  if (own.has(test.repo_path ?? test.file))
     return out("OWNED_BY_PR", isTrunkRun
       ? `This commit changes ${test.file}; a failure in a spec the commit edits is not noise.`
       : `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
@@ -214,13 +234,14 @@ export const SCHEMA = {
 /** Evidence pack for one finding: what the judge sees, and nothing else. */
 export function buildPack(finding, compareFiles, pr, others) {
   const names = compareFiles.map((f) => f.filename);
+  const ownPath = finding.repo_path ?? finding.file;
   const text = `${finding.error}\n${finding.file}`.toLowerCase();
   const small = compareFiles.length <= 8;
   const hunks = [];
   for (const f of compareFiles) {
     const base = f.filename.split("/").pop() ?? "";
     const stem = base.split(".")[0] ?? "";
-    const named = f.filename === finding.file || (stem.length > 3 && text.includes(stem.toLowerCase())) || finding.error.includes(base);
+    const named = f.filename === ownPath || (stem.length > 3 && text.includes(stem.toLowerCase())) || finding.error.includes(base);
     // `related` means the diff actually touches the failing spec or is named in
     // the error. On a small PR every hunk is shown for context, but only a
     // related one may be cited as proof.
@@ -233,7 +254,7 @@ export function buildPack(finding, compareFiles, pr, others) {
     engine: { class: finding.class, reason: finding.reason },
     trunk_history_14d: { runs: finding.trunk.runs, fails: finding.trunk.fails, flaky: finding.trunk.flaky, latest: finding.trunk.latest },
     cross_pr_failures_14d: { id: "cross_pr", other_prs_where_this_test_failed: finding.cross_pr.examples, other_pr_runs_where_it_passed: finding.cross_pr.passes },
-    pr: { number: pr.number, repository: pr.repository, title: pr.title, changed_file_count: names.length, changed_files: names.slice(0, 200), spec_file_changed_by_pr: names.includes(finding.file) },
+    pr: { number: pr.number, repository: pr.repository, title: pr.title, changed_file_count: names.length, changed_files: names.slice(0, 200), spec_file_changed_by_pr: names.includes(ownPath) },
     diff_hunks_of_files_named_in_error: hunks,
     other_failures_in_same_run: others.slice(0, 12),
   };
@@ -396,10 +417,29 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
   // them answers the same query with an unfiltered list, and taking the first
   // row means triaging a different repository's run and reporting its result as
   // this one's — silently, and in the direction of a green status.
-  const mine = groups.filter((g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name);
+  // The identity has to be complete. Repository, commit and name do not
+  // distinguish two workflow runs of the same suite on the same commit -- a
+  // rerun, or a dispatch repeated by the bot -- and both can carry attempt 1, so
+  // a nearest-match fallback could read an earlier green run and report its
+  // result as this one's.
+  const runId = String(id.gh_run_id ?? "");
   const attempt = String(id.gh_run_attempt ?? "");
-  const group = mine.find((g) => attempt && String(g.gh_run_attempt) === attempt) ?? mine[0];
-  if (!group) throw new Error(`TSIO returned no group matching ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} (of ${groups.length} row(s) returned; the deployment may predate the list filters)`);
+  if (!runId || !attempt)
+    throw new Error(`composite identity is missing gh_run_id or gh_run_attempt; refusing to guess which run to read (run_id=${runId || "-"} attempt=${attempt || "-"})`);
+  const group = groups.find(
+    (g) =>
+      g.repository === id.repository &&
+      g.commit === id.commit_sha &&
+      g.name === id.name &&
+      String(g.gh_run_id) === runId &&
+      String(g.gh_run_attempt) === attempt,
+  );
+  if (!group)
+    throw new Error(`TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`);
+  // An incomplete group is not a green run. Its cases may simply not have been
+  // uploaded yet, and no failures then reads as nothing wrong.
+  if (group.status !== "completed")
+    throw new Error(`group ${group.id} is ${group.status}, not completed; an unfinished upload cannot show whether the run passed`);
   const [{ suites = [] }, cases] = await Promise.all([get(`/reports/${group.id}/suites`), get(`/reports/${group.id}/cases`)]);
   const fileOf = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
   // Narrowing to one report is what makes a per-OS verdict possible. A filter
@@ -411,13 +451,22 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
     : null;
   if (scoped && scoped.size === 0)
     throw new Error(`no report in group ${group.id} has a name starting with "${reportName}" (of ${new Set(suites.map((s) => s.report_name)).size} report name(s) present)`);
+  // Identity is the suite, not the file. Two describe blocks in one file can
+  // carry the same leaf title; keyed on file and title their rows merge, sort as
+  // if they were retries of one test, and the last status wins -- so a pass in
+  // one block erases a failure in the other.
   const byTest = new Map();
   for (const c of cases) {
     if (scoped && !scoped.has(c.suite_id)) continue;
-    const k = `${fileOf.get(c.suite_id) ?? ""}\n${c.title}`;
+    const k = `${c.suite_id}\n${c.title}`;
     if (!byTest.has(k)) byTest.set(k, []);
     byTest.get(k).push(c);
   }
+  // Cases that arrived but belong to no suite we can place cannot be judged.
+  const placeable = [...byTest.keys()].every((k) => fileOf.has(k.split("\n")[0]));
+  if (!placeable) throw new Error(`group ${group.id} has case rows whose suite is not in the suite list; the run cannot be read reliably`);
+  if (byTest.size === 0)
+    throw new Error(`group ${group.id} reported no test cases${reportName ? ` for report "${reportName}"` : ""}; an empty result is not a passing run`);
   const failing = [];
   let failed = 0;
   let flaky = 0;
@@ -426,8 +475,8 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
     const last = attempts[attempts.length - 1];
     if (FAILED_STATUSES.has(last.status)) {
       failed++;
-      const [file, title] = k.split("\n");
-      failing.push({ file, title, error: [last.error_message, last.error_stack].filter(Boolean).join("\n") });
+      const [suiteId, title] = k.split("\n");
+      failing.push({ file: fileOf.get(suiteId) ?? "", title, error: [last.error_message, last.error_stack].filter(Boolean).join("\n") });
     } else if (last.status === "flaky" || attempts.some((a) => FAILED_STATUSES.has(a.status))) flaky++;
   }
   return { group_id: group.id, failing, counts: { total: byTest.size, failed, flaky } };
@@ -516,11 +565,22 @@ export async function fetchChangedFiles(api, id, prNumber, log = () => {}) {
         files.push(...(batch ?? []));
         if (!batch || batch.length < 100) return { files, ok: true };
       }
-      log(`stopped after ${CHANGED_FILES_MAX_PAGES} pages of changed files; ownership covers the first ${files.length}`);
-      return { files, ok: true };
+      // A prefix of the diff is not ownership evidence: the failing spec may be
+      // on a page never fetched, and it would read as untouched.
+      log(`stopped after ${CHANGED_FILES_MAX_PAGES} pages of changed files; ownership is incomplete and nothing will be cleared`);
+      return { files, ok: false };
     }
-    const commit = await api("GET", `/repos/${id.repository}/commits/${id.commit_sha}`);
-    return { files: commit.files ?? [], ok: true };
+    // The commit endpoint paginates its file list too, and caps the comparison.
+    // Reading only the first page silently truncates a large commit's diff.
+    const files = [];
+    for (let page = 1; page <= CHANGED_FILES_MAX_PAGES; page++) {
+      const commit = await api("GET", `/repos/${id.repository}/commits/${id.commit_sha}?per_page=100&page=${page}`);
+      const batch = commit?.files ?? [];
+      files.push(...batch);
+      if (batch.length < 100) return { files, ok: true };
+    }
+    log(`stopped after ${CHANGED_FILES_MAX_PAGES} pages of commit files; ownership is incomplete and nothing will be cleared`);
+    return { files, ok: false };
   } catch (e) {
     log(`changed files unavailable: ${String(e).slice(0, 200)}`);
     return { files: [], ok: false };
@@ -551,7 +611,11 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
   const isTrunkRun = prNumber == null;
   const base = (env.TSIO_BASE_URL || "https://test-io.test.mattermost.com").replace(/\/$/, "");
   const api = gh(fetchImpl, env.GITHUB_TOKEN);
-  const run = await fetchRun(fetchImpl, base, id, env.REPORT_NAME || null);
+  // Null when unset: the producer's test root is not guessable, and guessing it
+  // wrong makes every spec look untouched.
+  const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
+  const reportName = env.REPORT_NAME || null;
+  const run = await fetchRun(fetchImpl, base, id, reportName);
   const result = { verdict: "SUCCESS", findings: [], infra: null, counts: run.counts };
   if (run.failing.length) {
     result.infra = infraVerdict(run.failing, cfg);
@@ -559,20 +623,45 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       // The trunk half of the history request is scoped to the trunk branch, so
       // that branch has to be known first: from the pull request on a PR run,
       // and from the run itself on a trunk run.
-      const pull = prNumber ? await api("GET", `/repos/${id.repository}/pulls/${prNumber}`).catch(() => ({})) : {};
+      // A failed metadata read used to fall through to an empty object, which set
+      // the trunk branch to null -- and a null trunk branch makes classify accept
+      // every branchless row as trunk again. A transient 503 would silently undo
+      // the contamination guard, so the failure has to be visible instead.
+      let pull = {};
+      let baseUnknown = false;
+      if (prNumber) {
+        try {
+          pull = await api("GET", `/repos/${id.repository}/pulls/${prNumber}`);
+        } catch (e) {
+          log(`pull request metadata unavailable: ${String(e).slice(0, 200)}`);
+          pull = {};
+          baseUnknown = true;
+        }
+      }
       const trunkBranch = isTrunkRun ? id.branch : (pull?.base?.ref ?? null);
+      if (!isTrunkRun && !trunkBranch) baseUnknown = true;
       const [history, diff] = await Promise.all([
         fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, log),
         fetchChangedFiles(api, id, prNumber, log),
       ]);
       const files = (diff.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
       const changed = files.map((f) => f.filename);
-      result.findings = run.failing.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], changed, cfg, prNumber, laneOf(id.name), { isTrunkRun, groupId: run.group_id, trunkBranch }));
+      const withPaths = run.failing.map((t) => ({ ...t, repo_path: repoPath(testRoot, t.file) }));
+      result.findings = withPaths.map((t) => classify(t, history.get(`${t.file}\n${t.title}`) ?? [], changed, cfg, prNumber, laneOf(id.name), { isTrunkRun, groupId: run.group_id, trunkBranch }));
       // Two ways the evidence can be incomplete, and neither may clear anything.
       // The judge is skipped rather than merely overridden: it reads the same
       // incomplete pack, and letting it run would hand back a non-blocking
       // decision that silently undoes this.
-      const blind = history.truncated ? "History was truncated at the page cap" : !diff.ok ? "The list of changed files could not be read" : null;
+      // Every way the evidence can be incomplete. Each one makes some rule
+      // unsound rather than merely less informed, so none may clear anything, and
+      // the judge is skipped rather than overridden -- it reads the same pack.
+      const blind =
+        history.truncated ? "History was truncated at the page cap"
+        : !diff.ok ? "The list of changed files could not be read in full"
+        : testRoot == null ? "No test root is configured, so whether this PR edits the failing spec cannot be determined"
+        : baseUnknown ? "The pull request's base branch could not be read, so trunk history cannot be told from another branch's"
+        : reportName ? "History does not identify which report a past run came from, so another platform's history cannot be ruled out"
+        : null;
       if (blind) {
         result.historyTruncated = Boolean(history.truncated);
         result.ownershipUnknown = !diff.ok;
