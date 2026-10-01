@@ -19,6 +19,8 @@ import {
   EXONERATED_ON_TRUNK,
   decide,
   evidenceIds,
+  errorSignature,
+  sameFailure,
   fetchHistory,
   fetchRun,
   infraVerdict,
@@ -538,6 +540,95 @@ test("history counts runs, not attempts", async () => {
   const history = await fetchHistory(fakeFetch([["/reports/history", () => Response.json({ observations: rows })]]), "http://tsio", "o/r", [t], "2026-09-17T00:00:00Z", DEFAULTS, "master");
   assert.equal(history.ambiguous.has(identityKey(t)), false, "a retest is not a second test");
   assert.deepEqual(history.get(identityKey(t)).map((o) => [o.group_id, o.status]).sort(), [["g1", "flaky"], ["g2", "failed"], ["g3", "passed"]]);
+});
+// mattermost-mobile#10172, detox-android: one suite's shared setup broke. Six of
+// its tests had failed on other PRs and cleared; four were a day old and had no
+// history, so they blocked on the same error thrown from other lines.
+const setupError = (line) => `TypeError: Cannot read properties of undefined (reading 'id') at Object.<anonymous> (/home/runner/work/m/channel_attributes.e2e.ts:${line}:80) at processTicksAndRejections (node:internal/process/task_queues:104:5)`;
+const finding = (over) => ({
+  file: "detox/channel_attributes.e2e.ts", title: "t", class: "FLAKY_CROSS_PR", blocking: false, reason: "Failed on 4 other PRs.", error: setupError(219),
+  trunk: { runs: 7, fails: 0, flaky: 0, passes: 7, latest: "passed" }, cross_pr: { prs: [1, 2, 3, 4], examples: [], passes: 0 },
+  failure_signatures: [errorSignature(setupError(1))],
+  ...over,
+});
+
+test("an error signature ignores where the error was thrown", () => {
+  assert.equal(errorSignature(setupError(219)), errorSignature(setupError(380)));
+  assert.equal(errorSignature(`TypeError: Cannot read properties of undefined (reading 'id')\n    at Object.<anonymous> (C:\\a\\x.ts:3:1)`), errorSignature(setupError(1)));
+  assert.equal(errorSignature("Error: expect(locator).toBeVisible() failed\n\nLocator: getByTestId('chip')\nExpected: visible\n\nCall log:\n  - waiting"),
+    "Error: expect(locator).toBeVisible() failed Locator: getByTestId('chip') Expected: visible", "the locator is what tells two assertions apart");
+  for (const generic of ['thrown: "Exceeded timeout of 300000 ms for a test.', "Error: Test timeout of 60000ms exceeded.", "Error: expected visible", "", null])
+    assert.equal(errorSignature(generic), null, `${JSON.stringify(generic)} names no cause`);
+});
+test("a blocked failure with the same spec and error as a cleared one is cleared with it", () => {
+  const [anchor, blocked] = sameFailure([finding({ title: "MM-T6301_1" }), finding({ title: "MM-T6305_1", class: "INSUFFICIENT_DATA", blocking: true, reason: "Only 2 trunk runs.", error: setupError(380) })]);
+  assert.equal(anchor.class, "FLAKY_CROSS_PR");
+  assert.equal(blocked.class, "SAME_FAILURE_AS_CLEARED");
+  assert.equal(blocked.blocking, false);
+  assert.equal(blocked.same_as, "MM-T6301_1");
+  assert.match(blocked.reason, /MM-T6301_1.*FLAKY_CROSS_PR/);
+
+  // The judge declined it first; its section must not read as agreement.
+  const judged = { ...blocked, judge: { cause: "flaky_environment", confidence: 0.5, cited_evidence: [], explanation: "unsure" } };
+  const comment = renderComment({ context: "c", verdict: "SUCCESS", findings: [anchor, judged], infra: null, model: "m", runURL: "u", counts: { failed: 2 } });
+  assert.match(comment, /declined; cleared as the same failure/);
+  assert.doesNotMatch(comment, /agreed/);
+});
+test("the same-failure rule needs the same spec, a specific error and an anchor history cleared", () => {
+  const blocked = (over) => finding({ title: "new", class: "REGRESSION", blocking: true, error: setupError(500), ...over });
+  const stays = (findings, why) => assert.equal(sameFailure(findings).at(-1).blocking, true, why);
+  stays([finding({ file: "detox/other.e2e.ts" }), blocked()], "another spec is another cause");
+  stays([finding({ error: "TypeError: Cannot read properties of undefined (reading 'name')" }), blocked()], "another error is another cause");
+  const timeout = 'thrown: "Exceeded timeout of 300000 ms for a test.';
+  stays([finding({ error: timeout }), blocked({ error: timeout })], "two timeouts are not one failure");
+  stays([finding({ class: "SAME_FAILURE_AS_CLEARED" }), blocked()], "only history anchors; a cleared follower does not");
+  stays([finding({ class: "REGRESSION", blocking: false, decision: "adjudicator_unblock" }), blocked()], "a judge's clear is not history");
+  stays([finding({ judge: { cause: "caused_by_pr", confidence: 0.6 } }), blocked()], "an anchor the judge tied to the PR anchors nothing");
+  // desktop#4020, an Electron upgrade: MM-T804 cleared on two flaky passes in 39
+  // trunk runs and never failed there, so nothing shows its error is anyone else's.
+  stays([finding({ class: "FLAKY_ON_TRUNK", failure_signatures: [] }), blocked()], "an anchor whose history never failed this way proves nothing about this error");
+  stays([finding({ failure_signatures: ["TypeError: Cannot read properties of undefined (reading 'name')"] }), blocked()], "history that failed differently is not this error's");
+  stays([finding(), blocked({ judge: { cause: "caused_by_pr", confidence: 0.6 } })], "a failure the judge tied to the PR does not follow");
+  stays([finding(), blocked({ identity_unresolved: true })], "history that cannot name the test clears nothing");
+  stays([finding(), blocked({ decision: "evidence_incomplete" })], "incomplete evidence clears nothing");
+  stays([finding(), blocked({ class: "OWNED_BY_PR" })], "a spec the PR edits stays the PR's");
+});
+test("the same-failure rule runs on PR runs only", async () => {
+  // Two tests, one spec, one setup error. t1 failed on three other PRs; t2 is new.
+  const routes = (pr) => {
+    const identity = { repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "playwright-full", branch: pr ? "pr-5" : "master", ...(pr ? { gh_pr_number: 5 } : {}) };
+    const row = (title, line) => ({ ...caseRow(title, "failed"), error_message: setupError(line) });
+    const crossPR = [5, 6, 7, 8].filter((n) => n !== 5 || !pr).slice(0, 3).map((n) => obs({ title: "t1", gh_pr_number: n + 10, status: "failed", branch: `pr-${n}`, error_excerpt: setupError(40 + n) }));
+    return {
+      identity,
+      fetch: fakeFetch([
+        ...runRoutes([[row("t1", 219)], [row("t2", 380)]]),
+        ["/reports/history", () => Response.json({ observations: [...trunkPasses(8).map((o) => ({ ...o, title: "t1" })), ...crossPR, ...trunkPasses(2).map((o) => ({ ...o, title: "t2" }))] })],
+        ["/pulls/5/files", () => Response.json([{ filename: ".github/workflows/e2e.yml", patch: "@@" }])],
+        ["/pulls/5", () => Response.json({ title: "ci only", base: { ref: "master" } })],
+      ]),
+    };
+  };
+  const pr = routes(true);
+  const onPR = await triage({ env: { ...env, MODE: "report-only", ANTHROPIC_API_KEY: "", COMPOSITE_IDENTITY: JSON.stringify(pr.identity) }, fetchImpl: pr.fetch, log: () => {} });
+  assert.deepEqual(onPR.findings.map((f) => [f.title, f.class, f.blocking]), [["t1", "FLAKY_CROSS_PR", false], ["t2", "SAME_FAILURE_AS_CLEARED", false]]);
+  assert.equal(onPR.verdict, "SUCCESS");
+
+  // On trunk t1 is cleared as intermittent, but trunk asks whether trunk is
+  // broken, and a new test failing with it is not evidence that it is not.
+  const trunkIdentity = { repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "playwright-full", branch: "master" };
+  const row = (title, line) => ({ ...caseRow(title, "failed"), error_message: setupError(line) });
+  const t1 = [...trunkPasses(7), obs({ commit_sha: "old", status: "failed", created_at: "2026-09-01T00:00:00Z", error_excerpt: setupError(7) })].map((o) => ({ ...o, title: "t1" }));
+  const onTrunk = await triage({
+    env: { ...env, MODE: "report-only", ANTHROPIC_API_KEY: "", COMPOSITE_IDENTITY: JSON.stringify(trunkIdentity) },
+    fetchImpl: fakeFetch([
+      ...runRoutes([[row("t1", 219)], [row("t2", 380)]]),
+      ["/reports/history", () => Response.json({ observations: [...t1, ...trunkPasses(2).map((o) => ({ ...o, title: "t2" }))] })],
+      ["/commits/abc", () => Response.json({ files: [{ filename: "app/x.ts", patch: "@@" }] })],
+    ]),
+    log: () => {},
+  });
+  assert.deepEqual(onTrunk.findings.map((f) => [f.title, f.class, f.blocking]), [["t1", "FLAKY_ON_TRUNK", false], ["t2", "INSUFFICIENT_DATA", true]]);
 });
 test("a failure skipped on retry is still a failure", async () => {
   // Serial describe on desktop: attempt 0 fails, attempt 1 skips the rest of the

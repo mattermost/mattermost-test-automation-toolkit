@@ -22,6 +22,7 @@ trunk and cross-PR history, then applies these rules in order:
 | `FLAKY_ON_TRUNK` | This test is intermittent on trunk | Cleared |
 | `FLAKY_CROSS_PR` | At least three other PRs fail this test and trunk has actually passed it | Cleared |
 | `INSUFFICIENT_DATA`, `REGRESSION` | History cannot clear the failure | Blocking unless the model supplies qualifying evidence |
+| `SAME_FAILURE_AS_CLEARED` | Still blocked after the model, but fails with the same spec and error as a failure in this run that history cleared | Cleared (PR runs only; timeouts and short messages never match) |
 
 A widespread failure can be a product bug as well as an environment problem.
 `ACTION_REQUIRED` is not proof that the PR is innocent. Likewise, an unresolved

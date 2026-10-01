@@ -18,6 +18,8 @@
  *   FLAKY_ON_TRUNK   the test flakes on trunk in the window             -> not the PR's
  *   FLAKY_CROSS_PR   failed on 3+ other PRs while trunk stayed green    -> not the PR's
  *   INSUFFICIENT_DATA / REGRESSION                                      -> ask the judge
+ *   SAME_FAILURE_AS_CLEARED  after the judge, on PR runs: a blocked failure
+ *                    with the same spec and error as one history cleared -> not the PR's
  *
  * The judge may unblock a REGRESSION/INSUFFICIENT_DATA finding only with
  * confidence >= min (0.85) AND a citation a reviewer can check (cross-PR
@@ -171,6 +173,9 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
   const latestTrunk = trunk[0];
   const failedPRs = [...new Set(others.filter((o) => FAILED_STATUSES.has(o.status)).map(prOf))];
   const otherPasses = others.filter((o) => o.status === "passed" || o.status === "flaky").length;
+  // What this test's failures said when they happened without this PR. A flaky
+  // pass carries no error, so a test cleared on flaky passes alone has none.
+  const failureSignatures = [...new Set([...trunk, ...others].filter((o) => FAILED_STATUSES.has(o.status)).map((o) => errorSignature(o.error_excerpt)).filter(Boolean))];
   const stats = {
     trunk: { runs: trunk.length, fails: trunkFails, flaky: trunkFlaky, passes: trunkPasses, latest: latestTrunk?.status ?? "" },
     cross_pr: {
@@ -182,6 +187,7 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
         .map((o) => `PR ${prOf(o)} (${o.commit_sha?.slice(0, 7) ?? "unknown"}, ${o.created_at?.slice(5, 10) ?? "?"})`),
       passes: otherPasses,
     },
+    failure_signatures: failureSignatures,
   };
   const out = (cls, reason, blocking) => ({ ...test, class: cls, reason, blocking, ...stats });
   // repo_path is the canonical repository-relative path; test.file is TSIO's.
@@ -223,6 +229,73 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
   if (trunk.length < cfg.minTrunkRuns)
     return out("INSUFFICIENT_DATA", `Only ${trunk.length} trunk runs found (need ${cfg.minTrunkRuns}); history cannot clear it.`, true);
   return out("REGRESSION", `Fails here, passes on trunk (${trunkPasses}/${trunk.length}) and was not failing on other PRs enough to call it flaky (${failedPRs.length}).`, true);
+}
+
+// A message that only says time ran out names no cause, so two timeouts in one
+// spec are not evidence of one failure.
+const GENERIC_ERROR_RE = /^(?:\w*error:\s*)?(?:thrown:\s*)?["']?(?:test timeout|exceeded timeout|timeout of|timed out)/i;
+
+/**
+ * What a failure says, without where it happened: the message's first lines,
+ * cut at the stack whether it starts a line or follows the message inline, so
+ * the same error thrown from two lines of one spec compares equal. Null when
+ * the message is too short or too generic to say two failures share a cause.
+ */
+export function errorSignature(error) {
+  const kept = [];
+  for (const line of String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).map((l) => l.trim())) {
+    if (!line) continue;
+    if (/^at\s/.test(line) || /^call log:/i.test(line)) break;
+    kept.push(line);
+    if (kept.length === 3) break;
+  }
+  if (!kept.length || GENERIC_ERROR_RE.test(kept[0])) return null;
+  const sig = kept.join(" ")
+    .replace(/\s+at\s+(?:async\s+)?(?:\S+\s+)?\(?(?:file:\/\/)?(?:[A-Za-z]:)?[\\/].*$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return sig.length >= 30 ? sig : null;
+}
+
+/**
+ * A blocked failure with the same spec and error as a failure in this run that
+ * history cleared shares that failure's cause. The anchor's own history must
+ * show that same error without this PR: a test cleared on flaky passes alone
+ * proves its intermittency, not that this error is anyone else's, and on an
+ * upgrade PR that broke one dialog it lent its clear to every test the broken
+ * dialog failed. Typical case: a suite whose shared setup breaks, with some of
+ * its tests old enough to have history and some too new. Runs after the judge
+ * on PR runs only, so a failure the judge tied to the PR neither anchors nor
+ * follows.
+ */
+export function sameFailure(findings) {
+  const blamed = (f) => f.judge?.cause === "caused_by_pr";
+  const keyOf = (f) => {
+    const sig = errorSignature(f.error);
+    return sig ? JSON.stringify([f.repo_path ?? f.file, sig]) : null;
+  };
+  const anchors = new Map();
+  for (const f of findings) {
+    if (f.blocking || !EXONERATED.has(f.class) || f.identity_unresolved || blamed(f)) continue;
+    const sig = errorSignature(f.error);
+    if (!sig || !(f.failure_signatures ?? []).includes(sig)) continue;
+    const k = keyOf(f);
+    if (!anchors.has(k)) anchors.set(k, f);
+  }
+  for (const f of findings) {
+    if (!f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.decision === "evidence_incomplete" || blamed(f)) continue;
+    const k = keyOf(f);
+    const anchor = k && anchors.get(k);
+    if (!anchor) continue;
+    Object.assign(f, {
+      class: "SAME_FAILURE_AS_CLEARED",
+      blocking: false,
+      decision: "same_failure",
+      same_as: anchor.full_title || anchor.title,
+      reason: `Fails with the same error as "${anchor.title}" in this spec, which history cleared (${anchor.class}): ${anchor.reason}`,
+    });
+  }
+  return findings;
 }
 
 /** Run-level infrastructure call: many failures, or most failures share an infra signature. */
@@ -485,7 +558,7 @@ export function renderComment({ context, verdict, findings, infra, model, runURL
       const served = [...new Set(judged.map((f) => f.judge?.provenance?.served_model).filter(Boolean))];
       lines.push("", `### Second judge (${md(served.length ? served.join(", ") : model)})`, "", "Confidence is the model's assessment, not a measured accuracy rate.", "");
       for (const f of judged) {
-        const mark = f.decision === "adjudicator_unblock" ? "unblocked" : f.decision === "adjudicator_veto" ? "vetoed" : f.blocking ? "still blocking" : "agreed";
+        const mark = f.decision === "adjudicator_unblock" ? "unblocked" : f.decision === "adjudicator_veto" ? "vetoed" : f.decision === "same_failure" ? "declined; cleared as the same failure" : f.blocking ? "still blocking" : "agreed";
         lines.push(`- **${md(f.full_title || f.title)}** — ${CAUSE[f.judge.cause] ?? md(f.judge.cause)} (${Math.round(f.judge.confidence * 100)}%, ${mark}; cites ${md(f.judge.cited_evidence.join(", ") || "nothing checkable")}): ${md(f.judge.explanation)}`);
       }
     }
@@ -894,6 +967,7 @@ export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranc
       const packs = result.findings.map((f) => (f.class === "OWNED_BY_PR" || f.identity_unresolved ? null : buildPack(f, files, pr, others)));
       await judge(result.findings, packs, ask, cfg, log, isTrunkRun);
     }
+    if (!blind && prNumber) sameFailure(result.findings);
   }
   result.verdict = verdictOf(result.findings, result.infra);
   return result;
