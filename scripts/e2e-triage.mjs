@@ -17,6 +17,7 @@
  *   BROKEN_ON_TRUNK  trunk's latest run fails this test too             -> not the PR's
  *   FLAKY_ON_TRUNK   the test flakes on trunk in the window             -> not the PR's
  *   FLAKY_CROSS_PR   failed on 3+ other PRs while trunk stayed green    -> not the PR's
+ *                    (with the same error, unless the error is too generic to compare)
  *   INSUFFICIENT_DATA / REGRESSION                                      -> ask the judge
  *   SAME_FAILURE_AS_CLEARED  after the judge, on PR runs: a blocked failure
  *                    with the same spec and error as one history cleared -> not the PR's
@@ -171,7 +172,15 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
   const trunkFlaky = trunk.filter((o) => o.status === "flaky").length;
   const trunkPasses = trunk.filter((o) => o.status === "passed").length;
   const latestTrunk = trunk[0];
-  const failedPRs = [...new Set(others.filter((o) => FAILED_STATUSES.has(o.status)).map(prOf))];
+  // Another PR's failure is evidence about this one only when it failed the
+  // same way. Counted by test alone, mattermost-mobile#10017's leave_call --
+  // broken by that PR, failing on "tab_bar.home.tab is visible" -- would have
+  // cleared on three other PRs' unrelated server-form failures, and it stayed
+  // broken on main until a fix landed five days after the merge. A message too
+  // generic to compare (a timeout, a short assertion) keeps every failure.
+  const ownSignature = errorSignature(test.error);
+  const crossFailures = others.filter((o) => FAILED_STATUSES.has(o.status) && (ownSignature == null || errorSignature(o.error_excerpt) === ownSignature));
+  const failedPRs = [...new Set(crossFailures.map(prOf))];
   const otherPasses = others.filter((o) => o.status === "passed" || o.status === "flaky").length;
   // What this test's failures said when they happened without this PR. A flaky
   // pass carries no error, so a test cleared on flaky passes alone has none.
@@ -180,8 +189,7 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
     trunk: { runs: trunk.length, fails: trunkFails, flaky: trunkFlaky, passes: trunkPasses, latest: latestTrunk?.status ?? "" },
     cross_pr: {
       prs: failedPRs,
-      examples: others
-        .filter((o) => FAILED_STATUSES.has(o.status))
+      examples: crossFailures
         .filter((o, i, all) => all.findIndex((x) => prOf(x) === prOf(o)) === i)
         .slice(0, 12)
         .map((o) => `PR ${prOf(o)} (${o.commit_sha?.slice(0, 7) ?? "unknown"}, ${o.created_at?.slice(5, 10) ?? "?"})`),
@@ -225,7 +233,7 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
   // trunkFails === 0 is vacuously true when trunk was never observed, so require
   // real trunk passes before claiming trunk stayed green.
   if (failedPRs.length >= cfg.crossPRMinPRs && trunkFails === 0 && trunkPasses > 0)
-    return out("FLAKY_CROSS_PR", `Failed on ${failedPRs.length} other PRs in the last ${cfg.crossPRRuns} runs (${stats.cross_pr.examples.slice(0, 3).join(", ")}) while trunk stayed green.`, false);
+    return out("FLAKY_CROSS_PR", `Failed${ownSignature ? " with the same error" : ""} on ${failedPRs.length} other PRs in the last ${cfg.crossPRRuns} runs (${stats.cross_pr.examples.slice(0, 3).join(", ")}) while trunk stayed green.`, false);
   if (trunk.length < cfg.minTrunkRuns)
     return out("INSUFFICIENT_DATA", `Only ${trunk.length} trunk runs found (need ${cfg.minTrunkRuns}); history cannot clear it.`, true);
   return out("REGRESSION", `Fails here, passes on trunk (${trunkPasses}/${trunk.length}) and was not failing on other PRs enough to call it flaky (${failedPRs.length}).`, true);
@@ -238,8 +246,9 @@ const GENERIC_ERROR_RE = /^(?:\w*error:\s*)?(?:thrown:\s*)?["']?(?:test timeout|
 /**
  * What a failure says, without where it happened: the message's first lines,
  * cut at the stack whether it starts a line or follows the message inline, so
- * the same error thrown from two lines of one spec compares equal. Null when
- * the message is too short or too generic to say two failures share a cause.
+ * the same error thrown from two lines of one spec compares equal, and with
+ * generated names masked so two runs of it do too. Null when the message is
+ * too short or too generic to say two failures share a cause.
  */
 export function errorSignature(error) {
   const kept = [];
@@ -252,6 +261,10 @@ export function errorSignature(error) {
   if (!kept.length || GENERIC_ERROR_RE.test(kept[0])) return null;
   const sig = kept.join(" ")
     .replace(/\s+at\s+(?:async\s+)?(?:\S+\s+)?\(?(?:file:\/\/)?(?:[A-Za-z]:)?[\\/].*$/, "")
+    // Generated names differ on every run ("channel-e11bc4", a UUID, a
+    // throwaway host): mixed letter-and-digit tokens and long numbers.
+    .replace(/\b(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{6,}\b/gi, "<id>")
+    .replace(/\b\d{4,}\b/g, "<n>")
     .replace(/\s+/g, " ")
     .trim();
   return sig.length >= 30 ? sig : null;

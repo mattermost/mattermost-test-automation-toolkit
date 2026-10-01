@@ -552,11 +552,39 @@ const finding = (over) => ({
   ...over,
 });
 
+// mattermost-mobile#10017 broke leave_call: after leaving the call the home tab
+// never came back. Three other PRs had failed leave_call too, on the login and
+// server-form setup that every Maestro flow starts with.
+const leaveCall = (over) => ({ ...failing, file: "flows/calls/leave_call.yml", title: "leave_call", error: "Assertion is false: id: tab_bar.home.tab is visible", ...over });
+const otherPR = (n, error) => obs({ file: "flows/calls/leave_call.yml", title: "leave_call", gh_pr_number: n, branch: `pr-${n}`, status: "failed", error_excerpt: error });
+test("another PR's failure counts only when it failed with the same error", () => {
+  const green = trunkPasses(20).map((o) => ({ ...o, file: "flows/calls/leave_call.yml", title: "leave_call" }));
+  const setup = ["Assertion is false: id: server_form.display_help is not visible", "Element not found: Text matching regex: Display Name", "Assertion is false: id: server_form.server_url.input is visible"];
+  const unrelated = classify(leaveCall(), [...green, ...setup.map((e, i) => otherPR(20 + i, e))], [], undefined, 9);
+  assert.equal(unrelated.class, "REGRESSION", "three different failures are not this failure");
+  assert.deepEqual(unrelated.cross_pr.prs, []);
+  assert.deepEqual(unrelated.cross_pr.examples, [], "the judge is not shown them as recurrences either");
+
+  const same = classify(leaveCall(), [...green, ...[20, 21, 22].map((n) => otherPR(n, "Assertion is false: id: tab_bar.home.tab is visible"))], [], undefined, 9);
+  assert.equal(same.class, "FLAKY_CROSS_PR");
+  assert.match(same.reason, /^Failed with the same error on 3 other PRs/);
+
+  // A timeout says nothing about cause, so any failure still counts.
+  const timeout = 'thrown: "Exceeded timeout of 300000 ms for a test.';
+  const anyFailure = classify(leaveCall({ error: timeout }), [...green, ...setup.map((e, i) => otherPR(20 + i, e))], [], undefined, 9);
+  assert.equal(anyFailure.class, "FLAKY_CROSS_PR");
+  assert.match(anyFailure.reason, /^Failed on 3 other PRs/);
+});
 test("an error signature ignores where the error was thrown", () => {
   assert.equal(errorSignature(setupError(219)), errorSignature(setupError(380)));
   assert.equal(errorSignature(`TypeError: Cannot read properties of undefined (reading 'id')\n    at Object.<anonymous> (C:\\a\\x.ts:3:1)`), errorSignature(setupError(1)));
   assert.equal(errorSignature("Error: expect(locator).toBeVisible() failed\n\nLocator: getByTestId('chip')\nExpected: visible\n\nCall log:\n  - waiting"),
     "Error: expect(locator).toBeVisible() failed Locator: getByTestId('chip') Expected: visible", "the locator is what tells two assertions apart");
+  // MM-T3462 on mattermost-mobile: each run creates its own channel, so the name differs every time.
+  assert.equal(errorSignature("Error: Sidebar channel item not found for channel: channel-e11bc4; searched categories: [channels, unreads, favorites]"),
+    errorSignature("Error: Sidebar channel item not found for channel: channel-9f02aa; searched categories: [channels, unreads, favorites]"));
+  assert.notEqual(errorSignature("Assertion is false: id: tab_bar.home.tab is visible"), errorSignature("Assertion is false: id: server_form.display_help is not visible"),
+    "test ids are not generated names");
   for (const generic of ['thrown: "Exceeded timeout of 300000 ms for a test.', "Error: Test timeout of 60000ms exceeded.", "Error: expected visible", "", null])
     assert.equal(errorSignature(generic), null, `${JSON.stringify(generic)} names no cause`);
 });

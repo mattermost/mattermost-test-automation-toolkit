@@ -20,7 +20,7 @@ trunk and cross-PR history, then applies these rules in order:
 | `OWNED_BY_PR` | The PR changed the failing spec | Blocking; never sent to the model |
 | `BROKEN_ON_TRUNK` | The latest trunk observation fails this test too | Cleared |
 | `FLAKY_ON_TRUNK` | This test is intermittent on trunk | Cleared |
-| `FLAKY_CROSS_PR` | At least three other PRs fail this test and trunk has actually passed it | Cleared |
+| `FLAKY_CROSS_PR` | At least three other PRs fail this test with the same error (any error, when this one is too generic to compare, such as a timeout) and trunk has actually passed it | Cleared |
 | `INSUFFICIENT_DATA`, `REGRESSION` | History cannot clear the failure | Blocking unless the model supplies qualifying evidence |
 | `SAME_FAILURE_AS_CLEARED` | Still blocked after the model, but fails with the same spec and error as a failure in this run that history cleared | Cleared (PR runs only; timeouts and short messages never match) |
 
