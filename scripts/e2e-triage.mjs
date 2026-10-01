@@ -130,7 +130,11 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
   // `trunk` and the test would be reported as failing on trunk because of the
   // very run being judged.
   const seen = groupId == null ? observations : observations.filter((o) => o.group_id !== groupId);
-  const inLane = lane == null ? seen : seen.filter((o) => o.name == null || laneOf(o.name) === lane);
+  // A skipped execution is not a trial. Counted as one, it met the trunk-run
+  // minimum on its own (one real failure plus four skips cleared as flaky) and,
+  // as the latest trunk row, hid a broken-on-trunk streak.
+  const ran = seen.filter((o) => o.status !== "skipped");
+  const inLane = lane == null ? ran : ran.filter((o) => o.name == null || laneOf(o.name) === lane);
   // PR numbers arrive as numbers from TSIO but as strings from a composite
   // identity built with jq, so compare them as numbers. A strict mismatch would
   // file this PR's own runs under "other PRs", where enough of them satisfy
@@ -445,7 +449,7 @@ export function renderComment({ context, verdict, findings, infra, model, runURL
   const blocking = infra ? counts.failed : findings.filter((f) => f.blocking).length;
   const cleared = findings.filter((f) => !f.blocking).length;
   const lines = [`<!-- e2e-triage:${md(context)} -->`, `## E2E triage: ${verdict}`, "",
-    `${counts.failed} failed · ${cleared} cleared · ${blocking} unresolved.`, ""];
+    `${counts.passed ?? 0} passed · ${counts.failed} failed · ${cleared} cleared · ${blocking} unresolved · ${counts.skipped ?? 0} skipped.`, ""];
   if (infra) lines.push(`**Human investigation required.** ${md(infra)}`, "");
   else if (verdict === "SUCCESS") lines.push("The evidence clears this run's failures under the triage rules.", "");
   else lines.push("Review the unresolved failures below. Missing evidence does not establish that the PR caused them.", "");
@@ -473,8 +477,11 @@ export function renderComment({ context, verdict, findings, infra, model, runURL
   return lines.join("\n");
 }
 export function statusDescription(verdict, findings, infra, counts) {
-  const s = infra ? `Investigation required: ${infra}` : verdict === "SUCCESS" ? `${counts.failed} failed, ${findings.length} cleared by triage` : `${findings.filter((f) => f.blocking).length} unresolved failure(s); review triage evidence`;
-  return s.slice(0, 140);
+  const blocking = findings.filter((f) => f.blocking).length;
+  const triaged = infra
+    ? "not triaged, investigation required"
+    : `${findings.length - blocking} cleared by triage${blocking ? `, ${blocking} unresolved` : ""}`;
+  return `${counts.passed ?? 0} passed, ${counts.failed} failed (${triaged}), ${counts.skipped ?? 0} skipped`.slice(0, 140);
 }
 
 // ------------------------------------------------------------------ data access
@@ -571,9 +578,16 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
   const failing = [];
   let failed = 0;
   let flaky = 0;
+  let skipped = 0;
   for (const attempts of byTest.values()) {
     attempts.sort((a, b) => a.retry_count - b.retry_count || a.ordinal - b.ordinal);
-    const last = attempts[attempts.length - 1];
+    // A skipped retry is not an outcome. In a serial describe, a failure skips the
+    // rest of the block on the next attempt, so a test can fail and then be
+    // skipped; reading the last attempt filed that failure as skipped, kept it
+    // out of triage, and let enforce turn the OS green over it. Playwright reads
+    // it the same way: a test is skipped only when every attempt was.
+    const ran = attempts.filter((a) => a.status !== "skipped");
+    const last = (ran.length ? ran : attempts).at(-1);
     if (FAILED_STATUSES.has(last.status)) {
       failed++;
       const { suite_id: suiteId, title } = last;
@@ -591,9 +605,12 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
         identity_unresolved: testsPerIdentity.get(identityKey({ file, title, full_title: last.full_title, report_scope: reportName })).size > 1,
         error: [last.error_message, last.error_stack].filter(Boolean).join("\n"),
       });
-    } else if (last.status === "flaky" || attempts.some((a) => FAILED_STATUSES.has(a.status))) flaky++;
+    } else if (last.status === "skipped") skipped++;
+    else if (last.status === "flaky" || ran.some((a) => FAILED_STATUSES.has(a.status))) flaky++;
   }
-  return { group_id: group.id, failing, counts: { total: byTest.size, failed, flaky } };
+  // Passed counts retry-recovered tests, as the per-OS E2E statuses do, so the
+  // triage description and the one it replaces add up the same way.
+  return { group_id: group.id, failing, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
 }
 /**
  * Past executions of failing tests, keyed by identityKey (report scope, file and full title).

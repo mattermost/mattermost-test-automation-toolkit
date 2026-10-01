@@ -23,6 +23,7 @@ import {
   fetchRun,
   infraVerdict,
   isInfraError,
+  statusDescription,
   triage,
   verdictOf,
 } from "./e2e-triage.mjs";
@@ -483,6 +484,48 @@ test("only an explicit, valid enforce mode writes a commit status", async () => 
   await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "" }, fetchImpl: fakeFetch(routes(written)), log: () => {} });
   assert.equal(written.length, 1, "explicit enforce still writes exactly one status");
   assert.equal(written[0].context, "e2e-test/playwright");
+});
+test("skipped history rows are not trunk runs", () => {
+  const skipped = (n) => Array.from({ length: n }, (_, i) => obs({ commit_sha: `s${i}`, status: "skipped", created_at: "2026-09-11T00:00:00Z" }));
+  // Two real trunk runs padded by skips do not meet the five-run minimum.
+  const padded = classify(failing, [obs({ commit_sha: "p" }), obs({ status: "failed", commit_sha: "f" }), ...skipped(3)], [], DEFAULTS, 5);
+  assert.equal(padded.class, "INSUFFICIENT_DATA");
+  assert.equal(padded.trunk.runs, 2);
+  // On a trunk run, a skipped latest row does not hide the failure before it.
+  const streak = classify(failing, [...skipped(1), ...trunkFailsAll(1), ...trunkPasses(6)], [], DEFAULTS, null, null, { isTrunkRun: true });
+  assert.equal(streak.class, "BROKEN_ON_TRUNK");
+  assert.equal(streak.blocking, true);
+});
+test("a failure skipped on retry is still a failure", async () => {
+  // Serial describe on desktop: attempt 0 fails, attempt 1 skips the rest of the
+  // block. Read as skipped, the failure never reached triage and enforce wrote
+  // e2e/windows green over it.
+  const run = await fetchRun(fakeFetch(runRoutes([
+    [caseRow("serial", "failed", 0), caseRow("serial", "skipped", 1)],
+    [caseRow("late", "skipped", 0), caseRow("late", "passed", 1)],
+    [caseRow("never", "skipped", 0), caseRow("never", "skipped", 1)],
+  ])), "http://tsio", JSON.parse(env.COMPOSITE_IDENTITY));
+  assert.deepEqual(run.failing.map((f) => f.title), ["serial"]);
+  assert.deepEqual(run.counts, { total: 3, passed: 1, failed: 1, flaky: 0, skipped: 1 });
+});
+test("the status description accounts for every test in the run", async () => {
+  // Two failures broken on trunk, one passed, one recovered on retry, one skipped.
+  const routes = (statuses) => [
+    ...runRoutes([spec("t1", "failed"), spec("t2", "failed"), spec("t3", "passed"), spec("t4", "passed", 1), spec("t5", "skipped")]),
+    ["/reports/history", () => Response.json({ observations: [...trunkFailsAll(8), ...trunkFailsAll(8).map((o) => ({ ...o, title: "t2" }))] })],
+    ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+    ["/statuses/abc", (i) => { statuses.push(JSON.parse(i.body)); return Response.json({}); }],
+  ];
+  const written = [];
+  const result = await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "" }, fetchImpl: fakeFetch(routes(written)), log: () => {} });
+  assert.deepEqual(result.counts, { total: 5, passed: 2, failed: 2, flaky: 1, skipped: 1 });
+  assert.equal(written[0].state, "success");
+  assert.equal(written[0].description, "2 passed, 2 failed (2 cleared by triage), 1 skipped");
+
+  const counts = { passed: 240, failed: 2, skipped: 3 };
+  assert.equal(statusDescription("FAILURE", [{ blocking: true }, { blocking: false }], null, counts), "240 passed, 2 failed (1 cleared by triage, 1 unresolved), 3 skipped");
+  assert.equal(statusDescription("ACTION_REQUIRED", [], "5 of 6 failures are infrastructure errors", counts), "240 passed, 2 failed (not triaged, investigation required), 3 skipped");
 });
 test("a sibling suite's trunk failure cannot clear this suite's failure", async () => {
   // One spec, two suites, both with a test called "same leaf". Suite A fails on
