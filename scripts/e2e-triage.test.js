@@ -496,6 +496,49 @@ test("skipped history rows are not trunk runs", () => {
   assert.equal(streak.class, "BROKEN_ON_TRUNK");
   assert.equal(streak.blocking, true);
 });
+test("a spec retested on another worker is one test, not two", async () => {
+  // mattermost#38601: MM-T5828 failed twice on dispatch-run-14 and passed on its
+  // retest on dispatch-run-3. Keyed on the suite, that was a failure plus an
+  // ambiguous identity; the run summary, like Playwright, calls it flaky.
+  const suites = [
+    { id: "w14", file_path: "specs/a.spec.ts", title: "a", report_name: "dispatch-run-14" },
+    { id: "w3", file_path: "specs/a.spec.ts", title: "a", report_name: "dispatch-run-3" },
+  ];
+  const row = (suite, title, status, retry) => ({ ...caseRow(title, status, retry, suite), full_title: `a.spec.ts > a > ${title}` });
+  const cases = [
+    row("w14", "retested", "failed", 0), row("w14", "retested", "failed", 1), row("w3", "retested", "passed", 0),
+    row("w14", "broken", "failed", 0), row("w3", "broken", "failed", 0),
+  ];
+  const routes = [
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }] })],
+    ["/reports/g1/suites", () => Response.json({ suites })],
+    ["/reports/g1/cases", () => Response.json(cases)],
+  ];
+  const run = await fetchRun(fakeFetch(routes), "http://tsio", JSON.parse(env.COMPOSITE_IDENTITY));
+  assert.deepEqual(run.counts, { total: 2, passed: 1, failed: 1, flaky: 1, skipped: 0 });
+  assert.deepEqual(run.failing.map((f) => [f.title, f.identity_unresolved]), [["broken", false]]);
+
+  // A report scope declares reports to be separate lanes, so they stay apart --
+  // and one scope covering both is ambiguous rather than merged.
+  const scoped = await fetchRun(fakeFetch(routes), "http://tsio", JSON.parse(env.COMPOSITE_IDENTITY), "dispatch-run-");
+  assert.equal(scoped.counts.total, 4);
+  assert.ok(scoped.failing.every((f) => f.identity_unresolved));
+});
+test("history counts runs, not attempts", async () => {
+  const t = { ...failing, full_title: "A > t1" };
+  const row = (over) => obs({ full_title: "A > t1", suite_title: "A", name: "playwright-full", ...over });
+  const rows = [
+    // One trunk run that failed and passed on retry, another retested on a second worker.
+    row({ group_id: "g1", report_name: "w1", status: "failed", retry_count: 0 }),
+    row({ group_id: "g1", report_name: "w1", status: "passed", retry_count: 1 }),
+    row({ group_id: "g2", report_name: "w1", status: "failed", retry_count: 0 }),
+    row({ group_id: "g2", report_name: "w2", status: "failed", retry_count: 0 }),
+    row({ group_id: "g3", report_name: "w1", status: "passed", retry_count: 0 }),
+  ];
+  const history = await fetchHistory(fakeFetch([["/reports/history", () => Response.json({ observations: rows })]]), "http://tsio", "o/r", [t], "2026-09-17T00:00:00Z", DEFAULTS, "master");
+  assert.equal(history.ambiguous.has(identityKey(t)), false, "a retest is not a second test");
+  assert.deepEqual(history.get(identityKey(t)).map((o) => [o.group_id, o.status]).sort(), [["g1", "flaky"], ["g2", "failed"], ["g3", "passed"]]);
+});
 test("a failure skipped on retry is still a failure", async () => {
   // Serial describe on desktop: attempt 0 fails, attempt 1 skips the rest of the
   // block. Read as skipped, the failure never reached triage and enforce wrote

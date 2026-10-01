@@ -30,6 +30,23 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 
 export const FAILED_STATUSES = new Set(["failed", "timedOut", "interrupted"]);
+
+/**
+ * One execution's outcome from its attempts, read the way Playwright reads a
+ * test: skipped only when every attempt was, failed only when every attempt that
+ * ran failed, flaky when some did. Attempts are retries and, on an orchestrated
+ * run, a retest of the spec on another worker -- which is why the last attempt
+ * alone is not the answer: a serial describe skips the rest of its block on
+ * retry, so a failure can be followed by a skip. `last` is the attempt that
+ * speaks for the outcome, in the order the caller sorted them.
+ */
+export function outcomeOf(attempts) {
+  const ran = attempts.filter((a) => a.status !== "skipped");
+  if (!ran.length) return { status: "skipped", last: attempts.at(-1) };
+  const failed = ran.filter((a) => FAILED_STATUSES.has(a.status));
+  if (failed.length === ran.length) return { status: failed.at(-1).status, last: failed.at(-1) };
+  return { status: failed.length || ran.some((a) => a.status === "flaky") ? "flaky" : "passed", last: ran.at(-1) };
+}
 export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 // On a trunk run there is no PR to exonerate, so the question changes from "is
 // this the PR's fault" to "is this noise or is trunk actually broken". Only
@@ -544,14 +561,20 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
     : null;
   if (scoped && scoped.size === 0)
     throw new Error(`no report in group ${group.id} has a name starting with "${reportName}" (of ${new Set(suites.map((s) => s.report_name)).size} report name(s) present)`);
-  // Identity is the suite, not the file. Two describe blocks in one file can
-  // carry the same leaf title; keyed on file and title their rows merge, sort as
-  // if they were retries of one test, and the last status wins -- so a pass in
-  // one block erases a failure in the other.
+  // Identity is the qualified title, not the leaf. Two describe blocks in one
+  // file can carry the same leaf title; keyed on file and leaf their rows merge
+  // and a pass in one block erases a failure in the other. The full title names
+  // the describe chain, so with it the key is the test itself, wherever it ran:
+  // an orchestrated run retests a failed spec on another worker, in another
+  // report, and those attempts are one test, not two. A report scope says the
+  // reports are separate lanes, so there the report stays in the key. Without a
+  // full title only the suite can tell same-named tests apart.
   const byTest = new Map();
   for (const c of cases) {
     if (scoped && !scoped.has(c.suite_id)) continue;
-    const k = JSON.stringify([c.suite_id, c.full_title || c.title]);
+    const k = c.full_title
+      ? JSON.stringify([scoped ? reportOf.get(c.suite_id) ?? "" : "", fileOf.get(c.suite_id) ?? "", c.full_title])
+      : JSON.stringify([c.suite_id, c.title]);
     if (!byTest.has(k)) byTest.set(k, []);
     byTest.get(k).push(c);
   }
@@ -581,14 +604,8 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
   let skipped = 0;
   for (const attempts of byTest.values()) {
     attempts.sort((a, b) => a.retry_count - b.retry_count || a.ordinal - b.ordinal);
-    // A skipped retry is not an outcome. In a serial describe, a failure skips the
-    // rest of the block on the next attempt, so a test can fail and then be
-    // skipped; reading the last attempt filed that failure as skipped, kept it
-    // out of triage, and let enforce turn the OS green over it. Playwright reads
-    // it the same way: a test is skipped only when every attempt was.
-    const ran = attempts.filter((a) => a.status !== "skipped");
-    const last = (ran.length ? ran : attempts).at(-1);
-    if (FAILED_STATUSES.has(last.status)) {
+    const { status, last } = outcomeOf(attempts);
+    if (FAILED_STATUSES.has(status)) {
       failed++;
       const { suite_id: suiteId, title } = last;
       const file = fileOf.get(suiteId) ?? "";
@@ -605,8 +622,8 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
         identity_unresolved: testsPerIdentity.get(identityKey({ file, title, full_title: last.full_title, report_scope: reportName })).size > 1,
         error: [last.error_message, last.error_stack].filter(Boolean).join("\n"),
       });
-    } else if (last.status === "skipped") skipped++;
-    else if (last.status === "flaky" || ran.some((a) => FAILED_STATUSES.has(a.status))) flaky++;
+    } else if (status === "skipped") skipped++;
+    else if (status === "flaky") flaky++;
   }
   // Passed counts retry-recovered tests, as the per-OS E2E statuses do, so the
   // triage description and the one it replaces add up the same way.
@@ -735,6 +752,30 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
         warn(`history for ${files.length} file(s) hit the ${HISTORY_MAX_PAGES}-page cap with more to come; nothing will be cleared on partial history`);
       }
     }
+  }
+  // The endpoint returns attempts, and the rules count runs. A retry, or a
+  // retest on another worker, is the same run trying again: counted as rows, one
+  // flaky trunk run read as a failure and a pass, and a retest made one test look
+  // like two in different reports. Each run's attempts collapse to its outcome.
+  // A report scope keeps reports apart, as it does for the current run.
+  for (const [key, rows] of byTest) {
+    const runs = new Map();
+    const collapsed = [];
+    for (const row of rows) {
+      if (row.group_id == null) {
+        collapsed.push(row);
+        continue;
+      }
+      const run = JSON.stringify([row.group_id, reportName ? row.report_name ?? "" : ""]);
+      if (!runs.has(run)) runs.set(run, []);
+      runs.get(run).push(row);
+    }
+    for (const attempts of runs.values()) {
+      attempts.sort((a, b) => a.retry_count - b.retry_count);
+      const { status, last } = outcomeOf(attempts);
+      collapsed.push({ ...last, status });
+    }
+    byTest.set(key, collapsed);
   }
   for (const [leaf, keys] of fallbackByLeaf) {
     if ((ancestryByLeaf.get(leaf)?.size ?? 0) > 1)
