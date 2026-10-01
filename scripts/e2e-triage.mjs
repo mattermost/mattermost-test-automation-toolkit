@@ -30,7 +30,8 @@
  * Zero dependencies; Node >= 22.
  */
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 
 export const FAILED_STATUSES = new Set(["failed", "timedOut", "interrupted"]);
 
@@ -311,6 +312,93 @@ export function sameFailure(findings) {
   return findings;
 }
 
+const EVIDENCE_LIMITS = { files: 50, entries: 200, imagesPerTest: 2, imageBytes: 3_500_000, notes: 1500 };
+const IMAGE_TYPES = [
+  { media_type: "image/png", magic: [0x89, 0x50, 0x4e, 0x47] },
+  { media_type: "image/jpeg", magic: [0xff, 0xd8, 0xff] },
+];
+
+/**
+ * Evidence a producer recorded for its failing tests: screenshots and notes,
+ * as JSON files of `{file, title, full_title?, notes?, images?: [path]}` with
+ * image paths relative to the JSON file. The files come from the PR's own CI,
+ * so an image is read only from inside the directory, only when its bytes are
+ * a PNG or JPEG, and only within the size and count limits; anything else is
+ * skipped with a warning rather than failing the run.
+ */
+export function loadEvidence(dir, warn = () => {}) {
+  let root;
+  try {
+    root = realpathSync(dir);
+  } catch {
+    warn(`evidence directory ${JSON.stringify(dir)} does not exist; no producer evidence`);
+    return [];
+  }
+  const jsonFiles = [];
+  const walk = (d, depth) => {
+    for (const name of readdirSync(d).sort()) {
+      const full = join(d, name);
+      const st = statSync(full);
+      if (st.isDirectory() && depth < 4) walk(full, depth + 1);
+      else if (st.isFile() && name.endsWith(".json") && jsonFiles.length < EVIDENCE_LIMITS.files) jsonFiles.push(full);
+    }
+  };
+  walk(root, 0);
+  const out = [];
+  for (const file of jsonFiles) {
+    let entries;
+    try {
+      entries = JSON.parse(readFileSync(file, "utf8"));
+    } catch (e) {
+      warn(`evidence file ${relative(root, file)} is not JSON: ${String(e).slice(0, 120)}`);
+      continue;
+    }
+    if (!Array.isArray(entries)) continue;
+    for (const e of entries) {
+      if (out.length >= EVIDENCE_LIMITS.entries) return out;
+      if (!e || typeof e.file !== "string" || typeof e.title !== "string") continue;
+      const images = [];
+      for (const rel of Array.isArray(e.images) ? e.images : []) {
+        if (images.length >= EVIDENCE_LIMITS.imagesPerTest || typeof rel !== "string") break;
+        let path;
+        try {
+          path = realpathSync(resolve(dirname(file), rel));
+        } catch {
+          warn(`evidence image ${JSON.stringify(rel)} not found`);
+          continue;
+        }
+        if (relative(root, path).startsWith("..")) {
+          warn(`evidence image ${JSON.stringify(rel)} is outside the evidence directory; skipped`);
+          continue;
+        }
+        const bytes = readFileSync(path);
+        const type = IMAGE_TYPES.find((t) => t.magic.every((b, i) => bytes[i] === b));
+        if (!type || bytes.length > EVIDENCE_LIMITS.imageBytes) {
+          warn(`evidence image ${JSON.stringify(rel)} is not a PNG or JPEG within ${EVIDENCE_LIMITS.imageBytes} bytes; skipped`);
+          continue;
+        }
+        images.push({ name: relative(root, path), media_type: type.media_type, data: bytes.toString("base64"), sha256: createHash("sha256").update(bytes).digest("hex") });
+      }
+      const notes = typeof e.notes === "string" ? e.notes.slice(0, EVIDENCE_LIMITS.notes) : "";
+      if (notes || images.length) out.push({ file: e.file, title: e.title, full_title: typeof e.full_title === "string" ? e.full_title : null, notes, images });
+    }
+  }
+  return out;
+}
+
+/** The producer evidence recorded for this test, matched on title, qualified title and spec path. */
+export function evidenceFor(finding, evidence) {
+  const path = finding.repo_path ?? finding.file;
+  // Producers and TSIO may root paths differently, so a tail of at least one
+  // directory matches; a bare file name could be any spec of that name.
+  const tail = (long, short) => short.includes("/") && long.endsWith(`/${short}`);
+  return evidence.find((e) =>
+    e.title === finding.title &&
+    (e.full_title == null || finding.full_title == null || e.full_title === finding.full_title) &&
+    (path === e.file || tail(path, e.file) || tail(e.file, path)),
+  ) ?? null;
+}
+
 /** Run-level infrastructure call: many failures, or most failures share an infra signature. */
 export function infraVerdict(failing, cfg = DEFAULTS) {
   if (!failing.length) return null;
@@ -350,6 +438,10 @@ Rules:
 - flaky_environment with high confidence requires either recurrence on other PRs (evidence id starting with cross_pr)
   or an error text that is clearly infrastructural (server not healthy, cannot connect, device/emulator failure, app crash on
   launch) together with a diff that does not touch that area.
+- producer_evidence (id producer), when present, is what the test run itself recorded at the failure: screenshots of the
+  screen at that moment (attached as images) and log lines such as the requests the app was still waiting on. It shows
+  where the run was stuck, not why. A wait on the test server that never returned, in an area the diff does not touch,
+  supports flaky_environment; a stuck request, screen or flow that the diff changes supports caused_by_pr.
 - If the evidence is genuinely insufficient, answer with confidence below 0.6 rather than guessing.
 - Be precise and terse in the explanation: one paragraph a developer can act on.`;
 
@@ -382,7 +474,7 @@ export function buildPack(finding, compareFiles, pr, others) {
     if ((named || small) && f.patch) hunks.push({ id: `hunk_${hunks.length}`, file: f.filename, related: named, patch: f.patch.slice(0, named ? 4000 : 2500) });
     if (hunks.length >= 8) break;
   }
-  return {
+  const pack = {
     test: { title: finding.title, full_title: finding.full_title ?? null, suite: finding.suite_title ?? null, file: finding.file, report_scope: finding.report_scope ?? null, report_name: finding.report_name ?? null, lane: pr.lane },
     error: finding.error.slice(0, 2500),
     engine: { class: finding.class, reason: finding.reason },
@@ -391,8 +483,14 @@ export function buildPack(finding, compareFiles, pr, others) {
     pr: { number: pr.number, repository: pr.repository, title: pr.title, changed_file_count: names.length, changed_files: names.slice(0, 200), spec_file_changed_by_pr: names.includes(ownPath) },
     diff_hunks_of_files_named_in_error: hunks,
     other_failures_in_same_run: others.slice(0, 12),
+    ...(finding.producer ? { producer_evidence: { id: "producer", notes: finding.producer.notes, screenshots: finding.producer.images.map(({ name, sha256 }) => ({ name, sha256 })) } } : {}),
   };
+  if (finding.producer?.images.length) PACK_IMAGES.set(pack, finding.producer.images);
+  return pack;
 }
+// Screenshot bytes travel beside the pack, not in it: the pack is the JSON the
+// model reads and the cache key, which carries each image's hash instead.
+const PACK_IMAGES = new WeakMap();
 // Ids a citation may name. Evidence with no content is deliberately absent: a
 // model citing "cross_pr" on a finding with no other failing PRs, or a hunk from
 // a diff unrelated to the failure, would otherwise pass validation and clear the
@@ -405,6 +503,7 @@ export const evidenceIds = (pack) => [
   ...(pack.cross_pr_failures_14d?.other_prs_where_this_test_failed?.length ? ["cross_pr"] : []),
   "pr.changed_files",
   ...pack.diff_hunks_of_files_named_in_error.filter((h) => h.related).map((h) => h.id),
+  ...(pack.producer_evidence?.notes || pack.producer_evidence?.screenshots?.length ? ["producer"] : []),
 ];
 // Models that accept a non-default temperature. Newer models return a 400 for
 // it, so this is an allowlist: an unrecognised model gets the API default rather
@@ -430,11 +529,15 @@ export const packKey = (model, pack) => createHash("sha256").update(model + "\n"
 
 export async function askModel(fetchImpl, apiKey, model, pack, timeoutMs = 60000) {
   const sampling = samplingFor(model);
+  const text = `Evidence pack (JSON). Valid evidence ids to cite: ${evidenceIds(pack).join(", ")}\n\n${JSON.stringify(pack, null, 1)}`;
+  const images = PACK_IMAGES.get(pack) ?? [];
   const body = {
     model,
     max_tokens: 2000,
     system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
-    messages: [{ role: "user", content: `Evidence pack (JSON). Valid evidence ids to cite: ${evidenceIds(pack).join(", ")}\n\n${JSON.stringify(pack, null, 1)}` }],
+    messages: [{ role: "user", content: images.length
+      ? [...images.map((i) => ({ type: "image", source: { type: "base64", media_type: i.media_type, data: i.data } })), { type: "text", text }]
+      : text }],
     output_config: { format: { type: "json_schema", schema: SCHEMA }, ...(model.startsWith("claude-haiku") ? {} : { effort: "medium" }) },
     ...sampling,
   };
@@ -504,6 +607,7 @@ export function decide(cls, answer, pack, cfg = DEFAULTS, isTrunkRun = false, id
   const a = { ...answer, cited_evidence: cited };
   const hunk = cited.some((c) => c.startsWith("hunk_"));
   const cross = cited.includes("cross_pr");
+  const produced = cited.includes("producer");
   if (EXON.has(cls)) {
     if (a.cause === "caused_by_pr" && a.confidence >= cfg.vetoMin && hunk) return { blocking: true, decision: "adjudicator_veto", answer: a };
     return { blocking: false, decision: "engine", answer: a };
@@ -513,7 +617,7 @@ export function decide(cls, answer, pack, cfg = DEFAULTS, isTrunkRun = false, id
   // reach here when trunk history was clean, so a model asserting the test is
   // broken on master is contradicting the data, and it could clear a regression
   // while citing nothing a reviewer could open.
-  if (BORDERLINE.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && (cross || hunk))
+  if (BORDERLINE.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && (cross || hunk || produced))
     return { blocking: false, decision: "adjudicator_unblock", answer: a };
   return { blocking: !EXON.has(cls), decision: "engine", answer: a };
 }
@@ -572,6 +676,7 @@ export function renderComment({ context, verdict, findings, infra, model, runURL
       lines.push("", `### Second judge (${md(served.length ? served.join(", ") : model)})`, "", "Confidence is the model's assessment, not a measured accuracy rate.", "");
       for (const f of judged) {
         const mark = f.decision === "adjudicator_unblock" ? "unblocked" : f.decision === "adjudicator_veto" ? "vetoed" : f.decision === "same_failure" ? "declined; cleared as the same failure" : f.blocking ? "still blocking" : "agreed";
+        if (f.producer) lines.push(`- **${md(f.full_title || f.title)}** — the run recorded ${f.producer.images.length} screenshot(s)${f.producer.notes ? ` and: ${md(f.producer.notes.slice(0, 300))}` : ""}`);
         lines.push(`- **${md(f.full_title || f.title)}** — ${CAUSE[f.judge.cause] ?? md(f.judge.cause)} (${Math.round(f.judge.confidence * 100)}%, ${mark}; cites ${md(f.judge.cited_evidence.join(", ") || "nothing checkable")}): ${md(f.judge.explanation)}`);
       }
     }
@@ -943,7 +1048,7 @@ export function gh(fetchImpl, token) {
 // ------------------------------------------------------------------ the run
 
 /** Shared decision path for live runs and replay. Callers supply evidence, never publication. */
-export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranch, testRoot, cfg = DEFAULTS, prTitle = "", lane = id.name, ask, log = () => {} }) {
+export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranch, testRoot, cfg = DEFAULTS, prTitle = "", lane = id.name, ask, log = () => {}, evidence = [] }) {
   const isTrunkRun = prNumber == null;
   const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(run.failing, cfg), counts: run.counts };
   if (run.failing.length && !result.infra) {
@@ -958,6 +1063,10 @@ export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranc
         trunkBranch,
       }),
     );
+    for (const f of result.findings) {
+      const producer = evidenceFor(f, evidence);
+      if (producer) f.producer = producer;
+    }
     // Every way the evidence can be incomplete. Each one makes some rule
     // unsound rather than merely less informed, so none may clear anything, and
     // the judge is skipped rather than overridden -- it reads the same pack.
@@ -1023,6 +1132,7 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
     run, id, prNumber, history, diff, trunkBranch, testRoot, cfg,
     prTitle: pull.title ?? "", lane: env.LANE || id.name, log,
     ask: env.ANTHROPIC_API_KEY ? (pack) => askModel(fetchImpl, env.ANTHROPIC_API_KEY, cfg.model, pack) : null,
+    evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
   });
   const context = env.STATUS_CONTEXT;
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;

@@ -30,7 +30,8 @@ failure is not automatically proof that the PR caused it.
 
 Claude receives one evidence pack per finding, at most eight per run. Clearing
 requires confidence at least `min-confidence` (default 0.85) and a validated
-citation to actual cross-PR evidence or a related diff hunk. A model claiming
+citation to actual cross-PR evidence, a related diff hunk, or producer evidence
+(see below). A model claiming
 `bug_on_master` without qualifying evidence cannot clear anything. Vetoing a
 history-cleared finding requires confidence at least 0.9 and a related hunk.
 Model failure preserves the deterministic outcome. Model confidence is not a
@@ -96,6 +97,35 @@ needed for enforce; `pull-requests: write` is needed only for optional comments.
 The workflow token is used only with GitHub, never sent to TSIO or Anthropic.
 Only the exact mode `enforce` (with surrounding whitespace ignored) enables
 status writes. Unknown modes are logged and treated as report-only.
+
+## Producer evidence
+
+Some failures say nothing in their error text: a test that hits its timeout
+reports only that it ran out of time. A producer that recorded more at the
+moment of failure, such as a screenshot or the requests the app was still
+waiting on, can hand it to the judge with `evidence-dir`:
+
+```json
+[
+  {
+    "file": "detox/e2e/test/products/channels/smoke_test/messaging.e2e.ts",
+    "title": "MM-T4786_4 - should be able to ... pin/unpin a message",
+    "full_title": "Smoke Test - Messaging MM-T4786_4 - should be able to ... pin/unpin a message",
+    "notes": "Detox reported the app busy 9 times; still waiting on: Network Request .../api/v4/posts/<id>/pin",
+    "images": ["Smoke Test - Messaging MM-T4786_4 .../timeout.png"]
+  }
+]
+```
+
+Entries match a failing test on title, qualified title (when both sides have
+one) and spec path, where a path may be a tail of the other with at least one
+directory. Matched screenshots are sent to the model as images and the notes as
+the `producer` evidence item. Citing `producer` counts as checkable evidence for
+an unblock, under the same confidence threshold as a cross-PR recurrence: the
+screenshot and notes are in the run's artifacts and job summary for a reviewer
+to open. The evidence is produced by the PR's own CI, so it is treated like
+every other pack value: as data, never as instructions. Only PNG and JPEG files
+inside the directory are read, at most two per test and 3.5 MB each.
 
 ## Trunk runs
 

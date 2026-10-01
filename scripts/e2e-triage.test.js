@@ -1,6 +1,9 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import {
   DEFAULTS,
@@ -20,6 +23,8 @@ import {
   decide,
   evidenceIds,
   errorSignature,
+  evidenceFor,
+  loadEvidence,
   sameFailure,
   fetchHistory,
   fetchRun,
@@ -657,6 +662,93 @@ test("the same-failure rule runs on PR runs only", async () => {
     log: () => {},
   });
   assert.deepEqual(onTrunk.findings.map((f) => [f.title, f.class, f.blocking]), [["t1", "FLAKY_ON_TRUNK", false], ["t2", "INSUFFICIENT_DATA", true]]);
+});
+// mattermost-mobile#10172, detox-ios: MM-T4786_4 hit the 300 s Jest timeout with the
+// app waiting on a pin request the test server never answered. The error text
+// says only "Exceeded timeout"; the run recorded what the screen showed.
+const PNG = (fill = 0) => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64, fill)]);
+const timeoutTest = { file: "detox/e2e/test/products/channels/smoke_test/messaging.e2e.ts", title: "MM-T4786_4 - pin a message", full_title: "Smoke Test - Messaging MM-T4786_4 - pin a message" };
+const busyNotes = 'Detox reported the app busy 9 times; still waiting on: Network Request "https://site-1/api/v4/posts/6qgx/pin"';
+function evidenceDir(entries, files = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "evidence-"));
+  for (const [name, bytes] of Object.entries(files)) {
+    mkdirSync(join(dir, name, ".."), { recursive: true });
+    writeFileSync(join(dir, name), bytes);
+  }
+  mkdirSync(join(dir, "shard-1"), { recursive: true });
+  writeFileSync(join(dir, "shard-1", "evidence.json"), JSON.stringify(entries));
+  return dir;
+}
+test("producer evidence is read only from images inside its directory, within limits", () => {
+  const outside = mkdtempSync(join(tmpdir(), "outside-"));
+  writeFileSync(join(outside, "secret.png"), PNG());
+  const dir = evidenceDir(
+    [
+      { ...timeoutTest, notes: busyNotes, images: ["shot/timeout.png", "shot/second.png", "shot/third.png"] },
+      { ...timeoutTest, title: "escape", images: ["../../" + outside.split("/").pop() + "/secret.png", "shot/link.png"] },
+      { ...timeoutTest, title: "not an image", images: ["shot/fake.png", "shot/huge.png"] },
+      { title: "no file" },
+    ],
+    { "shard-1/shot/timeout.png": PNG(1), "shard-1/shot/second.png": PNG(2), "shard-1/shot/third.png": PNG(3), "shard-1/shot/fake.png": Buffer.from("#!/bin/sh\necho hi"), "shard-1/shot/huge.png": Buffer.concat([PNG(), Buffer.alloc(3_600_000)]) },
+  );
+  symlinkSync(join(outside, "secret.png"), join(dir, "shard-1", "shot", "link.png"));
+  const warnings = [];
+  try {
+    const evidence = loadEvidence(dir, (w) => warnings.push(w));
+    assert.deepEqual(evidence.map((e) => [e.title, e.images.length]), [[timeoutTest.title, 2]], "two images per test; the others carried nothing usable");
+    assert.equal(evidence[0].notes, busyNotes);
+    assert.equal(evidence[0].images[0].media_type, "image/png");
+    assert.match(evidence[0].images[0].sha256, /^[0-9a-f]{64}$/);
+    assert.ok(warnings.filter((w) => /outside the evidence directory/.test(w)).length === 2, "a relative escape and a symlink out are both refused");
+    assert.ok(warnings.some((w) => /not a PNG or JPEG/.test(w)));
+    assert.deepEqual(loadEvidence(join(dir, "missing")), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+test("producer evidence matches its test by title, qualified title and spec path", () => {
+  const e = { file: "e2e/test/products/channels/smoke_test/messaging.e2e.ts", title: timeoutTest.title, full_title: timeoutTest.full_title, notes: "n", images: [] };
+  assert.equal(evidenceFor(timeoutTest, [e]), e, "a path relative to a different root still matches on its tail");
+  assert.equal(evidenceFor({ ...timeoutTest, full_title: "Another describe " + timeoutTest.title }, [e]), null);
+  assert.equal(evidenceFor({ ...timeoutTest, file: "detox/e2e/test/other.e2e.ts" }, [e]), null);
+  assert.equal(evidenceFor({ ...timeoutTest, file: "x" + timeoutTest.file }, [{ ...e, file: "messaging.e2e.ts" }]), null, "a bare file name is not a path tail");
+});
+test("end to end: a timeout the judge clears from the screenshot the run recorded", async () => {
+  const dir = evidenceDir([{ ...timeoutTest, notes: busyNotes, images: ["timeout.png"] }], { "shard-1/timeout.png": PNG(7) });
+  const identity = { repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "mobile-pr-detox-ios", branch: "pr-5", gh_pr_number: 5 };
+  const sent = [];
+  const answer = { cause: "flaky_environment", confidence: 0.9, cited_evidence: ["producer"], explanation: "Stuck on a pin request to the test server; the diff only touches CI." };
+  const routes = () => fakeFetch([
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: identity.name, gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+    ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: timeoutTest.file }] })],
+    ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: timeoutTest.title, full_title: timeoutTest.full_title, status: "failed", retry_count: 0, ordinal: 0, error_message: 'thrown: "Exceeded timeout of 300000 ms for a test.', error_stack: null }])],
+    ["/reports/history", () => Response.json({ observations: trunkPasses(25).map((o) => ({ ...o, file: timeoutTest.file, title: timeoutTest.title, full_title: timeoutTest.full_title, name: "mobile-main-detox-ios" })) })],
+    ["/pulls/5/files", () => Response.json([{ filename: ".github/workflows/e2e.yml", patch: "@@" }])],
+    ["/pulls/5", () => Response.json({ title: "ci only", base: { ref: "main" } })],
+    ["api.anthropic.com", (init) => {
+      sent.push(JSON.parse(init.body));
+      return Response.json({ model: sent.at(-1).model, stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify(answer) }] });
+    }],
+  ]);
+  const base = { ...env, MODE: "report-only", COMPOSITE_IDENTITY: JSON.stringify(identity) };
+  try {
+    const result = await triage({ env: { ...base, EVIDENCE_DIR: dir }, fetchImpl: routes(), log: () => {} });
+    const [image, text] = sent[0].messages[0].content;
+    assert.deepEqual([image.type, image.source.media_type, image.source.data], ["image", "image/png", PNG(7).toString("base64")], "the screenshot goes first, as an image");
+    assert.match(text.text, /Valid evidence ids to cite: .*producer/);
+    assert.match(text.text, /posts\/6qgx\/pin/);
+    assert.equal(result.findings[0].decision, "adjudicator_unblock");
+    assert.equal(result.verdict, "SUCCESS");
+
+    // Without evidence there is no producer item, so citing it proves nothing.
+    sent.length = 0;
+    const without = await triage({ env: base, fetchImpl: routes(), log: () => {} });
+    assert.equal(typeof sent[0].messages[0].content, "string", "a pack without screenshots is sent as before");
+    assert.equal(without.findings[0].blocking, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 test("a failure skipped on retry is still a failure", async () => {
   // Serial describe on desktop: attempt 0 fails, attempt 1 skips the rest of the
