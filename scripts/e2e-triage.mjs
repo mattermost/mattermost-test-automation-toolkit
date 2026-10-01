@@ -66,8 +66,10 @@ export const DEFAULTS = {
   // applied to judgements they were never tuned for.
   model: "claude-haiku-4-5-20251001",
 };
+// The last alternative is mobile's merge-jest-results-for-tsio.js: a spec whose shard
+// uploaded nothing. It never ran, so it has no outcome to attribute to the PR.
 const INFRA_RE =
-  /server (?:is )?not healthy|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)/i;
+  /server (?:is )?not healthy|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result/i;
 
 export const isInfraError = (text) => INFRA_RE.test(text ?? "");
 
@@ -207,7 +209,7 @@ export function infraVerdict(failing, cfg = DEFAULTS) {
   if (!failing.length) return null;
   const infra = failing.filter((t) => isInfraError(t.error)).length;
   if (infra >= Math.max(3, Math.ceil(failing.length / 2)))
-    return `${infra} of ${failing.length} failures are infrastructure errors (server health, connectivity, device); rerun when the environment recovers.`;
+    return `${infra} of ${failing.length} failures are infrastructure errors (server health, connectivity, device, shard that never ran); rerun when the environment recovers.`;
   if (failing.length >= cfg.infraMinFailures)
     return `${failing.length} tests failed in one run; investigate a shared environment, build or product failure before attributing individual tests.`;
   return null;
@@ -605,7 +607,7 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
  * renamed test finds nothing, is reported as INSUFFICIENT_DATA and stays
  * blocking, which is the safe direction.
  */
-export async function fetchHistory(fetchImpl, base, repository, tests, until, cfg = DEFAULTS, trunkBranch = null, reportName = null, warn = () => {}) {
+export async function fetchHistory(fetchImpl, base, repository, tests, until, cfg = DEFAULTS, trunkBranch = null, reportName = null, warn = () => {}, lane = null) {
   const byTest = new Map();
   byTest.truncated = false;
   // Set when a report was asked for but the rows cannot say which report they
@@ -650,6 +652,11 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
         const leaf = `${o.file}\n${o.title}`;
         const candidates = byLeaf.get(leaf);
         if (!candidates) continue;
+        // Another lane's run is never evidence -- classify() drops it -- so it must
+        // not cast doubt on this lane's rows either. A compatibility-matrix run
+        // (cmt-desktop) executes one spec against several server versions inside
+        // one group; read here, it marked every desktop test ambiguous.
+        if (lane != null && o.name != null && laneOf(o.name) !== lane) continue;
         // Check the producer's stable report prefix before examining identity.
         // Raw report names may be shard/worker names, so do not guess a lane
         // from them when the producer supplied no report scope.
@@ -863,7 +870,7 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       }
     }
     [history, diff] = await Promise.all([
-      fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log),
+      fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, laneOf(id.name)),
       fetchChangedFiles(api, id, prNumber, log),
     ]);
   }
@@ -954,7 +961,7 @@ export async function replay({ runsPath, answersPath, comparePath, base, outPath
       // Only evidence available at the recorded evaluation time may be used.
       const until = new Date(r.run_at).toISOString();
       const history = run.failing.length && !infraVerdict(run.failing, cfg)
-        ? await fetchHistory(fetchImpl, base, id.repository, run.failing, until, cfg, trunkBranch, reportName, log)
+        ? await fetchHistory(fetchImpl, base, id.repository, run.failing, until, cfg, trunkBranch, reportName, log, laneOf(id.name))
         : new Map();
       const cmp = compares[`${r.repository}:${r.commit_sha}`];
       // A saved prefix of the diff is not ownership evidence. Corpus creation

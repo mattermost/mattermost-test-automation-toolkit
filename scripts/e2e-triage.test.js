@@ -22,6 +22,7 @@ import {
   fetchHistory,
   fetchRun,
   infraVerdict,
+  isInfraError,
   triage,
   verdictOf,
 } from "./e2e-triage.mjs";
@@ -131,6 +132,15 @@ test("infra call needs a majority of infra signatures or a storm", () => {
   assert.ok(infraVerdict([infra, infra, infra, failing]));
   assert.equal(infraVerdict([infra, failing, failing, failing]), null);
   assert.ok(infraVerdict(Array.from({ length: 30 }, () => failing)));
+});
+test("a spec whose shard uploaded nothing is an infrastructure failure, not a test outcome", () => {
+  // Verbatim from mattermost-mobile detox/utils/merge-jest-results-for-tsio.js.
+  const missing = (spec) => ({ file: spec, title: "spec did not run", error: `${spec} was assigned to a shard but produced no result. The shard uploaded nothing, or its Jest process died before reaching this spec.` });
+  assert.ok(isInfraError(missing("a.e2e.ts").error));
+  const regression = { ...failing, error: "Test Failed: Timed out while waiting for expectation: NOT TOBEVISIBLE" };
+  assert.equal(isInfraError(regression.error), false, "a Detox expectation timeout is not infrastructure");
+  assert.ok(infraVerdict([regression, ...["a", "b", "c", "d", "e"].map((s) => missing(`${s}.e2e.ts`))]));
+  assert.equal(infraVerdict([regression, regression, missing("a.e2e.ts")]), null, "one missing spec does not make the run infra");
 });
 test("decision matrix: unblock needs confidence plus a checkable citation; unknown citations are dropped", () => {
   const f = classify(failing, [...trunkPasses(8), ...crossPR(11, 12)], [], undefined, 1);
@@ -434,6 +444,23 @@ test("history from another platform cannot answer for this one", async () => {
   // Unscoped runs are unaffected.
   const plain = await fetchHistory(fakeFetch([["/reports/history", () => Response.json(rows({}))]]), "http://tsio", "o/r", tests, "2026-09-17T00:00:00Z", DEFAULTS, "master", null);
   assert.equal(plain.reportUnknown, false);
+});
+test("another lane's multi-report run does not make this lane's history ambiguous", async () => {
+  const t = { ...failing, full_title: "A > t1", report_scope: "e2e-on-windows" };
+  const row = (over) => obs({ full_title: "A > t1", suite_title: "A", report_name: "e2e-on-windows-2022-12.0", name: "desktop-master", ...over });
+  const history = (rows) => fakeFetch([["/reports/history", () => Response.json({ observations: rows })]]);
+  const trunk = [row({ group_id: "g1", commit_sha: "a" }), row({ group_id: "g2", commit_sha: "b" })];
+  // A compatibility-matrix run puts one spec against several server versions in one group.
+  const cmt = ["10.11", "11.10"].map((v) => row({ group_id: "cmt", name: "cmt-desktop", report_name: `e2e-on-windows-2022-${v}` }));
+
+  const scoped = await fetchHistory(history([...trunk, ...cmt]), "http://tsio", "o/r", [t], "2026-09-17T00:00:00Z", DEFAULTS, "master", "e2e-on-windows", () => {}, laneOf("desktop-pr"));
+  assert.equal(scoped.ambiguous.has(identityKey(t)), false, "the other lane's group is not this lane's evidence");
+  assert.deepEqual(scoped.get(identityKey(t)).map((o) => o.group_id).sort(), ["g1", "g2"]);
+
+  // The same shape inside this lane still needs a narrower producer scope.
+  const sameLane = cmt.map((o) => ({ ...o, name: "desktop-master" }));
+  const inLane = await fetchHistory(history([...trunk, ...sameLane]), "http://tsio", "o/r", [t], "2026-09-17T00:00:00Z", DEFAULTS, "master", "e2e-on-windows", () => {}, laneOf("desktop-pr"));
+  assert.equal(inLane.ambiguous.has(identityKey(t)), true);
 });
 test("only an explicit, valid enforce mode writes a commit status", async () => {
   const routes = (statuses) => [
