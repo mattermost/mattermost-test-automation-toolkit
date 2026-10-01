@@ -28,14 +28,37 @@ A widespread failure can be a product bug as well as an environment problem.
 `ACTION_REQUIRED` is not proof that the PR is innocent. Likewise, an unresolved
 failure is not automatically proof that the PR caused it.
 
-Claude receives one evidence pack per finding, at most eight per run. Clearing
-requires confidence at least `min-confidence` (default 0.85) and a validated
-citation to actual cross-PR evidence, a related diff hunk, or producer evidence
-(see below). A model claiming
-`bug_on_master` without qualifying evidence cannot clear anything. Vetoing a
-history-cleared finding requires confidence at least 0.9 and a related hunk.
-Model failure preserves the deterministic outcome. Model confidence is not a
-measured accuracy rate.
+Clearing requires confidence at least `min-confidence` (default 0.85) and a
+validated citation to actual cross-PR evidence, a related diff hunk, or producer
+evidence (see below). A model claiming `bug_on_master` without qualifying
+evidence cannot clear anything. Vetoing a history-cleared finding requires
+confidence at least 0.9 and a related hunk. Model failure preserves the
+deterministic outcome. Model confidence is not a measured accuracy rate.
+
+## When the model is asked, and what it costs
+
+The model is asked only about a finding whose outcome its answer could change,
+read off the rules above: a cleared finding only when the pack holds a related
+diff hunk (the one way to veto), a blocked one only when it holds something
+citable for an unblock. Everything else is decided by the rules at no cost.
+Findings with the same spec and error share one question, an answer already
+given for the same evidence is reused (`answers-cache`), and at most eight
+questions go in **one request per run**, with the PR context and related hunks
+sent once. Only hunks related to a failure are sent; the error is cut to its
+message and first app stack frames.
+
+An answer between 0.6 and the threshold, on a finding it could change, is asked
+once more of `escalation-model` (default `claude-opus-5-5`; empty turns it off).
+Each response's token usage is priced from a dated per-model table (overridable
+with `ai-prices`) and reported per test, per run in the summary, and as the
+`ai-calls` and `ai-cost-usd` outputs. A call whose worst case would cross
+`ai-budget-usd` (default 0.5) is not made, and its findings keep the rules'
+outcome. The system prompt carries no cache marker: it is below Haiku 4.5's
+minimum cacheable length, and a run makes one call per model.
+
+The job summary leads with what blocks, one row per test with the result, a
+sentence the PR author can act on, whether the rules or the model decided, and
+the model's cost; cleared tests are collapsed below.
 
 Incomplete changed files, unknown test root or trunk branch, truncated history,
 or unprovable report scope block clearing and skip the model. A test with

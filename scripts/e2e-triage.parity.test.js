@@ -35,8 +35,14 @@ function fixture() {
     if (p.includes("/comments") || p.includes("/statuses/")) return Response.json({ id: 1 });
     if (u.hostname === "api.anthropic.com") {
       f.modelCalls++;
+      const body = JSON.parse(init.body);
+      const answer = { cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "Recurs elsewhere" };
+      // One call carries every finding of a run; answer each id it asks about.
+      const text = typeof body.messages[0].content === "string" ? body.messages[0].content : body.messages[0].content.at(-1).text;
+      const ids = [...new Set(text.match(/"id":"f\d+"/g) ?? [])].map((m) => m.slice(6, -1));
+      const reply = body.output_config.format.schema.properties.answers ? { answers: ids.map((id) => ({ id, ...answer })) } : answer;
       // The real API names the model that answered; echo the one requested.
-      return Response.json({ model: JSON.parse(init.body).model, stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify({ cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "Recurs elsewhere" }) }] });
+      return Response.json({ model: body.model, stop_reason: "end_turn", usage: { input_tokens: 1000, output_tokens: 100 }, content: [{ type: "text", text: JSON.stringify(reply) }] });
     }
     throw new Error(`unexpected fake route ${p}`);
   };
@@ -177,15 +183,18 @@ test("replay caches sibling packs separately and sends no GitHub requests", asyn
   const f = fixture();
   f.cases.push({ ...f.cases[0], full_title: "B > leaf", ordinal: 1 });
   f.history.push(...f.history.map((o) => ({ ...o, full_title: "B > leaf", suite_title: "B" })));
+  // One other PR failing gives the judge something it may cite; without it a
+  // call could not change the outcome and is not made.
+  f.history.push(...["A > leaf", "B > leaf"].map((t) => ({ ...f.history[0], full_title: t, suite_title: t[0], gh_pr_number: 9, branch: "pr-9", name: "desktop-pr", status: "failed", group_id: `pr9-${t[0]}` })));
   const dir = mkdtempSync(join(tmpdir(), "triage-cache-"));
   writeFileSync(join(dir, "answers.json"), "{}");
   try {
     const first = await replayFixture(f, { dir, replayEnv: { ANTHROPIC_API_KEY: "fake" } });
-    assert.equal(Object.keys(first.answers).length, 2);
-    assert.equal(f.modelCalls, 2);
+    assert.equal(Object.keys(first.answers).length, 2, "each sibling's evidence is cached under its own key");
+    assert.equal(f.modelCalls, 1, "one call carries both findings");
     assert.notEqual(first.results[0].decisions[0].identity, first.results[0].decisions[1].identity);
     await replayFixture(f, { dir });
-    assert.equal(f.modelCalls, 2, "second replay uses these exact evidence packs");
+    assert.equal(f.modelCalls, 1, "second replay uses these exact evidence packs");
     assert.equal(f.calls.some((c) => c.url.hostname === "api.github.com"), false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -211,8 +220,8 @@ test("comments are opt-in in both modes; summary and outputs remain available wi
       assert.equal(f.calls.some((c) => c.url.pathname.includes("/comments")), false);
       assert.equal(f.calls.filter((c) => c.url.pathname.includes("/statuses/")).length, mode === "enforce" ? 1 : 0);
       const summary = readFileSync(f.env.GITHUB_STEP_SUMMARY, "utf8");
-      assert.match(summary, /1 failed · 0 cleared · 1 unresolved/);
-      assert.match(summary, /<details>/);
+      assert.match(summary, /1 failed → 0 cleared · 1 blocking/);
+      assert.match(summary, /### Blocking \(1\)/);
       assert.doesNotMatch(summary, /required status is green|attributable to the PR/);
       if (mode === "report-only") assert.match(summary, /does not change the required commit status/);
       assert.match(readFileSync(f.env.GITHUB_OUTPUT, "utf8"), /verdict=FAILURE\nblocking=1/);
@@ -242,7 +251,7 @@ test("mass failures require investigation without claiming the PR is innocent", 
     const result = await live(f);
     assert.equal(result.verdict, "ACTION_REQUIRED");
     const summary = readFileSync(f.env.GITHUB_STEP_SUMMARY, "utf8");
-    assert.match(summary, /30 failed · 0 cleared · 30 unresolved/);
+    assert.match(summary, /30 failed → 0 cleared · 30 blocking/);
     assert.match(summary, /product failure/);
     assert.doesNotMatch(summary, /not this PR|none caused/);
   } finally { rmSync(dir, { recursive: true, force: true }); }

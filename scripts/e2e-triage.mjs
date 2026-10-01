@@ -79,8 +79,15 @@ export const DEFAULTS = {
   minConfidence: 0.85,
   vetoMin: 0.9,
   maxJudged: 8,
-  concurrency: 4,
   infraMinFailures: 30,
+  // A second, stronger model for answers that land just short of a threshold:
+  // between escalateMin and the clear (or veto) threshold, on a finding the
+  // answer could change. Empty turns escalation off.
+  escalationModel: "claude-opus-5-5",
+  escalateMin: 0.6,
+  // Per-run ceiling on model spend. A call whose worst case would cross it is
+  // not made, and its findings keep the rules' outcome.
+  budgetUsd: 0.5,
   // A dated snapshot, not the alias. The 0.85 clear and 0.90 veto thresholds are
   // policy tuned against one model's behaviour; an alias can be repointed at a
   // different model without any change here, and the thresholds would then be
@@ -443,7 +450,8 @@ Rules:
   where the run was stuck, not why. A wait on the test server that never returned, in an area the diff does not touch,
   supports flaky_environment; a stuck request, screen or flow that the diff changes supports caused_by_pr.
 - If the evidence is genuinely insufficient, answer with confidence below 0.6 rather than guessing.
-- Be precise and terse in the explanation: one paragraph a developer can act on.`;
+- explanation: at most 280 characters, written for the PR author: what failed and what, if anything, they should do.
+  Do not restate the engine's classification or the history numbers; they are shown next to your answer.`;
 
 export const SCHEMA = {
   type: "object",
@@ -451,38 +459,53 @@ export const SCHEMA = {
     cause: { type: "string", enum: ["caused_by_pr", "flaky_environment", "bug_on_master", "test_bug"] },
     confidence: { type: "number", description: "0 to 1" },
     cited_evidence: { type: "array", items: { type: "string" }, description: "up to 6 evidence ids from the pack" },
-    explanation: { type: "string", description: "one short paragraph a developer can act on" },
+    explanation: { type: "string", description: "at most 280 characters, for the PR author" },
   },
   required: ["cause", "confidence", "cited_evidence", "explanation"],
   additionalProperties: false,
 };
 
 /** Evidence pack for one finding: what the judge sees, and nothing else. */
+/** The message and the first few app stack frames: what explains a failure, without framework noise. */
+export function compactError(error, max = 800) {
+  const message = [];
+  const frames = [];
+  for (const line of String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/)) {
+    const t = line.trim();
+    if (/^at\s/.test(t)) {
+      if (frames.length < 3 && !/node_modules|node:internal|\(internal\//.test(t)) frames.push(t);
+    } else if (!frames.length && message.length < 12) message.push(line.trimEnd());
+  }
+  return [...message, ...frames].join("\n").trim().slice(0, max);
+}
+
 export function buildPack(finding, compareFiles, pr, others) {
   const names = compareFiles.map((f) => f.filename);
   const ownPath = finding.repo_path ?? finding.file;
   const text = `${finding.error}\n${finding.file}`.toLowerCase();
-  const small = compareFiles.length <= 8;
   const hunks = [];
-  for (const f of compareFiles) {
+  for (const [index, f] of compareFiles.entries()) {
     const base = f.filename.split("/").pop() ?? "";
     const stem = base.split(".")[0] ?? "";
     const named = f.filename === ownPath || (stem.length > 3 && text.includes(stem.toLowerCase())) || finding.error.includes(base);
-    // `related` means the diff actually touches the failing spec or is named in
-    // the error. On a small PR every hunk is shown for context, but only a
-    // related one may be cited as proof.
-    if ((named || small) && f.patch) hunks.push({ id: `hunk_${hunks.length}`, file: f.filename, related: named, patch: f.patch.slice(0, named ? 4000 : 2500) });
+    // Only a hunk that touches the failing spec or is named in the error is
+    // sent: it is the only kind that may be cited, so an unrelated one costs
+    // tokens and can change nothing. The id is the file's place in the diff, so
+    // findings judged together share it.
+    if (named && f.patch) hunks.push({ id: `hunk_${index}`, file: f.filename, related: true, patch: f.patch.slice(0, 4000) });
     if (hunks.length >= 8) break;
   }
+  const signature = errorSignature(finding.error);
+  const neighbours = others.filter((o) => o.title !== finding.title && (o.file === finding.file || (signature && o.signature === signature)));
   const pack = {
     test: { title: finding.title, full_title: finding.full_title ?? null, suite: finding.suite_title ?? null, file: finding.file, report_scope: finding.report_scope ?? null, report_name: finding.report_name ?? null, lane: pr.lane },
-    error: finding.error.slice(0, 2500),
+    error: compactError(finding.error),
     engine: { class: finding.class, reason: finding.reason },
     trunk_history_14d: { runs: finding.trunk.runs, fails: finding.trunk.fails, flaky: finding.trunk.flaky, latest: finding.trunk.latest },
     cross_pr_failures_14d: { id: "cross_pr", other_prs_where_this_test_failed: finding.cross_pr.examples, other_pr_runs_where_it_passed: finding.cross_pr.passes },
     pr: { number: pr.number, repository: pr.repository, title: pr.title, changed_file_count: names.length, changed_files: names.slice(0, 200), spec_file_changed_by_pr: names.includes(ownPath) },
     diff_hunks_of_files_named_in_error: hunks,
-    other_failures_in_same_run: others.slice(0, 12),
+    other_failures_in_same_run: neighbours.slice(0, 8).map(({ class: cls, title }) => ({ class: cls, title })),
     ...(finding.producer ? { producer_evidence: { id: "producer", notes: finding.producer.notes, screenshots: finding.producer.images.map(({ name, sha256 }) => ({ name, sha256 })) } } : {}),
   };
   if (finding.producer?.images.length) PACK_IMAGES.set(pack, finding.producer.images);
@@ -525,21 +548,59 @@ const snapshotOf = (alias, served) => served.length === alias.length + 9 && serv
 export const servedMatches = (requested, served) =>
   typeof served === "string" && (served === requested || (!isSnapshot(requested) && snapshotOf(requested, served)));
 
+// List prices in USD per million tokens. Opus 5.5 and Sonnet 5.5 from
+// Anthropic's model documentation as of 2026-10-02; Haiku 4.5 from its launch
+// pricing. AI_PRICES (JSON of the same shape) overrides or adds models; a model
+// with no price still reports its tokens, at an unknown cost.
+export const PRICES = {
+  "claude-haiku-4-5": { input: 1, output: 5, cache_write: 1.25, cache_read: 0.1 },
+  "claude-sonnet-5-5": { input: 2, output: 10, cache_write: 2.5, cache_read: 0.2 },
+  "claude-opus-5-5": { input: 4, output: 20, cache_write: 5, cache_read: 0.2 },
+};
+export function priceFor(model, prices = PRICES) {
+  const m = String(model ?? "");
+  const key = Object.keys(prices).sort((a, b) => b.length - a.length).find((k) => m === k || m.startsWith(`${k}-`));
+  return key ? prices[key] : null;
+}
+/** USD for one response's usage, or null when the model has no price. */
+export function costOf(usage, model, prices = PRICES) {
+  const p = priceFor(model, prices);
+  if (!p || !usage) return null;
+  const n = (k) => Number(usage[k] ?? 0);
+  return (n("input_tokens") * p.input + n("output_tokens") * p.output + n("cache_creation_input_tokens") * p.cache_write + n("cache_read_input_tokens") * p.cache_read) / 1e6;
+}
+// What a run spent on the model, and why it did not spend more.
+export const newLedger = () => ({ calls: [], skipped: { no_effect: 0, duplicate: 0, cached: 0, cap: 0, budget: 0 } });
+export function ledgerTotals(ledger) {
+  const sum = (k) => ledger.calls.reduce((n, c) => n + Number(c.usage?.[k] ?? 0), 0);
+  const costs = ledger.calls.map((c) => c.cost_usd);
+  return {
+    calls: ledger.calls.length,
+    input_tokens: sum("input_tokens") + sum("cache_read_input_tokens") + sum("cache_creation_input_tokens"),
+    cached_tokens: sum("cache_read_input_tokens"),
+    output_tokens: sum("output_tokens"),
+    cost_usd: costs.some((c) => c == null) ? null : costs.reduce((a, b) => a + b, 0),
+  };
+}
+
 export const packKey = (model, pack) => createHash("sha256").update(model + "\n" + JSON.stringify(pack)).digest("hex");
 
-export async function askModel(fetchImpl, apiKey, model, pack, timeoutMs = 60000) {
-  const sampling = samplingFor(model);
-  const text = `Evidence pack (JSON). Valid evidence ids to cite: ${evidenceIds(pack).join(", ")}\n\n${JSON.stringify(pack, null, 1)}`;
-  const images = PACK_IMAGES.get(pack) ?? [];
+const imageBlock = (i) => ({ type: "image", source: { type: "base64", media_type: i.media_type, data: i.data } });
+
+/**
+ * One request to the Messages API, retried on transient failures. The system
+ * prompt is not marked for caching: it is below the minimum cacheable length
+ * on Haiku 4.5, and a run makes one call per model, so a cache write would be
+ * paid for and never read.
+ */
+async function requestModel(fetchImpl, apiKey, model, content, schema, maxTokens, timeoutMs) {
   const body = {
     model,
-    max_tokens: 2000,
-    system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
-    messages: [{ role: "user", content: images.length
-      ? [...images.map((i) => ({ type: "image", source: { type: "base64", media_type: i.media_type, data: i.data } })), { type: "text", text }]
-      : text }],
-    output_config: { format: { type: "json_schema", schema: SCHEMA }, ...(model.startsWith("claude-haiku") ? {} : { effort: "medium" }) },
-    ...sampling,
+    max_tokens: maxTokens,
+    system: SYSTEM,
+    messages: [{ role: "user", content }],
+    output_config: { format: { type: "json_schema", schema }, ...(model.startsWith("claude-haiku") ? {} : { effort: "medium" }) },
+    ...samplingFor(model),
   };
   let last;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -568,17 +629,78 @@ export async function askModel(fetchImpl, apiKey, model, pack, timeoutMs = 60000
         err.noRetry = true;
         throw err;
       }
-      const answer = parseAnswer(msg.content?.find((b) => b.type === "text")?.text ?? "");
-      return {
-        ...answer,
-        provenance: { requested_model: model, served_model: msg.model, temperature: sampling.temperature ?? null, pack_hash: packKey(model, pack) },
-      };
+      return msg;
     } catch (e) {
       last = e;
       if (e?.noRetry || String(e).startsWith("Error: anthropic 4")) throw e;
     }
   }
   throw last;
+}
+
+/** One finding, one request. */
+export async function askModel(fetchImpl, apiKey, model, pack, timeoutMs = 60000) {
+  const text = `Evidence pack (JSON). Valid evidence ids to cite: ${evidenceIds(pack).join(", ")}\n\n${JSON.stringify(pack, null, 1)}`;
+  const images = PACK_IMAGES.get(pack) ?? [];
+  const msg = await requestModel(fetchImpl, apiKey, model, images.length ? [...images.map(imageBlock), { type: "text", text }] : text, SCHEMA, 400, timeoutMs);
+  const answer = parseAnswer(msg.content?.find((b) => b.type === "text")?.text ?? "");
+  return {
+    ...answer,
+    usage: msg.usage ?? null,
+    provenance: { requested_model: model, served_model: msg.model, temperature: samplingFor(model).temperature ?? null, pack_hash: packKey(model, pack) },
+  };
+}
+
+export const BATCH_SCHEMA = {
+  type: "object",
+  properties: {
+    answers: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { id: { type: "string" }, ...SCHEMA.properties },
+        required: ["id", ...SCHEMA.required],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["answers"],
+  additionalProperties: false,
+};
+
+/**
+ * Every finding of a run in one request: the PR context and the diff hunks
+ * they cite are sent once, not once per finding. Returns one answer or Error
+ * per pack, in order, and the response's token usage.
+ */
+export async function askModelBatch(fetchImpl, apiKey, model, packs, timeoutMs = 90000) {
+  const ids = packs.map((_, i) => `f${i + 1}`);
+  const hunks = [...new Map(packs.flatMap((p) => p.diff_hunks_of_files_named_in_error).map((h) => [h.id, h])).values()];
+  const items = packs.map((p, i) => {
+    const { pr, diff_hunks_of_files_named_in_error: own, ...rest } = p;
+    return { id: ids[i], valid_evidence_ids: evidenceIds(p), related_hunks: own.map((h) => h.id), ...rest };
+  });
+  const text = `Shared context for every finding (JSON):\n${JSON.stringify({ pr: packs[0].pr, diff_hunks: hunks })}\n\n` +
+    `Findings (JSON). Answer every finding by its id, citing only that finding's valid_evidence_ids.\n${JSON.stringify(items)}`;
+  const content = [];
+  for (const [i, p] of packs.entries()) {
+    const images = PACK_IMAGES.get(p) ?? [];
+    if (images.length) content.push({ type: "text", text: `Screenshots recorded for ${ids[i]}:` }, ...images.map(imageBlock));
+  }
+  const msg = await requestModel(fetchImpl, apiKey, model, content.length ? [...content, { type: "text", text }] : text, BATCH_SCHEMA, Math.min(2000, 100 + 250 * packs.length), timeoutMs);
+  const raw = JSON.parse(msg.content?.find((b) => b.type === "text")?.text ?? "");
+  const byId = new Map((Array.isArray(raw?.answers) ? raw.answers : []).map((a) => [a?.id, a]));
+  const provenance = { requested_model: model, served_model: msg.model, temperature: samplingFor(model).temperature ?? null };
+  const answers = ids.map((id, i) => {
+    if (!byId.has(id)) return new Error(`no answer for ${id}`);
+    const { id: _, ...rest } = byId.get(id);
+    try {
+      return { ...parseAnswer(JSON.stringify(rest)), provenance: { ...provenance, pack_hash: packKey(model, packs[i]) } };
+    } catch (e) {
+      return e;
+    }
+  });
+  return { answers, usage: msg.usage ?? null, served_model: msg.model };
 }
 export function parseAnswer(text) {
   const a = JSON.parse(text);
@@ -592,7 +714,7 @@ export function parseAnswer(text) {
   if (!Array.isArray(a.cited_evidence) || !a.cited_evidence.every((c) => typeof c === "string"))
     throw new Error("answer failed validation: cited_evidence must be a list of evidence ids");
   if (typeof a.explanation !== "string") throw new Error("answer failed validation: explanation must be a string");
-  return { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence.slice(0, 6), explanation: a.explanation.slice(0, 900) };
+  return { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence.slice(0, 6), explanation: a.explanation.slice(0, 280) };
 }
 
 /** The decision matrix: what a judge answer may change. Citations must name evidence in the pack. */
@@ -622,24 +744,131 @@ export function decide(cls, answer, pack, cfg = DEFAULTS, isTrunkRun = false, id
   return { blocking: !EXON.has(cls), decision: "engine", answer: a };
 }
 
-/** Ask the judge about the findings that can still change the outcome; at most cfg.maxJudged, cfg.concurrency at a time. */
-export async function judge(findings, packs, ask, cfg = DEFAULTS, warn = () => {}, isTrunkRun = false) {
-  const EXON = exoneratedSet(isTrunkRun);
-  const queue = findings.map((f, i) => ({ f, pack: packs[i] })).filter((x) => !x.f.identity_unresolved && x.pack && (BORDERLINE.has(x.f.class) || EXON.has(x.f.class))).slice(0, cfg.maxJudged);
-  const workers = Array.from({ length: cfg.concurrency }, async () => {
-    for (;;) {
-      const item = queue.shift();
-      if (!item) return;
-      try {
-        const d = decide(item.f.class, await ask(item.pack), item.pack, cfg, isTrunkRun, Boolean(item.f.identity_unresolved));
-        Object.assign(item.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
-      } catch (e) {
-        warn(`judge unavailable for "${item.f.title}": ${String(e).slice(0, 200)}`);
-        Object.assign(item.f, { decision: "unavailable" });
-      }
+/**
+ * Whether any answer could change this finding's outcome, read off decide():
+ * a cleared finding can only be vetoed by citing a related diff hunk, and a
+ * blocked one only unblocked by citing a cross-PR recurrence, a related hunk
+ * or producer evidence. Without one in the pack, a call costs money and
+ * decides nothing.
+ */
+export function canChange(cls, pack, isTrunkRun = false) {
+  const ids = evidenceIds(pack);
+  const hunk = ids.some((id) => id.startsWith("hunk_"));
+  if (exoneratedSet(isTrunkRun).has(cls)) return hunk;
+  if (BORDERLINE.has(cls)) return hunk || ids.includes("cross_pr") || ids.includes("producer");
+  return false;
+}
+export const answerKey = (model, pack) => `v3:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + SYSTEM, pack)}`;
+
+// An answer that would change the outcome at a higher confidence, and fell short.
+function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
+  if (!answer || answer.confidence < cfg.escalateMin) return false;
+  const known = new Set(evidenceIds(pack));
+  const cited = answer.cited_evidence.filter((c) => known.has(c));
+  const hunk = cited.some((c) => c.startsWith("hunk_"));
+  if (exoneratedSet(isTrunkRun).has(cls)) return answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.vetoMin;
+  return BORDERLINE.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence &&
+    (hunk || cited.includes("cross_pr") || cited.includes("producer"));
+}
+
+/**
+ * Ask the model about the findings whose outcome an answer could change, in
+ * one call per model. Findings with the same spec and error share one
+ * question; answers already in cfg.answers are reused; a call that could cross
+ * cfg.budgetUsd is not made. Answers just short of a threshold go once to
+ * cfg.escalationModel. Every finding the model does not settle keeps the
+ * rules' outcome. Spend is recorded in the ledger.
+ */
+export async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {}, isTrunkRun = false, ledger = newLedger()) {
+  const groups = new Map();
+  for (const [i, f] of findings.entries()) {
+    const pack = packs[i];
+    if (!pack || f.identity_unresolved || !(BORDERLINE.has(f.class) || exoneratedSet(isTrunkRun).has(f.class))) continue;
+    if (!canChange(f.class, pack, isTrunkRun)) {
+      ledger.skipped.no_effect++;
+      f.ai = { skipped: "nothing the model could change" };
+      continue;
     }
-  });
-  await Promise.all(workers);
+    const sig = errorSignature(f.error);
+    const key = sig ? JSON.stringify([exoneratedSet(isTrunkRun).has(f.class), f.file, sig]) : `#${i}`;
+    if (groups.has(key)) {
+      ledger.skipped.duplicate++;
+      groups.get(key).members.push({ f, pack });
+    } else groups.set(key, { lead: { f, pack }, members: [{ f, pack }] });
+  }
+  let pending = [...groups.values()];
+  for (const g of pending.slice(cfg.maxJudged)) {
+    ledger.skipped.cap++;
+    for (const m of g.members) m.f.ai = { skipped: "over the per-run limit" };
+  }
+  pending = pending.slice(0, cfg.maxJudged);
+  const settle = (g, answer, error) => {
+    for (const m of g.members) {
+      if (error) {
+        Object.assign(m.f, { decision: "unavailable" });
+        continue;
+      }
+      const d = decide(m.f.class, answer, m.pack, cfg, isTrunkRun, false);
+      Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
+    }
+  };
+  const ask = async (model, batch) => {
+    const fresh = [];
+    for (const g of batch) {
+      const cached = cfg.answers?.[answerKey(model, g.lead.pack)];
+      if (cached) {
+        ledger.skipped.cached++;
+        g.answer = parseAnswer(JSON.stringify(cached));
+      } else fresh.push(g);
+    }
+    if (!fresh.length) return;
+    const chars = fresh.reduce((n, g) => n + JSON.stringify(g.lead.pack).length, SYSTEM.length);
+    const images = fresh.reduce((n, g) => n + (PACK_IMAGES.get(g.lead.pack)?.length ?? 0), 0);
+    const worst = costOf({ input_tokens: chars / 3 + images * 1600, output_tokens: 100 + 250 * fresh.length }, model, cfg.prices);
+    const spent = ledgerTotals(ledger).cost_usd ?? 0;
+    if (worst != null && spent + worst > cfg.budgetUsd) {
+      ledger.skipped.budget += fresh.length;
+      warn(`model call skipped: up to $${worst.toFixed(4)} would cross the $${cfg.budgetUsd} run budget`);
+      for (const g of fresh) for (const m of g.members) m.f.ai ??= { skipped: "over the run budget" };
+      return;
+    }
+    let res;
+    try {
+      res = await askMany(fresh.map((g) => g.lead.pack), model);
+    } catch (e) {
+      warn(`judge unavailable (${model}): ${String(e).slice(0, 200)}`);
+      for (const g of fresh) g.error = e;
+      return;
+    }
+    const cost = costOf(res.usage, model, cfg.prices);
+    ledger.calls.push({ model, served_model: res.served_model ?? model, findings: fresh.reduce((n, g) => n + g.members.length, 0), usage: res.usage, cost_usd: cost });
+    const share = cost == null ? null : cost / fresh.reduce((n, g) => n + g.members.length, 0);
+    for (const [i, g] of fresh.entries()) {
+      const a = res.answers[i];
+      if (a instanceof Error || !a) {
+        warn(`judge unavailable for "${g.lead.f.title}": ${String(a).slice(0, 200)}`);
+        g.error = a ?? new Error("no answer");
+      } else {
+        g.answer = a;
+        if (cfg.answers) cfg.answers[answerKey(model, g.lead.pack)] = { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence, explanation: a.explanation };
+      }
+      for (const m of g.members) m.f.ai = { model, cost_usd: share == null ? null : (m.f.ai?.cost_usd ?? 0) + share };
+    }
+  };
+  await ask(cfg.model, pending);
+  for (const g of pending) settle(g, g.answer, g.answer ? null : g.error ?? null);
+  const escalate = cfg.escalationModel && cfg.escalationModel !== cfg.model
+    ? pending.filter((g) => g.answer && nearMiss(g.lead.f.class, g.answer, g.lead.pack, cfg, isTrunkRun))
+    : [];
+  if (escalate.length) {
+    for (const g of escalate) delete g.answer;
+    await ask(cfg.escalationModel, escalate);
+    for (const g of escalate) {
+      if (!g.answer) continue;
+      settle(g, g.answer, null);
+      for (const m of g.members) m.f.escalated = true;
+    }
+  }
   return findings;
 }
 
@@ -652,35 +881,80 @@ export function verdictOf(findings, infra) {
 const md = (s) => String(s).replace(/[|<>`]/g, (c) => ({ "|": "&#124;", "<": "&lt;", ">": "&gt;", "`": "&#96;" })[c]).replace(/\r?\n/g, " ");
 const CAUSE = { caused_by_pr: "caused by this PR", flaky_environment: "flaky / environment", bug_on_master: "bug on trunk", test_bug: "test bug" };
 
-export function renderComment({ context, verdict, findings, infra, model, runURL, counts, mode = "report-only" }) {
+const RESULT = {
+  BROKEN_ON_TRUNK: "broken on master",
+  FLAKY_ON_TRUNK: "flaky on master",
+  FLAKY_CROSS_PR: "flaky on other PRs",
+  SAME_FAILURE_AS_CLEARED: "same failure as a cleared test",
+  REGRESSION: "likely regression",
+  INSUFFICIENT_DATA: "too little history",
+  OWNED_BY_PR: "spec changed by this PR",
+};
+const shortModel = (m) => String(m ?? "").replace(/^claude-/, "");
+const usd = (n) => (n == null ? "?" : n === 0 ? "$0" : n < 0.01 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`);
+const tokens = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+
+/** One sentence a PR author can act on: why this test was cleared or kept. */
+function whySentence(f) {
+  const t = f.trunk;
+  const a = f.judge;
+  const ai = a && `AI ${Math.round(a.confidence * 100)}%${a.cited_evidence.length ? ` (cites ${a.cited_evidence.join(", ")})` : ""}: ${a.explanation}`;
+  if (f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto") return ai;
+  if (f.decision === "evidence_incomplete" || f.identity_unresolved) return f.reason;
+  let why = {
+    BROKEN_ON_TRUNK: () => `master's latest run fails it too (${t.fails} of ${t.runs} master runs failed)`,
+    FLAKY_ON_TRUNK: () => `fails intermittently on master: ${t.fails} failed and ${t.flaky} flaky in ${t.runs} runs`,
+    FLAKY_CROSS_PR: () => `failed the same way on ${f.cross_pr.prs.length} other PRs while master passed`,
+    SAME_FAILURE_AS_CLEARED: () => `same error as ${f.same_as}, which history cleared`,
+    REGRESSION: () => `passes on master (${t.passes} of ${t.runs}) and no other PR fails it. Check your change, or merge master`,
+    INSUFFICIENT_DATA: () => `only ${t.runs} master runs, too few to tell a flake from a break`,
+    OWNED_BY_PR: () => "this PR edits the failing spec",
+  }[f.class]?.() ?? f.reason;
+  if (a && f.blocking) why += `. ${ai.replace(/^AI (\d+%)/, "AI $1, not enough to clear")}`;
+  if (f.producer) why += `. The run recorded ${f.producer.images.length} screenshot(s)${f.producer.notes ? " and notes" : ""}`;
+  return why;
+}
+
+function decidedBy(f) {
+  if (f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto")
+    return `AI · ${md(shortModel(f.judge?.provenance?.served_model ?? f.ai?.model))}${f.escalated ? " (escalated)" : ""}`;
+  return "rules";
+}
+
+export function renderComment({ context, verdict, findings, infra, model, runURL, counts, mode = "report-only", ai = newLedger() }) {
   const blocking = infra ? counts.failed : findings.filter((f) => f.blocking).length;
   const cleared = findings.filter((f) => !f.blocking).length;
-  const lines = [`<!-- e2e-triage:${md(context)} -->`, `## E2E triage: ${verdict}`, "",
-    `${counts.passed ?? 0} passed · ${counts.failed} failed · ${cleared} cleared · ${blocking} unresolved · ${counts.skipped ?? 0} skipped.`, ""];
+  const spend = ledgerTotals(ai);
+  const icon = verdict === "SUCCESS" ? "✅" : verdict === "FAILURE" ? "🔴" : "⚠️";
+  const lines = [`<!-- e2e-triage:${md(context)} -->`, `## E2E triage: ${icon} ${verdict}`, "",
+    `**${counts.failed} failed → ${infra ? 0 : cleared} cleared · ${blocking} blocking** · ${counts.passed ?? 0} passed · ${counts.skipped ?? 0} skipped · ` +
+    `AI: ${spend.calls} call(s), ${usd(spend.cost_usd)} · [run](${runURL})`, ""];
   if (infra) lines.push(`**Human investigation required.** ${md(infra)}`, "");
-  else if (verdict === "SUCCESS") lines.push("The evidence clears this run's failures under the triage rules.", "");
-  else lines.push("Review the unresolved failures below. Missing evidence does not establish that the PR caused them.", "");
-  lines.push(mode === "enforce" ? "Enforcement requested: this verdict is used for the commit status." : "Report-only: triage does not change the required commit status.", "",
-    `[Workflow run and logs](${runURL})`, "");
-  if (findings.length) {
-    lines.push("<details>", "<summary>Test evidence and model assessments</summary>", "",
-      "| Test / file | Finding | Trunk (runs / fails / flaky) | Other PRs failing | Why |",
-      "| --- | --- | --- | --- | --- |");
-    for (const f of [...findings].sort((a, b) => Number(b.blocking) - Number(a.blocking)))
-      lines.push(`| ${md(f.full_title || f.title)} — ${md(f.file)} | ${f.blocking ? "🔴" : "🟢"} ${f.class} | ${f.trunk.runs} / ${f.trunk.fails} / ${f.trunk.flaky} | ${f.cross_pr.prs.length} | ${md(f.reason)} |`);
-    const judged = findings.filter((f) => f.judge);
-    if (judged.length) {
-      // Name the model that answered, not the one asked for: they differ exactly
-      // when an alias has been repointed, which is when a reader needs to know.
-      const served = [...new Set(judged.map((f) => f.judge?.provenance?.served_model).filter(Boolean))];
-      lines.push("", `### Second judge (${md(served.length ? served.join(", ") : model)})`, "", "Confidence is the model's assessment, not a measured accuracy rate.", "");
-      for (const f of judged) {
-        const mark = f.decision === "adjudicator_unblock" ? "unblocked" : f.decision === "adjudicator_veto" ? "vetoed" : f.decision === "same_failure" ? "declined; cleared as the same failure" : f.blocking ? "still blocking" : "agreed";
-        if (f.producer) lines.push(`- **${md(f.full_title || f.title)}** — the run recorded ${f.producer.images.length} screenshot(s)${f.producer.notes ? ` and: ${md(f.producer.notes.slice(0, 300))}` : ""}`);
-        lines.push(`- **${md(f.full_title || f.title)}** — ${CAUSE[f.judge.cause] ?? md(f.judge.cause)} (${Math.round(f.judge.confidence * 100)}%, ${mark}; cites ${md(f.judge.cited_evidence.join(", ") || "nothing checkable")}): ${md(f.judge.explanation)}`);
-      }
-    }
-    lines.push("", "</details>");
+  lines.push(mode === "enforce" ? "Enforced: this verdict sets the commit status." : "Report-only: triage does not change the required commit status.", "");
+  const header = ["| Test | Result | Why | Decided by | Cost |", "| --- | --- | --- | --- | --- |"];
+  const row = (f) => {
+    const base = String(f.file ?? "").split("/").pop();
+    const label = f.decision === "adjudicator_unblock" ? CAUSE[f.judge.cause] ?? f.judge.cause : f.decision === "adjudicator_veto" ? "caused by this PR" : RESULT[f.class] ?? f.class;
+    const cost = f.ai?.model ? usd(f.ai.cost_usd) : "–";
+    return `| ${md(f.title)} · \`${md(base)}\` | ${f.blocking ? "🔴" : "✅"} ${md(label)} | ${md(whySentence(f))} | ${decidedBy(f)} | ${cost} |`;
+  };
+  const blocked = findings.filter((f) => f.blocking);
+  const clear = findings.filter((f) => !f.blocking);
+  if (blocked.length) lines.push(`### Blocking (${blocked.length})`, "", ...header, ...blocked.map(row), "");
+  if (clear.length) lines.push("<details>", `<summary>Cleared (${clear.length})</summary>`, "", ...header, ...clear.map(row), "", "</details>", "");
+  const sk = ai.skipped;
+  const skipped = [
+    sk.no_effect && `${sk.no_effect} with nothing the model could change`,
+    sk.duplicate && `${sk.duplicate} sharing another test's failure`,
+    sk.cached && `${sk.cached} answered before`,
+    sk.budget && `${sk.budget} over the run budget`,
+    sk.cap && `${sk.cap} over the per-run limit`,
+  ].filter(Boolean);
+  if (spend.calls || skipped.length) {
+    const used = spend.calls
+      ? `${spend.calls} call(s) (${[...new Set(ai.calls.map((c) => shortModel(c.served_model)))].join(", ")}) · ${tokens(spend.input_tokens)} tokens in${spend.cached_tokens ? ` (${tokens(spend.cached_tokens)} cached)` : ""} · ${tokens(spend.output_tokens)} out · **${usd(spend.cost_usd)}**`
+      : "no calls";
+    lines.push(`AI: ${used}${skipped.length ? ` · skipped: ${skipped.join(", ")}` : ""}. Confidence is the model's own estimate, not a measured accuracy.`);
   }
   return lines.join("\n");
 }
@@ -1050,7 +1324,7 @@ export function gh(fetchImpl, token) {
 /** Shared decision path for live runs and replay. Callers supply evidence, never publication. */
 export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranch, testRoot, cfg = DEFAULTS, prTitle = "", lane = id.name, ask, log = () => {}, evidence = [] }) {
   const isTrunkRun = prNumber == null;
-  const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(run.failing, cfg), counts: run.counts };
+  const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(run.failing, cfg), counts: run.counts, ai: newLedger() };
   if (run.failing.length && !result.infra) {
     const files = (diff.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
     const changed = files.map((f) => f.filename);
@@ -1084,10 +1358,10 @@ export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranc
         if (f.class !== "OWNED_BY_PR") Object.assign(f, { blocking: true, decision: "evidence_incomplete", reason: `${f.reason} ${blind}, so this could not be confirmed.` });
     }
     if (!blind && ask && prNumber) {
-      const others = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200) }));
+      const others = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const pr = { number: prNumber, repository: id.repository, title: prTitle, lane };
       const packs = result.findings.map((f) => (f.class === "OWNED_BY_PR" || f.identity_unresolved ? null : buildPack(f, files, pr, others)));
-      await judge(result.findings, packs, ask, cfg, log, isTrunkRun);
+      await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
     }
     if (!blind && prNumber) sameFailure(result.findings);
   }
@@ -1095,8 +1369,28 @@ export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranc
   return result;
 }
 
+/** Engine settings from the action's environment. An empty ESCALATION_MODEL turns escalation off. */
+export function configFrom(env) {
+  let prices = PRICES;
+  if (env.AI_PRICES) {
+    try {
+      prices = { ...PRICES, ...JSON.parse(env.AI_PRICES) };
+    } catch {
+      throw new Error("AI_PRICES is not valid JSON");
+    }
+  }
+  return {
+    ...DEFAULTS,
+    minConfidence: Number(env.MIN_CONFIDENCE || DEFAULTS.minConfidence),
+    model: env.CLAUDE_MODEL || DEFAULTS.model,
+    escalationModel: env.ESCALATION_MODEL ?? DEFAULTS.escalationModel,
+    budgetUsd: env.AI_BUDGET_USD ? Number(env.AI_BUDGET_USD) : DEFAULTS.budgetUsd,
+    prices,
+  };
+}
+
 export async function triage({ env, fetchImpl = fetch, log = console.error, now = new Date() }) {
-  const cfg = { ...DEFAULTS, minConfidence: Number(env.MIN_CONFIDENCE || DEFAULTS.minConfidence), model: env.CLAUDE_MODEL || DEFAULTS.model };
+  const cfg = configFrom(env);
   const id = JSON.parse(env.COMPOSITE_IDENTITY);
   const prNumber = Number(id.gh_pr_number || env.PR_NUMBER || 0) || null;
   // No PR number means this is a trunk run. The question then is not "is this
@@ -1128,18 +1422,31 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       fetchChangedFiles(api, id, prNumber, log),
     ]);
   }
+  // Answers from an earlier attempt at the same evidence, so a re-run does not pay twice.
+  if (env.ANSWERS_CACHE) {
+    try {
+      cfg.answers = existsSync(env.ANSWERS_CACHE) ? JSON.parse(readFileSync(env.ANSWERS_CACHE, "utf8")) : {};
+    } catch (e) {
+      log(`answers cache unreadable, starting empty: ${String(e).slice(0, 120)}`);
+      cfg.answers = {};
+    }
+  }
   const result = await evaluateRun({
     run, id, prNumber, history, diff, trunkBranch, testRoot, cfg,
     prTitle: pull.title ?? "", lane: env.LANE || id.name, log,
-    ask: env.ANTHROPIC_API_KEY ? (pack) => askModel(fetchImpl, env.ANTHROPIC_API_KEY, cfg.model, pack) : null,
+    ask: env.ANTHROPIC_API_KEY ? (packs, model) => askModelBatch(fetchImpl, env.ANTHROPIC_API_KEY, model, packs) : null,
     evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
   });
   const context = env.STATUS_CONTEXT;
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
   const enforce = String(env.MODE ?? "").trim() === "enforce";
-  const comment = renderComment({ mode: enforce ? "enforce" : "report-only", context, verdict: result.verdict, findings: result.findings, infra: result.infra, model: cfg.model, runURL, counts: run.counts });
+  if (env.ANSWERS_CACHE && cfg.answers) writeFileSync(env.ANSWERS_CACHE, JSON.stringify(cfg.answers));
+  const comment = renderComment({ mode: enforce ? "enforce" : "report-only", context, verdict: result.verdict, findings: result.findings, infra: result.infra, model: cfg.model, runURL, counts: run.counts, ai: result.ai });
   const description = statusDescription(result.verdict, result.findings, result.infra, run.counts);
-  if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `verdict=${result.verdict}\nblocking=${result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\n`);
+  const spend = ledgerTotals(result.ai);
+  if (env.GITHUB_OUTPUT)
+    appendFileSync(env.GITHUB_OUTPUT, `verdict=${result.verdict}\nblocking=${result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\n` +
+      `ai_calls=${spend.calls}\nai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}\nai_input_tokens=${spend.input_tokens}\nai_output_tokens=${spend.output_tokens}\n`);
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, comment + "\n");
   // Report-only unless the caller explicitly and validly asks otherwise. An
   // omitted mode, a typo, or a variable that failed to expand must never be the
@@ -1189,7 +1496,7 @@ export async function replay({ runsPath, answersPath, comparePath, base, outPath
   const runs = JSON.parse(readFileSync(runsPath, "utf8"));
   const answers = answersPath && existsSync(answersPath) ? JSON.parse(readFileSync(answersPath, "utf8")) : {};
   const compares = comparePath ? JSON.parse(readFileSync(comparePath, "utf8")) : {};
-  const cfg = { ...DEFAULTS, minConfidence: Number(env.MIN_CONFIDENCE || DEFAULTS.minConfidence), model: env.CLAUDE_MODEL || DEFAULTS.model };
+  const cfg = { ...configFrom(env), answers };
   const results = [];
   const skipped = [];
   for (const [i, r] of runs.entries()) {
@@ -1225,25 +1532,21 @@ export async function replay({ runsPath, answersPath, comparePath, base, outPath
       result = await evaluateRun({
         run, id, prNumber, history, diff, trunkBranch, testRoot, cfg,
         prTitle: cmp?.pr_title ?? "", lane: r.lane || env.LANE || id.name, log,
-        ask: async (pack) => {
-          // Legacy leaf-title answers cannot prove which test or evidence the
-          // model saw. Cache the full pack and system prompt, not a display name.
-          const key = `v3:${packKey(cfg.model + "\n" + JSON.stringify(samplingFor(cfg.model)) + "\n" + SYSTEM, pack)}`;
-          if (answers[key]) return parseAnswer(JSON.stringify(answers[key]));
+        // Answers are keyed by model, system prompt and the full evidence pack
+        // (see answerKey), never by a display name, and looked up in judge().
+        ask: async (packs, model) => {
           if (!env.ANTHROPIC_API_KEY) throw new Error("no answer for this evidence pack");
-          const answer = await askModel(fetchImpl, env.ANTHROPIC_API_KEY, cfg.model, pack);
-          answers[key] = answer;
-          if (answersPath) writeFileSync(answersPath, JSON.stringify(answers, null, 1));
-          return answer;
+          return askModelBatch(fetchImpl, env.ANTHROPIC_API_KEY, model, packs);
         },
       });
+      if (answersPath) writeFileSync(answersPath, JSON.stringify(answers, null, 1));
     } catch (e) {
       log(`[${i + 1}/${runs.length}] ${r.pr} ${r.name}: ${e}`);
       skipped.push({ ...r, why: String(e).slice(0, 200) });
       continue;
     }
     const { verdict, findings, infra } = result;
-    results.push({ ...r, verdict, infra: Boolean(infra), classes: findings.map((f) => f.class), decisions: findings.map((f) => ({
+    results.push({ ...r, verdict, infra: Boolean(infra), ai: ledgerTotals(result.ai), classes: findings.map((f) => f.class), decisions: findings.map((f) => ({
       identity: identityKey(f), title: f.title, full_title: f.full_title, report_scope: f.report_scope,
       class: f.class, blocking: f.blocking, decision: f.decision ?? "engine", judge: f.judge ?? null,
     })) });

@@ -23,6 +23,14 @@ import {
   decide,
   evidenceIds,
   errorSignature,
+  newLedger,
+  canChange,
+  compactError,
+  costOf,
+  priceFor,
+  configFrom,
+  answerKey,
+  askModelBatch,
   evidenceFor,
   loadEvidence,
   sameFailure,
@@ -186,20 +194,28 @@ test("a claim that master is broken cannot unblock on its own", () => {
   const real = decide("REGRESSION", { cause: "bug_on_master", confidence: 0.99, cited_evidence: ["cross_pr"], explanation: "x" }, pack);
   assert.equal(real.blocking, false, "a checkable citation still clears it");
 });
-test("judge caps the number of findings and survives outages", async () => {
-  const findings = Array.from({ length: 10 }, (_, i) => classify({ ...failing, title: `t${i}` }, [...trunkPasses(8), ...crossPR(31, 32)], [], undefined, 1));
-  const packs = findings.map((f) => buildPack(f, [], { number: 1, repository: "o/r", title: "", lane: "l" }, []));
-  let calls = 0;
-  await judge(findings, packs, async () => {
-    calls++;
-    if (calls === 2) throw new Error("boom");
-    return { cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "x" };
-  });
-  assert.equal(calls, 8);
-  assert.equal(findings.filter((f) => f.decision === "adjudicator_unblock").length, 7);
-  assert.equal(findings.filter((f) => f.decision === "unavailable").length, 1);
-  assert.equal(findings.slice(8).every((f) => f.blocking && !f.decision), true);
-  assert.equal(verdictOf(findings, null), "FAILURE");
+test("judge asks once per run, caps the findings it sends and survives an outage", async () => {
+  const make = () => Array.from({ length: 10 }, (_, i) => classify({ ...failing, title: `t${i}` }, [...trunkPasses(8), ...crossPR(31, 32)], [], undefined, 1));
+  const packsOf = (findings) => findings.map((f) => buildPack(f, [], { number: 1, repository: "o/r", title: "", lane: "l" }, []));
+  const answer = { cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "x" };
+  const sent = [];
+  const findings = make();
+  const ledger = newLedger();
+  await judge(findings, packsOf(findings), async (packs, model) => {
+    sent.push({ n: packs.length, model });
+    return { answers: packs.map(() => answer), usage: { input_tokens: 10000, output_tokens: 1000 } };
+  }, { ...DEFAULTS, escalationModel: "" }, () => {}, false, ledger);
+  assert.deepEqual(sent, [{ n: 8, model: DEFAULTS.model }], "one call carries up to maxJudged findings");
+  assert.equal(findings.filter((f) => f.decision === "adjudicator_unblock").length, 8);
+  assert.equal(findings.slice(8).every((f) => f.blocking && !f.decision && f.ai.skipped), true);
+  assert.equal(ledger.skipped.cap, 2);
+  assert.equal(ledger.calls[0].cost_usd, (10000 * 1 + 1000 * 5) / 1e6, "priced at Haiku 4.5 list price");
+
+  const down = make();
+  await judge(down, packsOf(down), async () => { throw new Error("boom"); }, DEFAULTS, () => {});
+  assert.equal(down.filter((f) => f.decision === "unavailable").length, 8, "an outage leaves every asked finding on the rules' outcome");
+  assert.equal(down.every((f) => f.blocking), true);
+  assert.equal(verdictOf(down, null), "FAILURE");
 });
 test("parseAnswer rejects anything it would otherwise have to repair", () => {
   const ok = { cause: "test_bug", confidence: 0.5, cited_evidence: ["a"], explanation: "e" };
@@ -233,6 +249,15 @@ function fakeFetch(routes) {
   };
   impl.calls = calls;
   return impl;
+}
+// A Messages API reply in the shape the request asked for: one answer per
+// finding id for a run's batch, a bare answer for a single pack.
+function modelReply(init, answer, usage = { input_tokens: 2000, output_tokens: 150 }) {
+  const body = JSON.parse(init.body);
+  const text = typeof body.messages[0].content === "string" ? body.messages[0].content : body.messages[0].content.at(-1).text;
+  const ids = [...new Set(text.match(/"id":"f\d+"/g) ?? [])].map((m) => m.slice(6, -1));
+  const reply = body.output_config.format.schema.properties.answers ? { answers: ids.map((id) => ({ id, ...answer })) } : answer;
+  return Response.json({ model: body.model, stop_reason: "end_turn", usage, content: [{ type: "text", text: JSON.stringify(reply) }] });
 }
 // TSIO run fixtures: one group, one suite per spec, one case row per attempt.
 const caseRow = (title, status, retry = 0, suite = "s1") => ({ suite_id: suite, title, status, retry_count: retry, ordinal: 0, error_message: status === "passed" ? null : "Error: expected visible", error_stack: null });
@@ -604,7 +629,7 @@ test("a blocked failure with the same spec and error as a cleared one is cleared
   // The judge declined it first; its section must not read as agreement.
   const judged = { ...blocked, judge: { cause: "flaky_environment", confidence: 0.5, cited_evidence: [], explanation: "unsure" } };
   const comment = renderComment({ context: "c", verdict: "SUCCESS", findings: [anchor, judged], infra: null, model: "m", runURL: "u", counts: { failed: 2 } });
-  assert.match(comment, /declined; cleared as the same failure/);
+  assert.match(comment, /same failure as a cleared test \| same error as MM-T6301_1/);
   assert.doesNotMatch(comment, /agreed/);
 });
 test("the same-failure rule needs the same spec, a specific error and an anchor history cleared", () => {
@@ -728,28 +753,183 @@ test("end to end: a timeout the judge clears from the screenshot the run recorde
     ["/pulls/5", () => Response.json({ title: "ci only", base: { ref: "main" } })],
     ["api.anthropic.com", (init) => {
       sent.push(JSON.parse(init.body));
-      return Response.json({ model: sent.at(-1).model, stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify(answer) }] });
+      return modelReply(init, answer);
     }],
   ]);
   const base = { ...env, MODE: "report-only", COMPOSITE_IDENTITY: JSON.stringify(identity) };
   try {
     const result = await triage({ env: { ...base, EVIDENCE_DIR: dir }, fetchImpl: routes(), log: () => {} });
-    const [image, text] = sent[0].messages[0].content;
-    assert.deepEqual([image.type, image.source.media_type, image.source.data], ["image", "image/png", PNG(7).toString("base64")], "the screenshot goes first, as an image");
-    assert.match(text.text, /Valid evidence ids to cite: .*producer/);
+    const [label, image, text] = sent[0].messages[0].content;
+    assert.equal(label.text, "Screenshots recorded for f1:");
+    assert.deepEqual([image.type, image.source.media_type, image.source.data], ["image", "image/png", PNG(7).toString("base64")], "the screenshot goes before the evidence, as an image");
+    assert.match(text.text, /"valid_evidence_ids":\[[^\]]*"producer"/);
     assert.match(text.text, /posts\/6qgx\/pin/);
     assert.equal(result.findings[0].decision, "adjudicator_unblock");
     assert.equal(result.verdict, "SUCCESS");
 
-    // Without evidence there is no producer item, so citing it proves nothing.
+    // Without evidence there is nothing the model could cite, so it is not asked.
     sent.length = 0;
     const without = await triage({ env: base, fetchImpl: routes(), log: () => {} });
-    assert.equal(typeof sent[0].messages[0].content, "string", "a pack without screenshots is sent as before");
+    assert.equal(sent.length, 0);
     assert.equal(without.findings[0].blocking, true);
+    assert.equal(without.ai.skipped.no_effect, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+// ---------------------------------------------------------------- AI spend
+
+const prCtx = { number: 1, repository: "o/r", title: "", lane: "l" };
+const ok = (answer) => async (packs) => ({ answers: packs.map(() => answer), usage: { input_tokens: 3000, output_tokens: 200 }, served_model: DEFAULTS.model });
+const flakyAnswer = { cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "recurs elsewhere" };
+
+test("the model is asked only when its answer could change the outcome", async () => {
+  // mattermost#38601: three tests master also fails, on a PR that changes only CI
+  // files. A cleared finding can only be vetoed by citing a related hunk; there is none.
+  const cleared = classify(failing, [obs({ status: "failed" }), ...trunkPasses(8)], [], undefined, 1);
+  assert.equal(cleared.class, "BROKEN_ON_TRUNK");
+  const ci = [{ filename: ".github/workflows/e2e.yml", patch: "@@ ci" }];
+  assert.equal(canChange(cleared.class, buildPack(cleared, ci, prCtx, [])), false);
+  assert.equal(canChange(cleared.class, buildPack(cleared, [{ filename: "specs/a.spec.ts", patch: "@@ spec" }], prCtx, [])), true, "a related hunk could support a veto");
+
+  // A blocked finding needs something to cite before an answer could clear it.
+  const regression = classify(failing, trunkPasses(8), [], undefined, 1);
+  assert.equal(canChange(regression.class, buildPack(regression, ci, prCtx, [])), false);
+  assert.equal(canChange(regression.class, buildPack(classify(failing, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1), ci, prCtx, [])), true);
+
+  let calls = 0;
+  const ledger = newLedger();
+  const findings = [cleared, regression];
+  await judge(findings, findings.map((f) => buildPack(f, ci, prCtx, [])), async () => { calls++; }, DEFAULTS, () => {}, false, ledger);
+  assert.equal(calls, 0);
+  assert.equal(ledger.skipped.no_effect, 2);
+  assert.deepEqual(findings.map((f) => f.blocking), [false, true], "the rules' outcome stands");
+});
+
+test("tests failing with one spec and error share one question", async () => {
+  const error = "TypeError: Cannot read properties of undefined (reading 'id') at Object.<anonymous> (/x/a.e2e.ts:12:3)";
+  // Another PR failed these tests with the same error, so there is something to cite.
+  const findings = ["t1", "t2", "t3"].map((title) => classify({ ...failing, title, error }, [...trunkPasses(8), ...crossPR(31).map((o) => ({ ...o, title, error_excerpt: error }))], [], undefined, 1));
+  const ledger = newLedger();
+  const sent = [];
+  await judge(findings, findings.map((f) => buildPack(f, [], prCtx, [])), async (packs, model) => { sent.push(packs.length); return ok(flakyAnswer)(packs, model); }, { ...DEFAULTS, escalationModel: "" }, () => {}, false, ledger);
+  assert.deepEqual(sent, [1]);
+  assert.equal(ledger.skipped.duplicate, 2);
+  assert.equal(findings.every((f) => f.decision === "adjudicator_unblock"), true, "each is decided against its own evidence");
+  assert.ok(Math.abs(findings.reduce((n, f) => n + f.ai.cost_usd, 0) - ledger.calls[0].cost_usd) < 1e-12, "the call's cost is split across the tests it answered");
+});
+
+test("an answer already given for the same evidence is reused, not paid for again", async () => {
+  const f = classify(failing, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1);
+  const pack = buildPack(f, [], prCtx, []);
+  const cfg = { ...DEFAULTS, escalationModel: "", answers: { [answerKey(DEFAULTS.model, pack)]: flakyAnswer } };
+  let calls = 0;
+  const ledger = newLedger();
+  await judge([f], [pack], async () => { calls++; }, cfg, () => {}, false, ledger);
+  assert.equal(calls, 0);
+  assert.equal(ledger.skipped.cached, 1);
+  assert.equal(f.decision, "adjudicator_unblock");
+});
+
+test("a call that could cross the run budget is not made", async () => {
+  const f = classify(failing, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1);
+  let calls = 0;
+  const ledger = newLedger();
+  const warnings = [];
+  await judge([f], [buildPack(f, [], prCtx, [])], async () => { calls++; }, { ...DEFAULTS, budgetUsd: 0.0001 }, (w) => warnings.push(w), false, ledger);
+  assert.equal(calls, 0);
+  assert.equal(ledger.skipped.budget, 1);
+  assert.equal(f.blocking, true, "over budget, the failure stays red");
+  assert.match(warnings[0], /run budget/);
+});
+
+test("an answer just short of the threshold goes once to the escalation model", async () => {
+  const f = classify(failing, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1);
+  const ledger = newLedger();
+  const asked = [];
+  await judge([f], [buildPack(f, [], prCtx, [])], async (packs, model) => {
+    asked.push(model);
+    const confidence = model === DEFAULTS.model ? 0.75 : 0.92;
+    return { answers: packs.map(() => ({ ...flakyAnswer, confidence })), usage: { input_tokens: 3000, output_tokens: 200 }, served_model: model };
+  }, DEFAULTS, () => {}, false, ledger);
+  assert.deepEqual(asked, [DEFAULTS.model, "claude-opus-5-5"]);
+  assert.equal(f.decision, "adjudicator_unblock");
+  assert.equal(f.escalated, true);
+  assert.equal(ledger.calls[1].cost_usd, (3000 * 4 + 200 * 20) / 1e6, "priced at Opus 5.5 list price");
+
+  // A confident answer, a refusal, and an answer below the band are not escalated.
+  for (const confidence of [0.95, 0.4]) {
+    const g = classify(failing, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1);
+    const models = [];
+    await judge([g], [buildPack(g, [], prCtx, [])], async (packs, model) => { models.push(model); return ok({ ...flakyAnswer, confidence })(packs, model); }, DEFAULTS, () => {});
+    assert.deepEqual(models, [DEFAULTS.model], `confidence ${confidence}`);
+  }
+});
+
+test("prices are looked up by model family and can be overridden", () => {
+  assert.deepEqual(priceFor("claude-haiku-4-5-20251001"), priceFor("claude-haiku-4-5"));
+  assert.equal(priceFor("claude-haiku-4"), null, "a prefix of a different name is not that model");
+  assert.equal(costOf({ input_tokens: 1e6, output_tokens: 1e6, cache_read_input_tokens: 1e6, cache_creation_input_tokens: 1e6 }, "claude-opus-5-5"), 4 + 20 + 0.2 + 5);
+  assert.equal(costOf({ input_tokens: 10 }, "some-future-model"), null, "an unpriced model has an unknown cost, not zero");
+  const cfg = configFrom({ AI_PRICES: JSON.stringify({ "some-future-model": { input: 3, output: 15, cache_write: 3.75, cache_read: 0.3 } }), ESCALATION_MODEL: "", AI_BUDGET_USD: "0.2" });
+  assert.equal(costOf({ input_tokens: 1e6 }, "some-future-model", cfg.prices), 3);
+  assert.equal(cfg.escalationModel, "", "an empty value turns escalation off");
+  assert.equal(cfg.budgetUsd, 0.2);
+  assert.throws(() => configFrom({ AI_PRICES: "{" }), /AI_PRICES/);
+});
+
+test("the evidence sent is the part that explains the failure", () => {
+  const error = ["Error: expect(locator).toBeVisible() failed", "Locator: getByTestId('chip')", "    at /repo/node_modules/playwright/lib/x.js:1:1",
+    "    at Object.<anonymous> (/repo/specs/a.spec.ts:40:9)", "    at node:internal/process/task_queues:105:5", "    at helper (/repo/support/ui.ts:7:3)",
+    "    at more (/repo/support/a.ts:1:1)", "    at evenMore (/repo/support/b.ts:1:1)"].join("\n");
+  assert.equal(compactError(error), "Error: expect(locator).toBeVisible() failed\nLocator: getByTestId('chip')\nat Object.<anonymous> (/repo/specs/a.spec.ts:40:9)\nat helper (/repo/support/ui.ts:7:3)\nat more (/repo/support/a.ts:1:1)");
+  assert.equal(compactError("x".repeat(2000)).length, 800);
+
+  const f = classify({ ...failing, error }, trunkPasses(8), [], undefined, 1);
+  const files = [{ filename: "app/login.ts", patch: "@@ unrelated" }, { filename: "specs/a.spec.ts", patch: "@@ spec" }];
+  const others = [
+    { class: "REGRESSION", title: "t1", file: "specs/a.spec.ts", signature: null },
+    { class: "REGRESSION", title: "sibling", file: "specs/a.spec.ts", signature: null },
+    { class: "REGRESSION", title: "elsewhere", file: "specs/b.spec.ts", signature: "different" },
+  ];
+  const pack = buildPack(f, files, prCtx, others);
+  assert.deepEqual(pack.diff_hunks_of_files_named_in_error.map((h) => h.id), ["hunk_1"], "only the related hunk, under its place in the diff");
+  assert.deepEqual(pack.other_failures_in_same_run.map((o) => o.title), ["sibling"], "only failures that share the spec or the error");
+});
+
+test("one request carries a run's findings with the shared context once", async () => {
+  const packs = ["t1", "t2"].map((title) => buildPack(classify({ ...failing, title }, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1), [{ filename: "specs/a.spec.ts", patch: "@@ spec" }], prCtx, []));
+  let body;
+  const res = await askModelBatch(async (_u, init) => { body = JSON.parse(init.body); return modelReply(init, flakyAnswer, { input_tokens: 1234, output_tokens: 56 }); }, "k", DEFAULTS.model, packs);
+  assert.equal(typeof body.system, "string", "no cache marker: the prompt is below Haiku 4.5's minimum cacheable length");
+  assert.equal(body.max_tokens, 600);
+  assert.equal(body.messages[0].content.match(/@@ spec/g).length, 1, "a hunk shared by both findings is sent once");
+  assert.deepEqual(res.answers.map((a) => a.cause), ["flaky_environment", "flaky_environment"]);
+  assert.deepEqual(res.usage, { input_tokens: 1234, output_tokens: 56 });
+  assert.match(res.answers[1].provenance.pack_hash, /^[0-9a-f]{64}$/);
+
+  // An answer missing for one finding fails that finding only.
+  const partial = await askModelBatch(async (_u, init) => Response.json({ model: DEFAULTS.model, stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify({ answers: [{ id: "f2", ...flakyAnswer }] }) }] }), "k", DEFAULTS.model, packs);
+  assert.ok(partial.answers[0] instanceof Error);
+  assert.equal(partial.answers[1].cause, "flaky_environment");
+});
+
+test("the summary leads with what blocks and says what the model cost", () => {
+  const blocked = classify({ ...failing, title: "MM-T5803 subtitle" }, trunkPasses(25), [], undefined, 1);
+  const cleared = { ...classify({ ...failing, title: "MM-T5828 redacts" }, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1),
+    blocking: false, decision: "adjudicator_unblock", ai: { model: DEFAULTS.model, cost_usd: 0.0031 },
+    judge: { ...flakyAnswer, confidence: 0.9, provenance: { served_model: "claude-haiku-4-5-20251001" } } };
+  const ai = { calls: [{ model: DEFAULTS.model, served_model: "claude-haiku-4-5-20251001", findings: 1, usage: { input_tokens: 2100, output_tokens: 120, cache_read_input_tokens: 0 }, cost_usd: 0.0031 }],
+    skipped: { no_effect: 3, duplicate: 0, cached: 0, cap: 0, budget: 0 } };
+  const c = renderComment({ context: "c", verdict: "FAILURE", findings: [cleared, blocked], infra: null, model: "m", runURL: "u", counts: { failed: 2, passed: 10, skipped: 1 }, ai });
+  assert.match(c, /\*\*2 failed → 1 cleared · 1 blocking\*\* · 10 passed · 1 skipped · AI: 1 call\(s\), \$0\.0031/);
+  assert.ok(c.indexOf("### Blocking (1)") < c.indexOf("<summary>Cleared (1)</summary>"), "what blocks comes first, open");
+  assert.match(c, /MM-T5803 subtitle · `a\.spec\.ts` \| 🔴 likely regression \| passes on master \(25 of 25\) and no other PR fails it\. Check your change, or merge master \| rules \| – \|/);
+  assert.match(c, /✅ flaky \/ environment \| AI 90% \(cites cross_pr\): recurs elsewhere \| AI · haiku-4-5-20251001 \| \$0\.0031 \|/);
+  assert.match(c, /AI: 1 call\(s\) \(haiku-4-5-20251001\) · 2\.1k tokens in · 120 out · \*\*\$0\.0031\*\* · skipped: 3 with nothing the model could change/);
+  assert.doesNotMatch(c, /Second judge|Test \/ file/, "the old essay and column layout are gone");
+});
+
 test("a failure skipped on retry is still a failure", async () => {
   // Serial describe on desktop: attempt 0 fails, attempt 1 skips the rest of the
   // block. Read as skipped, the failure never reached triage and enforce wrote
@@ -955,9 +1135,11 @@ test("end to end: a regression the judge clears with cross-PR evidence turns the
     ["/pulls/5/files", () => Response.json([{ filename: "app/login.ts", patch: "@@ -1 +1 @@" }])],
     ["/pulls/5", () => Response.json({ title: "Fix login", base: { ref: "master" } })],
     ["api.anthropic.com", (init) => {
-      assert.ok(JSON.parse(init.body).messages[0].content.includes("hunk_0"));
+      const text = JSON.parse(init.body).messages[0].content;
+      assert.match(text, /"valid_evidence_ids":\[[^\]]*"cross_pr"/);
+      assert.doesNotMatch(text, /@@ -1 \+1 @@/, "a hunk unrelated to the failure is not sent");
       assert.equal(init.headers["x-api-key"], "AK");
-      return Response.json({ model: JSON.parse(init.body).model, stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify({ cause: "flaky_environment", confidence: 0.9, cited_evidence: ["cross_pr", "error"], explanation: "recurs on PR 1" }) }] });
+      return modelReply(init, { cause: "flaky_environment", confidence: 0.9, cited_evidence: ["cross_pr", "error"], explanation: "recurs on PR 1" });
     }],
     ["/issues/5/comments", (init) => (init.method === "POST" ? Response.json({ id: 1 }) : Response.json([]))],
     ["/statuses/abc", (init) => {
@@ -1054,7 +1236,7 @@ test("provenance is recorded with the answer and named in the comment", async ()
 
   const f = { ...classify(failing, trunkPasses(8), []), judge: { ...a, cited_evidence: ["cross_pr"] }, decision: "adjudicator_unblock", blocking: false };
   const c = renderComment({ context: "c", verdict: "SUCCESS", findings: [f], infra: null, model: "claude-haiku-4-5", runURL: "u", counts: { failed: 1 } });
-  assert.ok(c.includes("Second judge (claude-haiku-4-5-20251001)"), "the header names the model that answered, not the alias that was asked for");
+  assert.ok(c.includes("AI · haiku-4-5-20251001"), "the row names the model that answered, not the alias that was asked for");
 });
 
 test("temperature is sent only to models that accept it", async () => {

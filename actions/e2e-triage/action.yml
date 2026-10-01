@@ -75,6 +75,33 @@ inputs:
     description: Optional lane label shown to the judge (defaults to the run name)
     required: false
     default: ""
+  escalation-model:
+    description: >
+      Stronger model asked again, once per run, about answers that land just short
+      of a threshold on a finding they could change (confidence from 0.6 up to the
+      clear or veto threshold). Empty turns escalation off.
+    required: false
+    default: claude-opus-5-5
+  ai-budget-usd:
+    description: >
+      Per-run ceiling on model spend in USD. A call whose worst case would cross
+      it is not made, and its findings keep the rules' outcome.
+    required: false
+    default: "0.5"
+  ai-prices:
+    description: >
+      Optional JSON of model prices in USD per million tokens, merged over the
+      built-in table: {"model-family": {"input", "output", "cache_write", "cache_read"}}.
+      A model without a price reports tokens at an unknown cost.
+    required: false
+    default: ""
+  answers-cache:
+    description: >
+      Optional file of earlier model answers keyed by model, prompt and the full
+      evidence. Read before asking and written after, so a re-run with the same
+      evidence does not pay again. Persist it with actions/cache.
+    required: false
+    default: ""
   evidence-dir:
     description: >
       Optional directory of producer evidence for failing tests: JSON files of
@@ -85,6 +112,12 @@ inputs:
     required: false
     default: ""
 outputs:
+  ai-calls:
+    description: Model calls this run made
+    value: ${{ steps.triage.outputs.ai_calls }}
+  ai-cost-usd:
+    description: What those calls cost in USD at list price, or "unknown" for an unpriced model
+    value: ${{ steps.triage.outputs.ai_cost_usd }}
   verdict:
     description: SUCCESS, FAILURE or ACTION_REQUIRED (run-level investigation)
     value: ${{ steps.triage.outputs.verdict }}
@@ -116,4 +149,8 @@ runs:
         REPORT_NAME: ${{ inputs.report-name }}
         LANE: ${{ inputs.lane }}
         EVIDENCE_DIR: ${{ inputs.evidence-dir }}
+        ESCALATION_MODEL: ${{ inputs.escalation-model }}
+        AI_BUDGET_USD: ${{ inputs.ai-budget-usd }}
+        AI_PRICES: ${{ inputs.ai-prices }}
+        ANSWERS_CACHE: ${{ inputs.answers-cache }}
       run: node "${{ github.action_path }}/../../scripts/e2e-triage.mjs"
