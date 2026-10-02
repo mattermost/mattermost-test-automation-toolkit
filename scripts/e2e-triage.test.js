@@ -911,7 +911,48 @@ test("one request carries a run's findings with the shared context once", async 
   // An answer missing for one finding fails that finding only.
   const partial = await askModelBatch(async (_u, init) => Response.json({ model: DEFAULTS.model, stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify({ answers: [{ id: "f2", ...flakyAnswer }] }) }] }), "k", DEFAULTS.model, packs);
   assert.ok(partial.answers[0] instanceof Error);
+  assert.equal(partial.answers[0].missing, true, "marked so the judge can ask again");
+  assert.match(String(partial.answers[0]), /no answer for f1 \(the response answered: f2\)/);
   assert.equal(partial.answers[1].cause, "flaky_environment");
+
+  // The request names every id it expects and the schema accepts no other.
+  assert.match(body.messages[0].content, /Return exactly 2 answer\(s\), one for each of: f1, f2\./);
+  assert.deepEqual(body.output_config.format.schema.properties.answers.items.properties.id, { type: "string", enum: ["f1", "f2"] });
+});
+
+test("judge asks again, once, about a finding the response left out", async () => {
+  const make = () => ["t1", "t2", "t3"].map((title) => classify({ ...failing, title }, [...trunkPasses(8), ...crossPR(31, 32)], [], undefined, 1));
+  const packsOf = (findings) => findings.map((f) => buildPack(f, [], { number: 1, repository: "o/r", title: "", lane: "l" }, []));
+  const answer = { cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "x" };
+  const leaveOut = (skip) => async (packs) => ({
+    answers: packs.map((_, i) => (skip.includes(i) ? Object.assign(new Error(`no answer for f${i + 1}`), { missing: true }) : answer)),
+    usage: { input_tokens: 1000, output_tokens: 100 },
+  });
+
+  const findings = make();
+  const sent = [];
+  const warnings = [];
+  const ledger = newLedger();
+  let call = 0;
+  await judge(findings, packsOf(findings), async (packs, model) => {
+    sent.push(packs.map((p) => p.test.title));
+    return (call++ === 0 ? leaveOut([0, 2]) : leaveOut([]))(packs, model);
+  }, { ...DEFAULTS, escalationModel: "" }, (w) => warnings.push(w), false, ledger);
+  assert.deepEqual(sent, [["t1", "t2", "t3"], ["t1", "t3"]], "only the left-out findings are asked again");
+  assert.equal(findings.every((f) => f.decision === "adjudicator_unblock"), true);
+  assert.equal(ledger.calls.length, 2, "both calls are paid for and recorded");
+  assert.equal(warnings.some((w) => /judge unavailable/.test(w)), false, "a recovered answer is not reported as unavailable");
+
+  // Left out twice: the finding keeps the rules' outcome, and there is no third call.
+  const stubborn = make();
+  const again = [];
+  let calls = 0;
+  await judge(stubborn, packsOf(stubborn), async (packs, model) => { calls++; return leaveOut([0])(packs, model); }, { ...DEFAULTS, escalationModel: "" }, (w) => again.push(w), false, newLedger());
+  assert.equal(calls, 2);
+  assert.equal(stubborn[0].decision, "unavailable");
+  assert.equal(stubborn[0].blocking, true);
+  assert.equal(stubborn.slice(1).every((f) => f.decision === "adjudicator_unblock"), true);
+  assert.equal(again.filter((w) => /judge unavailable for "t1"/.test(w)).length, 1);
 });
 
 test("the summary leads with what blocks and says what the model cost", () => {

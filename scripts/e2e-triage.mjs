@@ -667,11 +667,17 @@ export const BATCH_SCHEMA = {
   required: ["answers"],
   additionalProperties: false,
 };
+// The schema for one request: an answer may only carry an id that was asked.
+export function batchSchema(ids) {
+  const items = BATCH_SCHEMA.properties.answers.items;
+  return { ...BATCH_SCHEMA, properties: { answers: { ...BATCH_SCHEMA.properties.answers, items: { ...items, properties: { ...items.properties, id: { type: "string", enum: ids } } } } } };
+}
 
 /**
  * Every finding of a run in one request: the PR context and the diff hunks
  * they cite are sent once, not once per finding. Returns one answer or Error
- * per pack, in order, and the response's token usage.
+ * per pack, in order, and the response's token usage. A finding the response
+ * leaves out gets an Error with `missing` set, so the caller can ask again.
  */
 export async function askModelBatch(fetchImpl, apiKey, model, packs, timeoutMs = 90000) {
   const ids = packs.map((_, i) => `f${i + 1}`);
@@ -681,18 +687,20 @@ export async function askModelBatch(fetchImpl, apiKey, model, packs, timeoutMs =
     return { id: ids[i], valid_evidence_ids: evidenceIds(p), related_hunks: own.map((h) => h.id), ...rest };
   });
   const text = `Shared context for every finding (JSON):\n${JSON.stringify({ pr: packs[0].pr, diff_hunks: hunks })}\n\n` +
-    `Findings (JSON). Answer every finding by its id, citing only that finding's valid_evidence_ids.\n${JSON.stringify(items)}`;
+    `Findings (JSON). Answer every finding by its id, citing only that finding's valid_evidence_ids. ` +
+    `Return exactly ${ids.length} answer(s), one for each of: ${ids.join(", ")}.\n${JSON.stringify(items)}`;
   const content = [];
   for (const [i, p] of packs.entries()) {
     const images = PACK_IMAGES.get(p) ?? [];
     if (images.length) content.push({ type: "text", text: `Screenshots recorded for ${ids[i]}:` }, ...images.map(imageBlock));
   }
-  const msg = await requestModel(fetchImpl, apiKey, model, content.length ? [...content, { type: "text", text }] : text, BATCH_SCHEMA, Math.min(2000, 100 + 250 * packs.length), timeoutMs);
+  const msg = await requestModel(fetchImpl, apiKey, model, content.length ? [...content, { type: "text", text }] : text, batchSchema(ids), Math.min(2000, 100 + 250 * packs.length), timeoutMs);
   const raw = JSON.parse(msg.content?.find((b) => b.type === "text")?.text ?? "");
   const byId = new Map((Array.isArray(raw?.answers) ? raw.answers : []).map((a) => [a?.id, a]));
   const provenance = { requested_model: model, served_model: msg.model, temperature: samplingFor(model).temperature ?? null };
+  const answered = [...byId.keys()].map(String).join(", ") || "none";
   const answers = ids.map((id, i) => {
-    if (!byId.has(id)) return new Error(`no answer for ${id}`);
+    if (!byId.has(id)) return Object.assign(new Error(`no answer for ${id} (the response answered: ${answered})`), { missing: true });
     const { id: _, ...rest } = byId.get(id);
     try {
       return { ...parseAnswer(JSON.stringify(rest)), provenance: { ...provenance, pack_hash: packKey(model, packs[i]) } };
@@ -812,7 +820,9 @@ export async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () 
       Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
     }
   };
-  const ask = async (model, batch) => {
+  // A finding the response left out is asked once more, on its own request, so
+  // one skipped answer does not leave a failure the model could settle red.
+  const ask = async (model, batch, retryMissing = true) => {
     const fresh = [];
     for (const g of batch) {
       const cached = cfg.answers?.[answerKey(model, g.lead.pack)];
@@ -846,13 +856,19 @@ export async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () 
     for (const [i, g] of fresh.entries()) {
       const a = res.answers[i];
       if (a instanceof Error || !a) {
-        warn(`judge unavailable for "${g.lead.f.title}": ${String(a).slice(0, 200)}`);
+        if (!(retryMissing && a?.missing)) warn(`judge unavailable for "${g.lead.f.title}": ${String(a).slice(0, 200)}`);
         g.error = a ?? new Error("no answer");
       } else {
         g.answer = a;
         if (cfg.answers) cfg.answers[answerKey(model, g.lead.pack)] = { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence, explanation: a.explanation };
       }
       for (const m of g.members) m.f.ai = { model, cost_usd: share == null ? null : (m.f.ai?.cost_usd ?? 0) + share };
+    }
+    const missed = fresh.filter((g) => g.error?.missing);
+    if (retryMissing && missed.length) {
+      warn(`asking again about ${missed.length} finding(s) the ${model} response left out: ${String(missed[0].error).slice(0, 200)}`);
+      for (const g of missed) delete g.error;
+      await ask(model, missed, false);
     }
   };
   await ask(cfg.model, pending);
