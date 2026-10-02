@@ -8,11 +8,10 @@ import { test } from "node:test";
 import {
   DEFAULTS,
   parseAnswer,
-  renderComment,
+  renderSummary,
   judge,
   samplingFor,
   servedMatches,
-  askModel,
   identityKey,
   fetchChangedFiles,
   repoPath,
@@ -71,9 +70,7 @@ test("failing on three other PRs while trunk is green clears the PR; this PR's o
   assert.equal(classify(failing, hist.slice(0, 8), [], undefined, 9).class, "REGRESSION");
 });
 test("the PR's own runs never count as other PRs, even when TSIO sends string ids", () => {
-  // A composite identity built with jq carries gh_pr_number as a string. If the
-  // comparison were strict, PR 5's own three failures would look like three
-  // other PRs and clear the failure on the strength of its own history.
+  // jq-built identities carry the PR number as a string; PR 5's own failures must not count as other PRs'.
   const own = [1, 2, 3].map((i) => obs({ gh_pr_number: "5", status: "failed", commit_sha: `own${i}` }));
   const f = classify(failing, [...trunkPasses(8), ...own], [], undefined, "5");
   assert.notEqual(f.class, "FLAKY_CROSS_PR");
@@ -96,10 +93,7 @@ test("on trunk, an intermittent failure whose last run passed is a flake and cle
   assert.equal(f.blocking, false);
 });
 test("a run is never part of its own history", () => {
-  // On a trunk run the current group carries no PR number, so it would land in
-  // trunk history and the run would read its own failure as proof that trunk was
-  // already broken. The contrast is the whole point: same history, and only the
-  // group id changes the answer.
+  // On a trunk run the current group has no PR number; only the group id keeps it out of its own history.
   const history = [obs({ group_id: "self", status: "failed" }), ...trunkPasses(8)];
   const contaminated = classify(failing, history, [], undefined, null, null, { isTrunkRun: true });
   assert.equal(contaminated.class, "BROKEN_ON_TRUNK", "without the guard the run sees itself");
@@ -173,9 +167,7 @@ test("decision matrix: unblock needs confidence plus a checkable citation; unkno
   assert.equal(decide("OWNED_BY_PR", ok, pack).blocking, true);
   assert.equal(decide("REGRESSION", null, pack).decision, "unavailable");
 
-  // Evidence with no content must not be citable. Without this, a model naming
-  // "cross_pr" on a finding where no other PR failed clears it while pointing at
-  // an empty list, which is the whole guarantee gone.
+  // Empty evidence must not be citable.
   const alone = classify(failing, trunkPasses(8), []);
   const emptyPack = buildPack(alone, [{ filename: "docs/readme.md", patch: "@@" }], { number: 1, repository: "o/r", title: "", lane: "l" }, []);
   assert.equal(evidenceIds(emptyPack).includes("cross_pr"), false, "no other PR failed, so cross_pr is not citable");
@@ -183,9 +175,7 @@ test("decision matrix: unblock needs confidence plus a checkable citation; unkno
   assert.equal(decide("REGRESSION", { ...ok, cited_evidence: ["hunk_0"] }, emptyPack).blocking, true, "an unrelated hunk must not unblock");
 });
 test("a claim that master is broken cannot unblock on its own", () => {
-  // The rules only escalate a REGRESSION when trunk history was clean, so a model
-  // asserting bug_on_master is arguing against the data. Without a citation a
-  // reviewer can open, it must not clear the failure.
+  // bug_on_master contradicts clean trunk history, so it needs a citation like any other cause.
   const pack = buildPack(classify(failing, [...trunkPasses(8), ...crossPR(21, 22)], [], undefined, 1), [{ filename: "specs/a.spec.ts", patch: "@@" }], { number: 1, repository: "o/r", title: "", lane: "l" }, []);
   const noCitation = decide("REGRESSION", { cause: "bug_on_master", confidence: 0.99, cited_evidence: [], explanation: "x" }, pack);
   assert.equal(noCitation.blocking, true, "bug_on_master with no citation must stay blocking");
@@ -220,9 +210,7 @@ test("judge asks once per run, caps the findings it sends and survives an outage
 test("parseAnswer rejects anything it would otherwise have to repair", () => {
   const ok = { cause: "test_bug", confidence: 0.5, cited_evidence: ["a"], explanation: "e" };
   assert.throws(() => parseAnswer(JSON.stringify({ ...ok, cause: "vibes" })), /unknown cause/);
-  // A confidence outside [0, 1] used to be clamped: 7 became 1, the most trust
-  // the decision matrix can give, and cleared a regression. It is now rejected,
-  // so the finding keeps its deterministic outcome.
+  // An out-of-range confidence is rejected, not clamped (7 used to become 1 and clear).
   for (const bad of [7, -0.1, 1.0001, "0.9", null, true])
     assert.throws(() => parseAnswer(JSON.stringify({ ...ok, confidence: bad })), /confidence/, `confidence ${JSON.stringify(bad)}`);
   // NaN and Infinity cannot survive JSON, so test them past the parse.
@@ -233,10 +221,10 @@ test("parseAnswer rejects anything it would otherwise have to repair", () => {
   assert.equal(parseAnswer(JSON.stringify({ ...ok, confidence: 0 })).confidence, 0);
   assert.equal(parseAnswer(JSON.stringify({ ...ok, confidence: 1 })).confidence, 1);
 });
-test("comment names the evidence and escapes markdown", () => {
+test("the summary names the evidence and escapes markdown", () => {
   const f = { ...classify({ ...failing, title: "a | b" }, trunkPasses(8), []), judge: { cause: "flaky_environment", confidence: 0.9, cited_evidence: ["cross_pr"], explanation: "recurs <x>" }, decision: "adjudicator_unblock", blocking: false };
-  const c = renderComment({ context: "e2e-test/x", verdict: "SUCCESS", findings: [f], infra: null, model: "m", runURL: "u", counts: { failed: 1 } });
-  assert.ok(c.startsWith("<!-- e2e-triage:e2e-test/x -->"));
+  const c = renderSummary({ verdict: "SUCCESS", findings: [f], infra: null, runURL: "u", counts: { failed: 1 } });
+  assert.ok(c.startsWith("## E2E triage: ✅ SUCCESS"));
   assert.ok(c.includes("a &#124; b") && c.includes("&lt;x&gt;") && c.includes("cites cross_pr"));
 });
 
@@ -314,10 +302,7 @@ test("history is asked by run count, not by title or by window, and both queries
   assert.equal(history.get(identityKey({ ...failing, title: "t2" })), undefined, "a title with no rows stays unknown, so it stays blocking");
 });
 test("deduplication never drops a row it cannot identify", async () => {
-  // Rows that share file, title and attempt but come from different runs are the
-  // normal case, and rows may arrive without a group id at all. An over-eager key
-  // collapsed all of these into one, which shrank trunk history to a single run
-  // and made the rules report INSUFFICIENT_DATA on a test with plenty of history.
+  // Rows from different runs, or without a group id, must not collapse into one run.
   const noIds = Array.from({ length: 6 }, (_, i) => { const o = obs({ commit_sha: `c${i}` }); delete o.group_id; return o; });
   const single = fakeFetch([["/reports/history", () => Response.json({ observations: noIds })]]);
   const one = await fetchHistory(single, "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, null);
@@ -329,9 +314,7 @@ test("deduplication never drops a row it cannot identify", async () => {
   assert.equal(two.get(identityKey(failing)).length, 3, "distinct runs survive the overlap between the two queries");
 });
 test("a branch with no pull request is not trunk", () => {
-  // Pushing a branch without an open PR yields rows with no PR number, which is
-  // indistinguishable from a trunk run unless the branch is checked. On a real
-  // desktop spec such a branch supplied 15 of 41 supposed trunk rows.
+  // A pushed branch without a PR has no PR number either; it is not trunk.
   const rows = [
     ...trunkPasses(6),
     obs({ commit_sha: "f1", branch: "fix/something", status: "failed", created_at: "2026-09-12T00:00:00Z" }),
@@ -381,9 +364,7 @@ test("a run can be narrowed to one report, and a filter that matches nothing fai
   );
 });
 test("ownership compares repository paths, not TSIO's test-root-relative ones", () => {
-  // TSIO stores calls/x.test.ts where the desktop repository says
-  // e2e/specs/calls/x.test.ts. Compared directly they never match, so a PR that
-  // edits the failing spec was being cleared by trunk history instead.
+  // TSIO paths are relative to the test root; the PR's are relative to the repository.
   assert.equal(repoPath("e2e/specs", "calls/x.test.ts"), "e2e/specs/calls/x.test.ts");
   assert.equal(repoPath(".", "detox/e2e/test/a.e2e.ts"), "detox/e2e/test/a.e2e.ts");
   assert.equal(repoPath(null, "calls/x.test.ts"), null, "an unconfigured root is unknown, not repo-relative");
@@ -417,9 +398,7 @@ test("an incomplete or empty run is not a passing run", async () => {
     /no test cases/, "a report with a matching suite but no cases is not a green run");
 });
 test("two describe blocks sharing a leaf title are different tests", async () => {
-  // Keyed on file and title their rows merge, sort as if they were retries of
-  // one test, and the last status wins -- so the passing block erases the
-  // failing one and the run reports clean.
+  // Keyed on file and leaf title, the passing block would erase the failing one.
   const suites = [
     { id: "s-a", file_path: "specs/a.spec.ts", title: "describe A", report_name: "r1" },
     { id: "s-b", file_path: "specs/a.spec.ts", title: "describe B", report_name: "r1" },
@@ -576,9 +555,7 @@ test("skipped history rows are not trunk runs", () => {
   assert.equal(streak.blocking, true);
 });
 test("a spec retested on another worker is one test, not two", async () => {
-  // mattermost#38601: MM-T5828 failed twice on dispatch-run-14 and passed on its
-  // retest on dispatch-run-3. Keyed on the suite, that was a failure plus an
-  // ambiguous identity; the run summary, like Playwright, calls it flaky.
+  // mattermost#38601: failed twice on one worker, passed on a retest on another: flaky, one test.
   const suites = [
     { id: "w14", file_path: "specs/a.spec.ts", title: "a", report_name: "dispatch-run-14" },
     { id: "w3", file_path: "specs/a.spec.ts", title: "a", report_name: "dispatch-run-3" },
@@ -618,9 +595,7 @@ test("history counts runs, not attempts", async () => {
   assert.equal(history.ambiguous.has(identityKey(t)), false, "a retest is not a second test");
   assert.deepEqual(history.get(identityKey(t)).map((o) => [o.group_id, o.status]).sort(), [["g1", "flaky"], ["g2", "failed"], ["g3", "passed"]]);
 });
-// mattermost-mobile#10172, detox-android: one suite's shared setup broke. Six of
-// its tests had failed on other PRs and cleared; four were a day old and had no
-// history, so they blocked on the same error thrown from other lines.
+// mattermost-mobile#10172: a shared setup broke; tests too new for history fail with the same error.
 const setupError = (line) => `TypeError: Cannot read properties of undefined (reading 'id') at Object.<anonymous> (/home/runner/work/m/channel_attributes.e2e.ts:${line}:80) at processTicksAndRejections (node:internal/process/task_queues:104:5)`;
 const finding = (over) => ({
   file: "detox/channel_attributes.e2e.ts", title: "t", class: "FLAKY_CROSS_PR", blocking: false, reason: "Failed on 4 other PRs.", error: setupError(219),
@@ -629,9 +604,7 @@ const finding = (over) => ({
   ...over,
 });
 
-// mattermost-mobile#10017 broke leave_call: after leaving the call the home tab
-// never came back. Three other PRs had failed leave_call too, on the login and
-// server-form setup that every Maestro flow starts with.
+// mattermost-mobile#10017: other PRs failed leave_call with a different error (login setup).
 const leaveCall = (over) => ({ ...failing, file: "flows/calls/leave_call.yml", title: "leave_call", error: "Assertion is false: id: tab_bar.home.tab is visible", ...over });
 const otherPR = (n, error) => obs({ file: "flows/calls/leave_call.yml", title: "leave_call", gh_pr_number: n, branch: `pr-${n}`, status: "failed", error_excerpt: error });
 test("another PR's failure counts only when it failed with the same error", () => {
@@ -675,7 +648,7 @@ test("a blocked failure with the same spec and error as a cleared one is cleared
 
   // The judge declined it first; its section must not read as agreement.
   const judged = { ...blocked, judge: { cause: "flaky_environment", confidence: 0.5, cited_evidence: [], explanation: "unsure" } };
-  const comment = renderComment({ context: "c", verdict: "SUCCESS", findings: [anchor, judged], infra: null, model: "m", runURL: "u", counts: { failed: 2 } });
+  const comment = renderSummary({ context: "c", verdict: "SUCCESS", findings: [anchor, judged], infra: null, model: "m", runURL: "u", counts: { failed: 2 } });
   assert.match(comment, /same failure as a cleared test \| same error as MM-T6301_1/);
   assert.doesNotMatch(comment, /agreed/);
 });
@@ -735,9 +708,7 @@ test("the same-failure rule runs on PR runs only", async () => {
   });
   assert.deepEqual(onTrunk.findings.map((f) => [f.title, f.class, f.blocking]), [["t1", "FLAKY_ON_TRUNK", false], ["t2", "INSUFFICIENT_DATA", true]]);
 });
-// mattermost-mobile#10172, detox-ios: MM-T4786_4 hit the 300 s Jest timeout with the
-// app waiting on a pin request the test server never answered. The error text
-// says only "Exceeded timeout"; the run recorded what the screen showed.
+// mattermost-mobile#10172: a Jest timeout whose error says nothing; the screenshot shows the stuck request.
 const PNG = (fill = 0) => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64, fill)]);
 const timeoutTest = { file: "detox/e2e/test/products/channels/smoke_test/messaging.e2e.ts", title: "MM-T4786_4 - pin a message", full_title: "Smoke Test - Messaging MM-T4786_4 - pin a message" };
 const busyNotes = 'Detox reported the app busy 9 times; still waiting on: Network Request "https://site-1/api/v4/posts/6qgx/pin"';
@@ -823,7 +794,7 @@ test("end to end: a timeout the judge clears from the screenshot the run recorde
     assert.equal(without.findings[0].decision, "advice");
     assert.equal(without.findings[0].judge.cause, "flaky_environment");
     assert.equal(without.verdict, "FAILURE");
-    const summary = renderComment({ context: "c", verdict: without.verdict, findings: without.findings, infra: null, model: "m", runURL: "u", counts: { failed: 1, passed: 0, skipped: 0 }, ai: without.ai });
+    const summary = renderSummary({ context: "c", verdict: without.verdict, findings: without.findings, infra: null, model: "m", runURL: "u", counts: { failed: 1, passed: 0, skipped: 0 }, ai: without.ai });
     assert.match(summary, /AI's read \(advice only, nothing it could cite to clear\): flaky \/ environment, 90%/);
     assert.match(summary, /rules · AI advice/);
 
@@ -865,9 +836,7 @@ test("the model is asked only when its answer could change the outcome", async (
   assert.equal(ledger.skipped.no_effect, 2);
   assert.deepEqual(findings.map((f) => f.blocking), [false, true], "the rules' outcome stands");
 
-  // With advice on (the default), the blocked one is asked for advice only; the
-  // cleared one still isn't, since nothing could veto it. Even a confident
-  // "flaky" answer leaves the regression blocking.
+  // With advice on, only the blocked one is asked, and even a confident "flaky" leaves it blocking.
   const again = [classify(failing, [obs({ status: "failed" }), ...trunkPasses(8)], [], undefined, 1), classify(failing, trunkPasses(8), [], undefined, 1)];
   const asked = [];
   const advised = newLedger();
@@ -1034,7 +1003,7 @@ test("the summary leads with what blocks and says what the model cost", () => {
     judge: { ...flakyAnswer, confidence: 0.9, provenance: { served_model: "claude-haiku-4-5-20251001" } } };
   const ai = { calls: [{ model: DEFAULTS.model, served_model: "claude-haiku-4-5-20251001", findings: 1, usage: { input_tokens: 2100, output_tokens: 120, cache_read_input_tokens: 0 }, cost_usd: 0.0031 }],
     skipped: { no_effect: 3, duplicate: 0, cached: 0, cap: 0, budget: 0 } };
-  const c = renderComment({ context: "c", verdict: "FAILURE", findings: [cleared, blocked], infra: null, model: "m", runURL: "u", counts: { failed: 2, passed: 10, skipped: 1 }, ai });
+  const c = renderSummary({ context: "c", verdict: "FAILURE", findings: [cleared, blocked], infra: null, model: "m", runURL: "u", counts: { failed: 2, passed: 10, skipped: 1 }, ai });
   assert.match(c, /\*\*2 failed → 1 cleared · 1 blocking\*\* · 10 passed · 1 skipped · AI: 1 call\(s\), \$0\.0031/);
   assert.ok(c.indexOf("### Blocking (1)") < c.indexOf("<summary>Cleared (1)</summary>"), "what blocks comes first, open");
   assert.match(c, /MM-T5803 subtitle · `a\.spec\.ts` \| 🔴 likely regression \| passes on master \(25 of 25\) and no other PR fails it\. Check your change, or merge master \| rules \| – \|/);
@@ -1044,9 +1013,7 @@ test("the summary leads with what blocks and says what the model cost", () => {
 });
 
 test("a failure skipped on retry is still a failure", async () => {
-  // Serial describe on desktop: attempt 0 fails, attempt 1 skips the rest of the
-  // block. Read as skipped, the failure never reached triage and enforce wrote
-  // e2e/windows green over it.
+  // Desktop serial describe: a failure followed by a skip is a failure, not a skip.
   const run = await fetchRun(fakeFetch(runRoutes([
     [caseRow("serial", "failed", 0), caseRow("serial", "skipped", 1)],
     [caseRow("late", "skipped", 0), caseRow("late", "passed", 1)],
@@ -1077,10 +1044,7 @@ test("the status description accounts for every test in the run", async () => {
   assert.equal(statusDescription("ACTION_REQUIRED", [], "5 of 6 failures are infrastructure errors", counts), "240 passed, 2 failed (not triaged, investigation required), 3 skipped");
 });
 test("a sibling suite's trunk failure cannot clear this suite's failure", async () => {
-  // One spec, two suites, both with a test called "same leaf". Suite A fails on
-  // this PR and Suite B passes; trunk history holds a failure of Suite B's copy.
-  // Keyed on file and leaf title those are one test, so Suite B's trunk failure
-  // read as BROKEN_ON_TRUNK for Suite A and cleared it.
+  // Two suites with the same leaf title: Suite B's trunk failure must not clear Suite A.
   const suites = [
     { id: "s-a", file_path: "specs/a.spec.ts", title: "Suite A", report_name: "e2e-on-windows-2022-1.0" },
     { id: "s-b", file_path: "specs/a.spec.ts", title: "Suite B", report_name: "e2e-on-windows-2022-1.0" },
@@ -1192,17 +1156,13 @@ test("a trunk run is judged on what its own commit changed", async () => {
   assert.ok(fetchImpl.calls.some((c) => c.url.includes("/commits/abc")), "trunk ownership comes from the commit");
 });
 test("a run refuses to read another run's results", async () => {
-  // A deployment without the list filters answers the query with an unfiltered
-  // list. Taking the first row would report an unrelated repository's result as
-  // this run's, and it would look like a clean pass.
+  // A server that ignores the filters must not hand us another repository's run.
   const id = { repository: "o/r", commit_sha: "abc", name: "lane-a", gh_run_id: "12", gh_run_attempt: "1" };
   const other = { id: "g9", repository: "other/repo", commit: "zzz", name: "something-else", gh_run_attempt: "1" };
   const unfiltered = fakeFetch([["/reports?", () => Response.json({ reports: [other], total: 19659 })]]);
   await assert.rejects(() => fetchRun(unfiltered, "http://tsio", id), /no group for/);
 
-  // The dangerous sibling: same repository, commit, name and attempt, different
-  // workflow run. A rerun or a repeated dispatch produces exactly this, and the
-  // older one may be green.
+  // Same repository, commit, name and attempt, but another workflow run (a rerun): not ours.
   const sibling = { id: "g8", repository: "o/r", commit: "abc", name: "lane-a", gh_run_id: "11", gh_run_attempt: "1", status: "completed" };
   const ambiguous = fakeFetch([
     ["/reports?", () => Response.json({ reports: [sibling], total: 1 })],
@@ -1307,7 +1267,7 @@ test("end to end: green run posts success and no comment", async () => {
 });
 
 // ---- judge provenance, sampling and strict answers ----
-const answerText = (over = {}) => JSON.stringify({ cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "x", ...over });
+const answerText = (over = {}) => JSON.stringify({ answers: [{ id: "f1", cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "x", ...over }] });
 const judgePack = { cross_pr_failures_14d: { other_prs_where_this_test_failed: ["PR 1"] }, diff_hunks_of_files_named_in_error: [], test: {}, error: "", engine: {}, trunk_history_14d: {}, pr: {} };
 function fakeModel(served, { text = answerText(), stop = "end_turn" } = {}) {
   const calls = [];
@@ -1320,17 +1280,19 @@ function fakeModel(served, { text = answerText(), stop = "end_turn" } = {}) {
   return impl;
 }
 
+const askOne = (fetchImpl, model) => askModelBatch(fetchImpl, "k", model, [judgePack]);
+
 test("the judge is pinned to a dated snapshot", () => {
   assert.match(DEFAULTS.model, /^claude-haiku-4-5-\d{8}$/, "an alias can be repointed underneath the thresholds");
 });
 
 test("an answer from a model other than the one requested is discarded, once", async () => {
   const f = fakeModel("claude-haiku-4-5-20991231");
-  await assert.rejects(() => askModel(f, "k", "claude-haiku-4-5-20251001", judgePack), /is not the requested/);
+  await assert.rejects(() => askOne(f, "claude-haiku-4-5-20251001"), /is not the requested/);
   assert.equal(f.calls.length, 1, "a mismatch is deterministic, so it is not retried");
 
   const missing = fakeModel(undefined);
-  await assert.rejects(() => askModel(missing, "k", "claude-haiku-4-5-20251001", judgePack), /is not the requested/, "an answer that cannot name its model is not used");
+  await assert.rejects(() => askOne(missing, "claude-haiku-4-5-20251001"), /is not the requested/, "an answer that cannot name its model is not used");
 });
 
 test("an alias may be answered by its own snapshot and by nothing else", () => {
@@ -1343,28 +1305,28 @@ test("an alias may be answered by its own snapshot and by nothing else", () => {
 });
 
 test("provenance is recorded with the answer and named in the comment", async () => {
-  const a = await askModel(fakeModel((m) => m), "k", "claude-haiku-4-5-20251001", judgePack);
+  const [a] = (await askOne(fakeModel((m) => m), "claude-haiku-4-5-20251001")).answers;
   assert.equal(a.provenance.requested_model, "claude-haiku-4-5-20251001");
   assert.equal(a.provenance.served_model, "claude-haiku-4-5-20251001");
   assert.equal(a.provenance.temperature, 0);
   assert.match(a.provenance.pack_hash, /^[0-9a-f]{64}$/);
 
   const f = { ...classify(failing, trunkPasses(8), []), judge: { ...a, cited_evidence: ["cross_pr"] }, decision: "adjudicator_unblock", blocking: false };
-  const c = renderComment({ context: "c", verdict: "SUCCESS", findings: [f], infra: null, model: "claude-haiku-4-5", runURL: "u", counts: { failed: 1 } });
+  const c = renderSummary({ context: "c", verdict: "SUCCESS", findings: [f], infra: null, model: "claude-haiku-4-5", runURL: "u", counts: { failed: 1 } });
   assert.ok(c.includes("AI · haiku-4-5-20251001"), "the row names the model that answered, not the alias that was asked for");
 });
 
 test("temperature is sent only to models that accept it", async () => {
   for (const m of ["claude-haiku-4-5-20251001", "claude-haiku-4-5", "claude-opus-4-6", "claude-sonnet-4-6"]) {
     const f = fakeModel((x) => (m.endsWith("20251001") ? m : `${m}-20251001`));
-    await askModel(f, "k", m, judgePack);
+    await askOne(f, m);
     assert.equal(f.calls[0].temperature, 0, `${m} accepts temperature`);
   }
   // Newer models return a 400 for any non-default temperature, and an unknown
   // model is treated the same way: better the API default than a failed request.
   for (const m of ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "some-future-model"]) {
     const f = fakeModel(m);
-    await askModel(f, "k", m, judgePack);
+    await askOne(f, m);
     assert.equal("temperature" in f.calls[0], false, `${m} must not be sent a temperature`);
   }
 });
@@ -1375,12 +1337,12 @@ test("a malformed confidence cannot clear a regression, end to end", async () =>
   const findings = [classify(failing, trunkPasses(8), [])];
   assert.equal(findings[0].class, "REGRESSION");
   const packs = [judgePack];
-  await judge(findings, packs, (pack) => askModel(f, "k", "claude-haiku-4-5-20251001", pack), DEFAULTS, () => {});
+  await judge(findings, packs, (batch, model) => askModelBatch(f, "k", model, batch), DEFAULTS, () => {});
   assert.equal(findings[0].blocking, true, "a malformed answer leaves the deterministic verdict in place");
   assert.notEqual(findings[0].decision, "adjudicator_unblock");
 });
 
 test("only a complete answer is used", async () => {
   for (const stop of ["max_tokens", "stop_sequence", "refusal", "tool_use"])
-    await assert.rejects(() => askModel(fakeModel((m) => m, { stop }), "k", "claude-haiku-4-5-20251001", judgePack), /stop_reason/, stop);
+    await assert.rejects(() => askOne(fakeModel((m) => m, { stop }), "claude-haiku-4-5-20251001"), /stop_reason/, stop);
 });

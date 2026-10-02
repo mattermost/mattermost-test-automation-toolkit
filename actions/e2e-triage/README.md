@@ -1,238 +1,112 @@
 # E2E triage
 
-Reads Test System IO (TSIO) evidence after an E2E run and returns `SUCCESS`,
-`FAILURE`, or `ACTION_REQUIRED`. The default is **report-only**, with a concise
-GitHub job summary and structured outputs. It does not change the required
-commit status or post a PR comment by default.
+After an E2E run reported to Test System IO (TSIO), decides whether each failed
+test is the PR's fault and returns `SUCCESS`, `FAILURE` or `ACTION_REQUIRED`.
+In **enforce** mode it writes the verdict to the required commit status, so a red
+run whose failures all happen on master or on other PRs turns green. The default,
+report-only, writes only the job summary.
 
 One script, no dependencies: [`scripts/e2e-triage.mjs`](../../scripts/e2e-triage.mjs).
-The three producer repositories use this shared implementation; TSIO remains the
-source of run and historical test data.
 
 ## Decisions
 
-Tests that passed on retry are not failures. For failed tests the action reads
-trunk and cross-PR history, then applies these rules in order:
+A test that passed on retry is not a failure. For each failed test the action
+reads its recent history on the PR's base branch and on other PRs:
 
-| Finding | Meaning | Outcome on a PR |
+| Finding | Meaning | Outcome |
 | --- | --- | --- |
-| `INFRA` | Many infrastructure signatures, or 30+ failures | `ACTION_REQUIRED`; investigate, never cleared |
-| `OWNED_BY_PR` | The PR changed the failing spec | Blocking; never sent to the model |
-| `BROKEN_ON_TRUNK` | The latest trunk observation fails this test too | Cleared |
-| `FLAKY_ON_TRUNK` | This test is intermittent on trunk | Cleared |
-| `FLAKY_CROSS_PR` | At least three other PRs fail this test with the same error (any error, when this one is too generic to compare, such as a timeout) and trunk has actually passed it | Cleared |
-| `INSUFFICIENT_DATA`, `REGRESSION` | History cannot clear the failure | Blocking unless the model supplies qualifying evidence |
-| `SAME_FAILURE_AS_CLEARED` | Still blocked after the model, but fails with the same spec and error as a failure in this run that history cleared | Cleared (PR runs only; timeouts and short messages never match) |
+| `INFRA` | Mostly infrastructure errors, or 30+ failures | `ACTION_REQUIRED`, never cleared |
+| `OWNED_BY_PR` | The PR changed the failing spec | Blocking, never sent to the model |
+| `BROKEN_ON_TRUNK` | Master's latest run fails it too | Cleared |
+| `FLAKY_ON_TRUNK` | It is intermittent on master | Cleared |
+| `FLAKY_CROSS_PR` | 3+ other PRs fail it with the same error, and master passes it | Cleared |
+| `REGRESSION`, `INSUFFICIENT_DATA` | History can't clear it | Blocking, unless the model clears it with evidence |
+| `SAME_FAILURE_AS_CLEARED` | Same spec and error as a test history cleared in this run | Cleared |
 
-A widespread failure can be a product bug as well as an environment problem.
-`ACTION_REQUIRED` is not proof that the PR is innocent. Likewise, an unresolved
-failure is not automatically proof that the PR caused it.
+If the evidence is incomplete (changed files, test root, base branch, truncated
+history, report scope, or a test whose identity is ambiguous), nothing is
+cleared and the model is not asked.
 
-Clearing requires confidence at least `min-confidence` (default 0.85) and a
-validated citation to actual cross-PR evidence, a related diff hunk, or producer
-evidence (see below). A model claiming `bug_on_master` without qualifying
-evidence cannot clear anything. Vetoing a history-cleared finding requires
-confidence at least 0.9 and a related hunk. Model failure preserves the
-deterministic outcome. Model confidence is not a measured accuracy rate.
+## The model
 
-## When the model is asked, and what it costs
+Claude is asked only about failures history couldn't settle. It clears one only
+at `min-confidence` (0.85) or more **and** with a citation a reviewer can open:
+other PRs failing the same way, the related part of the PR's diff, or what the
+test run recorded (`evidence-dir`). It can veto a history clear only at 0.9 with
+a related diff hunk. If it fails or is unavailable, the rules' outcome stands.
 
-The model is asked only about a finding whose outcome its answer could change,
-read off the rules above: a cleared finding only when the pack holds a related
-diff hunk (the one way to veto), a blocked one only when it holds something
-citable for an unblock. Everything else is decided by the rules at no cost.
-Findings with the same spec and error share one question, an answer already
-given for the same evidence is reused (`answers-cache`), and at most eight
-questions go in **one request per run**, with the PR context and related hunks
-sent once. Only hunks related to a failure are sent; the error is cut to its
-message and first app stack frames.
+- All of a run's questions go in one request; tests with the same spec and error
+  share a question. A question the response leaves out is asked once more.
+- An answer just short of the threshold is asked once of `escalation-model`.
+- A blocking failure the model has nothing to cite for is still asked
+  (`ai-advice`), and its read is shown as advice. It never changes the outcome.
+- Spend is priced per call and shown in the summary and the `ai-cost-usd`
+  output; a call that could cross `ai-budget-usd` (0.5) is not made.
+  `answers-cache` lets a re-run reuse earlier answers.
 
-An answer between 0.6 and the threshold, on a finding it could change, is asked
-once more of `escalation-model` (default `claude-opus-5-5`; empty turns it off).
-Each response's token usage is priced from a dated per-model table (overridable
-with `ai-prices`) and reported per test, per run in the summary, and as the
-`ai-calls` and `ai-cost-usd` outputs. A call whose worst case would cross
-`ai-budget-usd` (default 0.5) is not made, and its findings keep the rules'
-outcome. A blocking failure with nothing an answer could cite is still asked,
-after those that could clear something, when `ai-advice` is on (default): its
-answer is shown as advice and never changes the outcome. The system prompt carries no cache marker: it is below Haiku 4.5's
-minimum cacheable length, and a run makes one call per model.
+## What the PR shows
 
-The job summary leads with what blocks, one row per test with the result, a
-sentence the PR author can act on, whether the rules or the model decided, and
-the model's cost; cleared tests are collapsed below.
-
-Incomplete changed files, unknown test root or trunk branch, truncated history,
-or unprovable report scope block clearing and skip the model. A test with
-unresolved identity also stays blocking and is never sent to the model.
-
-## Identity and report scope
-
-Runs require exact repository, commit, name, GitHub run ID and run attempt.
-Incomplete groups, missing suite file paths and empty runs fail closed.
-
-Tests are matched by file and full ancestor-qualified title, within the configured
-report scope. Same-leaf siblings cannot borrow each other's history or hide a
-failure with another sibling's pass. Qualified current titles cannot be matched
-to legacy history missing their ancestry. TSIO must serve full titles in both
-current cases and historical observations for that comparison to be possible.
-
-`report-name` is a producer-supplied prefix, such as `e2e-on-windows-2022-`.
-This keeps desktop history within one OS while allowing version suffixes to
-change. Without an explicit prefix, worker/shard names are not guessed into
-lanes. Duplicate identities across reports in one group, conflicting duplicate
-observations and ambiguous legacy identities remain blocking. A renamed test
-has no matching history; this action does not fuzzy-match names.
+- **Job summary:** what blocks first, one row per test with the result, a
+  sentence the author can act on, who decided (rules or model) and the cost.
+  Cleared tests are collapsed below.
+- **Required status** (enforce): success only for `SUCCESS`, otherwise failure.
+- **Triage check** (enforce, red runs): `<status-context>/triage` is pending
+  while triage runs, then shows the verdict, or an error if triage couldn't
+  finish. It is informational, never the required check.
 
 ## Usage
 
 ```yaml
       - name: ci/e2e-triage
-        if: always() && steps.summary.outcome != 'skipped'
-        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-triage@<published full sha>
+        if: always() && steps.summary.outcome != 'success'
+        continue-on-error: true
+        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-triage@<full sha>
         with:
           composite-identity: ${{ needs.prepare-run.outputs.composite-identity-json }}
           status-context: ${{ inputs.context_name }}
-          test-root: e2e-tests/playwright
+          test-root: e2e-tests/playwright/specs
           github-token: ${{ github.token }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          mode: ${{ vars.E2E_TRIAGE_MODE || 'report-only' }}
-          post-pr-comment: "false"
+          mode: ${{ vars.E2E_TRIAGE_MODE || 'enforce' }}
 ```
 
-Set `test-root` to the repository-relative root of this producer's specs, or `.`
-if TSIO already returns repository-relative paths. Desktop also supplies its
-per-OS `report-name`. The PR base branch is read from GitHub metadata.
+`test-root` is where specs live relative to the repository root (`.` if TSIO
+paths are already repository-relative). A run that uploads one report per OS
+passes `report-name` (a prefix such as `e2e-on-windows-2022`). All inputs are
+described in [`action.yml`](action.yml). Gate jobs on the `verdict` output, not
+on summary text.
 
-Outputs are `verdict`, `blocking`, `exonerated`, and `description`. `blocking`
-counts unresolved failures, including missing evidence and run-level infra
-failures. Consumers must use `verdict`, not parse summary text, to gate jobs.
-Existing consumer workflows retain their manual override handling.
+Permissions: `contents: read`, `pull-requests: read`, and `statuses: write` for
+enforce. The token is used only with GitHub. Only the exact mode `enforce`
+writes statuses; anything else is report-only.
 
-- **report-only (default):** job summary and outputs only; required status unchanged.
-- **enforce:** also writes success only for `SUCCESS`, otherwise failure, on the
-  configured commit-status context. The consumer remains responsible for its
-  job assertion and manual override ordering. On a red run it also writes a
-  check of its own, `triage-status-context` (default `<status-context>/triage`):
-  pending while triage works, then the verdict, or an error if triage could not
-  finish. It is informational and is never the required context.
-- **post-pr-comment: "true":** separately opts into a sticky comment, in either
-  mode. It contains the same compact summary with collapsed evidence. Otherwise
-  no comment is read, created, updated or deleted. Existing comments are left alone.
+## Evidence from the test run
 
-GitHub read access is needed for PR metadata and files. `statuses: write` is
-needed for enforce; `pull-requests: write` is needed only for optional comments.
-The workflow token is used only with GitHub, never sent to TSIO or Anthropic.
-Only the exact mode `enforce` (with surrounding whitespace ignored) enables
-status writes. Unknown modes are logged and treated as report-only.
-
-## Producer evidence
-
-Some failures say nothing in their error text: a test that hits its timeout
-reports only that it ran out of time. A producer that recorded more at the
-moment of failure, such as a screenshot or the requests the app was still
-waiting on, can hand it to the judge with `evidence-dir`:
+Some failures say nothing useful, such as a timeout. A producer can record what
+the screen showed and what the app was waiting on, and pass the directory as
+`evidence-dir`: JSON files of entries like
 
 ```json
-[
-  {
-    "file": "detox/e2e/test/products/channels/smoke_test/messaging.e2e.ts",
-    "title": "MM-T4786_4 - should be able to ... pin/unpin a message",
-    "full_title": "Smoke Test - Messaging MM-T4786_4 - should be able to ... pin/unpin a message",
-    "notes": "Detox reported the app busy 9 times; still waiting on: Network Request .../api/v4/posts/<id>/pin",
-    "images": ["Smoke Test - Messaging MM-T4786_4 .../timeout.png"]
-  }
-]
+[{ "file": "detox/e2e/test/products/channels/messaging.e2e.ts",
+   "title": "MM-T4786_4 - should pin a message",
+   "full_title": "Messaging MM-T4786_4 - should pin a message",
+   "notes": "still waiting on: POST /api/v4/posts/<id>/pin",
+   "images": ["timeout.png"] }]
 ```
 
-Entries match a failing test on title, qualified title (when both sides have
-one) and spec path, where a path may be a tail of the other with at least one
-directory. Matched screenshots are sent to the model as images and the notes as
-the `producer` evidence item. Citing `producer` counts as checkable evidence for
-an unblock, under the same confidence threshold as a cross-PR recurrence: the
-screenshot and notes are in the run's artifacts and job summary for a reviewer
-to open. The evidence is produced by the PR's own CI, so it is treated like
-every other pack value: as data, never as instructions. Only PNG and JPEG files
-inside the directory are read, at most two per test and 3.5 MB each.
+Entries match a failed test by title and spec path. Screenshots go to the model
+as images and the notes as the `producer` evidence it may cite. It comes from the
+PR's own CI, so it is data, never instructions: only PNG/JPEG files inside the
+directory are read, at most two per test and 3.5 MB each.
 
 ## Trunk runs
 
-Without a PR number the action evaluates the trunk commit's changed files.
-A previous failure of the same test is `BROKEN_ON_TRUNK` and **stays blocking**.
-Only intermittency with a prior passing run may clear. The current group is
-excluded from its own history and the model is not called on trunk runs.
-Master repair automation is separate from triage: a repeated master failure
-is evidence to investigate and fix, not a reason to permanently green trunk.
+Without a PR number, the run is a trunk run. A failure that was already there in
+the previous run is a streak and stays blocking; only intermittency clears. The
+model is not asked.
 
-## Replay against history
-
-Replay uses the same `evaluateRun` path as live triage, including ownership,
-report scope, ambiguity, evidence completeness and trunk rules. It never calls
-GitHub or publishes comments/statuses. With `ANTHROPIC_API_KEY` it may call the
-model; without it only answers for exact cached evidence packs are used.
-
-```sh
-node scripts/e2e-triage.mjs --replay runs.json --compare compares.json \
-  --answers answers.json --tsio http://localhost:8080 --out results.json
-```
-
-A `runs.json` row carries:
-
-```json
-{
-  "repository": "mattermost/desktop",
-  "pr": 123,
-  "name": "desktop-pr",
-  "commit_sha": "full-commit-sha",
-  "gh_run_id": "123456",
-  "gh_run_attempt": "1",
-  "branch": "pr-123",
-  "base_ref": "master",
-  "run_at": "2026-09-30T12:00:00Z",
-  "test_root": "e2e/specs",
-  "report_name": "e2e-on-windows-2022-",
-  "truth": "REGRESSION"
-}
-```
-
-`run_at` is the historical evaluation cutoff; later observations are not requested.
-For trunk, omit `pr` and supply the trunk `branch`. `test_root` and `report_name`
-may also come from `TEST_ROOT` and `REPORT_NAME` environment variables.
-
-`compares.json` maps **repository:full-commit-sha** to
-`{"complete": true, "files": [{"filename": "...", "patch": "..."}], "pr_title": "..."}`.
-Only mark it complete after capturing all pages of the PR diff (or trunk commit
-files) at the evaluated revision. Missing or partial captures cannot clear tests.
-
-Answers are keyed by model, system prompt and the complete evidence pack,
-including qualified test identity and report scope. Old leaf-title answer keys
-are deliberately ignored; they cannot establish which test was judged.
-
-Output is `{evaluated, skipped, results}`. Skipped entries include reasons and
-are reported alongside the ground-truth table. An empty or entirely skipped
-corpus exits nonzero. Partial coverage must be investigated before using a replay
-as calibration; it is not evidence of safety for the skipped population.
-
-## Validation and rollout
+## Tests
 
 ```sh
 node --test scripts/e2e-triage*.test.js
 ```
-
-The tests use fake HTTP responses, including live/replay parity, ambiguous
-identity, ownership, incomplete evidence, cache separation and comment opt-in.
-CI runs all triage test files. These tests do not establish production accuracy.
-
-The old 370-run replay used earlier rules and leaf-title cached model answers.
-Its percentages do **not** calibrate this implementation. Before enabling
-`E2E_TRIAGE_MODE=enforce` in any consumer:
-
-1. Deploy the required TSIO history/case identity fields and validate per-OS scope.
-2. Publish a reviewed toolkit commit and pin consumers to that reachable full SHA.
-3. Demonstrate `OWNED_BY_PR` on a controlled real report-only run.
-4. Replay an identity-aware corpus with complete captured diffs and inspect false
-   clearances, missing data and coverage, then review report-only outcomes with the team.
-
-Keep report-only until those checks are reviewed. TSIO credentials, rollout
-variables, master repair triggers and branch protection are outside this action's
-configuration changes.

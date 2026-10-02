@@ -5,29 +5,16 @@
 /**
  * E2E triage: is this red run the PR's fault?
  *
- * Runs after the E2E summary of a PR run. For every test that ended failed
- * (retry-recovered tests do not count) it asks TSIO for the test's history
- * across trunk and other PRs, applies a handful of rules, asks Claude about the
- * findings the rules cannot settle, and publishes the outcome as a
- * job summary and structured outputs, with opt-in statuses and PR comments.
- *
- * Rules, in order (production calibration must be repeated after rule changes):
- *   INFRA            the run failed for environmental reasons          -> red, nobody blamed
- *   OWNED_BY_PR      the PR changed the failing spec                    -> red, never judged
- *   BROKEN_ON_TRUNK  trunk's latest run fails this test too             -> not the PR's
- *   FLAKY_ON_TRUNK   the test flakes on trunk in the window             -> not the PR's
- *   FLAKY_CROSS_PR   failed on 3+ other PRs while trunk stayed green    -> not the PR's
- *                    (with the same error, unless the error is too generic to compare)
- *   INSUFFICIENT_DATA / REGRESSION                                      -> ask the judge
- *   SAME_FAILURE_AS_CLEARED  after the judge, on PR runs: a blocked failure
- *                    with the same spec and error as one history cleared -> not the PR's
- *
- * The judge may unblock a REGRESSION/INSUFFICIENT_DATA finding only with
- * confidence >= min (0.85) AND a citation a reviewer can check (cross-PR
- * recurrence or a related diff hunk). Anything short of that
- * stays red. Model outage keeps the rule outcome.
- *
- * Zero dependencies; Node >= 22.
+ * For each failed test, read its history in TSIO and apply, in order:
+ *   INFRA            the run failed for environmental reasons     -> red, nobody blamed
+ *   OWNED_BY_PR      the PR changed the failing spec               -> red, never judged
+ *   BROKEN_ON_TRUNK  trunk's latest run fails it too               -> not the PR's
+ *   FLAKY_ON_TRUNK   it flakes on trunk                            -> not the PR's
+ *   FLAKY_CROSS_PR   3+ other PRs failed it with the same error    -> not the PR's
+ *   REGRESSION / INSUFFICIENT_DATA                                 -> ask the model
+ *   SAME_FAILURE_AS_CLEARED  same spec and error as a cleared test -> not the PR's
+ * The model clears a finding only at >= 0.85 confidence and with evidence a
+ * reviewer can open. Anything less stays red. Zero dependencies; Node >= 22.
  */
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
@@ -36,13 +23,9 @@ import { dirname, join, relative, resolve } from "node:path";
 export const FAILED_STATUSES = new Set(["failed", "timedOut", "interrupted"]);
 
 /**
- * One execution's outcome from its attempts, read the way Playwright reads a
- * test: skipped only when every attempt was, failed only when every attempt that
- * ran failed, flaky when some did. Attempts are retries and, on an orchestrated
- * run, a retest of the spec on another worker -- which is why the last attempt
- * alone is not the answer: a serial describe skips the rest of its block on
- * retry, so a failure can be followed by a skip. `last` is the attempt that
- * speaks for the outcome, in the order the caller sorted them.
+ * A test's outcome from all its attempts (retries and retests on other workers),
+ * as Playwright reads it: failed only if every attempt that ran failed, flaky if
+ * some did. Not just the last attempt: a serial block can skip after a failure.
  */
 export function outcomeOf(attempts) {
   const ran = attempts.filter((a) => a.status !== "skipped");
@@ -52,25 +35,19 @@ export function outcomeOf(attempts) {
   return { status: failed.length || ran.some((a) => a.status === "flaky") ? "flaky" : "passed", last: ran.at(-1) };
 }
 export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
-// On a trunk run there is no PR to exonerate, so the question changes from "is
-// this the PR's fault" to "is this noise or is trunk actually broken". Only
-// intermittency answers that. BROKEN_ON_TRUNK deliberately does NOT clear here:
-// on trunk it means the failure is still there from last time, and greening a
-// standing breakage is how a broken trunk becomes permanent and invisible.
+// On a trunk run only flakiness clears: a failure still there from last time is a
+// standing breakage, and greening it would hide it.
 export const EXONERATED_ON_TRUNK = new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 export const exoneratedSet = (isTrunkRun) => (isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED);
 export const BORDERLINE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
-// The history endpoint pages; ask for its maximum page so a busy spec file is a
-// handful of requests rather than a hundred, and stop after enough pages that a
-// pathological file cannot stall the job.
+// Page caps so one busy spec file cannot stall the job.
 const HISTORY_MAX_FILES = 50;
 const HISTORY_PER_PAGE = 2000;
 const HISTORY_MAX_PAGES = 25;
 const CHANGED_FILES_MAX_PAGES = 30;
 export const DEFAULTS = {
   windowDays: 14,
-  // How many runs each half of the history request asks for. Counts, not days:
-  // see fetchHistory for why a window cannot answer either question.
+  // Runs, not days, per history query (see fetchHistory).
   trunkRuns: 50,
   crossPRRuns: 200,
   minTrunkRuns: 5,
@@ -79,50 +56,30 @@ export const DEFAULTS = {
   minConfidence: 0.85,
   vetoMin: 0.9,
   maxJudged: 8,
-  // Ask the model about blocking findings it has no checkable evidence to clear,
-  // and show its read as advice. The outcome is never changed by it.
+  // Ask about blocking findings the model can't clear, as advice only.
   advise: true,
   infraMinFailures: 30,
-  // A second, stronger model for answers that land just short of a threshold:
-  // between escalateMin and the clear (or veto) threshold, on a finding the
-  // answer could change. Empty turns escalation off.
+  // Re-asks an answer between escalateMin and the threshold. Empty turns it off.
   escalationModel: "claude-opus-5-5",
   escalateMin: 0.6,
-  // Per-run ceiling on model spend. A call whose worst case would cross it is
-  // not made, and its findings keep the rules' outcome.
+  // Per-run spend ceiling; a call that could cross it is not made.
   budgetUsd: 0.5,
-  // A dated snapshot, not the alias. The 0.85 clear and 0.90 veto thresholds are
-  // policy tuned against one model's behaviour; an alias can be repointed at a
-  // different model without any change here, and the thresholds would then be
-  // applied to judgements they were never tuned for.
+  // A dated snapshot, not an alias: the thresholds were tuned against this model.
   model: "claude-haiku-4-5-20251001",
 };
-// The last alternative is mobile's merge-jest-results-for-tsio.js: a spec whose shard
-// uploaded nothing. It never ran, so it has no outcome to attribute to the PR.
+// The last alternative: a mobile spec whose shard uploaded nothing never ran.
 const INFRA_RE =
   /server (?:is )?not healthy|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result/i;
 
 export const isInfraError = (text) => INFRA_RE.test(text ?? "");
 
-/**
- * The key a test's history is filed under. The ancestor-prefixed title when the
- * server supplies one, because two suites in a file can share a leaf title and a
- * leaf key then names both -- storing them under it lets the second overwrite
- * the first, and both then read whichever survived.
- */
+// History key. The full title when present: two suites in a file can share a leaf title.
 export const identityKey = (t) => JSON.stringify([t.report_scope ?? "", t.file, t.full_title || t.title]);
 
 /**
- * TSIO stores a spec path relative to the producer's test root; GitHub reports
- * changed files relative to the repository root. They are different namespaces:
- * TSIO says `calls/calls_functionality.test.ts` where the desktop repository
- * says `e2e/specs/calls/calls_functionality.test.ts`. Comparing them directly
- * never matches, so OWNED_BY_PR -- the rule that keeps a pull request
- * answerable for a spec it edited -- silently never fires.
- *
- * `testRoot` is the producer's root: "." when TSIO's paths are already
- * repository-relative, otherwise the prefix to prepend. Null means the consumer
- * did not configure one, and ownership is then unknowable rather than false.
+ * TSIO's spec path relative to the repository, so it can be compared with the
+ * PR's changed files. `testRoot` is "." when TSIO's paths are already
+ * repository-relative; null (not configured) makes ownership unknowable.
  */
 export const repoPath = (testRoot, file) => {
   if (testRoot == null || testRoot === "") return null;
@@ -130,21 +87,9 @@ export const repoPath = (testRoot, file) => {
   return root === "" ? file : `${root}/${file}`;
 };
 
-/**
- * Lane of a run name: the same spec set on the same platform. PR and trunk
- * runs of one lane differ only by producer prefix/suffix
- * (mobile-pr-detox-ios vs mobile-main-detox-ios; playwright-full-enterprise
- * vs playwright-full-enterprise-master). History is compared within a lane:
- * an Android flake says nothing about iOS.
- */
-// A lane is a report name with its run type removed, so a PR run and a trunk run
-// of the same suite compare against each other. Repos spell the run type
-// differently: mobile puts it in the middle ("mobile-pr-detox-ios"), desktop
-// makes it the whole suffix ("desktop-pr" vs "desktop-master"), and the server
-// repo appends it ("playwright-full-enterprise" vs "...-master"). Getting this
-// wrong does not fail loudly: the PR and trunk names simply land in different
-// lanes, no trunk history is ever found, and every failure reports as
-// INSUFFICIENT_DATA and stays blocking.
+// A run name without its run type, so PR and trunk runs of one suite compare:
+// mobile-pr-detox-ios ~ mobile-main-detox-ios, desktop-pr ~ desktop-master,
+// playwright-full-enterprise ~ ...-master. History is compared within a lane.
 export const laneOf = (name) =>
   String(name ?? "")
     .replace(/^(mobile|desktop)-(pr|main|master)(-|$)/, "")
@@ -156,45 +101,27 @@ export const laneOf = (name) =>
 export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = null, lane = null, opts = {}) {
   const { isTrunkRun = false, groupId = null, trunkBranch = null } = opts;
   const own = new Set(changedFiles);
-  // A run must never be part of its own history. On a PR run its group carries
-  // the PR number and drops out below, but on a trunk run it would land in
-  // `trunk` and the test would be reported as failing on trunk because of the
-  // very run being judged.
+  // A run is never part of its own history.
   const seen = groupId == null ? observations : observations.filter((o) => o.group_id !== groupId);
-  // A skipped execution is not a trial. Counted as one, it met the trunk-run
-  // minimum on its own (one real failure plus four skips cleared as flaky) and,
-  // as the latest trunk row, hid a broken-on-trunk streak.
+  // A skipped execution is not a trial.
   const ran = seen.filter((o) => o.status !== "skipped");
   const inLane = lane == null ? ran : ran.filter((o) => o.name == null || laneOf(o.name) === lane);
-  // PR numbers arrive as numbers from TSIO but as strings from a composite
-  // identity built with jq, so compare them as numbers. A strict mismatch would
-  // file this PR's own runs under "other PRs", where enough of them satisfy
-  // FLAKY_CROSS_PR and clear a failure on the strength of its own history.
+  // Compare as numbers: identities built with jq carry PR numbers as strings.
   const prOf = (o) => (o.gh_pr_number == null || o.gh_pr_number === "" ? null : Number(o.gh_pr_number));
   const currentPR = prNumber == null ? null : Number(prNumber);
-  // A row with no PR number is not automatically trunk. A branch pushed without
-  // an open pull request produces exactly that, and counting it as trunk lets an
-  // unrelated feature branch's breakage answer "is this broken on trunk" -- it
-  // was contributing 15 of 41 supposed trunk rows on a desktop spec. When the
-  // trunk branch is known, a row has to be on it.
+  // No PR number is not enough to be trunk: a pushed branch has none either.
   const trunk = inLane.filter((o) => prOf(o) == null && (trunkBranch == null || o.branch === trunkBranch));
   const others = inLane.filter((o) => prOf(o) != null && prOf(o) !== currentPR);
   const trunkFails = trunk.filter((o) => FAILED_STATUSES.has(o.status)).length;
   const trunkFlaky = trunk.filter((o) => o.status === "flaky").length;
   const trunkPasses = trunk.filter((o) => o.status === "passed").length;
   const latestTrunk = trunk[0];
-  // Another PR's failure is evidence about this one only when it failed the
-  // same way. Counted by test alone, mattermost-mobile#10017's leave_call --
-  // broken by that PR, failing on "tab_bar.home.tab is visible" -- would have
-  // cleared on three other PRs' unrelated server-form failures, and it stayed
-  // broken on main until a fix landed five days after the merge. A message too
-  // generic to compare (a timeout, a short assertion) keeps every failure.
+  // Other PRs' failures count only with the same error, unless it's too generic to compare.
   const ownSignature = errorSignature(test.error);
   const crossFailures = others.filter((o) => FAILED_STATUSES.has(o.status) && (ownSignature == null || errorSignature(o.error_excerpt) === ownSignature));
   const failedPRs = [...new Set(crossFailures.map(prOf))];
   const otherPasses = others.filter((o) => o.status === "passed" || o.status === "flaky").length;
-  // What this test's failures said when they happened without this PR. A flaky
-  // pass carries no error, so a test cleared on flaky passes alone has none.
+  // The errors this test failed with elsewhere (used by sameFailure).
   const failureSignatures = [...new Set([...trunk, ...others].filter((o) => FAILED_STATUSES.has(o.status)).map((o) => errorSignature(o.error_excerpt)).filter(Boolean))];
   const stats = {
     trunk: { runs: trunk.length, fails: trunkFails, flaky: trunkFlaky, passes: trunkPasses, latest: latestTrunk?.status ?? "" },
@@ -209,24 +136,18 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
     failure_signatures: failureSignatures,
   };
   const out = (cls, reason, blocking) => ({ ...test, class: cls, reason, blocking, ...stats });
-  // repo_path is the canonical repository-relative path; test.file is TSIO's.
-  // Comparing the wrong one against the diff never matches.
   if (own.has(test.repo_path ?? test.file))
     return out("OWNED_BY_PR", isTrunkRun
       ? `This commit changes ${test.file}; a failure in a spec the commit edits is not noise.`
       : `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
-  // Ownership is decided above on the diff alone, so it still holds. Everything
-  // below reads history, and history that names more than one test cannot clear
-  // any of them.
+  // History that names more than one test cannot clear any of them.
   if (test.identity_unresolved)
     return out(
       "INSUFFICIENT_DATA",
       `The available suite/report identity does not uniquely identify "${test.title}" in ${test.file}; history cannot clear it.`,
       true,
     );
-  // Trunk runs answer a different question, so they get their own order: a
-  // failure that was already there last time is a streak, not a flake, and stays
-  // red however often it has flaked before.
+  // On trunk, a failure already there last time is a streak and stays red.
   if (isTrunkRun) {
     if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status))
       return out("BROKEN_ON_TRUNK", `Still failing: the previous ${lane ?? "trunk"} run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}) failed this test too. That is a streak, not a flake.`, true);
@@ -241,8 +162,7 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
   const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
   if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0 && laplace >= cfg.pMin && latestTrunk?.status !== "failed")
     return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the last ${trunk.length} trunk runs.`, false);
-  // trunkFails === 0 is vacuously true when trunk was never observed, so require
-  // real trunk passes before claiming trunk stayed green.
+  // Require real trunk passes: trunkFails === 0 is also true with no trunk runs.
   if (failedPRs.length >= cfg.crossPRMinPRs && trunkFails === 0 && trunkPasses > 0)
     return out("FLAKY_CROSS_PR", `Failed${ownSignature ? " with the same error" : ""} on ${failedPRs.length} other PRs in the last ${cfg.crossPRRuns} runs (${stats.cross_pr.examples.slice(0, 3).join(", ")}) while trunk stayed green.`, false);
   if (trunk.length < cfg.minTrunkRuns)
@@ -255,11 +175,8 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
 const GENERIC_ERROR_RE = /^(?:\w*error:\s*)?(?:thrown:\s*)?["']?(?:test timeout|exceeded timeout|timeout of|timed out)/i;
 
 /**
- * What a failure says, without where it happened: the message's first lines,
- * cut at the stack whether it starts a line or follows the message inline, so
- * the same error thrown from two lines of one spec compares equal, and with
- * generated names masked so two runs of it do too. Null when the message is
- * too short or too generic to say two failures share a cause.
+ * What a failure says, not where: the message's first lines without the stack,
+ * generated ids masked. Null when too short or generic to compare.
  */
 export function errorSignature(error) {
   const kept = [];
@@ -272,8 +189,7 @@ export function errorSignature(error) {
   if (!kept.length || GENERIC_ERROR_RE.test(kept[0])) return null;
   const sig = kept.join(" ")
     .replace(/\s+at\s+(?:async\s+)?(?:\S+\s+)?\(?(?:file:\/\/)?(?:[A-Za-z]:)?[\\/].*$/, "")
-    // Generated names differ on every run ("channel-e11bc4", a UUID, a
-    // throwaway host): mixed letter-and-digit tokens and long numbers.
+    // Generated names differ per run: mixed letter-digit tokens and long numbers.
     .replace(/\b(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{6,}\b/gi, "<id>")
     .replace(/\b\d{4,}\b/g, "<n>")
     .replace(/\s+/g, " ")
@@ -282,15 +198,10 @@ export function errorSignature(error) {
 }
 
 /**
- * A blocked failure with the same spec and error as a failure in this run that
- * history cleared shares that failure's cause. The anchor's own history must
- * show that same error without this PR: a test cleared on flaky passes alone
- * proves its intermittency, not that this error is anyone else's, and on an
- * upgrade PR that broke one dialog it lent its clear to every test the broken
- * dialog failed. Typical case: a suite whose shared setup breaks, with some of
- * its tests old enough to have history and some too new. Runs after the judge
- * on PR runs only, so a failure the judge tied to the PR neither anchors nor
- * follows.
+ * A blocked failure with the same spec and error as a cleared one shares its
+ * cause, if the cleared test's own history shows that error without this PR.
+ * Typical case: a shared setup breaks, and only some of the suite's tests are
+ * old enough to have history. Runs after the judge, on PR runs only.
  */
 export function sameFailure(findings) {
   const blamed = (f) => f.judge?.cause === "caused_by_pr";
@@ -329,12 +240,9 @@ const IMAGE_TYPES = [
 ];
 
 /**
- * Evidence a producer recorded for its failing tests: screenshots and notes,
- * as JSON files of `{file, title, full_title?, notes?, images?: [path]}` with
- * image paths relative to the JSON file. The files come from the PR's own CI,
- * so an image is read only from inside the directory, only when its bytes are
- * a PNG or JPEG, and only within the size and count limits; anything else is
- * skipped with a warning rather than failing the run.
+ * Screenshots and notes the test run recorded: JSON files of
+ * `{file, title, full_title?, notes?, images?: [path]}`. They come from the PR's
+ * own CI, so only PNG/JPEG files inside `dir` and within limits are read.
  */
 export function loadEvidence(dir, warn = () => {}) {
   let root;
@@ -468,8 +376,7 @@ export const SCHEMA = {
   additionalProperties: false,
 };
 
-/** Evidence pack for one finding: what the judge sees, and nothing else. */
-/** The message and the first few app stack frames: what explains a failure, without framework noise. */
+/** The message and the first few app stack frames, without framework noise. */
 export function compactError(error, max = 800) {
   const message = [];
   const frames = [];
@@ -491,15 +398,13 @@ function namesChangedFile(finding, filename) {
   return filename === ownPath || (stem.length > 3 && text.includes(stem.toLowerCase())) || String(finding.error ?? "").includes(base);
 }
 
+/** What the model sees about one finding, and nothing else. */
 export function buildPack(finding, compareFiles, pr, others) {
   const names = compareFiles.map((f) => f.filename);
   const ownPath = finding.repo_path ?? finding.file;
   const hunks = [];
   for (const [index, f] of compareFiles.entries()) {
-    // Only a hunk that touches the failing spec or is named in the error is
-    // sent: it is the only kind that may be cited, so an unrelated one costs
-    // tokens and can change nothing. The id is the file's place in the diff, so
-    // findings judged together share it.
+    // Only hunks related to the failure are sent: nothing else may be cited.
     if (namesChangedFile(finding, f.filename) && f.patch) hunks.push({ id: `hunk_${index}`, file: f.filename, related: true, patch: f.patch.slice(0, 4000) });
     if (hunks.length >= 8) break;
   }
@@ -519,13 +424,9 @@ export function buildPack(finding, compareFiles, pr, others) {
   if (finding.producer?.images.length) PACK_IMAGES.set(pack, finding.producer.images);
   return pack;
 }
-// Screenshot bytes travel beside the pack, not in it: the pack is the JSON the
-// model reads and the cache key, which carries each image's hash instead.
+// Screenshot bytes travel beside the pack; the pack (and cache key) carries hashes.
 const PACK_IMAGES = new WeakMap();
-// Ids a citation may name. Evidence with no content is deliberately absent: a
-// model citing "cross_pr" on a finding with no other failing PRs, or a hunk from
-// a diff unrelated to the failure, would otherwise pass validation and clear the
-// failure while pointing at nothing a reviewer could open.
+// Ids a citation may name. Empty evidence is left out so it can't be cited.
 export const evidenceIds = (pack) => [
   "test",
   "error",
@@ -536,30 +437,19 @@ export const evidenceIds = (pack) => [
   ...pack.diff_hunks_of_files_named_in_error.filter((h) => h.related).map((h) => h.id),
   ...(pack.producer_evidence?.notes || pack.producer_evidence?.screenshots?.length ? ["producer"] : []),
 ];
-// Models that accept a non-default temperature. Newer models return a 400 for
-// it, so this is an allowlist: an unrecognised model gets the API default rather
-// than a request that fails. Zero narrows the spread between runs; it does not
-// make the model deterministic.
+// Models that accept temperature (newer ones reject it with a 400).
 const TEMPERATURE_MODELS = ["claude-haiku-4-5", "claude-opus-4-6", "claude-sonnet-4-6"];
 export const samplingFor = (model) =>
   TEMPERATURE_MODELS.some((m) => model === m || String(model).startsWith(`${m}-`)) ? { temperature: 0 } : {};
 
-// Whether the model that answered is the one asked for. A dated request must be
-// answered by exactly that snapshot. An alias request may be answered by one of
-// that alias's own dated snapshots -- that is what an alias is -- but by nothing
-// else.
+// The answer must come from the model asked for: a dated snapshot exactly, an
+// alias only from its own snapshots (alias + "-YYYYMMDD", not any prefix match).
 const isSnapshot = (model) => /-\d{8}$/.test(String(model));
-// The alias followed directly by the date and nothing else. A prefix test is not
-// enough: claude-haiku-4-5-20251001 starts with "claude-haiku-4-", which would
-// let a request for one model accept an answer from another.
 const snapshotOf = (alias, served) => served.length === alias.length + 9 && served.startsWith(`${alias}-`) && isSnapshot(served);
 export const servedMatches = (requested, served) =>
   typeof served === "string" && (served === requested || (!isSnapshot(requested) && snapshotOf(requested, served)));
 
-// List prices in USD per million tokens. Opus 5.5 and Sonnet 5.5 from
-// Anthropic's model documentation as of 2026-10-02; Haiku 4.5 from its launch
-// pricing. AI_PRICES (JSON of the same shape) overrides or adds models; a model
-// with no price still reports its tokens, at an unknown cost.
+// List prices, USD per million tokens, as of 2026-10-02. AI_PRICES overrides or adds.
 export const PRICES = {
   "claude-haiku-4-5": { input: 1, output: 5, cache_write: 1.25, cache_read: 0.1 },
   "claude-sonnet-5-5": { input: 2, output: 10, cache_write: 2.5, cache_read: 0.2 },
@@ -595,12 +485,7 @@ export const packKey = (model, pack) => createHash("sha256").update(model + "\n"
 
 const imageBlock = (i) => ({ type: "image", source: { type: "base64", media_type: i.media_type, data: i.data } });
 
-/**
- * One request to the Messages API, retried on transient failures. The system
- * prompt is not marked for caching: it is below the minimum cacheable length
- * on Haiku 4.5, and a run makes one call per model, so a cache write would be
- * paid for and never read.
- */
+/** One Messages API request, retried on transient failures. No cache marker: the prompt is below Haiku's minimum. */
 async function requestModel(fetchImpl, apiKey, model, content, schema, maxTokens, timeoutMs) {
   const body = {
     model,
@@ -626,12 +511,8 @@ async function requestModel(fetchImpl, apiKey, model, content, schema, maxTokens
         continue;
       }
       const msg = await res.json();
-      // The request sets no stop sequences, so end_turn is the only way a
-      // complete answer ends.
       if (msg.stop_reason !== "end_turn") throw new Error(`stop_reason=${msg.stop_reason}`);
-      // An answer from a model other than the one asked for is not used, and is
-      // not retried either: the next attempt would be served the same way. The
-      // finding then keeps its deterministic outcome.
+      // An answer from another model is not used, and retrying wouldn't change who serves it.
       if (!servedMatches(model, msg.model)) {
         const err = new Error(`served model ${JSON.stringify(msg.model)} is not the requested ${model}; its answer is not used`);
         err.noRetry = true;
@@ -644,19 +525,6 @@ async function requestModel(fetchImpl, apiKey, model, content, schema, maxTokens
     }
   }
   throw last;
-}
-
-/** One finding, one request. */
-export async function askModel(fetchImpl, apiKey, model, pack, timeoutMs = 60000) {
-  const text = `Evidence pack (JSON). Valid evidence ids to cite: ${evidenceIds(pack).join(", ")}\n\n${JSON.stringify(pack, null, 1)}`;
-  const images = PACK_IMAGES.get(pack) ?? [];
-  const msg = await requestModel(fetchImpl, apiKey, model, images.length ? [...images.map(imageBlock), { type: "text", text }] : text, SCHEMA, 400, timeoutMs);
-  const answer = parseAnswer(msg.content?.find((b) => b.type === "text")?.text ?? "");
-  return {
-    ...answer,
-    usage: msg.usage ?? null,
-    provenance: { requested_model: model, served_model: msg.model, temperature: samplingFor(model).temperature ?? null, pack_hash: packKey(model, pack) },
-  };
 }
 
 export const BATCH_SCHEMA = {
@@ -682,10 +550,8 @@ export function batchSchema(ids) {
 }
 
 /**
- * Every finding of a run in one request: the PR context and the diff hunks
- * they cite are sent once, not once per finding. Returns one answer or Error
- * per pack, in order, and the response's token usage. A finding the response
- * leaves out gets an Error with `missing` set, so the caller can ask again.
+ * All of a run's findings in one request, shared context sent once. Returns one
+ * answer or Error per pack; a finding left out gets an Error with `missing` set.
  */
 export async function askModelBatch(fetchImpl, apiKey, model, packs, timeoutMs = 90000) {
   const ids = packs.map((_, i) => `f${i + 1}`);
@@ -721,10 +587,7 @@ export async function askModelBatch(fetchImpl, apiKey, model, packs, timeoutMs =
 export function parseAnswer(text) {
   const a = JSON.parse(text);
   if (!SCHEMA.properties.cause.enum.includes(a.cause)) throw new Error("answer failed validation: unknown cause");
-  // A confidence outside [0, 1] is a malformed answer, not an emphatic one. It
-  // used to be clamped, so a confidence of 7 became 1 -- the most trust the
-  // decision matrix can give -- and cleared a regression on the strength of a
-  // number that meant nothing. NaN and Infinity are rejected for the same reason.
+  // Out of [0, 1] is malformed, not emphatic: reject rather than clamp.
   if (typeof a.confidence !== "number" || !Number.isFinite(a.confidence) || a.confidence < 0 || a.confidence > 1)
     throw new Error(`answer failed validation: confidence ${JSON.stringify(a.confidence)} is not a number in [0, 1]`);
   if (!Array.isArray(a.cited_evidence) || !a.cited_evidence.every((c) => typeof c === "string"))
@@ -736,8 +599,7 @@ export function parseAnswer(text) {
 /** The decision matrix: what a judge answer may change. Citations must name evidence in the pack. */
 export function decide(cls, answer, pack, cfg = DEFAULTS, isTrunkRun = false, identityUnresolved = false) {
   const EXON = exoneratedSet(isTrunkRun);
-  // Defence at the boundary: whatever reaches here, a finding whose history
-  // cannot be tied to it may not be cleared by an opinion about that history.
+  // A finding whose history can't be tied to it is never cleared by an opinion.
   if (identityUnresolved) return { blocking: true, decision: "evidence_incomplete", answer: answer ?? null };
   if (!answer) return { blocking: !EXON.has(cls), decision: "unavailable", answer: null };
   const known = new Set(evidenceIds(pack));
@@ -750,22 +612,15 @@ export function decide(cls, answer, pack, cfg = DEFAULTS, isTrunkRun = false, id
     if (a.cause === "caused_by_pr" && a.confidence >= cfg.vetoMin && hunk) return { blocking: true, decision: "adjudicator_veto", answer: a };
     return { blocking: false, decision: "engine", answer: a };
   }
-  // An unblock always needs a citation that survived validation against the pack.
-  // "bug_on_master" used to qualify on its own, which was a hole: the rules only
-  // reach here when trunk history was clean, so a model asserting the test is
-  // broken on master is contradicting the data, and it could clear a regression
-  // while citing nothing a reviewer could open.
+  // An unblock always needs a citation that exists in the pack.
   if (BORDERLINE.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && (cross || hunk || produced))
     return { blocking: false, decision: "adjudicator_unblock", answer: a };
   return { blocking: !EXON.has(cls), decision: "engine", answer: a };
 }
 
 /**
- * Whether any answer could change this finding's outcome, read off decide():
- * a cleared finding can only be vetoed by citing a related diff hunk, and a
- * blocked one only unblocked by citing a cross-PR recurrence, a related hunk
- * or producer evidence. Without one in the pack, a call costs money and
- * decides nothing.
+ * Whether any answer could change the outcome (see decide): a veto needs a related
+ * hunk; an unblock needs a hunk, a cross-PR recurrence or producer evidence.
  */
 export function canChange(cls, pack, isTrunkRun = false) {
   const ids = evidenceIds(pack);
@@ -788,17 +643,11 @@ function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
 }
 
 /**
- * Ask the model about the findings whose outcome an answer could change, in
- * one call per model. Findings with the same spec and error share one
- * question; answers already in cfg.answers are reused; a call that could cross
- * cfg.budgetUsd is not made. Answers just short of a threshold go once to
- * cfg.escalationModel. Every finding the model does not settle keeps the
- * rules' outcome. Spend is recorded in the ledger.
- *
- * A blocking finding the rules can't explain, with nothing an answer could
- * cite to clear it, is still asked when cfg.advise is on: the answer is shown
- * as advice and never changes the outcome. Those questions ride in the same
- * request, after the ones that could clear something.
+ * Ask the model, in one call per model, about findings an answer could change.
+ * Same spec and error share a question; cached answers are reused; a call that
+ * could cross the budget is not made; near misses go once to the escalation
+ * model. With cfg.advise, blocking findings it can't clear are asked too, as
+ * advice only. Whatever the model doesn't settle keeps the rules' outcome.
  */
 export async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {}, isTrunkRun = false, ledger = newLedger()) {
   const groups = new Map();
@@ -827,7 +676,6 @@ export async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () 
   const settle = (g, answer, error) => {
     for (const m of g.members) {
       if (g.advisory) {
-        // The outcome stays the rules'; only the model's read is kept.
         if (answer && !error) Object.assign(m.f, { decision: "advice", judge: answer });
         continue;
       }
@@ -839,8 +687,7 @@ export async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () 
       Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
     }
   };
-  // A finding the response left out is asked once more, on its own request, so
-  // one skipped answer does not leave a failure the model could settle red.
+  // A finding the response left out is asked once more, on its own.
   const ask = async (model, batch, retryMissing = true) => {
     const fresh = [];
     for (const g of batch) {
@@ -947,8 +794,6 @@ function whySentence(f) {
     INSUFFICIENT_DATA: () => `only ${t.runs} master runs, too few to tell a flake from a break`,
     OWNED_BY_PR: () => "this PR edits the failing spec",
   }[f.class]?.() ?? f.reason;
-  // Advice is the model's read of a failure it had no checkable evidence to
-  // clear: shown so the author knows where to look, never used to clear.
   if (a && f.decision === "advice") why += `. AI's read (advice only, nothing it could cite to clear): ${CAUSE[a.cause] ?? a.cause}, ${Math.round(a.confidence * 100)}%: ${a.explanation}`;
   else if (a && f.blocking) why += `. ${ai.replace(/^AI (\d+%)/, "AI $1, not enough to clear")}`;
   if (f.producer) why += `. The run recorded ${f.producer.images.length} screenshot(s)${f.producer.notes ? " and notes" : ""}`;
@@ -962,12 +807,13 @@ function decidedBy(f) {
   return "rules";
 }
 
-export function renderComment({ context, verdict, findings, infra, model, runURL, counts, mode = "report-only", ai = newLedger() }) {
+/** The job summary: what blocks first, then what was cleared and why, and what AI cost. */
+export function renderSummary({ verdict, findings, infra, runURL, counts, mode = "report-only", ai = newLedger() }) {
   const blocking = infra ? counts.failed : findings.filter((f) => f.blocking).length;
   const cleared = findings.filter((f) => !f.blocking).length;
   const spend = ledgerTotals(ai);
   const icon = verdict === "SUCCESS" ? "✅" : verdict === "FAILURE" ? "🔴" : "⚠️";
-  const lines = [`<!-- e2e-triage:${md(context)} -->`, `## E2E triage: ${icon} ${verdict}`, "",
+  const lines = [`## E2E triage: ${icon} ${verdict}`, "",
     `**${counts.failed} failed → ${infra ? 0 : cleared} cleared · ${blocking} blocking** · ${counts.passed ?? 0} passed · ${counts.skipped ?? 0} skipped · ` +
     `AI: ${spend.calls} call(s), ${usd(spend.cost_usd)} · [run](${runURL})`, ""];
   if (infra) lines.push(`**Human investigation required.** ${md(infra)}`, "");
@@ -1013,14 +859,8 @@ export function statusDescription(verdict, findings, infra, counts) {
 // ------------------------------------------------------------------ data access
 
 /**
- * The run's results, optionally narrowed to one report inside the group.
- *
- * A desktop run uploads one report per operating system into a single group, so
- * without narrowing there is nothing to attribute a failure to and the verdict
- * can only ever be written to one status covering all of them. `reportName`
- * matches a report by prefix -- the names carry a version suffix
- * (e2e-on-ubuntu-latest-12.0.0-rc2) that changes every release, so callers pass
- * the stable part.
+ * The run's results, optionally narrowed to one report in the group (desktop
+ * uploads one per OS). `reportName` is a prefix: names end in a release version.
  */
 export async function fetchRun(fetchImpl, base, id, reportName = null) {
   const get = async (path) => {
@@ -1030,15 +870,8 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
   };
   const q = new URLSearchParams({ repository: id.repository, commit: id.commit_sha, name: id.name, limit: "20" });
   const { reports: groups = [] } = await get(`/reports?${q}`);
-  // Never trust the server to have applied the filters. A deployment without
-  // them answers the same query with an unfiltered list, and taking the first
-  // row means triaging a different repository's run and reporting its result as
-  // this one's — silently, and in the direction of a green status.
-  // The identity has to be complete. Repository, commit and name do not
-  // distinguish two workflow runs of the same suite on the same commit -- a
-  // rerun, or a dispatch repeated by the bot -- and both can carry attempt 1, so
-  // a nearest-match fallback could read an earlier green run and report its
-  // result as this one's.
+  // Match the full identity ourselves: never trust the server's filtering, and
+  // run id + attempt are what tell two runs of one suite on one commit apart.
   const runId = String(id.gh_run_id ?? "");
   const attempt = String(id.gh_run_attempt ?? "");
   if (!runId || !attempt)
@@ -1053,31 +886,21 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
   );
   if (!group)
     throw new Error(`TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`);
-  // An incomplete group is not a green run. Its cases may simply not have been
-  // uploaded yet, and no failures then reads as nothing wrong.
+  // An unfinished upload is not a green run.
   if (group.status !== "completed")
     throw new Error(`group ${group.id} is ${group.status}, not completed; an unfinished upload cannot show whether the run passed`);
   const [{ suites = [] }, cases] = await Promise.all([get(`/reports/${group.id}/suites`), get(`/reports/${group.id}/cases`)]);
   const fileOf = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
   const reportOf = new Map(suites.map((s) => [s.id, s.report_name ?? null]));
   const suiteTitleOf = new Map(suites.map((s) => [s.id, s.title ?? ""]));
-  // Narrowing to one report is what makes a per-OS verdict possible. A filter
-  // that matches nothing must not look like a run with no failures: that would
-  // report SUCCESS and, under enforce, write a green status for an operating
-  // system whose results were never read.
+  // A report filter that matches nothing must not read as a run with no failures.
   const scoped = reportName
     ? new Set(suites.filter((s) => String(s.report_name ?? "").startsWith(reportName)).map((s) => s.id))
     : null;
   if (scoped && scoped.size === 0)
     throw new Error(`no report in group ${group.id} has a name starting with "${reportName}" (of ${new Set(suites.map((s) => s.report_name)).size} report name(s) present)`);
-  // Identity is the qualified title, not the leaf. Two describe blocks in one
-  // file can carry the same leaf title; keyed on file and leaf their rows merge
-  // and a pass in one block erases a failure in the other. The full title names
-  // the describe chain, so with it the key is the test itself, wherever it ran:
-  // an orchestrated run retests a failed spec on another worker, in another
-  // report, and those attempts are one test, not two. A report scope says the
-  // reports are separate lanes, so there the report stays in the key. Without a
-  // full title only the suite can tell same-named tests apart.
+  // One test per full title (two describe blocks can share a leaf title), so a
+  // retest on another worker is the same test. Without a full title, per suite.
   const byTest = new Map();
   for (const c of cases) {
     if (scoped && !scoped.has(c.suite_id)) continue;
@@ -1087,11 +910,7 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
     if (!byTest.has(k)) byTest.set(k, []);
     byTest.get(k).push(c);
   }
-  // History is keyed on file and title. When two suites in the same file and the
-  // same report both carry a test of this name, that key names more than one
-  // test, and another test's history would answer for this one. Detect it here
-  // rather than assume it cannot happen: full_title resolves it when the server
-  // supplies it, and until then an ambiguous test may not be cleared.
+  // Flag names shared by two suites: their history can't be told apart, so they can't clear.
   const testsPerLeaf = new Map();
   const testsPerIdentity = new Map();
   for (const [key, attempts] of byTest) {
@@ -1121,8 +940,6 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
       failing.push({
         file,
         title,
-        // The ancestor-prefixed path, when the server serves it. It is what makes
-        // two suites of the same name in one file distinguishable in history.
         full_title: last.full_title ?? null,
         suite_title: suiteTitleOf.get(suiteId) ?? null,
         report_name: reportOf.get(suiteId),
@@ -1134,37 +951,22 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
     } else if (status === "skipped") skipped++;
     else if (status === "flaky") flaky++;
   }
-  // Passed counts retry-recovered tests, as the per-OS E2E statuses do, so the
-  // triage description and the one it replaces add up the same way.
+  // Passed includes retry-recovered tests, as the E2E statuses count them.
   return { group_id: group.id, failing, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
 }
 /**
- * Past executions of failing tests, keyed by identityKey (report scope, file and full title).
- *
- * TSIO is asked for whole spec files rather than for named tests: a title is
- * reworded far more often than the file it lives in, so a request keyed on the
- * title would lose a test's history the moment somebody fixed a typo in it. The
- * response therefore carries every test in those files and the rows are matched
- * back here, which keeps the matching rule on this side where it can change
- * without a server deploy. The rule today is an exact file and title match, so a
- * renamed test finds nothing, is reported as INSUFFICIENT_DATA and stays
- * blocking, which is the safe direction.
+ * Past runs of the failing tests, keyed by identityKey. Asks for whole spec files
+ * and matches tests here; a renamed test finds nothing and stays blocking.
+ * Two queries: the trunk branch's last trunkRuns runs, and the last crossPRRuns
+ * runs anywhere (other PRs).
  */
 export async function fetchHistory(fetchImpl, base, repository, tests, until, cfg = DEFAULTS, trunkBranch = null, reportName = null, warn = () => {}, lane = null) {
   const byTest = new Map();
   byTest.truncated = false;
-  // Set when a report was asked for but the rows cannot say which report they
-  // came from -- an endpoint that predates report identity. History from another
-  // platform then cannot be ruled out, so nothing may be cleared on it.
-  byTest.reportUnknown = false;
-  // Keys whose rows could not be tied to one test: another suite in the same
-  // file carries a test of this name, and nothing in the rows says which of them
-  // an execution belonged to.
-  byTest.ambiguous = new Set();
+  byTest.reportUnknown = false; // rows can't say which report (platform) they came from
+  byTest.ambiguous = new Set(); // tests whose rows can't be tied to them alone
   const files = [...new Set(tests.map((t) => t.file).filter(Boolean))].slice(0, HISTORY_MAX_FILES);
   if (files.length === 0) return byTest;
-  // A leaf key can name several tests, so hold all of them: picking one would
-  // silently give its history to the others.
   const byLeaf = new Map();
   for (const t of tests) {
     const leaf = `${t.file}\n${t.title}`;
@@ -1174,12 +976,7 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
   const queries = [];
   if (trunkBranch) queries.push({ branch: trunkBranch, runs: cfg.trunkRuns });
   queries.push({ runs: cfg.crossPRRuns });
-  // The trunk request is a subset of the unscoped one, so a row arrives twice and
-  // would be counted twice. Deduplicate only when that overlap is actually
-  // possible, and only on a key that identifies the row: a run is its group, and
-  // a test appears in it once per attempt. Without a group id there is nothing to
-  // match on, and dropping a row we cannot identify would quietly shrink the very
-  // history the rules count.
+  // The trunk query overlaps the other, so rows with a group id are deduplicated.
   const seen = new Map();
   const ancestryByLeaf = new Map();
   const fallbackByLeaf = new Map();
@@ -1195,14 +992,8 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
         const leaf = `${o.file}\n${o.title}`;
         const candidates = byLeaf.get(leaf);
         if (!candidates) continue;
-        // Another lane's run is never evidence -- classify() drops it -- so it must
-        // not cast doubt on this lane's rows either. A compatibility-matrix run
-        // (cmt-desktop) executes one spec against several server versions inside
-        // one group; read here, it marked every desktop test ambiguous.
+        // Another lane's rows are never evidence, nor grounds for ambiguity.
         if (lane != null && o.name != null && laneOf(o.name) !== lane) continue;
-        // Check the producer's stable report prefix before examining identity.
-        // Raw report names may be shard/worker names, so do not guess a lane
-        // from them when the producer supplied no report scope.
         if (reportName) {
           if (!o.report_name) byTest.reportUnknown = true;
           else if (!String(o.report_name).startsWith(reportName)) continue;
@@ -1212,20 +1003,13 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
           if (!ancestryByLeaf.has(leaf)) ancestryByLeaf.set(leaf, new Set());
           ancestryByLeaf.get(leaf).add(ancestry);
         }
-        // Full titles carry suite ancestry, so when both sides have one they
-        // settle which test an execution belonged to. Without them a leaf key
-        // that names more than one test cannot be attributed, and none of those
-        // tests may use it.
+        // Full titles settle which test a row is; without them a shared name can't be used.
         let test = null;
         const comparable = Boolean(o.full_title) && candidates.every((c) => c.full_title);
         if (comparable) {
-          // Both sides name their ancestry, so this row belongs to exactly one
-          // test -- or to a sibling this run never asked about, which is simply
-          // not ours to read.
           test = candidates.find((c) => c.full_title === o.full_title) ?? null;
           if (!test) continue;
         } else if (candidates.length > 1 || candidates[0].identity_ambiguous) {
-          // The row cannot be attributed and the key names more than one test.
           for (const c of candidates) byTest.ambiguous.add(identityKey(c));
           continue;
         } else {
@@ -1254,19 +1038,12 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
       }
       if (!hasMore) break;
       if (page === HISTORY_MAX_PAGES) {
-        // Partial history cannot clear anything: the rows never fetched are
-        // exactly the ones that might have shown a failure on trunk, or shown that
-        // a recurrence was not a recurrence at all.
         byTest.truncated = true;
         warn(`history for ${files.length} file(s) hit the ${HISTORY_MAX_PAGES}-page cap with more to come; nothing will be cleared on partial history`);
       }
     }
   }
-  // The endpoint returns attempts, and the rules count runs. A retry, or a
-  // retest on another worker, is the same run trying again: counted as rows, one
-  // flaky trunk run read as a failure and a pass, and a retest made one test look
-  // like two in different reports. Each run's attempts collapse to its outcome.
-  // A report scope keeps reports apart, as it does for the current run.
+  // Rows are attempts; the rules count runs. Collapse each run's attempts to one outcome.
   for (const [key, rows] of byTest) {
     const runs = new Map();
     const collapsed = [];
@@ -1290,8 +1067,7 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
     if ((ancestryByLeaf.get(leaf)?.size ?? 0) > 1)
       for (const key of keys) byTest.ambiguous.add(key);
   }
-  // A repeated qualified name in two reports of one group is not one trial.
-  // It requires a narrower producer scope, not whichever report arrived first.
+  // One name in two reports of a run is ambiguous without a narrower report scope.
   for (const [key, rows] of byTest) {
     const reportsByGroup = new Map();
     for (const row of rows) {
@@ -1301,24 +1077,15 @@ export async function fetchHistory(fetchImpl, base, repository, tests, until, cf
     }
     if ([...reportsByGroup.values()].some((reports) => reports.size > 1)) byTest.ambiguous.add(key);
   }
-  // classify() reads trunk[0] as the latest trunk run, and rows merged from two
-  // requests are not in order.
+  // Newest first: classify() reads trunk[0] as the latest trunk run.
   const at = (o) => Date.parse(o.created_at) || 0;
   for (const rows of byTest.values()) rows.sort((a, b) => at(b) - at(a));
   return byTest;
 }
 /**
- * The files this run is answerable for, and whether we actually know them.
- *
- * A PR's files come from the pull-request endpoint, which pages properly. The
- * compare endpoint returns `files` on the first page only and caps the whole
- * comparison at 300, so paging it buys nothing. A trunk run has no PR, so the
- * question becomes what this commit itself changed.
- *
- * `ok` matters as much as the list. OWNED_BY_PR is the rule that keeps a change
- * answerable for a spec it edited, so an empty list from a failed request looks
- * exactly like "touched nothing" and would let history rules clear a failure the
- * change caused. Callers must refuse to clear anything when ok is false.
+ * The PR's changed files (a trunk run: the commit's), and `ok`: whether the list
+ * is complete. An incomplete list looks like "touched nothing", so callers clear
+ * nothing unless ok is true.
  */
 export async function fetchChangedFiles(api, id, prNumber, log = () => {}) {
   try {
@@ -1329,13 +1096,9 @@ export async function fetchChangedFiles(api, id, prNumber, log = () => {}) {
         files.push(...(batch ?? []));
         if (!batch || batch.length < 100) return { files, ok: true };
       }
-      // A prefix of the diff is not ownership evidence: the failing spec may be
-      // on a page never fetched, and it would read as untouched.
       log(`stopped after ${CHANGED_FILES_MAX_PAGES} pages of changed files; ownership is incomplete and nothing will be cleared`);
       return { files, ok: false };
     }
-    // The commit endpoint paginates its file list too, and caps the comparison.
-    // Reading only the first page silently truncates a large commit's diff.
     const files = [];
     for (let page = 1; page <= CHANGED_FILES_MAX_PAGES; page++) {
       const commit = await api("GET", `/repos/${id.repository}/commits/${id.commit_sha}?per_page=100&page=${page}`);
@@ -1365,7 +1128,7 @@ export function gh(fetchImpl, token) {
 
 // ------------------------------------------------------------------ the run
 
-/** Shared decision path for live runs and replay. Callers supply evidence, never publication. */
+/** Decide a run from evidence already fetched. Writes nothing. */
 export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranch, testRoot, cfg = DEFAULTS, prTitle = "", lane = id.name, ask, log = () => {}, evidence = [] }) {
   const isTrunkRun = prNumber == null;
   const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(run.failing, cfg), counts: run.counts, ai: newLedger() };
@@ -1384,14 +1147,10 @@ export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranc
     for (const f of result.findings) {
       const producer = evidenceFor(f, evidence);
       if (producer) f.producer = producer;
-      // A failure history can't explain is a "likely regression" only when the
-      // PR changes the test or a file its error names; otherwise the summary
-      // says so instead of pointing the author at a change that isn't there.
+      // "Likely regression" only if the PR touches the test or a file its error names.
       if (prNumber && diff.ok && f.class === "REGRESSION") f.untouched = !changed.some((name) => namesChangedFile(f, name));
     }
-    // Every way the evidence can be incomplete. Each one makes some rule
-    // unsound rather than merely less informed, so none may clear anything, and
-    // the judge is skipped rather than overridden -- it reads the same pack.
+    // Incomplete evidence makes the rules unsound: nothing clears, and the model isn't asked.
     const blind =
       history.truncated ? "History was truncated at the page cap"
       : !diff.ok ? "The list of changed files could not be read in full"
@@ -1441,23 +1200,18 @@ export function configFrom(env) {
 export async function triage({ env, fetchImpl = fetch, log = console.error, now = new Date() }) {
   const cfg = configFrom(env);
   const id = JSON.parse(env.COMPOSITE_IDENTITY);
-  const prNumber = Number(id.gh_pr_number || env.PR_NUMBER || 0) || null;
-  // No PR number means this is a trunk run. The question then is not "is this
-  // the PR's fault" but "is trunk noisy or actually broken", which changes which
-  // findings may clear; see EXONERATED_ON_TRUNK.
+  const prNumber = Number(id.gh_pr_number || 0) || null;
+  // No PR number: a trunk run (see EXONERATED_ON_TRUNK).
   const isTrunkRun = prNumber == null;
   const base = (env.TSIO_BASE_URL || "https://test-io.test.mattermost.com").replace(/\/$/, "");
   const api = gh(fetchImpl, env.GITHUB_TOKEN);
-  // Null when unset: the producer's test root is not guessable, and guessing it
-  // wrong makes every spec look untouched.
+  // Not guessed: a wrong root makes every spec look untouched.
   const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
   const reportName = env.REPORT_NAME || null;
   const run = await fetchRun(fetchImpl, base, id, reportName);
   const context = env.STATUS_CONTEXT;
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
-  // A check of its own, beside the required one, so a red run reads "triage is
-  // checking" until the verdict is in. Never the required context: it only
-  // reports. TRIAGE_CONTEXT=off turns it off.
+  // An informational check beside the required one: pending while triage runs, then the verdict.
   const triageContext = env.TRIAGE_CONTEXT === "off" ? null : env.TRIAGE_CONTEXT || (context ? `${context}/triage` : null);
   const postTriageCheck = async (state, description) => {
     if (!triageContext || !env.GITHUB_TOKEN) return;
@@ -1506,37 +1260,17 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
     });
     if (env.ANSWERS_CACHE && cfg.answers) writeFileSync(env.ANSWERS_CACHE, JSON.stringify(cfg.answers));
-    const comment = renderComment({ mode: enforce ? "enforce" : "report-only", context, verdict: result.verdict, findings: result.findings, infra: result.infra, model: cfg.model, runURL, counts: run.counts, ai: result.ai });
+    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts);
     const spend = ledgerTotals(result.ai);
     if (env.GITHUB_OUTPUT)
       appendFileSync(env.GITHUB_OUTPUT, `verdict=${result.verdict}\nblocking=${result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\n` +
         `ai_calls=${spend.calls}\nai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}\nai_input_tokens=${spend.input_tokens}\nai_output_tokens=${spend.output_tokens}\n`);
-    if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, comment + "\n");
-    // Report-only unless the caller explicitly and validly asks otherwise. An
-    // omitted mode, a typo, or a variable that failed to expand must never be the
-    // difference between describing a run and writing the status that gates it.
-    // Surrounding whitespace is transport noise and is ignored; casing is not.
-    // "enforce" is the documented spelling, and anything else -- a typo, a
-    // different case, a variable that did not expand -- is reported and treated as
-    // report-only rather than guessed at.
+    if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, summary + "\n");
+    // Only the exact value "enforce" writes the required status; anything else is report-only.
     const mode = String(env.MODE ?? "").trim();
     if (mode && mode !== "enforce" && mode !== "report-only")
       log(`unrecognised mode ${JSON.stringify(mode)}; the only value that enforces is "enforce", so this run is report-only`);
-    if (env.POST_PR_COMMENT === "true" && prNumber && (run.failing.length || env.ALWAYS_COMMENT === "true")) {
-      const marker = `<!-- e2e-triage:${md(context)} -->`;
-      // Comments come back oldest first, 100 to a page. On a long-running PR the
-      // sticky comment is not on the first page, and failing to find it posts a
-      // second one on every run instead of updating the one already there.
-      let mine = null;
-      for (let page = 1; page <= 20 && !mine; page++) {
-        const comments = await api("GET", `/repos/${id.repository}/issues/${prNumber}/comments?per_page=100&page=${page}`);
-        mine = comments.find((c) => c.body?.startsWith(marker)) ?? null;
-        if (comments.length < 100) break;
-      }
-      if (mine) await api("PATCH", `/repos/${id.repository}/issues/comments/${mine.id}`, { body: comment });
-      else await api("POST", `/repos/${id.repository}/issues/${prNumber}/comments`, { body: comment });
-    }
     if (enforce && context) {
       await api("POST", `/repos/${id.repository}/statuses/${id.commit_sha}`, {
         state: result.verdict === "SUCCESS" ? "success" : "failure",
@@ -1548,8 +1282,8 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
     if (announce) {
       const blocking = result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length;
       await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", result.infra
-        ? `${run.counts.failed} failed · investigation required${enforce ? "" : " (report-only)"}`
-        : `${run.counts.failed} failed → ${result.findings.length - blocking} cleared · ${blocking} blocking${enforce ? "" : " (report-only)"}`);
+        ? `${run.counts.failed} failed · investigation required`
+        : `${run.counts.failed} failed → ${result.findings.length - blocking} cleared · ${blocking} blocking`);
     }
     log(`e2e-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;
@@ -1559,102 +1293,10 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
   }
 }
 
-// ------------------------------------------------------------------- replay
-
-/**
- * Read-only replay through evaluateRun. Corpus rows carry exact run identity,
- * evaluation time, test_root, report_name and base_ref; captured diffs must be
- * complete. Judge answers are keyed by model, system prompt and full evidence
- * pack. See actions/e2e-triage/README.md for the input and output contracts.
- */
-export async function replay({ runsPath, answersPath, comparePath, base, outPath, env = process.env, fetchImpl = fetch, log = console.error }) {
-  const runs = JSON.parse(readFileSync(runsPath, "utf8"));
-  const answers = answersPath && existsSync(answersPath) ? JSON.parse(readFileSync(answersPath, "utf8")) : {};
-  const compares = comparePath ? JSON.parse(readFileSync(comparePath, "utf8")) : {};
-  const cfg = { ...configFrom(env), answers };
-  const results = [];
-  const skipped = [];
-  for (const [i, r] of runs.entries()) {
-    const id = {
-      repository: r.repository,
-      branch: r.branch,
-      commit_sha: r.commit_sha,
-      name: r.name,
-      gh_run_id: r.gh_run_id ?? r.run_id ?? null,
-      gh_run_attempt: r.gh_run_attempt ?? r.run_attempt ?? null,
-    };
-    if (!id.gh_run_id || !id.gh_run_attempt) {
-      skipped.push({ ...r, why: "corpus row has no gh_run_id/gh_run_attempt, and a run cannot be identified without them" });
-      log(`[${i + 1}/${runs.length}] skipped: ${r.repository} ${r.commit_sha?.slice(0, 7)} ${r.name} has no run identity`);
-      continue;
-    }
-    const prNumber = Number(r.pr || r.gh_pr_number || 0) || null;
-    const reportName = r.report_name || env.REPORT_NAME || null;
-    const testRoot = r.test_root || env.TEST_ROOT || null;
-    const trunkBranch = prNumber ? (r.base_ref || null) : r.branch;
-    let result;
-    try {
-      const run = await fetchRun(fetchImpl, base, id, reportName);
-      // Only evidence available at the recorded evaluation time may be used.
-      const until = new Date(r.run_at).toISOString();
-      const history = run.failing.length && !infraVerdict(run.failing, cfg)
-        ? await fetchHistory(fetchImpl, base, id.repository, run.failing, until, cfg, trunkBranch, reportName, log, laneOf(id.name))
-        : new Map();
-      const cmp = compares[`${r.repository}:${r.commit_sha}`];
-      // A saved prefix of the diff is not ownership evidence. Corpus creation
-      // must attest that every page was captured, including an empty full diff.
-      const diff = { files: cmp?.files ?? [], ok: cmp?.complete === true && Array.isArray(cmp.files) };
-      result = await evaluateRun({
-        run, id, prNumber, history, diff, trunkBranch, testRoot, cfg,
-        prTitle: cmp?.pr_title ?? "", lane: r.lane || env.LANE || id.name, log,
-        // Answers are keyed by model, system prompt and the full evidence pack
-        // (see answerKey), never by a display name, and looked up in judge().
-        ask: async (packs, model) => {
-          if (!env.ANTHROPIC_API_KEY) throw new Error("no answer for this evidence pack");
-          return askModelBatch(fetchImpl, env.ANTHROPIC_API_KEY, model, packs);
-        },
-      });
-      if (answersPath) writeFileSync(answersPath, JSON.stringify(answers, null, 1));
-    } catch (e) {
-      log(`[${i + 1}/${runs.length}] ${r.pr} ${r.name}: ${e}`);
-      skipped.push({ ...r, why: String(e).slice(0, 200) });
-      continue;
-    }
-    const { verdict, findings, infra } = result;
-    results.push({ ...r, verdict, infra: Boolean(infra), ai: ledgerTotals(result.ai), classes: findings.map((f) => f.class), decisions: findings.map((f) => ({
-      identity: identityKey(f), title: f.title, full_title: f.full_title, report_scope: f.report_scope,
-      class: f.class, blocking: f.blocking, decision: f.decision ?? "engine", judge: f.judge ?? null,
-    })) });
-    log(`[${i + 1}/${runs.length}] PR ${r.pr} ${r.name} ${r.commit_sha.slice(0, 7)} ${r.truth}: ${verdict} ${findings.map((f) => f.class).join(",")}`);
-  }
-  if (outPath) writeFileSync(outPath, JSON.stringify({ evaluated: results.length, skipped, results }, null, 1));
-  // An evaluation that quietly dropped most of its corpus is not calibration.
-  log(`evaluated ${results.length} of ${runs.length} run(s); skipped ${skipped.length}`);
-  for (const sk of skipped.slice(0, 10)) log(`  skipped ${sk.repository ?? "?"} ${String(sk.commit_sha ?? "").slice(0, 7)} ${sk.name ?? "?"}: ${sk.why}`);
-  if (results.length === 0 && runs.length > 0) log("NO RUNS EVALUATED -- these results say nothing about the rules");
-  const truths = [...new Set(results.map((r) => r.truth))].sort();
-  const table = ["| Ground truth | runs | green |", "|---|---|---|"];
-  for (const t of truths) {
-    const rs = results.filter((r) => r.truth === t);
-    table.push(`| ${t} | ${rs.length} | ${rs.filter((r) => r.verdict === "SUCCESS").length} |`);
-  }
-  log(table.join("\n"));
-  if (results.length === 0) throw new Error(`No runs evaluated (${runs.length} input, ${skipped.length} skipped); replay is not calibration`);
-  return results;
-}
-
 // --------------------------------------------------------------------- main
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const args = process.argv.slice(2);
-  const opt = (name) => {
-    const i = args.indexOf(`--${name}`);
-    return i >= 0 ? args[i + 1] : undefined;
-  };
-  const main = args.includes("--replay")
-    ? replay({ runsPath: opt("replay"), answersPath: opt("answers"), comparePath: opt("compare"), base: opt("tsio") ?? "http://localhost:8080", outPath: opt("out") })
-    : triage({ env: process.env });
-  main.catch((e) => {
+  triage({ env: process.env }).catch((e) => {
     console.error(String(e));
     process.exit(1);
   });

@@ -1,12 +1,7 @@
-// Reproductions from the external review of ca1c539. Each one failed against
-// that commit and passes here; they are kept separate from the main suite so
-// the cases an outside reviewer found stay identifiable as such.
+// Reproductions from an external review: tests sharing a leaf title in one spec.
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {triage, replay} from './e2e-triage.mjs';
-import {mkdtempSync, writeFileSync, rmSync} from 'node:fs';
-import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {triage} from './e2e-triage.mjs';
 
 function fixture({bothFail=false, fullTitles=true, judgeEnabled=false}={}) {
   const id={repository:'o/r', commit_sha:'abc', name:'desktop-pr', gh_run_id:'12', gh_run_attempt:'1', gh_pr_number:5, branch:'pr-5'};
@@ -32,7 +27,6 @@ function fixture({bothFail=false, fullTitles=true, judgeEnabled=false}={}) {
     if(p.endsWith('/history')) return Response.json({observations:history,has_more:false});
     if(p.endsWith('/pulls/5/files')) return Response.json([{filename:'app/change.ts',patch:'@@ unrelated change'}]);
     if(p.endsWith('/pulls/5')) return Response.json({title:'Product fix',base:{ref:'master'}});
-    if(p.endsWith('/issues/5/comments')) return Response.json(init.method==='POST'?{id:1}:[]);
     if(u.hostname==='api.anthropic.com') {
       asked++;
       return Response.json({stop_reason:'end_turn',content:[{type:'text',text:JSON.stringify({
@@ -66,22 +60,4 @@ test('unresolved test identity cannot reach or be cleared by the judge',async()=
   }))}));
   assert.equal(f.asked(),0,'Judge must not receive unresolved identity evidence');
   assert.equal(r.verdict,'FAILURE');
-});
-
-test('replay retains complete run identity from its input corpus',async()=>{
-  const dir=mkdtempSync(join(tmpdir(),'triage-replay-fixture-'));
-  const logs=[];
-  try {
-    const runsPath=join(dir,'runs.json');
-    writeFileSync(runsPath,JSON.stringify([{
-      repository:'o/r',commit_sha:'abc',name:'desktop-pr',branch:'pr-5',
-      pr:5,gh_run_id:'12',gh_run_attempt:'1',truth:'regression',run_at:'2026-09-30T00:00:00Z'
-    }]));
-    const f=fixture();
-    const result=await replay({runsPath,base:'http://fixture',env:{},fetchImpl:f.fetchImpl,log:s=>logs.push(s)});
-    console.log('REPLAY_IDENTITY',JSON.stringify({processed:result.length,logs}));
-    assert.equal(result.length,1,'A complete corpus entry must be evaluated, not silently skipped');
-  } finally {
-    rmSync(dir,{recursive:true,force:true});
-  }
 });
