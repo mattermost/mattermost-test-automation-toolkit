@@ -1,7 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -514,8 +514,55 @@ test("only an explicit, valid enforce mode writes a commit status", async () => 
   // The one spelling that may.
   const written = [];
   await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "" }, fetchImpl: fakeFetch(routes(written)), log: () => {} });
-  assert.equal(written.length, 1, "explicit enforce still writes exactly one status");
-  assert.equal(written[0].context, "e2e-test/playwright");
+  const required = written.filter((s) => s.context === "e2e-test/playwright");
+  assert.equal(required.length, 1, "explicit enforce still writes exactly one required status");
+  // Beside it, its own check: pending while triage works, then the verdict.
+  assert.deepEqual(written.filter((s) => s.context === "e2e-test/playwright/triage").map((s) => [s.state, s.description]), [
+    ["pending", "1 failed · triage is checking them"],
+    ["success", "1 failed → 1 cleared · 0 blocking"],
+  ]);
+  assert.ok(written.findIndex((s) => s.state === "pending") < written.findIndex((s) => s.context === "e2e-test/playwright"), "the triage check goes pending first");
+
+  // A triage that crashes says so on its check and leaves the E2E result alone.
+  const crashed = [];
+  const broken = routes(crashed).map(([path, h]) => (path === "/reports/history" ? [path, () => { throw new Error("history down"); }] : [path, h]));
+  await assert.rejects(triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "" }, fetchImpl: fakeFetch(broken), log: () => {} }));
+  assert.deepEqual(crashed.map((s) => [s.context, s.state]), [["e2e-test/playwright/triage", "pending"], ["e2e-test/playwright/triage", "error"]]);
+
+  // TRIAGE_CONTEXT=off posts only the required status.
+  const quiet = [];
+  await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", TRIAGE_CONTEXT: "off" }, fetchImpl: fakeFetch(routes(quiet)), log: () => {} });
+  assert.deepEqual(quiet.map((s) => s.context), ["e2e-test/playwright"]);
+});
+test("a failure history can't explain is a likely regression only when the PR touches it", async () => {
+  const routes = (files) => [
+    ...runRoutes([spec("t1", "failed")]),
+    ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
+    ["/pulls/5/files", () => Response.json(files)],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+    ["/statuses/abc", () => Response.json({})],
+  ];
+  const run = async (files) => {
+    const dir = mkdtempSync(join(tmpdir(), "triage-label-"));
+    try {
+      const result = await triage({ env: { ...env, ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: join(dir, "s.md") }, fetchImpl: fakeFetch(routes(files)), log: () => {} });
+      return { result, summary: readFileSync(join(dir, "s.md"), "utf8") };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  };
+  // mattermost-mobile#10172: the PR changed CI and test-harness files, none the
+  // test or its error names. It is still blocking, but not called a regression.
+  const untouched = await run([{ filename: "app/x.ts", patch: "@@" }]);
+  assert.equal(untouched.result.findings[0].class, "REGRESSION");
+  assert.equal(untouched.result.findings[0].blocking, true);
+  assert.match(untouched.summary, /🔴 not explained by history/);
+  assert.match(untouched.summary, /this PR changes neither the test nor any file its error names\. Re-run it/);
+  assert.doesNotMatch(untouched.summary, /likely regression/);
+
+  // A changed file the error names ("Error: expected visible") keeps the old wording.
+  const named = await run([{ filename: "src/visible.ts", patch: "@@" }]);
+  assert.equal(named.result.findings[0].class, "REGRESSION");
+  assert.match(named.summary, /🔴 likely regression/);
+  assert.match(named.summary, /Check your change, or merge master/);
 });
 test("skipped history rows are not trunk runs", () => {
   const skipped = (n) => Array.from({ length: n }, (_, i) => obs({ commit_sha: `s${i}`, status: "skipped", created_at: "2026-09-11T00:00:00Z" }));
@@ -767,12 +814,24 @@ test("end to end: a timeout the judge clears from the screenshot the run recorde
     assert.equal(result.findings[0].decision, "adjudicator_unblock");
     assert.equal(result.verdict, "SUCCESS");
 
-    // Without evidence there is nothing the model could cite, so it is not asked.
+    // Without evidence there is nothing the model could cite to clear it. It is
+    // still asked, for advice the summary shows; the outcome stays the rules'.
     sent.length = 0;
     const without = await triage({ env: base, fetchImpl: routes(), log: () => {} });
-    assert.equal(sent.length, 0);
+    assert.equal(sent.length, 1);
     assert.equal(without.findings[0].blocking, true);
-    assert.equal(without.ai.skipped.no_effect, 1);
+    assert.equal(without.findings[0].decision, "advice");
+    assert.equal(without.findings[0].judge.cause, "flaky_environment");
+    assert.equal(without.verdict, "FAILURE");
+    const summary = renderComment({ context: "c", verdict: without.verdict, findings: without.findings, infra: null, model: "m", runURL: "u", counts: { failed: 1, passed: 0, skipped: 0 }, ai: without.ai });
+    assert.match(summary, /AI's read \(advice only, nothing it could cite to clear\): flaky \/ environment, 90%/);
+    assert.match(summary, /rules · AI advice/);
+
+    // With advice off, it is not asked at all.
+    sent.length = 0;
+    const off = await triage({ env: { ...base, AI_ADVICE: "false" }, fetchImpl: routes(), log: () => {} });
+    assert.equal(sent.length, 0);
+    assert.equal(off.ai.skipped.no_effect, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -797,13 +856,26 @@ test("the model is asked only when its answer could change the outcome", async (
   assert.equal(canChange(regression.class, buildPack(regression, ci, prCtx, [])), false);
   assert.equal(canChange(regression.class, buildPack(classify(failing, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1), ci, prCtx, [])), true);
 
+  // With advice off, neither is asked.
   let calls = 0;
   const ledger = newLedger();
   const findings = [cleared, regression];
-  await judge(findings, findings.map((f) => buildPack(f, ci, prCtx, [])), async () => { calls++; }, DEFAULTS, () => {}, false, ledger);
+  await judge(findings, findings.map((f) => buildPack(f, ci, prCtx, [])), async () => { calls++; }, { ...DEFAULTS, advise: false }, () => {}, false, ledger);
   assert.equal(calls, 0);
   assert.equal(ledger.skipped.no_effect, 2);
   assert.deepEqual(findings.map((f) => f.blocking), [false, true], "the rules' outcome stands");
+
+  // With advice on (the default), the blocked one is asked for advice only; the
+  // cleared one still isn't, since nothing could veto it. Even a confident
+  // "flaky" answer leaves the regression blocking.
+  const again = [classify(failing, [obs({ status: "failed" }), ...trunkPasses(8)], [], undefined, 1), classify(failing, trunkPasses(8), [], undefined, 1)];
+  const asked = [];
+  const advised = newLedger();
+  await judge(again, again.map((f) => buildPack(f, ci, prCtx, [])), async (packs, model) => { asked.push(packs.map((p) => p.engine.class)); return ok({ ...flakyAnswer, confidence: 0.99, cited_evidence: [] })(packs, model); }, DEFAULTS, () => {}, false, advised);
+  assert.deepEqual(asked, [["REGRESSION"]]);
+  assert.equal(advised.skipped.no_effect, 1);
+  assert.deepEqual(again.map((f) => [f.blocking, f.decision ?? null]), [[false, null], [true, "advice"]]);
+  assert.equal(advised.calls.length, 1, "advice is paid for and shown like any other call");
 });
 
 test("tests failing with one spec and error share one question", async () => {
@@ -995,8 +1067,10 @@ test("the status description accounts for every test in the run", async () => {
   const written = [];
   const result = await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "" }, fetchImpl: fakeFetch(routes(written)), log: () => {} });
   assert.deepEqual(result.counts, { total: 5, passed: 2, failed: 2, flaky: 1, skipped: 1 });
-  assert.equal(written[0].state, "success");
-  assert.equal(written[0].description, "2 passed, 2 failed (2 cleared by triage), 1 skipped");
+  const required = written.filter((s) => s.context === "e2e-test/playwright");
+  assert.equal(required.length, 1);
+  assert.equal(required[0].state, "success");
+  assert.equal(required[0].description, "2 passed, 2 failed (2 cleared by triage), 1 skipped");
 
   const counts = { passed: 240, failed: 2, skipped: 3 };
   assert.equal(statusDescription("FAILURE", [{ blocking: true }, { blocking: false }], null, counts), "240 passed, 2 failed (1 cleared by triage, 1 unresolved), 3 skipped");

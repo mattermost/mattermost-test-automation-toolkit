@@ -53,7 +53,9 @@ Each response's token usage is priced from a dated per-model table (overridable
 with `ai-prices`) and reported per test, per run in the summary, and as the
 `ai-calls` and `ai-cost-usd` outputs. A call whose worst case would cross
 `ai-budget-usd` (default 0.5) is not made, and its findings keep the rules'
-outcome. The system prompt carries no cache marker: it is below Haiku 4.5's
+outcome. A blocking failure with nothing an answer could cite is still asked,
+after those that could clear something, when `ai-advice` is on (default): its
+answer is shown as advice and never changes the outcome. The system prompt carries no cache marker: it is below Haiku 4.5's
 minimum cacheable length, and a run makes one call per model.
 
 The job summary leads with what blocks, one row per test with the result, a
@@ -110,7 +112,10 @@ Existing consumer workflows retain their manual override handling.
 - **report-only (default):** job summary and outputs only; required status unchanged.
 - **enforce:** also writes success only for `SUCCESS`, otherwise failure, on the
   configured commit-status context. The consumer remains responsible for its
-  job assertion and manual override ordering.
+  job assertion and manual override ordering. On a red run it also writes a
+  check of its own, `triage-status-context` (default `<status-context>/triage`):
+  pending while triage works, then the verdict, or an error if triage could not
+  finish. It is informational and is never the required context.
 - **post-pr-comment: "true":** separately opts into a sticky comment, in either
   mode. It contains the same compact summary with collapsed evidence. Otherwise
   no comment is read, created, updated or deleted. Existing comments are left alone.

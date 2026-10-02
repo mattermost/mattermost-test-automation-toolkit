@@ -88,6 +88,21 @@ inputs:
       it is not made, and its findings keep the rules' outcome.
     required: false
     default: "0.5"
+  ai-advice:
+    description: >
+      "true" asks the model about blocking failures it has no checkable evidence
+      to clear, and shows its read in the summary as advice. Advice never
+      changes the outcome. "false" skips those questions.
+    required: false
+    default: "true"
+  triage-status-context:
+    description: >
+      In enforce mode, a check of its own that reads pending while triage works
+      on a red run and then shows the verdict, so a red required check is seen
+      to be under triage. Never the required context. Defaults to
+      "<status-context>/triage"; "off" turns it off.
+    required: false
+    default: ""
   ai-prices:
     description: >
       Optional JSON of model prices in USD per million tokens, merged over the
@@ -151,6 +166,8 @@ runs:
         EVIDENCE_DIR: ${{ inputs.evidence-dir }}
         ESCALATION_MODEL: ${{ inputs.escalation-model }}
         AI_BUDGET_USD: ${{ inputs.ai-budget-usd }}
+        AI_ADVICE: ${{ inputs.ai-advice }}
+        TRIAGE_CONTEXT: ${{ inputs.triage-status-context }}
         AI_PRICES: ${{ inputs.ai-prices }}
         ANSWERS_CACHE: ${{ inputs.answers-cache }}
       run: node "${{ github.action_path }}/../../scripts/e2e-triage.mjs"

@@ -79,6 +79,9 @@ export const DEFAULTS = {
   minConfidence: 0.85,
   vetoMin: 0.9,
   maxJudged: 8,
+  // Ask the model about blocking findings it has no checkable evidence to clear,
+  // and show its read as advice. The outcome is never changed by it.
+  advise: true,
   infraMinFailures: 30,
   // A second, stronger model for answers that land just short of a threshold:
   // between escalateMin and the clear (or veto) threshold, on a finding the
@@ -479,20 +482,25 @@ export function compactError(error, max = 800) {
   return [...message, ...frames].join("\n").trim().slice(0, max);
 }
 
+// Whether a changed file is the failing spec or is named in the failure's error.
+function namesChangedFile(finding, filename) {
+  const ownPath = finding.repo_path ?? finding.file;
+  const text = `${finding.error}\n${finding.file}`.toLowerCase();
+  const base = filename.split("/").pop() ?? "";
+  const stem = base.split(".")[0] ?? "";
+  return filename === ownPath || (stem.length > 3 && text.includes(stem.toLowerCase())) || String(finding.error ?? "").includes(base);
+}
+
 export function buildPack(finding, compareFiles, pr, others) {
   const names = compareFiles.map((f) => f.filename);
   const ownPath = finding.repo_path ?? finding.file;
-  const text = `${finding.error}\n${finding.file}`.toLowerCase();
   const hunks = [];
   for (const [index, f] of compareFiles.entries()) {
-    const base = f.filename.split("/").pop() ?? "";
-    const stem = base.split(".")[0] ?? "";
-    const named = f.filename === ownPath || (stem.length > 3 && text.includes(stem.toLowerCase())) || finding.error.includes(base);
     // Only a hunk that touches the failing spec or is named in the error is
     // sent: it is the only kind that may be cited, so an unrelated one costs
     // tokens and can change nothing. The id is the file's place in the diff, so
     // findings judged together share it.
-    if (named && f.patch) hunks.push({ id: `hunk_${index}`, file: f.filename, related: true, patch: f.patch.slice(0, 4000) });
+    if (namesChangedFile(finding, f.filename) && f.patch) hunks.push({ id: `hunk_${index}`, file: f.filename, related: true, patch: f.patch.slice(0, 4000) });
     if (hunks.length >= 8) break;
   }
   const signature = errorSignature(finding.error);
@@ -786,25 +794,31 @@ function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
  * cfg.budgetUsd is not made. Answers just short of a threshold go once to
  * cfg.escalationModel. Every finding the model does not settle keeps the
  * rules' outcome. Spend is recorded in the ledger.
+ *
+ * A blocking finding the rules can't explain, with nothing an answer could
+ * cite to clear it, is still asked when cfg.advise is on: the answer is shown
+ * as advice and never changes the outcome. Those questions ride in the same
+ * request, after the ones that could clear something.
  */
 export async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {}, isTrunkRun = false, ledger = newLedger()) {
   const groups = new Map();
   for (const [i, f] of findings.entries()) {
     const pack = packs[i];
     if (!pack || f.identity_unresolved || !(BORDERLINE.has(f.class) || exoneratedSet(isTrunkRun).has(f.class))) continue;
-    if (!canChange(f.class, pack, isTrunkRun)) {
+    const advisory = !canChange(f.class, pack, isTrunkRun);
+    if (advisory && !(cfg.advise && f.blocking && BORDERLINE.has(f.class))) {
       ledger.skipped.no_effect++;
       f.ai = { skipped: "nothing the model could change" };
       continue;
     }
     const sig = errorSignature(f.error);
-    const key = sig ? JSON.stringify([exoneratedSet(isTrunkRun).has(f.class), f.file, sig]) : `#${i}`;
+    const key = sig ? JSON.stringify([exoneratedSet(isTrunkRun).has(f.class), advisory, f.file, sig]) : `#${i}`;
     if (groups.has(key)) {
       ledger.skipped.duplicate++;
       groups.get(key).members.push({ f, pack });
-    } else groups.set(key, { lead: { f, pack }, members: [{ f, pack }] });
+    } else groups.set(key, { lead: { f, pack }, members: [{ f, pack }], advisory });
   }
-  let pending = [...groups.values()];
+  let pending = [...groups.values()].sort((a, b) => Number(a.advisory) - Number(b.advisory));
   for (const g of pending.slice(cfg.maxJudged)) {
     ledger.skipped.cap++;
     for (const m of g.members) m.f.ai = { skipped: "over the per-run limit" };
@@ -812,6 +826,11 @@ export async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () 
   pending = pending.slice(0, cfg.maxJudged);
   const settle = (g, answer, error) => {
     for (const m of g.members) {
+      if (g.advisory) {
+        // The outcome stays the rules'; only the model's read is kept.
+        if (answer && !error) Object.assign(m.f, { decision: "advice", judge: answer });
+        continue;
+      }
       if (error) {
         Object.assign(m.f, { decision: "unavailable" });
         continue;
@@ -874,7 +893,7 @@ export async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () 
   await ask(cfg.model, pending);
   for (const g of pending) settle(g, g.answer, g.answer ? null : g.error ?? null);
   const escalate = cfg.escalationModel && cfg.escalationModel !== cfg.model
-    ? pending.filter((g) => g.answer && nearMiss(g.lead.f.class, g.answer, g.lead.pack, cfg, isTrunkRun))
+    ? pending.filter((g) => !g.advisory && g.answer && nearMiss(g.lead.f.class, g.answer, g.lead.pack, cfg, isTrunkRun))
     : [];
   if (escalate.length) {
     for (const g of escalate) delete g.answer;
@@ -922,11 +941,16 @@ function whySentence(f) {
     FLAKY_ON_TRUNK: () => `fails intermittently on master: ${t.fails} failed and ${t.flaky} flaky in ${t.runs} runs`,
     FLAKY_CROSS_PR: () => `failed the same way on ${f.cross_pr.prs.length} other PRs while master passed`,
     SAME_FAILURE_AS_CLEARED: () => `same error as ${f.same_as}, which history cleared`,
-    REGRESSION: () => `passes on master (${t.passes} of ${t.runs}) and no other PR fails it. Check your change, or merge master`,
+    REGRESSION: () => f.untouched
+      ? `passes on master (${t.passes} of ${t.runs}) and no other PR fails it, and this PR changes neither the test nor any file its error names. Re-run it; if it fails again, check what the test depends on`
+      : `passes on master (${t.passes} of ${t.runs}) and no other PR fails it. Check your change, or merge master`,
     INSUFFICIENT_DATA: () => `only ${t.runs} master runs, too few to tell a flake from a break`,
     OWNED_BY_PR: () => "this PR edits the failing spec",
   }[f.class]?.() ?? f.reason;
-  if (a && f.blocking) why += `. ${ai.replace(/^AI (\d+%)/, "AI $1, not enough to clear")}`;
+  // Advice is the model's read of a failure it had no checkable evidence to
+  // clear: shown so the author knows where to look, never used to clear.
+  if (a && f.decision === "advice") why += `. AI's read (advice only, nothing it could cite to clear): ${CAUSE[a.cause] ?? a.cause}, ${Math.round(a.confidence * 100)}%: ${a.explanation}`;
+  else if (a && f.blocking) why += `. ${ai.replace(/^AI (\d+%)/, "AI $1, not enough to clear")}`;
   if (f.producer) why += `. The run recorded ${f.producer.images.length} screenshot(s)${f.producer.notes ? " and notes" : ""}`;
   return why;
 }
@@ -934,6 +958,7 @@ function whySentence(f) {
 function decidedBy(f) {
   if (f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto")
     return `AI · ${md(shortModel(f.judge?.provenance?.served_model ?? f.ai?.model))}${f.escalated ? " (escalated)" : ""}`;
+  if (f.decision === "advice") return `rules · AI advice (${md(shortModel(f.judge?.provenance?.served_model ?? f.ai?.model))})`;
   return "rules";
 }
 
@@ -950,7 +975,10 @@ export function renderComment({ context, verdict, findings, infra, model, runURL
   const header = ["| Test | Result | Why | Decided by | Cost |", "| --- | --- | --- | --- | --- |"];
   const row = (f) => {
     const base = String(f.file ?? "").split("/").pop();
-    const label = f.decision === "adjudicator_unblock" ? CAUSE[f.judge.cause] ?? f.judge.cause : f.decision === "adjudicator_veto" ? "caused by this PR" : RESULT[f.class] ?? f.class;
+    const label = f.decision === "adjudicator_unblock" ? CAUSE[f.judge.cause] ?? f.judge.cause
+      : f.decision === "adjudicator_veto" ? "caused by this PR"
+      : f.class === "REGRESSION" && f.untouched ? "not explained by history"
+      : RESULT[f.class] ?? f.class;
     const cost = f.ai?.model ? usd(f.ai.cost_usd) : "–";
     return `| ${md(f.title)} · \`${md(base)}\` | ${f.blocking ? "🔴" : "✅"} ${md(label)} | ${md(whySentence(f))} | ${decidedBy(f)} | ${cost} |`;
   };
@@ -1356,6 +1384,10 @@ export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranc
     for (const f of result.findings) {
       const producer = evidenceFor(f, evidence);
       if (producer) f.producer = producer;
+      // A failure history can't explain is a "likely regression" only when the
+      // PR changes the test or a file its error names; otherwise the summary
+      // says so instead of pointing the author at a change that isn't there.
+      if (prNumber && diff.ok && f.class === "REGRESSION") f.untouched = !changed.some((name) => namesChangedFile(f, name));
     }
     // Every way the evidence can be incomplete. Each one makes some rule
     // unsound rather than merely less informed, so none may clear anything, and
@@ -1401,6 +1433,7 @@ export function configFrom(env) {
     model: env.CLAUDE_MODEL || DEFAULTS.model,
     escalationModel: env.ESCALATION_MODEL ?? DEFAULTS.escalationModel,
     budgetUsd: env.AI_BUDGET_USD ? Number(env.AI_BUDGET_USD) : DEFAULTS.budgetUsd,
+    advise: env.AI_ADVICE ? env.AI_ADVICE !== "false" : DEFAULTS.advise,
     prices,
   };
 }
@@ -1420,84 +1453,110 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
   const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
   const reportName = env.REPORT_NAME || null;
   const run = await fetchRun(fetchImpl, base, id, reportName);
-  let pull = {};
-  let history = new Map();
-  let diff = { files: [], ok: false };
-  let trunkBranch = isTrunkRun ? id.branch : null;
-  if (run.failing.length && !infraVerdict(run.failing, cfg)) {
-    if (prNumber) {
-      try {
-        pull = await api("GET", `/repos/${id.repository}/pulls/${prNumber}`);
-        trunkBranch = pull?.base?.ref ?? null;
-      } catch (e) {
-        log(`pull request metadata unavailable: ${String(e).slice(0, 200)}`);
-      }
-    }
-    [history, diff] = await Promise.all([
-      fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, laneOf(id.name)),
-      fetchChangedFiles(api, id, prNumber, log),
-    ]);
-  }
-  // Answers from an earlier attempt at the same evidence, so a re-run does not pay twice.
-  if (env.ANSWERS_CACHE) {
-    try {
-      cfg.answers = existsSync(env.ANSWERS_CACHE) ? JSON.parse(readFileSync(env.ANSWERS_CACHE, "utf8")) : {};
-    } catch (e) {
-      log(`answers cache unreadable, starting empty: ${String(e).slice(0, 120)}`);
-      cfg.answers = {};
-    }
-  }
-  const result = await evaluateRun({
-    run, id, prNumber, history, diff, trunkBranch, testRoot, cfg,
-    prTitle: pull.title ?? "", lane: env.LANE || id.name, log,
-    ask: env.ANTHROPIC_API_KEY ? (packs, model) => askModelBatch(fetchImpl, env.ANTHROPIC_API_KEY, model, packs) : null,
-    evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
-  });
   const context = env.STATUS_CONTEXT;
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
-  const enforce = String(env.MODE ?? "").trim() === "enforce";
-  if (env.ANSWERS_CACHE && cfg.answers) writeFileSync(env.ANSWERS_CACHE, JSON.stringify(cfg.answers));
-  const comment = renderComment({ mode: enforce ? "enforce" : "report-only", context, verdict: result.verdict, findings: result.findings, infra: result.infra, model: cfg.model, runURL, counts: run.counts, ai: result.ai });
-  const description = statusDescription(result.verdict, result.findings, result.infra, run.counts);
-  const spend = ledgerTotals(result.ai);
-  if (env.GITHUB_OUTPUT)
-    appendFileSync(env.GITHUB_OUTPUT, `verdict=${result.verdict}\nblocking=${result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\n` +
-      `ai_calls=${spend.calls}\nai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}\nai_input_tokens=${spend.input_tokens}\nai_output_tokens=${spend.output_tokens}\n`);
-  if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, comment + "\n");
-  // Report-only unless the caller explicitly and validly asks otherwise. An
-  // omitted mode, a typo, or a variable that failed to expand must never be the
-  // difference between describing a run and writing the status that gates it.
-  // Surrounding whitespace is transport noise and is ignored; casing is not.
-  // "enforce" is the documented spelling, and anything else -- a typo, a
-  // different case, a variable that did not expand -- is reported and treated as
-  // report-only rather than guessed at.
-  const mode = String(env.MODE ?? "").trim();
-  if (mode && mode !== "enforce" && mode !== "report-only")
-    log(`unrecognised mode ${JSON.stringify(mode)}; the only value that enforces is "enforce", so this run is report-only`);
-  if (env.POST_PR_COMMENT === "true" && prNumber && (run.failing.length || env.ALWAYS_COMMENT === "true")) {
-    const marker = `<!-- e2e-triage:${md(context)} -->`;
-    // Comments come back oldest first, 100 to a page. On a long-running PR the
-    // sticky comment is not on the first page, and failing to find it posts a
-    // second one on every run instead of updating the one already there.
-    let mine = null;
-    for (let page = 1; page <= 20 && !mine; page++) {
-      const comments = await api("GET", `/repos/${id.repository}/issues/${prNumber}/comments?per_page=100&page=${page}`);
-      mine = comments.find((c) => c.body?.startsWith(marker)) ?? null;
-      if (comments.length < 100) break;
+  // A check of its own, beside the required one, so a red run reads "triage is
+  // checking" until the verdict is in. Never the required context: it only
+  // reports. TRIAGE_CONTEXT=off turns it off.
+  const triageContext = env.TRIAGE_CONTEXT === "off" ? null : env.TRIAGE_CONTEXT || (context ? `${context}/triage` : null);
+  const postTriageCheck = async (state, description) => {
+    if (!triageContext || !env.GITHUB_TOKEN) return;
+    try {
+      await api("POST", `/repos/${id.repository}/statuses/${id.commit_sha}`, { state, context: triageContext, description: description.slice(0, 140), target_url: runURL });
+    } catch (e) {
+      log(`triage check ${triageContext} not updated: ${String(e).slice(0, 200)}`);
     }
-    if (mine) await api("PATCH", `/repos/${id.repository}/issues/comments/${mine.id}`, { body: comment });
-    else await api("POST", `/repos/${id.repository}/issues/${prNumber}/comments`, { body: comment });
-  }
-  if (enforce && context) {
-    await api("POST", `/repos/${id.repository}/statuses/${id.commit_sha}`, {
-      state: result.verdict === "SUCCESS" ? "success" : "failure",
-      context,
-      description,
-      target_url: runURL,
+  };
+  const enforce = String(env.MODE ?? "").trim() === "enforce";
+  // Like the required status, only an enforcing run writes to the PR.
+  const announce = enforce && run.failing.length > 0;
+  if (announce) await postTriageCheck("pending", `${run.counts.failed} failed · triage is checking them`);
+  try {
+    let pull = {};
+    let history = new Map();
+    let diff = { files: [], ok: false };
+    let trunkBranch = isTrunkRun ? id.branch : null;
+    if (run.failing.length && !infraVerdict(run.failing, cfg)) {
+      if (prNumber) {
+        try {
+          pull = await api("GET", `/repos/${id.repository}/pulls/${prNumber}`);
+          trunkBranch = pull?.base?.ref ?? null;
+        } catch (e) {
+          log(`pull request metadata unavailable: ${String(e).slice(0, 200)}`);
+        }
+      }
+      [history, diff] = await Promise.all([
+        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, laneOf(id.name)),
+        fetchChangedFiles(api, id, prNumber, log),
+      ]);
+    }
+    // Answers from an earlier attempt at the same evidence, so a re-run does not pay twice.
+    if (env.ANSWERS_CACHE) {
+      try {
+        cfg.answers = existsSync(env.ANSWERS_CACHE) ? JSON.parse(readFileSync(env.ANSWERS_CACHE, "utf8")) : {};
+      } catch (e) {
+        log(`answers cache unreadable, starting empty: ${String(e).slice(0, 120)}`);
+        cfg.answers = {};
+      }
+    }
+    const result = await evaluateRun({
+      run, id, prNumber, history, diff, trunkBranch, testRoot, cfg,
+      prTitle: pull.title ?? "", lane: env.LANE || id.name, log,
+      ask: env.ANTHROPIC_API_KEY ? (packs, model) => askModelBatch(fetchImpl, env.ANTHROPIC_API_KEY, model, packs) : null,
+      evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
     });
+    if (env.ANSWERS_CACHE && cfg.answers) writeFileSync(env.ANSWERS_CACHE, JSON.stringify(cfg.answers));
+    const comment = renderComment({ mode: enforce ? "enforce" : "report-only", context, verdict: result.verdict, findings: result.findings, infra: result.infra, model: cfg.model, runURL, counts: run.counts, ai: result.ai });
+    const description = statusDescription(result.verdict, result.findings, result.infra, run.counts);
+    const spend = ledgerTotals(result.ai);
+    if (env.GITHUB_OUTPUT)
+      appendFileSync(env.GITHUB_OUTPUT, `verdict=${result.verdict}\nblocking=${result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\n` +
+        `ai_calls=${spend.calls}\nai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}\nai_input_tokens=${spend.input_tokens}\nai_output_tokens=${spend.output_tokens}\n`);
+    if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, comment + "\n");
+    // Report-only unless the caller explicitly and validly asks otherwise. An
+    // omitted mode, a typo, or a variable that failed to expand must never be the
+    // difference between describing a run and writing the status that gates it.
+    // Surrounding whitespace is transport noise and is ignored; casing is not.
+    // "enforce" is the documented spelling, and anything else -- a typo, a
+    // different case, a variable that did not expand -- is reported and treated as
+    // report-only rather than guessed at.
+    const mode = String(env.MODE ?? "").trim();
+    if (mode && mode !== "enforce" && mode !== "report-only")
+      log(`unrecognised mode ${JSON.stringify(mode)}; the only value that enforces is "enforce", so this run is report-only`);
+    if (env.POST_PR_COMMENT === "true" && prNumber && (run.failing.length || env.ALWAYS_COMMENT === "true")) {
+      const marker = `<!-- e2e-triage:${md(context)} -->`;
+      // Comments come back oldest first, 100 to a page. On a long-running PR the
+      // sticky comment is not on the first page, and failing to find it posts a
+      // second one on every run instead of updating the one already there.
+      let mine = null;
+      for (let page = 1; page <= 20 && !mine; page++) {
+        const comments = await api("GET", `/repos/${id.repository}/issues/${prNumber}/comments?per_page=100&page=${page}`);
+        mine = comments.find((c) => c.body?.startsWith(marker)) ?? null;
+        if (comments.length < 100) break;
+      }
+      if (mine) await api("PATCH", `/repos/${id.repository}/issues/comments/${mine.id}`, { body: comment });
+      else await api("POST", `/repos/${id.repository}/issues/${prNumber}/comments`, { body: comment });
+    }
+    if (enforce && context) {
+      await api("POST", `/repos/${id.repository}/statuses/${id.commit_sha}`, {
+        state: result.verdict === "SUCCESS" ? "success" : "failure",
+        context,
+        description,
+        target_url: runURL,
+      });
+    }
+    if (announce) {
+      const blocking = result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length;
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", result.infra
+        ? `${run.counts.failed} failed · investigation required${enforce ? "" : " (report-only)"}`
+        : `${run.counts.failed} failed → ${result.findings.length - blocking} cleared · ${blocking} blocking${enforce ? "" : " (report-only)"}`);
+    }
+    log(`e2e-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
+    return result;
+  } catch (e) {
+    if (announce) await postTriageCheck("error", "Triage could not finish; the E2E result stands");
+    throw e;
   }
-  log(`e2e-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
-  return result;
 }
 
 // ------------------------------------------------------------------- replay

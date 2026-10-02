@@ -218,7 +218,9 @@ test("comments are opt-in in both modes; summary and outputs remain available wi
     try {
       await live(f);
       assert.equal(f.calls.some((c) => c.url.pathname.includes("/comments")), false);
-      assert.equal(f.calls.filter((c) => c.url.pathname.includes("/statuses/")).length, mode === "enforce" ? 1 : 0);
+      const statuses = f.calls.filter((c) => c.url.pathname.includes("/statuses/"));
+      assert.equal(statuses.filter((c) => !c.body.context.endsWith("/triage")).length, mode === "enforce" ? 1 : 0);
+      assert.equal(statuses.length, mode === "enforce" ? 3 : 0, "plus the triage check, pending then verdict, only when enforcing");
       const summary = readFileSync(f.env.GITHUB_STEP_SUMMARY, "utf8");
       assert.match(summary, /1 failed → 0 cleared · 1 blocking/);
       assert.match(summary, /### Blocking \(1\)/);
