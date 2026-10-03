@@ -37,6 +37,7 @@ import {
   fetchRun,
   infraVerdict,
   isInfraError,
+  missingReports,
   statusDescription,
   triage,
   verdictOf,
@@ -382,20 +383,55 @@ test("ownership compares repository paths, not TSIO's test-root-relative ones", 
 test("an incomplete or empty run is not a passing run", async () => {
   const group = (over) => ({ id: "g1", repository: "o/r", commit: "abc", name: "n", gh_run_id: "12", gh_run_attempt: "1", status: "completed", ...over });
   const id = { repository: "o/r", commit_sha: "abc", name: "n", gh_run_id: "12", gh_run_attempt: "1" };
-  const routes = (g, suites, cases) => [
+  const routes = (g, suites, cases, detail = g) => [
     ["/reports?", () => Response.json({ reports: [g] })],
     ["/reports/g1/suites", () => Response.json({ suites })],
     ["/reports/g1/cases", () => Response.json(cases)],
+    ["/reports/g1", () => Response.json(detail)],
   ];
   const suite = [{ id: "s1", file_path: "specs/a.spec.ts", report_name: "e2e-on-windows-2022-1.0" }];
+  const cases = [{ suite_id: "s1", title: "t1", status: "failed", retry_count: 0, ordinal: 0, error_message: "Error: x" }];
+  const now = { attempts: 1, ms: 0 };
 
-  await assert.rejects(
-    () => fetchRun(fakeFetch(routes(group({ status: "processing" }), suite, [])), "http://tsio", id),
-    /not completed/, "an unfinished upload cannot show whether the run passed");
+  // Two workers never uploaded: what arrived is read, and the gap is reported.
+  const open = group({ status: "in_progress", total_reports_expected: 30 });
+  const partial = await fetchRun(fakeFetch(routes(open, suite, cases, { ...open, reports: Array(28).fill({}) })), "http://tsio", id, null, now);
+  assert.equal(partial.failing.length, 1);
+  assert.deepEqual(partial.missing, { expected: 30, received: 28, status: "in_progress" });
+  assert.deepEqual(missingReports(partial.missing), { text: "2 of 30 reports never uploaded, so the specs on those workers never ran", short: "2 report(s) missing" });
+  assert.equal(missingReports({ expected: null, received: null, status: "processing" }).short, "results incomplete");
+
+  // A late upload that completes the group while we wait is a complete run.
+  const late = await fetchRun(fakeFetch(routes(open, suite, cases, { ...open, status: "completed" })), "http://tsio", id, null, now);
+  assert.equal(late.missing, null);
 
   await assert.rejects(
     () => fetchRun(fakeFetch(routes(group(), suite, [])), "http://tsio", id, "e2e-on-windows"),
     /no test cases/, "a report with a matching suite but no cases is not a green run");
+});
+test("a run with missing reports is triaged but never comes out green", async () => {
+  const routes = (statuses) => [
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "in_progress", total_reports_expected: 3 }], total: 1 })],
+    ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+    ["/reports/g1/cases", () => Response.json(spec("t1", "failed"))],
+    ["/reports/g1", () => Response.json({ id: "g1", status: "in_progress", total_reports_expected: 3, reports: [{}, {}] })],
+    // Master fails it too, so on a complete run this would clear.
+    ["/reports/history", () => Response.json({ observations: trunkFailsAll(8) })],
+    ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+    ["/statuses/abc", (i) => { statuses.push(JSON.parse(i.body)); return Response.json({}); }],
+  ];
+  const statuses = [];
+  const dir = mkdtempSync(join(tmpdir(), "triage-missing-"));
+  try {
+    const result = await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: join(dir, "s.md") }, fetchImpl: fakeFetch(routes(statuses)), log: () => {}, wait: { attempts: 1, ms: 0 } });
+    assert.equal(result.findings[0].blocking, false, "the failure that did upload is still judged");
+    assert.equal(result.verdict, "FAILURE", "the specs that never ran keep it red");
+    assert.match(readFileSync(join(dir, "s.md"), "utf8"), /\*\*Not every result arrived:\*\* 1 of 3 reports never uploaded/);
+    const required = statuses.filter((s) => s.context === "e2e-test/playwright");
+    assert.deepEqual(required.map((s) => [s.state, s.description]), [["failure", "0 passed, 1 failed (1 cleared by triage), 0 skipped; 1 report(s) missing"]]);
+    assert.equal(statuses.filter((s) => s.context === "e2e-test/playwright/triage").at(-1).description, "1 failed → 1 cleared · 0 blocking · 1 report(s) missing");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 test("two describe blocks sharing a leaf title are different tests", async () => {
   // Keyed on file and leaf title, the passing block would erase the failing one.

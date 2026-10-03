@@ -808,7 +808,7 @@ function decidedBy(f) {
 }
 
 /** The job summary: what blocks first, then what was cleared and why, and what AI cost. */
-export function renderSummary({ verdict, findings, infra, runURL, counts, mode = "report-only", ai = newLedger() }) {
+export function renderSummary({ verdict, findings, infra, runURL, counts, mode = "report-only", ai = newLedger(), missing = null }) {
   const blocking = infra ? counts.failed : findings.filter((f) => f.blocking).length;
   const cleared = findings.filter((f) => !f.blocking).length;
   const spend = ledgerTotals(ai);
@@ -817,6 +817,7 @@ export function renderSummary({ verdict, findings, infra, runURL, counts, mode =
     `**${counts.failed} failed → ${infra ? 0 : cleared} cleared · ${blocking} blocking** · ${counts.passed ?? 0} passed · ${counts.skipped ?? 0} skipped · ` +
     `AI: ${spend.calls} call(s), ${usd(spend.cost_usd)} · [run](${runURL})`, ""];
   if (infra) lines.push(`**Human investigation required.** ${md(infra)}`, "");
+  if (missing) lines.push(`**Not every result arrived:** ${md(missing.text)}. Re-run the failed jobs; until they run, this run can't be cleared.`, "");
   lines.push(mode === "enforce" ? "Enforced: this verdict sets the commit status." : "Report-only: triage does not change the required commit status.", "");
   const header = ["| Test | Result | Why | Decided by | Cost |", "| --- | --- | --- | --- | --- |"];
   const row = (f) => {
@@ -848,12 +849,12 @@ export function renderSummary({ verdict, findings, infra, runURL, counts, mode =
   }
   return lines.join("\n");
 }
-export function statusDescription(verdict, findings, infra, counts) {
+export function statusDescription(verdict, findings, infra, counts, missing = null) {
   const blocking = findings.filter((f) => f.blocking).length;
   const triaged = infra
     ? "not triaged, investigation required"
     : `${findings.length - blocking} cleared by triage${blocking ? `, ${blocking} unresolved` : ""}`;
-  return `${counts.passed ?? 0} passed, ${counts.failed} failed (${triaged}), ${counts.skipped ?? 0} skipped`.slice(0, 140);
+  return `${counts.passed ?? 0} passed, ${counts.failed} failed (${triaged}), ${counts.skipped ?? 0} skipped${missing ? `; ${missing.short}` : ""}`.slice(0, 140);
 }
 
 // ------------------------------------------------------------------ data access
@@ -862,7 +863,7 @@ export function statusDescription(verdict, findings, infra, counts) {
  * The run's results, optionally narrowed to one report in the group (desktop
  * uploads one per OS). `reportName` is a prefix: names end in a release version.
  */
-export async function fetchRun(fetchImpl, base, id, reportName = null) {
+export async function fetchRun(fetchImpl, base, id, reportName = null, wait = { attempts: 6, ms: 20000 }) {
   const get = async (path) => {
     const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(60000) });
     if (!res.ok) throw new Error(`TSIO GET ${path}: ${res.status}`);
@@ -886,9 +887,22 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
   );
   if (!group)
     throw new Error(`TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`);
-  // An unfinished upload is not a green run.
-  if (group.status !== "completed")
-    throw new Error(`group ${group.id} is ${group.status}, not completed; an unfinished upload cannot show whether the run passed`);
+  // A worker that never uploaded leaves the group open for good. Wait a little for
+  // late uploads, then read what arrived: the missing reports keep the run red (all
+  // of it: a report-scoped run can't tell which scope a missing report belonged to).
+  let missing = null;
+  if (group.status !== "completed") {
+    let detail = group;
+    for (let i = 0; i < wait.attempts && detail.status !== "completed"; i++) {
+      await new Promise((r) => setTimeout(r, wait.ms));
+      detail = await get(`/reports/${group.id}`);
+    }
+    if (detail.status !== "completed") {
+      const expected = Number(detail.total_reports_expected ?? group.total_reports_expected) || null;
+      const received = Array.isArray(detail.reports) ? detail.reports.length : null;
+      missing = { expected, received, status: detail.status };
+    }
+  }
   const [{ suites = [] }, cases] = await Promise.all([get(`/reports/${group.id}/suites`), get(`/reports/${group.id}/cases`)]);
   const fileOf = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
   const reportOf = new Map(suites.map((s) => [s.id, s.report_name ?? null]));
@@ -952,7 +966,7 @@ export async function fetchRun(fetchImpl, base, id, reportName = null) {
     else if (status === "flaky") flaky++;
   }
   // Passed includes retry-recovered tests, as the E2E statuses count them.
-  return { group_id: group.id, failing, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
+  return { group_id: group.id, failing, missing, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
 }
 /**
  * Past runs of the failing tests, keyed by identityKey. Asks for whole spec files
@@ -1128,6 +1142,15 @@ export function gh(fetchImpl, token) {
 
 // ------------------------------------------------------------------ the run
 
+/** What a run is missing when some reports never arrived, long and short; null if complete. */
+export function missingReports(missing) {
+  if (!missing) return null;
+  const { expected, received } = missing;
+  return expected != null && received != null && expected > received
+    ? { text: `${expected - received} of ${expected} reports never uploaded, so the specs on those workers never ran`, short: `${expected - received} report(s) missing` }
+    : { text: `the run's results are incomplete (TSIO group ${missing.status ?? "not completed"})`, short: "results incomplete" };
+}
+
 /** Decide a run from evidence already fetched. Writes nothing. */
 export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranch, testRoot, cfg = DEFAULTS, prTitle = "", lane = id.name, ask, log = () => {}, evidence = [] }) {
   const isTrunkRun = prNumber == null;
@@ -1173,6 +1196,9 @@ export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranc
     if (!blind && prNumber) sameFailure(result.findings);
   }
   result.verdict = verdictOf(result.findings, result.infra);
+  // Specs that never ran can't be vouched for, whatever happened to the rest.
+  result.missing = missingReports(run.missing);
+  if (result.missing && result.verdict === "SUCCESS") result.verdict = "FAILURE";
   return result;
 }
 
@@ -1197,7 +1223,7 @@ export function configFrom(env) {
   };
 }
 
-export async function triage({ env, fetchImpl = fetch, log = console.error, now = new Date() }) {
+export async function triage({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait }) {
   const cfg = configFrom(env);
   const id = JSON.parse(env.COMPOSITE_IDENTITY);
   const prNumber = Number(id.gh_pr_number || 0) || null;
@@ -1208,7 +1234,7 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
   // Not guessed: a wrong root makes every spec look untouched.
   const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
   const reportName = env.REPORT_NAME || null;
-  const run = await fetchRun(fetchImpl, base, id, reportName);
+  const run = await fetchRun(fetchImpl, base, id, reportName, wait);
   const context = env.STATUS_CONTEXT;
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
   // An informational check beside the required one: pending while triage runs, then the verdict.
@@ -1223,7 +1249,7 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
   };
   const enforce = String(env.MODE ?? "").trim() === "enforce";
   // Like the required status, only an enforcing run writes to the PR.
-  const announce = enforce && run.failing.length > 0;
+  const announce = enforce && (run.failing.length > 0 || Boolean(run.missing));
   if (announce) await postTriageCheck("pending", `${run.counts.failed} failed · triage is checking them`);
   try {
     let pull = {};
@@ -1260,8 +1286,8 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
     });
     if (env.ANSWERS_CACHE && cfg.answers) writeFileSync(env.ANSWERS_CACHE, JSON.stringify(cfg.answers));
-    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai });
-    const description = statusDescription(result.verdict, result.findings, result.infra, run.counts);
+    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing });
+    const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing);
     const spend = ledgerTotals(result.ai);
     if (env.GITHUB_OUTPUT)
       appendFileSync(env.GITHUB_OUTPUT, `verdict=${result.verdict}\nblocking=${result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\n` +
@@ -1281,9 +1307,9 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
     }
     if (announce) {
       const blocking = result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length;
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", result.infra
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra
         ? `${run.counts.failed} failed · investigation required`
-        : `${run.counts.failed} failed → ${result.findings.length - blocking} cleared · ${blocking} blocking`);
+        : `${run.counts.failed} failed → ${result.findings.length - blocking} cleared · ${blocking} blocking`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
     log(`e2e-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;

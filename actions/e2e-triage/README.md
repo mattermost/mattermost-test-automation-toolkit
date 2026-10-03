@@ -27,6 +27,10 @@ If the evidence is incomplete (changed files, test root, base branch, truncated
 history, report scope, or a test whose identity is ambiguous), nothing is
 cleared and the model is not asked.
 
+If some of the run's reports never uploaded (a worker died), triage waits about
+two minutes for them, then judges what arrived and says how many are missing.
+Specs that never ran can't be vouched for, so that run never comes out green.
+
 ## The model
 
 Claude is asked only about failures history couldn't settle. It clears one only
