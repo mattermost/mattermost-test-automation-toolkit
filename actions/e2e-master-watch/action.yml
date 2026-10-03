@@ -1,0 +1,87 @@
+name: E2E master watch
+description: >
+  After a trunk E2E run, find the failures that repeat (broken twice in a row, or
+  flaky) and hand each spec to a repair agent through a Cursor automation webhook.
+author: Mattermost
+inputs:
+  repository:
+    description: owner/repo of the run
+    required: true
+  gh-run-id:
+    description: Workflow run id of the trunk E2E run
+    required: true
+  gh-run-attempt:
+    description: Attempt of that run
+    required: false
+    default: "1"
+  branch:
+    description: Trunk branch; suites the run reported for any other branch are ignored
+    required: false
+    default: master
+  suites:
+    description: 'JSON list of the run''s suites: [{"name": "<TSIO report group name>", "test_root": "<spec root>", "report_name": "<optional prefix>"}]'
+    required: true
+  github-token:
+    description: Token to read PRs (dedupe, suspect commits); never sent elsewhere
+    required: true
+  cursor-webhook-url:
+    description: Cursor automation webhook. Empty means report only
+    required: false
+    default: ""
+  cursor-webhook-key:
+    description: The webhook's API key
+    required: false
+    default: ""
+  max-per-run:
+    description: Repair requests per trunk run
+    required: false
+    default: "2"
+  max-per-day:
+    description: Repair requests sent (or repair PRs, label e2e-master-repair, opened) in the last 24 hours before requests stop
+    required: false
+    default: "5"
+  hold-hours:
+    description: Hours a requested spec is left to its agent before it can be requested again
+    required: false
+    default: "24"
+  extra-labels:
+    description: Comma-separated labels the repair PR should also carry (e.g. AI/babysit)
+    required: false
+    default: ""
+  tsio-base-url:
+    description: Test System IO base URL
+    required: false
+    default: https://test-io.test.mattermost.com
+runs:
+  using: composite
+  steps:
+    # Requests sent by earlier runs, so a spec still broken while its agent works is not requested twice.
+    # A workflow_run job runs on the default branch, so every run shares this cache.
+    - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ github.workspace }}/.e2e-master-watch/ledger.json
+        key: e2e-master-watch-${{ inputs.branch }}-${{ inputs.gh-run-id }}-${{ inputs.gh-run-attempt }}
+        restore-keys: e2e-master-watch-${{ inputs.branch }}-
+    - shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        GH_RUN_ID: ${{ inputs.gh-run-id }}
+        GH_RUN_ATTEMPT: ${{ inputs.gh-run-attempt }}
+        BRANCH: ${{ inputs.branch }}
+        SUITES: ${{ inputs.suites }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        CURSOR_WEBHOOK_URL: ${{ inputs.cursor-webhook-url }}
+        CURSOR_WEBHOOK_KEY: ${{ inputs.cursor-webhook-key }}
+        MAX_PER_RUN: ${{ inputs.max-per-run }}
+        MAX_PER_DAY: ${{ inputs.max-per-day }}
+        HOLD_HOURS: ${{ inputs.hold-hours }}
+        LEDGER_PATH: ${{ github.workspace }}/.e2e-master-watch/ledger.json
+        EXTRA_LABELS: ${{ inputs.extra-labels }}
+        TSIO_BASE_URL: ${{ inputs.tsio-base-url }}
+      run: node "${{ github.action_path }}/../../scripts/e2e-master-watch.mjs"
+    # Saved even when the step above failed: requests it sent before failing are already recorded.
+    - if: always()
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ github.workspace }}/.e2e-master-watch/ledger.json
+        key: e2e-master-watch-${{ inputs.branch }}-${{ inputs.gh-run-id }}-${{ inputs.gh-run-attempt }}
