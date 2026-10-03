@@ -355,11 +355,14 @@ Rules:
   feature under test is.
 - flaky_environment with high confidence requires either recurrence on other PRs (evidence id starting with cross_pr)
   or an error text that is clearly infrastructural (server not healthy, cannot connect, device/emulator failure, app crash on
-  launch) together with a diff that does not touch that area.
+  launch), or producer evidence showing the test server failed or rejected the request the step depended on, together
+  with a diff that does not touch that area.
 - producer_evidence (id producer), when present, is what the test run itself recorded at the failure: screenshots of the
-  screen at that moment (attached as images) and log lines such as the requests the app was still waiting on. It shows
-  where the run was stuck, not why. A wait on the test server that never returned, in an area the diff does not touch,
-  supports flaky_environment; a stuck request, screen or flow that the diff changes supports caused_by_pr.
+  screen at that moment (attached as images), the step the test stopped at, and log lines such as the requests the app
+  was still waiting on or the errors the app logged. A wait on the test server that never returned, or a server request
+  that failed or was rejected (an error dialog on screen, an app error naming the call), in an area the diff does not
+  touch, supports flaky_environment; a stuck or failing request, screen or flow that the diff changes supports
+  caused_by_pr.
 - If the evidence is genuinely insufficient, answer with confidence below 0.6 rather than guessing.
 - explanation: at most 280 characters, written for the PR author: what failed and what, if anything, they should do.
   Do not restate the engine's classification or the history numbers; they are shown next to your answer.`;
