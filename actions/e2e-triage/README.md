@@ -54,9 +54,12 @@ a related diff hunk. If it fails or is unavailable, the rules' outcome stands.
   sentence the author can act on, who decided (rules or model) and the cost.
   Cleared tests are collapsed below.
 - **Required status** (enforce): success only for `SUCCESS`, otherwise failure.
-- **Triage check** (enforce, red runs): `<status-context>/triage` is pending
-  while triage runs, then shows the verdict, or an error if triage couldn't
-  finish. It is informational, never the required check.
+- **Triage check** (enforce, red runs): pending while triage runs, then the
+  verdict. It is informational, never the required check. With `triage-lanes`
+  (every lane's required context) and one shared `triage-status-context`, it is
+  a single check for the whole PR: it waits until every red lane has a triage
+  verdict, then reads e.g. "detox-ios still red · maestro-ios cleared by triage"
+  or "All lanes green". Without it, each lane gets `<status-context>/triage`.
 
 ## Usage
 

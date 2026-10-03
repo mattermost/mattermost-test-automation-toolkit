@@ -37,6 +37,7 @@ import {
   fetchRun,
   infraVerdict,
   isInfraError,
+  laneSummary,
   missingReports,
   statusDescription,
   triage,
@@ -578,6 +579,41 @@ test("a failure history can't explain is a likely regression only when the PR to
   assert.equal(named.result.findings[0].class, "REGRESSION");
   assert.match(named.summary, /🔴 likely regression/);
   assert.match(named.summary, /Check your change, or merge master/);
+});
+test("one triage check for the whole PR summarises every lane", async () => {
+  const st = (state, description) => ({ state, description });
+  const lanes = (rows) => laneSummary(Object.entries(rows).map(([context, status]) => ({ context, status })));
+  assert.deepEqual(lanes({ "e2e-test/detox-ios": st("failure", "590 passed, 7 failed, 41 skipped"), "e2e-test/maestro-ios": st("pending", "running") }),
+    { state: "pending", description: "Triage is checking: waiting for detox-ios, maestro-ios" }, "a red lane without a verdict, or a running one, keeps it pending");
+  assert.deepEqual(lanes({
+    "e2e-test/detox-ios": st("failure", "590 passed, 7 failed (2 cleared by triage, 5 unresolved), 41 skipped"),
+    "e2e-test/maestro-ios": st("success", "6 passed, 1 failed (1 cleared by triage), 1 skipped"),
+    "e2e-test/detox-ipad": st("success", "19 passed, 0 skipped"),
+    "e2e-test/maestro-android": null,
+  }), { state: "failure", description: "detox-ios still red · maestro-ios cleared by triage" });
+  assert.deepEqual(lanes({ "e2e-test/maestro-ios": st("success", "6 passed, 1 failed (1 cleared by triage), 1 skipped"), "e2e-test/detox-ios": st("success", "597 passed, 0 failed (0 cleared by triage)") }),
+    { state: "success", description: "maestro-ios cleared by triage · all lanes green" });
+  assert.deepEqual(lanes({ "e2e/linux": st("success", "235 passed, 0 failed") }), { state: "success", description: "All lanes green" });
+
+  // Through triage(): this lane's verdict is written, then the PR-wide check from every lane.
+  const written = [];
+  const lane = "e2e-test/playwright";
+  const statuses = () => [...written].reverse();
+  const routes = [
+    ...runRoutes([spec("t1", "failed")]),
+    ["/reports/history", () => Response.json({ observations: trunkFailsAll(8) })],
+    ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+    ["/commits/abc/statuses", () => Response.json([...statuses(), { context: "e2e-test/other", state: "success", description: "10 passed" }])],
+    ["/statuses/abc", (i) => { written.push(JSON.parse(i.body)); return Response.json({}); }],
+  ];
+  await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", STATUS_CONTEXT: lane, TRIAGE_CONTEXT: "e2e-test/triage", TRIAGE_LANES: `${lane}, e2e-test/other`, TRIAGE_SETTLE_MS: "0" }, fetchImpl: fakeFetch(routes), log: () => {} });
+  assert.deepEqual(written.map((s) => [s.context, s.state, s.description]), [
+    ["e2e-test/triage", "pending", "Triage is checking playwright"],
+    [lane, "success", "0 passed, 1 failed (1 cleared by triage), 0 skipped"],
+    ["e2e-test/triage", "success", "playwright cleared by triage · all lanes green"],
+    ["e2e-test/triage", "success", "playwright cleared by triage · all lanes green"],
+  ]);
 });
 test("skipped history rows are not trunk runs", () => {
   const skipped = (n) => Array.from({ length: n }, (_, i) => obs({ commit_sha: `s${i}`, status: "skipped", created_at: "2026-09-11T00:00:00Z" }));

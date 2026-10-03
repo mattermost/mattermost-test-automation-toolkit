@@ -1250,7 +1250,33 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
   const enforce = String(env.MODE ?? "").trim() === "enforce";
   // Like the required status, only an enforcing run writes to the PR.
   const announce = enforce && (run.failing.length > 0 || Boolean(run.missing));
-  if (announce) await postTriageCheck("pending", `${run.counts.failed} failed · triage is checking them`);
+  // TRIAGE_LANES lists every lane's required context: then the triage check is one
+  // for the whole PR, summarising all lanes, rather than one per lane.
+  const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
+  const postLaneSummary = async () => {
+    const latest = new Map();
+    for (let page = 1; page <= 5; page++) {
+      const rows = await api("GET", `/repos/${id.repository}/commits/${id.commit_sha}/statuses?per_page=100&page=${page}`);
+      for (const r of rows) if (!latest.has(r.context)) latest.set(r.context, r);
+      if (rows.length < 100) break;
+    }
+    const sum = laneSummary(lanes.map((c) => ({ context: c, status: latest.get(c) ?? null })));
+    await postTriageCheck(sum.state, sum.description);
+    return sum;
+  };
+  // Lanes finish at about the same time and each writes the summary from what it
+  // can read, so look again once the others have had time to write theirs.
+  const settleLaneSummary = async () => {
+    try {
+      const first = await postLaneSummary();
+      await new Promise((r) => setTimeout(r, Number(env.TRIAGE_SETTLE_MS ?? 15000)));
+      const again = await postLaneSummary();
+      if (again.description !== first.description) log(`triage check updated after other lanes reported: ${again.description}`);
+    } catch (e) {
+      log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
+    }
+  };
+  if (announce) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(context)}` : `${run.counts.failed} failed · triage is checking them`);
   try {
     let pull = {};
     let history = new Map();
@@ -1305,7 +1331,8 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
         target_url: runURL,
       });
     }
-    if (announce) {
+    if (announce && lanes.length) await settleLaneSummary();
+    else if (announce) {
       const blocking = result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length;
       await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra
         ? `${run.counts.failed} failed · investigation required`
@@ -1314,9 +1341,34 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
     log(`e2e-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;
   } catch (e) {
-    if (announce) await postTriageCheck("error", "Triage could not finish; the E2E result stands");
+    if (announce && lanes.length && context) {
+      // Mark the lane as having no verdict, so the PR-wide check stops waiting for it.
+      try {
+        await api("POST", `/repos/${id.repository}/statuses/${id.commit_sha}`, { state: "failure", context, description: `${run.counts.passed ?? 0} passed, ${run.counts.failed} failed (not triaged: triage could not finish)`.slice(0, 140), target_url: runURL });
+      } catch {}
+      await settleLaneSummary();
+    } else if (announce) await postTriageCheck("error", "Triage could not finish; the E2E result stands");
     throw e;
   }
+}
+
+// A lane's name in the PR-wide check: its context without the shared prefix.
+const laneName = (context) => String(context).replace(/^e2e(-test)?\//, "");
+
+/**
+ * One check for the whole PR from every lane's latest required status: pending
+ * while a lane is still running or red without a triage verdict yet, then red if
+ * triage left any lane red, otherwise green. Lanes with no status did not run.
+ */
+export function laneSummary(lanes) {
+  const seen = lanes.filter((l) => l.status);
+  const waiting = seen.filter((l) => l.status.state === "pending" || (l.status.state !== "success" && !/triage/i.test(l.status.description ?? "")));
+  if (waiting.length) return { state: "pending", description: `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}` };
+  const red = seen.filter((l) => l.status.state !== "success");
+  const cleared = seen.filter((l) => l.status.state === "success" && /\(([1-9]\d*) cleared by triage/.test(l.status.description ?? ""));
+  const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
+  if (red.length) return { state: "failure", description: [`${red.map((l) => laneName(l.context)).join(", ")} still red`, clearedText].filter(Boolean).join(" · ") };
+  return { state: "success", description: clearedText ? `${clearedText} · all lanes green` : "All lanes green" };
 }
 
 // --------------------------------------------------------------------- main

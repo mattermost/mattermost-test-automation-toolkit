@@ -62,6 +62,10 @@ inputs:
     description: Informational check, pending while triage runs and then the verdict (enforce mode only). Defaults to "<status-context>/triage"; "off" turns it off
     required: false
     default: ""
+  triage-lanes:
+    description: Comma-separated required contexts of every lane in the run. When set, the triage check is one for the whole PR (give all lanes the same triage-status-context), summarising every lane
+    required: false
+    default: ""
   ai-prices:
     description: 'Optional JSON of prices per million tokens merged over the built-in table: {"model": {"input", "output", "cache_write", "cache_read"}}'
     required: false
@@ -115,6 +119,7 @@ runs:
         AI_BUDGET_USD: ${{ inputs.ai-budget-usd }}
         AI_ADVICE: ${{ inputs.ai-advice }}
         TRIAGE_CONTEXT: ${{ inputs.triage-status-context }}
+        TRIAGE_LANES: ${{ inputs.triage-lanes }}
         AI_PRICES: ${{ inputs.ai-prices }}
         ANSWERS_CACHE: ${{ inputs.answers-cache }}
       run: node "${{ github.action_path }}/../../scripts/e2e-triage.mjs"
