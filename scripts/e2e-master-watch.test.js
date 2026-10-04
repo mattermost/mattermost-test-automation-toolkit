@@ -62,7 +62,7 @@ test("broken specs that last passed on the same commit go to one agent; flaky on
 // With `recovered`, two more specs fail once and pass on retry: v/e.spec.ts flaked on trunk before, u/f.spec.ts never did.
 // With `lanes`, the run has one report group per lane; `failIn` says which lanes each spec fails in, and
 // `firstFailure` makes every spec pass in all earlier runs, so a failure now is its first.
-function routes({ compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts"], branch = "master", recovered = false, repairPRs = [], lanes = ["pw-master"], failIn = {}, firstFailure = false }) {
+function routes({ compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts"], branch = "master", recovered = false, repairPRs = [], lanes = ["pw-master"], failIn = {}, firstFailure = false, openPRLabels = ["e2e-autofix"], releasePRFiles = [] }) {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
   const retried = recovered ? ["v/e.spec.ts", "u/f.spec.ts"] : [];
   const fails = (file, lane) => (failIn[file] ?? lanes).includes(lane);
@@ -74,7 +74,12 @@ function routes({ compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts
   const groups = lanes.map((name, n) => ({ id: `g${n + 1}`, repository: "o/r", branch, commit: "abc", name, gh_run_id: "12", gh_run_attempt: "1", status: "completed", created_at: "2026-10-02T09:30:00Z", last_upload_at: "2026-10-02T09:50:00Z" }));
   const laneOfGroup = (url) => groups.find((g) => String(url).includes(`/reports/${g.id}/`)).name;
   const table = [
-    ["/reports?", () => Response.json({ reports: groups })],
+    ["/reports?", (init, url) => {
+      // Asked by suite name, as the watcher does; triage's own lookup adds the commit.
+      const name = new URL(String(url)).searchParams.get("name");
+      assert.ok(name, "reports are listed per suite name, not as the newest of the whole repository");
+      return Response.json({ reports: groups.filter((g) => g.name === name) });
+    }],
     ["/suites", (init, url) => Response.json({ suites: [...files, ...retried].map((file_path, i) => ({ id: `s${i}`, file_path })) })],
     ["/cases", (init, url) => {
       const lane = laneOfGroup(url);
@@ -96,9 +101,9 @@ function routes({ compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts
       }
       // Two pages: #41 is not among the newest 50, and #7 was last updated too long ago to count.
       const { after } = variables;
-      const pr = (number, updatedAt, paths = []) => ({ number, updatedAt, files: { pageInfo: { hasNextPage: false }, nodes: paths.map((path) => ({ path })) } });
+      const pr = (number, updatedAt, paths = [], labels = [], baseRefName = "master") => ({ number, title: `PR ${number}`, url: `https://github.com/o/r/pull/${number}`, baseRefName, updatedAt, labels: { nodes: labels.map((name) => ({ name })) }, files: { pageInfo: { hasNextPage: false }, nodes: paths.map((path) => ({ path })) } });
       if (!after) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p2" }, nodes: Array.from({ length: 50 }, (_, i) => pr(100 + i, "2026-10-02T12:00:00Z")) } } } });
-      return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p3" }, nodes: [pr(41, "2026-10-02T00:00:00Z", openPRFiles), pr(7, "2026-09-01T00:00:00Z", ["specs/x/a.spec.ts"])] } } } });
+      return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p3" }, nodes: [pr(43, "2026-10-02T01:00:00Z", releasePRFiles, [], "release-12.0"), pr(41, "2026-10-02T00:00:00Z", openPRFiles, openPRLabels), pr(7, "2026-09-01T00:00:00Z", ["specs/x/a.spec.ts"])] } } } });
     }],
     ["/compare/", (init, url) => {
       compared.push(String(url).split("/compare/")[1]);
@@ -136,7 +141,7 @@ test("broken specs with one cause go to one agent with what broke them, and are 
   const LEDGER_PATH = ledgerPath();
   const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl, hook });
   assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [
-    [["specs/y/b.spec.ts"], "skipped: #41 changes it or its directory"],
+    [["specs/y/b.spec.ts"], "skipped: #41 (e2e-autofix) already changes it or its directory"],
     [["specs/x/a.spec.ts", "specs/z/c.spec.ts"], "to request"],
   ]);
   assert.equal(hook[0].kind, "e2e-autofix");
@@ -168,7 +173,7 @@ test("a request the agent did not accept is not recorded, so the next run plans 
   const fetchImpl = routes({});
   await run({ env: { ...env, LEDGER_PATH }, fetchImpl, hook, status: 500 });
   const next = await run({ env: { ...env, LEDGER_PATH }, fetchImpl, now: new Date(now.getTime() + 1800e3), hook });
-  assert.deepEqual(next.decisions.map((d) => d.action), ["skipped: #41 changes it or its directory", "to request"]);
+  assert.deepEqual(next.decisions.map((d) => d.action), ["skipped: #41 (e2e-autofix) already changes it or its directory", "to request"]);
   assert.equal(hook.length, 2);
 });
 
@@ -234,7 +239,7 @@ test("a test that failed and passed on retry is repaired as flaky only if it als
   const hook = [];
   const { decisions } = await run({ env, fetchImpl: routes({ recovered: true }), hook });
   assert.deepEqual(decisions.map((d) => [d.specs, d.kind, d.action]), [
-    [["specs/y/b.spec.ts"], "broken", "skipped: #41 changes it or its directory"],
+    [["specs/y/b.spec.ts"], "broken", "skipped: #41 (e2e-autofix) already changes it or its directory"],
     [["specs/x/a.spec.ts", "specs/z/c.spec.ts"], "broken", "to request"],
     [["specs/v/e.spec.ts"], "flaky", "to request"],
   ], "u/f.spec.ts recovered on retry but never flaked on trunk before: wait");
@@ -264,4 +269,12 @@ test("a fix PR that conflicts with trunk goes back to the agent, once per PR hea
   // The agent pushed a merge, and a later trunk merge conflicts again: a new head is a new request.
   await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ repairPRs: [pr(50, "CONFLICTING", "h50b")] }), now: new Date(now.getTime() + 3600e3), hook });
   assert.equal(hook.filter((h) => h.kind === "e2e-autofix-conflict").length, 2);
+});
+
+test("someone else's open PR on a spec doesn't hold back the fix: the agent gets it to judge", async () => {
+  const hook = [];
+  // #41 is feature work (no autofix label) beside y/b.spec.ts; #43 targets a release branch.
+  const { decisions } = await run({ env, fetchImpl: routes({ openPRLabels: [], releasePRFiles: ["specs/x/a.spec.ts"] }), hook });
+  assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [[["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], "to request"]]);
+  assert.deepEqual(hook[0].open_prs_touching, [{ number: 41, title: "PR 41", url: "https://github.com/o/r/pull/41" }], "the release-branch PR is not listed");
 });

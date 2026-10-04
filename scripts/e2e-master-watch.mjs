@@ -19,8 +19,11 @@
  *   new     failed for the first time, in one lane                    -> wait for the next run
  *   infra   the run failed for environmental reasons                  -> report only
  * Broken specs that last passed on the same commit most likely share a cause and
- * go to one agent together; each flaky spec goes alone. A spec is skipped when an
- * open PR changes it or its directory, or when it was requested within HOLD_HOURS
+ * go to one agent together; each flaky spec goes alone. A spec is skipped when one
+ * of the agent's own open PRs (LABEL) changes it or its directory, or when it was
+ * requested within HOLD_HOURS. Other open PRs into trunk that change it are passed
+ * to the agent (open_prs_touching) to judge: feature work that edits a spec is not
+ * a fix for trunk, and skipping on it left the largest break of a month unfixed
  * (its agent is still working). Broken requests all go out at once (up to
  * MAX_BROKEN_PER_RUN, a safety limit), since master is red until they're fixed;
  * flaky requests draw on a daily budget of MAX_FLAKY_PER_DAY, most-flaky first.
@@ -155,27 +158,33 @@ const OPEN_PRS = `query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, first: 50, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { number updatedAt files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
+      nodes { number title url baseRefName updatedAt labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
     }
   }
 }`;
 
 /**
- * Files changed by every open PR updated in the last `days` days, with the PR numbers.
- * All of them, not the newest few: a busy repository has hundreds open.
+ * Files changed by every open PR into `base` updated in the last `days` days: `files` maps
+ * a path to PR numbers, `prs` a number to { number, title, url, labels }. All of them, not
+ * the newest few: a busy repository has hundreds open.
  */
-export async function specsInOpenPRs(api, repository, { days = 14, now = new Date(), maxPages = 20 } = {}) {
+export async function specsInOpenPRs(api, repository, { days = 14, now = new Date(), maxPages = 20, base = null } = {}) {
   const since = now.getTime() - days * 24 * HOUR;
   const [owner, name] = repository.split("/");
   const touched = new Map();
+  const prs = new Map();
   const add = (path, number) => touched.set(path, [...(touched.get(path) ?? []), number]);
+  const result = { files: touched, prs };
   let after = null;
   for (let page = 0; page < maxPages; page++) {
     const res = await api("POST", "/graphql", { query: OPEN_PRS, variables: { owner, name, after } });
     if (res.errors?.length) throw new Error(`GitHub GraphQL: ${res.errors[0].message}`);
-    const prs = res.data.repository.pullRequests;
-    for (const p of prs.nodes) {
-      if (Date.parse(p.updatedAt) < since) return touched;
+    const page_ = res.data.repository.pullRequests;
+    for (const p of page_.nodes) {
+      if (Date.parse(p.updatedAt) < since) return result;
+      // A PR into another branch (a release cherry-pick) changes nothing on trunk.
+      if (base && p.baseRefName !== base) continue;
+      prs.set(p.number, { number: p.number, title: p.title, url: p.url, labels: (p.labels?.nodes ?? []).map((l) => l.name) });
       for (const f of p.files.nodes) add(f.path, p.number);
       // Over 100 files: the rest from REST, up to 300 in all.
       for (let filesPage = 2; p.files.pageInfo.hasNextPage && filesPage <= 3; filesPage++) {
@@ -184,10 +193,10 @@ export async function specsInOpenPRs(api, repository, { days = 14, now = new Dat
         if (files.length < 100) break;
       }
     }
-    if (!prs.pageInfo.hasNextPage) break;
-    after = prs.pageInfo.endCursor;
+    if (!page_.pageInfo.hasNextPage) break;
+    after = page_.pageInfo.endCursor;
   }
-  return touched;
+  return result;
 }
 
 /** Open PRs that change the spec, or any other file in its directory (a restructure, a shared helper). */
@@ -281,11 +290,12 @@ export function bundle(groups) {
       r.specs.push(g.spec);
       for (const s of g.suites) r.suites.add(s);
       r.tests.push(...g.tests);
+      for (const p of g.openPRs ?? []) if (!r.openPRs.some((q) => q.number === p.number)) r.openPRs.push(p);
       const red = g.range.red;
       if (red && (!r.range.red || Date.parse(red.created_at) < Date.parse(r.range.red.created_at))) r.range = { ...r.range, red };
       continue;
     }
-    const req = { specs: [g.spec], kind: g.kind, suites: new Set(g.suites), tests: [...g.tests], range: g.range };
+    const req = { specs: [g.spec], kind: g.kind, suites: new Set(g.suites), tests: [...g.tests], range: g.range, openPRs: [...(g.openPRs ?? [])] };
     if (key) byGreen.set(key, req);
     requests.push(req);
   }
@@ -309,14 +319,20 @@ export async function conflictedRepairPRs(api, repository, label = DEFAULT_LABEL
 }
 
 /**
- * The TSIO groups of one workflow run. The merge workflow tests the branch named
- * in its inputs, not the ref it was started from, so branch and commit come from
- * what the run reported rather than from the triggering event.
+ * The TSIO groups of one workflow run, for the suites asked for. The merge workflow tests
+ * the branch named in its inputs, not the ref it was started from, so branch and commit
+ * come from what the run reported rather than from the triggering event. Asked per suite
+ * name: the newest reports of the whole repository are mostly PR runs, and a busy day
+ * pushes a trunk run out of any fixed window.
  */
-export async function runGroups(fetchImpl, base, repository, runId, attempt) {
-  const res = await fetchImpl(`${base}/api/v1/reports?${new URLSearchParams({ repository, limit: "200" })}`, { signal: AbortSignal.timeout(60000) });
-  if (!res.ok) throw new Error(`TSIO GET /reports: ${res.status}`);
-  return ((await res.json()).reports ?? []).filter((g) => String(g.gh_run_id) === String(runId) && String(g.gh_run_attempt) === String(attempt));
+export async function runGroups(fetchImpl, base, repository, runId, attempt, names) {
+  const groups = [];
+  for (const name of names) {
+    const res = await fetchImpl(`${base}/api/v1/reports?${new URLSearchParams({ repository, name, limit: "50" })}`, { signal: AbortSignal.timeout(60000) });
+    if (!res.ok) throw new Error(`TSIO GET /reports (${name}): ${res.status}`);
+    groups.push(...((await res.json()).reports ?? []).filter((g) => g.name === name && String(g.gh_run_id) === String(runId) && String(g.gh_run_attempt) === String(attempt)));
+  }
+  return groups;
 }
 
 export async function watch({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait } = {}) {
@@ -324,7 +340,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   const trunk = env.BRANCH || "master";
   const attempt = env.GH_RUN_ATTEMPT || "1";
   const wanted = JSON.parse(env.SUITES);
-  const groupsOfRun = await runGroups(fetchImpl, base, env.REPOSITORY, env.GH_RUN_ID, attempt);
+  const groupsOfRun = await runGroups(fetchImpl, base, env.REPOSITORY, env.GH_RUN_ID, attempt, wanted.map((s) => s.name));
   const suites = wanted.filter((s) => groupsOfRun.some((g) => g.name === s.name && g.branch === trunk));
   const first = groupsOfRun.find((g) => g.branch === trunk);
   if (!first) {
@@ -384,14 +400,15 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   const instructions = env.INSTRUCTIONS ? { instructions: env.INSTRUCTIONS } : {};
   const ledger = readLedger(env.LEDGER_PATH).filter((r) => now.getTime() - Date.parse(r.at) < 7 * 24 * HOUR);
   writeLedger(env.LEDGER_PATH, ledger); // pruned, and present for the cache to save even when nothing is sent
-  const touched = groups.size ? await specsInOpenPRs(api, id.repository, { now }) : new Map();
+  const open = groups.size ? await specsInOpenPRs(api, id.repository, { now, base: trunk }) : { files: new Map(), prs: new Map() };
   const ready = [];
   for (const g of groups.values()) {
-    const prs = prsTouching(touched, g.spec);
+    const prs = prsTouching(open.files, g.spec).map((n) => open.prs.get(n));
+    const own = prs.filter((p) => p.labels.includes(label));
     const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < holdMs);
-    if (prs.length) decisions.push({ specs: [g.spec], kind: g.kind, tests: g.tests, action: `skipped: #${prs.join(", #")} changes it or its directory` });
+    if (own.length) decisions.push({ specs: [g.spec], kind: g.kind, tests: g.tests, action: `skipped: #${own.map((p) => p.number).join(", #")} (${label}) already changes it or its directory` });
     else if (held) decisions.push({ specs: [g.spec], kind: g.kind, tests: g.tests, action: `skipped: requested ${held.at.slice(0, 16).replace("T", " ")} UTC by ${held.run}` });
-    else ready.push({ ...g, range: await specRange(fetchImpl, base, id, g, until, log) });
+    else ready.push({ ...g, openPRs: prs, range: await specRange(fetchImpl, base, id, g, until, log) });
   }
 
   const requests = bundle(ready);
@@ -414,6 +431,8 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
       specs: r.specs, classification: r.kind, suites: [...r.suites],
       tests: tests.slice(0, MAX_TESTS), tests_omitted: Math.max(0, tests.length - MAX_TESTS),
       ...(await suspects(api, id, r.range, log)),
+      // Not skipped on: the agent checks whether any of these already fixes this failure.
+      open_prs_touching: r.openPRs.slice(0, 10).map(({ number, title, url }) => ({ number, title, url })),
       ...instructions,
       labels: [label, ...(env.EXTRA_LABELS ? env.EXTRA_LABELS.split(",").map((l) => l.trim()).filter(Boolean) : [])],
     };

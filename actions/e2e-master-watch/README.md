@@ -19,9 +19,13 @@ request carries the failing tests, their errors and history, the last trunk
 commit where they all passed, the first one where they failed, and the commits
 in between (oldest first). Broken requests go before flaky ones.
 
-A spec is skipped when an open PR changes it or another file in its directory, or
-when it was requested in the last `hold-hours` (its agent is still working, and
-master E2E runs after every merge). Master stays red until a break is fixed, so
+A spec is skipped when one of the agent's own open PRs (its `label`) changes it or
+another file in its directory, or when it was requested in the last `hold-hours`
+(its agent is still working, and master E2E runs after every merge). Other open
+PRs into trunk that change it are not a reason to wait: they are mostly feature
+work, and in a month of master history skipping on them would have left the
+largest break unfixed. They go to the agent as `open_prs_touching`, so it can tell
+whether one of them already fixes the failure. Master stays red until a break is fixed, so
 broken requests all go out on the run that finds them (`max-broken-per-run` is
 only a safety limit); flaky requests share a budget of `max-flaky-per-day` in any
 24 hours, most-flaky first.
