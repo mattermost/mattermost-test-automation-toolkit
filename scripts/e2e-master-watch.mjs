@@ -279,27 +279,34 @@ async function suspects(api, id, range, log) {
   }
 }
 
-/** Broken specs that last passed on the same commit go together; everything else alone. Broken first. */
-export function bundle(groups) {
+/**
+ * Broken specs that started failing on the same trunk commit go to one agent together: one
+ * merge broke them, and separate agents would race to fix the same cause. Keyed by the first
+ * red commit, not the last green one: incomplete runs leave each spec a different last pass.
+ * A spec with no first red in the history failed first in this run (`currentCommit`). Broken
+ * specs with no range (never passed in the window), and every flaky spec, go alone. The bundle
+ * keeps the oldest last-green commit, so its suspect range covers every spec in it. Broken first;
+ * among flaky ones, the one that flaked most on trunk first.
+ */
+export function bundle(groups, { currentCommit = null } = {}) {
   const requests = [];
-  const byGreen = new Map();
+  const byRed = new Map();
+  const at = (o) => Date.parse(o?.created_at) || 0;
   for (const g of groups) {
-    const key = g.kind === "broken" && g.range ? g.range.green.commit_sha : null;
-    const r = key && byGreen.get(key);
+    const key = g.kind === "broken" && g.range ? (g.range.red?.commit_sha ?? currentCommit) : null;
+    const r = key && byRed.get(key);
     if (r) {
       r.specs.push(g.spec);
       for (const s of g.suites) r.suites.add(s);
       r.tests.push(...g.tests);
       for (const p of g.openPRs ?? []) if (!r.openPRs.some((q) => q.number === p.number)) r.openPRs.push(p);
-      const red = g.range.red;
-      if (red && (!r.range.red || Date.parse(red.created_at) < Date.parse(r.range.red.created_at))) r.range = { ...r.range, red };
+      if (at(g.range.green) < at(r.range.green)) r.range = { ...r.range, green: g.range.green };
       continue;
     }
     const req = { specs: [g.spec], kind: g.kind, suites: new Set(g.suites), tests: [...g.tests], range: g.range, openPRs: [...(g.openPRs ?? [])] };
-    if (key) byGreen.set(key, req);
+    if (key) byRed.set(key, req);
     requests.push(req);
   }
-  // Broken first; among flaky ones, the one that flaked most on trunk first.
   const flakes = (r) => r.tests.reduce((n, t) => n + (t.trunk?.fails ?? 0) + (t.trunk?.flaky ?? 0), 0);
   return requests.sort((a, b) => (a.kind === b.kind ? (a.kind === "flaky" ? flakes(b) - flakes(a) : 0) : a.kind === "broken" ? -1 : 1));
 }
@@ -411,7 +418,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     else ready.push({ ...g, openPRs: prs, range: await specRange(fetchImpl, base, id, g, until, log) });
   }
 
-  const requests = bundle(ready);
+  const requests = bundle(ready, { currentCommit: id.commit_sha });
   // Master stays red until a break is fixed, so breaks all go now; flaky specs share a daily budget.
   let brokenLeft = maxBrokenPerRun;
   let flakyLeft = maxFlakyPerDay - ledger.filter((r) => r.kind === "flaky" && now.getTime() - Date.parse(r.at) < 24 * HOUR).length;

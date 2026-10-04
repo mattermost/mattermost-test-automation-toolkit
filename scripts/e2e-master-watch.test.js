@@ -51,11 +51,29 @@ test("the suspect range starts where every failing test last passed and ends at 
   assert.equal(rangeOf(new Map([[identityKey(t1), [row("failed", 1), row("passed", 2, { gh_pr_number: 5 })]]]), [t1], "master"), null, "no trunk pass in the window: no range");
 });
 
-test("broken specs that last passed on the same commit go to one agent; flaky ones alone, after them", () => {
-  const g = (spec, kind, green, red) => ({ spec, kind, suites: new Set(["s"]), tests: [{ spec, title: "t" }], range: green ? { green: { commit_sha: green }, red: { commit_sha: red, created_at: `2026-10-02T${red}:00:00Z` } } : null });
-  const requests = bundle([g("f.spec.ts", "flaky", "c1", "10"), g("a.spec.ts", "broken", "c1", "12"), g("b.spec.ts", "broken", "c1", "11"), g("c.spec.ts", "broken", "c9", "13"), g("d.spec.ts", "broken", null)]);
-  assert.deepEqual(requests.map((r) => [r.specs, r.kind]), [[["a.spec.ts", "b.spec.ts"], "broken"], [["c.spec.ts"], "broken"], [["d.spec.ts"], "broken"], [["f.spec.ts"], "flaky"]]);
-  assert.equal(requests[0].range.red.commit_sha, "11", "the earliest first failure of the bundle");
+test("broken specs that started failing on the same commit go to one agent; flaky ones alone, after them", () => {
+  const row = (sha, hour) => ({ commit_sha: sha, created_at: `2026-10-02T${hour}:00:00Z` });
+  const g = (spec, kind, green, red) => ({ spec, kind, suites: new Set(["s"]), tests: [{ spec, title: "t" }], range: green ? { green, red } : null });
+  const requests = bundle([
+    g("f.spec.ts", "flaky", row("c1", "01"), row("r1", "10")),
+    // One merge broke a and b; an incomplete run left them different last passes.
+    g("a.spec.ts", "broken", row("c3", "03"), row("r1", "10")),
+    g("b.spec.ts", "broken", row("c2", "02"), row("r1", "10")),
+    g("c.spec.ts", "broken", row("c1", "01"), row("r2", "11")),
+    // First failure in this run: no red row yet, so the current commit is its first red.
+    g("e.spec.ts", "broken", row("c4", "04"), null),
+    g("h.spec.ts", "broken", row("c5", "05"), null),
+    g("d.spec.ts", "broken", null),
+  ], { currentCommit: "now" });
+  assert.deepEqual(requests.map((r) => [r.specs, r.kind]), [
+    [["a.spec.ts", "b.spec.ts"], "broken"],
+    [["c.spec.ts"], "broken"],
+    [["e.spec.ts", "h.spec.ts"], "broken"],
+    [["d.spec.ts"], "broken"],
+    [["f.spec.ts"], "flaky"],
+  ]);
+  assert.equal(requests[0].range.green.commit_sha, "c2", "the oldest last pass, so the suspect range covers both specs");
+  assert.equal(requests[0].range.red.commit_sha, "r1");
 });
 
 // A trunk run with three broken specs, all broken since c1; an open PR changes a helper beside y/b.spec.ts.
