@@ -52,20 +52,21 @@ test("the suspect range starts where every failing test last passed and ends at 
 });
 
 test("broken specs whose break windows overlap go to one agent; flaky ones alone, after them", () => {
+  const t = (hhmm) => Date.parse(`2026-10-02T${hhmm}:00Z`);
   const row = (sha, hhmm) => ({ commit_sha: sha, created_at: `2026-10-02T${hhmm}:00Z` });
-  const g = (spec, kind, green, red, fails = 1) => ({ spec, kind, suites: new Set(["s"]), tests: [{ spec, title: "t", trunk: { fails } }], range: green ? { green, red } : null });
-  const now = Date.parse("2026-10-02T12:00:00Z");
+  // window: when it could have broken; range: its suspect commits (last pass .. first failure).
+  const g = (spec, kind, from, to, range = null) => ({ spec, kind, suites: new Set(["s"]), tests: [{ spec, title: "t" }], range, window: from == null ? null : { from, to } });
   const requests = bundle([
-    g("f.spec.ts", "flaky", row("c1", "01:00"), row("r1", "10:00")),
+    g("f.spec.ts", "flaky", t("01:00"), t("10:00")),
     // One merge broke a and b; an incomplete run left them different last passes.
-    g("a.spec.ts", "broken", row("c3", "03:00"), row("r1", "10:00")),
-    g("b.spec.ts", "broken", row("c2", "02:00"), row("r1", "10:00")),
-    // x has been red since 08:00; y failed first in this run but was last seen passing at 02:00, so it may share x's cause.
-    g("x.spec.ts", "broken", row("c1", "01:00"), row("r0", "08:00")),
-    g("y.spec.ts", "broken", row("c2", "02:00"), null),
-    // No range, but failing in earlier runs too: an older break that can't be placed.
+    g("a.spec.ts", "broken", t("03:00"), t("10:00"), { green: row("c3", "03:00"), red: row("r1", "10:00") }),
+    g("b.spec.ts", "broken", t("02:00"), t("10:00"), { green: row("c2", "02:00"), red: row("r1", "10:00") }),
+    // x has been red since 08:00; y was last seen at 02:00 and failed first in this run (12:00), so it may share x's cause.
+    g("x.spec.ts", "broken", t("01:00"), t("08:00"), { green: row("c1", "01:00"), red: row("r0", "08:00") }),
+    g("y.spec.ts", "broken", t("02:00"), t("12:00"), { green: row("c2", "02:00"), red: null }),
+    // A break with no window (no history could place it) goes alone.
     g("d.spec.ts", "broken", null),
-  ], { currentAt: now });
+  ]);
   assert.deepEqual(requests.map((r) => [r.specs.slice().sort(), r.kind]), [
     [["a.spec.ts", "b.spec.ts", "x.spec.ts", "y.spec.ts"], "broken"],
     [["d.spec.ts"], "broken"],
@@ -73,18 +74,35 @@ test("broken specs whose break windows overlap go to one agent; flaky ones alone
   ]);
   assert.equal(requests[0].range.green.commit_sha, "c1", "from the oldest last pass");
   assert.equal(requests[0].range.red, null, "to this run, the latest first failure in the bundle");
+  assert.deepEqual(requests[0].window, { from: t("01:00"), to: t("12:00") });
 
-  // c passed in the run where a first failed (its other lane started a minute later): a separate break.
-  const c = g("c.spec.ts", "broken", row("r1", "10:01"), row("r2", "11:00"));
-  assert.deepEqual(bundle([g("a.spec.ts", "broken", row("c3", "03:00"), row("r1", "10:00")), c], { currentAt: now }).map((r) => r.specs), [["a.spec.ts"], ["c.spec.ts"]]);
-  // y could have broken any time since 02:00, c's window included: they can't be told apart, so one agent takes both.
-  assert.deepEqual(bundle([g("y.spec.ts", "broken", row("c2", "02:00"), null), c], { currentAt: now }).map((r) => r.specs.length), [2]);
-
-  // A spec that never ran before (it had only been skipped) could have broken at any time: it joins whatever broke.
-  const k = g("k.spec.ts", "broken", null, null, 0);
-  assert.deepEqual(breakWindow(k, now), { from: -Infinity, to: now });
-  assert.deepEqual(bundle([k, g("c.spec.ts", "broken", row("r1", "10:01"), row("r2", "11:00"))], { currentAt: now }).map((r) => r.specs.length), [2]);
+  // c ran clean in the run where a first failed (its other lane started a minute later): a separate break.
+  const c = g("c.spec.ts", "broken", t("10:01"), t("11:00"));
+  assert.deepEqual(bundle([g("a.spec.ts", "broken", t("03:00"), t("10:00")), c]).map((r) => r.specs), [["a.spec.ts"], ["c.spec.ts"]]);
+  // A chain: w overlaps a, and a overlaps v, so all three go together.
+  assert.deepEqual(bundle([g("v.spec.ts", "broken", t("01:00"), t("04:00")), g("a.spec.ts", "broken", t("03:00"), t("10:00")), g("w.spec.ts", "broken", t("09:00"), t("12:00"))]).map((r) => r.specs.length), [3]);
   assert.equal(windowsOverlap({ from: 0, to: 600e3 }, { from: 540e3, to: 900e3 }), false, "ends within five minutes are the same run");
+});
+
+test("a break window starts after the last run that didn't fail the spec: passed, flaky, or skipped", () => {
+  const t1 = { file: "a.spec.ts", title: "t1" };
+  const t2 = { file: "a.spec.ts", title: "t2" };
+  const r = (status, hh, over = {}) => ({ status, created_at: `2026-10-02T${hh}:00:00Z`, branch: "master", gh_pr_number: null, ...over });
+  const at = (hh) => Date.parse(`2026-10-02T${hh}:00:00Z`);
+  const now = at("12");
+  // Newest first. t1 was skipped behind a flag until it failed at 10; t2 last passed on trunk at 07 and
+  // failed from 08 (a PR's pass at 10 is not a trunk run).
+  const history = new Map([
+    [identityKey(t1), [r("failed", "11"), r("failed", "10"), r("skipped", "09"), r("skipped", "08")]],
+    [identityKey(t2), [r("failed", "11"), r("passed", "10", { gh_pr_number: 5 }), r("failed", "08"), r("passed", "07")]],
+  ]);
+  assert.deepEqual(breakWindow(history, [t1], "master", now), { from: at("09"), to: at("10") }, "a skipped run counts as not failing");
+  assert.deepEqual(breakWindow(history, [t2], "master", now), { from: at("07"), to: at("08") }, "the PR's pass doesn't count");
+  assert.deepEqual(breakWindow(history, [t1, t2], "master", now), { from: at("07"), to: at("10") }, "spanning all its tests");
+  // Failing first in this run (its row not in the history yet): the window ends now.
+  assert.deepEqual(breakWindow(new Map([[identityKey(t1), [r("passed", "09")]]]), [t1], "master", now), { from: at("09"), to: now });
+  // A test with no trunk history could have broken any time.
+  assert.deepEqual(breakWindow(new Map(), [t1], "master", now), { from: -Infinity, to: now });
 });
 
 // A trunk run with three broken specs, all broken since c1; an open PR changes a helper beside y/b.spec.ts.

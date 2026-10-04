@@ -252,14 +252,15 @@ export function rangeOf(history, tests, branch) {
   return green ? { green, red } : null;
 }
 
-async function specRange(fetchImpl, base, id, group, until, log) {
+/** A spec's suspect range (for the request) and, if broken, its break window (for bundling and holds). */
+async function specRange(fetchImpl, base, id, group, until, currentAt, log) {
   try {
     const tests = group.tests.map((t) => t.finding);
     const history = await fetchHistory(fetchImpl, base, id.repository, tests, until, undefined, id.branch, null, log, laneOf([...group.suites][0]));
-    return rangeOf(history, tests, id.branch);
+    return { range: rangeOf(history, tests, id.branch), window: group.kind === "broken" ? breakWindow(history, tests, id.branch, currentAt) : null };
   } catch (e) {
     log(`history for ${group.spec} unavailable: ${String(e).slice(0, 200)}`);
-    return null;
+    return { range: null, window: null };
   }
 }
 
@@ -282,18 +283,23 @@ async function suspects(api, id, range, log) {
 }
 
 /**
- * When a broken spec could have broken: after its last trunk pass and up to its first trunk
- * failure, as run times { from, to }. A first failure in this run ends at `currentAt`. A spec
- * that never passed in the history window but never failed before either (it had only been
- * skipped, e.g. behind a flag the breaking merge turned on) could have broken any time before
- * now: from -Infinity. Null for flaky specs, and for an older break that never passed in the
- * window, which can't be placed.
+ * When a broken spec could have broken, as run times { from, to }: after the last trunk run in
+ * which none of its failing tests failed (passed, flaky, or skipped: a test skipped behind a flag
+ * still ran, and broke only when something made it run), up to the first trunk failure after
+ * that, or this run (`currentAt`). Spanning all its tests. A test with no trunk history at all
+ * could have broken any time: from -Infinity.
  */
-export function breakWindow(g, currentAt) {
-  if (g.kind !== "broken") return null;
-  const at = (o) => Date.parse(o?.created_at) || 0;
-  if (g.range) return { from: at(g.range.green), to: g.range.red ? at(g.range.red) : currentAt };
-  return g.tests.every((t) => t.trunk?.fails === 0) ? { from: -Infinity, to: currentAt } : null;
+export function breakWindow(history, tests, branch, currentAt) {
+  let from = Infinity;
+  let to = -Infinity;
+  for (const t of tests) {
+    // Newest first; trunk rows only, since history also carries other PRs' runs.
+    const rows = (history.get(identityKey(t)) ?? []).filter((o) => o.branch === branch && (o.gh_pr_number == null || o.gh_pr_number === ""));
+    const i = rows.findIndex((o) => !FAILED_STATUSES.has(o.status));
+    from = Math.min(from, i < 0 ? -Infinity : Date.parse(rows[i].created_at) || -Infinity);
+    to = Math.max(to, i > 0 ? Date.parse(rows[i - 1].created_at) || currentAt : currentAt);
+  }
+  return Number.isFinite(to) ? { from, to } : null;
 }
 
 // A run's lanes (enterprise, FIPS) start seconds apart; runs of different commits start minutes apart.
@@ -306,14 +312,14 @@ const SAME_RUN_MS = 5 * 60e3;
 export const windowsOverlap = (a, b) => a.from < b.to - SAME_RUN_MS && b.from < a.to - SAME_RUN_MS;
 
 /**
- * Broken specs whose break windows overlap go to one agent together: they can't be told apart,
+ * Broken specs whose break windows (see breakWindow) overlap go to one agent together: they can't be told apart,
  * and separate agents would race to fix the same cause. Windows, not exact commits, because an
  * incomplete run can leave one spec of a break red a run earlier or later than another. The
  * bundle's range runs from the oldest last pass to the latest first failure, so its suspect
  * commits cover every spec in it. Flaky specs, and breaks with no window, go alone. Broken
  * first; among flaky ones, the one that flaked most on trunk first.
  */
-export function bundle(groups, { currentAt = null } = {}) {
+export function bundle(groups) {
   const at = (o) => Date.parse(o?.created_at) || 0;
   const newReq = (g, window) => ({ specs: [g.spec], kind: g.kind, suites: new Set(g.suites), tests: [...g.tests], range: g.range, openPRs: [...(g.openPRs ?? [])], window });
   const absorb = (r, g) => {
@@ -331,7 +337,7 @@ export function bundle(groups, { currentAt = null } = {}) {
   const windowed = [];
   const alone = [];
   for (const g of groups) {
-    const window = breakWindow(g, currentAt);
+    const window = g.kind === "broken" ? g.window : null;
     (window ? windowed : alone).push({ g, window });
   }
   // Merge overlapping windows: sorted by start, a window joins the current bundle while it starts before the bundle ends.
@@ -455,10 +461,10 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < holdMs);
     if (own.length) decisions.push({ specs: [g.spec], kind: g.kind, tests: g.tests, action: `skipped: #${own.map((p) => p.number).join(", #")} (${label}) already changes it or its directory` });
     else if (held) decisions.push({ specs: [g.spec], kind: g.kind, tests: g.tests, action: `skipped: requested ${held.at.slice(0, 16).replace("T", " ")} UTC by ${held.run}` });
-    else ready.push({ ...g, openPRs: prs, range: await specRange(fetchImpl, base, id, g, until, log) });
+    else ready.push({ ...g, openPRs: prs, ...(await specRange(fetchImpl, base, id, g, until, currentAt, log)) });
   }
 
-  const requests = bundle(ready, { currentAt });
+  const requests = bundle(ready);
   // Master stays red until a break is fixed, so breaks all go now; flaky specs share a daily budget.
   let brokenLeft = maxBrokenPerRun;
   let flakyLeft = maxFlakyPerDay - ledger.filter((r) => r.kind === "flaky" && now.getTime() - Date.parse(r.at) < 24 * HOUR).length;
