@@ -1,0 +1,125 @@
+name: E2E triage
+description: >
+  After an E2E run reported to Test System IO, decide whether each failure is the
+  PR's fault from test history, ask Claude about the ones history can't settle,
+  and publish a job summary. In enforce mode, also write the commit status.
+author: Mattermost
+inputs:
+  composite-identity:
+    description: JSON with repository, commit_sha, gh_run_id, gh_run_attempt, name, branch and gh_pr_number (as given to the TSIO actions)
+    required: true
+  status-context:
+    description: Required commit-status context the verdict is written to in enforce mode
+    required: true
+  github-token:
+    description: Token for the PR diff and commit statuses; never sent to TSIO or Anthropic
+    required: true
+  anthropic-api-key:
+    description: Anthropic API key; without it only the history rules run
+    required: false
+    default: ""
+  claude-model:
+    description: Model for the judge. The confidence thresholds are tuned against the default
+    required: false
+    default: claude-sonnet-5-5
+  min-confidence:
+    description: Minimum model confidence (0.5-1) to clear a failure history can't explain
+    required: false
+    default: "0.85"
+  mode:
+    description: '"enforce" writes the commit status; anything else (default report-only) only writes the summary'
+    required: false
+    default: report-only
+  tsio-base-url:
+    description: Test System IO base URL
+    required: false
+    default: https://test-io.test.mattermost.com
+  test-root:
+    description: Where specs live relative to the repository root ("." if TSIO paths are repository-relative). Unset means ownership is unknown and nothing clears
+    required: false
+    default: ""
+  report-name:
+    description: Prefix of the one report in the run to triage (e.g. one per OS). Matching none fails the step
+    required: false
+    default: ""
+  lane:
+    description: Lane label shown to the model (defaults to the run name)
+    required: false
+    default: ""
+  escalation-model:
+    description: Stronger model asked once about answers just short of a threshold, or that blame the PR without citing a change. Empty turns it off
+    required: false
+    default: claude-fable-5-1
+  ai-budget-usd:
+    description: Per-run ceiling on model spend in USD; a call that could cross it is not made
+    required: false
+    default: "1"
+  ai-advice:
+    description: '"true" also asks about blocking failures the model can''t clear, and shows its read as advice (never changes the outcome)'
+    required: false
+    default: "true"
+  triage-status-context:
+    description: Informational check, pending while triage runs and then the verdict (enforce mode only). Defaults to "<status-context>/triage"; "off" turns it off
+    required: false
+    default: ""
+  triage-lanes:
+    description: Comma-separated required contexts of every lane in the run. When set, the triage check is one for the whole PR (give all lanes the same triage-status-context), summarising every lane
+    required: false
+    default: ""
+  ai-prices:
+    description: 'Optional JSON of prices per million tokens merged over the built-in table: {"model": {"input", "output", "cache_write", "cache_read"}}'
+    required: false
+    default: ""
+  answers-cache:
+    description: Optional file of earlier answers, so a re-run with the same evidence doesn't pay again. Persist it with actions/cache
+    required: false
+    default: ""
+  evidence-dir:
+    description: Optional directory of JSON evidence the test run recorded per failed test ({file, title, full_title, notes, images}); PNG/JPEG only, at most two per test
+    required: false
+    default: ""
+outputs:
+  verdict:
+    description: SUCCESS, FAILURE or ACTION_REQUIRED (run-level investigation)
+    value: ${{ steps.triage.outputs.verdict }}
+  blocking:
+    description: Failures still blocking, including those with too little evidence
+    value: ${{ steps.triage.outputs.blocking }}
+  exonerated:
+    description: Failures cleared by history or the model
+    value: ${{ steps.triage.outputs.exonerated }}
+  description:
+    description: The commit-status description written (or that would be)
+    value: ${{ steps.triage.outputs.description }}
+  ai-calls:
+    description: Model calls this run made
+    value: ${{ steps.triage.outputs.ai_calls }}
+  ai-cost-usd:
+    description: Their cost in USD at list price, or "unknown" for an unpriced model
+    value: ${{ steps.triage.outputs.ai_cost_usd }}
+runs:
+  using: composite
+  steps:
+    - id: triage
+      shell: bash
+      env:
+        COMPOSITE_IDENTITY: ${{ inputs.composite-identity }}
+        STATUS_CONTEXT: ${{ inputs.status-context }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        CLAUDE_MODEL: ${{ inputs.claude-model }}
+        MIN_CONFIDENCE: ${{ inputs.min-confidence }}
+        MODE: ${{ inputs.mode }}
+        TSIO_BASE_URL: ${{ inputs.tsio-base-url }}
+        TEST_ROOT: ${{ inputs.test-root }}
+        REPORT_NAME: ${{ inputs.report-name }}
+        LANE: ${{ inputs.lane }}
+        EVIDENCE_DIR: ${{ inputs.evidence-dir }}
+        ESCALATION_MODEL: ${{ inputs.escalation-model }}
+        AI_BUDGET_USD: ${{ inputs.ai-budget-usd }}
+        AI_ADVICE: ${{ inputs.ai-advice }}
+        TRIAGE_CONTEXT: ${{ inputs.triage-status-context }}
+        TRIAGE_LANES: ${{ inputs.triage-lanes }}
+        AI_PRICES: ${{ inputs.ai-prices }}
+        ANSWERS_CACHE: ${{ inputs.answers-cache }}
+      run: node "${{ github.action_path }}/../../scripts/e2e-triage.mjs"
