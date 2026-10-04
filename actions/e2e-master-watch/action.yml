@@ -54,6 +54,10 @@ inputs:
     description: The agent's PRs in conflict with trunk sent back to it per trunk run
     required: false
     default: "2"
+  cause-hold-hours:
+    description: Hours a break whose suspect commits overlap one already requested waits for that agent to open its PR
+    required: false
+    default: "4"
   hold-hours:
     description: Hours a requested spec or conflicted PR head is left to its agent before it can be requested again
     required: false
@@ -98,6 +102,7 @@ runs:
         MAX_FLAKY_PER_DAY: ${{ inputs.max-flaky-per-day }}
         MAX_CONFLICTS_PER_RUN: ${{ inputs.max-conflicts-per-run }}
         HOLD_HOURS: ${{ inputs.hold-hours }}
+        CAUSE_HOLD_HOURS: ${{ inputs.cause-hold-hours }}
         LEDGER_PATH: ${{ github.workspace }}/.e2e-master-watch/ledger.json
         PENDING_PATH: ${{ github.workspace }}/.e2e-master-watch/pending.json
         TSIO_BASE_URL: ${{ inputs.tsio-base-url }}

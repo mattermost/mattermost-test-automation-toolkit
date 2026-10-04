@@ -18,14 +18,15 @@
  *           run, e.g. enterprise and FIPS: two signals at once         -> repair
  *   new     failed for the first time, in one lane                    -> wait for the next run
  *   infra   the run failed for environmental reasons                  -> report only
- * Broken specs that last passed on the same commit most likely share a cause and
- * go to one agent together; each flaky spec goes alone. A spec is skipped when one
- * of the agent's own open PRs (LABEL) changes it or its directory, or when it was
- * requested within HOLD_HOURS. Other open PRs into trunk that change it are passed
- * to the agent (open_prs_touching) to judge: feature work that edits a spec is not
- * a fix for trunk, and skipping on it left the largest break of a month unfixed
- * (its agent is still working). Broken requests all go out at once (up to
- * MAX_BROKEN_PER_RUN, a safety limit), since master is red until they're fixed;
+ * Broken specs whose break windows (last trunk pass .. first trunk failure) overlap
+ * can't be told apart and go to one agent together; each flaky spec goes alone. A
+ * break overlapping one requested within CAUSE_HOLD_HOURS waits for that agent's PR.
+ * A spec is skipped when one of the agent's own open PRs (LABEL) changes it or its
+ * directory, or when it was requested within HOLD_HOURS (its agent is still working).
+ * Other open PRs into trunk that change it are passed to the agent (open_prs_touching)
+ * to judge: feature work that edits a spec is not a fix for trunk, and skipping on it
+ * left the largest break of a month unfixed. Broken requests all go out at once (up
+ * to MAX_BROKEN_PER_RUN, a safety limit), since trunk is red until they're fixed;
  * flaky requests draw on a daily budget of MAX_FLAKY_PER_DAY, most-flaky first.
  *
  * The agent also owns the PRs it opened: an open PR with its label that now
@@ -212,8 +213,8 @@ export function prsTouching(touched, spec) {
 
 /**
  * Requests sent by earlier runs, persisted between runs by the action's cache: a fix
- * request is { at, specs, kind, red?, run } (red: the first failing trunk commit of a break),
- * a conflict request { at, pr, head, run }.
+ * request is { at, specs, kind, window?, run } (window: a break's { from, to } run times, from
+ * null for -Infinity), a conflict request { at, pr, head, run }.
  */
 export function readLedger(path) {
   if (!path) return [];
@@ -281,36 +282,69 @@ async function suspects(api, id, range, log) {
 }
 
 /**
- * Broken specs that started failing on the same trunk commit go to one agent together: one
- * merge broke them, and separate agents would race to fix the same cause. Keyed by the first
- * red commit, not the last green one: incomplete runs leave each spec a different last pass.
- * A spec with no first red in the history failed first in this run (`currentCommit`), and so did
- * one with no range whose tests never failed on trunk before (they had only been skipped, e.g.
- * behind a feature flag the breaking merge turned on). A broken spec with no range that did fail
- * before, and every flaky spec, go alone. The bundle keeps the oldest last-green commit, so its
- * suspect range covers every spec in it. Broken first;
- * among flaky ones, the one that flaked most on trunk first.
+ * When a broken spec could have broken: after its last trunk pass and up to its first trunk
+ * failure, as run times { from, to }. A first failure in this run ends at `currentAt`. A spec
+ * that never passed in the history window but never failed before either (it had only been
+ * skipped, e.g. behind a flag the breaking merge turned on) could have broken any time before
+ * now: from -Infinity. Null for flaky specs, and for an older break that never passed in the
+ * window, which can't be placed.
  */
-export function bundle(groups, { currentCommit = null } = {}) {
-  const requests = [];
-  const byRed = new Map();
+export function breakWindow(g, currentAt) {
+  if (g.kind !== "broken") return null;
   const at = (o) => Date.parse(o?.created_at) || 0;
-  for (const g of groups) {
-    const firstFailureNow = g.tests.every((t) => t.trunk?.fails === 0);
-    const key = g.kind !== "broken" ? null : g.range ? (g.range.red?.commit_sha ?? currentCommit) : firstFailureNow ? currentCommit : null;
-    const r = key && byRed.get(key);
-    if (r) {
-      r.specs.push(g.spec);
-      for (const s of g.suites) r.suites.add(s);
-      r.tests.push(...g.tests);
-      for (const p of g.openPRs ?? []) if (!r.openPRs.some((q) => q.number === p.number)) r.openPRs.push(p);
-      if (g.range && (!r.range || at(g.range.green) < at(r.range.green))) r.range = { ...(r.range ?? g.range), green: g.range.green };
-      continue;
+  if (g.range) return { from: at(g.range.green), to: g.range.red ? at(g.range.red) : currentAt };
+  return g.tests.every((t) => t.trunk?.fails === 0) ? { from: -Infinity, to: currentAt } : null;
+}
+
+// A run's lanes (enterprise, FIPS) start seconds apart; runs of different commits start minutes apart.
+const SAME_RUN_MS = 5 * 60e3;
+
+/**
+ * Two break windows share a commit that could have broken both. Ends in the same run don't
+ * overlap: one spec passed in the run where the other first failed.
+ */
+export const windowsOverlap = (a, b) => a.from < b.to - SAME_RUN_MS && b.from < a.to - SAME_RUN_MS;
+
+/**
+ * Broken specs whose break windows overlap go to one agent together: they can't be told apart,
+ * and separate agents would race to fix the same cause. Windows, not exact commits, because an
+ * incomplete run can leave one spec of a break red a run earlier or later than another. The
+ * bundle's range runs from the oldest last pass to the latest first failure, so its suspect
+ * commits cover every spec in it. Flaky specs, and breaks with no window, go alone. Broken
+ * first; among flaky ones, the one that flaked most on trunk first.
+ */
+export function bundle(groups, { currentAt = null } = {}) {
+  const at = (o) => Date.parse(o?.created_at) || 0;
+  const newReq = (g, window) => ({ specs: [g.spec], kind: g.kind, suites: new Set(g.suites), tests: [...g.tests], range: g.range, openPRs: [...(g.openPRs ?? [])], window });
+  const absorb = (r, g) => {
+    r.specs.push(...(g.specs ?? [g.spec]));
+    for (const s of g.suites) r.suites.add(s);
+    r.tests.push(...g.tests);
+    for (const p of g.openPRs ?? []) if (!r.openPRs.some((q) => q.number === p.number)) r.openPRs.push(p);
+    if (g.range) {
+      const green = !r.range || at(g.range.green) < at(r.range.green) ? g.range.green : r.range.green;
+      // No red row means this run: the latest first failure there is.
+      const red = !r.range || !g.range.red || !r.range.red ? null : at(g.range.red) > at(r.range.red) ? g.range.red : r.range.red;
+      r.range = { green, red };
     }
-    const req = { specs: [g.spec], kind: g.kind, suites: new Set(g.suites), tests: [...g.tests], range: g.range, openPRs: [...(g.openPRs ?? [])], firstRed: key };
-    if (key) byRed.set(key, req);
-    requests.push(req);
+  };
+  const windowed = [];
+  const alone = [];
+  for (const g of groups) {
+    const window = breakWindow(g, currentAt);
+    (window ? windowed : alone).push({ g, window });
   }
+  // Merge overlapping windows: sorted by start, a window joins the current bundle while it starts before the bundle ends.
+  windowed.sort((a, b) => a.window.from - b.window.from);
+  const bundles = [];
+  for (const { g, window } of windowed) {
+    const last = bundles.at(-1);
+    if (last && windowsOverlap(window, last.window)) {
+      absorb(last, g);
+      last.window = { from: Math.min(last.window.from, window.from), to: Math.max(last.window.to, window.to) };
+    } else bundles.push(newReq(g, { ...window }));
+  }
+  const requests = [...bundles, ...alone.map(({ g }) => newReq(g, null))];
   const flakes = (r) => r.tests.reduce((n, t) => n + (t.trunk?.fails ?? 0) + (t.trunk?.flaky ?? 0), 0);
   return requests.sort((a, b) => (a.kind === b.kind ? (a.kind === "flaky" ? flakes(b) - flakes(a) : 0) : a.kind === "broken" ? -1 : 1));
 }
@@ -369,6 +403,8 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   const maxBrokenPerRun = Number(env.MAX_BROKEN_PER_RUN || 10);
   const maxFlakyPerDay = Number(env.MAX_FLAKY_PER_DAY || 6);
   const holdMs = Number(env.HOLD_HOURS || 24) * HOUR;
+  const causeHoldMs = Number(env.CAUSE_HOLD_HOURS || 4) * HOUR;
+  const currentAt = Date.parse(first.created_at) || now.getTime();
   const label = env.LABEL || DEFAULT_LABEL;
 
   const groups = new Map();
@@ -422,18 +458,21 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     else ready.push({ ...g, openPRs: prs, range: await specRange(fetchImpl, base, id, g, until, log) });
   }
 
-  const requests = bundle(ready, { currentCommit: id.commit_sha });
+  const requests = bundle(ready, { currentAt });
   // Master stays red until a break is fixed, so breaks all go now; flaky specs share a daily budget.
   let brokenLeft = maxBrokenPerRun;
   let flakyLeft = maxFlakyPerDay - ledger.filter((r) => r.kind === "flaky" && now.getTime() - Date.parse(r.at) < 24 * HOUR).length;
   for (const r of requests) {
     const decision = { specs: r.specs, kind: r.kind, tests: r.tests };
     decisions.push(decision);
-    // A spec of a break already handed over (it failed in only one lane then, say) is that agent's:
-    // it fixes the shared cause wherever it appears.
-    const sameCause = r.firstRed && ledger.find((e) => e.red === r.firstRed && now.getTime() - Date.parse(e.at) < holdMs);
+    // A break whose window overlaps one handed over in the last few hours may be the same cause,
+    // showing up a run later (an incomplete run, a spec that failed in one lane only). Give that
+    // agent time to open its PR: then the own-PR skip, or the new agent's own check of that PR,
+    // takes over. A different cause waits only those hours.
+    const sameCause = r.window && ledger.find((e) => e.window && now.getTime() - Date.parse(e.at) < causeHoldMs &&
+      windowsOverlap(r.window, { from: e.window.from ?? -Infinity, to: e.window.to }));
     if (sameCause) {
-      decision.action = `skipped: first failed on ${r.firstRed.slice(0, 9)}, like the break requested ${sameCause.at.slice(0, 16).replace("T", " ")} UTC`;
+      decision.action = `skipped: may be the break requested ${sameCause.at.slice(0, 16).replace("T", " ")} UTC (overlapping suspect commits)`;
       continue;
     }
     if (r.kind === "broken" ? brokenLeft <= 0 : flakyLeft <= 0) {
@@ -456,7 +495,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     };
     decision.payload = payload;
     decision.action = "to request";
-    out.push({ id: `fix-${out.length + 1}`, payload, entry: { at: now.toISOString(), specs: r.specs, kind: r.kind, ...(r.firstRed ? { red: r.firstRed } : {}), run: runURL } });
+    out.push({ id: `fix-${out.length + 1}`, payload, entry: { at: now.toISOString(), specs: r.specs, kind: r.kind, ...(r.window ? { window: { from: Number.isFinite(r.window.from) ? r.window.from : null, to: r.window.to } } : {}), run: runURL } });
   }
 
   // The repair PRs the automation opened are its own to keep mergeable: a trunk merge that

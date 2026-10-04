@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { identityKey } from "./e2e-triage.mjs";
-import { bundle, prsTouching, rangeOf, readLedger, record, selectCrossLane, selectRepairs, watch } from "./e2e-master-watch.mjs";
+import { breakWindow, bundle, prsTouching, rangeOf, readLedger, record, selectCrossLane, selectRepairs, watch, windowsOverlap } from "./e2e-master-watch.mjs";
 
 const finding = (over) => ({ file: "a.spec.ts", repo_path: "specs/a.spec.ts", title: "t", error: "Error: expected visible", class: "BROKEN_ON_TRUNK", trunk: { runs: 8, fails: 2, flaky: 0, passes: 6 }, ...over });
 
@@ -51,33 +51,40 @@ test("the suspect range starts where every failing test last passed and ends at 
   assert.equal(rangeOf(new Map([[identityKey(t1), [row("failed", 1), row("passed", 2, { gh_pr_number: 5 })]]]), [t1], "master"), null, "no trunk pass in the window: no range");
 });
 
-test("broken specs that started failing on the same commit go to one agent; flaky ones alone, after them", () => {
-  const row = (sha, hour) => ({ commit_sha: sha, created_at: `2026-10-02T${hour}:00:00Z` });
+test("broken specs whose break windows overlap go to one agent; flaky ones alone, after them", () => {
+  const row = (sha, hhmm) => ({ commit_sha: sha, created_at: `2026-10-02T${hhmm}:00Z` });
   const g = (spec, kind, green, red, fails = 1) => ({ spec, kind, suites: new Set(["s"]), tests: [{ spec, title: "t", trunk: { fails } }], range: green ? { green, red } : null });
+  const now = Date.parse("2026-10-02T12:00:00Z");
   const requests = bundle([
-    g("f.spec.ts", "flaky", row("c1", "01"), row("r1", "10")),
+    g("f.spec.ts", "flaky", row("c1", "01:00"), row("r1", "10:00")),
     // One merge broke a and b; an incomplete run left them different last passes.
-    g("a.spec.ts", "broken", row("c3", "03"), row("r1", "10")),
-    g("b.spec.ts", "broken", row("c2", "02"), row("r1", "10")),
-    g("c.spec.ts", "broken", row("c1", "01"), row("r2", "11")),
-    // First failure in this run: no red row yet, so the current commit is its first red.
-    // No range, never failed before: it had only been skipped until this run.
-    g("k.spec.ts", "broken", null, null, 0),
-    g("e.spec.ts", "broken", row("c4", "04"), null),
-    g("h.spec.ts", "broken", row("c5", "05"), null),
-    // No range, but failing in earlier runs too: an older break of its own.
+    g("a.spec.ts", "broken", row("c3", "03:00"), row("r1", "10:00")),
+    g("b.spec.ts", "broken", row("c2", "02:00"), row("r1", "10:00")),
+    // x has been red since 08:00; y failed first in this run but was last seen passing at 02:00, so it may share x's cause.
+    g("x.spec.ts", "broken", row("c1", "01:00"), row("r0", "08:00")),
+    g("y.spec.ts", "broken", row("c2", "02:00"), null),
+    // No range, but failing in earlier runs too: an older break that can't be placed.
     g("d.spec.ts", "broken", null),
-  ], { currentCommit: "now" });
-  assert.deepEqual(requests.map((r) => [r.specs, r.kind]), [
-    [["a.spec.ts", "b.spec.ts"], "broken"],
-    [["c.spec.ts"], "broken"],
-    [["k.spec.ts", "e.spec.ts", "h.spec.ts"], "broken"],
+  ], { currentAt: now });
+  assert.deepEqual(requests.map((r) => [r.specs.slice().sort(), r.kind]), [
+    [["a.spec.ts", "b.spec.ts", "x.spec.ts", "y.spec.ts"], "broken"],
     [["d.spec.ts"], "broken"],
     [["f.spec.ts"], "flaky"],
   ]);
-  assert.equal(requests[0].range.green.commit_sha, "c2", "the oldest last pass, so the suspect range covers both specs");
-  assert.equal(requests[0].range.red.commit_sha, "r1");
-  assert.equal(requests[2].range.green.commit_sha, "c4", "a bundle started by a spec with no range takes the others' range");
+  assert.equal(requests[0].range.green.commit_sha, "c1", "from the oldest last pass");
+  assert.equal(requests[0].range.red, null, "to this run, the latest first failure in the bundle");
+
+  // c passed in the run where a first failed (its other lane started a minute later): a separate break.
+  const c = g("c.spec.ts", "broken", row("r1", "10:01"), row("r2", "11:00"));
+  assert.deepEqual(bundle([g("a.spec.ts", "broken", row("c3", "03:00"), row("r1", "10:00")), c], { currentAt: now }).map((r) => r.specs), [["a.spec.ts"], ["c.spec.ts"]]);
+  // y could have broken any time since 02:00, c's window included: they can't be told apart, so one agent takes both.
+  assert.deepEqual(bundle([g("y.spec.ts", "broken", row("c2", "02:00"), null), c], { currentAt: now }).map((r) => r.specs.length), [2]);
+
+  // A spec that never ran before (it had only been skipped) could have broken at any time: it joins whatever broke.
+  const k = g("k.spec.ts", "broken", null, null, 0);
+  assert.deepEqual(breakWindow(k, now), { from: -Infinity, to: now });
+  assert.deepEqual(bundle([k, g("c.spec.ts", "broken", row("r1", "10:01"), row("r2", "11:00"))], { currentAt: now }).map((r) => r.specs.length), [2]);
+  assert.equal(windowsOverlap({ from: 0, to: 600e3 }, { from: 540e3, to: 900e3 }), false, "ends within five minutes are the same run");
 });
 
 // A trunk run with three broken specs, all broken since c1; an open PR changes a helper beside y/b.spec.ts.
@@ -301,17 +308,31 @@ test("someone else's open PR on a spec doesn't hold back the fix: the agent gets
   assert.deepEqual(hook[0].open_prs_touching, [{ number: 41, title: "PR 41", url: "https://github.com/o/r/pull/41" }], "the release-branch PR is not listed");
 });
 
-test("a spec that broke on the same commit as a break already handed over is left to that agent", async () => {
-  const LEDGER_PATH = ledgerPath();
-  // An earlier run sent the break that first failed on c1 (only x/a then); y/b and z/c show up now.
-  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 3600e3).toISOString(), specs: ["specs/q/other.spec.ts"], kind: "broken", red: "c1", run: "r" }] }));
+test("a break overlapping one handed over a few hours ago waits for that agent; later it is requested", async () => {
+  // a, b and c broke between c2 (07:00) and c1 (08:00). An earlier run sent a break with an overlapping window.
+  const sentAt = new Date(now.getTime() - 3600e3).toISOString();
+  const ledgerWith = (window) => {
+    const path = ledgerPath();
+    writeFileSync(path, JSON.stringify({ requests: [{ at: sentAt, specs: ["specs/q/other.spec.ts"], kind: "broken", window, run: "r" }] }));
+    return path;
+  };
+  const overlapping = { from: Date.parse("2026-10-02T06:00:00Z"), to: Date.parse("2026-10-02T07:30:00Z") };
   const hook = [];
-  const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [] }), hook });
-  assert.deepEqual(decisions.map((d) => d.action), ["skipped: first failed on c1, like the break requested 2026-10-02 23:00 UTC"]);
+  const held = await run({ env: { ...env, LEDGER_PATH: ledgerWith(overlapping) }, fetchImpl: routes({ openPRFiles: [] }), hook });
+  assert.deepEqual(held.decisions.map((d) => d.action), ["skipped: may be the break requested 2026-10-02 23:00 UTC (overlapping suspect commits)"]);
   assert.equal(hook.length, 0);
 
-  // A request records its first failing commit, so later runs can tell.
+  // After the cause hold (4 hours by default) it goes out: by then that agent's PR exists, or it found nothing.
+  const later = await run({ env: { ...env, LEDGER_PATH: ledgerWith(overlapping) }, fetchImpl: routes({ openPRFiles: [] }), now: new Date(now.getTime() + 4 * 3600e3), hook });
+  assert.deepEqual(later.decisions.map((d) => d.action), ["to request"]);
+
+  // An earlier break that ended before these last passed can't be the same cause.
+  const before = { from: Date.parse("2026-10-02T04:00:00Z"), to: Date.parse("2026-10-02T07:00:00Z") };
+  const separate = await run({ env: { ...env, LEDGER_PATH: ledgerWith(before) }, fetchImpl: routes({ openPRFiles: [] }), hook: [] });
+  assert.deepEqual(separate.decisions.map((d) => d.action), ["to request"]);
+
+  // A request keeps its window, so later runs can tell.
   const fresh = ledgerPath();
   await run({ env: { ...env, LEDGER_PATH: fresh }, fetchImpl: routes({ openPRFiles: [] }), hook: [] });
-  assert.deepEqual(readLedger(fresh).map((e) => [e.kind, e.red]), [["broken", "c1"]]);
+  assert.deepEqual(readLedger(fresh).map((e) => [e.kind, e.window]), [["broken", { from: Date.parse("2026-10-02T07:00:00Z"), to: Date.parse("2026-10-02T08:00:00Z") }]]);
 });

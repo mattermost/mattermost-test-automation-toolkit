@@ -13,8 +13,13 @@ fix only for what repeats:
 | Failed for the first time, in one lane | wait for the next run |
 | Run failed for environmental reasons | report only |
 
-Broken specs whose failing tests last passed on the same commit most likely share
-a cause, so they go to one agent in one request; each flaky spec goes alone. A
+Each broken spec has a break window: from its last trunk pass to its first trunk
+failure. Broken specs whose windows overlap can't be told apart, so they go to one
+agent in one request (an incomplete run can make one spec of a break show up a run
+earlier or later than another); each flaky spec goes alone. A break whose window
+overlaps one requested in the last `cause-hold-hours` waits, so its agent has time
+to open its PR; after that the agent's own-PR skip or the next agent's check of
+that PR takes over. A
 request carries the failing tests, their errors and history, the last trunk
 commit where they all passed, the first one where they failed, and the commits
 in between (oldest first). Broken requests go before flaky ones.
