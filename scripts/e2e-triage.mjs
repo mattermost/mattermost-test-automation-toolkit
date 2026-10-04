@@ -115,6 +115,10 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
   // No PR number is not enough to be trunk: a pushed branch has none either.
   const trunk = inLane.filter((o) => prOf(o) == null && (trunkBranch == null || o.branch === trunkBranch));
   const others = inLane.filter((o) => prOf(o) != null && prOf(o) !== currentPR);
+  // This PR's own earlier runs: a test that passed on an earlier commit of the PR,
+  // with nothing related changed since, did not break because of the PR.
+  const mine = currentPR == null ? [] : inLane.filter((o) => prOf(o) === currentPR);
+  const minePassed = mine.filter((o) => o.status === "passed" || o.status === "flaky");
   const trunkFails = trunk.filter((o) => FAILED_STATUSES.has(o.status)).length;
   const trunkFlaky = trunk.filter((o) => o.status === "flaky").length;
   const trunkPasses = trunk.filter((o) => o.status === "passed").length;
@@ -137,6 +141,12 @@ export function classify(test, observations, changedFiles, cfg = DEFAULTS, prNum
       passes: otherPasses,
     },
     failure_signatures: failureSignatures,
+    this_pr: {
+      runs: mine.length,
+      passes: minePassed.length,
+      fails: mine.filter((o) => FAILED_STATUSES.has(o.status)).length,
+      last_pass: minePassed[0] ? { commit_sha: minePassed[0].commit_sha ?? null, created_at: minePassed[0].created_at ?? null } : null,
+    },
   };
   const out = (cls, reason, blocking) => ({ ...test, class: cls, reason, blocking, ...stats });
   if (own.has(test.repo_path ?? test.file))
@@ -358,20 +368,35 @@ Rules:
   feature under test is.
 - flaky_environment with high confidence requires either recurrence on other PRs (evidence id starting with cross_pr)
   or an error text that is clearly infrastructural (server not healthy, cannot connect, device/emulator failure, app crash on
-  launch), or producer evidence showing the test server failed or rejected the request the step depended on, together
-  with a diff that does not touch that area.
+  launch), or producer evidence showing the test server failed or rejected the request the step depended on, or
+  this_pr_history showing the test passed on an earlier commit of this PR with nothing related to it changed since,
+  together with a diff that does not touch that area.
 - producer_evidence (id producer), when present, is what the test run itself recorded at the failure: screenshots of the
   screen at that moment (attached as images), the step the test stopped at, and log lines such as the requests the app
   was still waiting on or the errors the app logged. A wait on the test server that never returned, or a server request
   that failed or was rejected (an error dialog on screen, an app error naming the call), in an area the diff does not
   touch, supports flaky_environment; a stuck or failing request, screen or flow that the diff changes supports
   caused_by_pr.
+- this_pr_history (id this_pr) is this test on earlier commits of the same PR, and the files that changed between its
+  last pass and now. If it passed with the same PR changes in place and nothing in changed_since_last_pass could
+  affect the test (read the changes when they are given: app code the test exercises counts even if the error doesn't
+  name it), the PR's changes did not break it. A change since the last pass that could explain the failure supports
+  caused_by_pr. If related_to_this_test lists files, or the test never passed on this
+  PR, this history does not clear it.
+- same_test_other_platforms_this_run (id other_platforms) is the same test in the same run on other platforms. It
+  passing elsewhere points to a platform or environment cause rather than shared code, but alone it does not clear.
+- tries_in_this_run says how many times the test ran in this run and how many failed. Failing every try means it
+  failed consistently in this run, not that the PR caused it.
+- test_code_near_failure is the test's code around the failing line. Use it to say what the test was doing, for
+  example waiting on an outside website or service the test does not control.
 - confidence: 0.9 or higher when the cited evidence meets the requirement above for the cause you give and no part of
   the diff plausibly touches the failing test, its flow or screen, or the request it depends on; 0.6 to 0.85 when it
-  meets the requirement but some part of the diff could plausibly be involved. If the evidence is genuinely
+  meets the requirement but some part of the diff could plausibly be involved. A pass on an earlier commit of this PR
+  (this_pr) already had the PR's changes in place, so those changes are ruled out; only what changed since that pass
+  can still be involved. If you read those changes and none could affect the test, answer 0.9 or higher. If the evidence is genuinely
   insufficient, answer with confidence below 0.6 rather than guessing.
-- explanation: at most 280 characters, written for the PR author: what failed and what, if anything, they should do.
-  Do not restate the engine's classification or the history numbers; they are shown next to your answer.`;
+- explanation: one or two plain sentences, at most 200 characters, written for the PR author: what most likely
+  happened. No evidence ids, no percentages and no history numbers; those are shown next to your answer.`;
 
 export const SCHEMA = {
   type: "object",
@@ -379,7 +404,7 @@ export const SCHEMA = {
     cause: { type: "string", enum: ["caused_by_pr", "flaky_environment", "bug_on_master", "test_bug"] },
     confidence: { type: "number", description: "0 to 1" },
     cited_evidence: { type: "array", items: { type: "string" }, description: "up to 6 evidence ids from the pack" },
-    explanation: { type: "string", description: "at most 280 characters, for the PR author" },
+    explanation: { type: "string", description: "one or two plain sentences, at most 200 characters, for the PR author" },
   },
   required: ["cause", "confidence", "cited_evidence", "explanation"],
   additionalProperties: false,
@@ -444,9 +469,27 @@ export function buildPack(finding, compareFiles, pr, others) {
     diff_hunks_of_files_named_in_error: hunks,
     other_failures_in_same_run: neighbours.slice(0, 8).map(({ class: cls, title }) => ({ class: cls, title })),
     ...(finding.producer ? { producer_evidence: { id: "producer", notes: finding.producer.notes, screenshots: finding.producer.images.map(({ name, sha256 }) => ({ name, sha256 })) } } : {}),
+    ...(finding.this_pr?.runs ? { this_pr_history: thisPrHistory(finding) } : {}),
+    ...(finding.other_lanes?.length ? { same_test_other_platforms_this_run: { id: "other_platforms", results: finding.other_lanes } } : {}),
+    ...(finding.tries?.ran ? { tries_in_this_run: finding.tries } : {}),
+    ...(finding.code_near_failure ? { test_code_near_failure: finding.code_near_failure } : {}),
   };
   if (finding.producer?.images.length) PACK_IMAGES.set(pack, finding.producer.images);
   return pack;
+}
+// This PR's earlier runs of the test, and what changed between its last pass and now.
+function thisPrHistory(f) {
+  const since = f.since_last_pass;
+  return {
+    id: "this_pr",
+    earlier_runs_on_this_pr: f.this_pr.runs,
+    passed: f.this_pr.passes,
+    failed: f.this_pr.fails,
+    last_passed: f.this_pr.last_pass ? { commit: f.this_pr.last_pass.commit_sha?.slice(0, 7) ?? null, at: f.this_pr.last_pass.created_at } : null,
+    ...(since
+      ? { changed_since_last_pass: { file_count: since.files.length, files: since.files.slice(0, 30), related_to_this_test: since.related.map((r) => r.file), related_changes: since.related.slice(0, 3), ...(since.changes?.length ? { changes: since.changes } : {}) } }
+      : {}),
+  };
 }
 // Screenshot bytes travel beside the pack; the pack (and cache key) carries hashes.
 const PACK_IMAGES = new WeakMap();
@@ -460,7 +503,13 @@ export const evidenceIds = (pack) => [
   "pr.changed_files",
   ...pack.diff_hunks_of_files_named_in_error.filter((h) => h.related).map((h) => h.id),
   ...(pack.producer_evidence?.notes || pack.producer_evidence?.screenshots?.length ? ["producer"] : []),
+  // Citable only when the test passed earlier on this PR and nothing that changed since relates to it.
+  ...(pack.this_pr_history?.passed > 0 && pack.this_pr_history.changed_since_last_pass && !pack.this_pr_history.changed_since_last_pass.related_to_this_test.length ? ["this_pr"] : []),
+  ...(pack.same_test_other_platforms_this_run ? ["other_platforms"] : []),
 ];
+// Evidence that can carry a clear on its own: a related hunk, other PRs failing the
+// same way, what the run recorded, or this PR's own earlier pass.
+const CLEARING = (ids) => ids.some((c) => c.startsWith("hunk_")) || ids.includes("cross_pr") || ids.includes("producer") || ids.includes("this_pr");
 // Models that accept temperature (newer ones reject it with a 400).
 const TEMPERATURE_MODELS = ["claude-haiku-4-5", "claude-opus-4-6", "claude-sonnet-4-6"];
 export const samplingFor = (model) =>
@@ -641,27 +690,25 @@ export function decide(cls, answer, pack, cfg = DEFAULTS, isTrunkRun = false, id
   const cited = answer.cited_evidence.filter((c) => known.has(c));
   const a = { ...answer, cited_evidence: cited };
   const hunk = cited.some((c) => c.startsWith("hunk_"));
-  const cross = cited.includes("cross_pr");
-  const produced = cited.includes("producer");
   if (EXON.has(cls)) {
     if (a.cause === "caused_by_pr" && a.confidence >= cfg.vetoMin && hunk) return { blocking: true, decision: "adjudicator_veto", answer: a };
     return { blocking: false, decision: "engine", answer: a };
   }
   // An unblock always needs a citation that exists in the pack.
-  if (BORDERLINE.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && (cross || hunk || produced))
+  if (BORDERLINE.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && CLEARING(cited))
     return { blocking: false, decision: "adjudicator_unblock", answer: a };
   return { blocking: !EXON.has(cls), decision: "engine", answer: a };
 }
 
 /**
  * Whether any answer could change the outcome (see decide): a veto needs a related
- * hunk; an unblock needs a hunk, a cross-PR recurrence or producer evidence.
+ * hunk; an unblock needs a hunk, a cross-PR recurrence, producer evidence or a pass earlier on this PR.
  */
 export function canChange(cls, pack, isTrunkRun = false) {
   const ids = evidenceIds(pack);
   const hunk = ids.some((id) => id.startsWith("hunk_"));
   if (exoneratedSet(isTrunkRun).has(cls)) return hunk;
-  if (BORDERLINE.has(cls)) return hunk || ids.includes("cross_pr") || ids.includes("producer");
+  if (BORDERLINE.has(cls)) return CLEARING(ids);
   return false;
 }
 export const answerKey = (model, pack) => `v3:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + SYSTEM, pack)}`;
@@ -677,8 +724,7 @@ function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
   if (BORDERLINE.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
   if (answer.confidence < cfg.escalateMin) return false;
   if (exoneratedSet(isTrunkRun).has(cls)) return answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.vetoMin;
-  return BORDERLINE.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence &&
-    (hunk || cited.includes("cross_pr") || cited.includes("producer"));
+  return BORDERLINE.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && CLEARING(cited);
 }
 
 /**
@@ -815,63 +861,122 @@ const shortModel = (m) => String(m ?? "").replace(/^claude-/, "");
 const usd = (n) => (n == null ? "?" : n === 0 ? "$0" : n < 0.01 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`);
 const tokens = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
 
-/** One sentence a PR author can act on: why this test was cleared or kept. */
-function whySentence(f) {
-  const t = f.trunk;
+const pct = (x) => `${Math.round(x * 100)}%`;
+const count = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const sha7 = (c) => String(c ?? "").slice(0, 7);
+const LIKELY = { flaky_environment: "flaky or environment", bug_on_master: "already broken on the default branch", test_bug: "a test bug" };
+
+/** What triage concluded about one test, and what the author should do next. */
+function verdictFor(f, branch) {
   const a = f.judge;
-  const ai = a && `AI ${Math.round(a.confidence * 100)}%${a.cited_evidence.length ? ` (cites ${a.cited_evidence.join(", ")})` : ""}: ${a.explanation}`;
-  if (f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto") return ai;
-  if (f.decision === "evidence_incomplete" || f.identity_unresolved) return f.reason;
-  let why = {
-    BROKEN_ON_TRUNK: () => `master's latest run fails it too (${t.fails} of ${t.runs} master runs failed)`,
-    FLAKY_ON_TRUNK: () => `fails intermittently on master: ${t.fails} failed and ${t.flaky} flaky in ${t.runs} runs`,
-    FLAKY_CROSS_PR: () => `failed the same way on ${f.cross_pr.prs.length} other PRs while master passed`,
-    SAME_FAILURE_AS_CLEARED: () => `same error as ${f.same_as}, which history cleared`,
-    REGRESSION: () => f.untouched
-      ? `passes on master (${t.passes} of ${t.runs}) and no other PR fails it, and this PR changes neither the test nor any file its error names. Re-run it; if it fails again, check what the test depends on`
-      : `passes on master (${t.passes} of ${t.runs}) and no other PR fails it. Check your change, or merge master`,
-    INSUFFICIENT_DATA: () => `only ${t.runs} master runs, too few to tell a flake from a break`,
-    OWNED_BY_PR: () => "this PR edits the failing spec",
-  }[f.class]?.() ?? f.reason;
-  if (a && f.decision === "advice") why += `. AI's read (advice only, nothing it could cite to clear): ${CAUSE[a.cause] ?? a.cause}, ${Math.round(a.confidence * 100)}%: ${a.explanation}`;
-  else if (a && f.blocking) why += `. ${ai.replace(/^AI (\d+%)/, "AI $1, not enough to clear")}`;
-  if (f.producer) why += `. The run recorded ${f.producer.images.length} screenshot(s)${f.producer.notes ? " and notes" : ""}`;
-  return why;
+  if (!f.blocking) {
+    const why = f.decision === "adjudicator_unblock" ? LIKELY[a?.cause] ?? CAUSE[a?.cause] ?? a?.cause : RESULT[f.class] ?? f.class;
+    return { icon: "✅", label: `Not caused by this PR: ${why}`, next: "Nothing" };
+  }
+  if (f.class === "OWNED_BY_PR") return { icon: "🔴", label: "This PR edits the test", next: "Check your change to the test" };
+  if (f.decision === "adjudicator_veto" || a?.cause === "caused_by_pr") return { icon: "🔴", label: "Likely caused by this PR", next: "Check the change named below" };
+  if (f.decision === "evidence_incomplete" || f.identity_unresolved) return { icon: "🟡", label: "Could not check its history", next: "Re-run the job, or check it by hand" };
+  if (a) return { icon: "🟡", label: `Likely ${LIKELY[a.cause] ?? a.cause}, but not sure enough to clear`, next: "Re-run the job" };
+  if (f.class === "INSUFFICIENT_DATA") return { icon: "🟡", label: "Too little history to tell", next: "Re-run the job; if it fails again, check the test" };
+  if (f.class === "REGRESSION" && f.untouched) return { icon: "🔴", label: "Not explained by history", next: "Re-run the job; if it fails again, check what the test depends on" };
+  return { icon: "🔴", label: "Likely regression", next: `Check your change, or merge ${branch}` };
 }
 
 function decidedBy(f) {
-  if (f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto")
-    return `AI · ${md(shortModel(f.judge?.provenance?.served_model ?? f.ai?.model))}${f.escalated ? " (escalated)" : ""}`;
-  if (f.decision === "advice") return `rules · AI advice (${md(shortModel(f.judge?.provenance?.served_model ?? f.ai?.model))})`;
+  const model = shortModel(f.judge?.provenance?.served_model ?? f.ai?.model);
+  if (f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto") return `AI · ${md(model)}${f.escalated ? " (second opinion)" : ""}`;
+  if (f.judge || f.ai?.model) return `rules + AI${f.escalated ? " (second opinion)" : ""}`;
   return "rules";
 }
 
-/** The job summary: what blocks first, then what was cleared and why, and what AI cost. */
-export function renderSummary({ verdict, findings, infra, runURL, counts, mode = "report-only", ai = newLedger(), missing = null }) {
-  const blocking = infra ? counts.failed : findings.filter((f) => f.blocking).length;
-  const cleared = findings.filter((f) => !f.blocking).length;
+/** The facts behind one test's verdict, one question per row. */
+function factsTable(f, branch, pr) {
+  const t = f.trunk;
+  const rows = [];
+  const edits = f.class === "OWNED_BY_PR";
+  rows.push(["Does this PR change the test?", edits ? "Yes" : "No"]);
+  if (!edits && f.untouched != null) rows.push(["Does this PR change a file its error names?", f.untouched ? "No" : "Yes"]);
+  if (t) rows.push(t.runs ? [`${branch}, last ${count(t.runs, "run")}`, `Passed ${t.passes}, failed ${t.fails}${t.flaky ? `, passed on retry ${t.flaky}` : ""}${t.latest ? `. Latest: ${t.latest}` : ""}`] : [`${branch}`, "No runs on record"]);
+  if (f.cross_pr) {
+    const ex = f.cross_pr.examples.slice(0, 3).join(", ");
+    rows.push(["Other PRs", f.cross_pr.prs.length ? `Failed with the same error on ${count(f.cross_pr.prs.length, "PR")}${ex ? `: ${ex}` : ""}`
+      : f.cross_pr.passes ? `Never failed the same way in ${count(f.cross_pr.passes, "run")}` : "No runs on record"]);
+  }
+  if (pr && f.this_pr?.runs) {
+    const lp = f.this_pr.last_pass;
+    rows.push(["This PR's earlier runs", `Passed ${f.this_pr.passes} of ${f.this_pr.runs}${lp ? `. Last pass: ${sha7(lp.commit_sha)}, ${String(lp.created_at ?? "").slice(0, 16).replace("T", " ")}` : ""}`]);
+    const since = f.since_last_pass;
+    if (since) rows.push(["Changed on this PR since that pass", since.files.length
+      ? `${count(since.files.length, "file")}${since.files.length <= 3 ? `: ${since.files.join(", ")}` : `, for example ${since.files.slice(0, 3).join(", ")}`}. ${since.related.length ? `Named in the test's error: ${since.related.map((r) => r.file).join(", ")}` : "None named in the test's error"}`
+      : "Nothing (same commit)"]);
+  }
+  if (f.other_lanes?.length) rows.push(["Same test, same run, other platforms", f.other_lanes.map((o) => `${o.platform}: ${o.result}`).join(", ")]);
+  if (f.tries?.ran) rows.push(["Tries in this run", f.tries.ran === 1 ? "Failed its only try" : f.tries.failed === f.tries.ran ? `Failed all ${f.tries.ran}` : `Failed ${f.tries.failed} of ${f.tries.ran}`]);
+  if (f.producer) rows.push(["Recorded by the run", [f.producer.images.length && count(f.producer.images.length, "screenshot"), f.producer.notes && `notes: ${f.producer.notes.slice(0, 200)}`].filter(Boolean).join("; ")]);
+  if (f.same_as) rows.push(["Same failure as", f.same_as]);
+  if (f.decision === "evidence_incomplete" || f.identity_unresolved) rows.push(["Why history wasn't used", f.reason]);
+  const a = f.judge;
+  if (a) {
+    const verdict = a.cause === "caused_by_pr" ? "Caused by this PR" : `Not caused by this PR (${LIKELY[a.cause] ?? a.cause})`;
+    const sure = f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto" ? `${pct(a.confidence)} sure, enough to decide`
+      : f.decision === "advice" ? `${pct(a.confidence)} sure, but with nothing it could point to, so it can't clear`
+      : `${pct(a.confidence)} sure; clearing needs 85% and evidence`;
+    const model = shortModel(a.provenance?.served_model ?? f.ai?.model);
+    rows.push([model ? `AI (${model})` : "AI", `${verdict}, ${sure}. ${a.explanation}`]);
+  }
+  return ["| Question | Answer |", "| --- | --- |", ...rows.map(([q, v]) => `| ${md(q)} | ${md(v)} |`)];
+}
+
+/** The job summary: a verdict first, then one row per test, then the facts behind each. */
+export function renderSummary({ verdict, findings, infra, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true }) {
+  const branch = trunkBranch || "the default branch";
+  const blocked = infra ? [] : findings.filter((f) => f.blocking);
+  const cleared = infra ? [] : findings.filter((f) => !f.blocking);
   const spend = ledgerTotals(ai);
-  const icon = verdict === "SUCCESS" ? "✅" : verdict === "FAILURE" ? "🔴" : "⚠️";
-  const lines = [`## E2E triage: ${icon} ${verdict}`, "",
-    `**${counts.failed} failed → ${infra ? 0 : cleared} cleared · ${blocking} blocking** · ${counts.passed ?? 0} passed · ${counts.skipped ?? 0} skipped · ` +
-    `AI: ${spend.calls} call(s), ${usd(spend.cost_usd)} · [run](${runURL})`, ""];
-  if (infra) lines.push(`**Human investigation required.** ${md(infra)}`, "");
-  if (missing) lines.push(`**Not every result arrived:** ${md(missing.text)}. Re-run the failed jobs; until they run, this run can't be cleared.`, "");
-  lines.push(mode === "enforce" ? "Enforced: this verdict sets the commit status." : "Report-only: triage does not change the required commit status.", "");
-  const header = ["| Test | Result | Why | Decided by | Cost |", "| --- | --- | --- | --- | --- |"];
-  const row = (f) => {
-    const base = String(f.file ?? "").split("/").pop();
-    const label = f.decision === "adjudicator_unblock" ? CAUSE[f.judge.cause] ?? f.judge.cause
-      : f.decision === "adjudicator_veto" ? "caused by this PR"
-      : f.class === "REGRESSION" && f.untouched ? "not explained by history"
-      : RESULT[f.class] ?? f.class;
-    const cost = f.ai?.model ? usd(f.ai.cost_usd) : "–";
-    return `| ${md(f.title)} · \`${md(base)}\` | ${f.blocking ? "🔴" : "✅"} ${md(label)} | ${md(whySentence(f))} | ${decidedBy(f)} | ${cost} |`;
-  };
-  const blocked = findings.filter((f) => f.blocking);
-  const clear = findings.filter((f) => !f.blocking);
-  if (blocked.length) lines.push(`### Blocking (${blocked.length})`, "", ...header, ...blocked.map(row), "");
-  if (clear.length) lines.push("<details>", `<summary>Cleared (${clear.length})</summary>`, "", ...header, ...clear.map(row), "", "</details>", "");
+  const where = lane ? ` · ${md(lane)}` : "";
+  const head = infra ? "⚠️ needs investigation"
+    : verdict === "SUCCESS" ? `✅ ${counts.failed ? `all ${count(counts.failed, "failure")} cleared` : "nothing failed"}`
+    : missing && !blocked.length ? "🔴 results missing"
+    : `🔴 ${blocked.length === 1 ? "1 test needs" : `${blocked.length} tests need`} a look`;
+  const lines = [`## E2E triage${where}: ${head}`, ""];
+
+  // The verdict in one or two sentences, for someone who reads nothing else.
+  const v = blocked.map((f) => verdictFor(f, branch));
+  const likely = v.filter((x) => x.icon === "🟡").length;
+  const caused = v.filter((x) => x.label.startsWith("Likely caused") || x.label.startsWith("This PR edits")).length;
+  const other = blocked.length - likely - caused;
+  let say;
+  if (infra) say = `Too many failures to triage one by one. ${infra}`;
+  else if (verdict === "SUCCESS") say = counts.failed ? `None of the ${count(counts.failed, "failed test")} were caused by this PR, so the check passes.` : "No test failed.";
+  else {
+    const parts = [likely && (likely === 1 ? "1 looks like a flaky or environment failure, but triage was not sure enough to clear it" : `${likely} look like flaky or environment failures, but triage was not sure enough to clear them`),
+      caused && `${caused} look${caused === 1 ? "s" : ""} caused by this PR`,
+      other && `${other} ${other === 1 ? "is" : "are"} not explained by history`].filter(Boolean);
+    if (blocked.length) {
+      say = `${count(blocked.length, "failed test")} still block${blocked.length === 1 ? "s" : ""}: ${parts.join("; ")}.`;
+      if (cleared.length) say += ` ${count(cleared.length, "other failed test")} ${cleared.length === 1 ? "was" : "were"} cleared.`;
+      say += caused ? " Next step: check the changes named below." : " Next step: re-run the job.";
+    } else say = cleared.length ? `All ${count(cleared.length, "failed test")} ${cleared.length === 1 ? "was" : "were"} cleared.` : "";
+  }
+  if (missing) say += ` ${missing.text}; re-run the failed jobs.`;
+  lines.push(`**Verdict:** ${md(say.trim())}`, "");
+  lines.push(`${counts.passed ?? 0} passed · ${counts.failed} failed · ${counts.skipped ?? 0} skipped · AI: ${count(spend.calls, "call")}, ${usd(spend.cost_usd)} · ${mode === "enforce" ? "sets the E2E check" : "report only"} · [run](${runURL})`, "");
+
+  if (!infra && findings.length) {
+    lines.push("| Test | Verdict | Next step | Decided by |", "| --- | --- | --- | --- |");
+    for (const f of [...blocked, ...cleared]) {
+      const x = verdictFor(f, branch);
+      lines.push(`| ${md(f.title)} · \`${md(String(f.file ?? "").split("/").pop())}\` | ${x.icon} ${md(x.label)} | ${md(x.next)} | ${decidedBy(f)} |`);
+    }
+    lines.push("");
+    const shown = [...blocked, ...cleared].slice(0, 30);
+    for (const f of shown) {
+      const x = verdictFor(f, branch);
+      lines.push("<details>", `<summary>${x.icon} <b>${md(f.title)}</b>: the facts</summary>`, "", ...factsTable(f, branch, pr), "", "</details>", "");
+    }
+    if (findings.length > shown.length) lines.push(`${findings.length - shown.length} more tests are not shown.`, "");
+  }
+
   const sk = ai.skipped;
   const skipped = [
     sk.no_effect && `${sk.no_effect} with nothing the model could change`,
@@ -882,9 +987,9 @@ export function renderSummary({ verdict, findings, infra, runURL, counts, mode =
   ].filter(Boolean);
   if (spend.calls || skipped.length) {
     const used = spend.calls
-      ? `${spend.calls} call(s) (${[...new Set(ai.calls.map((c) => shortModel(c.served_model)))].join(", ")}) · ${tokens(spend.input_tokens)} tokens in${spend.cached_tokens ? ` (${tokens(spend.cached_tokens)} cached)` : ""} · ${tokens(spend.output_tokens)} out · **${usd(spend.cost_usd)}**`
+      ? `${count(spend.calls, "call")} (${[...new Set(ai.calls.map((c) => shortModel(c.served_model)))].join(", ")}) · ${tokens(spend.input_tokens)} tokens in${spend.cached_tokens ? ` (${tokens(spend.cached_tokens)} cached)` : ""} · ${tokens(spend.output_tokens)} out · **${usd(spend.cost_usd)}**`
       : "no calls";
-    lines.push(`AI: ${used}${skipped.length ? ` · skipped: ${skipped.join(", ")}` : ""}. Confidence is the model's own estimate, not a measured accuracy.`);
+    lines.push(`AI: ${used}${skipped.length ? ` · skipped: ${skipped.join(", ")}` : ""}`);
   }
   return lines.join("\n");
 }
@@ -983,9 +1088,13 @@ export async function fetchRun(fetchImpl, base, id, reportName = null, wait = { 
   let failed = 0;
   let flaky = 0;
   let skipped = 0;
+  // Every test's final outcome by file and title, so another platform's run of the
+  // same test can be looked up (see sameTestElsewhere).
+  const outcomes = new Map();
   for (const attempts of byTest.values()) {
     attempts.sort((a, b) => a.retry_count - b.retry_count || a.ordinal - b.ordinal);
     const { status, last } = outcomeOf(attempts);
+    outcomes.set(JSON.stringify([fileOf.get(last.suite_id) ?? "", last.title]), status);
     if (FAILED_STATUSES.has(status)) {
       failed++;
       const { suite_id: suiteId, title } = last;
@@ -1000,12 +1109,13 @@ export async function fetchRun(fetchImpl, base, id, reportName = null, wait = { 
         identity_ambiguous: testsPerLeaf.get(JSON.stringify([file, title])).size > 1,
         identity_unresolved: testsPerIdentity.get(identityKey({ file, title, full_title: last.full_title, report_scope: reportName })).size > 1,
         error: [last.error_message, last.error_stack].filter(Boolean).join("\n"),
+        tries: { ran: attempts.filter((a) => a.status !== "skipped").length, failed: attempts.filter((a) => FAILED_STATUSES.has(a.status)).length },
       });
     } else if (status === "skipped") skipped++;
     else if (status === "flaky") flaky++;
   }
   // Passed includes retry-recovered tests, as the E2E statuses count them.
-  return { group_id: group.id, failing, missing, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
+  return { group_id: group.id, failing, missing, outcomes, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
 }
 /**
  * Past runs of the failing tests, keyed by identityKey. Asks for whole spec files
@@ -1191,7 +1301,7 @@ export function missingReports(missing) {
 }
 
 /** Decide a run from evidence already fetched. Writes nothing. */
-export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranch, testRoot, cfg = DEFAULTS, prTitle = "", lane = id.name, ask, log = () => {}, evidence = [] }) {
+export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranch, testRoot, cfg = DEFAULTS, prTitle = "", lane = id.name, ask, log = () => {}, evidence = [], enrich = null }) {
   const isTrunkRun = prNumber == null;
   const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(run.failing, cfg), counts: run.counts, ai: newLedger() };
   if (run.failing.length && !result.infra) {
@@ -1227,6 +1337,14 @@ export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranc
         if (f.class !== "OWNED_BY_PR") Object.assign(f, { blocking: true, decision: "evidence_incomplete", reason: `${f.reason} ${blind}, so this could not be confirmed.` });
     }
     if (!blind && ask && prNumber) {
+      // More facts for the failures the rules couldn't settle; a lookup that fails only leaves a fact out.
+      if (enrich) {
+        try {
+          await enrich(result.findings.filter((f) => BORDERLINE.has(f.class) && !f.identity_unresolved));
+        } catch (e) {
+          log(`extra evidence unavailable: ${String(e).slice(0, 200)}`);
+        }
+      }
       const others = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const pr = { number: prNumber, repository: id.repository, title: prTitle, lane };
       const packs = result.findings.map((f) => (f.class === "OWNED_BY_PR" || f.identity_unresolved ? null : buildPack(f, files, pr, others)));
@@ -1239,6 +1357,94 @@ export async function evaluateRun({ run, id, prNumber, history, diff, trunkBranc
   result.missing = missingReports(run.missing);
   if (result.missing && result.verdict === "SUCCESS") result.verdict = "FAILURE";
   return result;
+}
+
+// ------------------------------------------------------------ extra evidence
+
+/** The failing line of the test's own file, from its error's stack. */
+export function failingLine(f) {
+  const base = String(f.file ?? "").split("/").pop();
+  if (!base) return null;
+  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const m = new RegExp(`${escaped}:(\\d+)`).exec(String(f.error ?? ""));
+  return m ? Number(m[1]) : null;
+}
+
+/** Numbered lines before and at the failing line, capped. */
+export function codeExcerpt(text, line, before = 12, after = 2) {
+  const lines = String(text).split("\n");
+  if (!line || line > lines.length) return null;
+  const from = Math.max(1, line - before);
+  const to = Math.min(lines.length, line + after);
+  const out = [];
+  for (let n = from; n <= to; n++) out.push(`${n}${n === line ? ">" : " "} ${lines[n - 1]}`);
+  return out.join("\n").slice(0, 2500);
+}
+
+/**
+ * Facts for the failures the rules couldn't settle, each from its own source:
+ * what changed on this PR since the test last passed here (GitHub compare), the
+ * test's code near the failing line (GitHub contents), and the same test on the
+ * run's other platforms (TSIO).
+ */
+export async function enrichFindings({ findings, api, fetchImpl, base, id, testRoot, log = () => {} }) {
+  if (!findings.length) return;
+  const compares = new Map();
+  const sources = new Map();
+  for (const f of findings) {
+    const last = f.this_pr?.last_pass;
+    if (last?.commit_sha) {
+      if (last.commit_sha === id.commit_sha) f.since_last_pass = { files: [], related: [] };
+      else {
+        if (!compares.has(last.commit_sha)) {
+          compares.set(last.commit_sha, await api("GET", `/repos/${id.repository}/compare/${last.commit_sha}...${id.commit_sha}`)
+            .then((c) => (c.files ?? []).map((x) => ({ filename: x.filename, patch: x.patch ?? "" })))
+            .catch((e) => (log(`changes since ${last.commit_sha.slice(0, 7)} unavailable: ${String(e).slice(0, 160)}`), null)));
+        }
+        const files = compares.get(last.commit_sha);
+        // With only a few changes since the pass, all of them go to the judge: a change
+        // the error doesn't name can still be what broke the test.
+        if (files) f.since_last_pass = {
+          files: files.map((x) => x.filename),
+          related: files.filter((x) => namesChangedFile(f, x.filename)).map((x) => ({ file: x.filename, patch: x.patch.slice(0, 2000) })),
+          changes: files.length <= 10 ? files.slice(0, 5).map((x) => ({ file: x.filename, patch: x.patch.slice(0, 1500) })) : [],
+        };
+      }
+    }
+    const line = failingLine(f);
+    const path = f.repo_path ?? repoPath(testRoot, f.file);
+    if (line && path) {
+      if (!sources.has(path)) {
+        sources.set(path, await api("GET", `/repos/${id.repository}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${id.commit_sha}`)
+          .then((c) => (c?.encoding === "base64" ? Buffer.from(c.content, "base64").toString("utf8") : null))
+          .catch((e) => (log(`source of ${path} unavailable: ${String(e).slice(0, 160)}`), null)));
+      }
+      const text = sources.get(path);
+      if (text) f.code_near_failure = codeExcerpt(text, line);
+    }
+  }
+  // The same test on the run's other platforms: one TSIO group per platform.
+  try {
+    const res = await fetchImpl(`${base}/api/v1/reports?${new URLSearchParams({ repository: id.repository, commit: id.commit_sha, limit: "20" })}`, { signal: AbortSignal.timeout(60000) });
+    if (!res.ok) throw new Error(`TSIO ${res.status}`);
+    const { reports = [] } = await res.json();
+    const siblings = reports.filter((g) => String(g.gh_run_id) === String(id.gh_run_id) && String(g.gh_run_attempt) === String(id.gh_run_attempt) && g.name !== id.name).slice(0, 5);
+    for (const g of siblings) {
+      let other;
+      try {
+        other = await fetchRun(fetchImpl, base, { ...id, name: g.name }, null, { attempts: 1, ms: 0 });
+      } catch (e) {
+        log(`results of ${g.name} unavailable: ${String(e).slice(0, 160)}`);
+        continue;
+      }
+      for (const f of findings) {
+        const status = other.outcomes?.get(JSON.stringify([f.file, f.title]));
+        if (status) (f.other_lanes ??= []).push({ platform: laneOf(g.name), result: status });
+      }
+    }
+  } catch (e) {
+    log(`other platforms' results unavailable: ${String(e).slice(0, 160)}`);
+  }
 }
 
 /** Engine settings from the action's environment. An empty ESCALATION_MODEL turns escalation off. */
@@ -1349,9 +1555,10 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
       prTitle: pull.title ?? "", lane: env.LANE || id.name, log,
       ask: env.ANTHROPIC_API_KEY ? (packs, model) => askModelBatch(fetchImpl, env.ANTHROPIC_API_KEY, model, packs) : null,
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
+      enrich: (findings) => enrichFindings({ findings, api, fetchImpl, base, id, testRoot, log }),
     });
     if (env.ANSWERS_CACHE && cfg.answers) writeFileSync(env.ANSWERS_CACHE, JSON.stringify(cfg.answers));
-    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing });
+    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber) });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing);
     const spend = ledgerTotals(result.ai);
     if (env.GITHUB_OUTPUT)
