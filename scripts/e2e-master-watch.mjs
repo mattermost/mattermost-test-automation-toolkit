@@ -137,10 +137,10 @@ export function rangeOf(history, tests, branch) {
   return green ? { green, red } : null;
 }
 
-async function specRange(fetchImpl, base, id, group, log) {
+async function specRange(fetchImpl, base, id, group, until, log) {
   try {
     const tests = group.tests.map((t) => t.finding);
-    const history = await fetchHistory(fetchImpl, base, id.repository, tests, new Date().toISOString(), undefined, id.branch, null, log, laneOf([...group.suites][0]));
+    const history = await fetchHistory(fetchImpl, base, id.repository, tests, until, undefined, id.branch, null, log, laneOf([...group.suites][0]));
     return rangeOf(history, tests, id.branch);
   } catch (e) {
     log(`history for ${group.spec} unavailable: ${String(e).slice(0, 200)}`);
@@ -212,6 +212,10 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     return { decisions: [], notes: ["not a trunk run"] };
   }
   const id = { repository: env.REPOSITORY, commit_sha: first.commit, gh_run_id: env.GH_RUN_ID, gh_run_attempt: attempt, branch: trunk };
+  // History for the suspect range ends with this run: later runs (a re-read of an old run, or one that
+  // finished meanwhile) could show a pass newer than this failure.
+  const ranAt = Math.max(...groupsOfRun.filter((g) => g.branch === trunk).flatMap((g) => [g.created_at, g.last_upload_at, g.orchestration?.durations?.last_test_at].map((t) => Date.parse(t) || 0)));
+  const until = new Date(Math.min(now.getTime(), ranAt > 0 ? ranAt + 60e3 : now.getTime())).toISOString();
   const api = gh(fetchImpl, env.GITHUB_TOKEN);
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
   const maxPerRun = Number(env.MAX_PER_RUN || 2);
@@ -256,7 +260,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     const held = ledger.find((r) => r.specs.includes(g.spec) && now.getTime() - Date.parse(r.at) < holdMs);
     if (prs.length) decisions.push({ specs: [g.spec], kind: g.kind, tests: g.tests, action: `skipped: #${prs.join(", #")} changes it or its directory` });
     else if (held) decisions.push({ specs: [g.spec], kind: g.kind, tests: g.tests, action: `skipped: requested ${held.at.slice(0, 16).replace("T", " ")} UTC by ${held.run}` });
-    else ready.push({ ...g, range: await specRange(fetchImpl, base, id, g, log) });
+    else ready.push({ ...g, range: await specRange(fetchImpl, base, id, g, until, log) });
   }
 
   const requests = bundle(ready);

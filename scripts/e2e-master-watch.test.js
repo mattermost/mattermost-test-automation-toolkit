@@ -59,15 +59,15 @@ test("broken specs that last passed on the same commit go to one agent; flaky on
 });
 
 // A trunk run with three broken specs, all broken since c1; an open PR changes a helper beside y/b.spec.ts.
-function routes({ hook, compared = [], openPRFiles = ["specs/y/helpers.ts"], openedToday = 0, branch = "master" }) {
+function routes({ hook, compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts"], openedToday = 0, branch = "master" }) {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
   const obs = (file, status, i) => ({ file, title: "t1", status, retry_count: 0, gh_pr_number: null, branch: "master", group_id: `old-${i}`, commit_sha: `c${i}`, created_at: `2026-10-02T0${9 - i}:00:00Z`, name: "pw-master", error_excerpt: "Error: expected visible" });
   const history = files.flatMap((file) => [obs(file, "failed", 1), ...[2, 3, 4, 5, 6].map((i) => obs(file, "passed", i))]);
   const table = [
-    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", branch, commit: "abc", name: "pw-master", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }] })],
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", branch, commit: "abc", name: "pw-master", gh_run_id: "12", gh_run_attempt: "1", status: "completed", created_at: "2026-10-02T09:30:00Z", last_upload_at: "2026-10-02T09:50:00Z" }] })],
     ["/reports/g1/suites", () => Response.json({ suites: files.map((file_path, i) => ({ id: `s${i}`, file_path })) })],
     ["/reports/g1/cases", () => Response.json(files.map((_, i) => ({ suite_id: `s${i}`, title: "t1", status: "failed", retry_count: 0, ordinal: i, error_message: "Error: expected visible" })))],
-    ["/reports/history", () => Response.json({ observations: history })],
+    ["/reports/history", (init) => { untils.push(JSON.parse(init.body).until); return Response.json({ observations: history }); }],
     ["/commits/abc", () => Response.json({ files: [] })],
     ["/graphql", (init) => {
       // Two pages: #41 is not among the newest 50, and #7 was last updated too long ago to count.
@@ -97,7 +97,8 @@ const ledgerPath = () => join(mkdtempSync(join(tmpdir(), "watch-")), "ledger.jso
 test("broken specs with one cause go to one agent with what broke them, and are not requested again while it works", async () => {
   const hook = [];
   const compared = [];
-  const fetchImpl = routes({ hook, compared });
+  const untils = [];
+  const fetchImpl = routes({ hook, compared, untils });
   const LEDGER_PATH = ledgerPath();
   const { decisions } = await watch({ env: { ...env, LEDGER_PATH }, fetchImpl, now, log: () => {} });
   assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [
@@ -108,6 +109,7 @@ test("broken specs with one cause go to one agent with what broke them, and are 
   assert.deepEqual(hook[0].specs, ["specs/x/a.spec.ts", "specs/z/c.spec.ts"]);
   assert.equal(hook[0].classification, "broken");
   assert.deepEqual(compared, ["c2...c1"], "from the last green commit to the first red one");
+  assert.ok(untils.includes("2026-10-02T09:51:00.000Z"), "the suspect range reads history only up to this run, not later ones");
   assert.equal(hook[0].last_green_commit, "c2");
   assert.equal(hook[0].first_red_commit, "c1");
   assert.equal(hook[0].suspect_commits.length, 30);
