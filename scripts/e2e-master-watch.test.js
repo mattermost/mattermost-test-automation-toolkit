@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { identityKey } from "./e2e-triage.mjs";
-import { bundle, prsTouching, rangeOf, record, selectRepairs, watch } from "./e2e-master-watch.mjs";
+import { bundle, prsTouching, rangeOf, readLedger, record, selectCrossLane, selectRepairs, watch } from "./e2e-master-watch.mjs";
 
 const finding = (over) => ({ file: "a.spec.ts", repo_path: "specs/a.spec.ts", title: "t", error: "Error: expected visible", class: "BROKEN_ON_TRUNK", trunk: { runs: 8, fails: 2, flaky: 0, passes: 6 }, ...over });
 
@@ -60,24 +60,32 @@ test("broken specs that last passed on the same commit go to one agent; flaky on
 
 // A trunk run with three broken specs, all broken since c1; an open PR changes a helper beside y/b.spec.ts.
 // With `recovered`, two more specs fail once and pass on retry: v/e.spec.ts flaked on trunk before, u/f.spec.ts never did.
-function routes({ compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts"], openedToday = 0, branch = "master", recovered = false, repairPRs = [] }) {
+// With `lanes`, the run has one report group per lane; `failIn` says which lanes each spec fails in, and
+// `firstFailure` makes every spec pass in all earlier runs, so a failure now is its first.
+function routes({ compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts"], branch = "master", recovered = false, repairPRs = [], lanes = ["pw-master"], failIn = {}, firstFailure = false }) {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
   const retried = recovered ? ["v/e.spec.ts", "u/f.spec.ts"] : [];
-  const obs = (file, status, i) => ({ file, title: "t1", status, retry_count: 0, gh_pr_number: null, branch: "master", group_id: `old-${i}`, commit_sha: `c${i}`, created_at: `2026-10-02T0${9 - i}:00:00Z`, name: "pw-master", error_excerpt: "Error: expected visible" });
+  const fails = (file, lane) => (failIn[file] ?? lanes).includes(lane);
+  const obs = (file, status, i, name = "pw-master") => ({ file, title: "t1", status, retry_count: 0, gh_pr_number: null, branch: "master", group_id: `old-${name}-${i}`, commit_sha: `c${i}`, created_at: `2026-10-02T0${9 - i}:00:00Z`, name, error_excerpt: "Error: expected visible" });
   const history = [
-    ...files.flatMap((file) => [obs(file, "failed", 1), ...[2, 3, 4, 5, 6].map((i) => obs(file, "passed", i))]),
+    ...lanes.flatMap((lane) => files.flatMap((file) => [obs(file, firstFailure ? "passed" : "failed", 1, lane), ...[2, 3, 4, 5, 6].map((i) => obs(file, "passed", i, lane))])),
     ...(recovered ? [obs("v/e.spec.ts", "flaky", 3), ...[1, 2, 4, 5, 6].map((i) => obs("v/e.spec.ts", "passed", i)), ...[1, 2, 3, 4, 5, 6].map((i) => obs("u/f.spec.ts", "passed", i))] : []),
   ];
+  const groups = lanes.map((name, n) => ({ id: `g${n + 1}`, repository: "o/r", branch, commit: "abc", name, gh_run_id: "12", gh_run_attempt: "1", status: "completed", created_at: "2026-10-02T09:30:00Z", last_upload_at: "2026-10-02T09:50:00Z" }));
+  const laneOfGroup = (url) => groups.find((g) => String(url).includes(`/reports/${g.id}/`)).name;
   const table = [
-    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", branch, commit: "abc", name: "pw-master", gh_run_id: "12", gh_run_attempt: "1", status: "completed", created_at: "2026-10-02T09:30:00Z", last_upload_at: "2026-10-02T09:50:00Z" }] })],
-    ["/reports/g1/suites", () => Response.json({ suites: [...files, ...retried].map((file_path, i) => ({ id: `s${i}`, file_path })) })],
-    ["/reports/g1/cases", () => Response.json([
-      ...files.map((_, i) => ({ suite_id: `s${i}`, title: "t1", status: "failed", retry_count: 0, ordinal: i, error_message: "Error: expected visible" })),
-      ...retried.flatMap((_, j) => [
-        { suite_id: `s${files.length + j}`, title: "t1", status: "failed", retry_count: 0, ordinal: files.length + j, error_message: "Error: toast not visible" },
-        { suite_id: `s${files.length + j}`, title: "t1", status: "passed", retry_count: 1, ordinal: files.length + j },
-      ]),
-    ])],
+    ["/reports?", () => Response.json({ reports: groups })],
+    ["/suites", (init, url) => Response.json({ suites: [...files, ...retried].map((file_path, i) => ({ id: `s${i}`, file_path })) })],
+    ["/cases", (init, url) => {
+      const lane = laneOfGroup(url);
+      return Response.json([
+        ...files.map((file, i) => ({ suite_id: `s${i}`, title: "t1", status: fails(file, lane) ? "failed" : "passed", retry_count: 0, ordinal: i, error_message: fails(file, lane) ? "Error: expected visible" : null })),
+        ...retried.flatMap((_, j) => [
+          { suite_id: `s${files.length + j}`, title: "t1", status: "failed", retry_count: 0, ordinal: files.length + j, error_message: "Error: toast not visible" },
+          { suite_id: `s${files.length + j}`, title: "t1", status: "passed", retry_count: 1, ordinal: files.length + j },
+        ]),
+      ]);
+    }],
     ["/reports/history", (init) => { untils.push(JSON.parse(init.body).until); return Response.json({ observations: history }); }],
     ["/commits/abc", () => Response.json({ files: [] })],
     ["/graphql", (init) => {
@@ -92,7 +100,6 @@ function routes({ compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts
       if (!after) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p2" }, nodes: Array.from({ length: 50 }, (_, i) => pr(100 + i, "2026-10-02T12:00:00Z")) } } } });
       return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p3" }, nodes: [pr(41, "2026-10-02T00:00:00Z", openPRFiles), pr(7, "2026-09-01T00:00:00Z", ["specs/x/a.spec.ts"])] } } } });
     }],
-    ["/search/issues", () => Response.json({ total_count: openedToday })],
     ["/compare/", (init, url) => {
       compared.push(String(url).split("/compare/")[1]);
       // Oldest first, as GitHub returns them; the cause is usually among the first.
@@ -105,7 +112,8 @@ function routes({ compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts
     throw new Error(`unexpected fetch ${url}`);
   };
 }
-const env = { REPOSITORY: "o/r", GH_RUN_ID: "12", BRANCH: "master", GITHUB_TOKEN: "t", TSIO_BASE_URL: "http://tsio", SUITES: JSON.stringify([{ name: "pw-master", test_root: "specs" }]) };
+const suite = (name) => ({ name, test_root: "specs" });
+const env = { REPOSITORY: "o/r", GH_RUN_ID: "12", BRANCH: "master", GITHUB_TOKEN: "t", TSIO_BASE_URL: "http://tsio", SUITES: JSON.stringify([suite("pw-master")]) };
 const now = new Date("2026-10-03T00:00:00Z");
 const ledgerPath = () => join(mkdtempSync(join(tmpdir(), "watch-")), "ledger.json");
 
@@ -164,23 +172,33 @@ test("a request the agent did not accept is not recorded, so the next run plans 
   assert.equal(hook.length, 2);
 });
 
-test("the daily cap counts requests as well as PRs", async () => {
-  const capped = [];
-  const { decisions } = await run({ env, fetchImpl: routes({ openPRFiles: [], openedToday: 5 }), hook: capped });
-  assert.equal(capped.length, 0);
-  assert.ok(decisions.every((d) => d.action === "skipped: over the repair cap"));
-
-  // Five requests for other specs sent today, none of them a PR yet; one from yesterday doesn't count.
+test("breaks all go out at once; flaky specs draw on a daily budget", async () => {
+  // Six flaky requests already sent in the last 24 hours (and broken ones, which don't count), plus one from yesterday.
   const LEDGER_PATH = ledgerPath();
   const at = (h) => new Date(now.getTime() - h * 3600e3).toISOString();
-  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [1, 2, 3, 4, 5, 30].map((h) => ({ at: at(h), specs: [`specs/other${h}.spec.ts`], run: "r" })) }));
+  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [
+    ...[1, 2, 3, 4, 5, 6, 30].map((h) => ({ at: at(h), specs: [`specs/flaky${h}.spec.ts`], kind: "flaky", run: "r" })),
+    ...[1, 2, 3].map((h) => ({ at: at(h), specs: [`specs/broken${h}.spec.ts`], kind: "broken", run: "r" })),
+  ] }));
   const sent = [];
-  const over = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [] }), hook: sent });
-  assert.equal(sent.length, 0);
-  assert.ok(over.decisions.every((d) => d.action === "skipped: over the repair cap"));
-  const room = await run({ env: { ...env, LEDGER_PATH, MAX_PER_DAY: "6" }, fetchImpl: routes({ openPRFiles: [] }), hook: sent });
-  assert.equal(sent.length, 1);
-  assert.deepEqual(room.decisions.map((d) => d.action), ["to request"]);
+  const used = await run({ env: { ...env, LEDGER_PATH: `${LEDGER_PATH}` }, fetchImpl: routes({ openPRFiles: [], recovered: true }), hook: sent });
+  assert.deepEqual(used.decisions.map((d) => [d.kind, d.action]), [
+    ["broken", "to request"],
+    ["flaky", "skipped: flaky budget of 6 a day used"],
+  ], "the break goes out even with the flaky budget spent");
+
+  const roomyLedger = ledgerPath();
+  const roomy = await run({ env: { ...env, LEDGER_PATH: roomyLedger, MAX_FLAKY_PER_DAY: "7" }, fetchImpl: routes({ openPRFiles: [], recovered: true }), hook: [] });
+  assert.ok(roomy.decisions.every((d) => d.action === "to request"));
+  // What was sent is kept with its kind, so the next run counts the flaky one against the budget.
+  assert.deepEqual(readLedger(roomyLedger).map((r) => [r.specs, r.kind]), [
+    [["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], "broken"],
+    [["specs/v/e.spec.ts"], "flaky"],
+  ]);
+
+  // The per-run limit on breaks is a safety stop only.
+  const stopped = await run({ env: { ...env, MAX_BROKEN_PER_RUN: "0" }, fetchImpl: routes({ openPRFiles: [] }), hook: [] });
+  assert.deepEqual(stopped.decisions.map((d) => d.action), ["skipped: over 0 broken requests in one run"]);
 
   // A release-branch run started from the same workflow is not trunk.
   const release = [];
@@ -189,9 +207,32 @@ test("the daily cap counts requests as well as PRs", async () => {
   assert.deepEqual(other.notes, ["not a trunk run"]);
 });
 
+test("a first failure in two lanes of the same run is broken now; in one lane it waits", async () => {
+  const hook = [];
+  const lanes = ["pw-master", "pw-fips-master"];
+  const { decisions } = await run({
+    env: { ...env, SUITES: JSON.stringify(lanes.map(suite)) },
+    fetchImpl: routes({ lanes, openPRFiles: [], firstFailure: true, failIn: { "x/a.spec.ts": lanes, "y/b.spec.ts": ["pw-master"], "z/c.spec.ts": [] } }),
+    hook,
+  });
+  assert.deepEqual(decisions.map((d) => [d.specs, d.kind, d.action]), [[["specs/x/a.spec.ts"], "broken", "to request"]], "y/b failed in one lane only: wait for the next run");
+  assert.deepEqual(hook[0].tests[0].failed_in_suites_now, lanes);
+  assert.deepEqual(hook[0].suites, lanes);
+  assert.equal(hook[0].last_green_commit, "c1", "it passed on the commit before");
+});
+
+test("selectCrossLane ignores tests already broken or flaky, and names it cannot tell apart", () => {
+  const f = (over) => ({ file: "a.spec.ts", repo_path: "specs/a.spec.ts", title: "t", error: "Error: x", trunk: { runs: 8, fails: 0, flaky: 0, passes: 8 }, class: "REGRESSION", ...over });
+  const groups = selectCrossLane([
+    { suite: "ent", findings: [f({}), f({ title: "b", class: "BROKEN_ON_TRUNK" }), f({ title: "u", identity_unresolved: true }), f({ title: "n", class: "INSUFFICIENT_DATA" })] },
+    { suite: "fips", findings: [f({}), f({ title: "b", class: "BROKEN_ON_TRUNK" }), f({ title: "u", identity_unresolved: true }), f({ title: "n", class: "INSUFFICIENT_DATA" })] },
+  ]);
+  assert.deepEqual(groups.map((g) => [g.spec, g.kind, g.tests.map((t) => t.title)]), [["specs/a.spec.ts", "broken", ["t", "n"]]]);
+});
+
 test("a test that failed and passed on retry is repaired as flaky only if it also flaked on trunk before", async () => {
   const hook = [];
-  const { decisions } = await run({ env: { ...env, MAX_PER_RUN: "3" }, fetchImpl: routes({ recovered: true }), hook });
+  const { decisions } = await run({ env, fetchImpl: routes({ recovered: true }), hook });
   assert.deepEqual(decisions.map((d) => [d.specs, d.kind, d.action]), [
     [["specs/y/b.spec.ts"], "broken", "skipped: #41 changes it or its directory"],
     [["specs/x/a.spec.ts", "specs/z/c.spec.ts"], "broken", "to request"],

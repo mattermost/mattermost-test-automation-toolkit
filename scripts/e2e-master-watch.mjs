@@ -14,12 +14,16 @@
  *   flaky   FLAKY_ON_TRUNK: failed now and at least MIN_FLAKY times before -> repair
  *   flaky   failed and then passed on retry now, and failed or flaked on trunk
  *           at least MIN_FLAKY times before                            -> repair
- *   new     failed for the first time                                 -> wait for the next run
+ *   broken  failed for the first time, but in two or more lanes (suites) of this
+ *           run, e.g. enterprise and FIPS: two signals at once         -> repair
+ *   new     failed for the first time, in one lane                    -> wait for the next run
  *   infra   the run failed for environmental reasons                  -> report only
  * Broken specs that last passed on the same commit most likely share a cause and
  * go to one agent together; each flaky spec goes alone. A spec is skipped when an
  * open PR changes it or its directory, or when it was requested within HOLD_HOURS
- * (its agent is still working). Requests are capped per run and per day.
+ * (its agent is still working). Broken requests all go out at once (up to
+ * MAX_BROKEN_PER_RUN, a safety limit), since master is red until they're fixed;
+ * flaky requests draw on a daily budget of MAX_FLAKY_PER_DAY, most-flaky first.
  *
  * The agent also owns the PRs it opened: an open PR with its label that now
  * conflicts with trunk gets a conflict request, so the agent merges trunk in and
@@ -86,6 +90,45 @@ export async function retryRecovered(fetchImpl, base, groupId) {
     if (file && perIdentity.get(identityKey(test)) === 1) out.push(test);
   }
   return out;
+}
+
+// Triage classes for a test failing on trunk for the first time (or with too little history to say).
+const FIRST_FAILURE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
+
+/**
+ * Tests failing for the first time in two or more lanes (suites) of the same run: independent
+ * signals at once, so they count as broken now instead of waiting for the next run.
+ * `bySuite` is [{ suite, findings }] from triage, one entry per suite read.
+ */
+export function selectCrossLane(bySuite) {
+  const seen = new Map();
+  for (const { suite, findings } of bySuite) {
+    for (const f of findings) {
+      if (f.identity_unresolved || !FIRST_FAILURE.has(f.class)) continue;
+      const spec = f.repo_path ?? f.file;
+      const key = JSON.stringify([spec, f.full_title || f.title]);
+      if (!seen.has(key)) seen.set(key, { spec, f, suites: new Set() });
+      seen.get(key).suites.add(suite);
+    }
+  }
+  const bySpec = new Map();
+  for (const { spec, f, suites } of seen.values()) {
+    if (suites.size < 2) continue;
+    if (!bySpec.has(spec)) bySpec.set(spec, { spec, kind: "broken", suites: new Set(), tests: [] });
+    const g = bySpec.get(spec);
+    for (const x of suites) g.suites.add(x);
+    g.tests.push({ spec, title: f.title, full_title: f.full_title ?? null, error: compactError(f.error, 600), trunk: f.trunk, failed_in_suites_now: [...suites], finding: f });
+  }
+  return [...bySpec.values()];
+}
+
+/** Adds a spec's group, merging with one already found in another suite: broken wins over flaky. */
+function addGroup(groups, g) {
+  const prev = groups.get(g.spec);
+  if (!prev) return void groups.set(g.spec, g);
+  prev.kind = prev.kind === "broken" || g.kind === "broken" ? "broken" : "flaky";
+  for (const x of g.suites) prev.suites.add(x);
+  for (const t of g.tests) if (!prev.tests.some((p) => (p.full_title || p.title) === (t.full_title || t.title))) prev.tests.push(t);
 }
 
 /** Retry-recovered tests that also failed or flaked in an earlier trunk run, grouped by spec file. */
@@ -158,15 +201,9 @@ export function prsTouching(touched, spec) {
   return [...prs].sort((a, b) => a - b);
 }
 
-/** The agent's PRs (by label) opened since `since`: the daily cap's fallback when the request record is lost. */
-export async function repairsOpenedSince(api, repository, since, label = DEFAULT_LABEL) {
-  const q = encodeURIComponent(`repo:${repository} is:pr label:${label} created:>=${since.toISOString().slice(0, 10)}`);
-  return (await api("GET", `/search/issues?q=${q}&per_page=1`)).total_count ?? 0;
-}
-
 /**
  * Requests sent by earlier runs, persisted between runs by the action's cache: a fix
- * request is { at, specs, run }, a conflict request { at, pr, head, run }.
+ * request is { at, specs, kind, run }, a conflict request { at, pr, head, run }.
  */
 export function readLedger(path) {
   if (!path) return [];
@@ -302,13 +339,14 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   const until = new Date(Math.min(now.getTime(), ranAt > 0 ? ranAt + 60e3 : now.getTime())).toISOString();
   const api = gh(fetchImpl, env.GITHUB_TOKEN);
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
-  const maxPerRun = Number(env.MAX_PER_RUN || 2);
-  const maxPerDay = Number(env.MAX_PER_DAY || 5);
+  const maxBrokenPerRun = Number(env.MAX_BROKEN_PER_RUN || 10);
+  const maxFlakyPerDay = Number(env.MAX_FLAKY_PER_DAY || 6);
   const holdMs = Number(env.HOLD_HOURS || 24) * HOUR;
   const label = env.LABEL || DEFAULT_LABEL;
 
   const groups = new Map();
   const notes = [];
+  const bySuite = [];
   for (const s of suites) {
     let result;
     try {
@@ -324,6 +362,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
       notes.push(`${s.name}: infrastructure, not repaired (${result.infra})`);
       continue;
     }
+    bySuite.push({ suite: s.name, findings: result.findings });
     const found = selectRepairs(result, s.name, { minFlaky: Number(env.MIN_FLAKY || 1) });
     try {
       const groupId = groupsOfRun.find((g) => g.name === s.name && g.branch === trunk).id;
@@ -335,16 +374,9 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     } catch (e) {
       notes.push(`${s.name}: retry-recovered tests not read (${String(e).slice(0, 160)})`);
     }
-    for (const g of found) {
-      const prev = groups.get(g.spec);
-      if (!prev) groups.set(g.spec, g);
-      else {
-        prev.kind = prev.kind === "broken" || g.kind === "broken" ? "broken" : "flaky";
-        for (const x of g.suites) prev.suites.add(x);
-        for (const t of g.tests) if (!prev.tests.some((p) => (p.full_title || p.title) === (t.full_title || t.title))) prev.tests.push(t);
-      }
-    }
+    for (const g of found) addGroup(groups, g);
   }
+  for (const g of selectCrossLane(bySuite)) addGroup(groups, g);
 
   const decisions = [];
   // What the workflow should send, each with the ledger entry `record` keeps once it is accepted.
@@ -363,17 +395,18 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   }
 
   const requests = bundle(ready);
-  const sentToday = ledger.filter((r) => r.specs && now.getTime() - Date.parse(r.at) < 24 * HOUR).length;
-  const openedToday = requests.length ? await repairsOpenedSince(api, id.repository, new Date(now.getTime() - 24 * HOUR), label) : 0;
-  let budget = Math.min(maxPerRun, maxPerDay - Math.max(sentToday, openedToday));
+  // Master stays red until a break is fixed, so breaks all go now; flaky specs share a daily budget.
+  let brokenLeft = maxBrokenPerRun;
+  let flakyLeft = maxFlakyPerDay - ledger.filter((r) => r.kind === "flaky" && now.getTime() - Date.parse(r.at) < 24 * HOUR).length;
   for (const r of requests) {
     const decision = { specs: r.specs, kind: r.kind, tests: r.tests };
     decisions.push(decision);
-    if (budget <= 0) {
-      decision.action = "skipped: over the repair cap";
+    if (r.kind === "broken" ? brokenLeft <= 0 : flakyLeft <= 0) {
+      decision.action = r.kind === "broken" ? `skipped: over ${maxBrokenPerRun} broken requests in one run` : `skipped: flaky budget of ${maxFlakyPerDay} a day used`;
       continue;
     }
-    budget--;
+    if (r.kind === "broken") brokenLeft--;
+    else flakyLeft--;
     const tests = r.tests.map(({ finding, ...t }) => t);
     const payload = {
       kind: "e2e-autofix",
@@ -386,7 +419,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     };
     decision.payload = payload;
     decision.action = "to request";
-    out.push({ id: `fix-${out.length + 1}`, payload, entry: { at: now.toISOString(), specs: r.specs, run: runURL } });
+    out.push({ id: `fix-${out.length + 1}`, payload, entry: { at: now.toISOString(), specs: r.specs, kind: r.kind, run: runURL } });
   }
 
   // The repair PRs the automation opened are its own to keep mergeable: a trunk merge that

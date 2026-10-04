@@ -9,7 +9,8 @@ fix only for what repeats:
 | Failed in this run and the previous one (`BROKEN_ON_TRUNK`) | fix |
 | Intermittent on trunk: failed in this run and at least once before (`FLAKY_ON_TRUNK`) | fix |
 | Failed and then passed on retry in this run, and failed or flaked on trunk at least once before | fix (flaky) |
-| Failed for the first time | wait for the next run |
+| Failed for the first time in two or more lanes (suites) of the same run, e.g. enterprise and FIPS | fix (broken) |
+| Failed for the first time, in one lane | wait for the next run |
 | Run failed for environmental reasons | report only |
 
 Broken specs whose failing tests last passed on the same commit most likely share
@@ -20,9 +21,10 @@ in between (oldest first). Broken requests go before flaky ones.
 
 A spec is skipped when an open PR changes it or another file in its directory, or
 when it was requested in the last `hold-hours` (its agent is still working, and
-master E2E runs after every merge). Requests stop at `max-per-run` per run and
-`max-per-day` a day, counting requests sent and PRs with the agent's `label`
-opened.
+master E2E runs after every merge). Master stays red until a break is fixed, so
+broken requests all go out on the run that finds them (`max-broken-per-run` is
+only a safety limit); flaky requests share a budget of `max-flaky-per-day` in any
+24 hours, most-flaky first.
 
 The agent also owns the PRs it opens. After each trunk run, an open PR with its
 `label` that now conflicts with trunk gets a conflict request, so the agent merges

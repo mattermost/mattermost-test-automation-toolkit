@@ -42,14 +42,14 @@ inputs:
     description: Earlier trunk failures or flaky passes a test needs, besides this run's, to count as flaky
     required: false
     default: "1"
-  max-per-run:
-    description: Fix requests per trunk run
+  max-broken-per-run:
+    description: Safety limit on broken-spec requests per trunk run; breaks are otherwise all sent at once
     required: false
-    default: "2"
-  max-per-day:
-    description: Fix requests sent (or PRs with the label opened) in the last 24 hours before requests stop
+    default: "10"
+  max-flaky-per-day:
+    description: Flaky-spec requests sent in any 24 hours, most-flaky first
     required: false
-    default: "5"
+    default: "6"
   max-conflicts-per-run:
     description: The agent's PRs in conflict with trunk sent back to it per trunk run
     required: false
@@ -94,8 +94,8 @@ runs:
         EXTRA_LABELS: ${{ inputs.extra-labels }}
         INSTRUCTIONS: ${{ inputs.instructions }}
         MIN_FLAKY: ${{ inputs.min-flaky }}
-        MAX_PER_RUN: ${{ inputs.max-per-run }}
-        MAX_PER_DAY: ${{ inputs.max-per-day }}
+        MAX_BROKEN_PER_RUN: ${{ inputs.max-broken-per-run }}
+        MAX_FLAKY_PER_DAY: ${{ inputs.max-flaky-per-day }}
         MAX_CONFLICTS_PER_RUN: ${{ inputs.max-conflicts-per-run }}
         HOLD_HOURS: ${{ inputs.hold-hours }}
         LEDGER_PATH: ${{ github.workspace }}/.e2e-master-watch/ledger.json
