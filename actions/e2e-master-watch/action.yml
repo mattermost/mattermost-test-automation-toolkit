@@ -1,0 +1,109 @@
+name: E2E master watch
+description: >
+  After a trunk E2E run, find the failures that repeat (broken twice in a row, or
+  flaky) and the agent's own PRs that no longer merge into trunk, and output one
+  request per fix for the caller to send to its fixing agent. Pair it with
+  actions/e2e-master-watch/record after sending.
+author: Mattermost
+inputs:
+  repository:
+    description: owner/repo of the run
+    required: true
+  gh-run-id:
+    description: Workflow run id of the trunk E2E run
+    required: true
+  gh-run-attempt:
+    description: Attempt of that run
+    required: false
+    default: "1"
+  branch:
+    description: Trunk branch; suites the run reported for any other branch are ignored
+    required: false
+    default: master
+  suites:
+    description: 'JSON list of the run''s suites: [{"name": "<TSIO report group name>", "test_root": "<spec root>", "report_name": "<optional prefix>"}]'
+    required: true
+  github-token:
+    description: Token to read PRs (dedupe, suspect commits, conflicts); never sent elsewhere
+    required: true
+  label:
+    description: Label the agent puts on its PRs; used to find them, and passed in each request
+    required: false
+    default: e2e-autofix
+  extra-labels:
+    description: Comma-separated labels the agent's PR should also carry (e.g. AI/babysit)
+    required: false
+    default: ""
+  instructions:
+    description: Path of the agent's instructions in the consumer repository, passed in each request
+    required: false
+    default: ""
+  min-flaky:
+    description: Earlier trunk failures or flaky passes a test needs, besides this run's, to count as flaky
+    required: false
+    default: "1"
+  max-broken-per-run:
+    description: Safety limit on broken-spec requests per trunk run; breaks are otherwise all sent at once
+    required: false
+    default: "10"
+  max-flaky-per-day:
+    description: Flaky-spec requests sent in any 24 hours, most-flaky first
+    required: false
+    default: "6"
+  max-conflicts-per-run:
+    description: The agent's PRs in conflict with trunk sent back to it per trunk run
+    required: false
+    default: "2"
+  cause-hold-hours:
+    description: Hours a break whose suspect commits overlap one already requested waits for that agent to open its PR
+    required: false
+    default: "4"
+  hold-hours:
+    description: Hours a requested spec or conflicted PR head is left to its agent before it can be requested again
+    required: false
+    default: "24"
+  tsio-base-url:
+    description: Test System IO base URL
+    required: false
+    default: https://test-io.test.mattermost.com
+outputs:
+  requests:
+    description: 'JSON list [{"id", "payload"}]: send each payload, then pass [{"id", "status"}] to the record action'
+    value: ${{ steps.plan.outputs.requests }}
+  count:
+    description: Number of requests
+    value: ${{ steps.plan.outputs.count }}
+runs:
+  using: composite
+  steps:
+    # Requests sent by earlier runs, so a spec still broken while its agent works is not requested twice.
+    # A workflow_run job runs on the default branch, so every run shares this cache; the record action saves it
+    # under a key unique to this run of the calling workflow (caches can't be overwritten), and this restores
+    # the newest one.
+    - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ github.workspace }}/.e2e-master-watch/ledger.json
+        key: e2e-master-watch-${{ inputs.branch }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: e2e-master-watch-${{ inputs.branch }}-
+    - id: plan
+      shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        GH_RUN_ID: ${{ inputs.gh-run-id }}
+        GH_RUN_ATTEMPT: ${{ inputs.gh-run-attempt }}
+        BRANCH: ${{ inputs.branch }}
+        SUITES: ${{ inputs.suites }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        LABEL: ${{ inputs.label }}
+        EXTRA_LABELS: ${{ inputs.extra-labels }}
+        INSTRUCTIONS: ${{ inputs.instructions }}
+        MIN_FLAKY: ${{ inputs.min-flaky }}
+        MAX_BROKEN_PER_RUN: ${{ inputs.max-broken-per-run }}
+        MAX_FLAKY_PER_DAY: ${{ inputs.max-flaky-per-day }}
+        MAX_CONFLICTS_PER_RUN: ${{ inputs.max-conflicts-per-run }}
+        HOLD_HOURS: ${{ inputs.hold-hours }}
+        CAUSE_HOLD_HOURS: ${{ inputs.cause-hold-hours }}
+        LEDGER_PATH: ${{ github.workspace }}/.e2e-master-watch/ledger.json
+        PENDING_PATH: ${{ github.workspace }}/.e2e-master-watch/pending.json
+        TSIO_BASE_URL: ${{ inputs.tsio-base-url }}
+      run: node "${{ github.action_path }}/../../scripts/e2e-master-watch.mjs"
