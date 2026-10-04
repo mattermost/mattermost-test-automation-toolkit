@@ -512,6 +512,24 @@ test("another lane's multi-report run does not make this lane's history ambiguou
   const inLane = await fetchHistory(history([...trunk, ...sameLane]), "http://tsio", "o/r", [t], "2026-09-17T00:00:00Z", DEFAULTS, "master", "e2e-on-windows", () => {}, laneOf("desktop-pr"));
   assert.equal(inLane.ambiguous.has(identityKey(t)), true);
 });
+test("a lane with nothing failed keeps its own status", async () => {
+  // mattermost-mobile#10172: green lanes were rewritten as "0 failed (0 cleared by
+  // triage)", and a lane red outside its tests would have been turned green.
+  const statuses = [];
+  await triage({
+    env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "" },
+    fetchImpl: fakeFetch([
+      ...runRoutes([spec("t1", "passed"), spec("t2", "passed")]),
+      ["/reports/history", () => Response.json({ observations: [] })],
+      ["/pulls/5/files", () => Response.json([])],
+      ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+      ["/statuses/abc", (i) => { statuses.push(JSON.parse(i.body)); return Response.json({}); }],
+    ]),
+    log: () => {},
+  });
+  assert.deepEqual(statuses, [], "nothing to triage, nothing written");
+});
+
 test("only an explicit, valid enforce mode writes a commit status", async () => {
   const routes = (statuses) => [
     ...runRoutes([spec("t1", "failed")]),

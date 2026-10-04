@@ -1362,7 +1362,10 @@ export async function triage({ env, fetchImpl = fetch, log = console.error, now 
     const mode = String(env.MODE ?? "").trim();
     if (mode && mode !== "enforce" && mode !== "report-only")
       log(`unrecognised mode ${JSON.stringify(mode)}; the only value that enforces is "enforce", so this run is report-only`);
-    if (enforce && context) {
+    // A lane with nothing failed or missing keeps the status its own job posted: there
+    // is nothing triage decided, and overwriting it could turn a lane that went red
+    // outside its tests green.
+    if (enforce && context && (run.failing.length > 0 || Boolean(run.missing))) {
       await api("POST", `/repos/${id.repository}/statuses/${id.commit_sha}`, {
         state: result.verdict === "SUCCESS" ? "success" : "failure",
         context,
