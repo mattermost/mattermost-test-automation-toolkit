@@ -168,10 +168,10 @@ test("summary and outputs in both modes; only enforce writes statuses, and never
       assert.equal(statuses.filter((c) => !c.body.context.endsWith("/triage")).length, mode === "enforce" ? 1 : 0);
       assert.equal(statuses.length, mode === "enforce" ? 3 : 0, "plus the triage check, pending then verdict, only when enforcing");
       const summary = readFileSync(f.env.GITHUB_STEP_SUMMARY, "utf8");
-      assert.match(summary, /1 failed → 0 cleared · 1 blocking/);
-      assert.match(summary, /### Blocking \(1\)/);
+      assert.match(summary, /🔴 1 test needs a look/);
+      assert.match(summary, /\*\*Verdict:\*\* 1 failed test still blocks/);
       assert.doesNotMatch(summary, /required status is green|attributable to the PR/);
-      if (mode === "report-only") assert.match(summary, /does not change the required commit status/);
+      assert.match(summary, mode === "enforce" ? /sets the E2E check/ : /report only/);
       assert.match(readFileSync(f.env.GITHUB_OUTPUT, "utf8"), /verdict=FAILURE\nblocking=1/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
@@ -185,7 +185,8 @@ test("mass failures require investigation without claiming the PR is innocent", 
     const result = await live(f);
     assert.equal(result.verdict, "ACTION_REQUIRED");
     const summary = readFileSync(f.env.GITHUB_STEP_SUMMARY, "utf8");
-    assert.match(summary, /30 failed → 0 cleared · 30 blocking/);
+    assert.match(summary, /⚠️ needs investigation/);
+    assert.match(summary, /Too many failures to triage one by one/);
     assert.match(summary, /product failure/);
     assert.doesNotMatch(summary, /not this PR|none caused/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
