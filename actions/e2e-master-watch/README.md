@@ -78,6 +78,4 @@ jobs:
         uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-master-watch/record@<full sha>
         with:
           results: ${{ steps.send.outputs.results || '[]' }}
-          gh-run-id: ${{ github.event.workflow_run.id }}
-          gh-run-attempt: ${{ github.event.workflow_run.run_attempt }}
 ```

@@ -124,7 +124,7 @@ test("broken specs with one cause go to one agent with what broke them, and are 
   const hook = [];
   const compared = [];
   const untils = [];
-  const fetchImpl = routes({ hook, compared, untils });
+  const fetchImpl = routes({ compared, untils });
   const LEDGER_PATH = ledgerPath();
   const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl, hook });
   assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [

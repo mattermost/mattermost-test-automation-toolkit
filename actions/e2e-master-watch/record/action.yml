@@ -9,13 +9,6 @@ inputs:
     description: 'JSON list [{"id", "status"}] with the HTTP status each request got (0 if none)'
     required: false
     default: "[]"
-  gh-run-id:
-    description: Workflow run id of the trunk E2E run, as given to the watch action
-    required: true
-  gh-run-attempt:
-    description: Attempt of that run, as given to the watch action
-    required: false
-    default: "1"
   branch:
     description: Trunk branch, as given to the watch action
     required: false
@@ -32,4 +25,5 @@ runs:
     - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ${{ github.workspace }}/.e2e-master-watch/ledger.json
-        key: e2e-master-watch-${{ inputs.branch }}-${{ inputs.gh-run-id }}-${{ inputs.gh-run-attempt }}
+        # Unique to this run of the calling workflow: a re-run saves a new entry instead of failing to overwrite.
+        key: e2e-master-watch-${{ inputs.branch }}-${{ github.run_id }}-${{ github.run_attempt }}

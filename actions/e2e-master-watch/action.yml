@@ -38,6 +38,10 @@ inputs:
     description: Path of the agent's instructions in the consumer repository, passed in each request
     required: false
     default: ""
+  min-flaky:
+    description: Earlier trunk failures or flaky passes a test needs, besides this run's, to count as flaky
+    required: false
+    default: "1"
   max-per-run:
     description: Fix requests per trunk run
     required: false
@@ -69,11 +73,13 @@ runs:
   using: composite
   steps:
     # Requests sent by earlier runs, so a spec still broken while its agent works is not requested twice.
-    # A workflow_run job runs on the default branch, so every run shares this cache; the record action saves it.
+    # A workflow_run job runs on the default branch, so every run shares this cache; the record action saves it
+    # under a key unique to this run of the calling workflow (caches can't be overwritten), and this restores
+    # the newest one.
     - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ${{ github.workspace }}/.e2e-master-watch/ledger.json
-        key: e2e-master-watch-${{ inputs.branch }}-${{ inputs.gh-run-id }}-${{ inputs.gh-run-attempt }}
+        key: e2e-master-watch-${{ inputs.branch }}-${{ github.run_id }}-${{ github.run_attempt }}
         restore-keys: e2e-master-watch-${{ inputs.branch }}-
     - id: plan
       shell: bash
@@ -87,6 +93,7 @@ runs:
         LABEL: ${{ inputs.label }}
         EXTRA_LABELS: ${{ inputs.extra-labels }}
         INSTRUCTIONS: ${{ inputs.instructions }}
+        MIN_FLAKY: ${{ inputs.min-flaky }}
         MAX_PER_RUN: ${{ inputs.max-per-run }}
         MAX_PER_DAY: ${{ inputs.max-per-day }}
         MAX_CONFLICTS_PER_RUN: ${{ inputs.max-conflicts-per-run }}
