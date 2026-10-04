@@ -613,7 +613,14 @@ test("one triage check for the whole PR summarises every lane", async () => {
     "e2e-test/maestro-ios": st("success", "6 passed, 1 failed (1 cleared by triage), 1 skipped"),
     "e2e-test/detox-ipad": st("success", "19 passed, 0 skipped"),
     "e2e-test/maestro-android": null,
-  }), { state: "failure", description: "detox-ios still red · maestro-ios cleared by triage" });
+  }), { state: "failure", description: "detox-ios: 2 cleared, 5 to check · maestro-ios cleared by triage" });
+  // mattermost#38601: every failure cleared, but two runners timed out without a report.
+  assert.deepEqual(lanes({ "e2e-test/playwright-full/enterprise": st("failure", "1119 passed, 26 failed (26 cleared by triage), 118 skipped; 2 report(s) missing") }),
+    { state: "failure", description: "playwright-full/enterprise: 26 cleared, 2 report(s) missing, re-run" });
+  assert.deepEqual(lanes({ "e2e-test/detox-ios": st("failure", "49 passed, 132 failed (not triaged, investigation required), 29 skipped") }),
+    { state: "failure", description: "detox-ios: too many failures to triage" });
+  assert.deepEqual(lanes({ "e2e/linux": st("failure", "10 passed, 2 failed (not triaged: triage could not finish)") }),
+    { state: "failure", description: "linux: triage could not finish" });
   assert.deepEqual(lanes({ "e2e-test/maestro-ios": st("success", "6 passed, 1 failed (1 cleared by triage), 1 skipped"), "e2e-test/detox-ios": st("success", "597 passed, 0 failed (0 cleared by triage)") }),
     { state: "success", description: "maestro-ios cleared by triage · all lanes green" });
   assert.deepEqual(lanes({ "e2e/linux": st("success", "235 passed, 0 failed") }), { state: "success", description: "All lanes green" });
