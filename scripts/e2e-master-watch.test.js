@@ -300,3 +300,18 @@ test("someone else's open PR on a spec doesn't hold back the fix: the agent gets
   assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [[["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], "to request"]]);
   assert.deepEqual(hook[0].open_prs_touching, [{ number: 41, title: "PR 41", url: "https://github.com/o/r/pull/41" }], "the release-branch PR is not listed");
 });
+
+test("a spec that broke on the same commit as a break already handed over is left to that agent", async () => {
+  const LEDGER_PATH = ledgerPath();
+  // An earlier run sent the break that first failed on c1 (only x/a then); y/b and z/c show up now.
+  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 3600e3).toISOString(), specs: ["specs/q/other.spec.ts"], kind: "broken", red: "c1", run: "r" }] }));
+  const hook = [];
+  const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [] }), hook });
+  assert.deepEqual(decisions.map((d) => d.action), ["skipped: first failed on c1, like the break requested 2026-10-02 23:00 UTC"]);
+  assert.equal(hook.length, 0);
+
+  // A request records its first failing commit, so later runs can tell.
+  const fresh = ledgerPath();
+  await run({ env: { ...env, LEDGER_PATH: fresh }, fetchImpl: routes({ openPRFiles: [] }), hook: [] });
+  assert.deepEqual(readLedger(fresh).map((e) => [e.kind, e.red]), [["broken", "c1"]]);
+});

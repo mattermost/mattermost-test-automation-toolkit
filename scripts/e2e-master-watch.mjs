@@ -212,7 +212,8 @@ export function prsTouching(touched, spec) {
 
 /**
  * Requests sent by earlier runs, persisted between runs by the action's cache: a fix
- * request is { at, specs, kind, run }, a conflict request { at, pr, head, run }.
+ * request is { at, specs, kind, red?, run } (red: the first failing trunk commit of a break),
+ * a conflict request { at, pr, head, run }.
  */
 export function readLedger(path) {
   if (!path) return [];
@@ -306,7 +307,7 @@ export function bundle(groups, { currentCommit = null } = {}) {
       if (g.range && (!r.range || at(g.range.green) < at(r.range.green))) r.range = { ...(r.range ?? g.range), green: g.range.green };
       continue;
     }
-    const req = { specs: [g.spec], kind: g.kind, suites: new Set(g.suites), tests: [...g.tests], range: g.range, openPRs: [...(g.openPRs ?? [])] };
+    const req = { specs: [g.spec], kind: g.kind, suites: new Set(g.suites), tests: [...g.tests], range: g.range, openPRs: [...(g.openPRs ?? [])], firstRed: key };
     if (key) byRed.set(key, req);
     requests.push(req);
   }
@@ -428,6 +429,13 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   for (const r of requests) {
     const decision = { specs: r.specs, kind: r.kind, tests: r.tests };
     decisions.push(decision);
+    // A spec of a break already handed over (it failed in only one lane then, say) is that agent's:
+    // it fixes the shared cause wherever it appears.
+    const sameCause = r.firstRed && ledger.find((e) => e.red === r.firstRed && now.getTime() - Date.parse(e.at) < holdMs);
+    if (sameCause) {
+      decision.action = `skipped: first failed on ${r.firstRed.slice(0, 9)}, like the break requested ${sameCause.at.slice(0, 16).replace("T", " ")} UTC`;
+      continue;
+    }
     if (r.kind === "broken" ? brokenLeft <= 0 : flakyLeft <= 0) {
       decision.action = r.kind === "broken" ? `skipped: over ${maxBrokenPerRun} broken requests in one run` : `skipped: flaky budget of ${maxFlakyPerDay} a day used`;
       continue;
@@ -448,7 +456,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     };
     decision.payload = payload;
     decision.action = "to request";
-    out.push({ id: `fix-${out.length + 1}`, payload, entry: { at: now.toISOString(), specs: r.specs, kind: r.kind, run: runURL } });
+    out.push({ id: `fix-${out.length + 1}`, payload, entry: { at: now.toISOString(), specs: r.specs, kind: r.kind, ...(r.firstRed ? { red: r.firstRed } : {}), run: runURL } });
   }
 
   // The repair PRs the automation opened are its own to keep mergeable: a trunk merge that
