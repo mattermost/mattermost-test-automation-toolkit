@@ -37,6 +37,7 @@ import {
   fetchRun,
   infraVerdict,
   isInfraError,
+  namesChangedFile,
   laneSummary,
   missingReports,
   statusDescription,
@@ -201,7 +202,7 @@ test("judge asks once per run, caps the findings it sends and survives an outage
   assert.equal(findings.filter((f) => f.decision === "adjudicator_unblock").length, 8);
   assert.equal(findings.slice(8).every((f) => f.blocking && !f.decision && f.ai.skipped), true);
   assert.equal(ledger.skipped.cap, 2);
-  assert.equal(ledger.calls[0].cost_usd, (10000 * 1 + 1000 * 5) / 1e6, "priced at Haiku 4.5 list price");
+  assert.equal(ledger.calls[0].cost_usd, (10000 * 2 + 1000 * 10) / 1e6, "priced at Sonnet 5.5 list price");
 
   const down = make();
   await judge(down, packsOf(down), async () => { throw new Error("boom"); }, DEFAULTS, () => {});
@@ -551,17 +552,17 @@ test("only an explicit, valid enforce mode writes a commit status", async () => 
   assert.deepEqual(quiet.map((s) => s.context), ["e2e-test/playwright"]);
 });
 test("a failure history can't explain is a likely regression only when the PR touches it", async () => {
-  const routes = (files) => [
-    ...runRoutes([spec("t1", "failed")]),
+  const routes = (files, error) => [
+    ...runRoutes([spec("t1", "failed").map((row) => (error ? { ...row, error_message: error } : row))]),
     ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
     ["/pulls/5/files", () => Response.json(files)],
     ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
     ["/statuses/abc", () => Response.json({})],
   ];
-  const run = async (files) => {
+  const run = async (files, error) => {
     const dir = mkdtempSync(join(tmpdir(), "triage-label-"));
     try {
-      const result = await triage({ env: { ...env, ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: join(dir, "s.md") }, fetchImpl: fakeFetch(routes(files)), log: () => {} });
+      const result = await triage({ env: { ...env, ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: join(dir, "s.md") }, fetchImpl: fakeFetch(routes(files, error)), log: () => {} });
       return { result, summary: readFileSync(join(dir, "s.md"), "utf8") };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   };
@@ -574,8 +575,12 @@ test("a failure history can't explain is a likely regression only when the PR to
   assert.match(untouched.summary, /this PR changes neither the test nor any file its error names\. Re-run it/);
   assert.doesNotMatch(untouched.summary, /likely regression/);
 
-  // A changed file the error names ("Error: expected visible") keeps the old wording.
-  const named = await run([{ filename: "src/visible.ts", patch: "@@" }]);
+  // A plain word of the error's prose ("expected visible") does not name src/visible.ts.
+  const prose = await run([{ filename: "src/visible.ts", patch: "@@" }]);
+  assert.match(prose.summary, /🔴 not explained by history/);
+
+  // A changed file the error names (its test id server_form) keeps the old wording.
+  const named = await run([{ filename: "app/screens/server_form.tsx", patch: "@@" }], "Error: expected server_form to be visible");
   assert.equal(named.result.findings[0].class, "REGRESSION");
   assert.match(named.summary, /🔴 likely regression/);
   assert.match(named.summary, /Check your change, or merge master/);
@@ -965,10 +970,10 @@ test("an answer just short of the threshold goes once to the escalation model", 
     const confidence = model === DEFAULTS.model ? 0.75 : 0.92;
     return { answers: packs.map(() => ({ ...flakyAnswer, confidence })), usage: { input_tokens: 3000, output_tokens: 200 }, served_model: model };
   }, DEFAULTS, () => {}, false, ledger);
-  assert.deepEqual(asked, [DEFAULTS.model, "claude-opus-5-5"]);
+  assert.deepEqual(asked, [DEFAULTS.model, DEFAULTS.escalationModel]);
   assert.equal(f.decision, "adjudicator_unblock");
   assert.equal(f.escalated, true);
-  assert.equal(ledger.calls[1].cost_usd, (3000 * 4 + 200 * 20) / 1e6, "priced at Opus 5.5 list price");
+  assert.equal(ledger.calls[1].cost_usd, (3000 * 10 + 200 * 50) / 1e6, "priced at Fable 5.1 list price");
 
   // A confident answer, a refusal, and an answer below the band are not escalated.
   for (const confidence of [0.95, 0.4]) {
@@ -977,6 +982,38 @@ test("an answer just short of the threshold goes once to the escalation model", 
     await judge([g], [buildPack(g, [], prCtx, [])], async (packs, model) => { models.push(model); return ok({ ...flakyAnswer, confidence })(packs, model); }, DEFAULTS, () => {});
     assert.deepEqual(models, [DEFAULTS.model], `confidence ${confidence}`);
   }
+});
+
+test("an answer that blames the PR without citing a change goes to the escalation model", async () => {
+  // mattermost-mobile#10172 replay: Haiku blamed "test setup and environment files" for a
+  // Maestro flow the diff does not touch, cited no hunk, and so skipped escalation.
+  const ungrounded = { cause: "caused_by_pr", confidence: 0.72, cited_evidence: ["error", "engine"], explanation: "x" };
+  const run = async (second) => {
+    const f = classify(failing, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1);
+    const asked = [];
+    await judge([f], [buildPack(f, [], prCtx, [])], async (packs, model) => {
+      asked.push(model);
+      return ok(model === DEFAULTS.model ? ungrounded : second)(packs, model);
+    }, DEFAULTS, () => {});
+    return { f, asked };
+  };
+  const cleared = await run({ ...flakyAnswer, confidence: 0.92 });
+  assert.deepEqual(cleared.asked, [DEFAULTS.model, DEFAULTS.escalationModel]);
+  assert.equal(cleared.f.decision, "adjudicator_unblock");
+  assert.equal(cleared.f.blocking, false);
+  // The stronger model blaming the PR as well keeps it red.
+  const kept = await run(ungrounded);
+  assert.equal(kept.f.blocking, true);
+  assert.equal(kept.f.escalated, true);
+  // Blame that names a related change is grounded and is not second-guessed.
+  const h = classify({ ...failing, error: "Error: expected server_form to be visible" }, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1);
+  const pack = buildPack(h, [{ filename: "app/server_form.tsx", patch: "@@ -1 +1 @@" }], prCtx, []);
+  const hunkId = pack.diff_hunks_of_files_named_in_error.find((x) => x.related)?.id;
+  assert.ok(hunkId, "the changed component the error names is a related hunk");
+  const models = [];
+  await judge([h], [pack], async (packs, model) => { models.push(model); return ok({ ...ungrounded, cited_evidence: ["error", hunkId] })(packs, model); }, DEFAULTS, () => {});
+  assert.deepEqual(models, [DEFAULTS.model]);
+  assert.equal(h.blocking, true);
 });
 
 test("prices are looked up by model family and can be overridden", () => {
@@ -1015,7 +1052,10 @@ test("one request carries a run's findings with the shared context once", async 
   let body;
   const res = await askModelBatch(async (_u, init) => { body = JSON.parse(init.body); return modelReply(init, flakyAnswer, { input_tokens: 1234, output_tokens: 56 }); }, "k", DEFAULTS.model, packs);
   assert.equal(typeof body.system, "string", "no cache marker: the prompt is below Haiku 4.5's minimum cacheable length");
-  assert.equal(body.max_tokens, 600);
+  assert.equal(body.max_tokens, 600 + 16000, "room to think before the answer; thinking counts against max_tokens");
+  let haikuBody;
+  await askModelBatch(async (_u, init) => { haikuBody = JSON.parse(init.body); return modelReply(init, flakyAnswer, { input_tokens: 1, output_tokens: 1 }); }, "k", "claude-haiku-4-5-20251001", packs);
+  assert.equal(haikuBody.max_tokens, 600, "a model that does not think gets only the answer's room");
   assert.equal(body.messages[0].content.match(/@@ spec/g).length, 1, "a hunk shared by both findings is sent once");
   assert.deepEqual(res.answers.map((a) => a.cause), ["flaky_environment", "flaky_environment"]);
   assert.deepEqual(res.usage, { input_tokens: 1234, output_tokens: 56 });
@@ -1354,8 +1394,12 @@ function fakeModel(served, { text = answerText(), stop = "end_turn" } = {}) {
 
 const askOne = (fetchImpl, model) => askModelBatch(fetchImpl, "k", model, [judgePack]);
 
-test("the judge is pinned to a dated snapshot", () => {
-  assert.match(DEFAULTS.model, /^claude-haiku-4-5-\d{8}$/, "an alias can be repointed underneath the thresholds");
+test("the judge and its escalation are pinned to versioned models", () => {
+  // Versioned ids (no dated snapshot exists for these): a family alias could be
+  // repointed underneath the thresholds.
+  assert.equal(DEFAULTS.model, "claude-sonnet-5-5");
+  assert.equal(DEFAULTS.escalationModel, "claude-fable-5-1");
+  for (const m of [DEFAULTS.model, DEFAULTS.escalationModel]) assert.ok(priceFor(m), `${m} is priced, so the run budget applies to it`);
 });
 
 test("an answer from a model other than the one requested is discarded, once", async () => {
@@ -1417,4 +1461,28 @@ test("a malformed confidence cannot clear a regression, end to end", async () =>
 test("only a complete answer is used", async () => {
   for (const stop of ["max_tokens", "stop_sequence", "refusal", "tool_use"])
     await assert.rejects(() => askOne(fakeModel((m) => m, { stop }), "claude-haiku-4-5-20251001"), /stop_reason/, stop);
+});
+
+test("a changed file relates to an error only where the error names it", () => {
+  const f = (error, file = "detox/maestro/flows/account/a.yml") => ({ error, file });
+  const precondition = f("AllowDownloadLogs=false never reached the client config; the flow's pre-condition was not in force");
+  // mattermost-mobile#10172: the word "config" made detox/e2e/config.js look related.
+  assert.equal(namesChangedFile(precondition, "detox/e2e/config.js"), false);
+  assert.equal(namesChangedFile(f("Cannot find module './config' from 'x.ts'"), "detox/e2e/config.js"), true);
+  assert.equal(namesChangedFile(f("at load (detox/e2e/config.js:12:3)"), "detox/e2e/config.js"), true);
+  assert.equal(namesChangedFile(f("Expected index to be 3"), "app/screens/home/index.tsx"), false);
+  // Identifier-like names relate wherever they appear, so a changed component stays tied to its test ids.
+  assert.equal(namesChangedFile(f("Expected server_form to be visible"), "app/screens/server/server_form.tsx"), true);
+  const bookmark = f("Assertion is false: id: channel_bookmark.screen is not visible");
+  assert.equal(namesChangedFile(bookmark, "app/screens/channel_bookmark/index.tsx"), true);
+  assert.equal(namesChangedFile(bookmark, "app/utils/channel_bookmark.ts"), true);
+  assert.equal(namesChangedFile(bookmark, ".github/workflows/e2e-maestro-template.yml"), false);
+  assert.equal(namesChangedFile(f("boom", "e2e/channels/channel_settings.spec.ts"), "support/ui/channel_settings.ts"), true);
+  assert.equal(namesChangedFile({ error: "x", file: "a/b.spec.ts", repo_path: "a/b.spec.ts" }, "a/b.spec.ts"), true);
+});
+
+test("a server answering with a page instead of JSON is infrastructure", () => {
+  assert.ok(isInfraError("AllowDownloadLogs never took: wanted 'false', client config serves '<client config was not JSON: the server answered with an HTML page starting '<!DOCTYPE html>'>'"));
+  assert.ok(isInfraError("Received HTML from server instead of JSON"));
+  assert.equal(isInfraError("Assertion is false: id: channel_bookmark.screen is not visible"), false);
 });

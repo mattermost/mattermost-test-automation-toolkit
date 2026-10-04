@@ -19,9 +19,9 @@ inputs:
     required: false
     default: ""
   claude-model:
-    description: Model for the judge. A dated snapshot, since the confidence thresholds are tuned against it
+    description: Model for the judge. The confidence thresholds are tuned against the default
     required: false
-    default: claude-haiku-4-5-20251001
+    default: claude-sonnet-5-5
   min-confidence:
     description: Minimum model confidence (0.5-1) to clear a failure history can't explain
     required: false
@@ -47,13 +47,13 @@ inputs:
     required: false
     default: ""
   escalation-model:
-    description: Stronger model asked once about answers just short of a threshold. Empty turns it off
+    description: Stronger model asked once about answers just short of a threshold, or that blame the PR without citing a change. Empty turns it off
     required: false
-    default: claude-opus-5-5
+    default: claude-fable-5-1
   ai-budget-usd:
     description: Per-run ceiling on model spend in USD; a call that could cross it is not made
     required: false
-    default: "0.5"
+    default: "1"
   ai-advice:
     description: '"true" also asks about blocking failures the model can''t clear, and shows its read as advice (never changes the outcome)'
     required: false

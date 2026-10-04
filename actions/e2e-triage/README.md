@@ -41,11 +41,12 @@ a related diff hunk. If it fails or is unavailable, the rules' outcome stands.
 
 - All of a run's questions go in one request; tests with the same spec and error
   share a question. A question the response leaves out is asked once more.
-- An answer just short of the threshold is asked once of `escalation-model`.
+- An answer just short of the threshold, or one that blames the PR without citing a
+  change, is asked once of `escalation-model` (Fable 5.1; the judge is Sonnet 5.5).
 - A blocking failure the model has nothing to cite for is still asked
   (`ai-advice`), and its read is shown as advice. It never changes the outcome.
 - Spend is priced per call and shown in the summary and the `ai-cost-usd`
-  output; a call that could cross `ai-budget-usd` (0.5) is not made.
+  output; a call that could cross `ai-budget-usd` (1) is not made.
   `answers-cache` lets a re-run reuse earlier answers.
 
 ## What the PR shows

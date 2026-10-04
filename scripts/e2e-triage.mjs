@@ -59,17 +59,20 @@ export const DEFAULTS = {
   // Ask about blocking findings the model can't clear, as advice only.
   advise: true,
   infraMinFailures: 30,
-  // Re-asks an answer between escalateMin and the threshold. Empty turns it off.
-  escalationModel: "claude-opus-5-5",
+  // Re-asks an answer between escalateMin and the threshold, or one that blames the PR
+  // without citing a change. Empty turns it off.
+  escalationModel: "claude-fable-5-1",
   escalateMin: 0.6,
   // Per-run spend ceiling; a call that could cross it is not made.
-  budgetUsd: 0.5,
-  // A dated snapshot, not an alias: the thresholds were tuned against this model.
-  model: "claude-haiku-4-5-20251001",
+  budgetUsd: 1,
+  // Replays of real mobile runs (mattermost-mobile#10172): Haiku 4.5 blamed the PR
+  // without citing a change on 3 of 6 findings; Sonnet 5.5 cited correctly on all of
+  // them and cleared 4 of the 5 the PR did not cause, Fable 5.1 the fifth on escalation.
+  model: "claude-sonnet-5-5",
 };
 // The last alternative: a mobile spec whose shard uploaded nothing never ran.
 const INFRA_RE =
-  /server (?:is )?not healthy|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result/i;
+  /server (?:is )?not healthy|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server/i;
 
 export const isInfraError = (text) => INFRA_RE.test(text ?? "");
 
@@ -363,7 +366,10 @@ Rules:
   that failed or was rejected (an error dialog on screen, an app error naming the call), in an area the diff does not
   touch, supports flaky_environment; a stuck or failing request, screen or flow that the diff changes supports
   caused_by_pr.
-- If the evidence is genuinely insufficient, answer with confidence below 0.6 rather than guessing.
+- confidence: 0.9 or higher when the cited evidence meets the requirement above for the cause you give and no part of
+  the diff plausibly touches the failing test, its flow or screen, or the request it depends on; 0.6 to 0.85 when it
+  meets the requirement but some part of the diff could plausibly be involved. If the evidence is genuinely
+  insufficient, answer with confidence below 0.6 rather than guessing.
 - explanation: at most 280 characters, written for the PR author: what failed and what, if anything, they should do.
   Do not restate the engine's classification or the history numbers; they are shown next to your answer.`;
 
@@ -392,13 +398,28 @@ export function compactError(error, max = 800) {
   return [...message, ...frames].join("\n").trim().slice(0, max);
 }
 
-// Whether a changed file is the failing spec or is named in the failure's error.
-function namesChangedFile(finding, filename) {
+// Identifier-like: has "_" or "-" or an inner capital (server_form, channelBookmark).
+// A plain word (config, index, utils) is as likely to be prose as a file name.
+const identifierLike = (name) => name.length > 3 && /[_-]|[a-z][A-Z]/.test(name);
+
+// Whether a changed file is the failing spec or is named in the failure's error or spec
+// path. An identifier-like file or folder name relates wherever it appears; a plain word
+// only where it reads as a path or module ("e2e/config.js", "'./config'"), so "never
+// reached the client config" does not name config.js.
+export function namesChangedFile(finding, filename) {
   const ownPath = finding.repo_path ?? finding.file;
-  const text = `${finding.error}\n${finding.file}`.toLowerCase();
-  const base = filename.split("/").pop() ?? "";
+  const error = String(finding.error ?? "");
+  const parts = filename.split("/");
+  const base = parts.at(-1) ?? "";
+  if (filename === ownPath || error.includes(base)) return true;
   const stem = base.split(".")[0] ?? "";
-  return filename === ownPath || (stem.length > 3 && text.includes(stem.toLowerCase())) || String(finding.error ?? "").includes(base);
+  const text = `${error}\n${finding.file}`.toLowerCase();
+  if (identifierLike(stem) && text.includes(stem.toLowerCase())) return true;
+  const folder = parts.at(-2) ?? "";
+  if (identifierLike(folder) && error.toLowerCase().includes(folder.toLowerCase())) return true;
+  if (stem.length <= 3) return false;
+  const escaped = stem.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[\\\\/'"\`])${escaped}(?=$|[.'"\`:)\\s\\\\/])`, "m").test(text);
 }
 
 /** What the model sees about one finding, and nothing else. */
@@ -444,6 +465,16 @@ export const evidenceIds = (pack) => [
 const TEMPERATURE_MODELS = ["claude-haiku-4-5", "claude-opus-4-6", "claude-sonnet-4-6"];
 export const samplingFor = (model) =>
   TEMPERATURE_MODELS.some((m) => model === m || String(model).startsWith(`${m}-`)) ? { temperature: 0 } : {};
+// The same older models are the ones that do not think by default. Every newer one
+// thinks before answering (Opus 5.5 and Fable 5.1 cannot be told not to), and its
+// thinking counts against max_tokens: without room for it the answer is cut off.
+export const thinks = (model) => !("temperature" in samplingFor(model));
+const THINKING_ROOM = 16000;
+// What thinking is expected to cost, for the budget check: room is not spend.
+const THINKING_ESTIMATE = 3000;
+const answerTokens = (findings) => 100 + 250 * findings;
+export const maxTokensFor = (model, findings) => (thinks(model) ? answerTokens(findings) + THINKING_ROOM : Math.min(2000, answerTokens(findings)));
+const expectedOutput = (model, findings) => answerTokens(findings) + (thinks(model) ? THINKING_ESTIMATE : 0);
 
 // The answer must come from the model asked for: a dated snapshot exactly, an
 // alias only from its own snapshots (alias + "-YYYYMMDD", not any prefix match).
@@ -457,6 +488,7 @@ export const PRICES = {
   "claude-haiku-4-5": { input: 1, output: 5, cache_write: 1.25, cache_read: 0.1 },
   "claude-sonnet-5-5": { input: 2, output: 10, cache_write: 2.5, cache_read: 0.2 },
   "claude-opus-5-5": { input: 4, output: 20, cache_write: 5, cache_read: 0.2 },
+  "claude-fable-5-1": { input: 10, output: 50, cache_write: 12.5, cache_read: 0.25 },
 };
 export function priceFor(model, prices = PRICES) {
   const m = String(model ?? "");
@@ -571,7 +603,7 @@ export async function askModelBatch(fetchImpl, apiKey, model, packs, timeoutMs =
     const images = PACK_IMAGES.get(p) ?? [];
     if (images.length) content.push({ type: "text", text: `Screenshots recorded for ${ids[i]}:` }, ...images.map(imageBlock));
   }
-  const msg = await requestModel(fetchImpl, apiKey, model, content.length ? [...content, { type: "text", text }] : text, batchSchema(ids), Math.min(2000, 100 + 250 * packs.length), timeoutMs);
+  const msg = await requestModel(fetchImpl, apiKey, model, content.length ? [...content, { type: "text", text }] : text, batchSchema(ids), maxTokensFor(model, packs.length), thinks(model) ? Math.max(timeoutMs, 180000) : timeoutMs);
   const raw = JSON.parse(msg.content?.find((b) => b.type === "text")?.text ?? "");
   const byId = new Map((Array.isArray(raw?.answers) ? raw.answers : []).map((a) => [a?.id, a]));
   const provenance = { requested_model: model, served_model: msg.model, temperature: samplingFor(model).temperature ?? null };
@@ -634,12 +666,16 @@ export function canChange(cls, pack, isTrunkRun = false) {
 }
 export const answerKey = (model, pack) => `v3:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + SYSTEM, pack)}`;
 
-// An answer that would change the outcome at a higher confidence, and fell short.
+// An answer that would change the outcome at a higher confidence, and fell short; or
+// one that blames the PR without the change that would explain it, which the judge's
+// rules forbid and which would otherwise keep a failure red on no evidence.
 function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
-  if (!answer || answer.confidence < cfg.escalateMin) return false;
+  if (!answer) return false;
   const known = new Set(evidenceIds(pack));
   const cited = answer.cited_evidence.filter((c) => known.has(c));
   const hunk = cited.some((c) => c.startsWith("hunk_"));
+  if (BORDERLINE.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
+  if (answer.confidence < cfg.escalateMin) return false;
   if (exoneratedSet(isTrunkRun).has(cls)) return answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.vetoMin;
   return BORDERLINE.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence &&
     (hunk || cited.includes("cross_pr") || cited.includes("producer"));
@@ -703,7 +739,7 @@ export async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () 
     if (!fresh.length) return;
     const chars = fresh.reduce((n, g) => n + JSON.stringify(g.lead.pack).length, SYSTEM.length);
     const images = fresh.reduce((n, g) => n + (PACK_IMAGES.get(g.lead.pack)?.length ?? 0), 0);
-    const worst = costOf({ input_tokens: chars / 3 + images * 1600, output_tokens: 100 + 250 * fresh.length }, model, cfg.prices);
+    const worst = costOf({ input_tokens: chars / 3 + images * 1600, output_tokens: expectedOutput(model, fresh.length) }, model, cfg.prices);
     const spent = ledgerTotals(ledger).cost_usd ?? 0;
     if (worst != null && spent + worst > cfg.budgetUsd) {
       ledger.skipped.budget += fresh.length;
