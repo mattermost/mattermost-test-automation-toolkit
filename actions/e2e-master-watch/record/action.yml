@@ -1,0 +1,35 @@
+name: E2E master watch record
+description: >
+  After the caller sent the requests from actions/e2e-master-watch, keep the
+  accepted ones, so the next trunk run holds their specs and PRs and counts them
+  toward the daily cap. Run it on every trunk run, even one that sent nothing.
+author: Mattermost
+inputs:
+  results:
+    description: 'JSON list [{"id", "status"}] with the HTTP status each request got (0 if none)'
+    required: false
+    default: "[]"
+  gh-run-id:
+    description: Workflow run id of the trunk E2E run, as given to the watch action
+    required: true
+  gh-run-attempt:
+    description: Attempt of that run, as given to the watch action
+    required: false
+    default: "1"
+  branch:
+    description: Trunk branch, as given to the watch action
+    required: false
+    default: master
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        RESULTS: ${{ inputs.results }}
+        LEDGER_PATH: ${{ github.workspace }}/.e2e-master-watch/ledger.json
+        PENDING_PATH: ${{ github.workspace }}/.e2e-master-watch/pending.json
+      run: node "${{ github.action_path }}/../../../scripts/e2e-master-watch.mjs" record
+    - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ github.workspace }}/.e2e-master-watch/ledger.json
+        key: e2e-master-watch-${{ inputs.branch }}-${{ inputs.gh-run-id }}-${{ inputs.gh-run-attempt }}

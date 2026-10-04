@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { identityKey } from "./e2e-triage.mjs";
-import { bundle, prsTouching, rangeOf, selectRepairs, watch } from "./e2e-master-watch.mjs";
+import { bundle, prsTouching, rangeOf, record, selectRepairs, watch } from "./e2e-master-watch.mjs";
 
 const finding = (over) => ({ file: "a.spec.ts", repo_path: "specs/a.spec.ts", title: "t", error: "Error: expected visible", class: "BROKEN_ON_TRUNK", trunk: { runs: 8, fails: 2, flaky: 0, passes: 6 }, ...over });
 
@@ -60,7 +60,7 @@ test("broken specs that last passed on the same commit go to one agent; flaky on
 
 // A trunk run with three broken specs, all broken since c1; an open PR changes a helper beside y/b.spec.ts.
 // With `recovered`, two more specs fail once and pass on retry: v/e.spec.ts flaked on trunk before, u/f.spec.ts never did.
-function routes({ hook, compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts"], openedToday = 0, branch = "master", recovered = false, repairPRs = [] }) {
+function routes({ compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts"], openedToday = 0, branch = "master", recovered = false, repairPRs = [] }) {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
   const retried = recovered ? ["v/e.spec.ts", "u/f.spec.ts"] : [];
   const obs = (file, status, i) => ({ file, title: "t1", status, retry_count: 0, gh_pr_number: null, branch: "master", group_id: `old-${i}`, commit_sha: `c${i}`, created_at: `2026-10-02T0${9 - i}:00:00Z`, name: "pw-master", error_excerpt: "Error: expected visible" });
@@ -83,7 +83,7 @@ function routes({ hook, compared = [], untils = [], openPRFiles = ["specs/y/help
     ["/graphql", (init) => {
       const { query, variables } = JSON.parse(init.body);
       if (query.includes("search(")) {
-        assert.match(variables.q, /is:open label:e2e-master-repair/);
+        assert.match(variables.q, /is:open label:e2e-autofix/);
         return Response.json({ data: { search: { nodes: repairPRs } } });
       }
       // Two pages: #41 is not among the newest 50, and #7 was last updated too long ago to count.
@@ -99,16 +99,26 @@ function routes({ hook, compared = [], untils = [], openPRFiles = ["specs/y/help
       const commits = Array.from({ length: 35 }, (_, i) => ({ sha: `${i}`.padStart(10, "d"), commit: { message: `change ${i}\n\nbody`, author: { name: "dev" } }, author: { login: `dev${i}` } }));
       return Response.json({ total_commits: 35, commits });
     }],
-    ["hooks.cursor", (init) => { hook.push(JSON.parse(init.body)); return Response.json({ ok: true }); }],
   ];
   return async (url, init = {}) => {
     for (const [m, r] of table) if (String(url).includes(m)) return r(init, url);
     throw new Error(`unexpected fetch ${url}`);
   };
 }
-const env = { REPOSITORY: "o/r", GH_RUN_ID: "12", BRANCH: "master", GITHUB_TOKEN: "t", TSIO_BASE_URL: "http://tsio", SUITES: JSON.stringify([{ name: "pw-master", test_root: "specs" }]), CURSOR_WEBHOOK_URL: "https://hooks.cursor.test/x", CURSOR_WEBHOOK_KEY: "k" };
+const env = { REPOSITORY: "o/r", GH_RUN_ID: "12", BRANCH: "master", GITHUB_TOKEN: "t", TSIO_BASE_URL: "http://tsio", SUITES: JSON.stringify([{ name: "pw-master", test_root: "specs" }]) };
 const now = new Date("2026-10-03T00:00:00Z");
 const ledgerPath = () => join(mkdtempSync(join(tmpdir(), "watch-")), "ledger.json");
+
+// One trunk run as the workflow does it: plan, send each request (into `hook`, answered with
+// `status`), then record what was accepted.
+async function run({ env: e, fetchImpl, now: at = now, hook = [], status = 200 }) {
+  const LEDGER_PATH = e.LEDGER_PATH ?? ledgerPath();
+  const PENDING_PATH = `${LEDGER_PATH}.pending`;
+  const result = await watch({ env: { ...e, LEDGER_PATH, PENDING_PATH }, fetchImpl, now: at, log: () => {} });
+  for (const r of result.requests) hook.push(r.payload);
+  record({ env: { LEDGER_PATH, PENDING_PATH, RESULTS: JSON.stringify(result.requests.map((r) => ({ id: r.id, status }))) }, now: at, log: () => {} });
+  return result;
+}
 
 test("broken specs with one cause go to one agent with what broke them, and are not requested again while it works", async () => {
   const hook = [];
@@ -116,11 +126,12 @@ test("broken specs with one cause go to one agent with what broke them, and are 
   const untils = [];
   const fetchImpl = routes({ hook, compared, untils });
   const LEDGER_PATH = ledgerPath();
-  const { decisions } = await watch({ env: { ...env, LEDGER_PATH }, fetchImpl, now, log: () => {} });
+  const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl, hook });
   assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [
     [["specs/y/b.spec.ts"], "skipped: #41 changes it or its directory"],
-    [["specs/x/a.spec.ts", "specs/z/c.spec.ts"], "repair requested"],
+    [["specs/x/a.spec.ts", "specs/z/c.spec.ts"], "to request"],
   ]);
+  assert.equal(hook[0].kind, "e2e-autofix");
   assert.equal(hook.length, 1);
   assert.deepEqual(hook[0].specs, ["specs/x/a.spec.ts", "specs/z/c.spec.ts"]);
   assert.equal(hook[0].classification, "broken");
@@ -131,21 +142,31 @@ test("broken specs with one cause go to one agent with what broke them, and are 
   assert.equal(hook[0].suspect_commits.length, 30);
   assert.equal(hook[0].suspect_commits[0].author, "dev0", "the oldest commits are kept");
   assert.equal(hook[0].suspect_commits_total, 35);
-  assert.deepEqual(hook[0].labels, ["e2e-master-repair"]);
+  assert.deepEqual(hook[0].labels, ["e2e-autofix"]);
 
   // The next master run, half an hour later: still broken, no PR yet, so its agent is still working.
-  const later = await watch({ env: { ...env, LEDGER_PATH }, fetchImpl, now: new Date(now.getTime() + 1800e3), log: () => {} });
+  const later = await run({ env: { ...env, LEDGER_PATH }, fetchImpl, now: new Date(now.getTime() + 1800e3), hook });
   assert.equal(hook.length, 1);
   assert.ok(later.decisions.filter((d) => d.specs[0] !== "specs/y/b.spec.ts").every((d) => d.action.startsWith("skipped: requested 2026-10-03 00:00 UTC")));
 
   // A day later with still no fix, it is asked again.
-  await watch({ env: { ...env, LEDGER_PATH }, fetchImpl, now: new Date(now.getTime() + 25 * 3600e3), log: () => {} });
+  await run({ env: { ...env, LEDGER_PATH }, fetchImpl, now: new Date(now.getTime() + 25 * 3600e3), hook });
   assert.equal(hook.length, 2);
 });
 
-test("the daily cap counts requests as well as PRs, and without a webhook it only reports", async () => {
+test("a request the agent did not accept is not recorded, so the next run plans it again", async () => {
+  const hook = [];
+  const LEDGER_PATH = ledgerPath();
+  const fetchImpl = routes({});
+  await run({ env: { ...env, LEDGER_PATH }, fetchImpl, hook, status: 500 });
+  const next = await run({ env: { ...env, LEDGER_PATH }, fetchImpl, now: new Date(now.getTime() + 1800e3), hook });
+  assert.deepEqual(next.decisions.map((d) => d.action), ["skipped: #41 changes it or its directory", "to request"]);
+  assert.equal(hook.length, 2);
+});
+
+test("the daily cap counts requests as well as PRs", async () => {
   const capped = [];
-  const { decisions } = await watch({ env, fetchImpl: routes({ hook: capped, openPRFiles: [], openedToday: 5 }), now, log: () => {} });
+  const { decisions } = await run({ env, fetchImpl: routes({ openPRFiles: [], openedToday: 5 }), hook: capped });
   assert.equal(capped.length, 0);
   assert.ok(decisions.every((d) => d.action === "skipped: over the repair cap"));
 
@@ -154,32 +175,27 @@ test("the daily cap counts requests as well as PRs, and without a webhook it onl
   const at = (h) => new Date(now.getTime() - h * 3600e3).toISOString();
   writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [1, 2, 3, 4, 5, 30].map((h) => ({ at: at(h), specs: [`specs/other${h}.spec.ts`], run: "r" })) }));
   const sent = [];
-  const over = await watch({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ hook: sent, openPRFiles: [] }), now, log: () => {} });
+  const over = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [] }), hook: sent });
   assert.equal(sent.length, 0);
   assert.ok(over.decisions.every((d) => d.action === "skipped: over the repair cap"));
-  const room = await watch({ env: { ...env, LEDGER_PATH, MAX_PER_DAY: "6" }, fetchImpl: routes({ hook: sent, openPRFiles: [] }), now, log: () => {} });
+  const room = await run({ env: { ...env, LEDGER_PATH, MAX_PER_DAY: "6" }, fetchImpl: routes({ openPRFiles: [] }), hook: sent });
   assert.equal(sent.length, 1);
-  assert.deepEqual(room.decisions.map((d) => d.action), ["repair requested"]);
+  assert.deepEqual(room.decisions.map((d) => d.action), ["to request"]);
 
   // A release-branch run started from the same workflow is not trunk.
   const release = [];
-  const other = await watch({ env, fetchImpl: routes({ hook: release, openPRFiles: [], branch: "release-12.0" }), now, log: () => {} });
+  const other = await run({ env, fetchImpl: routes({ openPRFiles: [], branch: "release-12.0" }), hook: release });
   assert.equal(release.length, 0);
   assert.deepEqual(other.notes, ["not a trunk run"]);
-
-  const dry = [];
-  const report = await watch({ env: { ...env, CURSOR_WEBHOOK_URL: "" }, fetchImpl: routes({ hook: dry, openPRFiles: [] }), now, log: () => {} });
-  assert.equal(dry.length, 0);
-  assert.deepEqual(report.decisions.map((d) => [d.specs.length, d.action]), [[3, "would request a repair (no webhook configured)"]]);
 });
 
 test("a test that failed and passed on retry is repaired as flaky only if it also flaked on trunk before", async () => {
   const hook = [];
-  const { decisions } = await watch({ env: { ...env, MAX_PER_RUN: "3" }, fetchImpl: routes({ hook, recovered: true }), now, log: () => {} });
+  const { decisions } = await run({ env: { ...env, MAX_PER_RUN: "3" }, fetchImpl: routes({ recovered: true }), hook });
   assert.deepEqual(decisions.map((d) => [d.specs, d.kind, d.action]), [
     [["specs/y/b.spec.ts"], "broken", "skipped: #41 changes it or its directory"],
-    [["specs/x/a.spec.ts", "specs/z/c.spec.ts"], "broken", "repair requested"],
-    [["specs/v/e.spec.ts"], "flaky", "repair requested"],
+    [["specs/x/a.spec.ts", "specs/z/c.spec.ts"], "broken", "to request"],
+    [["specs/v/e.spec.ts"], "flaky", "to request"],
   ], "u/f.spec.ts recovered on retry but never flaked on trunk before: wait");
   const flaky = hook.find((h) => h.classification === "flaky");
   assert.equal(flaky.tests[0].trunk.flaky, 1);
@@ -187,24 +203,24 @@ test("a test that failed and passed on retry is repaired as flaky only if it als
   assert.match(flaky.tests[0].error, /toast not visible/, "the error is the failed attempt's");
 });
 
-test("a repair PR that conflicts with trunk goes back to the automation, once per PR head", async () => {
+test("a fix PR that conflicts with trunk goes back to the agent, once per PR head", async () => {
   const hook = [];
   const LEDGER_PATH = ledgerPath();
-  const pr = (number, mergeable, head = `h${number}`) => ({ number, url: `https://github.com/o/r/pull/${number}`, headRefName: `fix/e2e-master-repair-${number}`, headRefOid: head, mergeable });
+  const pr = (number, mergeable, head = `h${number}`) => ({ number, url: `https://github.com/o/r/pull/${number}`, headRefName: `fix/e2e-autofix-${number}`, headRefOid: head, mergeable });
   const repairPRs = [pr(50, "CONFLICTING"), pr(51, "MERGEABLE"), pr(52, "UNKNOWN")];
-  const first = await watch({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ hook, repairPRs }), now, log: () => {} });
-  assert.deepEqual(first.conflicts.map((c) => [c.pr, c.action]), [[50, "asked the automation to resolve it"]], "only a known conflict is sent; UNKNOWN waits for the next run");
-  const sent = hook.filter((h) => h.kind === "e2e-master-repair-conflict");
+  const first = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ repairPRs }), hook });
+  assert.deepEqual(first.conflicts.map((c) => [c.pr, c.action]), [[50, "to send back"]], "only a known conflict is sent; UNKNOWN waits for the next run");
+  const sent = hook.filter((h) => h.kind === "e2e-autofix-conflict");
   assert.equal(sent.length, 1);
-  assert.deepEqual([sent[0].pr, sent[0].pr_branch, sent[0].pr_head], [50, "fix/e2e-master-repair-50", "h50"]);
-  assert.equal(hook.filter((h) => h.kind === "e2e-master-repair").length, 1, "a conflict request does not use up the repair cap");
+  assert.deepEqual([sent[0].pr, sent[0].pr_branch, sent[0].pr_head], [50, "fix/e2e-autofix-50", "h50"]);
+  assert.equal(hook.filter((h) => h.kind === "e2e-autofix").length, 1, "a conflict request does not use up the fix cap");
 
   // Next trunk run, same head still in conflict: its agent is on it.
-  const again = await watch({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ hook, repairPRs }), now: new Date(now.getTime() + 1800e3), log: () => {} });
+  const again = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ repairPRs }), now: new Date(now.getTime() + 1800e3), hook });
   assert.match(again.conflicts[0].action, /^skipped: sent .* for this head$/);
-  assert.equal(hook.filter((h) => h.kind === "e2e-master-repair-conflict").length, 1);
+  assert.equal(hook.filter((h) => h.kind === "e2e-autofix-conflict").length, 1);
 
   // The agent pushed a merge, and a later trunk merge conflicts again: a new head is a new request.
-  await watch({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ hook, repairPRs: [pr(50, "CONFLICTING", "h50b")] }), now: new Date(now.getTime() + 3600e3), log: () => {} });
-  assert.equal(hook.filter((h) => h.kind === "e2e-master-repair-conflict").length, 2);
+  await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ repairPRs: [pr(50, "CONFLICTING", "h50b")] }), now: new Date(now.getTime() + 3600e3), hook });
+  assert.equal(hook.filter((h) => h.kind === "e2e-autofix-conflict").length, 2);
 });
