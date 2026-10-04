@@ -7,6 +7,7 @@ trunk rules (branch and commit come from what the run reported to TSIO) and asks
 | --- | --- |
 | Failed in this run and the previous one (`BROKEN_ON_TRUNK`) | repair |
 | Intermittent on trunk: failed in this run and at least once before (`FLAKY_ON_TRUNK`) | repair |
+| Failed and then passed on retry in this run, and failed or flaked on trunk at least once before | repair (flaky) |
 | Failed for the first time | wait for the next run |
 | Run failed for environmental reasons | report only |
 

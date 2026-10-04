@@ -9,6 +9,8 @@
  * The decision is the triage engine's, on the trunk run itself (no AI):
  *   broken  BROKEN_ON_TRUNK: failed in this run and the previous one  -> repair
  *   flaky   FLAKY_ON_TRUNK: failed now and at least MIN_FLAKY times before -> repair
+ *   flaky   failed and then passed on retry now, and failed or flaked on trunk
+ *           at least MIN_FLAKY times before                            -> repair
  *   new     failed for the first time                                 -> wait for the next run
  *   infra   the run failed for environmental reasons                  -> report only
  * Broken specs that last passed on the same commit most likely share a cause and
@@ -19,7 +21,7 @@
  */
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { compactError, FAILED_STATUSES, fetchHistory, gh, identityKey, laneOf, triage } from "./e2e-triage.mjs";
+import { compactError, FAILED_STATUSES, fetchHistory, gh, identityKey, laneOf, outcomeOf, repoPath, triage } from "./e2e-triage.mjs";
 
 export const LABEL = "e2e-master-repair";
 const HOUR = 3600e3;
@@ -40,6 +42,62 @@ export function selectRepairs(result, suite, { minFlaky = 1 } = {}) {
     if (kind === "broken") g.kind = "broken";
     g.suites.add(suite);
     g.tests.push({ spec, title: f.title, full_title: f.full_title ?? null, error: compactError(f.error, 600), trunk: f.trunk, finding: f });
+  }
+  return [...bySpec.values()];
+}
+
+/**
+ * Tests that failed and then passed on retry in one run. The triage engine counts them as
+ * passed, so a test that flakes on trunk but always recovers would otherwise never be seen.
+ */
+export async function retryRecovered(fetchImpl, base, groupId) {
+  const get = async (path) => {
+    const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(60000) });
+    if (!res.ok) throw new Error(`TSIO GET ${path}: ${res.status}`);
+    return res.json();
+  };
+  const [{ suites = [] }, cases] = await Promise.all([get(`/reports/${groupId}/suites`), get(`/reports/${groupId}/cases`)]);
+  const fileOf = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
+  const byTest = new Map();
+  for (const c of cases) {
+    const k = c.full_title ? JSON.stringify([fileOf.get(c.suite_id) ?? "", c.full_title]) : JSON.stringify([c.suite_id, c.title]);
+    if (!byTest.has(k)) byTest.set(k, []);
+    byTest.get(k).push(c);
+  }
+  // A name two tests share can't be matched to its own history.
+  const perIdentity = new Map();
+  for (const attempts of byTest.values()) {
+    const key = identityKey({ file: fileOf.get(attempts[0].suite_id), title: attempts[0].title, full_title: attempts[0].full_title });
+    perIdentity.set(key, (perIdentity.get(key) ?? 0) + 1);
+  }
+  const out = [];
+  for (const attempts of byTest.values()) {
+    attempts.sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0));
+    if (outcomeOf(attempts).status !== "flaky") continue;
+    const failed = attempts.find((a) => FAILED_STATUSES.has(a.status)) ?? attempts[0];
+    const file = fileOf.get(failed.suite_id) ?? "";
+    const test = { file, title: failed.title, full_title: failed.full_title ?? null, error: [failed.error_message, failed.error_stack].filter(Boolean).join("\n") };
+    if (file && perIdentity.get(identityKey(test)) === 1) out.push(test);
+  }
+  return out;
+}
+
+/** Retry-recovered tests that also failed or flaked in an earlier trunk run, grouped by spec file. */
+export function selectRetryFlakes(tests, history, { suite, testRoot, branch, groupId, minFlaky = 1 }) {
+  const bySpec = new Map();
+  for (const t of tests) {
+    if (history.ambiguous?.has(identityKey(t))) continue;
+    const trunk = (history.get(identityKey(t)) ?? []).filter((o) => o.group_id !== groupId && o.branch === branch && (o.gh_pr_number == null || o.gh_pr_number === "") && o.status !== "skipped");
+    const fails = trunk.filter((o) => FAILED_STATUSES.has(o.status)).length;
+    const flaky = trunk.filter((o) => o.status === "flaky").length;
+    if (fails + flaky < minFlaky) continue;
+    const spec = repoPath(testRoot, t.file) ?? t.file;
+    if (!bySpec.has(spec)) bySpec.set(spec, { spec, kind: "flaky", suites: new Set([suite]), tests: [] });
+    bySpec.get(spec).tests.push({
+      spec, title: t.title, full_title: t.full_title, error: compactError(t.error, 600),
+      trunk: { runs: trunk.length, fails, flaky, passes: trunk.filter((o) => o.status === "passed").length, latest: trunk[0]?.status ?? "", recovered_on_retry_now: true },
+      finding: t,
+    });
   }
   return [...bySpec.values()];
 }
@@ -185,7 +243,9 @@ export function bundle(groups) {
     if (key) byGreen.set(key, req);
     requests.push(req);
   }
-  return requests.sort((a, b) => (a.kind === b.kind ? 0 : a.kind === "broken" ? -1 : 1));
+  // Broken first; among flaky ones, the one that flaked most on trunk first.
+  const flakes = (r) => r.tests.reduce((n, t) => n + (t.trunk?.fails ?? 0) + (t.trunk?.flaky ?? 0), 0);
+  return requests.sort((a, b) => (a.kind === b.kind ? (a.kind === "flaky" ? flakes(b) - flakes(a) : 0) : a.kind === "broken" ? -1 : 1));
 }
 
 /**
@@ -239,7 +299,18 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
       notes.push(`${s.name}: infrastructure, not repaired (${result.infra})`);
       continue;
     }
-    for (const g of selectRepairs(result, s.name, { minFlaky: Number(env.MIN_FLAKY || 1) })) {
+    const found = selectRepairs(result, s.name, { minFlaky: Number(env.MIN_FLAKY || 1) });
+    try {
+      const groupId = groupsOfRun.find((g) => g.name === s.name && g.branch === trunk).id;
+      const recovered = await retryRecovered(fetchImpl, base, groupId);
+      if (recovered.length) {
+        const history = await fetchHistory(fetchImpl, base, id.repository, recovered, until, undefined, trunk, s.report_name || null, log, laneOf(s.name));
+        found.push(...selectRetryFlakes(recovered, history, { suite: s.name, testRoot: s.test_root, branch: trunk, groupId, minFlaky: Number(env.MIN_FLAKY || 1) }));
+      }
+    } catch (e) {
+      notes.push(`${s.name}: retry-recovered tests not read (${String(e).slice(0, 160)})`);
+    }
+    for (const g of found) {
       const prev = groups.get(g.spec);
       if (!prev) groups.set(g.spec, g);
       else {

@@ -59,14 +59,25 @@ test("broken specs that last passed on the same commit go to one agent; flaky on
 });
 
 // A trunk run with three broken specs, all broken since c1; an open PR changes a helper beside y/b.spec.ts.
-function routes({ hook, compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts"], openedToday = 0, branch = "master" }) {
+// With `recovered`, two more specs fail once and pass on retry: v/e.spec.ts flaked on trunk before, u/f.spec.ts never did.
+function routes({ hook, compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts"], openedToday = 0, branch = "master", recovered = false }) {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
+  const retried = recovered ? ["v/e.spec.ts", "u/f.spec.ts"] : [];
   const obs = (file, status, i) => ({ file, title: "t1", status, retry_count: 0, gh_pr_number: null, branch: "master", group_id: `old-${i}`, commit_sha: `c${i}`, created_at: `2026-10-02T0${9 - i}:00:00Z`, name: "pw-master", error_excerpt: "Error: expected visible" });
-  const history = files.flatMap((file) => [obs(file, "failed", 1), ...[2, 3, 4, 5, 6].map((i) => obs(file, "passed", i))]);
+  const history = [
+    ...files.flatMap((file) => [obs(file, "failed", 1), ...[2, 3, 4, 5, 6].map((i) => obs(file, "passed", i))]),
+    ...(recovered ? [obs("v/e.spec.ts", "flaky", 3), ...[1, 2, 4, 5, 6].map((i) => obs("v/e.spec.ts", "passed", i)), ...[1, 2, 3, 4, 5, 6].map((i) => obs("u/f.spec.ts", "passed", i))] : []),
+  ];
   const table = [
     ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", branch, commit: "abc", name: "pw-master", gh_run_id: "12", gh_run_attempt: "1", status: "completed", created_at: "2026-10-02T09:30:00Z", last_upload_at: "2026-10-02T09:50:00Z" }] })],
-    ["/reports/g1/suites", () => Response.json({ suites: files.map((file_path, i) => ({ id: `s${i}`, file_path })) })],
-    ["/reports/g1/cases", () => Response.json(files.map((_, i) => ({ suite_id: `s${i}`, title: "t1", status: "failed", retry_count: 0, ordinal: i, error_message: "Error: expected visible" })))],
+    ["/reports/g1/suites", () => Response.json({ suites: [...files, ...retried].map((file_path, i) => ({ id: `s${i}`, file_path })) })],
+    ["/reports/g1/cases", () => Response.json([
+      ...files.map((_, i) => ({ suite_id: `s${i}`, title: "t1", status: "failed", retry_count: 0, ordinal: i, error_message: "Error: expected visible" })),
+      ...retried.flatMap((_, j) => [
+        { suite_id: `s${files.length + j}`, title: "t1", status: "failed", retry_count: 0, ordinal: files.length + j, error_message: "Error: toast not visible" },
+        { suite_id: `s${files.length + j}`, title: "t1", status: "passed", retry_count: 1, ordinal: files.length + j },
+      ]),
+    ])],
     ["/reports/history", (init) => { untils.push(JSON.parse(init.body).until); return Response.json({ observations: history }); }],
     ["/commits/abc", () => Response.json({ files: [] })],
     ["/graphql", (init) => {
@@ -155,4 +166,18 @@ test("the daily cap counts requests as well as PRs, and without a webhook it onl
   const report = await watch({ env: { ...env, CURSOR_WEBHOOK_URL: "" }, fetchImpl: routes({ hook: dry, openPRFiles: [] }), now, log: () => {} });
   assert.equal(dry.length, 0);
   assert.deepEqual(report.decisions.map((d) => [d.specs.length, d.action]), [[3, "would request a repair (no webhook configured)"]]);
+});
+
+test("a test that failed and passed on retry is repaired as flaky only if it also flaked on trunk before", async () => {
+  const hook = [];
+  const { decisions } = await watch({ env: { ...env, MAX_PER_RUN: "3" }, fetchImpl: routes({ hook, recovered: true }), now, log: () => {} });
+  assert.deepEqual(decisions.map((d) => [d.specs, d.kind, d.action]), [
+    [["specs/y/b.spec.ts"], "broken", "skipped: #41 changes it or its directory"],
+    [["specs/x/a.spec.ts", "specs/z/c.spec.ts"], "broken", "repair requested"],
+    [["specs/v/e.spec.ts"], "flaky", "repair requested"],
+  ], "u/f.spec.ts recovered on retry but never flaked on trunk before: wait");
+  const flaky = hook.find((h) => h.classification === "flaky");
+  assert.equal(flaky.tests[0].trunk.flaky, 1);
+  assert.equal(flaky.tests[0].trunk.recovered_on_retry_now, true);
+  assert.match(flaky.tests[0].error, /toast not visible/, "the error is the failed attempt's");
 });
