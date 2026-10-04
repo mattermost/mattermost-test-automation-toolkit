@@ -60,7 +60,7 @@ test("broken specs that last passed on the same commit go to one agent; flaky on
 
 // A trunk run with three broken specs, all broken since c1; an open PR changes a helper beside y/b.spec.ts.
 // With `recovered`, two more specs fail once and pass on retry: v/e.spec.ts flaked on trunk before, u/f.spec.ts never did.
-function routes({ hook, compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts"], openedToday = 0, branch = "master", recovered = false }) {
+function routes({ hook, compared = [], untils = [], openPRFiles = ["specs/y/helpers.ts"], openedToday = 0, branch = "master", recovered = false, repairPRs = [] }) {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
   const retried = recovered ? ["v/e.spec.ts", "u/f.spec.ts"] : [];
   const obs = (file, status, i) => ({ file, title: "t1", status, retry_count: 0, gh_pr_number: null, branch: "master", group_id: `old-${i}`, commit_sha: `c${i}`, created_at: `2026-10-02T0${9 - i}:00:00Z`, name: "pw-master", error_excerpt: "Error: expected visible" });
@@ -81,8 +81,13 @@ function routes({ hook, compared = [], untils = [], openPRFiles = ["specs/y/help
     ["/reports/history", (init) => { untils.push(JSON.parse(init.body).until); return Response.json({ observations: history }); }],
     ["/commits/abc", () => Response.json({ files: [] })],
     ["/graphql", (init) => {
+      const { query, variables } = JSON.parse(init.body);
+      if (query.includes("search(")) {
+        assert.match(variables.q, /is:open label:e2e-master-repair/);
+        return Response.json({ data: { search: { nodes: repairPRs } } });
+      }
       // Two pages: #41 is not among the newest 50, and #7 was last updated too long ago to count.
-      const { after } = JSON.parse(init.body).variables;
+      const { after } = variables;
       const pr = (number, updatedAt, paths = []) => ({ number, updatedAt, files: { pageInfo: { hasNextPage: false }, nodes: paths.map((path) => ({ path })) } });
       if (!after) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p2" }, nodes: Array.from({ length: 50 }, (_, i) => pr(100 + i, "2026-10-02T12:00:00Z")) } } } });
       return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p3" }, nodes: [pr(41, "2026-10-02T00:00:00Z", openPRFiles), pr(7, "2026-09-01T00:00:00Z", ["specs/x/a.spec.ts"])] } } } });
@@ -180,4 +185,26 @@ test("a test that failed and passed on retry is repaired as flaky only if it als
   assert.equal(flaky.tests[0].trunk.flaky, 1);
   assert.equal(flaky.tests[0].trunk.recovered_on_retry_now, true);
   assert.match(flaky.tests[0].error, /toast not visible/, "the error is the failed attempt's");
+});
+
+test("a repair PR that conflicts with trunk goes back to the automation, once per PR head", async () => {
+  const hook = [];
+  const LEDGER_PATH = ledgerPath();
+  const pr = (number, mergeable, head = `h${number}`) => ({ number, url: `https://github.com/o/r/pull/${number}`, headRefName: `fix/e2e-master-repair-${number}`, headRefOid: head, mergeable });
+  const repairPRs = [pr(50, "CONFLICTING"), pr(51, "MERGEABLE"), pr(52, "UNKNOWN")];
+  const first = await watch({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ hook, repairPRs }), now, log: () => {} });
+  assert.deepEqual(first.conflicts.map((c) => [c.pr, c.action]), [[50, "asked the automation to resolve it"]], "only a known conflict is sent; UNKNOWN waits for the next run");
+  const sent = hook.filter((h) => h.kind === "e2e-master-repair-conflict");
+  assert.equal(sent.length, 1);
+  assert.deepEqual([sent[0].pr, sent[0].pr_branch, sent[0].pr_head], [50, "fix/e2e-master-repair-50", "h50"]);
+  assert.equal(hook.filter((h) => h.kind === "e2e-master-repair").length, 1, "a conflict request does not use up the repair cap");
+
+  // Next trunk run, same head still in conflict: its agent is on it.
+  const again = await watch({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ hook, repairPRs }), now: new Date(now.getTime() + 1800e3), log: () => {} });
+  assert.match(again.conflicts[0].action, /^skipped: sent .* for this head$/);
+  assert.equal(hook.filter((h) => h.kind === "e2e-master-repair-conflict").length, 1);
+
+  // The agent pushed a merge, and a later trunk merge conflicts again: a new head is a new request.
+  await watch({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ hook, repairPRs: [pr(50, "CONFLICTING", "h50b")] }), now: new Date(now.getTime() + 3600e3), log: () => {} });
+  assert.equal(hook.filter((h) => h.kind === "e2e-master-repair-conflict").length, 2);
 });

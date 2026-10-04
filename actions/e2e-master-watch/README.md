@@ -24,6 +24,11 @@ day, counting requests sent and repair PRs (label `e2e-master-repair`) opened. T
 record of requests sent is kept between runs with `actions/cache`. Without a
 webhook URL it only writes the job summary, so it can run report-only first.
 
+The automation also owns the PRs it opens. After each trunk run, an open repair PR
+(label `e2e-master-repair`) that now conflicts with trunk is sent back to it with a
+conflict request, so it merges trunk in, resolves the conflict and re-verifies. Each
+PR head is sent once per `hold-hours`.
+
 The repair itself (reproduce, fix, verify several times, open the PR) is the
 automation's job; its instructions live in the consumer repository, for example
 `.cursor/automations/e2e-master-repair.md`.

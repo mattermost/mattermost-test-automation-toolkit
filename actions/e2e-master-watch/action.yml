@@ -40,6 +40,10 @@ inputs:
     description: Repair requests sent (or repair PRs, label e2e-master-repair, opened) in the last 24 hours before requests stop
     required: false
     default: "5"
+  max-conflicts-per-run:
+    description: Repair PRs in conflict with trunk sent back to the automation per trunk run
+    required: false
+    default: "2"
   hold-hours:
     description: Hours a requested spec is left to its agent before it can be requested again
     required: false
@@ -75,6 +79,7 @@ runs:
         MAX_PER_RUN: ${{ inputs.max-per-run }}
         MAX_PER_DAY: ${{ inputs.max-per-day }}
         HOLD_HOURS: ${{ inputs.hold-hours }}
+        MAX_CONFLICTS_PER_RUN: ${{ inputs.max-conflicts-per-run }}
         LEDGER_PATH: ${{ github.workspace }}/.e2e-master-watch/ledger.json
         EXTRA_LABELS: ${{ inputs.extra-labels }}
         TSIO_BASE_URL: ${{ inputs.tsio-base-url }}

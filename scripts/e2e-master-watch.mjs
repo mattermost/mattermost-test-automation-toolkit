@@ -18,6 +18,10 @@
  * open PR changes it or its directory, or when it was requested within HOLD_HOURS
  * (its agent is still working). Requests are capped per run and per day. Without
  * a webhook URL it only reports.
+ *
+ * The automation also owns the PRs it opened: a repair PR (label LABEL) that now
+ * conflicts with trunk is sent back to it to merge trunk in and re-verify, once per
+ * PR head within HOLD_HOURS.
  */
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -248,6 +252,20 @@ export function bundle(groups) {
   return requests.sort((a, b) => (a.kind === b.kind ? (a.kind === "flaky" ? flakes(b) - flakes(a) : 0) : a.kind === "broken" ? -1 : 1));
 }
 
+const REPAIR_PRS = `query($q: String!) {
+  search(query: $q, type: ISSUE, first: 30) {
+    nodes { ... on PullRequest { number url headRefName headRefOid mergeable } }
+  }
+}`;
+
+/** Open repair PRs (label LABEL) whose branch no longer merges cleanly into trunk. */
+export async function conflictedRepairPRs(api, repository) {
+  const res = await api("POST", "/graphql", { query: REPAIR_PRS, variables: { q: `repo:${repository} is:pr is:open label:${LABEL}` } });
+  if (res.errors?.length) throw new Error(`GitHub GraphQL: ${res.errors[0].message}`);
+  // UNKNOWN means GitHub has not computed it yet: the next trunk run looks again.
+  return (res.data?.search?.nodes ?? []).filter((p) => p?.mergeable === "CONFLICTING");
+}
+
 /**
  * The TSIO groups of one workflow run. The merge workflow tests the branch named
  * in its inputs, not the ref it was started from, so branch and commit come from
@@ -321,6 +339,12 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     }
   }
 
+  const send = (payload) => fetchImpl(env.CURSOR_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${env.CURSOR_WEBHOOK_KEY ?? ""}` },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(30000),
+  });
   const decisions = [];
   const ledger = readLedger(env.LEDGER_PATH).filter((r) => now.getTime() - Date.parse(r.at) < 7 * 24 * HOUR);
   writeLedger(env.LEDGER_PATH, ledger); // pruned, and present for the cache to save even when nothing is sent
@@ -328,14 +352,14 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   const ready = [];
   for (const g of groups.values()) {
     const prs = prsTouching(touched, g.spec);
-    const held = ledger.find((r) => r.specs.includes(g.spec) && now.getTime() - Date.parse(r.at) < holdMs);
+    const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < holdMs);
     if (prs.length) decisions.push({ specs: [g.spec], kind: g.kind, tests: g.tests, action: `skipped: #${prs.join(", #")} changes it or its directory` });
     else if (held) decisions.push({ specs: [g.spec], kind: g.kind, tests: g.tests, action: `skipped: requested ${held.at.slice(0, 16).replace("T", " ")} UTC by ${held.run}` });
     else ready.push({ ...g, range: await specRange(fetchImpl, base, id, g, until, log) });
   }
 
   const requests = bundle(ready);
-  const sentToday = ledger.filter((r) => now.getTime() - Date.parse(r.at) < 24 * HOUR).length;
+  const sentToday = ledger.filter((r) => r.specs && now.getTime() - Date.parse(r.at) < 24 * HOUR).length;
   const openedToday = requests.length ? await repairsOpenedSince(api, id.repository, new Date(now.getTime() - 24 * HOUR)) : 0;
   let budget = Math.min(maxPerRun, maxPerDay - Math.max(sentToday, openedToday));
   for (const r of requests) {
@@ -361,12 +385,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
       decision.action = "would request a repair (no webhook configured)";
       continue;
     }
-    const res = await fetchImpl(env.CURSOR_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${env.CURSOR_WEBHOOK_KEY ?? ""}` },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(30000),
-    });
+    const res = await send(payload);
     decision.action = res.ok ? "repair requested" : `repair request failed: HTTP ${res.status}`;
     if (res.ok) {
       // Written at once, so a crash later in this run cannot lose a request that was sent.
@@ -375,16 +394,53 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     }
   }
 
+  // The repair PRs the automation opened are its own to keep mergeable: a trunk merge that
+  // conflicts with one goes back to it, once per PR head within the hold.
+  const conflicts = [];
+  try {
+    for (const pr of (await conflictedRepairPRs(api, id.repository)).slice(0, Number(env.MAX_CONFLICTS_PER_RUN || 2))) {
+      const held = ledger.find((r) => r.pr === pr.number && r.head === pr.headRefOid && now.getTime() - Date.parse(r.at) < holdMs);
+      const c = { pr: pr.number, url: pr.url };
+      conflicts.push(c);
+      if (held) {
+        c.action = `skipped: sent ${held.at.slice(0, 16).replace("T", " ")} UTC for this head`;
+        continue;
+      }
+      c.payload = {
+        kind: "e2e-master-repair-conflict",
+        repository: id.repository, branch: id.branch, master_run: runURL,
+        pr: pr.number, pr_url: pr.url, pr_branch: pr.headRefName, pr_head: pr.headRefOid,
+        instructions: env.INSTRUCTIONS || ".cursor/automations/e2e-master-repair.md",
+      };
+      if (!env.CURSOR_WEBHOOK_URL) {
+        c.action = "would ask the automation to resolve it (no webhook configured)";
+        continue;
+      }
+      const res = await send(c.payload);
+      c.action = res.ok ? "asked the automation to resolve it" : `request failed: HTTP ${res.status}`;
+      if (res.ok) {
+        ledger.push({ at: now.toISOString(), pr: pr.number, head: pr.headRefOid, run: runURL });
+        writeLedger(env.LEDGER_PATH, ledger);
+      }
+    }
+  } catch (e) {
+    notes.push(`repair PRs not checked for conflicts (${String(e).slice(0, 160)})`);
+  }
+
   const lines = [`## E2E master watch: ${id.commit_sha.slice(0, 9)} · [run](${runURL})`, ""];
   if (!decisions.length) lines.push("No failure needs a repair: nothing failed twice in a row or flaked repeatedly.");
   else {
     lines.push("| Specs | Kind | Tests | Action |", "| --- | --- | --- | --- |");
     for (const d of decisions) lines.push(`| ${d.specs.map((s) => `\`${s}\``).join("<br>")} | ${d.kind} | ${d.tests.length} | ${d.action} |`);
   }
+  if (conflicts.length) {
+    lines.push("", "Repair PRs in conflict with trunk:", "", "| PR | Action |", "| --- | --- |");
+    for (const c of conflicts) lines.push(`| [#${c.pr}](${c.url}) | ${c.action} |`);
+  }
   if (notes.length) lines.push("", ...notes.map((n) => `- ${n}`));
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
   log(lines.join("\n"));
-  return { decisions, notes };
+  return { decisions, conflicts, notes };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
