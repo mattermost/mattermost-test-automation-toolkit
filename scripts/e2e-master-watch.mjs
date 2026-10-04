@@ -283,9 +283,11 @@ async function suspects(api, id, range, log) {
  * Broken specs that started failing on the same trunk commit go to one agent together: one
  * merge broke them, and separate agents would race to fix the same cause. Keyed by the first
  * red commit, not the last green one: incomplete runs leave each spec a different last pass.
- * A spec with no first red in the history failed first in this run (`currentCommit`). Broken
- * specs with no range (never passed in the window), and every flaky spec, go alone. The bundle
- * keeps the oldest last-green commit, so its suspect range covers every spec in it. Broken first;
+ * A spec with no first red in the history failed first in this run (`currentCommit`), and so did
+ * one with no range whose tests never failed on trunk before (they had only been skipped, e.g.
+ * behind a feature flag the breaking merge turned on). A broken spec with no range that did fail
+ * before, and every flaky spec, go alone. The bundle keeps the oldest last-green commit, so its
+ * suspect range covers every spec in it. Broken first;
  * among flaky ones, the one that flaked most on trunk first.
  */
 export function bundle(groups, { currentCommit = null } = {}) {
@@ -293,14 +295,15 @@ export function bundle(groups, { currentCommit = null } = {}) {
   const byRed = new Map();
   const at = (o) => Date.parse(o?.created_at) || 0;
   for (const g of groups) {
-    const key = g.kind === "broken" && g.range ? (g.range.red?.commit_sha ?? currentCommit) : null;
+    const firstFailureNow = g.tests.every((t) => t.trunk?.fails === 0);
+    const key = g.kind !== "broken" ? null : g.range ? (g.range.red?.commit_sha ?? currentCommit) : firstFailureNow ? currentCommit : null;
     const r = key && byRed.get(key);
     if (r) {
       r.specs.push(g.spec);
       for (const s of g.suites) r.suites.add(s);
       r.tests.push(...g.tests);
       for (const p of g.openPRs ?? []) if (!r.openPRs.some((q) => q.number === p.number)) r.openPRs.push(p);
-      if (at(g.range.green) < at(r.range.green)) r.range = { ...r.range, green: g.range.green };
+      if (g.range && (!r.range || at(g.range.green) < at(r.range.green))) r.range = { ...(r.range ?? g.range), green: g.range.green };
       continue;
     }
     const req = { specs: [g.spec], kind: g.kind, suites: new Set(g.suites), tests: [...g.tests], range: g.range, openPRs: [...(g.openPRs ?? [])] };

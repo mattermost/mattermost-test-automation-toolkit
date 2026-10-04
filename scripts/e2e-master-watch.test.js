@@ -53,7 +53,7 @@ test("the suspect range starts where every failing test last passed and ends at 
 
 test("broken specs that started failing on the same commit go to one agent; flaky ones alone, after them", () => {
   const row = (sha, hour) => ({ commit_sha: sha, created_at: `2026-10-02T${hour}:00:00Z` });
-  const g = (spec, kind, green, red) => ({ spec, kind, suites: new Set(["s"]), tests: [{ spec, title: "t" }], range: green ? { green, red } : null });
+  const g = (spec, kind, green, red, fails = 1) => ({ spec, kind, suites: new Set(["s"]), tests: [{ spec, title: "t", trunk: { fails } }], range: green ? { green, red } : null });
   const requests = bundle([
     g("f.spec.ts", "flaky", row("c1", "01"), row("r1", "10")),
     // One merge broke a and b; an incomplete run left them different last passes.
@@ -61,19 +61,23 @@ test("broken specs that started failing on the same commit go to one agent; flak
     g("b.spec.ts", "broken", row("c2", "02"), row("r1", "10")),
     g("c.spec.ts", "broken", row("c1", "01"), row("r2", "11")),
     // First failure in this run: no red row yet, so the current commit is its first red.
+    // No range, never failed before: it had only been skipped until this run.
+    g("k.spec.ts", "broken", null, null, 0),
     g("e.spec.ts", "broken", row("c4", "04"), null),
     g("h.spec.ts", "broken", row("c5", "05"), null),
+    // No range, but failing in earlier runs too: an older break of its own.
     g("d.spec.ts", "broken", null),
   ], { currentCommit: "now" });
   assert.deepEqual(requests.map((r) => [r.specs, r.kind]), [
     [["a.spec.ts", "b.spec.ts"], "broken"],
     [["c.spec.ts"], "broken"],
-    [["e.spec.ts", "h.spec.ts"], "broken"],
+    [["k.spec.ts", "e.spec.ts", "h.spec.ts"], "broken"],
     [["d.spec.ts"], "broken"],
     [["f.spec.ts"], "flaky"],
   ]);
   assert.equal(requests[0].range.green.commit_sha, "c2", "the oldest last pass, so the suspect range covers both specs");
   assert.equal(requests[0].range.red.commit_sha, "r1");
+  assert.equal(requests[2].range.green.commit_sha, "c4", "a bundle started by a spec with no range takes the others' range");
 });
 
 // A trunk run with three broken specs, all broken since c1; an open PR changes a helper beside y/b.spec.ts.
