@@ -1,6 +1,6 @@
-name: E2E master watch record
+name: E2E test watch record
 description: >
-  After the caller sent the requests from actions/e2e-master-watch, keep the
+  After the caller sent the requests from actions/e2e-test-watch, keep the
   accepted ones, so the next trunk run holds their specs and PRs and counts them
   toward the daily cap. Run it on every trunk run, even one that sent nothing.
 author: Mattermost
@@ -28,4 +28,5 @@ runs:
       with:
         path: ${{ github.workspace }}/.e2e-master-watch/ledger.json
         # Unique to this run of the calling workflow: a re-run saves a new entry instead of failing to overwrite.
+        # Keeps the former action name, like the restore in action.yml: the key identifies the saved ledger.
         key: e2e-master-watch-${{ inputs.branch }}-${{ github.run_id }}-${{ github.run_attempt }}

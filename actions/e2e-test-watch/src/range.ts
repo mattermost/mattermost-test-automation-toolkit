@@ -1,9 +1,9 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import type { TestRef } from "../../e2e-triage/src/types.ts";
-import { fetchHistory } from "../../e2e-triage/src/history.ts";
-import { laneOf } from "../../e2e-triage/src/config.ts";
+import type { TestRef } from "../../e2e-test-triage/src/types.ts";
+import { fetchHistory } from "../../e2e-test-triage/src/history.ts";
+import { laneOf } from "../../e2e-test-triage/src/config.ts";
 import type { FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { FAILED_STATUSES } from "../../shared/src/tsio.ts";
 import { flakes, trunkRows } from "./model.ts";

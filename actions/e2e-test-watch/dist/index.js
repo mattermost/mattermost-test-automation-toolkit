@@ -1,10 +1,10 @@
 "use strict";
 
 // src/watch.ts
-var import_node_fs4 = require("fs");
+var import_node_fs5 = require("fs");
 var import_node_path3 = require("path");
 
-// ../e2e-triage/src/pricing.ts
+// ../e2e-test-triage/src/pricing.ts
 var PRICES = {
   "claude-haiku-4-5": { input: 1, output: 5, cache_write: 1.25, cache_read: 0.1 },
   "claude-sonnet-5-5": { input: 2, output: 10, cache_write: 2.5, cache_read: 0.2 },
@@ -37,7 +37,7 @@ function ledgerTotals(ledger) {
   };
 }
 
-// ../e2e-triage/src/config.ts
+// ../e2e-test-triage/src/config.ts
 var PR_SPEND_KEY = "_pr_spend";
 var HISTORY_MAX_FILES = 50;
 var HISTORY_PER_PAGE = 2e3;
@@ -79,6 +79,11 @@ var DEFAULTS = {
   model: "claude-sonnet-5-5"
 };
 var laneOf = (name) => String(name ?? "").replace(/^(mobile|desktop)-(pr|main|master)(-|$)/, "").replace(/-(master|main|release(-cut)?)$/, "") || "default";
+var OS_OF_REPORT = [[/ubuntu/, "linux"], [/windows/, "windows"], [/macos/, "macos"]];
+var laneOfReport = (name) => {
+  const rest = String(name).replace(/^e2e-on-/, "");
+  return OS_OF_REPORT.find(([re]) => re.test(rest))?.[1] ?? rest;
+};
 var repoPath = (testRoot, file) => {
   if (testRoot == null || testRoot === "") return null;
   const root = String(testRoot).replace(/^\.?\/*/, "").replace(/\/+$/, "");
@@ -153,6 +158,13 @@ function configFrom(env, warn = () => {
 
 // ../shared/src/tsio.ts
 var FAILED_STATUSES = /* @__PURE__ */ new Set(["failed", "timedOut", "interrupted"]);
+var isFailedTry = (status) => FAILED_STATUSES.has(status) || status === "flaky";
+var elsewhereKey = (file, title) => JSON.stringify([String(file ?? "").replace(/\\/g, "/"), String(title ?? "").replace(/\\/g, "/")]);
+async function tsioJson(fetchImpl, base, path) {
+  const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(6e4) });
+  if (!res.ok) throw new Error(`TSIO GET ${path}: ${res.status}`);
+  return await res.json();
+}
 var DEFAULT_TSIO_BASE_URL = "https://test-io.test.mattermost.com";
 var STAGING_TSIO_BASE_URL = "https://staging-test-io.test.mattermost.com";
 var withoutTrailingSlash = (url) => url.replace(/\/$/, "");
@@ -190,14 +202,37 @@ function compositeIdentityFrom(raw) {
     throw new Error(`COMPOSITE_IDENTITY is not valid JSON: ${String(e).slice(0, 120)}`);
   }
 }
+var newerRun = (a, b) => {
+  const run = BigInt(a.gh_run_id) - BigInt(b.gh_run_id);
+  return run !== BigInt(0) ? run > BigInt(0) : BigInt(a.gh_run_attempt) > BigInt(b.gh_run_attempt);
+};
+var SupersededRunError = class extends Error {
+  replacement;
+  constructor(message, replacement) {
+    super(message);
+    this.name = "SupersededRunError";
+    this.replacement = replacement;
+  }
+};
+var NoResultsError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "NoResultsError";
+  }
+};
+function missingArrived(missing) {
+  if (!missing) return null;
+  const { expected, received } = missing;
+  if (expected != null && received != null) return `${received} of ${expected} reports arrived`;
+  return `${received ?? "?"} reports arrived (the expected count is unknown)`;
+}
 async function fetchRun(fetchImpl, base, id, reportName = null, wait = { attempts: 6, ms: 2e4 }) {
-  const get = async (path) => {
-    const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(6e4) });
-    if (!res.ok) throw new Error(`TSIO GET ${path}: ${res.status}`);
-    return await res.json();
-  };
   const q = new URLSearchParams({ repository: id.repository, commit: id.commit_sha, name: String(id.name), limit: "20" });
-  const { reports: groups = [] } = await get(`/reports?${q}`);
+  const { reports: groups = [] } = await tsioJson(fetchImpl, base, `/reports?${q}`);
+  return runFromGroups(fetchImpl, base, id, groups, reportName, wait);
+}
+async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wait = { attempts: 6, ms: 2e4 }) {
+  const get = (path) => tsioJson(fetchImpl, base, path);
   const runId = String(id.gh_run_id ?? "");
   const attempt = String(id.gh_run_attempt ?? "");
   if (!runId || !attempt)
@@ -205,8 +240,18 @@ async function fetchRun(fetchImpl, base, id, reportName = null, wait = { attempt
   const group = groups.find(
     (g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name && String(g.gh_run_id) === runId && String(g.gh_run_attempt) === attempt
   );
-  if (!group)
-    throw new Error(`TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`);
+  if (!group) {
+    const noGroup = `TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`;
+    const newest = /^\d+$/.test(runId) && /^\d+$/.test(attempt) ? groups.filter((g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name).map((g) => ({
+      gh_run_id: String(g.gh_run_id),
+      gh_run_attempt: String(g.gh_run_attempt),
+      gh_pr_number: g.gh_pr_number === void 0 ? void 0 : g.gh_pr_number === null || String(g.gh_pr_number) === "" ? null : String(g.gh_pr_number),
+      branch: g.branch === void 0 ? void 0 : g.branch
+    })).filter((r) => /^\d+$/.test(r.gh_run_id) && /^\d+$/.test(r.gh_run_attempt) && newerRun(r, { gh_run_id: runId, gh_run_attempt: attempt })).reduce((best, r) => !best || newerRun(r, best) ? r : best, null) : null;
+    if (newest)
+      throw new SupersededRunError(`${noGroup}; its group now belongs to run ${newest.gh_run_id} attempt ${newest.gh_run_attempt}`, newest);
+    throw new NoResultsError(noGroup);
+  }
   let missing = null;
   if (group.status !== "completed") {
     let detail = group;
@@ -227,6 +272,21 @@ async function fetchRun(fetchImpl, base, id, reportName = null, wait = { attempt
   const fileOf2 = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
   const reportOf = new Map(suites.map((s) => [s.id, s.report_name ?? null]));
   const suiteTitleOf = new Map(suites.map((s) => [s.id, s.title ?? ""]));
+  const perReport = /* @__PURE__ */ new Map();
+  for (const c of cases) {
+    const report = reportOf.get(c.suite_id) ?? "";
+    const identity = elsewhereKey(fileOf2.get(c.suite_id) ?? "", c.full_title || c.title);
+    const key = JSON.stringify([report, identity]);
+    if (!perReport.has(key)) perReport.set(key, { report, identity, attempts: [] });
+    perReport.get(key).attempts.push(c);
+  }
+  const elsewhere = /* @__PURE__ */ new Map();
+  for (const { report, identity, attempts } of perReport.values()) {
+    attempts.sort((a, b) => a.retry_count - b.retry_count || a.ordinal - b.ordinal);
+    const { status } = outcomeWithDuplicates(attempts, (a) => reportOf.get(a.suite_id) ?? null);
+    if (!elsewhere.has(identity)) elsewhere.set(identity, []);
+    elsewhere.get(identity).push({ report, status });
+  }
   const scoped = reportName ? new Set(suites.filter((s) => String(s.report_name ?? "").startsWith(reportName)).map((s) => s.id)) : null;
   if (scoped && scoped.size === 0)
     throw new Error(`no report in group ${group.id} has a name starting with "${reportName}" (of ${new Set(suites.map((s) => s.report_name)).size} report name(s) present)`);
@@ -282,7 +342,7 @@ async function fetchRun(fetchImpl, base, id, reportName = null, wait = { attempt
     } else if (status === "skipped") skipped++;
     else if (status === "flaky") flaky++;
   }
-  return { group_id: group.id, failing, missing, outcomes, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
+  return { group_id: group.id, failing, missing, outcomes, elsewhere, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
 }
 function missingReports(missing) {
   if (!missing) return null;
@@ -294,7 +354,7 @@ function missingReports(missing) {
   return { text: `the run's results are incomplete (${received ?? "?"} of ${expected} reports arrived; TSIO group ${state})`, short: `results incomplete: ${received ?? "?"} of ${expected} reports` };
 }
 
-// ../e2e-triage/src/history.ts
+// ../e2e-test-triage/src/history.ts
 var HISTORY_RETRY_MS = 500;
 async function postHistory(fetchImpl, url, body) {
   let failure;
@@ -526,8 +586,8 @@ async function markBrokeBy({ findings, api, id, log = () => {
   }
 }
 
-// ../e2e-triage/src/triage.ts
-var import_node_fs2 = require("fs");
+// ../e2e-test-triage/src/triage.ts
+var import_node_fs3 = require("fs");
 
 // ../shared/src/github.ts
 function gh(fetchImpl, token) {
@@ -679,7 +739,7 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
   };
 }
 
-// ../e2e-triage/src/evidence.ts
+// ../e2e-test-triage/src/evidence.ts
 var import_node_crypto = require("crypto");
 var import_node_fs = require("fs");
 var import_node_path = require("path");
@@ -795,7 +855,7 @@ function evidenceFor(finding, evidence) {
   ) ?? null;
 }
 
-// ../e2e-triage/src/classify.ts
+// ../e2e-test-triage/src/classify.ts
 var INFRA_RE = /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready/i;
 var isInfraError = (text) => INFRA_RE.test(text ?? "");
 var EXONERATED = /* @__PURE__ */ new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
@@ -994,7 +1054,7 @@ function infraVerdict(failing, cfg = DEFAULTS) {
   return null;
 }
 
-// ../e2e-triage/src/pack.ts
+// ../e2e-test-triage/src/pack.ts
 function compactError(error, max = 800) {
   const message = [];
   const frames = [];
@@ -1079,7 +1139,7 @@ var evidenceIds = (pack) => [
 ];
 var CLEARING = (ids) => ids.some((c) => c.startsWith("hunk_")) || ids.includes("cross_pr") || ids.includes("this_pr");
 
-// ../e2e-triage/src/enrich.ts
+// ../e2e-test-triage/src/enrich.ts
 function failingLine(f) {
   const base = String(f.file ?? "").split("/").pop();
   if (!base) return null;
@@ -1096,11 +1156,70 @@ function codeExcerpt(text, line, before = 12, after = 2) {
   for (let n = from; n <= to; n++) out.push(`${n}${n === line ? ">" : " "} ${lines[n - 1]}`);
   return out.join("\n").slice(0, 2500);
 }
+var worseness = (result) => FAILED_STATUSES.has(result) ? 2 : result === "flaky" ? 1 : 0;
+function addOtherLane(f, platform, result) {
+  const seen = f.other_lanes?.find((o) => o.platform === platform);
+  if (seen) {
+    if (worseness(result) > worseness(seen.result)) seen.result = result;
+    return;
+  }
+  (f.other_lanes ??= []).push({ platform, result });
+}
+function sameTestOnOtherReports(findings, run) {
+  for (const f of findings) {
+    const own = f.report_name ?? "";
+    const others = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? []).filter((o) => o.report !== "" && o.report !== own);
+    const sorted = [...others].sort((a, b) => laneOfReport(a.report).localeCompare(laneOfReport(b.report)));
+    for (const o of sorted) addOtherLane(f, laneOfReport(o.report), o.status);
+  }
+}
+var SIBLING_DEADLINE_MS = 3e4;
+async function siblingPlatforms({
+  findings,
+  fetchImpl,
+  base,
+  id,
+  log = () => {
+  },
+  deadlineMs = SIBLING_DEADLINE_MS
+}) {
+  if (!findings.length) return;
+  const deadline = Date.now() + deadlineMs;
+  const bySomeDeadline = (read) => {
+    let timer;
+    const late = new Promise((resolve2) => {
+      timer = setTimeout(() => resolve2("late"), Math.max(0, deadline - Date.now()));
+    });
+    return Promise.race([read, late]).finally(() => clearTimeout(timer));
+  };
+  const laterMessage = `other platforms' reads ran past the ${deadlineMs / 1e3}s deadline`;
+  try {
+    const listed = await bySomeDeadline(
+      (async () => {
+        const res = await fetchImpl(`${base}/api/v1/reports?${new URLSearchParams({ repository: id.repository, commit: id.commit_sha, limit: "20" })}`, { signal: AbortSignal.timeout(6e4) });
+        if (!res.ok) throw new Error(`TSIO ${res.status}`);
+        return (await res.json()).reports ?? [];
+      })()
+    );
+    if (listed === "late") return log(`${laterMessage}; none was read`);
+    const siblings = listed.filter((g) => String(g.gh_run_id) === String(id.gh_run_id) && String(g.gh_run_attempt) === String(id.gh_run_attempt) && g.name !== id.name).slice(0, 5);
+    for (const g of siblings) {
+      if (Date.now() >= deadline) return log(`${laterMessage}; ${g.name} and the rest were not read`);
+      const read = await bySomeDeadline(runFromGroups(fetchImpl, base, { ...id, name: g.name }, listed, null, { attempts: 1, ms: 0 }).catch((e) => (log(`results of ${g.name} unavailable: ${String(e).slice(0, 160)}`), null)));
+      if (read === "late") return log(`${laterMessage}; ${g.name} and the rest were not read`);
+      if (!read) continue;
+      for (const f of findings) {
+        const hits = read.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? [];
+        for (const h of hits) addOtherLane(f, laneOf(g.name), h.status);
+      }
+    }
+  } catch (e) {
+    log(`other platforms' results unavailable: ${String(e).slice(0, 160)}`);
+  }
+}
 async function enrichFindings({
   findings,
   api,
-  fetchImpl,
-  base,
   id,
   testRoot,
   log = () => {
@@ -1148,30 +1267,9 @@ async function enrichFindings({
       if (text) f.code_near_failure = codeExcerpt(text, line);
     }
   }
-  try {
-    const res = await fetchImpl(`${base}/api/v1/reports?${new URLSearchParams({ repository: id.repository, commit: id.commit_sha, limit: "20" })}`, { signal: AbortSignal.timeout(6e4) });
-    if (!res.ok) throw new Error(`TSIO ${res.status}`);
-    const { reports = [] } = await res.json();
-    const siblings = reports.filter((g) => String(g.gh_run_id) === String(id.gh_run_id) && String(g.gh_run_attempt) === String(id.gh_run_attempt) && g.name !== id.name).slice(0, 5);
-    for (const g of siblings) {
-      let other;
-      try {
-        other = await fetchRun(fetchImpl, base, { ...id, name: g.name }, null, { attempts: 1, ms: 0 });
-      } catch (e) {
-        log(`results of ${g.name} unavailable: ${String(e).slice(0, 160)}`);
-        continue;
-      }
-      for (const f of findings) {
-        const status = other.outcomes.get(JSON.stringify([f.file, f.title]));
-        if (status) (f.other_lanes ??= []).push({ platform: laneOf(g.name), result: status });
-      }
-    }
-  } catch (e) {
-    log(`other platforms' results unavailable: ${String(e).slice(0, 160)}`);
-  }
 }
 
-// ../e2e-triage/src/judge.ts
+// ../e2e-test-triage/src/judge.ts
 var import_node_crypto2 = require("crypto");
 var SYSTEM = `You are the second judge in an automated CI triage system for end-to-end test failures on pull requests.
 A deterministic engine has already classified each failing test from statistics (trunk history, other PRs' history,
@@ -1250,7 +1348,8 @@ var expectedOutput = (model, findings) => answerTokens(findings) + (thinks(model
 var isSnapshot = (model) => /-\d{8}$/.test(String(model));
 var snapshotOf = (alias, served) => served.length === alias.length + 9 && served.startsWith(`${alias}-`) && isSnapshot(served);
 var servedMatches = (requested, served) => typeof served === "string" && (served === requested || !isSnapshot(requested) && snapshotOf(requested, served));
-var packKey = (model, pack) => (0, import_node_crypto2.createHash)("sha256").update(model + "\n" + JSON.stringify(pack)).digest("hex");
+var UNKEYED_FIELDS = /* @__PURE__ */ new Set(["same_test_other_platforms_this_run"]);
+var packKey = (model, pack) => (0, import_node_crypto2.createHash)("sha256").update(model + "\n" + JSON.stringify(Object.fromEntries(Object.entries(pack).filter(([k]) => !UNKEYED_FIELDS.has(k))))).digest("hex");
 var imageBlock = (i) => ({ type: "image", source: { type: "base64", media_type: i.media_type, data: i.data } });
 var billedField = (e, key) => e?.[key];
 function rejected(err, msg) {
@@ -1372,7 +1471,7 @@ function parseAnswer(text) {
 }
 var answerKey = (model, pack) => `v3:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + SYSTEM, pack)}`;
 
-// ../e2e-triage/src/decision.ts
+// ../e2e-test-triage/src/decision.ts
 function unblocks(cause, cited, pack) {
   const has = (...ids) => ids.some((id) => cited.includes(id));
   const trunk = pack.trunk_history_14d ?? {};
@@ -1532,7 +1631,7 @@ async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
   return findings;
 }
 
-// ../e2e-triage/src/evaluate.ts
+// ../e2e-test-triage/src/evaluate.ts
 var verdictOf = (findings, infra) => {
   if (infra) return "ACTION_REQUIRED";
   return findings.some((f) => f.blocking) ? "FAILURE" : "SUCCESS";
@@ -1553,6 +1652,7 @@ async function evaluateRun({
   },
   evidence = [],
   enrich = null,
+  otherPlatforms = null,
   outOfDate = null,
   brokeBy = null
 }) {
@@ -1582,6 +1682,14 @@ async function evaluateRun({
       result.ownershipUnknown = !diff.ok;
       for (const f of result.findings)
         if (f.class !== "OWNED_BY_PR") Object.assign(f, { blocking: true, decision: "evidence_incomplete", reason: `${f.reason} ${blind}, so this could not be confirmed.` });
+    }
+    sameTestOnOtherReports(result.findings, run);
+    if (otherPlatforms && !result.infra) {
+      try {
+        await otherPlatforms(result.findings);
+      } catch (e) {
+        log(`other platforms unavailable: ${String(e).slice(0, 200)}`);
+      }
     }
     if (!blind && prNumber && outOfDate) {
       const candidates = result.findings.filter((f) => f.blocking && BORDERLINE.has(f.class) && !f.identity_unresolved && f.repo_path);
@@ -1624,7 +1732,82 @@ async function evaluateRun({
   return result;
 }
 
-// ../e2e-triage/src/render.ts
+// ../e2e-test-triage/src/findings.ts
+var import_node_fs2 = require("fs");
+var FINDINGS_SCHEMA = 1;
+var SECRET_PATTERNS = [/gh[pousr]_[A-Za-z0-9]{20,}/g, /github_pat_[A-Za-z0-9_]{20,}/g, /sk-ant-[A-Za-z0-9_-]{8,}/g, /\bBearer\s+[^\s"']+/gi];
+var ANSI = /\x1b\[[0-9;]*m/g;
+var CREDENTIAL_KV = /([A-Za-z0-9_.-]*(?:token|password|secret|passwd|api[_-]?key|apikey|license|authorization)[A-Za-z0-9_.-]*)(\s*[=:]\s*)((?:Bearer\s+)?[^\s"',;&]+)/gi;
+function redact(text, secrets) {
+  let out = String(text);
+  for (const s of secrets) if (s.length >= 8) out = out.split(s).join("[redacted]");
+  out = out.replace(/https?:\/\/[^\s"'<>)]+/gi, (url) => {
+    const q = url.indexOf("?");
+    return q < 0 ? url : `${url.slice(0, q)}?[redacted]`;
+  });
+  out = out.replace(CREDENTIAL_KV, "$1$2[redacted]");
+  for (const p of SECRET_PATTERNS) out = out.replace(p, "[redacted]");
+  return out;
+}
+var clip = (s, max) => s.length > max ? s.slice(0, max) : s;
+var firstLine = (error) => {
+  const line = String(error ?? "").replace(ANSI, "").split(/\r?\n/).find((l) => l.trim()) ?? "";
+  return clip(line.trim(), 200);
+};
+function rowOf(f, secrets) {
+  const judge2 = f.judge ?? null;
+  return {
+    title: redact(f.title, secrets),
+    full_title: f.full_title ? redact(f.full_title, secrets) : null,
+    file: redact(f.repo_path ?? f.file, secrets),
+    class: f.class,
+    blocking: f.blocking,
+    decision: f.decision ?? null,
+    reason: clip(redact(f.reason ?? "", secrets), 300),
+    error_first_line: redact(firstLine(f.error), secrets),
+    out_of_date: Boolean(f.out_of_date),
+    tries: f.tries ? { ran: f.tries.ran, failed: f.tries.failed } : null,
+    other_lanes_failed: (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform),
+    ai: { cause: judge2?.cause ?? null, confidence: judge2?.confidence ?? null, cited: judge2?.cited_evidence ?? [], cleared: f.decision === "adjudicator_unblock" }
+  };
+}
+var secretsOf = (env) => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY].filter((s) => Boolean(s));
+function findingsRecord({ env, id, mode, run, result, notTriaged }) {
+  const secrets = secretsOf(env);
+  const ai = result?.ai ?? newLedger();
+  const spend = ledgerTotals(ai);
+  const served = [...new Set(ai.calls.map((c) => c.served_model))];
+  const text = (v) => v == null || String(v) === "" ? null : String(v);
+  return {
+    schema: FINDINGS_SCHEMA,
+    repository: text(id?.repository),
+    commit_sha: text(id?.commit_sha),
+    pr: Number(id?.gh_pr_number || 0) || null,
+    lane: text(env.LANE) ?? text(id?.name),
+    status_context: text(env.STATUS_CONTEXT),
+    run_id: text(id?.gh_run_id),
+    run_attempt: text(id?.gh_run_attempt),
+    mode,
+    verdict: result?.verdict ?? null,
+    counts: run?.counts ?? null,
+    ai: { calls: spend.calls, cost_usd: spend.cost_usd, model: served.length ? served.join(", ") : null },
+    triaged: notTriaged == null,
+    not_triaged_reason: notTriaged == null ? null : redact(notTriaged, secrets),
+    findings: (result?.findings ?? []).map((f) => rowOf(f, secrets))
+  };
+}
+function writeFindings(facts, log) {
+  const path = facts.env.FINDINGS_FILE;
+  if (!path) return;
+  try {
+    (0, import_node_fs2.writeFileSync)(path, `${JSON.stringify(findingsRecord(facts), null, 2)}
+`);
+  } catch (e) {
+    log(`findings file not written: ${String(e).slice(0, 160)}`);
+  }
+}
+
+// ../e2e-test-triage/src/render.ts
 var CODE_ESCAPES = { "|": "&#124;", "<": "&lt;", ">": "&gt;", "`": "&#96;" };
 var mdCode = (s) => String(s).replace(/[|<>`]/g, (c) => CODE_ESCAPES[c]).replace(/\r?\n/g, " ");
 var md = (s) => mdCode(
@@ -1658,6 +1841,18 @@ function brokeByText(b) {
   return `one of ${b.total} commits merged between ${sha7(b.from)} and ${sha7(b.to)}`;
 }
 var PERCENT = (n) => `${Math.round(n * 100)}%`;
+var failedElsewhere = (f) => (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform);
+var alsoFailed = (f, tail) => {
+  const other = f.other_lanes ?? [];
+  const failed = other.filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform);
+  const once = other.filter((o) => o.result === "flaky").map((o) => o.platform);
+  if (failed.length && once.length) return ` Also failed on ${failed.join(", ")}, and once on ${once.join(", ")} (passed on retry), in this run${tail}`;
+  if (once.length) return ` Also failed once on ${once.join(", ")} in this run (passed on retry)${tail}`;
+  if (failed.length) return ` Also failed on ${failed.join(", ")} in this run${tail}`;
+  return "";
+};
+var SHARED_CAUSE = ": likely environment or a shared cause.";
+var PLAIN = ".";
 function whyNext(f, branch, pr) {
   const t = f.trunk ?? { runs: 0, passes: 0, fails: 0, flaky: 0 };
   const a = f.judge;
@@ -1756,7 +1951,8 @@ function passRate(counts) {
   return `${Math.min(99.9, Math.round(passed / ran * 1e3) / 10).toFixed(1)}%`;
 }
 var passLine = (counts) => `${passRate(counts)} passed (${counts.passed ?? 0} passed, ${counts.failed} failed, ${counts.skipped ?? 0} skipped)`;
-function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [] }) {
+var RED_OUTSIDE = "No test failed. The lane is red because a job outside the tests failed (setup, upload or runner), or results are missing: re-run the failed jobs.";
+function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null }) {
   const branch = trunkBranch || "the default branch";
   const where = lane ? ` \xB7 ${md(lane)}` : "";
   const groups = { yours: [], outdated: [], check: [], broken: [], flaky: [] };
@@ -1768,12 +1964,15 @@ function renderSummary({ findings, infra = null, runURL, counts, mode = "report-
   const outdatedLead = findings.length > 0 && outdated.length * 2 >= findings.length;
   const staleText = outdated.length ? `${outdated.length} out of date` : "";
   const needText = check.length ? `${check.length} need${check.length === 1 ? "s" : ""} a look` : "";
-  const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? "\u2705 nothing failed" : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : check.length || outdated.length ? `\u{1F7E1} ${[needText, staleText].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
+  const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? laneRed ? "\u{1F534} red outside the tests" : "\u2705 nothing failed" : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : check.length || outdated.length ? `\u{1F7E1} ${[needText, staleText].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
   const lines = [`## E2E triage${where}: ${head}`, ""];
+  const several = findings.filter((f) => failedElsewhere(f).length > 0).length;
+  if (several) lines.push(`${count(several, "test")} failed on several platforms in this run.`, "");
   lines.push(mode === "enforce" ? "> Triage sets the E2E check: it passes only when every failure is cleared." : "> **Report only.** This is triage's advice; it doesn't change the E2E check.", "");
   for (const n of notes) lines.push(`> ${md(n)}`, "");
   let say = "";
-  if (!counts.failed) say = "No test failed.";
+  const arrived = missing ? `${[reportsArrived, missing.text].filter(Boolean).join("; ")}.` : "";
+  if (!counts.failed) say = missing || laneRed ? `${RED_OUTSIDE}${arrived ? ` ${arrived}` : ""}` : "No test failed.";
   else if (findings.length) {
     const kinds = [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
     say = `${count(yours.length + outdated.length + check.length + blockingBroken + unrelated, "failure")}: ` + [
@@ -1786,14 +1985,15 @@ function renderSummary({ findings, infra = null, runURL, counts, mode = "report-
     if (outdatedLead) say = `Merge ${branch} and re-run first. ${say}`;
   }
   if (infra) say = `${infra} ${say}`;
-  if (missing) say += ` Results incomplete: ${missing.text}; re-run the failed jobs before relying on this.`;
+  if (missing && counts.failed) say += ` Results incomplete: ${missing.text}; re-run the failed jobs before relying on this.`;
   lines.push(`**${md(say.trim())}** ${passLine(counts)} \xB7 [run](${runURL})`, "");
   const section = (title, list, heading = `${title} (${list.length})`) => {
     if (!list.length) return;
     lines.push(`### ${heading}`, "", "| Test | Why | Next step |", "| --- | --- | --- |");
     for (const f of list) {
       const [why, next] = whyNext(f, branch, pr);
-      lines.push(`| ${md(f.title)} \xB7 \`${mdCode(fileOf(f))}\` | ${md(why)} | ${md(next)} |`);
+      const blamesPR = bucketOf(f) === "yours" || bucketOf(f) === "outdated";
+      lines.push(`| ${md(f.title)} \xB7 \`${mdCode(fileOf(f))}\` | ${md(why + alsoFailed(f, blamesPR ? PLAIN : SHARED_CAUSE))} | ${md(next)} |`);
     }
     lines.push("");
   };
@@ -1826,34 +2026,102 @@ function renderUnfinished({ reason, lane = null }) {
   const where = lane ? ` \xB7 ${md(lane)}` : "";
   return [`## E2E triage${where}: \u26A0\uFE0F not triaged`, "", `**${md(`triage could not finish: ${reason}`)}** The E2E result stands.`, ""].join("\n");
 }
+function renderNotTriaged({ text, lane = null }) {
+  const where = lane ? ` \xB7 ${md(lane)}` : "";
+  return [`## E2E triage${where}: \u26A0\uFE0F not triaged`, "", `**${text}**`, ""].join("\n");
+}
+function supersededText(newerRunId, repository, lane) {
+  return `Not triaged: run [${md(newerRunId)}](https://github.com/${repository}/actions/runs/${newerRunId}) replaced this one for ${md(lane)}; see that run's triage.`;
+}
+function otherRunText(lane) {
+  return `Not triaged: another run of this commit replaced this one for ${md(lane)}.`;
+}
+function noResultsText(lane, commitSha) {
+  return `Not triaged: TSIO has no results for ${md(lane)} at ${sha7(commitSha)} (the tests may not have run).`;
+}
 function statusDescription(verdict, findings, infra, counts, missing = null) {
   const blocking = findings.filter((f) => f.blocking).length;
   const triaged = infra && !findings.length ? "not triaged, investigation required" : `${findings.length - blocking} cleared by triage${blocking ? `, ${blocking} unresolved` : ""}${infra ? "; investigation required" : ""}`;
   return `(${triaged}${missing ? `; ${missing.short}` : ""}) ${passLine(counts)}`.slice(0, 140);
 }
 
-// ../e2e-triage/src/triage.ts
+// ../e2e-test-triage/src/triage.ts
 var isPlainObject2 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var isPrSpend = (v) => isPlainObject2(v) && typeof v.pr === "number" && typeof v.usd === "number" && Number.isFinite(v.usd) && v.usd >= 0;
+var NotTriagedError = class extends Error {
+};
+function identityOrNull(env) {
+  try {
+    return compositeIdentityFrom(env.COMPOSITE_IDENTITY);
+  } catch {
+    return null;
+  }
+}
+var errorLine = (e, secrets) => redact((e instanceof Error ? e.message : String(e)).split(/\r?\n/)[0] ?? "", secrets);
 async function triage(options) {
   const written = { summary: false };
+  const seen = { run: null, result: null, enforce: null };
+  const { env } = options;
+  const log = options.log ?? console.error;
+  const requested = String(env.MODE ?? "").trim() === "enforce" ? "enforce" : "report-only";
   try {
-    return await decideRun(options, written);
+    const result = await decideRun(options, written, seen);
+    writeFindings({ env, id: identityOrNull(env), mode: seen.enforce ? "enforce" : requested, run: seen.run, result, notTriaged: null }, log);
+    return result;
   } catch (e) {
-    const log = options.log ?? console.error;
-    const summaryPath = options.env.GITHUB_STEP_SUMMARY;
+    const id = identityOrNull(env);
+    const secrets = secretsOf(env);
+    const summaryPath = env.GITHUB_STEP_SUMMARY;
+    const reason = errorLine(e, secrets);
+    let notTriaged = `error: ${reason}`;
+    let body = null;
+    if (e instanceof SupersededRunError && id) {
+      const rep = e.replacement;
+      const samePR = rep.gh_pr_number !== void 0 && (rep.gh_pr_number ? rep.gh_pr_number === String(id.gh_pr_number ?? "") : !id.gh_pr_number && rep.branch != null && rep.branch === id.branch);
+      body = samePR ? supersededText(rep.gh_run_id, id.repository, String(id.name)) : otherRunText(String(id.name));
+      notTriaged = `superseded: run ${e.replacement.gh_run_id} replaced this run`;
+    } else if (e instanceof NoResultsError && id) {
+      body = noResultsText(String(id.name), id.commit_sha);
+      notTriaged = "no_results: TSIO has no results for this run";
+      await noteNoResults(options, id);
+    }
     if (!written.summary && summaryPath) {
-      const reason = (e instanceof Error ? e.message : String(e)).split(/\r?\n/)[0] ?? "";
       try {
-        (0, import_node_fs2.appendFileSync)(summaryPath, renderUnfinished({ reason, lane: options.env.LANE || null }) + "\n");
+        const text = body ? renderNotTriaged({ text: body, lane: env.LANE || id?.name || null }) : renderUnfinished({ reason, lane: env.LANE || null });
+        (0, import_node_fs3.appendFileSync)(summaryPath, text + "\n");
       } catch (writeError) {
         log(`triage's summary not written: ${String(writeError).slice(0, 160)}`);
       }
     }
+    const mode = seen.enforce === null ? requested : seen.enforce ? "enforce" : "report-only";
+    writeFindings({ env, id, mode, run: seen.run, result: seen.result, notTriaged }, log);
+    if (e instanceof SupersededRunError) throw new NotTriagedError(notTriaged);
     throw e;
   }
 }
-async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /* @__PURE__ */ new Date(), wait }, written) {
+async function noteNoResults({ env, fetchImpl = fetch, log = console.error }, id) {
+  const context = env.STATUS_CONTEXT;
+  if (!context || !env.GITHUB_TOKEN) return;
+  try {
+    const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
+    const own = (await readStatuses(api, id)).find((r) => r.context === context);
+    if (!own || own.state === "pending") return;
+    const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
+    await statusPublisher({ api, id, context, env, log }).write({ state: own.state, description: "(not triaged: no results)", target_url: runURL }, "triage");
+  } catch (e) {
+    log(`not-triaged note not written on ${context}: ${String(e).slice(0, 200)}`);
+  }
+}
+async function laneIsRed(api, id, context, log) {
+  try {
+    const own = (await readStatuses(api, id)).find((r) => r.context === context);
+    return own?.state === "failure" || own?.state === "error";
+  } catch (e) {
+    log(`lane status unavailable: ${String(e).slice(0, 160)}`);
+    return false;
+  }
+}
+async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /* @__PURE__ */ new Date(), wait }, written, seen) {
   const cfg = configFrom(env, log);
   const id = compositeIdentityFrom(env.COMPOSITE_IDENTITY);
   const prNumber = Number(id.gh_pr_number || 0) || null;
@@ -1863,6 +2131,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
   const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
   const reportName = env.REPORT_NAME || null;
   const run = await fetchRun(fetchImpl, base, id, reportName, wait);
+  seen.run = run;
   const context = env.STATUS_CONTEXT;
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
   const publisher = statusPublisher({ api, id, context, env, log });
@@ -1895,6 +2164,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     enforce = false;
     notes.push(`Report only on this PR: it has the ${cfg.reportOnlyLabel} label, so triage leaves the E2E check as the tests set it.`);
   }
+  seen.enforce = enforce;
   const announce = enforce && (run.failing.length > 0 || Boolean(run.missing));
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
   const settleLaneSummary = async () => {
@@ -1918,7 +2188,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     let unknownSpend = null;
     if (env.ANSWERS_CACHE) {
       try {
-        const loaded = (0, import_node_fs2.existsSync)(env.ANSWERS_CACHE) ? JSON.parse((0, import_node_fs2.readFileSync)(env.ANSWERS_CACHE, "utf8")) : {};
+        const loaded = (0, import_node_fs3.existsSync)(env.ANSWERS_CACHE) ? JSON.parse((0, import_node_fs3.readFileSync)(env.ANSWERS_CACHE, "utf8")) : {};
         if (isPlainObject2(loaded)) cfg.answers = loaded;
         else {
           cfg.answers = {};
@@ -1962,24 +2232,27 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       log,
       ask,
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
-      enrich: (findings) => enrichFindings({ findings, api, fetchImpl, base, id, testRoot, log }),
+      enrich: (findings) => enrichFindings({ findings, api, id, testRoot, log }),
+      otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log })
     });
+    seen.result = result;
     const spend = ledgerTotals(result.ai);
     if (env.ANSWERS_CACHE && cfg.answers) {
       if (prNumber) cfg.answers[PR_SPEND_KEY] = { pr: prNumber, usd: prSpent + (spend.cost_usd ?? 0) };
       try {
-        (0, import_node_fs2.writeFileSync)(env.ANSWERS_CACHE, JSON.stringify(cfg.answers));
+        (0, import_node_fs3.writeFileSync)(env.ANSWERS_CACHE, JSON.stringify(cfg.answers));
       } catch (e) {
         log(`answers cache not saved: ${String(e).slice(0, 160)}`);
       }
     }
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
-    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes });
+    const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
+    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing) });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing);
     if (env.GITHUB_OUTPUT)
-      (0, import_node_fs2.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}
+      (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}
 verdict=${result.verdict}
 blocking=${result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length}
 exonerated=${result.findings.filter((f) => !f.blocking).length}
@@ -1989,8 +2262,8 @@ ai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}
 ai_input_tokens=${spend.input_tokens}
 ai_output_tokens=${spend.output_tokens}
 `);
-    if (env.GITHUB_STEP_SUMMARY && (run.failing.length > 0 || Boolean(run.missing))) {
-      (0, import_node_fs2.appendFileSync)(env.GITHUB_STEP_SUMMARY, summary + "\n");
+    if (env.GITHUB_STEP_SUMMARY && (run.failing.length > 0 || Boolean(run.missing) || laneRed)) {
+      (0, import_node_fs3.appendFileSync)(env.GITHUB_STEP_SUMMARY, summary + "\n");
       written.summary = true;
     }
     const mode = String(env.MODE ?? "").trim();
@@ -2019,9 +2292,9 @@ ai_output_tokens=${spend.output_tokens}
       const blocking = result.findings.filter((f) => f.blocking).length;
       await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra && !result.findings.length ? `${run.counts.failed} failed \xB7 investigation required` : `${run.counts.failed} failed \u2192 ${result.findings.length - blocking} cleared \xB7 ${blocking} blocking${result.infra ? " \xB7 investigation required" : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
     }
-    if (env.GITHUB_OUTPUT) (0, import_node_fs2.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
+    if (env.GITHUB_OUTPUT) (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
 `);
-    log(`e2e-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
+    log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;
   } catch (e) {
     if (announce && lanes.length && context) {
@@ -2036,7 +2309,7 @@ ai_output_tokens=${spend.output_tokens}
 }
 
 // src/ledger.ts
-var import_node_fs3 = require("fs");
+var import_node_fs4 = require("fs");
 var import_node_path2 = require("path");
 
 // src/model.ts
@@ -2055,7 +2328,7 @@ function readLedger(path) {
   if (!path) return [];
   let text;
   try {
-    text = (0, import_node_fs3.readFileSync)(path, "utf8");
+    text = (0, import_node_fs4.readFileSync)(path, "utf8");
   } catch (e) {
     if (isNodeError(e) && e.code === "ENOENT") return [];
     throw e;
@@ -2068,9 +2341,9 @@ function readLedger(path) {
 }
 function writeLedger(path, requests) {
   if (!path) return;
-  (0, import_node_fs3.mkdirSync)((0, import_node_path2.dirname)(path), { recursive: true });
-  (0, import_node_fs3.writeFileSync)(`${path}.tmp`, JSON.stringify({ requests }, null, 1));
-  (0, import_node_fs3.renameSync)(`${path}.tmp`, path);
+  (0, import_node_fs4.mkdirSync)((0, import_node_path2.dirname)(path), { recursive: true });
+  (0, import_node_fs4.writeFileSync)(`${path}.tmp`, JSON.stringify({ requests }, null, 1));
+  (0, import_node_fs4.renameSync)(`${path}.tmp`, path);
 }
 function errorMessage(e) {
   return e instanceof Error ? e.message : String(e);
@@ -2471,7 +2744,7 @@ async function watch({ env, fetchImpl = fetch, log = console.error, now = /* @__
     const seen = [...new Set(groupsOfRun.map((g) => `${g.name}@${g.branch}`))];
     const note = seen.length ? `not a ${trunk} run (${seen.join(", ")})` : `no reports for run ${env.GH_RUN_ID} in TSIO under ${wanted.map((s) => s.name).join(", ")}`;
     log(`${note}; nothing to watch`);
-    if (env.GITHUB_STEP_SUMMARY) (0, import_node_fs4.appendFileSync)(env.GITHUB_STEP_SUMMARY, `## E2E master watch
+    if (env.GITHUB_STEP_SUMMARY) (0, import_node_fs5.appendFileSync)(env.GITHUB_STEP_SUMMARY, `## E2E test watch
 
 ${note}; nothing to watch.
 `);
@@ -2655,11 +2928,11 @@ ${note}; nothing to watch.
   });
   out.push(...conflictOut);
   const lines = summaryLines({ commit: id.commit_sha, runURL, decisions, conflicts, notes });
-  if (env.GITHUB_STEP_SUMMARY) (0, import_node_fs4.appendFileSync)(env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+  if (env.GITHUB_STEP_SUMMARY) (0, import_node_fs5.appendFileSync)(env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
   log(lines.join("\n"));
   if (env.PENDING_PATH) {
-    (0, import_node_fs4.mkdirSync)((0, import_node_path3.dirname)(env.PENDING_PATH), { recursive: true });
-    (0, import_node_fs4.writeFileSync)(env.PENDING_PATH, JSON.stringify(out.map(({ id: rid, entry }) => ({ id: rid, entry }))));
+    (0, import_node_fs5.mkdirSync)((0, import_node_path3.dirname)(env.PENDING_PATH), { recursive: true });
+    (0, import_node_fs5.writeFileSync)(env.PENDING_PATH, JSON.stringify(out.map(({ id: rid, entry }) => ({ id: rid, entry }))));
   }
   const planned = out.map(({ id: rid, payload }) => ({ id: rid, payload }));
   writeOutputs(env, planned);
@@ -2715,7 +2988,7 @@ function summaryLines({
   conflicts,
   notes
 }) {
-  const lines = [`## E2E master watch: ${commit.slice(0, 9)} \xB7 [run](${runURL})`, ""];
+  const lines = [`## E2E test watch: ${commit.slice(0, 9)} \xB7 [run](${runURL})`, ""];
   if (!decisions.length) lines.push("No failure needs a repair: nothing failed twice in a row or flaked repeatedly.");
   else {
     lines.push("| Specs | Kind | Tests | Action |", "| --- | --- | --- | --- |");
@@ -2730,16 +3003,16 @@ function summaryLines({
 }
 function writeOutputs(env, requests) {
   if (env.REQUESTS_PATH) {
-    (0, import_node_fs4.mkdirSync)((0, import_node_path3.dirname)(env.REQUESTS_PATH), { recursive: true });
-    (0, import_node_fs4.writeFileSync)(env.REQUESTS_PATH, JSON.stringify(requests));
+    (0, import_node_fs5.mkdirSync)((0, import_node_path3.dirname)(env.REQUESTS_PATH), { recursive: true });
+    (0, import_node_fs5.writeFileSync)(env.REQUESTS_PATH, JSON.stringify(requests));
   }
-  if (env.GITHUB_OUTPUT) (0, import_node_fs4.appendFileSync)(env.GITHUB_OUTPUT, `count=${requests.length}
+  if (env.GITHUB_OUTPUT) (0, import_node_fs5.appendFileSync)(env.GITHUB_OUTPUT, `count=${requests.length}
 `);
 }
 function record({ env, now = /* @__PURE__ */ new Date(), log = console.error }) {
   let pending = [];
   try {
-    pending = JSON.parse((0, import_node_fs4.readFileSync)(env.PENDING_PATH ?? "", "utf8"));
+    pending = JSON.parse((0, import_node_fs5.readFileSync)(env.PENDING_PATH ?? "", "utf8"));
   } catch {
   }
   const results = new Map(JSON.parse(env.RESULTS || "[]").map((r) => [r.id, Number(r.status) || 0]));
@@ -2753,7 +3026,7 @@ function record({ env, now = /* @__PURE__ */ new Date(), log = console.error }) 
   writeLedger(env.LEDGER_PATH, ledger);
   const sent = pending.length - lines.length;
   const summary = pending.length ? [`Sent ${sent} of ${pending.length} request(s).`, ...lines] : [];
-  if (summary.length && env.GITHUB_STEP_SUMMARY) (0, import_node_fs4.appendFileSync)(env.GITHUB_STEP_SUMMARY, "\n" + summary.join("\n") + "\n");
+  if (summary.length && env.GITHUB_STEP_SUMMARY) (0, import_node_fs5.appendFileSync)(env.GITHUB_STEP_SUMMARY, "\n" + summary.join("\n") + "\n");
   if (summary.length) log(summary.join("\n"));
   return { sent, failed: lines.length };
 }

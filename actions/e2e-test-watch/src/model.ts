@@ -1,7 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import type { Observation, TestRef } from "../../e2e-triage/src/types.ts";
+import type { Observation, TestRef } from "../../e2e-test-triage/src/types.ts";
 import { identityKey } from "../../shared/src/tsio.ts";
 
 export const HOUR = 3600e3;

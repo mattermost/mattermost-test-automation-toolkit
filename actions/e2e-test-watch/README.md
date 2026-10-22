@@ -1,4 +1,4 @@
-# E2E master watch
+# E2E test watch
 
 Runs after a trunk (master) E2E run. It reads the run with the triage engine's
 trunk rules (branch and commit come from what the run reported to TSIO) and plans a
@@ -30,16 +30,16 @@ and open PRs past the pages read, are named in the summary.
 
 A spec is skipped when one of the agent's own open PRs (its `label`, or one found by
 the agent's search) changes that exact spec file, or when it was requested in the last
-`hold-hours` (its agent is still working, and master E2E runs after every merge). A
+`hold-hours` (its agent is still working, and trunk E2E runs after every merge). A
 PR that changes another file in the spec's directory is not a reason to skip. An agent
 PR with no update and no commit for more than `own-pr-idle-days` (3 by default) stops
 skipping: the spec goes out, and the summary names the PR as stalled. If the agent's PRs
 can't all be read, no fix request goes out that run. Other open PRs into trunk that
 change it are not a reason to wait: they are mostly feature work, and in a month of
-master history skipping on them would have left the largest break unfixed. They go to
+trunk history skipping on them would have left the largest break unfixed. They go to
 the agent as `open_prs_touching`, so it can tell whether one of them already fixes the
 failure. Fork PRs (from another repository) are dropped as soon as they are read: they
-are not listed, and they never count as the agent's. Master stays red until a break is fixed, so
+are not listed, and they never count as the agent's. Trunk stays red until a break is fixed, so
 broken requests all go out on the run that finds them (`max-broken-per-run` is
 only a safety limit); flaky requests share a budget of `max-flaky-per-day` in any
 24 hours: specs not requested in the last week first, then most-flaky first, so a
@@ -58,7 +58,7 @@ own credentials. Then [`record`](record/action.yml) keeps the requests that were
 accepted, between runs with `actions/cache`, so the next run holds them and counts
 them toward the daily cap. Run `record` on every trunk run, even one that sent
 nothing. If the cached record is not valid JSON the action fails instead of
-forgetting what was sent; delete the `e2e-master-watch-*` caches to start over. The fix itself (reproduce, fix, verify several times, open the PR) is the
+forgetting what was sent; delete the `e2e-master-watch-*` caches to start over. The cache keys keep the action's former name on purpose: a new key would find no saved ledger and re-send its requests. The fix itself (reproduce, fix, verify several times, open the PR) is the
 agent's job; its instructions live in the consumer repository.
 
 The caller's job needs two settings that this action cannot set, and the example below has both:
@@ -76,13 +76,13 @@ jobs:
     if: github.event.workflow_run.conclusion != 'cancelled'
     runs-on: ubuntu-24.04
     concurrency:
-      group: e2e-master-watch-${{ github.repository }}
+      group: e2e-test-watch-${{ github.repository }}
       cancel-in-progress: false
     cache-mode: write
     permissions: { contents: read, pull-requests: read }
     steps:
       - id: plan
-        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-master-watch@<full sha>
+        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-test-watch@<full sha>
         with:
           repository: ${{ github.repository }}
           gh-run-id: ${{ github.event.workflow_run.id }}
@@ -108,7 +108,7 @@ jobs:
           done < <(jq -c '.[]' "$REQUESTS_FILE")
           echo "results=$results" >> "$GITHUB_OUTPUT"
       - if: always() && steps.plan.outcome == 'success'
-        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-master-watch/record@<full sha>
+        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-test-watch/record@<full sha>
         with:
           results: ${{ steps.send.outputs.results || '[]' }}
 ```

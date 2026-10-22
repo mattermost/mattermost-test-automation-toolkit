@@ -3,16 +3,16 @@
 
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { Finding } from "../../e2e-triage/src/types.ts";
-import type { EvaluatedRun } from "../../e2e-triage/src/evaluate.ts";
-import { laneOf } from "../../e2e-triage/src/config.ts";
-import { fetchHistory } from "../../e2e-triage/src/history.ts";
-import { triage } from "../../e2e-triage/src/triage.ts";
+import type { Finding } from "../../e2e-test-triage/src/types.ts";
+import type { EvaluatedRun } from "../../e2e-test-triage/src/evaluate.ts";
+import { laneOf } from "../../e2e-test-triage/src/config.ts";
+import { fetchHistory } from "../../e2e-test-triage/src/history.ts";
+import { triage } from "../../e2e-test-triage/src/triage.ts";
 import { gh } from "../../shared/src/github.ts";
 import type { Env, FetchImpl } from "../../shared/src/github.ts";
 import { tsioBase } from "../../shared/src/tsio.ts";
 import type { Wait } from "../../shared/src/tsio.ts";
-import type { TsioId } from "../../e2e-triage/src/types.ts";
+import type { TsioId } from "../../e2e-test-triage/src/types.ts";
 import { LEDGER_MS, readLedger, writeLedger } from "./ledger.ts";
 import type { LedgerEntry } from "./ledger.ts";
 import { DAY, HOUR, flakes, utcMinute } from "./model.ts";
@@ -172,7 +172,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     const seen = [...new Set(groupsOfRun.map((g) => `${g.name}@${g.branch}`))];
     const note = seen.length ? `not a ${trunk} run (${seen.join(", ")})` : `no reports for run ${env.GH_RUN_ID} in TSIO under ${wanted.map((s) => s.name).join(", ")}`;
     log(`${note}; nothing to watch`);
-    if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `## E2E master watch\n\n${note}; nothing to watch.\n`);
+    if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `## E2E test watch\n\n${note}; nothing to watch.\n`);
     writeOutputs(env, []);
     return { decisions: [], conflicts: [], requests: [], notes: [note] };
   }
@@ -289,7 +289,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     else candidates.push({ ...g, openPRs: prs });
   }
 
-  // Master stays red until a break is fixed, so breaks all go now. Flaky specs share a daily budget,
+  // Trunk stays red until a break is fixed, so breaks all go now. Flaky specs share a daily budget,
   // chosen before any history is read: those not requested in the last week first (so the budget
   // rotates), then the most flaky.
   const asked = (g: Group): number => ledger.filter((e) => e.specs?.includes(g.spec)).length;
@@ -466,7 +466,7 @@ function summaryLines({
   conflicts: ConflictRow[];
   notes: string[];
 }): string[] {
-  const lines = [`## E2E master watch: ${commit.slice(0, 9)} · [run](${runURL})`, ""];
+  const lines = [`## E2E test watch: ${commit.slice(0, 9)} · [run](${runURL})`, ""];
   if (!decisions.length) lines.push("No failure needs a repair: nothing failed twice in a row or flaked repeatedly.");
   else {
     lines.push("| Specs | Kind | Tests | Action |", "| --- | --- | --- | --- |");

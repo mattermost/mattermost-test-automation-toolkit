@@ -1,12 +1,12 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import type { Finding } from "../../e2e-triage/src/types.ts";
-import { compactError } from "../../e2e-triage/src/pack.ts";
-import { repoPath } from "../../e2e-triage/src/config.ts";
+import type { Finding } from "../../e2e-test-triage/src/types.ts";
+import { compactError } from "../../e2e-test-triage/src/pack.ts";
+import { repoPath } from "../../e2e-test-triage/src/config.ts";
 import type { FetchImpl } from "../../shared/src/github.ts";
 import { FAILED_STATUSES, identityKey, outcomeOf } from "../../shared/src/tsio.ts";
-import type { TsioId } from "../../e2e-triage/src/types.ts";
+import type { TsioId } from "../../e2e-test-triage/src/types.ts";
 import { specOf, trunkRows } from "./model.ts";
 import type { Group, Kind, RunHistory } from "./model.ts";
 
