@@ -2447,36 +2447,28 @@ var utcMinute = (iso) => iso.slice(0, 16).replace("T", " ");
 function trunkRows(history, test, branch) {
   return (history.get(identityKey(test)) ?? []).filter((o) => o.branch === branch && (o.gh_pr_number == null || o.gh_pr_number === ""));
 }
-var flakes = (r) => r.tests.reduce((n, t) => n + (t.trunk?.fails ?? 0) + (t.trunk?.flaky ?? 0), 0);
+var flakes = (r) => r.tests.reduce((n, t) => n + t.trunk.fails + t.trunk.flaky, 0);
 
 // src/ledger.ts
 var LEDGER_MS = 7 * DAY;
 function readLedger(path) {
-  if (!path) return [];
   let text;
   try {
     text = (0, import_node_fs4.readFileSync)(path, "utf8");
   } catch (e) {
-    if (isNodeError(e) && e.code === "ENOENT") return [];
+    if (e instanceof Error && "code" in e && e.code === "ENOENT") return [];
     throw e;
   }
   try {
     return JSON.parse(text).requests ?? [];
   } catch (e) {
-    throw new Error(`ledger ${path} is not valid JSON (${errorMessage(e)}); delete the e2e-master-watch caches to start a new one`);
+    throw new Error(`ledger ${path} is not valid JSON (${e instanceof Error ? e.message : String(e)}); delete the e2e-master-watch caches to start a new one`);
   }
 }
 function writeLedger(path, requests) {
-  if (!path) return;
   (0, import_node_fs4.mkdirSync)((0, import_node_path2.dirname)(path), { recursive: true });
   (0, import_node_fs4.writeFileSync)(`${path}.tmp`, JSON.stringify({ requests }, null, 1));
   (0, import_node_fs4.renameSync)(`${path}.tmp`, path);
-}
-function errorMessage(e) {
-  return e instanceof Error ? e.message : String(e);
-}
-function isNodeError(e) {
-  return e instanceof Error && "code" in e;
 }
 
 // src/prs.ts
@@ -2564,12 +2556,12 @@ var conflictedRepairPRs = (own) => own.prs.filter((p) => p.mergeable === "CONFLI
 
 // src/select.ts
 var ERROR_CHARS = 600;
+var MIN_FLAKY = 1;
 var FIRST_FAILURE = /* @__PURE__ */ new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
-var unlistedKey = (file, title, fullTitle) => JSON.stringify(["", file, fullTitle || title]);
-function selectRepairs(result, suite, { minFlaky = 1 } = {}) {
+function selectRepairs(result, suite) {
   const bySpec = /* @__PURE__ */ new Map();
   for (const f of result.findings) {
-    const kind = f.class === "BROKEN_ON_TRUNK" ? "broken" : f.class === "FLAKY_ON_TRUNK" && f.trunk.fails + f.trunk.flaky >= minFlaky ? "flaky" : null;
+    const kind = f.class === "BROKEN_ON_TRUNK" ? "broken" : f.class === "FLAKY_ON_TRUNK" && f.trunk.fails + f.trunk.flaky >= MIN_FLAKY ? "flaky" : null;
     if (!kind || f.identity_unresolved) continue;
     const spec = specOf(f);
     let g = bySpec.get(spec);
@@ -2584,12 +2576,10 @@ function selectRepairs(result, suite, { minFlaky = 1 } = {}) {
   return [...bySpec.values()];
 }
 async function retryRecovered(fetchImpl, base, groupId) {
-  const get = async (path) => {
-    const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(6e4) });
-    if (!res.ok) throw new Error(`TSIO GET ${path}: ${res.status}`);
-    return await res.json();
-  };
-  const [{ suites = [] }, cases] = await Promise.all([get(`/reports/${groupId}/suites`), get(`/reports/${groupId}/cases`)]);
+  const [{ suites = [] }, cases] = await Promise.all([
+    tsioJson(fetchImpl, base, `/reports/${groupId}/suites`),
+    tsioJson(fetchImpl, base, `/reports/${groupId}/cases`)
+  ]);
   const fileOf2 = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
   const byTest = /* @__PURE__ */ new Map();
   for (const c of cases) {
@@ -2603,12 +2593,12 @@ async function retryRecovered(fetchImpl, base, groupId) {
   }
   const perIdentity = /* @__PURE__ */ new Map();
   for (const attempts of byTest.values()) {
-    const key = unlistedKey(fileOf2.get(attempts[0].suite_id), attempts[0].title, attempts[0].full_title);
+    const key = identityKey({ file: fileOf2.get(attempts[0].suite_id) ?? "", title: attempts[0].title, full_title: attempts[0].full_title });
     perIdentity.set(key, (perIdentity.get(key) ?? 0) + 1);
   }
   const out = [];
   for (const attempts of byTest.values()) {
-    attempts.sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0));
+    attempts.sort((a, b) => a.retry_count - b.retry_count || a.ordinal - b.ordinal);
     if (outcomeOf(attempts).status !== "flaky") continue;
     const failed = attempts.find((a) => FAILED_STATUSES.has(a.status)) ?? attempts[0];
     const file = fileOf2.get(failed.suite_id) ?? "";
@@ -2654,7 +2644,6 @@ function selectCrossLane(bySuite) {
         full_title: f.full_title ?? null,
         error: compactError(f.error, ERROR_CHARS),
         trunk: f.trunk,
-        failed_in_suites_now: [...suites.keys()],
         finding: f
       });
     }
@@ -2675,8 +2664,7 @@ function selectRetryFlakes(tests, history, {
   suite,
   testRoot,
   branch,
-  groupId,
-  minFlaky = 1
+  groupId
 }) {
   const bySpec = /* @__PURE__ */ new Map();
   for (const t of tests) {
@@ -2684,7 +2672,7 @@ function selectRetryFlakes(tests, history, {
     const trunk = trunkRows(history, t, branch).filter((o) => o.group_id !== groupId && o.status !== "skipped");
     const fails = trunk.filter((o) => FAILED_STATUSES.has(o.status)).length;
     const flaky = trunk.filter((o) => o.status === "flaky").length;
-    if (fails + flaky < minFlaky) continue;
+    if (fails + flaky < MIN_FLAKY) continue;
     const spec = repoPath(testRoot, t.file) ?? t.file;
     let g = bySpec.get(spec);
     if (!g) {
@@ -2729,14 +2717,17 @@ function rangeOf(history, tests, branch) {
   }
   return green ? { green, red } : null;
 }
+function mergeRanges(a, b) {
+  const at = (o) => Date.parse(o.created_at ?? "") || 0;
+  return {
+    green: at(b.green) < at(a.green) ? b.green : a.green,
+    red: !a.red || !b.red ? null : at(b.red) > at(a.red) ? b.red : a.red
+  };
+}
 function combineRanges(ranges) {
   const known = ranges.filter((r) => r !== null);
-  if (!ranges.length || known.length !== ranges.length) return null;
-  const at = (o) => Date.parse(o.created_at ?? "") || 0;
-  const earliest = (rows) => rows.reduce((a, b) => at(b) < at(a) ? b : a);
-  const latest = (rows) => rows.reduce((a, b) => at(b) > at(a) ? b : a);
-  const reds = known.map((r) => r.red).filter((r) => Boolean(r));
-  return { green: earliest(known.map((r) => r.green)), red: reds.length ? latest(reds) : null };
+  if (!known.length || known.length !== ranges.length) return null;
+  return known.reduce(mergeRanges);
 }
 function combineWindows(windows) {
   const known = windows.filter((w) => Boolean(w));
@@ -2798,7 +2789,6 @@ function breakWindow(history, tests, branch, currentAt) {
 }
 var windowsOverlap = (a, b) => a.from < b.to - SAME_RUN_MS && b.from < a.to - SAME_RUN_MS;
 function bundle(groups) {
-  const at = (o) => Date.parse(o?.created_at ?? "") || 0;
   const newReq = (g, window) => ({
     specs: [g.spec],
     kind: g.kind,
@@ -2813,12 +2803,7 @@ function bundle(groups) {
     for (const s of g.suites) r.suites.add(s);
     r.tests.push(...g.tests);
     for (const p of g.openPRs ?? []) if (!r.openPRs.some((q) => q.number === p.number)) r.openPRs.push(p);
-    if (!r.range || !g.range) r.range = null;
-    else {
-      const green = at(g.range.green) < at(r.range.green) ? g.range.green : r.range.green;
-      const red = !g.range.red || !r.range.red ? null : at(g.range.red) > at(r.range.red) ? g.range.red : r.range.red;
-      r.range = { green, red };
-    }
+    r.range = r.range && g.range ? mergeRanges(r.range, g.range) : null;
   };
   const windowed = [];
   const alone = [];
@@ -2843,18 +2828,21 @@ function bundle(groups) {
 // src/watch.ts
 var MAX_TESTS = 40;
 var MAX_OPEN_PRS_TOUCHING = 10;
-async function runGroups(fetchImpl, base, repository, runId, attempt, names, { pageSize = 100, maxPages = 5 } = {}) {
+var MAX_CONFLICTS_PER_RUN = 2;
+var HOLD_MS = 24 * HOUR;
+var OWN_PR_IDLE_MS = 3 * DAY;
+var REPORTS_PAGE = 100;
+var REPORTS_MAX_PAGES = 5;
+async function runGroups(fetchImpl, base, repository, runId, attempt, names) {
   const groups = [];
   const ofRun = (g) => String(g.gh_run_id) === String(runId) && String(g.gh_run_attempt) === String(attempt);
   for (const name of names) {
-    for (let page = 0; page < maxPages; page++) {
-      const query = new URLSearchParams({ repository, name, limit: String(pageSize), offset: String(page * pageSize) });
-      const res = await fetchImpl(`${base}/api/v1/reports?${query}`, { signal: AbortSignal.timeout(6e4) });
-      if (!res.ok) throw new Error(`TSIO GET /reports (${name}): ${res.status}`);
-      const reports = (await res.json()).reports ?? [];
+    for (let page = 0; page < REPORTS_MAX_PAGES; page++) {
+      const query = new URLSearchParams({ repository, name, limit: String(REPORTS_PAGE), offset: String(page * REPORTS_PAGE) });
+      const { reports = [] } = await tsioJson(fetchImpl, base, `/reports?${query}`);
       const found = reports.filter((g) => g.name === name && ofRun(g));
       groups.push(...found);
-      if (reports.length < pageSize || found.length > 0 && !ofRun(reports[reports.length - 1])) break;
+      if (reports.length < REPORTS_PAGE || found.length > 0 && !ofRun(reports[reports.length - 1])) break;
     }
   }
   return groups;
@@ -2889,10 +2877,7 @@ ${note}; nothing to watch.
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
   const maxBrokenPerRun = Number(env.MAX_BROKEN_PER_RUN || 10);
   const maxFlakyPerDay = Number(env.MAX_FLAKY_PER_DAY || 6);
-  const holdMs = Number(env.HOLD_HOURS || 24) * HOUR;
-  const ownIdleMs = Number(env.OWN_PR_IDLE_DAYS || 3) * DAY;
   const causeHoldMs = Number(env.CAUSE_HOLD_HOURS || 4) * HOUR;
-  const minFlaky = Number(env.MIN_FLAKY || 1);
   const currentAt = Date.parse(first.created_at ?? "") || now.getTime();
   const label = env.LABEL || DEFAULT_LABEL;
   const reportNameOf = new Map(suites.map((s) => [s.name, s.report_name || null]));
@@ -2918,13 +2903,13 @@ ${note}; nothing to watch.
       continue;
     }
     bySuite.push({ suite: s.name, findings: result.findings });
-    const found = selectRepairs(result, s.name, { minFlaky });
+    const found = selectRepairs(result, s.name);
     try {
       const groupId = groupsOfRun.find((g) => g.name === s.name && g.branch === trunk).id;
       const recovered = await retryRecovered(fetchImpl, base, groupId);
       if (recovered.length) {
         const history = await fetchHistory(fetchImpl, base, id.repository, recovered, until, void 0, trunk, s.report_name || null, log, laneOf(s.name));
-        found.push(...selectRetryFlakes(recovered, history, { suite: s.name, testRoot: s.test_root, branch: trunk, groupId, minFlaky }));
+        found.push(...selectRetryFlakes(recovered, history, { suite: s.name, testRoot: s.test_root, branch: trunk, groupId }));
       }
     } catch (e) {
       notes.push(`${s.name}: retry-recovered tests not read (${String(e).slice(0, 160)})`);
@@ -2934,9 +2919,9 @@ ${note}; nothing to watch.
   for (const g of selectCrossLane(bySuite)) addGroup(groups, g);
   const decisions = [];
   const out = [];
-  const instructions = env.INSTRUCTIONS ? { instructions: env.INSTRUCTIONS } : {};
-  const ledger = readLedger(env.LEDGER_PATH).filter((r) => now.getTime() - Date.parse(r.at) < LEDGER_MS);
-  writeLedger(env.LEDGER_PATH, ledger);
+  const ledgerPath = String(env.LEDGER_PATH);
+  const ledger = readLedger(ledgerPath).filter((r) => now.getTime() - Date.parse(r.at) < LEDGER_MS);
+  writeLedger(ledgerPath, ledger);
   const open = groups.size ? await specsInOpenPRs(api, id.repository, { now, base: trunk }) : { files: /* @__PURE__ */ new Map(), prs: /* @__PURE__ */ new Map() };
   if (open.truncated) notes.push("open PRs past the newest read were not checked for overlap with these specs");
   let own = { prs: [], files: /* @__PURE__ */ new Map() };
@@ -2965,14 +2950,14 @@ ${note}; nothing to watch.
     const ownPRs = [];
     for (const n of agentPRs) {
       const at = activity.get(n) ?? null;
-      if (at != null && now.getTime() - at > ownIdleMs) {
+      if (at != null && now.getTime() - at > OWN_PR_IDLE_MS) {
         if (!idleNoted.has(n)) {
           idleNoted.add(n);
           notes.push(`stalled agent PR #${n} (idle ${Math.floor((now.getTime() - at) / DAY)} days): not blocking new requests`);
         }
       } else ownPRs.push(n);
     }
-    const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < holdMs);
+    const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < HOLD_MS);
     if (ownUnknown) skip(g, "skipped: the agent's own PRs could not be read");
     else if (ownPRs.length) skip(g, `skipped: #${ownPRs.join(", #")} (${label}) already changes it`);
     else if (held) skip(g, `skipped: requested ${utcMinute(held.at)} UTC by ${held.run}`);
@@ -3012,8 +2997,6 @@ ${note}; nothing to watch.
     const tests = r.tests.map(({ finding: _finding, ...t }) => t);
     const payload = {
       kind: "e2e-autofix",
-      repository: id.repository,
-      branch: id.branch,
       commit: id.commit_sha,
       master_run: runURL,
       specs: r.specs,
@@ -3024,10 +3007,8 @@ ${note}; nothing to watch.
       ...await suspects(api, id, r.range, log),
       // Not skipped on: the agent checks whether any of these already fixes this failure.
       open_prs_touching: r.openPRs.slice(0, MAX_OPEN_PRS_TOUCHING).map(({ number, title, url }) => ({ number, title, url })),
-      ...instructions,
       labels: [label, ...env.EXTRA_LABELS ? env.EXTRA_LABELS.split(",").map((l) => l.trim()).filter(Boolean) : []]
     };
-    decision.payload = payload;
     decision.action = "to request";
     out.push({
       id: `fix-${out.length + 1}`,
@@ -3042,17 +3023,7 @@ ${note}; nothing to watch.
     });
   }
   for (const g of flaky.slice(Math.max(0, flakyLeft))) skip(g, `skipped: flaky budget of ${maxFlakyPerDay} a day used`);
-  const { conflicts, out: conflictOut } = planConflicts({
-    own,
-    ledger,
-    now,
-    holdMs,
-    maxPerRun: Number(env.MAX_CONFLICTS_PER_RUN || 2),
-    repository: id.repository,
-    branch: id.branch,
-    runURL,
-    instructions
-  });
+  const { conflicts, out: conflictOut } = planConflicts({ own, ledger, now, runURL });
   out.push(...conflictOut);
   const lines = summaryLines({ commit: id.commit_sha, runURL, decisions, conflicts, notes });
   if (env.GITHUB_STEP_SUMMARY) (0, import_node_fs5.appendFileSync)(env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
@@ -3065,22 +3036,12 @@ ${note}; nothing to watch.
   writeOutputs(env, planned);
   return { decisions, conflicts, requests: planned, notes };
 }
-function planConflicts({
-  own,
-  ledger,
-  now,
-  holdMs,
-  maxPerRun,
-  repository,
-  branch,
-  runURL,
-  instructions
-}) {
+function planConflicts({ own, ledger, now, runURL }) {
   const conflicts = [];
   const out = [];
-  let left = maxPerRun;
+  let left = MAX_CONFLICTS_PER_RUN;
   for (const pr of conflictedRepairPRs(own)) {
-    const held = ledger.find((r) => r.pr === pr.number && r.head === pr.headRefOid && now.getTime() - Date.parse(r.at) < holdMs);
+    const held = ledger.find((r) => r.pr === pr.number && r.head === pr.headRefOid && now.getTime() - Date.parse(r.at) < HOLD_MS);
     const c = { pr: pr.number, url: pr.url };
     conflicts.push(c);
     if (held) {
@@ -3088,23 +3049,13 @@ function planConflicts({
       continue;
     }
     if (left <= 0) {
-      c.action = `skipped: over ${maxPerRun} conflict requests in one run`;
+      c.action = `skipped: over ${MAX_CONFLICTS_PER_RUN} conflict requests in one run`;
       continue;
     }
     left--;
-    c.payload = {
-      kind: "e2e-autofix-conflict",
-      repository,
-      branch,
-      master_run: runURL,
-      pr: pr.number,
-      pr_url: pr.url,
-      pr_branch: pr.headRefName,
-      pr_head: pr.headRefOid,
-      ...instructions
-    };
+    const payload = { kind: "e2e-autofix-conflict", pr: pr.number, pr_url: pr.url, pr_branch: pr.headRefName, pr_head: pr.headRefOid };
     c.action = "to send back";
-    out.push({ id: `conflict-${pr.number}`, payload: c.payload, entry: { at: now.toISOString(), pr: pr.number, head: pr.headRefOid, run: runURL } });
+    out.push({ id: `conflict-${pr.number}`, payload, entry: { at: now.toISOString(), pr: pr.number, head: pr.headRefOid, run: runURL } });
   }
   return { conflicts, out };
 }
@@ -3143,19 +3094,19 @@ function record({ env, now = /* @__PURE__ */ new Date(), log = console.error }) 
   } catch {
   }
   const results = new Map(JSON.parse(env.RESULTS || "[]").map((r) => [r.id, Number(r.status) || 0]));
-  const ledger = readLedger(env.LEDGER_PATH).filter((r) => now.getTime() - Date.parse(r.at) < LEDGER_MS);
+  const ledgerPath = String(env.LEDGER_PATH);
+  const ledger = readLedger(ledgerPath).filter((r) => now.getTime() - Date.parse(r.at) < LEDGER_MS);
   const lines = [];
   for (const p of pending) {
     const status = results.get(p.id);
     if (status !== void 0 && status >= 200 && status < 300) ledger.push(p.entry);
     else lines.push(`- \`${p.id}\`: ${status == null ? "not sent" : `not accepted (HTTP ${status})`}; it will be planned again on the next trunk run`);
   }
-  writeLedger(env.LEDGER_PATH, ledger);
+  writeLedger(ledgerPath, ledger);
   const sent = pending.length - lines.length;
   const summary = pending.length ? [`Sent ${sent} of ${pending.length} request(s).`, ...lines] : [];
   if (summary.length && env.GITHUB_STEP_SUMMARY) (0, import_node_fs5.appendFileSync)(env.GITHUB_STEP_SUMMARY, "\n" + summary.join("\n") + "\n");
   if (summary.length) log(summary.join("\n"));
-  return { sent, failed: lines.length };
 }
 
 // src/index.ts

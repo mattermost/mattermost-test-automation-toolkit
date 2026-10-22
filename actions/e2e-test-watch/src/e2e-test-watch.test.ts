@@ -40,12 +40,12 @@ test("only failures that repeat on trunk are repaired, grouped by spec", () => {
     finding({ title: "t4", class: "INSUFFICIENT_DATA" }),
     finding({ title: "t5", file: "b.spec.ts", repo_path: "specs/b.spec.ts", class: "FLAKY_ON_TRUNK", trunk: trunkOf(1, 0, 7) }),
     finding({ title: "t6", identity_unresolved: true }),
+    // History excludes this run: flaky with no earlier failure is this run's alone.
+    finding({ title: "t7", file: "c.spec.ts", repo_path: "specs/c.spec.ts", class: "FLAKY_ON_TRUNK", trunk: trunkOf(0, 0, 8) }),
   ];
   const groups = selectRepairs({ findings }, "suite-a");
   assert.deepEqual(groups.map((g) => [g.spec, g.kind]), [["specs/a.spec.ts", "broken"], ["specs/b.spec.ts", "flaky"]], "a broken test makes its spec broken; one earlier failure plus this one is flaky enough");
   assert.deepEqual(groups[0].tests.map((t) => t.title), ["t1", "t2"]);
-  // History excludes this run, so minFlaky 2 asks for two earlier failures.
-  assert.deepEqual(selectRepairs({ findings }, "suite-a", { minFlaky: 2 }).map((g) => g.spec), ["specs/a.spec.ts"]);
 });
 
 test("an open PR blocks a spec when it changes the spec or a file beside it", () => {
@@ -76,19 +76,6 @@ test("the suspect range starts where every failing test last passed and ends at 
   assert.equal(r?.red?.commit_sha, "c2", "the later of the two first failures");
   // A PR's run is not trunk.
   assert.equal(rangeOf(new Map([[identityKey(t1), [row("failed", 1), row("passed", 2, { gh_pr_number: 5 })]]]), [t1], "master"), null, "no trunk pass in the window: no range");
-});
-
-test("the suspect range ends at the latest first failure among a spec's tests, not the earliest", () => {
-  // Commit c<n> is the trunk commit of hour n. A broke at c5, after its green c4; B broke at c10, after its green c9.
-  const at = (n: number, status: string): RunRow => ({ status, commit_sha: `c${n}`, created_at: `2026-10-02T${String(n).padStart(2, "0")}:00:00Z`, branch: "master", gh_pr_number: null });
-  const a = { file: "a.spec.ts", title: "a" };
-  const b = { file: "a.spec.ts", title: "b" };
-  const history = new Map<string, RunRow[]>([
-    [identityKey(a), [at(5, "failed"), at(4, "passed")]],
-    [identityKey(b), [at(10, "failed"), at(9, "passed")]],
-  ]);
-  const r = rangeOf(history, [a, b], "master");
-  assert.deepEqual([r?.green.commit_sha, r?.red?.commit_sha], ["c4", "c10"], "from the oldest last pass to the latest first failure: c10 is among the suspects");
 });
 
 /** A bundle test's suspect range: its oldest green and first red run, as TSIO rows carry them. */
@@ -423,7 +410,6 @@ test("a first failure in two lanes of the same run is broken now; in one lane it
     hook,
   });
   assert.deepEqual(decisions.map((d) => [d.specs, d.kind, d.action]), [[["specs/x/a.spec.ts"], "broken", "to request"]], "y/b failed in one lane only: wait for the next run");
-  assert.deepEqual(asFix(hook[0]).tests[0].failed_in_suites_now, lanes);
   assert.deepEqual(asFix(hook[0]).suites, lanes);
   assert.equal(asFix(hook[0]).last_green_commit, "c1", "it passed on the commit before");
 });
@@ -438,23 +424,18 @@ test("selectCrossLane ignores tests already broken or flaky, and names it cannot
   assert.deepEqual(groups.map((g) => [g.spec, g.kind, g.tests.map((t) => [t.suite, t.title])]), [["specs/a.spec.ts", "broken", [["ent", "t"], ["fips", "t"], ["ent", "n"], ["fips", "n"]]]]);
 });
 
-test("a test is read against its own lane's history, not the first suite's", async () => {
+test("a lane failing first in this run makes this run the suspect range's end", async () => {
   const lanes = ["playwright-full-enterprise-master", "playwright-full-fips-master"];
-  const row = (name: string, status: string, i: number) => ({ file: "x/a.spec.ts", title: "t1", status, retry_count: 0, gh_pr_number: null, branch: "master", group_id: `${name}-${i}`, commit_sha: `c${i}`, created_at: `2026-10-02T0${9 - i}:00:00Z`, name });
-  // Enterprise passed on every run. FIPS failed on run 1 and passed on run 2, so its break starts after c2.
-  const observations = [
-    ...[1, 2, 3, 4, 5, 6].map((i) => row(lanes[0], "passed", i)),
-    row(lanes[1], "failed", 1),
-    ...[2, 3, 4, 5, 6].map((i) => row(lanes[1], "passed", i)),
-  ];
+  const obs = (name: string, n: number, status: string) => ({ file: "x/a.spec.ts", title: "t1", status, retry_count: 0, gh_pr_number: null, branch: "master", group_id: `${name}-${n}`, commit_sha: `c${n}`, created_at: `2026-10-02T${String(n).padStart(2, "0")}:00:00Z`, name });
+  // Enterprise passed up to c7 and fails first in this run; FIPS broke at c8, after its green c7.
+  const observations = [obs(lanes[0], 7, "passed"), obs(lanes[0], 6, "passed"), obs(lanes[1], 8, "failed"), obs(lanes[1], 7, "passed")];
   const fetchImpl: FetchImpl = async () => Response.json({ observations, has_more: false });
-  // The same spec fails for the first time in both lanes, so it is one cross-lane group.
   const finding: RepairFinding = { file: "x/a.spec.ts", title: "t1", error: "Error: expected visible", class: "REGRESSION", trunk: trunkOf(0, 0, 8) };
   const [group] = selectCrossLane(lanes.map((suite) => ({ suite, findings: [finding] })));
-  const id: WatchId = { repository: "o/r", branch: "master", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1" };
+  const id: WatchId = { repository: "o/r", branch: "master", commit_sha: "c9", gh_run_id: "12", gh_run_attempt: "1" };
   const { range } = await specRange(fetchImpl, "http://tsio", id, group, "2026-10-03T00:00:00Z", Date.parse("2026-10-02T09:00:00Z"), () => {}, new Map(lanes.map((l): [string, string | null] => [l, null])));
-  assert.equal(range?.green.commit_sha, "c2", "the FIPS test's last green run, not the enterprise one");
-  assert.equal(range?.red?.commit_sha, "c1", "the first FIPS failure");
+  assert.equal(range?.green.commit_sha, "c7");
+  assert.equal(range?.red, null, "enterprise's first failure is this run, later than FIPS's c8");
 });
 
 test("the suspect range covers every lane's break, ending at the latest lane's first failure", async () => {
@@ -632,7 +613,7 @@ test("a labelled open PR beside a spec, not on it, does not block the spec; it i
   assert.deepEqual(asFix(hook[0]).open_prs_touching.map((p) => p.number), [41], "still listed, so the agent can judge it");
 });
 
-test("an agent PR idle for more than own-pr-idle-days (3 by default) no longer blocks, and is named in the summary", async () => {
+test("an agent PR idle for more than 3 days no longer blocks, and is named in the summary", async () => {
   // Last updated and last committed four days before the run.
   const idle = ownPR(9, "specs/z/c.spec.ts", { updatedAt: "2026-09-29T00:00:00Z", commits: { nodes: [{ commit: { committedDate: "2026-09-29T00:00:00Z" } }] } });
   const { decisions, notes } = await run({ env, fetchImpl: routes({ openPRFiles: [], repairPRs: [idle] }), hook: [] });
@@ -650,14 +631,14 @@ test("a recent commit keeps an agent PR active, even when its update is old", as
   assert.deepEqual(notes, []);
 });
 
-test("own-pr-idle-days sets how long an agent PR may sit idle before it stops blocking", async () => {
-  const idle = ownPR(9, "specs/z/c.spec.ts", { updatedAt: "2026-09-29T00:00:00Z" });
-  const longer = await run({ env: { ...env, OWN_PR_IDLE_DAYS: "5" }, fetchImpl: routes({ openPRFiles: [], repairPRs: [idle] }), hook: [] });
-  assert.deepEqual(longer.decisions.map((d) => [d.specs, d.action]), [
+test("an agent PR idle for less than 3 days still blocks", async () => {
+  const idle = ownPR(9, "specs/z/c.spec.ts", { updatedAt: "2026-10-01T00:00:00Z" });
+  const recent = await run({ env, fetchImpl: routes({ openPRFiles: [], repairPRs: [idle] }), hook: [] });
+  assert.deepEqual(recent.decisions.map((d) => [d.specs, d.action]), [
     [["specs/z/c.spec.ts"], "skipped: #9 (e2e-autofix) already changes it"],
     [["specs/x/a.spec.ts", "specs/y/b.spec.ts"], "to request"],
   ]);
-  assert.deepEqual(longer.notes, [], "not idle yet: nothing to name");
+  assert.deepEqual(recent.notes, [], "not idle yet: nothing to name");
 });
 
 test("the hold still limits duplicates for a spec whose agent PR is idle", async () => {

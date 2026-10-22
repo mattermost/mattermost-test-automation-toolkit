@@ -88,15 +88,20 @@ export function rangeOf(history: RunHistory, tests: readonly TestRef[], branch: 
   return green ? { green, red } : null;
 }
 
-/** The union of per-lane suspect ranges: the oldest green, the latest red, so every lane's break is in it. Null when any lane has no range, as rangeOf is null when any test has none. */
+/** Two suspect ranges as one: the older green, the later red. No red row means this run, the latest there is. */
+function mergeRanges(a: SuspectRange, b: SuspectRange): SuspectRange {
+  const at = (o: RangeEnd): number => Date.parse(o.created_at ?? "") || 0;
+  return {
+    green: at(b.green) < at(a.green) ? b.green : a.green,
+    red: !a.red || !b.red ? null : at(b.red) > at(a.red) ? b.red : a.red,
+  };
+}
+
+/** The union of per-lane suspect ranges, so every lane's break is in it. Null when any lane has no range, as rangeOf is null when any test has none. */
 function combineRanges(ranges: (SuspectRange | null)[]): SuspectRange | null {
   const known = ranges.filter((r): r is SuspectRange => r !== null);
-  if (!ranges.length || known.length !== ranges.length) return null;
-  const at = (o: RangeEnd): number => Date.parse(o.created_at ?? "") || 0;
-  const earliest = <R extends RangeEnd>(rows: R[]): R => rows.reduce((a, b) => (at(b) < at(a) ? b : a));
-  const latest = <R extends RangeEnd>(rows: R[]): R => rows.reduce((a, b) => (at(b) > at(a) ? b : a));
-  const reds = known.map((r) => r.red).filter((r): r is RangeEnd => Boolean(r));
-  return { green: earliest(known.map((r) => r.green)), red: reds.length ? latest(reds) : null };
+  if (!known.length || known.length !== ranges.length) return null;
+  return known.reduce(mergeRanges);
 }
 
 /** The union of per-lane break windows: from the earliest start to the latest end. */
@@ -202,7 +207,6 @@ export const windowsOverlap = (a: BreakWindow, b: BreakWindow): boolean => a.fro
  * first; among flaky ones, the one that flaked most on trunk first.
  */
 export function bundle(groups: RangedGroup[]): FixRequest[] {
-  const at = (o: RangeEnd | null | undefined): number => Date.parse(o?.created_at ?? "") || 0;
   const newReq = (g: RangedGroup, window: BreakWindow | null): FixRequest => ({
     specs: [g.spec],
     kind: g.kind,
@@ -219,13 +223,7 @@ export function bundle(groups: RangedGroup[]): FixRequest[] {
     for (const p of g.openPRs ?? []) if (!r.openPRs.some((q) => q.number === p.number)) r.openPRs.push(p);
     // A member whose break is older than the history can see leaves the bundle's start unknown too:
     // suspect commits from the other members alone would leave out what broke it.
-    if (!r.range || !g.range) r.range = null;
-    else {
-      const green = at(g.range.green) < at(r.range.green) ? g.range.green : r.range.green;
-      // No red row means this run: the latest first failure there is.
-      const red = !g.range.red || !r.range.red ? null : at(g.range.red) > at(r.range.red) ? g.range.red : r.range.red;
-      r.range = { green, red };
-    }
+    r.range = r.range && g.range ? mergeRanges(r.range, g.range) : null;
   };
   const windowed: { g: RangedGroup; window: BreakWindow }[] = [];
   const alone: RangedGroup[] = [];

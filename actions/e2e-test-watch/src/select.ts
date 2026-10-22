@@ -5,12 +5,15 @@ import type { Finding } from "../../e2e-test-triage/src/types.ts";
 import { compactError } from "../../e2e-test-triage/src/pack.ts";
 import { repoPath } from "../../e2e-test-triage/src/config.ts";
 import type { FetchImpl } from "../../shared/src/github.ts";
-import { FAILED_STATUSES, identityKey, outcomeOf } from "../../shared/src/tsio.ts";
+import { FAILED_STATUSES, identityKey, outcomeOf, tsioJson } from "../../shared/src/tsio.ts";
+import type { TsioCase, TsioSuite } from "../../shared/src/tsio.ts";
 import type { TsioId } from "../../e2e-test-triage/src/types.ts";
 import { specOf, trunkRows } from "./model.ts";
 import type { Group, Kind, RunHistory } from "./model.ts";
 
 const ERROR_CHARS = 600;
+// Earlier trunk failures or flaky passes a test needs, besides this run's, to count as flaky.
+const MIN_FLAKY = 1;
 
 /** The parts of a triage finding that selecting repairs reads. */
 export type RepairFinding = Pick<Finding, "class" | "title" | "full_title" | "file" | "repo_path" | "error" | "identity_unresolved" | "trunk">;
@@ -23,40 +26,16 @@ export interface RecoveredTest {
   error: string;
 }
 
-interface SuiteRow {
-  id: TsioId;
-  file_path?: string | null;
-  file?: string | null;
-}
-
-interface CaseRow {
-  suite_id: TsioId;
-  title: string;
-  full_title?: string | null;
-  status: string;
-  retry_count: number;
-  ordinal?: number | null;
-  error_message?: string | null;
-  error_stack?: string | null;
-}
-
 // Triage classes for a test failing on trunk for the first time (or with too little history to say).
 const FIRST_FAILURE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
 
-/**
- * The key identityKey gives a test in a file TSIO did not list: JSON.stringify writes the missing file as null,
- * so the key of such a test is the same as identityKey's, with the file left out.
- */
-const unlistedKey = (file: string | undefined, title: string, fullTitle: string | null | undefined): string =>
-  JSON.stringify(["", file, fullTitle || title]);
-
 /** Which failures in a trunk triage result need a repair, grouped by spec file. */
-export function selectRepairs(result: { findings: readonly RepairFinding[] }, suite: string, { minFlaky = 1 }: { minFlaky?: number } = {}): Group[] {
+export function selectRepairs(result: { findings: readonly RepairFinding[] }, suite: string): Group[] {
   const bySpec = new Map<string, Group>();
   for (const f of result.findings) {
-    // trunk counts exclude this run, so minFlaky 1 means this failure plus one before it.
+    // trunk counts exclude this run, so MIN_FLAKY 1 means this failure plus one before it.
     const kind: Kind | null =
-      f.class === "BROKEN_ON_TRUNK" ? "broken" : f.class === "FLAKY_ON_TRUNK" && f.trunk.fails + f.trunk.flaky >= minFlaky ? "flaky" : null;
+      f.class === "BROKEN_ON_TRUNK" ? "broken" : f.class === "FLAKY_ON_TRUNK" && f.trunk.fails + f.trunk.flaky >= MIN_FLAKY ? "flaky" : null;
     if (!kind || f.identity_unresolved) continue;
     const spec = specOf(f);
     let g = bySpec.get(spec);
@@ -76,14 +55,12 @@ export function selectRepairs(result: { findings: readonly RepairFinding[] }, su
  * passed, so a test that flakes on trunk but always recovers would otherwise never be seen.
  */
 export async function retryRecovered(fetchImpl: FetchImpl, base: string, groupId: TsioId): Promise<RecoveredTest[]> {
-  const get = async <T>(path: string): Promise<T> => {
-    const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(60000) });
-    if (!res.ok) throw new Error(`TSIO GET ${path}: ${res.status}`);
-    return (await res.json()) as T;
-  };
-  const [{ suites = [] }, cases] = await Promise.all([get<{ suites?: SuiteRow[] }>(`/reports/${groupId}/suites`), get<CaseRow[]>(`/reports/${groupId}/cases`)]);
+  const [{ suites = [] }, cases] = await Promise.all([
+    tsioJson<{ suites?: TsioSuite[] }>(fetchImpl, base, `/reports/${groupId}/suites`),
+    tsioJson<TsioCase[]>(fetchImpl, base, `/reports/${groupId}/cases`),
+  ]);
   const fileOf = new Map<TsioId, string>(suites.map((s): [TsioId, string] => [s.id, s.file_path ?? s.file ?? ""]));
-  const byTest = new Map<string, CaseRow[]>();
+  const byTest = new Map<string, TsioCase[]>();
   for (const c of cases) {
     const k = c.full_title ? JSON.stringify([fileOf.get(c.suite_id) ?? "", c.full_title]) : JSON.stringify([c.suite_id, c.title]);
     let attempts = byTest.get(k);
@@ -96,12 +73,12 @@ export async function retryRecovered(fetchImpl: FetchImpl, base: string, groupId
   // A name two tests share can't be matched to its own history.
   const perIdentity = new Map<string, number>();
   for (const attempts of byTest.values()) {
-    const key = unlistedKey(fileOf.get(attempts[0].suite_id), attempts[0].title, attempts[0].full_title);
+    const key = identityKey({ file: fileOf.get(attempts[0].suite_id) ?? "", title: attempts[0].title, full_title: attempts[0].full_title });
     perIdentity.set(key, (perIdentity.get(key) ?? 0) + 1);
   }
   const out: RecoveredTest[] = [];
   for (const attempts of byTest.values()) {
-    attempts.sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0));
+    attempts.sort((a, b) => a.retry_count - b.retry_count || a.ordinal - b.ordinal);
     if (outcomeOf(attempts).status !== "flaky") continue;
     const failed = attempts.find((a) => FAILED_STATUSES.has(a.status)) ?? attempts[0];
     const file = fileOf.get(failed.suite_id) ?? "";
@@ -155,7 +132,6 @@ export function selectCrossLane(bySuite: { suite: string; findings: readonly Rep
         full_title: f.full_title ?? null,
         error: compactError(f.error, ERROR_CHARS),
         trunk: f.trunk,
-        failed_in_suites_now: [...suites.keys()],
         finding: f,
       });
     }
@@ -184,8 +160,7 @@ export function selectRetryFlakes(
     testRoot,
     branch,
     groupId,
-    minFlaky = 1,
-  }: { suite: string; testRoot: string | null | undefined; branch: string; groupId: TsioId; minFlaky?: number },
+  }: { suite: string; testRoot: string | null | undefined; branch: string; groupId: TsioId },
 ): Group[] {
   const bySpec = new Map<string, Group>();
   for (const t of tests) {
@@ -193,7 +168,7 @@ export function selectRetryFlakes(
     const trunk = trunkRows(history, t, branch).filter((o) => o.group_id !== groupId && o.status !== "skipped");
     const fails = trunk.filter((o) => FAILED_STATUSES.has(o.status)).length;
     const flaky = trunk.filter((o) => o.status === "flaky").length;
-    if (fails + flaky < minFlaky) continue;
+    if (fails + flaky < MIN_FLAKY) continue;
     const spec = repoPath(testRoot, t.file) ?? t.file;
     let g = bySpec.get(spec);
     if (!g) {

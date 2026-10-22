@@ -48,7 +48,6 @@ export interface GroupTest {
   error: string;
   trunk: TrunkCounts;
   finding: TestRef;
-  failed_in_suites_now?: string[];
 }
 
 /** The failing tests of one spec, with the kind of repair they need. */
@@ -72,4 +71,4 @@ export function trunkRows(history: RunHistory, test: TestRef, branch: string): R
 
 /** How often a group's or request's tests failed or flaked on trunk before this run. */
 export const flakes = (r: { readonly tests: readonly GroupTest[] }): number =>
-  r.tests.reduce((n, t) => n + (t.trunk?.fails ?? 0) + (t.trunk?.flaky ?? 0), 0);
+  r.tests.reduce((n, t) => n + t.trunk.fails + t.trunk.flaky, 0);

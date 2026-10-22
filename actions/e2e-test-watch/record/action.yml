@@ -22,11 +22,9 @@ runs:
         LEDGER_PATH: ${{ github.workspace }}/.e2e-master-watch/ledger.json
         PENDING_PATH: ${{ github.workspace }}/.e2e-master-watch/pending.json
       run: node "${{ github.action_path }}/../dist/index.js" record
-    # The caller's job must set `cache-mode: write` (see the README): a workflow_run run is read-only by default,
-    # and then this save is skipped with a log message, so the next run sends the same requests again.
+    # Needs the caller's `cache-mode: write`: see the README.
     - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ${{ github.workspace }}/.e2e-master-watch/ledger.json
-        # Unique to this run of the calling workflow: a re-run saves a new entry instead of failing to overwrite.
-        # Keeps the former action name, like the restore in action.yml: the key identifies the saved ledger.
+        # The restore's key in ../action.yml, which says why it keeps the former name.
         key: e2e-master-watch-${{ inputs.branch }}-${{ github.run_id }}-${{ github.run_attempt }}

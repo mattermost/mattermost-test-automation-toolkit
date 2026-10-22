@@ -27,36 +27,25 @@ export interface LedgerEntry {
  * Requests sent by earlier runs, persisted between runs by the action's cache. A missing ledger is an empty one;
  * an unreadable one stops the run.
  */
-export function readLedger(path: string | null | undefined): LedgerEntry[] {
-  if (!path) return [];
+export function readLedger(path: string): LedgerEntry[] {
   let text: string;
   try {
     text = readFileSync(path, "utf8");
   } catch (e) {
-    if (isNodeError(e) && e.code === "ENOENT") return []; // the first run, or the cache expired
+    if (e instanceof Error && "code" in e && e.code === "ENOENT") return []; // the first run, or the cache expired
     throw e;
   }
   // An unreadable ledger would drop every hold and resend what agents are working on: stop instead.
   try {
     return (JSON.parse(text) as { requests?: LedgerEntry[] }).requests ?? [];
   } catch (e) {
-    throw new Error(`ledger ${path} is not valid JSON (${errorMessage(e)}); delete the e2e-master-watch caches to start a new one`);
+    throw new Error(`ledger ${path} is not valid JSON (${e instanceof Error ? e.message : String(e)}); delete the e2e-master-watch caches to start a new one`);
   }
 }
 
-export function writeLedger(path: string | null | undefined, requests: LedgerEntry[]): void {
-  if (!path) return;
+export function writeLedger(path: string, requests: LedgerEntry[]): void {
   mkdirSync(dirname(path), { recursive: true });
   // Renamed into place, so an interrupted write can't leave half a ledger for the cache to save.
   writeFileSync(`${path}.tmp`, JSON.stringify({ requests }, null, 1));
   renameSync(`${path}.tmp`, path);
-}
-
-/** The message of an error thrown by the runtime, as `e.message`. */
-export function errorMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
-
-function isNodeError(e: unknown): e is NodeJS.ErrnoException {
-  return e instanceof Error && "code" in e;
 }

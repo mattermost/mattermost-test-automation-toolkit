@@ -10,7 +10,7 @@ import { fetchHistory } from "../../e2e-test-triage/src/history.ts";
 import { triage } from "../../e2e-test-triage/src/triage.ts";
 import { gh } from "../../shared/src/github.ts";
 import type { Env, FetchImpl } from "../../shared/src/github.ts";
-import { tsioBase } from "../../shared/src/tsio.ts";
+import { tsioBase, tsioJson } from "../../shared/src/tsio.ts";
 import type { Wait } from "../../shared/src/tsio.ts";
 import type { TsioId } from "../../e2e-test-triage/src/types.ts";
 import { LEDGER_MS, readLedger, writeLedger } from "./ledger.ts";
@@ -23,10 +23,15 @@ import { addGroup, retryRecovered, selectCrossLane, selectRepairs, selectRetryFl
 import { bundle, specRange, suspects, windowsOverlap } from "./range.ts";
 import type { RangedGroup, WatchId } from "./range.ts";
 
-export { DEFAULT_LABEL } from "./prs.ts";
-
 const MAX_TESTS = 40;
 const MAX_OPEN_PRS_TOUCHING = 10;
+const MAX_CONFLICTS_PER_RUN = 2;
+// How long a requested spec or conflicted PR head is left to its agent before it can be requested again.
+const HOLD_MS = 24 * HOUR;
+// An agent PR with no activity for longer than this stops blocking the spec it changes.
+const OWN_PR_IDLE_MS = 3 * DAY;
+const REPORTS_PAGE = 100;
+const REPORTS_MAX_PAGES = 5;
 
 /** One of the watched suites, as the workflow passes it: TSIO report group name, spec root, optional report prefix. */
 export interface Suite {
@@ -51,8 +56,6 @@ export interface ReportGroup {
 /** A fix request's body, as the workflow sends it to the agent. */
 export interface FixPayload {
   kind: "e2e-autofix";
-  repository: string;
-  branch: string;
   commit: string;
   master_run: string;
   specs: string[];
@@ -65,21 +68,16 @@ export interface FixPayload {
   suspect_commits: { sha: string; title: string; author?: string }[];
   suspect_commits_total: number;
   open_prs_touching: { number: number; title: string; url: string }[];
-  instructions?: string;
   labels: string[];
 }
 
 /** A conflict request's body: one of the agent's PRs no longer merges into trunk. */
 export interface ConflictPayload {
   kind: "e2e-autofix-conflict";
-  repository: string;
-  branch: string;
-  master_run: string;
   pr: number;
   pr_url: string;
   pr_branch: string;
   pr_head: string;
-  instructions?: string;
 }
 
 export type Payload = FixPayload | ConflictPayload;
@@ -90,7 +88,6 @@ export interface Decision {
   kind: Kind;
   tests: GroupTest[];
   action: string;
-  payload?: FixPayload;
 }
 
 /** One of the agent's PRs in conflict with trunk, with its outcome. */
@@ -98,7 +95,6 @@ export interface ConflictRow {
   pr: number;
   url: string;
   action?: string;
-  payload?: ConflictPayload;
 }
 
 /** A request the workflow sends, with the ledger entry `record` keeps once it is accepted. */
@@ -132,7 +128,7 @@ export interface WatchOptions {
 /** The TSIO report groups of one workflow run, for the suites asked for. The merge workflow tests
  * the branch named in its inputs, not the ref it was started from, so branch and commit
  * come from what the run reported rather than from the triggering event. Asked per suite
- * name, newest first, until the run's groups are passed or `maxPages` pages are read.
+ * name, newest first, until the run's groups are passed or REPORTS_MAX_PAGES pages are read.
  */
 export async function runGroups(
   fetchImpl: FetchImpl,
@@ -141,20 +137,17 @@ export async function runGroups(
   runId: string | undefined,
   attempt: string,
   names: string[],
-  { pageSize = 100, maxPages = 5 }: { pageSize?: number; maxPages?: number } = {},
 ): Promise<ReportGroup[]> {
   const groups: ReportGroup[] = [];
   const ofRun = (g: ReportGroup): boolean => String(g.gh_run_id) === String(runId) && String(g.gh_run_attempt) === String(attempt);
   for (const name of names) {
-    for (let page = 0; page < maxPages; page++) {
-      const query = new URLSearchParams({ repository, name, limit: String(pageSize), offset: String(page * pageSize) });
-      const res = await fetchImpl(`${base}/api/v1/reports?${query}`, { signal: AbortSignal.timeout(60000) });
-      if (!res.ok) throw new Error(`TSIO GET /reports (${name}): ${res.status}`);
-      const reports = ((await res.json()) as { reports?: ReportGroup[] }).reports ?? [];
+    for (let page = 0; page < REPORTS_MAX_PAGES; page++) {
+      const query = new URLSearchParams({ repository, name, limit: String(REPORTS_PAGE), offset: String(page * REPORTS_PAGE) });
+      const { reports = [] } = await tsioJson<{ reports?: ReportGroup[] }>(fetchImpl, base, `/reports?${query}`);
       const found = reports.filter((g) => g.name === name && ofRun(g));
       groups.push(...found);
       // Found, and the page goes on to older runs: nothing of this run is further back.
-      if (reports.length < pageSize || (found.length > 0 && !ofRun(reports[reports.length - 1]))) break;
+      if (reports.length < REPORTS_PAGE || (found.length > 0 && !ofRun(reports[reports.length - 1]))) break;
     }
   }
   return groups;
@@ -191,11 +184,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
   const maxBrokenPerRun = Number(env.MAX_BROKEN_PER_RUN || 10);
   const maxFlakyPerDay = Number(env.MAX_FLAKY_PER_DAY || 6);
-  const holdMs = Number(env.HOLD_HOURS || 24) * HOUR;
-  // An agent PR with no activity for longer than this stops blocking the spec it changes.
-  const ownIdleMs = Number(env.OWN_PR_IDLE_DAYS || 3) * DAY;
   const causeHoldMs = Number(env.CAUSE_HOLD_HOURS || 4) * HOUR;
-  const minFlaky = Number(env.MIN_FLAKY || 1);
   const currentAt = Date.parse(first.created_at ?? "") || now.getTime();
   const label = env.LABEL || DEFAULT_LABEL;
   const reportNameOf = new Map<string, string | null>(suites.map((s): [string, string | null] => [s.name, s.report_name || null]));
@@ -222,13 +211,13 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
       continue;
     }
     bySuite.push({ suite: s.name, findings: result.findings });
-    const found = selectRepairs(result, s.name, { minFlaky });
+    const found = selectRepairs(result, s.name);
     try {
       const groupId = groupsOfRun.find((g) => g.name === s.name && g.branch === trunk)!.id;
       const recovered = await retryRecovered(fetchImpl, base, groupId);
       if (recovered.length) {
         const history = await fetchHistory(fetchImpl, base, id.repository, recovered, until, undefined, trunk, s.report_name || null, log, laneOf(s.name));
-        found.push(...selectRetryFlakes(recovered, history, { suite: s.name, testRoot: s.test_root, branch: trunk, groupId, minFlaky }));
+        found.push(...selectRetryFlakes(recovered, history, { suite: s.name, testRoot: s.test_root, branch: trunk, groupId }));
       }
     } catch (e) {
       notes.push(`${s.name}: retry-recovered tests not read (${String(e).slice(0, 160)})`);
@@ -240,9 +229,9 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   const decisions: Decision[] = [];
   // What the workflow should send, each with the ledger entry `record` keeps once it is accepted.
   const out: Outgoing[] = [];
-  const instructions = env.INSTRUCTIONS ? { instructions: env.INSTRUCTIONS } : {};
-  const ledger = readLedger(env.LEDGER_PATH).filter((r) => now.getTime() - Date.parse(r.at) < LEDGER_MS);
-  writeLedger(env.LEDGER_PATH, ledger); // pruned, and present for the cache to save even when nothing is sent
+  const ledgerPath = String(env.LEDGER_PATH);
+  const ledger = readLedger(ledgerPath).filter((r) => now.getTime() - Date.parse(r.at) < LEDGER_MS);
+  writeLedger(ledgerPath, ledger); // pruned, and present for the cache to save even when nothing is sent
   const open: OpenPRs = groups.size ? await specsInOpenPRs(api, id.repository, { now, base: trunk }) : { files: new Map(), prs: new Map() };
   if (open.truncated) notes.push("open PRs past the newest read were not checked for overlap with these specs");
   // The agent's own PRs by label as well: an idle one drops out of specsInOpenPRs' recent window.
@@ -274,14 +263,14 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     const ownPRs: number[] = [];
     for (const n of agentPRs) {
       const at = activity.get(n) ?? null;
-      if (at != null && now.getTime() - at > ownIdleMs) {
+      if (at != null && now.getTime() - at > OWN_PR_IDLE_MS) {
         if (!idleNoted.has(n)) {
           idleNoted.add(n);
           notes.push(`stalled agent PR #${n} (idle ${Math.floor((now.getTime() - at) / DAY)} days): not blocking new requests`);
         }
       } else ownPRs.push(n);
     }
-    const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < holdMs);
+    const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < HOLD_MS);
     // Without the agent's own PRs a request may duplicate one it is already fixing: wait for the next run.
     if (ownUnknown) skip(g, "skipped: the agent's own PRs could not be read");
     else if (ownPRs.length) skip(g, `skipped: #${ownPRs.join(", #")} (${label}) already changes it`);
@@ -335,8 +324,6 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     const tests = r.tests.map(({ finding: _finding, ...t }) => t);
     const payload: FixPayload = {
       kind: "e2e-autofix",
-      repository: id.repository,
-      branch: id.branch,
       commit: id.commit_sha,
       master_run: runURL,
       specs: r.specs,
@@ -347,10 +334,8 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
       ...(await suspects(api, id, r.range, log)),
       // Not skipped on: the agent checks whether any of these already fixes this failure.
       open_prs_touching: r.openPRs.slice(0, MAX_OPEN_PRS_TOUCHING).map(({ number, title, url }) => ({ number, title, url })),
-      ...instructions,
       labels: [label, ...(env.EXTRA_LABELS ? env.EXTRA_LABELS.split(",").map((l) => l.trim()).filter(Boolean) : [])],
     };
-    decision.payload = payload;
     decision.action = "to request";
     out.push({
       id: `fix-${out.length + 1}`,
@@ -368,17 +353,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
 
   // The repair PRs the automation opened are its own to keep mergeable: a trunk merge that
   // conflicts with one goes back to it, once per PR head within the hold.
-  const { conflicts, out: conflictOut } = planConflicts({
-    own,
-    ledger,
-    now,
-    holdMs,
-    maxPerRun: Number(env.MAX_CONFLICTS_PER_RUN || 2),
-    repository: id.repository,
-    branch: id.branch,
-    runURL,
-    instructions,
-  });
+  const { conflicts, out: conflictOut } = planConflicts({ own, ledger, now, runURL });
   out.push(...conflictOut);
 
   const lines = summaryLines({ commit: id.commit_sha, runURL, decisions, conflicts, notes });
@@ -395,34 +370,17 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
 
 /**
  * Conflict requests for the agent's own PRs that no longer merge into trunk: once per PR head within
- * `holdMs`, and at most `maxPerRun` new ones per run. Returns the summary rows and the requests to send.
+ * HOLD_MS, and at most MAX_CONFLICTS_PER_RUN new ones per run. Returns the summary rows and the requests to send.
  */
-function planConflicts({
-  own,
-  ledger,
-  now,
-  holdMs,
-  maxPerRun,
-  repository,
-  branch,
-  runURL,
-  instructions,
-}: {
-  own: RepairPRs;
-  ledger: LedgerEntry[];
-  now: Date;
-  holdMs: number;
-  maxPerRun: number;
-  repository: string;
-  branch: string;
-  runURL: string;
-  instructions: { instructions?: string };
-}): { conflicts: ConflictRow[]; out: Outgoing[] } {
+function planConflicts({ own, ledger, now, runURL }: { own: RepairPRs; ledger: LedgerEntry[]; now: Date; runURL: string }): {
+  conflicts: ConflictRow[];
+  out: Outgoing[];
+} {
   const conflicts: ConflictRow[] = [];
   const out: Outgoing[] = [];
-  let left = maxPerRun;
+  let left = MAX_CONFLICTS_PER_RUN;
   for (const pr of conflictedRepairPRs(own)) {
-    const held = ledger.find((r) => r.pr === pr.number && r.head === pr.headRefOid && now.getTime() - Date.parse(r.at) < holdMs);
+    const held = ledger.find((r) => r.pr === pr.number && r.head === pr.headRefOid && now.getTime() - Date.parse(r.at) < HOLD_MS);
     const c: ConflictRow = { pr: pr.number, url: pr.url };
     conflicts.push(c);
     // Not counted against the per-run limit: a PR already sent for its head can't starve the others.
@@ -431,23 +389,13 @@ function planConflicts({
       continue;
     }
     if (left <= 0) {
-      c.action = `skipped: over ${maxPerRun} conflict requests in one run`;
+      c.action = `skipped: over ${MAX_CONFLICTS_PER_RUN} conflict requests in one run`;
       continue;
     }
     left--;
-    c.payload = {
-      kind: "e2e-autofix-conflict",
-      repository,
-      branch,
-      master_run: runURL,
-      pr: pr.number,
-      pr_url: pr.url,
-      pr_branch: pr.headRefName,
-      pr_head: pr.headRefOid,
-      ...instructions,
-    };
+    const payload: ConflictPayload = { kind: "e2e-autofix-conflict", pr: pr.number, pr_url: pr.url, pr_branch: pr.headRefName, pr_head: pr.headRefOid };
     c.action = "to send back";
-    out.push({ id: `conflict-${pr.number}`, payload: c.payload, entry: { at: now.toISOString(), pr: pr.number, head: pr.headRefOid, run: runURL } });
+    out.push({ id: `conflict-${pr.number}`, payload, entry: { at: now.toISOString(), pr: pr.number, head: pr.headRefOid, run: runURL } });
   }
   return { conflicts, out };
 }
@@ -497,7 +445,7 @@ function writeOutputs(env: Env, requests: PlannedRequest[]): void {
  * trunk run holds their specs and PRs and counts them toward the daily cap. RESULTS is
  * [{ id, status }] with each request's HTTP status (0 when it never got one).
  */
-export function record({ env, now = new Date(), log = console.error }: { env: Env; now?: Date; log?: (message: string) => void }): { sent: number; failed: number } {
+export function record({ env, now = new Date(), log = console.error }: { env: Env; now?: Date; log?: (message: string) => void }): void {
   let pending: PlannedEntry[] = [];
   try {
     pending = JSON.parse(readFileSync(env.PENDING_PATH ?? "", "utf8")) as PlannedEntry[];
@@ -505,7 +453,8 @@ export function record({ env, now = new Date(), log = console.error }: { env: En
     // Nothing planned (not a trunk run, or the plan step failed before writing it).
   }
   const results = new Map<string, number>((JSON.parse(env.RESULTS || "[]") as { id: string; status: unknown }[]).map((r) => [r.id, Number(r.status) || 0]));
-  const ledger = readLedger(env.LEDGER_PATH).filter((r) => now.getTime() - Date.parse(r.at) < LEDGER_MS);
+  const ledgerPath = String(env.LEDGER_PATH);
+  const ledger = readLedger(ledgerPath).filter((r) => now.getTime() - Date.parse(r.at) < LEDGER_MS);
   const lines: string[] = [];
   for (const p of pending) {
     const status = results.get(p.id);
@@ -513,12 +462,11 @@ export function record({ env, now = new Date(), log = console.error }: { env: En
     else lines.push(`- \`${p.id}\`: ${status == null ? "not sent" : `not accepted (HTTP ${status})`}; it will be planned again on the next trunk run`);
   }
   // Always written, so the cache keeps the record alive even on runs that send nothing.
-  writeLedger(env.LEDGER_PATH, ledger);
+  writeLedger(ledgerPath, ledger);
   const sent = pending.length - lines.length;
   const summary = pending.length ? [`Sent ${sent} of ${pending.length} request(s).`, ...lines] : [];
   if (summary.length && env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, "\n" + summary.join("\n") + "\n");
   if (summary.length) log(summary.join("\n"));
-  return { sent, failed: lines.length };
 }
 
 /** A planned request as the plan step wrote it to PENDING_PATH. */
