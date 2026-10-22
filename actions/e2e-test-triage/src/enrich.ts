@@ -4,7 +4,7 @@
 import type { FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { FAILED_STATUSES, elsewhereKey, runFromGroups } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult, TsioGroup } from "../../shared/src/tsio.ts";
-import { COMPARE_FILE_CAP, laneOf, laneOfReport, repoPath } from "./config.ts";
+import { COMPARE_FILE_CAP, laneOf, laneOfReport, osOfReport, repoPath } from "./config.ts";
 import { namesChangedFile } from "./pack.ts";
 import type { Finding } from "./types.ts";
 
@@ -58,7 +58,11 @@ function addOtherLane(f: Finding, platform: string, result: string): void {
 export function sameTestOnOtherReports(findings: Finding[], run: Pick<RunResult, "elsewhere">): void {
   for (const f of findings) {
     const own = f.report_name ?? "";
-    const others = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? []).filter((o) => o.report !== "" && o.report !== own);
+    const ownOs = osOfReport(own);
+    // Another platform only: a report that names no OS, or the same OS, is a worker or retest of this lane, not a
+    // second platform (mattermost reports are per worker; desktop shards one OS across reports).
+    const others = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? [])
+      .filter((o) => ownOs != null && o.report !== "" && o.report !== own && osOfReport(o.report) != null && osOfReport(o.report) !== ownOs);
     const sorted = [...others].sort((a, b) => laneOfReport(a.report).localeCompare(laneOfReport(b.report)));
     for (const o of sorted) addOtherLane(f, laneOfReport(o.report), o.status);
   }

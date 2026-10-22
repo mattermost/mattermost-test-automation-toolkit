@@ -9,13 +9,13 @@ import { canChange, decide, judge } from "./decision.ts";
 import { EXONERATED_ON_TRUNK, classify, errorSignature, infraVerdict, isInfraError, sameFailure } from "./classify.ts";
 import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, laneOfReport, repoPath } from "./config.ts";
 import { answerKey, askModelBatch, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
-import { fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate } from "./history.ts";
+import { fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { codeExcerpt, enrichFindings, failingLine, sameTestOnOtherReports, siblingPlatforms } from "./enrich.ts";
 import { evidenceFor, loadEvidence } from "./evidence.ts";
-import { buildPack, compactError, evidenceIds, namesChangedFile } from "./pack.ts";
+import { CLEARING, buildPack, changeCategory, changeSummary, compactError, evidenceIds, namesChangedFile } from "./pack.ts";
 import type { OtherFailure } from "./pack.ts";
 import { PRICES, costOf, newLedger, priceFor } from "./pricing.ts";
-import { bucketOf, passRate, renderSummary, statusDescription } from "./render.ts";
+import { bucketOf, passRate, renderSummary, statusDescription, statusLabelOf, statusLabels } from "./render.ts";
 import type { SummaryInput } from "./render.ts";
 import { evaluateRun, verdictOf } from "./evaluate.ts";
 import { NotTriagedError, triage } from "./triage.ts";
@@ -627,8 +627,8 @@ test("a run with missing reports is triaged but never comes out green", async ()
     assert.equal(result.verdict, "FAILURE", "the specs that never ran keep it red");
     assert.match(readFileSync(join(dir, "s.md"), "utf8"), /1 of 3 reports never uploaded, so the specs on those workers never ran; re-run the failed jobs/);
     const required = statuses.filter((s) => s.context === "e2e-test/playwright");
-    assert.deepEqual(required.map((s) => [s.state, s.description]), [["failure", "(1 cleared by triage; 1 report(s) missing) 0% passed (0 passed, 1 failed, 0 skipped)"]]);
-    assert.equal(statuses.filter((s) => s.context === "e2e-test/playwright/triage").at(-1)?.description, "1 failed → 1 cleared · 0 blocking · 1 report(s) missing");
+    assert.deepEqual(required.map((s) => [s.state, s.description]), [["failure", "(1 broken on main; 1 report(s) missing) 0% passed (0 passed, 1 failed, 0 skipped)"]]);
+    assert.equal(statuses.filter((s) => s.context === "e2e-test/playwright/triage").at(-1)?.description, "1 failed → 1 broken on main · 1 report(s) missing");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 test("two describe blocks sharing a leaf title are different tests", async () => {
@@ -760,7 +760,7 @@ test("only an explicit, valid enforce mode changes the E2E check's state", async
   // Beside it, its own check: pending while triage works, then the verdict.
   assert.deepEqual(written.filter((s) => s.context === "e2e-test/playwright/triage").map((s) => [s.state, s.description]), [
     ["pending", "1 failed · triage is checking them"],
-    ["success", "1 failed → 1 cleared · 0 blocking"],
+    ["success", "1 failed → 1 broken on main"],
   ]);
   assert.ok(written.findIndex((s) => s.state === "pending") < written.findIndex((s) => s.context === "e2e-test/playwright"), "the triage check goes pending first");
 
@@ -850,7 +850,7 @@ test("one triage check for the whole PR summarises every lane", async () => {
   await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", STATUS_CONTEXT: lane, TRIAGE_CONTEXT: "e2e-test/triage", TRIAGE_LANES: `${lane}, e2e-test/other`, TRIAGE_SETTLE_MS: "0" }, fetchImpl: fakeFetch(routes), log: () => {} });
   assert.deepEqual(written.map((s) => [s.context, s.state, s.description]), [
     ["e2e-test/triage", "pending", "Triage is checking playwright"],
-    [lane, "success", "(1 cleared by triage) 0% passed (0 passed, 1 failed, 0 skipped)"],
+    [lane, "success", "(1 broken on main) 0% passed (0 passed, 1 failed, 0 skipped)"],
     ["e2e-test/triage", "success", "playwright cleared by triage · all lanes green"],
   ]);
 });
@@ -1561,19 +1561,19 @@ test("the status description accounts for every test in the run", async () => {
   const required = written.filter((s) => s.context === "e2e-test/playwright");
   assert.equal(required.length, 1);
   assert.equal(required[0].state, "success");
-  assert.equal(required[0].description, "(2 cleared by triage) 50.0% passed (2 passed, 2 failed, 1 skipped)");
+  assert.equal(required[0].description, "(2 broken on main) 50.0% passed (2 passed, 2 failed, 1 skipped)");
 
   // mattermost's convention: passed ÷ (passed + failed), one decimal, skipped not counted.
   const counts = { passed: 240, failed: 2, skipped: 3 };
-  assert.equal(statusDescription("FAILURE", [blockingOnly(true), blockingOnly(false)], null, counts), "(1 cleared by triage, 1 unresolved) 99.2% passed (240 passed, 2 failed, 3 skipped)");
+  assert.equal(statusDescription("FAILURE", [blockingOnly(true), blockingOnly(false)], null, counts), "(1 flaky, 1 needs investigation) 99.2% passed (240 passed, 2 failed, 3 skipped)");
   assert.equal(statusDescription("ACTION_REQUIRED", [], "5 of 6 failures are infrastructure errors", counts), "(not triaged, investigation required) 99.2% passed (240 passed, 2 failed, 3 skipped)");
   // A run with many failures still says what triage made of each one; the run stays red either way.
   const storm = [...Array.from({ length: 49 }, () => blockingOnly(false)), ...Array.from({ length: 4 }, () => blockingOnly(true))];
   assert.equal(statusDescription("ACTION_REQUIRED", storm, "53 tests failed in one run", { passed: 555, failed: 53, skipped: 42 }),
-    "(49 cleared by triage, 4 unresolved; investigation required) 91.3% passed (555 passed, 53 failed, 42 skipped)");
-  assert.equal(statusDescription("SUCCESS", Array.from({ length: 4 }, () => blockingOnly(false)), null, { passed: 1186, failed: 4, skipped: 164 }), "(4 cleared by triage) 99.7% passed (1186 passed, 4 failed, 164 skipped)");
+    "(49 flaky, 4 needs investigation; investigation required) 91.3% passed (555 passed, 53 failed, 42 skipped)");
+  assert.equal(statusDescription("SUCCESS", Array.from({ length: 4 }, () => blockingOnly(false)), null, { passed: 1186, failed: 4, skipped: 164 }), "(4 flaky) 99.7% passed (1186 passed, 4 failed, 164 skipped)");
   // Never "100%" while something failed.
-  assert.equal(statusDescription("SUCCESS", [blockingOnly(false)], null, { passed: 5000, failed: 1, skipped: 0 }), "(1 cleared by triage) 99.9% passed (5000 passed, 1 failed, 0 skipped)");
+  assert.equal(statusDescription("SUCCESS", [blockingOnly(false)], null, { passed: 5000, failed: 1, skipped: 0 }), "(1 flaky) 99.9% passed (5000 passed, 1 failed, 0 skipped)");
 });
 test("a sibling suite's trunk failure cannot clear this suite's failure", async () => {
   // Two suites with the same leaf title: Suite B's trunk failure must not clear Suite A.
@@ -1938,7 +1938,7 @@ const mine = (status: string, sha: string, at: string): Observation => obs({ gh_
 test("this PR's own earlier runs are counted, newest pass first", () => {
   const f = classify(failing, [...trunkPasses(8), mine("failed", "new", "2026-09-12T00:00:00Z"), mine("passed", "mid", "2026-09-11T00:00:00Z"), mine("passed", "old", "2026-09-10T00:00:00Z")], [], undefined, 1);
   assert.equal(f.class, "REGRESSION", "this PR's own runs never change the rules' class");
-  assert.deepEqual(f.this_pr, { runs: 3, passes: 2, fails: 1, last_pass: { commit_sha: "mid", created_at: "2026-09-11T00:00:00Z" } });
+  assert.deepEqual(f.this_pr, { runs: 3, passes: 2, fails: 1, last_pass: { commit_sha: "mid", created_at: "2026-09-11T00:00:00Z" }, latest: "failed" });
   assert.equal(f.cross_pr.passes, 0, "and they are not counted as other PRs");
   assert.equal(classify(failing, trunkPasses(8), [], undefined, null).this_pr.runs, 0, "a trunk run has no PR history");
 });
@@ -2258,7 +2258,7 @@ test("an out-of-date failure is its own group: merge and re-run, never the PR's 
   assert.match(text, /\| master changed this test \(#39127, 2026-10-13\) after this PR last merged master, so the PR ran its old copy\. \| Merge master and re-run\. \|/);
   assert.match(text, /\*\*Merge master and re-run first\. 1 failure: 1 out of date\.\*\*/);
   assert.doesNotMatch(text, /may be caused by this PR|Your PR/);
-  assert.match(statusDescription("FAILURE", [stale], null, { passed: 9, failed: 1 }), /^\(0 cleared by triage, 1 unresolved\)/, "the check counts it as unresolved, as before");
+  assert.match(statusDescription("FAILURE", [stale], null, { passed: 9, failed: 1 }), /^\(1 out of date\)/, "the check names it as out of date");
 });
 
 test("out-of-date failures are counted apart from the PR's own, and lead the headline once they are half the failures", () => {
@@ -2346,7 +2346,7 @@ test("report-only writes triage's line on the E2E check but keeps the state the 
     return posted;
   };
   // The failure is cleared, but a red check stays red: report only never turns red green.
-  assert.deepEqual(await run("failure"), [{ state: "failure", context: "e2e-test/playwright", description: "(1 cleared by triage) 0% passed (0 passed, 1 failed, 0 skipped)", target_url: "https://github.com/o/r/actions/runs/12?status_run_id=12&status_run_attempt=1" }]);
+  assert.deepEqual(await run("failure"), [{ state: "failure", context: "e2e-test/playwright", description: "(1 flaky) 0% passed (0 passed, 1 failed, 0 skipped)", target_url: "https://github.com/o/r/actions/runs/12?status_run_id=12&status_run_attempt=1" }]);
   // A check a waiver label already turned green stays green.
   assert.deepEqual((await run("success")).map((s) => s.state), ["success"]);
   // No final state yet (or no status at all): nothing is written.
@@ -2829,8 +2829,8 @@ test("a red lane whose reports never all arrived says how many did, and keeps th
       statusSink(statuses),
     ];
     await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl: fakeFetch(routes), log: () => {}, wait: { attempts: 1, ms: 0 } });
-    assert.match(readFileSync(summaryPath, "utf8"), /^\*\*No test failed\. The lane is red because a job outside the tests failed \(setup, upload or runner\), or results are missing: re-run the failed jobs\. 1 of 2 reports arrived; 1 of 2 reports never uploaded, so the specs on those workers never ran\.\*\*/m);
-    assert.deepEqual(statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => [s.state, s.description]), [["failure", "(0 cleared by triage; 1 report(s) missing) 100% passed (1 passed, 0 failed, 0 skipped)"]]);
+    assert.match(readFileSync(summaryPath, "utf8"), /^\*\*Re-run the failed jobs: 1 of 2 reports arrived; 1 of 2 reports never uploaded, so the specs on those workers never ran\.\*\*/m);
+    assert.deepEqual(statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => [s.state, s.description]), [["failure", "(1 report(s) missing) 100% passed (1 passed, 0 failed, 0 skipped)"]]);
   });
 });
 
@@ -3004,7 +3004,7 @@ test("the answer-cache key ignores the other-platform evidence, and equals the k
   const withOthers = { ...pack, same_test_other_platforms_this_run: { id: "other_platforms", results: [{ platform: "windows", result: "failed" }] } } as unknown as Pack;
   assert.equal(answerKey("claude-sonnet-5-5", withOthers), answerKey("claude-sonnet-5-5", pack), "the evidence is not part of the key");
   // Computed from HEAD (bdce26e) for this pack: a cached answer keeps its key, so no call is paid again.
-  assert.equal(answerKey("claude-sonnet-5-5", pack), "v3:66ab3c425fa3f89d6f1679608b3cf18e73dfcc21b54452686a07b50d08b4843e");
+  assert.equal(answerKey("claude-sonnet-5-5", pack), "v4:66ab3c425fa3f89d6f1679608b3cf18e73dfcc21b54452686a07b50d08b4843e");
 });
 
 test("a sibling's same leaf title in another describe block is another test: no other-platform line", async () => {
@@ -3113,7 +3113,7 @@ test("zero failures with missing reports says both how many arrived and what nev
       statusSink(statuses),
     ];
     await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl: fakeFetch(routes), log: () => {}, wait: { attempts: 1, ms: 0 } });
-    assert.match(readFileSync(summaryPath, "utf8"), /re-run the failed jobs\. 1 of 2 reports arrived; 1 of 2 reports never uploaded, so the specs on those workers never ran\.\*\*/m);
+    assert.match(readFileSync(summaryPath, "utf8"), /\*\*Re-run the failed jobs: 1 of 2 reports arrived; 1 of 2 reports never uploaded, so the specs on those workers never ran\.\*\*/m);
   });
 });
 
@@ -3133,4 +3133,279 @@ test("an other-platform entry keeps the worst result for its OS: failed over onc
   const f = finding({ title: "t1", file: "specs/a.spec.ts", report_name: "e2e-on-ubuntu-latest-1.0" });
   sameTestOnOtherReports([f], run);
   assert.deepEqual(f.other_lanes, [{ platform: "macos", result: "failed" }, { platform: "windows", result: "flaky" }]);
+});
+
+test("other workers and shards of the same lane are not other platforms", () => {
+  // Mattermost reports are per worker; desktop shards one OS across reports. Neither is a second platform.
+  const run = { elsewhere: new Map([[elsewhereKey("specs/a.spec.ts", "t1"), [{ report: "e2e-cypress / cypress-full / dispatch-run-12", status: "failed" }, { report: "e2e-on-ubuntu-latest-2-of-3-1.0", status: "failed" }]]]) } as unknown as Pick<RunResult, "elsewhere">;
+  const worker = finding({ title: "t1", file: "specs/a.spec.ts", report_name: "e2e-cypress / cypress-full / dispatch-run-4" });
+  sameTestOnOtherReports([worker], run);
+  assert.equal(worker.other_lanes, undefined, "a mattermost worker names no OS");
+  const shard = finding({ title: "t1", file: "specs/a.spec.ts", report_name: "e2e-on-ubuntu-latest-1-of-3-1.0" });
+  sameTestOnOtherReports([shard], run);
+  assert.equal(shard.other_lanes, undefined, "another linux shard is the same platform");
+});
+
+// ---------------------------------------------------------------- branch state, trunk fallback, unnamed failures, change categories, status labels
+
+const branchError = 'Error: expect(locator).toHaveText(expected) failed: expected "Channel header" but received "Set a header"';
+const branchTest: TestRef = { ...failing, error: branchError };
+/**
+ * The fake with the repository read answering the default branch. A route matches any URL that contains its text, so
+ * "/repos/o/r" would also take the commit statuses; this answers the exact repository URL only, and records the call.
+ */
+function withDefaultBranch(fake: FakeFetch, branch: string): FakeFetch {
+  const impl = async (url: string, init: RequestInit = {}): Promise<Response> => {
+    if (/\/repos\/o\/r$/.test(String(url))) {
+      fake.calls.push({ url: String(url), init });
+      return Response.json({ default_branch: branch });
+    }
+    return fake(url, init);
+  };
+  return Object.assign(impl, { calls: fake.calls });
+}
+/** This PR's earlier run of the test: its status and the error it showed, with the commit it ran on. */
+const prRun = (sha: string, status: string, error: string | null = branchError, at = "2026-09-12T00:00:00Z"): Observation =>
+  obs({ gh_pr_number: 5, status, commit_sha: sha, created_at: at, error_excerpt: error });
+
+test("branch state: failing the same way on this PR's last commits, and never on trunk, is held out of date, not cleared", () => {
+  const f = classify(branchTest, [prRun("c2", "failed"), prRun("c1", "failed", branchError, "2026-09-11T00:00:00Z"), ...trunkPasses(8)], [], DEFAULTS, 5);
+  assert.equal(f.class, "BRANCH_STATE");
+  assert.equal(f.blocking, true);
+  assert.deepEqual(f.out_of_date, { base: "the default branch", behind: null, commit: null, streak: 3 });
+  assert.equal(f.reason, "Failed the same way on this PR's last 3 commits and never on the default branch: the branch is behind or broken; merge the default branch and re-run.");
+});
+
+test("branch state comes before the environment rule: an infrastructure error repeated on this PR's commits is held, not cleared", () => {
+  const infra = 'Error: server at "http://localhost:8065" is not healthy after 30 seconds of retries';
+  const cfg = { ...DEFAULTS, infraClears: true };
+  const held = classify({ ...branchTest, error: infra }, [prRun("c2", "failed", infra), prRun("c1", "failed", infra), ...trunkPasses(8)], [], cfg, 5);
+  assert.equal(held.class, "BRANCH_STATE");
+  assert.equal(held.blocking, true);
+  assert.equal(classify({ ...branchTest, error: infra }, [...trunkPasses(8)], [], cfg, 5).class, "INFRA_ERROR", "one failing commit is still the environment's, as before");
+});
+
+test("branch state needs a streak: one failing commit, or a pass that ends the run of failures, leaves the rules as they were", () => {
+  assert.notEqual(classify(branchTest, [...trunkPasses(8)], [], DEFAULTS, 5).class, "BRANCH_STATE", "a single failing commit");
+  const broken = [prRun("c2", "passed", null), prRun("c1", "failed", branchError, "2026-09-11T00:00:00Z"), prRun("c0", "failed", branchError, "2026-09-10T00:00:00Z")];
+  assert.notEqual(classify(branchTest, [...broken, ...trunkPasses(8)], [], DEFAULTS, 5).class, "BRANCH_STATE", "the newest earlier run passed, so the streak is the current run alone");
+  const otherLine = 'Error: expect(locator).toHaveText(expected) failed: expected "Team header" but received "Set a header"';
+  assert.notEqual(classify(branchTest, [prRun("c2", "failed", otherLine), prRun("c1", "failed"), ...trunkPasses(8)], [], DEFAULTS, 5).class, "BRANCH_STATE", "a different first line on this PR is not the same failure");
+});
+
+test("branch state counts commits, not runs: re-runs of one commit are one, and re-runs of this commit add nothing", () => {
+  const reruns = [prRun("c1", "failed"), prRun("c1", "failed", branchError, "2026-09-11T00:00:00Z")];
+  assert.equal(classify(branchTest, [...reruns, ...trunkPasses(8)], [], DEFAULTS, 5, null, { commitSha: "c1" }).class !== "BRANCH_STATE", true, "two runs of the current commit are one commit");
+  const held = classify(branchTest, [...reruns, ...trunkPasses(8)], [], DEFAULTS, 5, null, { commitSha: "c9" });
+  assert.equal(held.class, "BRANCH_STATE");
+  assert.equal(held.out_of_date?.streak, 2, "c1 twice and the current commit are two commits");
+});
+
+test("branch state needs enough trunk history to say the failure never happened there", () => {
+  const earlier = [prRun("c2", "failed"), prRun("c1", "failed", branchError, "2026-09-11T00:00:00Z")];
+  assert.notEqual(classify(branchTest, [...earlier, ...trunkPasses(DEFAULTS.minTrunkRuns - 1)], [], DEFAULTS, 5).class, "BRANCH_STATE");
+  assert.equal(classify(branchTest, [...earlier, ...trunkPasses(DEFAULTS.minTrunkRuns)], [], DEFAULTS, 5).class, "BRANCH_STATE");
+});
+
+test("branch state holds when trunk fails the test with a different first line, and not when trunk fails it with the same one", () => {
+  const otherLine = 'Error: expect(locator).toHaveText(expected) failed: expected "Team header" but received "Set a header"';
+  const earlier = [prRun("c2", "failed"), prRun("c1", "failed", branchError, "2026-09-11T00:00:00Z")];
+  const trunkOther = obs({ status: "failed", error_excerpt: otherLine, commit_sha: "t9", created_at: "2026-09-01T00:00:00Z" });
+  assert.equal(classify(branchTest, [...earlier, ...trunkPasses(8), trunkOther], [], DEFAULTS, 5).class, "BRANCH_STATE", "trunk failed another way: the branch is the difference");
+  const trunkSame = obs({ status: "failed", error_excerpt: branchError, commit_sha: "t8", created_at: "2026-09-01T00:00:00Z" });
+  assert.notEqual(classify(branchTest, [...earlier, ...trunkPasses(8), trunkSame], [], DEFAULTS, 5).class, "BRANCH_STATE", "trunk fails it the same way: not the branch");
+});
+
+test("branch state does not hold when trunk's latest run failed the test", () => {
+  const otherLine = 'Error: expect(locator).toHaveText(expected) failed: expected "Team header" but received "Set a header"';
+  const trunkLatestFailed = obs({ status: "failed", error_excerpt: otherLine, commit_sha: "t0", created_at: "2026-09-12T00:00:00Z" });
+  assert.notEqual(classify(branchTest, [prRun("c2", "failed"), prRun("c1", "failed", branchError, "2026-09-11T00:00:00Z"), trunkLatestFailed, ...trunkPasses(8)], [], DEFAULTS, 5).class, "BRANCH_STATE");
+});
+
+test("branch state, end to end: the check is red as out of date, the summary says merge and re-run, and the model is not asked", async () => {
+  await inTmp(async (dir) => {
+    const statuses: StatusBody[] = [];
+    const summaryPath = join(dir, "s.md");
+    const routes: Route[] = [
+      ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+      ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+      ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: "t1", status: "failed", retry_count: 0, ordinal: 0, error_message: branchError, error_stack: null }])],
+      // The other-PRs query (no branch) gets this PR's rows only; the trunk query (branch master) gets trunk's.
+      ["/reports/history", (i) => Response.json({ observations: parsed<HistoryBody>(bodyText(i)).branch ? trunkPasses(8) : [prRun("c2", "failed"), prRun("c1", "failed", branchError, "2026-09-11T00:00:00Z")] })],
+      ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+      ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+      statusSink(statuses),
+    ];
+    const fetchImpl = fakeFetch(routes);
+    const result = await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "AK", TRIAGE_CONTEXT: "off", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl, log: () => {} });
+    assert.equal(result.findings[0].class, "BRANCH_STATE");
+    assert.equal(fetchImpl.calls.filter((c) => c.url.includes("api.anthropic.com")).length, 0, "held before the judge, so the model is not asked");
+    assert.deepEqual(statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => [s.state, s.description]), [["failure", "(1 out of date) 0% passed (0 passed, 1 failed, 0 skipped)"]]);
+    const text = readFileSync(summaryPath, "utf8");
+    assert.match(text, /^## E2E triage · playwright-full: 🔴 merge master and re-run: 1 out of date$/m);
+    assert.match(text, /^### Out of date \(1\): this PR fails the same way on its last commits and never on master$/m);
+    assert.match(text, /\| Failed the same way on this PR's last 3 commits and never on master: the branch is behind or broken\. \| Merge master and re-run\. \|/);
+  });
+});
+
+test("a PR whose base branch has too little history reads trunk from the default branch, and says so", async () => {
+  await inTmp(async (dir) => {
+    const summaryPath = join(dir, "s.md");
+    const history = (i: RequestInit): Response => Response.json({ observations: parsed<HistoryBody>(bodyText(i)).branch === "master" ? trunkFailsAll(8) : [] });
+    const fetchImpl = withDefaultBranch(fakeFetch([
+      ...runRoutes([spec("t1", "failed")]),
+      ["/reports/history", history],
+      ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+      ["/pulls/5", () => Response.json({ title: "stacked", base: { ref: "feature/base" } })],
+      statusSink([]),
+    ]), "master");
+    const result = await triage({ env: { ...env, TRIAGE_CONTEXT: "off", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl, log: () => {} });
+    assert.equal(result.findings[0].trunk.runs, 8, "the default branch's runs judge the test");
+    assert.equal(result.findings[0].class, "BROKEN_ON_TRUNK");
+    assert.equal(fetchImpl.calls.filter((c) => /\/repos\/o\/r$/.test(c.url)).length, 1, "the default branch is read once");
+    const text = readFileSync(summaryPath, "utf8");
+    assert.match(text, /^> Trunk history is read from master, the default branch: feature\/base has 0 earlier runs of these tests, fewer than 5\.$/m);
+    assert.match(text, /Fails on master's latest run too/);
+  });
+});
+
+test("a PR whose base branch has enough history keeps it, and asks GitHub for no default branch", async () => {
+  await inTmp(async (dir) => {
+    const summaryPath = join(dir, "s.md");
+    const baseRows = trunkFailsAll(8).map((o) => ({ ...o, branch: "feature/base" }));
+    const history = (i: RequestInit): Response => Response.json({ observations: parsed<HistoryBody>(bodyText(i)).branch === "feature/base" ? baseRows : [] });
+    const fetchImpl = withDefaultBranch(fakeFetch([
+      ...runRoutes([spec("t1", "failed")]),
+      ["/reports/history", history],
+      ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+      ["/pulls/5", () => Response.json({ title: "stacked", base: { ref: "feature/base" } })],
+      statusSink([]),
+    ]), "master");
+    const result = await triage({ env: { ...env, TRIAGE_CONTEXT: "off", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl, log: () => {} });
+    assert.equal(result.findings[0].trunk.runs, 8);
+    assert.equal(fetchImpl.calls.filter((c) => /\/repos\/o\/r$/.test(c.url)).length, 0);
+    assert.doesNotMatch(readFileSync(summaryPath, "utf8"), /Trunk history is read from/);
+  });
+});
+
+test("trunkRunsOn counts a branch's runs with no PR, the most any one test has", () => {
+  const rows = new Map<string, Observation[]>([
+    ["a", [obs({ branch: "feature/base" }), obs({ branch: "feature/base" }), obs({ branch: "feature/base", gh_pr_number: 7 }), obs({ branch: "master" })]],
+    ["b", [obs({ branch: "feature/base" }), obs({ branch: "feature/base" }), obs({ branch: "feature/base" })]],
+  ]);
+  assert.equal(trunkRunsOn(rows, "feature/base"), 3);
+  assert.equal(trunkRunsOn(rows, "release"), 0);
+});
+
+test("a lane whose every failure names no test is red for a re-run: no history is read, nothing is asked, and the line says what arrived", async () => {
+  await inTmp(async (dir) => {
+    const statuses: StatusBody[] = [];
+    const summaryPath = join(dir, "s.md");
+    const routes: Route[] = [
+      ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "in_progress", total_reports_expected: 3 }], total: 1 })],
+      ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+      ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: "", status: "failed", retry_count: 0, ordinal: 0, error_message: null, error_stack: null }])],
+      ["/reports/g1", () => Response.json({ id: "g1", status: "in_progress", total_reports_expected: 3, reports: [{}, {}] })],
+      statusSink(statuses),
+    ];
+    const fetchImpl = fakeFetch(routes);
+    const result = await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "AK", TRIAGE_CONTEXT: "off", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl, log: () => {}, wait: { attempts: 1, ms: 0 } });
+    assert.equal(result.verdict, "FAILURE");
+    assert.equal(result.findings.length, 0, "nothing is classified");
+    assert.equal(fetchImpl.calls.filter((c) => c.url.includes("api.anthropic.com")).length, 0, "no model call");
+    assert.equal(fetchImpl.calls.filter((c) => c.url.includes("/reports/history")).length, 0, "no history read");
+    assert.match(readFileSync(summaryPath, "utf8"), /^\*\*Re-run the failed jobs: 2 of 3 reports arrived; 1 of 3 reports never uploaded, so the specs on those workers never ran\.\*\*/m);
+    assert.deepEqual(statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => [s.state, s.description]), [["failure", "(re-run the failed jobs; 1 report(s) missing) 0% passed (0 passed, 1 failed, 0 skipped)"]]);
+  });
+});
+
+test("a run whose only failures name no test, with every report in, says so: a re-run line, no model, red", async () => {
+  await inTmp(async (dir) => {
+    const summaryPath = join(dir, "s.md");
+    const fetchImpl = fakeFetch([
+      ...runRoutes([[{ suite_id: "s1", title: "", status: "failed", retry_count: 0, ordinal: 0, error_message: null, error_stack: null }]]),
+    ]);
+    const result = await triage({ env: { ...env, MODE: "report-only", ANTHROPIC_API_KEY: "AK", TRIAGE_CONTEXT: "off", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl, log: () => {} });
+    assert.equal(result.verdict, "FAILURE");
+    assert.equal(fetchImpl.calls.filter((c) => c.url.includes("api.anthropic.com")).length, 0);
+    assert.match(readFileSync(summaryPath, "utf8"), /^\*\*Re-run the failed jobs: 1 failed result with no test name\.\*\*/m);
+  });
+});
+
+test("this_pr is citable only when this PR's most recent earlier run of the test passed, not after any earlier pass", () => {
+  const since = fixture<SinceLastPass>({ files: [], related: [] });
+  const latestFailed = classify(failing, [...trunkPasses(8), mine("failed", "new", "2026-09-12T00:00:00Z"), mine("passed", "old", "2026-09-10T00:00:00Z")], [], undefined, 1);
+  const failedPack = buildPack({ ...latestFailed, since_last_pass: since }, [], prCtx, []);
+  assert.equal(failedPack.this_pr_history?.passed, 1, "it passed on an earlier commit");
+  assert.equal(failedPack.this_pr_history?.latest, "failed");
+  assert.ok(!evidenceIds(failedPack).includes("this_pr"), "but its latest run failed, so the pass is not citable");
+  const latestPassed = classify(failing, [...trunkPasses(8), mine("passed", "new", "2026-09-12T00:00:00Z"), mine("failed", "old", "2026-09-10T00:00:00Z")], [], undefined, 1);
+  assert.ok(evidenceIds(buildPack({ ...latestPassed, since_last_pass: since }, [], prCtx, [])).includes("this_pr"), "the latest run passed");
+});
+
+test("the PR's changed files are sorted into product, e2e harness, ci, docs and other; an unknown file is product", () => {
+  const ctx = { testRoot: "e2e-tests/playwright/specs", failingSpecs: ["e2e-tests/playwright/specs/a.spec.ts"] };
+  assert.equal(changeCategory("webapp/channels/x.tsx", ctx), "product");
+  assert.equal(changeCategory("some/new/unknown-file.bin", ctx), "product", "unknown files count as product");
+  assert.equal(changeCategory("e2e-tests/playwright/specs/helpers/login.ts", ctx), "e2e_harness");
+  assert.equal(changeCategory("e2e-tests/playwright/specs/a.spec.ts", ctx), "e2e_harness", "the failing spec is harness");
+  assert.equal(changeCategory("e2e-tests/playwright/specs-old/x.ts", ctx), "product", "whole path segments only");
+  assert.equal(changeCategory("e2e-tests/playwright/specs/README.md", ctx), "docs", "docs before harness");
+  assert.equal(changeCategory(".github/workflows/e2e.yml", ctx), "ci");
+  assert.equal(changeCategory("docs/e2e.md", ctx), "docs");
+  assert.equal(changeCategory("LICENSE.txt", ctx), "other");
+  assert.equal(changeCategory("e2e/x.ts", { testRoot: ".", failingSpecs: [] }), "product", "a test root of . names no harness folder");
+  const names = [...Array.from({ length: 25 }, (_, i) => `webapp/f${i}.ts`), "docs/x.md", ".github/a.yml"];
+  const summary = changeSummary(names, { testRoot: null, failingSpecs: [] });
+  assert.equal(summary.product.count, 25);
+  assert.equal(summary.product.examples.length, 20, "up to 20 example paths");
+  assert.equal(summary.docs.count, 1);
+  assert.equal(summary.ci.count, 1);
+  assert.equal(summary.e2e_harness.count, 0);
+});
+
+test("the change summary is in the pack and clears nothing: no citation is added for it, and no same-run environment evidence", () => {
+  const f = classify(failing, [...trunkPasses(8), mine("passed", "mid", "2026-09-11T00:00:00Z")], [], undefined, 1);
+  const withCI = buildPack(f, [{ filename: ".github/ci.yml", patch: "@@" }], prCtx, [], { testRoot: "e2e-tests/playwright/specs", failingSpecs: [] });
+  const withHarness = buildPack(f, [{ filename: "e2e-tests/playwright/specs/helpers/login.ts", patch: "@@" }], prCtx, [], { testRoot: "e2e-tests/playwright/specs", failingSpecs: [] });
+  assert.equal(withCI.pr.change_summary?.ci.count, 1);
+  assert.equal(withHarness.pr.change_summary?.e2e_harness.count, 1);
+  assert.deepEqual(evidenceIds(withCI), evidenceIds(withHarness), "a category adds no evidence id");
+  assert.equal(CLEARING(evidenceIds(withHarness)), CLEARING(evidenceIds(withCI)));
+  assert.ok(!JSON.stringify(withHarness).includes("same_run_env"), "no environment-clearing citation");
+});
+
+test("the status text names each finding by its label, in the owner's order, and leaves out zero labels", () => {
+  const cleared = (over: Partial<Finding>): Finding => finding({ blocking: false, ...over });
+  const blocked = (over: Partial<Finding>): Finding => finding({ blocking: true, ...over });
+  const judged = (cause: string, decision: string, blocking: boolean): Finding => blocked({ class: "REGRESSION", decision, blocking, judge: { cause, confidence: 0.9, cited_evidence: [], explanation: "x" } as Finding["judge"] });
+  const mixed = [
+    cleared({ class: "FLAKY_ON_TRUNK" }),
+    cleared({ class: "REGRESSION", decision: "adjudicator_unblock", judge: { cause: "bug_on_master", confidence: 0.9, cited_evidence: [], explanation: "x" } as Finding["judge"] }),
+    cleared({ class: "BROKEN_ON_TRUNK" }),
+    judged("caused_by_pr", "adjudicator_blame", true),
+    blocked({ class: "REGRESSION", out_of_date: { base: "master", behind: 3, commit: null } }),
+    blocked({ class: "REGRESSION" }),
+  ];
+  assert.equal(statusDescription("FAILURE", mixed, null, { passed: 10, failed: 6, skipped: 0 }), "(1 flaky, 2 broken on main, 1 caused by PR, 1 out of date, 1 needs investigation) 62.5% passed (10 passed, 6 failed, 0 skipped)");
+  assert.equal(statusDescription("SUCCESS", [cleared({ class: "FLAKY_ON_TRUNK" }), cleared({ class: "FLAKY_ON_TRUNK" })], null, { passed: 1186, failed: 2, skipped: 164 }), "(2 flaky) 99.8% passed (1186 passed, 2 failed, 164 skipped)");
+  assert.equal(statusDescription("SUCCESS", [], null, { passed: 9, failed: 0 }), "100% passed (9 passed, 0 failed, 0 skipped)", "no labels, no brackets");
+  assert.equal(statusDescription("SUCCESS", [cleared({ class: "SAME_FAILURE_AS_CLEARED", same_as_class: "BROKEN_ON_TRUNK" })], null, { passed: 9, failed: 1 }), "(1 broken on main) 90.0% passed (9 passed, 1 failed, 0 skipped)", "takes its anchor's label");
+  assert.equal(statusDescription("SUCCESS", [cleared({ class: "SAME_FAILURE_AS_CLEARED", same_as_class: "FLAKY_ON_TRUNK" })], null, { passed: 9, failed: 1 }), "(1 flaky) 90.0% passed (9 passed, 1 failed, 0 skipped)");
+  assert.deepEqual(statusLabels([blocked({ class: "REGRESSION" })], 1), ["needs investigation"].map((l) => `1 ${l}`));
+  assert.equal(statusLabelOf(blocked({ class: "REGRESSION", judge: { cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "x" } as Finding["judge"], decision: "advice" })), "needs investigation", "advice is not a blame: the finding stays unlabelled as caused by PR");
+});
+
+test("the status text is at most 140 characters, keeps its pass line whole, and shortens the labels only as the last resort", () => {
+  const many = [
+    ...Array.from({ length: 60 }, () => finding({ class: "REGRESSION", blocking: true, decision: "adjudicator_blame", judge: { cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "x" } as Finding["judge"] })),
+    ...Array.from({ length: 20 }, () => finding({ class: "FLAKY_ON_TRUNK", blocking: false })),
+    ...Array.from({ length: 9 }, () => finding({ class: "REGRESSION", blocking: true, out_of_date: { base: "master", behind: 1, commit: null } })),
+    ...Array.from({ length: 5 }, () => finding({ class: "REGRESSION", blocking: true })),
+  ];
+  const text = statusDescription("FAILURE", many, "investigation", { passed: 90, failed: 10, skipped: 0 }, { text: "x", short: "2 report(s) missing" });
+  assert.ok(text.length <= 140, `length ${text.length}`);
+  assert.match(text, /\) 90\.0% passed \(90 passed, 10 failed, 0 skipped\)$/, "the pass line is whole");
+  assert.match(text, /^\(\d+ flaky/, "the labels are kept, shortened to fit");
+  assert.ok(text.includes("…"), "shortened with an ellipsis");
 });

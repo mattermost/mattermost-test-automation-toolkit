@@ -22,6 +22,8 @@ export interface ClassifyOptions {
   isTrunkRun?: boolean;
   groupId?: TsioId | null;
   trunkBranch?: string | null | undefined;
+  /** The commit this run tested: its re-runs are not earlier commits of the PR. */
+  commitSha?: string | null;
 }
 
 /** Classify one failing test from its history and the PR's changed files. */
@@ -34,7 +36,7 @@ export function classify(
   lane: string | null = null,
   opts: ClassifyOptions = {},
 ): Finding {
-  const { isTrunkRun = false, groupId = null, trunkBranch = null } = opts;
+  const { isTrunkRun = false, groupId = null, trunkBranch = null, commitSha = null } = opts;
   const own = new Set(changedFiles);
   // A run is never part of its own history.
   const seen = groupId == null ? observations : observations.filter((o) => o.group_id !== groupId);
@@ -97,6 +99,7 @@ export function classify(
       passes: minePassed.length,
       fails: mine.filter((o) => FAILED_STATUSES.has(o.status)).length,
       last_pass: minePassed[0] ? { commit_sha: minePassed[0].commit_sha ?? null, created_at: minePassed[0].created_at ?? null } : null,
+      latest: mine[0]?.status ?? "",
     },
   };
   const out = (cls: string, reason: string, blocking: boolean): Finding => ({ ...test, class: cls, reason, blocking, ...stats });
@@ -112,6 +115,25 @@ export function classify(
     return out("OWNED_BY_PR", isTrunkRun
       ? `This commit changes ${test.file}; a failure in a spec the commit edits is not noise.`
       : `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
+  // Branch state: this PR's last commits fail the same way, and trunk does not. The PR's own runs count (newest
+  // first) while they fail with this first line; a pass or flaky run in between ends the streak. Commits count, not
+  // runs: re-runs of one commit (this one included) are one. The current commit counts as one. Blocking, in the
+  // out-of-date bucket: merge trunk and re-run, never a clear. Needs enough trunk history to say "never on trunk".
+  if (!isTrunkRun && currentPR != null && !test.identity_unresolved) {
+    const earlier = new Set<string>();
+    for (const o of mine) {
+      if (!FAILED_STATUSES.has(o.status) || !sameFirstLine(o.error_excerpt, test.error)) break;
+      if (o.commit_sha && o.commit_sha !== commitSha) earlier.add(o.commit_sha);
+    }
+    const streak = earlier.size + 1;
+    const trunkFailedSame = trunk.some((o) => FAILED_STATUSES.has(o.status) && sameFirstLine(o.error_excerpt, test.error));
+    if (streak >= 2 && trunk.length >= cfg.minTrunkRuns && latestTrunk?.status === "passed" && !trunkFailedSame) {
+      const base = trunkBranch || "the default branch";
+      return Object.assign(out("BRANCH_STATE", `Failed the same way on this PR's last ${streak} commits and never on ${base}: the branch is behind or broken; merge ${base} and re-run.`, true), {
+        out_of_date: { base, behind: null, commit: null, streak },
+      });
+    }
+  }
   // The test's own error says the environment failed (the test server down or behind a proxy page,
   // a shard that never ran): history says nothing about that. Where the PR can't touch the
   // environment (an app against a separate test server) it clears; where it can (a server PR that
@@ -238,6 +260,16 @@ function stuckStep(lines: string[]): string | null {
     .replace(/\b\d+(?:\.\d+)?\s*sec\b/gi, "<n>sec")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/**
+ * Whether two failures show the same first line of error: the same distinctive error (errorSignature), or the same stuck
+ * step of a timeout (failureKey). A bare timeout or a message with no usable text is never the same as another.
+ */
+export function sameFirstLine(a: string | null | undefined, b: string | null | undefined): boolean {
+  const ka = failureKey(a);
+  const kb = failureKey(b);
+  return (ka.kind === "distinctive" || ka.kind === "stuck") && kb.kind === ka.kind && kb.key === ka.key;
 }
 
 export function failureKey(error: string | null | undefined): FailureKey {

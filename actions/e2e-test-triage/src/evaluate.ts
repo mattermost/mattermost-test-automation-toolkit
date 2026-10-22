@@ -23,6 +23,8 @@ export interface EvaluatedRun {
   historyTruncated?: boolean;
   ownershipUnknown?: boolean;
   missing: { text: string; short: string } | null;
+  /** Set when every failure names no test (shard-level): none is classified or sent to the model, and the lane is red. */
+  unnamed?: number;
 }
 
 export interface EvaluateParams {
@@ -73,12 +75,17 @@ export async function evaluateRun({
 }: EvaluateParams): Promise<EvaluatedRun> {
   const isTrunkRun = prNumber == null;
   const result: EvaluatedRun = { verdict: "SUCCESS", findings: [], infra: infraVerdict(run.failing, cfg), counts: run.counts, ai: newLedger(), missing: null };
+  // A failure with no test name (a shard that reported nothing by name) has no history to read and nothing to show the
+  // model. A run whose failures all lack names is red for them: it is counted, and not classified or asked.
+  const named = run.failing.some((t) => t.title.trim() !== "");
+  if (run.failing.length && !named) result.unnamed = run.failing.length;
   // A run-level infra call still names each failure (an environment error is named, and the run stays red
   // through its verdict); only the model is kept out of an infra run.
-  if (run.failing.length) {
+  if (run.failing.length && named) {
     const files = (diff.files ?? []).map((f: ChangedFile) => ({ filename: f.filename, patch: f.patch }));
     const changed = files.map((f) => f.filename);
     const withPaths = run.failing.map((t) => ({ ...t, repo_path: repoPath(testRoot, t.file) }));
+    const changeContext = { testRoot, failingSpecs: withPaths.map((t) => t.repo_path).filter((p): p is string => Boolean(p)) };
     const unresolved = (t: { identity_unresolved?: boolean }, key: string): boolean => Boolean(t.identity_unresolved) || (history.ambiguous?.has(key) ?? false);
     result.findings = withPaths.map((t) => {
       const key = identityKey(t);
@@ -86,6 +93,7 @@ export async function evaluateRun({
         isTrunkRun,
         groupId: run.group_id,
         trunkBranch,
+        commitSha: id.commit_sha,
       });
     });
     for (const f of result.findings) {
@@ -156,7 +164,7 @@ export async function evaluateRun({
       }
       const others: OtherFailure[] = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const pr: PrRef = { number: prNumber, repository: id.repository, title: prTitle, lane };
-      const packs = result.findings.map((f) => (f.class === "OWNED_BY_PR" || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete" ? null : buildPack(f, files, pr, others)));
+      const packs = result.findings.map((f) => (f.class === "OWNED_BY_PR" || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete" ? null : buildPack(f, files, pr, others, changeContext)));
       await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
     }
     if (!blind && prNumber) sameFailure(result.findings);
@@ -164,6 +172,6 @@ export async function evaluateRun({
   result.verdict = verdictOf(result.findings, result.infra);
   // Specs that never ran can't be vouched for, whatever happened to the rest.
   result.missing = missingReports(run.missing);
-  if (result.missing && result.verdict === "SUCCESS") result.verdict = "FAILURE";
+  if ((result.missing || result.unnamed) && result.verdict === "SUCCESS") result.verdict = "FAILURE";
   return result;
 }

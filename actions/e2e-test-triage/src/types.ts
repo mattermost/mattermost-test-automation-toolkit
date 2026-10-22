@@ -70,6 +70,8 @@ export interface ThisPRStats {
   passes: number;
   fails: number;
   last_pass: At | null;
+  /** The status of this PR's most recent earlier run of the test ("" when there is none). */
+  latest: string;
 }
 
 /** One test's verdict input: the test, its class and reason, and the history statistics behind them. */
@@ -151,6 +153,7 @@ export interface Pack {
     changed_file_count: number;
     changed_files: string[];
     spec_file_changed_by_pr: boolean;
+    change_summary?: ChangeSummary;
   };
   diff_hunks_of_files_named_in_error: Hunk[];
   other_failures_in_same_run: { class: string; title: string }[];
@@ -161,11 +164,28 @@ export interface Pack {
   test_code_near_failure?: string;
 }
 
+/** The PR's changed files in one category: how many, and up to 20 of their paths. */
+export interface ChangeBucket {
+  count: number;
+  examples: string[];
+}
+
+/** What the PR changed, by category (see changeSummary in pack.ts). Unknown files count as product. */
+export interface ChangeSummary {
+  product: ChangeBucket;
+  e2e_harness: ChangeBucket;
+  ci: ChangeBucket;
+  docs: ChangeBucket;
+  other: ChangeBucket;
+}
+
 export interface ThisPRHistory {
   id: "this_pr";
   earlier_runs_on_this_pr: number;
   passed: number;
   failed: number;
+  /** The status of the most recent earlier run of this test on this PR ("" when none). Only "passed" makes this_pr citable. */
+  latest: string;
   last_passed: { commit: string | null; at: string | null } | null;
   changed_since_last_pass?: {
     file_count: number;
@@ -208,8 +228,11 @@ export interface CommitRef {
 
 export interface OutOfDate {
   base: string;
-  behind: number;
+  /** Commits the PR is behind the base; null for the branch-state hold, where no comparison was made. */
+  behind: number | null;
   commit: CommitRef | null;
+  /** The branch-state hold: this PR failed the same way on its last `streak` commits (this run included), never on the base. */
+  streak?: number;
 }
 
 export interface BrokeByCommit {

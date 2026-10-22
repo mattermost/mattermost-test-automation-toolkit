@@ -19,16 +19,28 @@ function gh(fetchImpl, token) {
 
 // ../shared/src/lane.ts
 var laneName = (context) => String(context).replace(/^e2e(-test)?\//, "");
+function namedIn(description) {
+  const d = String(description ?? "");
+  const count2 = (re) => Number(re.exec(d)?.[1] ?? 0);
+  return {
+    cleared: count2(/(\d+) cleared by triage/) + count2(/(\d+) flaky/) + count2(/(\d+) broken on main/),
+    caused: count2(/(\d+) caused by PR/),
+    outdated: count2(/(\d+) out of date/),
+    check: count2(/(\d+) unresolved/) + count2(/(\d+) needs investigation/)
+  };
+}
 function redReason(description = "") {
   const d = String(description);
+  const { cleared, caused, outdated, check } = namedIn(d);
   const parts = [];
-  const cleared = /\(([1-9]\d*) cleared by triage/.exec(d)?.[1];
   if (cleared) parts.push(`${cleared} cleared`);
-  const unresolved = /(\d+) unresolved/.exec(d)?.[1];
-  if (unresolved) parts.push(`${unresolved} to check`);
+  if (caused) parts.push(`${caused} caused by PR`);
+  if (outdated) parts.push(`${outdated} out of date`);
+  if (check) parts.push(`${check} to check`);
   const missing = /(\d+) report\(s\) missing/.exec(d)?.[1];
   if (missing) parts.push(`${missing} report(s) missing, re-run`);
   else if (/results incomplete/.test(d)) parts.push("results incomplete, re-run");
+  else if (/re-run the failed jobs/.test(d)) parts.push("re-run the failed jobs");
   if (/investigation required/.test(d)) parts.push("many failures in one run");
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
   return parts.length ? parts.join(", ") : "still red";
@@ -38,7 +50,7 @@ function laneSummary(lanes) {
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}` };
   const red = seen.filter((l) => l.status.state !== "success");
-  const cleared = seen.filter((l) => l.status.state === "success" && /\(([1-9]\d*) cleared by triage/.test(l.status.description ?? ""));
+  const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
   if (red.length) return { state: "failure", description: [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText].filter(Boolean).join(" \xB7 ") };
   return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
@@ -431,6 +443,7 @@ var laneOfReport = (name) => {
   const rest = String(name).replace(/^e2e-on-/, "");
   return OS_OF_REPORT.find(([re]) => re.test(rest))?.[1] ?? rest;
 };
+var osOfReport = (name) => OS_OF_REPORT.find(([re]) => re.test(String(name)))?.[1] ?? null;
 var repoPath = (testRoot, file) => {
   if (testRoot == null || testRoot === "") return null;
   const root = String(testRoot).replace(/^\.?\/*/, "").replace(/\/+$/, "");
@@ -760,6 +773,14 @@ ${o.title}`;
   for (const rows of byTest.values()) rows.sort((a, b) => at(b) - at(a));
   return byTest;
 }
+function trunkRunsOn(history, branch) {
+  let most = 0;
+  for (const rows of history.values()) {
+    const runs = rows.filter((o) => (o.gh_pr_number == null || o.gh_pr_number === "") && o.branch === branch).length;
+    most = Math.max(most, runs);
+  }
+  return most;
+}
 async function fetchChangedFiles(api, id, prNumber, log = () => {
 }) {
   try {
@@ -859,7 +880,7 @@ var EXONERATED_ON_TRUNK = /* @__PURE__ */ new Set(["FLAKY_ON_TRUNK", "FLAKY_CROS
 var exoneratedSet = (isTrunkRun) => isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED;
 var BORDERLINE = /* @__PURE__ */ new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
 function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = null, lane = null, opts = {}) {
-  const { isTrunkRun = false, groupId = null, trunkBranch = null } = opts;
+  const { isTrunkRun = false, groupId = null, trunkBranch = null, commitSha = null } = opts;
   const own = new Set(changedFiles);
   const seen = groupId == null ? observations : observations.filter((o) => o.group_id !== groupId);
   const ran = seen.filter((o) => o.status !== "skipped");
@@ -903,7 +924,8 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
       runs: mine.length,
       passes: minePassed.length,
       fails: mine.filter((o) => FAILED_STATUSES.has(o.status)).length,
-      last_pass: minePassed[0] ? { commit_sha: minePassed[0].commit_sha ?? null, created_at: minePassed[0].created_at ?? null } : null
+      last_pass: minePassed[0] ? { commit_sha: minePassed[0].commit_sha ?? null, created_at: minePassed[0].created_at ?? null } : null,
+      latest: mine[0]?.status ?? ""
     }
   };
   const out = (cls, reason, blocking) => ({ ...test, class: cls, reason, blocking, ...stats });
@@ -914,6 +936,21 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
   };
   if (own.has(test.repo_path ?? test.file))
     return out("OWNED_BY_PR", isTrunkRun ? `This commit changes ${test.file}; a failure in a spec the commit edits is not noise.` : `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
+  if (!isTrunkRun && currentPR != null && !test.identity_unresolved) {
+    const earlier = /* @__PURE__ */ new Set();
+    for (const o of mine) {
+      if (!FAILED_STATUSES.has(o.status) || !sameFirstLine(o.error_excerpt, test.error)) break;
+      if (o.commit_sha && o.commit_sha !== commitSha) earlier.add(o.commit_sha);
+    }
+    const streak2 = earlier.size + 1;
+    const trunkFailedSame = trunk.some((o) => FAILED_STATUSES.has(o.status) && sameFirstLine(o.error_excerpt, test.error));
+    if (streak2 >= 2 && trunk.length >= cfg.minTrunkRuns && latestTrunk?.status === "passed" && !trunkFailedSame) {
+      const base = trunkBranch || "the default branch";
+      return Object.assign(out("BRANCH_STATE", `Failed the same way on this PR's last ${streak2} commits and never on ${base}: the branch is behind or broken; merge ${base} and re-run.`, true), {
+        out_of_date: { base, behind: null, commit: null, streak: streak2 }
+      });
+    }
+  }
   if (isInfraError(test.error))
     return out("INFRA_ERROR", cfg.infraClears ? "Environment error, not the change: the test failed on its environment (see the error). Rerun when it recovers." : "Environment error: the test failed on its environment (see the error). Rerun; if it fails the same way again, the change may be the cause.", !cfg.infraClears);
   if (test.identity_unresolved)
@@ -991,6 +1028,11 @@ function stuckStep(lines) {
   }
   if (!action && !target) return null;
   return [action ? `action ${action}` : null, target].filter(Boolean).join(" ").replace(/\b(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{6,}\b/gi, "<id>").replace(/\b\d{4,}\b/g, "<n>").replace(/\b\d+(?:\.\d+)?\s*sec\b/gi, "<n>sec").replace(/\s+/g, " ").trim();
+}
+function sameFirstLine(a, b) {
+  const ka = failureKey(a);
+  const kb = failureKey(b);
+  return (ka.kind === "distinctive" || ka.kind === "stuck") && kb.kind === ka.kind && kb.key === ka.key;
 }
 function failureKey(error) {
   const lines = [];
@@ -1080,9 +1122,37 @@ ${finding.file}`.toLowerCase();
   if (stem.length <= 3) return false;
   return new RegExp(`(?:^|[\\\\/'"\`])${escapeRe(stem.toLowerCase())}(?=$|[.'"\`:)\\s\\\\/])`, "m").test(text);
 }
-function buildPack(finding, compareFiles, pr, others) {
+var NO_CHANGE_CONTEXT = { testRoot: null, failingSpecs: [] };
+var OTHER_FILE = /^(LICENSE[^/]*|CODEOWNERS|\.gitignore|\.gitattributes|\.editorconfig)$/;
+var under = (file, dir) => dir !== "" && dir !== "." && (file === dir || file.startsWith(`${dir}/`));
+function changeCategory(filename, ctx) {
+  if (under(filename, ".github")) return "ci";
+  if (filename.toLowerCase().endsWith(".md") || under(filename, "docs")) return "docs";
+  const root = String(ctx.testRoot ?? "").trim().replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+  if (ctx.failingSpecs.includes(filename) || under(filename, root)) return "e2e_harness";
+  if (OTHER_FILE.test(filename)) return "other";
+  return "product";
+}
+var EXAMPLES = 20;
+function changeSummary(names, ctx) {
+  const out = {
+    product: { count: 0, examples: [] },
+    e2e_harness: { count: 0, examples: [] },
+    ci: { count: 0, examples: [] },
+    docs: { count: 0, examples: [] },
+    other: { count: 0, examples: [] }
+  };
+  for (const name of names) {
+    const bucket = out[changeCategory(name, ctx)];
+    bucket.count++;
+    if (bucket.examples.length < EXAMPLES) bucket.examples.push(name);
+  }
+  return out;
+}
+function buildPack(finding, compareFiles, pr, others, ctx = NO_CHANGE_CONTEXT) {
   const names = compareFiles.map((f) => f.filename);
   const ownPath = finding.repo_path ?? finding.file;
+  const changes = changeSummary(names, { ...ctx, failingSpecs: [...ctx.failingSpecs, ownPath] });
   const hunks = [];
   for (const [index, f] of compareFiles.entries()) {
     if (namesChangedFile(finding, f.filename) && f.patch) hunks.push({ id: `hunk_${index}`, file: f.filename, related: true, patch: f.patch.slice(0, 4e3) });
@@ -1096,7 +1166,7 @@ function buildPack(finding, compareFiles, pr, others) {
     engine: { class: finding.class, reason: finding.reason },
     trunk_history_14d: { runs: finding.trunk.runs, fails: finding.trunk.fails, flaky: finding.trunk.flaky, latest: finding.trunk.latest },
     cross_pr_failures_14d: { id: "cross_pr", other_prs_where_this_test_failed: finding.cross_pr.examples, other_pr_runs_where_it_passed: finding.cross_pr.passes },
-    pr: { number: pr.number, repository: pr.repository, title: pr.title, changed_file_count: names.length, changed_files: names.slice(0, 200), spec_file_changed_by_pr: names.includes(ownPath) },
+    pr: { number: pr.number, repository: pr.repository, title: pr.title, changed_file_count: names.length, changed_files: names.slice(0, 200), spec_file_changed_by_pr: names.includes(ownPath), change_summary: changes },
     diff_hunks_of_files_named_in_error: hunks,
     other_failures_in_same_run: neighbours.slice(0, 8).map(({ class: cls, title }) => ({ class: cls, title })),
     ...finding.producer ? { producer_evidence: { id: "producer", notes: finding.producer.notes, screenshots: finding.producer.images.map(({ name, sha256 }) => ({ name, sha256 })) } } : {},
@@ -1115,6 +1185,7 @@ function thisPrHistory(f) {
     earlier_runs_on_this_pr: f.this_pr.runs,
     passed: f.this_pr.passes,
     failed: f.this_pr.fails,
+    latest: f.this_pr.latest,
     last_passed: f.this_pr.last_pass ? { commit: f.this_pr.last_pass.commit_sha?.slice(0, 7) ?? null, at: f.this_pr.last_pass.created_at } : null,
     ...since ? { changed_since_last_pass: { file_count: since.files.length, files: since.files.slice(0, 30), complete: since.complete !== false, related_to_this_test: since.related.map((r) => r.file), related_changes: since.related.slice(0, 3), ...since.changes?.length ? { changes: since.changes } : {} } } : {}
   };
@@ -1129,8 +1200,9 @@ var evidenceIds = (pack) => [
   "pr.changed_files",
   ...pack.diff_hunks_of_files_named_in_error.filter((h) => h.related).map((h) => h.id),
   ...pack.producer_evidence?.notes || pack.producer_evidence?.screenshots?.length ? ["producer"] : [],
-  // Citable only when the test passed earlier on this PR and the complete list of what changed since shows nothing related.
-  ...(pack.this_pr_history?.passed ?? 0) > 0 && pack.this_pr_history?.changed_since_last_pass?.complete === true && !pack.this_pr_history.changed_since_last_pass.related_to_this_test.length ? ["this_pr"] : [],
+  // Citable only when this PR's most recent earlier run of the test passed (a pass before a later failure does not count),
+  // and the complete list of what changed since that pass shows nothing related.
+  ...pack.this_pr_history?.latest === "passed" && pack.this_pr_history.changed_since_last_pass?.complete === true && !pack.this_pr_history.changed_since_last_pass.related_to_this_test.length ? ["this_pr"] : [],
   ...pack.same_test_other_platforms_this_run ? ["other_platforms"] : []
 ];
 var CLEARING = (ids) => ids.some((c) => c.startsWith("hunk_")) || ids.includes("cross_pr") || ids.includes("this_pr");
@@ -1164,7 +1236,8 @@ function addOtherLane(f, platform, result) {
 function sameTestOnOtherReports(findings, run) {
   for (const f of findings) {
     const own = f.report_name ?? "";
-    const others = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? []).filter((o) => o.report !== "" && o.report !== own);
+    const ownOs = osOfReport(own);
+    const others = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? []).filter((o) => ownOs != null && o.report !== "" && o.report !== own && osOfReport(o.report) != null && osOfReport(o.report) !== ownOs);
     const sorted = [...others].sort((a, b) => laneOfReport(a.report).localeCompare(laneOfReport(b.report)));
     for (const o of sorted) addOtherLane(f, laneOfReport(o.report), o.status);
   }
@@ -1465,7 +1538,7 @@ function parseAnswer(text) {
   if (typeof a.explanation !== "string") throw new Error("answer failed validation: explanation must be a string");
   return { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence.slice(0, 6), explanation: a.explanation.slice(0, 280) };
 }
-var answerKey = (model, pack) => `v3:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + SYSTEM, pack)}`;
+var answerKey = (model, pack) => `v4:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + SYSTEM, pack)}`;
 
 // src/decision.ts
 function unblocks(cause, cited, pack) {
@@ -1654,17 +1727,21 @@ async function evaluateRun({
 }) {
   const isTrunkRun = prNumber == null;
   const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(run.failing, cfg), counts: run.counts, ai: newLedger(), missing: null };
-  if (run.failing.length) {
+  const named = run.failing.some((t) => t.title.trim() !== "");
+  if (run.failing.length && !named) result.unnamed = run.failing.length;
+  if (run.failing.length && named) {
     const files = (diff.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
     const changed = files.map((f) => f.filename);
     const withPaths = run.failing.map((t) => ({ ...t, repo_path: repoPath(testRoot, t.file) }));
+    const changeContext = { testRoot, failingSpecs: withPaths.map((t) => t.repo_path).filter((p) => Boolean(p)) };
     const unresolved = (t, key) => Boolean(t.identity_unresolved) || (history.ambiguous?.has(key) ?? false);
     result.findings = withPaths.map((t) => {
       const key = identityKey(t);
       return classify(unresolved(t, key) ? { ...t, identity_unresolved: true } : t, history.get(key) ?? [], changed, cfg, prNumber, historyLane(id, cfg), {
         isTrunkRun,
         groupId: run.group_id,
-        trunkBranch
+        trunkBranch,
+        commitSha: id.commit_sha
       });
     });
     for (const f of result.findings) {
@@ -1717,14 +1794,14 @@ async function evaluateRun({
       }
       const others = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const pr = { number: prNumber, repository: id.repository, title: prTitle, lane };
-      const packs = result.findings.map((f) => f.class === "OWNED_BY_PR" || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete" ? null : buildPack(f, files, pr, others));
+      const packs = result.findings.map((f) => f.class === "OWNED_BY_PR" || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete" ? null : buildPack(f, files, pr, others, changeContext));
       await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
     }
     if (!blind && prNumber) sameFailure(result.findings);
   }
   result.verdict = verdictOf(result.findings, result.infra);
   result.missing = missingReports(run.missing);
-  if (result.missing && result.verdict === "SUCCESS") result.verdict = "FAILURE";
+  if ((result.missing || result.unnamed) && result.verdict === "SUCCESS") result.verdict = "FAILURE";
   return result;
 }
 
@@ -1859,6 +1936,7 @@ function whyNext(f, branch, pr) {
       if (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto") return [`Points to this PR's change (${ai}).`, "Check the change named in the evidence."];
       return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and this PR changes a file its error names.`, "Check your change to that file."];
     case "outdated": {
+      if (f.out_of_date?.streak) return [`Failed the same way on this PR's last ${f.out_of_date.streak} commits and never on ${branch}: the branch is behind or broken.`, `Merge ${branch} and re-run.`];
       const c = f.out_of_date?.commit;
       const where = c ? ` (${c.pr ? `#${c.pr}` : sha7(c.sha)}${c.date ? `, ${c.date}` : ""})` : "";
       return [`${branch} changed this test${where} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
@@ -1923,9 +2001,11 @@ function factsTable(f, branch, pr) {
   if (f.tries?.ran) rows.push(["Tries in this run", f.tries.ran === 1 ? "Failed its only try" : f.tries.failed === f.tries.ran ? `Failed all ${f.tries.ran}` : `Failed ${f.tries.failed} of ${f.tries.ran}`]);
   if (f.producer) rows.push(["Recorded by the run", [f.producer.images.length && count(f.producer.images.length, "screenshot"), f.producer.notes && `notes: ${f.producer.notes.slice(0, 200)}`].filter(Boolean).join("; ")]);
   if (f.same_as) rows.push(["Same failure as", f.same_as]);
-  if (f.out_of_date) {
+  if (f.out_of_date?.streak) {
+    rows.push([`Failed the same way on this PR's last ${count(f.out_of_date.streak, "commit")}`, `Never on ${branch}; its latest run passed`]);
+  } else if (f.out_of_date) {
     const c = f.out_of_date.commit;
-    rows.push([`Changed on ${branch} since this PR last merged it`, `Yes${c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}` : ""}. This PR is ${count(f.out_of_date.behind, "commit")} behind, so it ran its old copy of the test`]);
+    rows.push([`Changed on ${branch} since this PR last merged it`, `Yes${c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}` : ""}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
   }
   if (f.decision === "evidence_incomplete" || f.identity_unresolved) rows.push(["Why history wasn't used", f.reason]);
   const a = f.judge;
@@ -1948,7 +2028,7 @@ function passRate(counts) {
 }
 var passLine = (counts) => `${passRate(counts)} passed (${counts.passed ?? 0} passed, ${counts.failed} failed, ${counts.skipped ?? 0} skipped)`;
 var RED_OUTSIDE = "No test failed. The lane is red because a job outside the tests failed (setup, upload or runner), or results are missing: re-run the failed jobs.";
-function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null }) {
+function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null }) {
   const branch = trunkBranch || "the default branch";
   const where = lane ? ` \xB7 ${md(lane)}` : "";
   const groups = { yours: [], outdated: [], check: [], broken: [], flaky: [] };
@@ -1960,16 +2040,19 @@ function renderSummary({ findings, infra = null, runURL, counts, mode = "report-
   const outdatedLead = findings.length > 0 && outdated.length * 2 >= findings.length;
   const staleText = outdated.length ? `${outdated.length} out of date` : "";
   const needText = check.length ? `${check.length} need${check.length === 1 ? "s" : ""} a look` : "";
-  const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? laneRed ? "\u{1F534} red outside the tests" : "\u2705 nothing failed" : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : check.length || outdated.length ? `\u{1F7E1} ${[needText, staleText].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
+  const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? laneRed ? "\u{1F534} red outside the tests" : "\u2705 nothing failed" : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : unnamed ? "\u{1F534} re-run the failed jobs" : check.length || outdated.length ? `\u{1F7E1} ${[needText, staleText].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
   const lines = [`## E2E triage${where}: ${head}`, ""];
   const several = findings.filter((f) => failedElsewhere(f).length > 0).length;
   if (several) lines.push(`${count(several, "test")} failed on several platforms in this run.`, "");
   lines.push(mode === "enforce" ? "> Triage sets the E2E check: it passes only when every failure is cleared." : "> **Report only.** This is triage's advice; it doesn't change the E2E check.", "");
   for (const n of notes) lines.push(`> ${md(n)}`, "");
   let say = "";
-  const arrived = missing ? `${[reportsArrived, missing.text].filter(Boolean).join("; ")}.` : "";
-  if (!counts.failed) say = missing || laneRed ? `${RED_OUTSIDE}${arrived ? ` ${arrived}` : ""}` : "No test failed.";
-  else if (findings.length) {
+  const arrived = [reportsArrived, missing?.text].filter(Boolean).join("; ");
+  if (unnamed) {
+    say = `Re-run the failed jobs: ${arrived || `${count(unnamed, "failed result")} with no test name`}.`;
+  } else if (!counts.failed) {
+    say = missing ? `Re-run the failed jobs: ${arrived}.` : laneRed ? RED_OUTSIDE : "No test failed.";
+  } else if (findings.length) {
     const kinds = [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
     say = `${count(yours.length + outdated.length + check.length + blockingBroken + unrelated, "failure")}: ` + [
       yours.length && `${yours.length} may be caused by this ${pr ? "PR" : "commit"}`,
@@ -1981,7 +2064,7 @@ function renderSummary({ findings, infra = null, runURL, counts, mode = "report-
     if (outdatedLead) say = `Merge ${branch} and re-run first. ${say}`;
   }
   if (infra) say = `${infra} ${say}`;
-  if (missing && counts.failed) say += ` Results incomplete: ${missing.text}; re-run the failed jobs before relying on this.`;
+  if (missing && counts.failed && !unnamed) say += ` Results incomplete: ${missing.text}; re-run the failed jobs before relying on this.`;
   lines.push(`**${md(say.trim())}** ${passLine(counts)} \xB7 [run](${runURL})`, "");
   const section = (title, list, heading = `${title} (${list.length})`) => {
     if (!list.length) return;
@@ -1994,7 +2077,8 @@ function renderSummary({ findings, infra = null, runURL, counts, mode = "report-
     lines.push("");
   };
   section(pr ? "Your PR" : "This commit", yours);
-  section("Out of date", outdated, `Out of date (${outdated.length}): ${md(branch)} changed these tests after this PR last merged ${md(branch)}`);
+  const streakOnly = outdated.length > 0 && outdated.every((f) => f.out_of_date?.streak);
+  section("Out of date", outdated, streakOnly ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}` : `Out of date (${outdated.length}): ${md(branch)} changed these tests after this PR last merged ${md(branch)}`);
   section("Needs a look", check);
   section(`Broken on ${md(branch)}`, broken);
   section("Flaky", flaky);
@@ -2035,10 +2119,35 @@ function otherRunText(lane) {
 function noResultsText(lane, commitSha) {
   return `Not triaged: TSIO has no results for ${md(lane)} at ${sha7(commitSha)} (the tests may not have run).`;
 }
+var STATUS_LABELS = ["flaky", "broken on main", "caused by PR", "out of date", "needs investigation"];
+function statusLabelOf(f) {
+  if (f.blocking) {
+    if (f.out_of_date) return "out of date";
+    if (f.class === "OWNED_BY_PR" || f.judge?.cause === "caused_by_pr" && (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto")) return "caused by PR";
+    return "needs investigation";
+  }
+  if (f.class === "SAME_FAILURE_AS_CLEARED") return f.same_as_class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
+  if (f.decision === "adjudicator_unblock") return f.judge?.cause === "bug_on_master" ? "broken on main" : "flaky";
+  return f.class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
+}
+function statusLabels(findings, failed = findings.length) {
+  if (!findings.length) return failed ? ["re-run the failed jobs"] : [];
+  const counts = /* @__PURE__ */ new Map();
+  for (const f of findings) {
+    const label = statusLabelOf(f);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  return STATUS_LABELS.filter((l) => counts.has(l)).map((l) => `${counts.get(l)} ${l}`);
+}
+var STATUS_MAX = 140;
 function statusDescription(verdict, findings, infra, counts, missing = null) {
-  const blocking = findings.filter((f) => f.blocking).length;
-  const triaged = infra && !findings.length ? "not triaged, investigation required" : `${findings.length - blocking} cleared by triage${blocking ? `, ${blocking} unresolved` : ""}${infra ? "; investigation required" : ""}`;
-  return `(${triaged}${missing ? `; ${missing.short}` : ""}) ${passLine(counts)}`.slice(0, 140);
+  const pass = passLine(counts);
+  const head = infra && !findings.length ? "not triaged, investigation required" : statusLabels(findings, counts.failed ?? 0).join(", ");
+  const rest = [infra && findings.length ? "investigation required" : "", missing?.short ?? ""].filter(Boolean).join("; ");
+  const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);
+  const shown = head.length <= room ? head : room > 1 ? `${head.slice(0, room - 1).trimEnd()}\u2026` : "";
+  const inner = [shown, rest].filter(Boolean).join("; ");
+  return inner ? `(${inner}) ${pass}` : pass;
 }
 
 // src/triage.ts
@@ -2117,6 +2226,15 @@ async function laneIsRed(api, id, context, log) {
     return false;
   }
 }
+async function defaultBranchOf(api, repository, log) {
+  try {
+    const repo = await api("GET", `/repos/${repository}`);
+    return repo?.default_branch || null;
+  } catch (e) {
+    log(`default branch unavailable: ${String(e).slice(0, 160)}`);
+    return null;
+  }
+}
 async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /* @__PURE__ */ new Date(), wait }, written, seen) {
   const cfg = configFrom(env, log);
   const id = compositeIdentityFrom(env.COMPOSITE_IDENTITY);
@@ -2174,12 +2292,22 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
   try {
     let history = /* @__PURE__ */ new Map();
     let diff = { files: [], ok: false };
-    const trunkBranch = isTrunkRun ? id.branch : pull.base?.ref ?? null;
-    if (run.failing.length) {
+    const prBase = isTrunkRun ? null : pull.base?.ref ?? null;
+    let trunkBranch = isTrunkRun ? id.branch : prBase;
+    if (run.failing.some((t) => t.title.trim() !== "")) {
       [history, diff] = await Promise.all([
         fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg)),
         fetchChangedFiles(api, id, prNumber, log)
       ]);
+      const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;
+      if (prBase && baseRuns < cfg.minTrunkRuns) {
+        const fallback = await defaultBranchOf(api, id.repository, log);
+        if (fallback && fallback !== prBase) {
+          trunkBranch = fallback;
+          notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
+          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
+        }
+      }
     }
     let unknownSpend = null;
     if (env.ANSWERS_CACHE) {
@@ -2245,7 +2373,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     }
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
     const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
-    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing) });
+    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing);
     if (env.GITHUB_OUTPUT)
       (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}
@@ -2285,8 +2413,7 @@ ai_output_tokens=${spend.output_tokens}
     }
     if (announce && lanes.length) await settleLaneSummary();
     else if (announce) {
-      const blocking = result.findings.filter((f) => f.blocking).length;
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra && !result.findings.length ? `${run.counts.failed} failed \xB7 investigation required` : `${run.counts.failed} failed \u2192 ${result.findings.length - blocking} cleared \xB7 ${blocking} blocking${result.infra ? " \xB7 investigation required" : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra && !result.findings.length ? `${run.counts.failed} failed \xB7 investigation required` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${result.infra ? " \xB7 investigation required" : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
 `);

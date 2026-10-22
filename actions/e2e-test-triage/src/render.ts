@@ -97,6 +97,7 @@ function whyNext(f: Finding, branch: string, pr: boolean): [string, string] {
       if (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto") return [`Points to this PR's change (${ai}).`, "Check the change named in the evidence."];
       return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and this PR changes a file its error names.`, "Check your change to that file."];
     case "outdated": {
+      if (f.out_of_date?.streak) return [`Failed the same way on this PR's last ${f.out_of_date.streak} commits and never on ${branch}: the branch is behind or broken.`, `Merge ${branch} and re-run.`];
       const c = f.out_of_date?.commit;
       const where = c ? ` (${c.pr ? `#${c.pr}` : sha7(c.sha)}${c.date ? `, ${c.date}` : ""})` : "";
       return [`${branch} changed this test${where} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
@@ -170,9 +171,11 @@ function factsTable(f: Finding, branch: string, pr: boolean): string[] {
   if (f.tries?.ran) rows.push(["Tries in this run", f.tries.ran === 1 ? "Failed its only try" : f.tries.failed === f.tries.ran ? `Failed all ${f.tries.ran}` : `Failed ${f.tries.failed} of ${f.tries.ran}`]);
   if (f.producer) rows.push(["Recorded by the run", [f.producer.images.length && count(f.producer.images.length, "screenshot"), f.producer.notes && `notes: ${f.producer.notes.slice(0, 200)}`].filter(Boolean).join("; ")]);
   if (f.same_as) rows.push(["Same failure as", f.same_as]);
-  if (f.out_of_date) {
+  if (f.out_of_date?.streak) {
+    rows.push([`Failed the same way on this PR's last ${count(f.out_of_date.streak, "commit")}`, `Never on ${branch}; its latest run passed`]);
+  } else if (f.out_of_date) {
     const c = f.out_of_date.commit;
-    rows.push([`Changed on ${branch} since this PR last merged it`, `Yes${c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}` : ""}. This PR is ${count(f.out_of_date.behind, "commit")} behind, so it ran its old copy of the test`]);
+    rows.push([`Changed on ${branch} since this PR last merged it`, `Yes${c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}` : ""}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
   }
   if (f.decision === "evidence_incomplete" || f.identity_unresolved) rows.push(["Why history wasn't used", f.reason]);
   const a = f.judge;
@@ -223,6 +226,8 @@ export interface SummaryInput {
   laneRed?: boolean;
   /** "2 of 3 reports arrived", for a run with missing reports (see missingArrived). */
   reportsArrived?: string | null;
+  /** Failures that name no test (see evaluateRun): counted, not classified, and the lane is red for them. */
+  unnamed?: number | null;
 }
 
 /** What a red lane with no failed test is to re-run: a job outside the tests, or reports that never arrived. */
@@ -232,7 +237,7 @@ const RED_OUTSIDE = "No test failed. The lane is red because a job outside the t
  * The job summary, shortest first: a one-line answer, then the failed tests in four
  * groups (one line each: why and the next step), then the evidence, collapsed.
  */
-export function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null }: SummaryInput): string {
+export function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null }: SummaryInput): string {
   const branch = trunkBranch || "the default branch";
   const where = lane ? ` · ${md(lane)}` : "";
   const groups: Record<Bucket, Finding[]> = { yours: [], outdated: [], check: [], broken: [], flaky: [] };
@@ -254,6 +259,7 @@ export function renderSummary({ findings, infra = null, runURL, counts, mode = "
     : outdatedLead ? `🔴 merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}`
     : yours.length ? `🔴 ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}`
     : missing ? "🔴 results missing"
+    : unnamed ? "🔴 re-run the failed jobs"
     : check.length || outdated.length ? `🟡 ${[needText, staleText].filter(Boolean).join(", ")}`
     : blockingBroken ? `🔴 ${blockingBroken} still failing on ${md(branch)}`
     : `✅ none caused by this ${pr ? "PR" : "commit"}`;
@@ -267,11 +273,16 @@ export function renderSummary({ findings, infra = null, runURL, counts, mode = "
   for (const n of notes) lines.push(`> ${md(n)}`, "");
 
   let say = "";
-  // Red with no failed test: say which job to re-run, and how many reports arrived when some never did.
-  // With missing reports, the count that arrived and what never ran: the reason the lane is red.
-  const arrived = missing ? `${[reportsArrived, missing.text].filter(Boolean).join("; ")}.` : "";
-  if (!counts.failed) say = missing || laneRed ? `${RED_OUTSIDE}${arrived ? ` ${arrived}` : ""}` : "No test failed.";
-  else if (findings.length) {
+  // What arrived, and what never ran: the reason a lane with missing reports is red.
+  const arrived = [reportsArrived, missing?.text].filter(Boolean).join("; ");
+  if (unnamed) {
+    // Failures that name no test: nothing is judged, so the line says which jobs to re-run, and what arrived.
+    say = `Re-run the failed jobs: ${arrived || `${count(unnamed, "failed result")} with no test name`}.`;
+  } else if (!counts.failed) {
+    // Red with no failed test: the jobs to re-run. A missing report says how many arrived; a lane that is red for a job
+    // outside the tests says that.
+    say = missing ? `Re-run the failed jobs: ${arrived}.` : laneRed ? RED_OUTSIDE : "No test failed.";
+  } else if (findings.length) {
     const kinds = [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
     say = `${count(yours.length + outdated.length + check.length + blockingBroken + unrelated, "failure")}: ` + [
       yours.length && `${yours.length} may be caused by this ${pr ? "PR" : "commit"}`,
@@ -283,7 +294,7 @@ export function renderSummary({ findings, infra = null, runURL, counts, mode = "
     if (outdatedLead) say = `Merge ${branch} and re-run first. ${say}`;
   }
   if (infra) say = `${infra} ${say}`;
-  if (missing && counts.failed) say += ` Results incomplete: ${missing.text}; re-run the failed jobs before relying on this.`;
+  if (missing && counts.failed && !unnamed) say += ` Results incomplete: ${missing.text}; re-run the failed jobs before relying on this.`;
   lines.push(`**${md(say.trim())}** ${passLine(counts)} · [run](${runURL})`, "");
 
   const section = (title: string, list: Finding[], heading = `${title} (${list.length})`): void => {
@@ -298,7 +309,11 @@ export function renderSummary({ findings, infra = null, runURL, counts, mode = "
     lines.push("");
   };
   section(pr ? "Your PR" : "This commit", yours);
-  section("Out of date", outdated, `Out of date (${outdated.length}): ${md(branch)} changed these tests after this PR last merged ${md(branch)}`);
+  // A branch-state hold changed nothing on the base: its heading says what it is.
+  const streakOnly = outdated.length > 0 && outdated.every((f) => f.out_of_date?.streak);
+  section("Out of date", outdated, streakOnly
+    ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}`
+    : `Out of date (${outdated.length}): ${md(branch)} changed these tests after this PR last merged ${md(branch)}`);
   section("Needs a look", check);
   section(`Broken on ${md(branch)}`, broken);
   section("Flaky", flaky);
@@ -357,12 +372,54 @@ export function noResultsText(lane: string, commitSha: string): string {
   return `Not triaged: TSIO has no results for ${md(lane)} at ${sha7(commitSha)} (the tests may not have run).`;
 }
 
-/** The E2E check's text: "(4 cleared by triage) 99.7% passed (1186 passed, 4 failed, 164 skipped)". */
+/** The five labels the E2E check's text uses, in the order it lists them. */
+export const STATUS_LABELS = ["flaky", "broken on main", "caused by PR", "out of date", "needs investigation"] as const;
+export type StatusLabel = (typeof STATUS_LABELS)[number];
+
+/**
+ * The label of one finding. Blocking: out of date (a stale copy, or the branch-state hold), caused by this PR (the PR
+ * edits the spec, or the judge blames or vetoes it), otherwise needs investigation. Cleared: broken on main (a trunk
+ * break, or the judge's bug_on_master), otherwise flaky (trunk or cross-PR flakes, the environment, a test bug, or the
+ * same failure as one of those).
+ */
+export function statusLabelOf(f: Finding): StatusLabel {
+  if (f.blocking) {
+    if (f.out_of_date) return "out of date";
+    if (f.class === "OWNED_BY_PR" || (f.judge?.cause === "caused_by_pr" && (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto"))) return "caused by PR";
+    return "needs investigation";
+  }
+  if (f.class === "SAME_FAILURE_AS_CLEARED") return f.same_as_class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
+  if (f.decision === "adjudicator_unblock") return f.judge?.cause === "bug_on_master" ? "broken on main" : "flaky";
+  return f.class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
+}
+
+/**
+ * The status labels for a run, each with its count, in the fixed order and only where non-zero ("2 flaky, 2 caused by PR").
+ * A run with failures and no findings (every failure names no test) is red for a re-run, and says so.
+ */
+export function statusLabels(findings: Finding[], failed = findings.length): string[] {
+  if (!findings.length) return failed ? ["re-run the failed jobs"] : [];
+  const counts = new Map<StatusLabel, number>();
+  for (const f of findings) {
+    const label = statusLabelOf(f);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  return STATUS_LABELS.filter((l) => counts.has(l)).map((l) => `${counts.get(l)} ${l}`);
+}
+
+const STATUS_MAX = 140;
+
+/**
+ * The E2E check's text: "(2 flaky, 2 caused by PR) 99.7% passed (1186 passed, 4 failed, 164 skipped)". Zero labels are
+ * left out. The pass line is never shortened; past 140 characters the labels are, as the last resort.
+ */
 export function statusDescription(verdict: string, findings: Finding[], infra: string | null | undefined, counts: Partial<Counts>, missing: SummaryMissing | null = null): string {
-  const blocking = findings.filter((f) => f.blocking).length;
+  const pass = passLine(counts);
   // A run with many failures stays red, but still says what triage made of each one.
-  const triaged = infra && !findings.length
-    ? "not triaged, investigation required"
-    : `${findings.length - blocking} cleared by triage${blocking ? `, ${blocking} unresolved` : ""}${infra ? "; investigation required" : ""}`;
-  return `(${triaged}${missing ? `; ${missing.short}` : ""}) ${passLine(counts)}`.slice(0, 140);
+  const head = infra && !findings.length ? "not triaged, investigation required" : statusLabels(findings, counts.failed ?? 0).join(", ");
+  const rest = [infra && findings.length ? "investigation required" : "", missing?.short ?? ""].filter(Boolean).join("; ");
+  const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);
+  const shown = head.length <= room ? head : room > 1 ? `${head.slice(0, room - 1).trimEnd()}…` : "";
+  const inner = [shown, rest].filter(Boolean).join("; ");
+  return inner ? `(${inner}) ${pass}` : pass;
 }
