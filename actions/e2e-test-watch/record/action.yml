@@ -23,7 +23,7 @@ runs:
         PENDING_PATH: ${{ github.workspace }}/.e2e-master-watch/pending.json
       run: node "${{ github.action_path }}/../dist/index.js" record
     # Needs the caller's `cache-mode: write`: see the README.
-    - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+    - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ github.workspace }}/.e2e-master-watch/ledger.json
         # The restore's key in ../action.yml, which says why it keeps the former name.
