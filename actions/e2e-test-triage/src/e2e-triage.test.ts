@@ -2068,8 +2068,9 @@ const blockingOnly = (blocking: boolean): Finding => fixture<Finding>({ blocking
 test("the report-only label makes triage report-only on that PR, whatever the repo's mode", async () => {
   await inTmp(async (dir) => {
     const statuses: StatusBody[] = [];
-    const result = await triage({ env: { ...env, GITHUB_STEP_SUMMARY: join(dir, "s.md"), GITHUB_OUTPUT: join(dir, "output") }, fetchImpl: fakeFetch(judgedRoutes({ labels: [{ name: "E2E/Triage-report-only" }], statuses })), log: () => {} });
+    const result = await triage({ env: { ...env, GITHUB_STEP_SUMMARY: join(dir, "s.md"), GITHUB_OUTPUT: join(dir, "output"), FINDINGS_FILE: join(dir, "findings.json") }, fetchImpl: fakeFetch(judgedRoutes({ labels: [{ name: "E2E/Triage-report-only" }], statuses })), log: () => {} });
     assert.equal(result.verdict, "SUCCESS", "the failure is still judged");
+    assert.equal(parsed<{ mode: string }>(readFileSync(join(dir, "findings.json"), "utf8")).mode, "report-only", "the findings file records the mode the run ran in, not the one asked for");
     assert.ok(keptRed(statuses), "the cleared failure does not turn the check green; only its text changes");
     const summaryText = readFileSync(join(dir, "s.md"), "utf8");
     assert.match(summaryText, /\*\*Report only\.\*\*/);
