@@ -2173,9 +2173,10 @@ async function triage(options) {
   const { env } = options;
   const log = options.log ?? console.error;
   const requested = String(env.MODE ?? "").trim() === "enforce" ? "enforce" : "report-only";
+  const effective = () => seen.enforce === null ? requested : seen.enforce ? "enforce" : "report-only";
   try {
     const result = await decideRun(options, written, seen);
-    writeFindings({ env, id: identityOrNull(env), mode: seen.enforce ? "enforce" : requested, run: seen.run, result, notTriaged: null }, log);
+    writeFindings({ env, id: identityOrNull(env), mode: effective(), run: seen.run, result, notTriaged: null }, log);
     return result;
   } catch (e) {
     const id = identityOrNull(env);
@@ -2202,8 +2203,7 @@ async function triage(options) {
         log(`triage's summary not written: ${String(writeError).slice(0, 160)}`);
       }
     }
-    const mode = seen.enforce === null ? requested : seen.enforce ? "enforce" : "report-only";
-    writeFindings({ env, id, mode, run: seen.run, result: seen.result, notTriaged }, log);
+    writeFindings({ env, id, mode: effective(), run: seen.run, result: seen.result, notTriaged }, log);
     if (e instanceof SupersededRunError) throw new NotTriagedError(notTriaged);
     throw e;
   }

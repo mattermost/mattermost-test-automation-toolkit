@@ -111,12 +111,16 @@ rules' outcome stands.
   the state the check has, and writes nothing while it is still pending.
 - **Job summary**, for a lane where something failed, a report is missing, or
   the lane is red with no failed test, shortest first: a one-line answer, then
-  the failed tests in four fixed groups, one line each with why and the next step:
-  - **Your PR**: the PR edits the test, changes a file its error names, ran an
-    out-of-date copy of it, or the model points to the PR's change. The model
+  the failed tests in five fixed groups, one line each with why and the next step:
+  - **Your PR**: the PR edits the test, changes a file its error names, or the
+    model points to the PR's change. The model
     needs the same bar to name the PR as to clear a test: at least
     `min-confidence` and a change in the diff it can point to. A weaker guess
     stays under **Needs a look**.
+  - **Out of date**: the base branch changed the test after this PR last merged
+    it, so the PR ran its old copy; or it failed the same way on this PR's last
+    commits and never on master, whose latest run passes it. Next step: merge
+    master and re-run. The model is not asked.
   - **Needs a look**: nothing explains it yet. Next step: read the error before
     re-running (a real break can pass on a re-run).
   - **Broken on master**: master's latest run fails it too. The row names the PR

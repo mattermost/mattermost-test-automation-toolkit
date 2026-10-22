@@ -234,8 +234,9 @@ export interface SummaryInput {
 const RED_OUTSIDE = "No test failed. The lane is red because a job outside the tests failed (setup, upload or runner), or results are missing: re-run the failed jobs.";
 
 /**
- * The job summary, shortest first: a one-line answer, then the failed tests in four
- * groups (one line each: why and the next step), then the evidence, collapsed.
+ * The job summary, shortest first: a one-line answer, then the failed tests in five
+ * groups (Your PR, Out of date, Needs a look, Broken on the base branch, Flaky; one line each: why and the next
+ * step), then the evidence, collapsed.
  */
 export function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null }: SummaryInput): string {
   const branch = trunkBranch || "the default branch";
