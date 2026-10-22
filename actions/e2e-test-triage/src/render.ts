@@ -410,6 +410,9 @@ export function statusLabels(findings: Finding[], failed = findings.length): str
 
 const STATUS_MAX = 140;
 
+/** Why a run-level verdict keeps the run red, in the check's words: the environment, or a storm of failures. */
+export const runFlag = (infra: string): string => (/infrastructure errors/.test(infra) ? "mostly environment errors, re-run" : "many failures in one run");
+
 /**
  * The E2E check's text: "(2 flaky, 2 caused by PR) 99.7% passed (1186 passed, 4 failed, 164 skipped)". Zero labels are
  * left out. The pass line is never shortened; past 140 characters the labels are, as the last resort.
@@ -417,8 +420,8 @@ const STATUS_MAX = 140;
 export function statusDescription(verdict: string, findings: Finding[], infra: string | null | undefined, counts: Partial<Counts>, missing: SummaryMissing | null = null): string {
   const pass = passLine(counts);
   // A run with many failures stays red, but still says what triage made of each one.
-  const head = infra && !findings.length ? "not triaged, investigation required" : statusLabels(findings, counts.failed ?? 0).join(", ");
-  const rest = [infra && findings.length ? "investigation required" : "", missing?.short ?? ""].filter(Boolean).join("; ");
+  const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0).join(", ");
+  const rest = [infra && findings.length ? runFlag(infra) : "", missing?.short ?? ""].filter(Boolean).join("; ");
   const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);
   const shown = head.length <= room ? head : room > 1 ? `${head.slice(0, room - 1).trimEnd()}…` : "";
   const inner = [shown, rest].filter(Boolean).join("; ");

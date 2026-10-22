@@ -1566,11 +1566,15 @@ test("the status description accounts for every test in the run", async () => {
   // mattermost's convention: passed ÷ (passed + failed), one decimal, skipped not counted.
   const counts = { passed: 240, failed: 2, skipped: 3 };
   assert.equal(statusDescription("FAILURE", [blockingOnly(true), blockingOnly(false)], null, counts), "(1 flaky, 1 needs investigation) 99.2% passed (240 passed, 2 failed, 3 skipped)");
-  assert.equal(statusDescription("ACTION_REQUIRED", [], "5 of 6 failures are infrastructure errors", counts), "(not triaged, investigation required) 99.2% passed (240 passed, 2 failed, 3 skipped)");
+  assert.equal(statusDescription("ACTION_REQUIRED", [], "5 of 6 failures are infrastructure errors", counts), "(not triaged, mostly environment errors, re-run) 99.2% passed (240 passed, 2 failed, 3 skipped)");
   // A run with many failures still says what triage made of each one; the run stays red either way.
   const storm = [...Array.from({ length: 49 }, () => blockingOnly(false)), ...Array.from({ length: 4 }, () => blockingOnly(true))];
   assert.equal(statusDescription("ACTION_REQUIRED", storm, "53 tests failed in one run", { passed: 555, failed: 53, skipped: 42 }),
-    "(49 flaky, 4 needs investigation; investigation required) 91.3% passed (555 passed, 53 failed, 42 skipped)");
+    "(49 flaky, 4 needs investigation; many failures in one run) 91.3% passed (555 passed, 53 failed, 42 skipped)");
+  // A run most of whose failures are environment errors says so once, after the labels: "investigation" appears once.
+  const envRun = [...Array.from({ length: 17 }, () => blockingOnly(false)), ...Array.from({ length: 2 }, () => blockingOnly(true))];
+  assert.equal(statusDescription("ACTION_REQUIRED", envRun, "15 of 19 failures are infrastructure errors (server health, connectivity, device, shard that never ran); rerun when the environment recovers.", { passed: 587, failed: 19, skipped: 42 }),
+    "(17 flaky, 2 needs investigation; mostly environment errors, re-run) 96.9% passed (587 passed, 19 failed, 42 skipped)");
   assert.equal(statusDescription("SUCCESS", Array.from({ length: 4 }, () => blockingOnly(false)), null, { passed: 1186, failed: 4, skipped: 164 }), "(4 flaky) 99.7% passed (1186 passed, 4 failed, 164 skipped)");
   // Never "100%" while something failed.
   assert.equal(statusDescription("SUCCESS", [blockingOnly(false)], null, { passed: 5000, failed: 1, skipped: 0 }), "(1 flaky) 99.9% passed (5000 passed, 1 failed, 0 skipped)");
@@ -1785,11 +1789,18 @@ test("end to end: infra storm is red for the environment, not the PR, and asks n
     ...runRoutes(many),
     ["/reports/history", () => Response.json({ observations: [], has_more: false })],
     ["/issues/5/comments", (init) => (init.method === "POST" ? Response.json({ id: 1 }) : Response.json([]))],
-    ["/statuses/abc", (init) => (assert.equal(parsed<StatusBody>(bodyText(init)).state, "failure"), Response.json({}))],
+    ["/pulls/5/files", () => Response.json([])],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+    ["/statuses/abc", (init) => { statuses.push(parsed<StatusBody>(bodyText(init))); return Response.json({}); }],
   ]);
+  const statuses: StatusBody[] = [];
   const result = await triage({ env, fetchImpl, log: () => {} });
   assert.equal(result.verdict, "ACTION_REQUIRED");
   assert.ok(result.infra);
+  const required = statuses.filter((s) => s.context === "e2e-test/playwright");
+  assert.deepEqual(required.map((s) => s.state), ["failure"]);
+  assert.equal(required.at(-1)?.description, "(6 needs investigation; mostly environment errors, re-run) 0% passed (0 passed, 6 failed, 0 skipped)");
+  assert.equal(statuses.filter((s) => s.context === "e2e-test/playwright/triage").at(-1)?.description, "6 failed → 6 needs investigation · mostly environment errors, re-run");
   // Each failure is still named (an environment error), and the storm asks no model.
   assert.equal(result.findings.length, 6);
   assert.ok(result.findings.every((f) => f.class === "INFRA_ERROR" && f.blocking === true), "named, but the run stays red");

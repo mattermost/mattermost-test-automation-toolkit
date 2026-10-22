@@ -3,7 +3,8 @@
   "private": true,
   "workspaces": [
     "actions/e2e-test-status",
-    "actions/e2e-test-triage"
+    "actions/e2e-test-triage",
+    "actions/e2e-test-watch"
   ],
   "allowScripts": {
     "esbuild@0.27.7": true,

@@ -18,7 +18,7 @@ export const elsewhereKey = (file: string | null | undefined, title: string | nu
   JSON.stringify([String(file ?? "").replace(/\\/g, "/"), String(title ?? "").replace(/\\/g, "/")]);
 
 /** One GET of TSIO's API; a failed status throws with the path, never a body. */
-async function tsioJson<T>(fetchImpl: FetchImpl, base: string, path: string): Promise<T> {
+export async function tsioJson<T>(fetchImpl: FetchImpl, base: string, path: string): Promise<T> {
   const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(60000) });
   if (!res.ok) throw new Error(`TSIO GET ${path}: ${res.status}`);
   return (await res.json()) as T;
@@ -137,7 +137,7 @@ export interface TsioGroup {
   branch?: string | null;
 }
 
-interface TsioSuite {
+export interface TsioSuite {
   id: TsioId;
   file_path?: string | null;
   file?: string | null;
@@ -145,7 +145,7 @@ interface TsioSuite {
   title?: string | null;
 }
 
-interface TsioCase {
+export interface TsioCase {
   suite_id: TsioId;
   title: string;
   full_title?: string | null;

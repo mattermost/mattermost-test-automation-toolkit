@@ -17,7 +17,7 @@ import { evaluateRun } from "./evaluate.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
 import { redact, secretsOf, writeFindings } from "./findings.ts";
 import { ledgerTotals } from "./pricing.ts";
-import { noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, statusDescription, statusLabels, supersededText } from "./render.ts";
+import { noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
 import type { AskFn, Config, Diff, HistoryLike } from "./types.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
@@ -363,8 +363,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     else if (announce) {
       // The same labels as the E2E check's text (see statusDescription).
       await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra && !result.findings.length
-        ? `${run.counts.failed} failed · investigation required`
-        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${result.infra ? " · investigation required" : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
+        ? `${run.counts.failed} failed · not triaged, ${runFlag(result.infra)}`
+        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${result.infra ? ` · ${runFlag(result.infra)}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
     log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);

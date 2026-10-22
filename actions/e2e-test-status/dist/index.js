@@ -41,7 +41,8 @@ function redReason(description = "") {
   if (missing) parts.push(`${missing} report(s) missing, re-run`);
   else if (/results incomplete/.test(d)) parts.push("results incomplete, re-run");
   else if (/re-run the failed jobs/.test(d)) parts.push("re-run the failed jobs");
-  if (/investigation required/.test(d)) parts.push("many failures in one run");
+  if (/environment errors, re-run/.test(d)) parts.push("environment errors, re-run");
+  else if (/investigation required|many failures in one run/.test(d)) parts.push("many failures in one run");
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
   return parts.length ? parts.join(", ") : "still red";
 }

@@ -1,0 +1,30 @@
+name: E2E test watch record
+description: >
+  After the caller sent the requests from actions/e2e-test-watch, keep the
+  accepted ones, so the next trunk run holds their specs and PRs and counts them
+  toward the daily cap. Run it on every trunk run, even one that sent nothing.
+author: Mattermost
+inputs:
+  results:
+    description: 'JSON list [{"id", "status"}] with the HTTP status each request got (0 if none)'
+    required: false
+    default: "[]"
+  branch:
+    description: Trunk branch, as given to the watch action
+    required: false
+    default: master
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        RESULTS: ${{ inputs.results }}
+        LEDGER_PATH: ${{ github.workspace }}/.e2e-master-watch/ledger.json
+        PENDING_PATH: ${{ github.workspace }}/.e2e-master-watch/pending.json
+      run: node "${{ github.action_path }}/../dist/index.js" record
+    # Needs the caller's `cache-mode: write`: see the README.
+    - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ github.workspace }}/.e2e-master-watch/ledger.json
+        # The restore's key in ../action.yml, which says why it keeps the former name.
+        key: e2e-master-watch-${{ inputs.branch }}-${{ github.run_id }}-${{ github.run_attempt }}

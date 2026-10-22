@@ -107,6 +107,9 @@ rules' outcome stands.
   order: flaky, broken on main, caused by PR, out of date, needs investigation. The
   rate is passed ÷ (passed + failed), as in
   mattermost's own E2E check; it never reads 100% while something failed.
+  A run flagged as a whole stays red and says why after the labels: "mostly
+  environment errors, re-run" when at least half its failures are environment
+  errors, or "many failures in one run" at 30 or more.
   Enforce also sets the state (success only for `SUCCESS`); report-only keeps
   the state the check has, and writes nothing while it is still pending.
 - **Job summary**, for a lane where something failed, a report is missing, or
