@@ -1,0 +1,89 @@
+---
+name: Owned E2E test status
+description: Publish a run-owned E2E status and refresh the cross-lane summary under the caller's SHA-scoped concurrency lock.
+inputs:
+  composite-identity:
+    description: TSIO identity, including repository, commit_sha, gh_run_id and gh_run_attempt
+    required: true
+  status-context:
+    description: Required lane status context
+    required: true
+  github-token:
+    description: Token with statuses write permission
+    required: true
+  operation:
+    description: claim starts a run or skips tests; finish publishes its result; refresh updates its lane summary; summarize projects current statuses after human verification
+    default: finish
+  state:
+    description: pending, success, failure or error
+    default: error
+  description:
+    description: Commit status description
+    default: E2E results unavailable
+  target-url:
+    description: Report URL (defaults to the publishing workflow run)
+    default: ""
+  cancelled:
+    description: Skip all publication when the calling workflow was cancelled
+    default: "false"
+  verify-reports:
+    description: For finish, require a complete nonempty TSIO report group for the exact run and attempt before allowing success
+    default: "false"
+  execution-success:
+    description: With verify-reports, must be true only if preparation, dispatch and all workers succeeded
+    default: "false"
+  report-wait-seconds:
+    description: >-
+      With verify-reports, how long to wait for late report uploads. Keep it short when the caller holds
+      the publication lock and runs after every worker job has finished (their uploads are done by then).
+      No wait when execution-success is not "true": the lane is red either way.
+    default: "120"
+  tsio-base-url:
+    description: Same Test System IO base URL used by the dispatcher and summary; empty for the shared instance
+    default: ""
+  use-staging:
+    description: >
+      When true, target the staging deployment
+      (https://staging-test-io.test.mattermost.com) instead of production
+      (https://test-io.test.mattermost.com). Fails if tsio-base-url is set to any other URL.
+    required: false
+    default: "false"
+  triage-status-context:
+    description: Optional cross-lane summary context
+    default: ""
+  triage-lanes:
+    description: Comma-separated required status contexts included in the cross-lane summary
+    default: ""
+outputs:
+  state:
+    description: Raw result after execution and report validation (publication still requires ownership)
+    value: ${{ steps.publish.outputs.state }}
+  reports-complete:
+    description: Whether verification found a complete nonempty report group for this run and attempt
+    value: ${{ steps.publish.outputs.reports_complete }}
+  published:
+    description: Whether the required status was written
+    value: ${{ steps.publish.outputs.published }}
+runs:
+  using: composite
+  steps:
+    - id: publish
+      if: ${{ !cancelled() && inputs.cancelled != 'true' }}
+      shell: bash
+      env:
+        COMPOSITE_IDENTITY: ${{ inputs.composite-identity }}
+        STATUS_CONTEXT: ${{ inputs.status-context }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        OPERATION: ${{ inputs.operation }}
+        STATUS_STATE: ${{ inputs.state }}
+        STATUS_DESCRIPTION: ${{ inputs.description }}
+        TARGET_URL: ${{ inputs.target-url }}
+        CANCELLED: ${{ inputs.cancelled }}
+        VERIFY_REPORTS: ${{ inputs.verify-reports }}
+        EXECUTION_SUCCESS: ${{ inputs.execution-success }}
+        REPORT_WAIT_SECONDS: ${{ inputs.report-wait-seconds }}
+        TSIO_BASE_URL: ${{ inputs.tsio-base-url }}
+        USE_STAGING: ${{ inputs.use-staging }}
+        TRIAGE_CONTEXT: ${{ inputs.triage-status-context }}
+        TRIAGE_LANES: ${{ inputs.triage-lanes }}
+      run: node "${{ github.action_path }}/dist/index.js"

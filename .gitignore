@@ -30,3 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Dependencies of the TypeScript actions (npm ci installs them; dist/ is committed)
+node_modules/

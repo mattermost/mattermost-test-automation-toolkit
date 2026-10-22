@@ -11,17 +11,16 @@ mattermost-test-automation-toolkit/
 │       └── <reusable-workflow>/
 ├── actions/
 │   └── <reusable-composite-action>/
-├── packages/
-│   └── mattermost-testcontainers/
-└── scripts/
+└── packages/
+    └── mattermost-testcontainers/
 ```
 
 - **`.github/workflows/`** — Reusable GitHub Actions workflows shared across repositories.
 - **`actions/`** — Reusable composite actions for GitHub Actions.
 - **`packages/`** — Publishable libraries and tools (e.g., `mattermost-testcontainers`).
-- **`scripts/`** — Utility scripts for test automation tasks.
 
 ## Available for use
 
 1. Reusable workflow [`pr-test-analysis.yml`](.github/workflows/pr-test-analysis.yml). Documentation: [PR Test Analysis](.github/workflows/pr-test-analysis.md).
 2. Reusable workflow [`pr-test-analysis-override.yml`](.github/workflows/pr-test-analysis-override.yml). Documentation: [PR Test Analysis Override](.github/workflows/pr-test-analysis-override.md).
+3. Composite action [`actions/e2e-test-triage`](actions/e2e-test-triage): is a red E2E run the PR's fault? History rules plus a model for what history can't settle; writes the required status in enforce mode and explains each test in the job summary. Documentation: [E2E triage](actions/e2e-test-triage/README.md).

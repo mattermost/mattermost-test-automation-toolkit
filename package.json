@@ -1,0 +1,12 @@
+{
+  "name": "mattermost-test-automation-toolkit",
+  "private": true,
+  "workspaces": [
+    "actions/e2e-test-status",
+    "actions/e2e-test-triage"
+  ],
+  "allowScripts": {
+    "esbuild@0.27.7": true,
+    "fsevents@2.3.3": true
+  }
+}
