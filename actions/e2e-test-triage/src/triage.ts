@@ -3,20 +3,21 @@
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { gh } from "../../shared/src/github.ts";
-import type { Env, FetchImpl } from "../../shared/src/github.ts";
+import type { Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { laneName, laneSummary } from "../../shared/src/lane.ts";
 import { readStatuses, statusPublisher } from "../../shared/src/status.ts";
-import { compositeIdentityFrom, fetchRun, tsioBase } from "../../shared/src/tsio.ts";
-import type { CompositeIdentity, Wait } from "../../shared/src/tsio.ts";
+import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, SupersededRunError, tsioBase } from "../../shared/src/tsio.ts";
+import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.ts";
 import { configFrom, DEFAULTS, historyLane, PR_SPEND_KEY } from "./config.ts";
 import { loadEvidence } from "./evidence.ts";
 import { fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate } from "./history.ts";
-import { enrichFindings } from "./enrich.ts";
+import { enrichFindings, siblingPlatforms } from "./enrich.ts";
 import { askModelBatch } from "./judge.ts";
 import { evaluateRun } from "./evaluate.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
+import { redact, secretsOf, writeFindings } from "./findings.ts";
 import { ledgerTotals } from "./pricing.ts";
-import { passLine, renderSummary, renderUnfinished, statusDescription } from "./render.ts";
+import { noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, statusDescription, supersededText } from "./render.ts";
 import type { AskFn, Config, Diff, HistoryLike } from "./types.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
@@ -37,6 +38,12 @@ const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v ===
 const isPrSpend = (v: unknown): v is { pr: number; usd: number } =>
   isPlainObject(v) && typeof v.pr === "number" && typeof v.usd === "number" && Number.isFinite(v.usd) && v.usd >= 0;
 
+/**
+ * Thrown for a run triage leaves unjudged on purpose: a newer dispatch replaced it. Its summary and findings file say
+ * why. This is not a failure, so the action exits 0 on it (index.ts). Any other error still exits 1.
+ */
+export class NotTriagedError extends Error {}
+
 export interface TriageOptions {
   env: Env;
   fetchImpl?: FetchImpl;
@@ -45,30 +52,109 @@ export interface TriageOptions {
   wait?: Wait;
 }
 
+/** What triage got as far as it went, for the findings file and the not-triaged paths. */
+interface Seen {
+  run: RunResult | null;
+  result: EvaluatedRun | null;
+  enforce: boolean | null;
+}
+
+/** The composite identity, or null when it cannot be read: the findings file then names what it can. */
+function identityOrNull(env: Env): TriageIdentity | null {
+  try {
+    return compositeIdentityFrom<TriageIdentity>(env.COMPOSITE_IDENTITY);
+  } catch {
+    return null;
+  }
+}
+
+/** The first line of what went wrong, with secrets redacted: what the summary and the findings file say. */
+const errorLine = (e: unknown, secrets: string[]): string => redact((e instanceof Error ? e.message : String(e)).split(/\r?\n/)[0] ?? "", secrets);
+
 /**
  * Triages a run. However it ends without a verdict (a read that fails, a history that stays down), the job summary
- * says why, in report-only too, so the run page does not show only an exit.
+ * says why, in report-only too, so the run page does not show only an exit. The findings file is written however it
+ * ends (FINDINGS_FILE): judged, superseded, with no results, or broken off.
  */
 export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
   const written = { summary: false };
+  const seen: Seen = { run: null, result: null, enforce: null };
+  const { env } = options;
+  const log = options.log ?? console.error;
+  const requested: "enforce" | "report-only" = String(env.MODE ?? "").trim() === "enforce" ? "enforce" : "report-only";
   try {
-    return await decideRun(options, written);
+    const result = await decideRun(options, written, seen);
+    writeFindings({ env, id: identityOrNull(env), mode: seen.enforce ? "enforce" : requested, run: seen.run, result, notTriaged: null }, log);
+    return result;
   } catch (e) {
-    const log = options.log ?? console.error;
-    const summaryPath = options.env.GITHUB_STEP_SUMMARY;
+    const id = identityOrNull(env);
+    const secrets = secretsOf(env);
+    const summaryPath = env.GITHUB_STEP_SUMMARY;
+    const reason = errorLine(e, secrets);
+    // A run triage did not judge on purpose says why in its summary: a newer dispatch took its group, or TSIO has no
+    // results for it. Anything else is an unfinished triage.
+    let notTriaged = `error: ${reason}`;
+    let body: string | null = null;
+    if (e instanceof SupersededRunError && id) {
+      // A link only to a replacement of this same PR, or of the same branch when neither run has a PR: another PR's run
+      // is not this lane's triage, so it is named without a link.
+      const rep = e.replacement;
+      const samePR = rep.gh_pr_number !== undefined && (rep.gh_pr_number ? rep.gh_pr_number === String(id.gh_pr_number ?? "") : !id.gh_pr_number && rep.branch != null && rep.branch === id.branch);
+      body = samePR ? supersededText(rep.gh_run_id, id.repository, String(id.name)) : otherRunText(String(id.name));
+      notTriaged = `superseded: run ${e.replacement.gh_run_id} replaced this run`;
+    } else if (e instanceof NoResultsError && id) {
+      body = noResultsText(String(id.name), id.commit_sha);
+      notTriaged = "no_results: TSIO has no results for this run";
+      await noteNoResults(options, id);
+    }
     if (!written.summary && summaryPath) {
-      const reason = (e instanceof Error ? e.message : String(e)).split(/\r?\n/)[0] ?? "";
       try {
-        appendFileSync(summaryPath, renderUnfinished({ reason, lane: options.env.LANE || null }) + "\n");
+        const text = body ? renderNotTriaged({ text: body, lane: env.LANE || id?.name || null }) : renderUnfinished({ reason, lane: env.LANE || null });
+        appendFileSync(summaryPath, text + "\n");
       } catch (writeError) {
         log(`triage's summary not written: ${String(writeError).slice(0, 160)}`);
       }
     }
+    const mode = seen.enforce === null ? requested : seen.enforce ? "enforce" : "report-only";
+    writeFindings({ env, id, mode, run: seen.run, result: seen.result, notTriaged }, log);
+    if (e instanceof SupersededRunError) throw new NotTriagedError(notTriaged);
     throw e;
   }
 }
 
-async function decideRun({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait }: TriageOptions, written: { summary: boolean }): Promise<EvaluatedRun> {
+/**
+ * The lane's status when TSIO has no results: the note goes on the state it already has, so the lane stays as it
+ * was, and only where this run owns the status (the publisher checks that). A failed note is logged, not raised.
+ */
+async function noteNoResults({ env, fetchImpl = fetch, log = console.error }: TriageOptions, id: TriageIdentity): Promise<void> {
+  const context = env.STATUS_CONTEXT;
+  if (!context || !env.GITHUB_TOKEN) return;
+  try {
+    const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
+    const own = (await readStatuses(api, id)).find((r) => r.context === context);
+    if (!own || own.state === "pending") return;
+    const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
+    await statusPublisher({ api, id, context, env, log }).write({ state: own.state, description: "(not triaged: no results)", target_url: runURL }, "triage");
+  } catch (e) {
+    log(`not-triaged note not written on ${context}: ${String(e).slice(0, 200)}`);
+  }
+}
+
+/**
+ * Whether the lane's own status is red. Read only where no test failed: a red lane then has a job outside the tests
+ * that failed, which the summary says. Nothing is written for it. An unreadable status is logged, and reads as not red.
+ */
+async function laneIsRed(api: GhApi, id: TriageIdentity, context: string, log: (message: string) => void): Promise<boolean> {
+  try {
+    const own = (await readStatuses(api, id)).find((r) => r.context === context);
+    return own?.state === "failure" || own?.state === "error";
+  } catch (e) {
+    log(`lane status unavailable: ${String(e).slice(0, 160)}`);
+    return false;
+  }
+}
+
+async function decideRun({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait }: TriageOptions, written: { summary: boolean }, seen: Seen): Promise<EvaluatedRun> {
   const cfg: Config = configFrom(env, log);
   const id = compositeIdentityFrom<TriageIdentity>(env.COMPOSITE_IDENTITY);
   const prNumber = Number(id.gh_pr_number || 0) || null;
@@ -80,6 +166,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
   const reportName = env.REPORT_NAME || null;
   const run = await fetchRun(fetchImpl, base, id, reportName, wait);
+  seen.run = run;
   const context = env.STATUS_CONTEXT;
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
   // The lane's context is set in the environment (STATUS_CONTEXT); an unset one is passed through as undefined,
@@ -117,6 +204,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     enforce = false;
     notes.push(`Report only on this PR: it has the ${cfg.reportOnlyLabel} label, so triage leaves the E2E check as the tests set it.`);
   }
+  seen.enforce = enforce;
   // Like the required status, only an enforcing run writes to the PR.
   const announce = enforce && (run.failing.length > 0 || Boolean(run.missing));
   // TRIAGE_LANES lists every lane's required context: then the triage check is one
@@ -187,10 +275,12 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       prTitle: pull.title ?? "", lane: env.LANE || id.name, log,
       ask,
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
-      enrich: (findings) => enrichFindings({ findings, api, fetchImpl, base, id, testRoot, log }),
+      enrich: (findings) => enrichFindings({ findings, api, id, testRoot, log }),
+      otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
     });
+    seen.result = result;
     const spend = ledgerTotals(result.ai);
     if (env.ANSWERS_CACHE && cfg.answers) {
       // What this run counted, on top of the PR's known spend. Unknown spend is not saved as used up: this run made no call, so the next run starts the PR budget fresh.
@@ -203,14 +293,16 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       }
     }
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
-    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes });
+    // Nothing failed and every report arrived, yet the lane is red: a job outside the tests failed. Its own status says so.
+    const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
+    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing) });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing);
     if (env.GITHUB_OUTPUT)
       appendFileSync(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}\nverdict=${result.verdict}\nblocking=${result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\n` +
         `ai_calls=${spend.calls}\nai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}\nai_input_tokens=${spend.input_tokens}\nai_output_tokens=${spend.output_tokens}\n`);
     // A lane with nothing failed or missing has nothing to report, so it writes no job
     // summary: the run page then shows only the lanes someone needs to read.
-    if (env.GITHUB_STEP_SUMMARY && (run.failing.length > 0 || Boolean(run.missing))) {
+    if (env.GITHUB_STEP_SUMMARY && (run.failing.length > 0 || Boolean(run.missing) || laneRed)) {
       appendFileSync(env.GITHUB_STEP_SUMMARY, summary + "\n");
       written.summary = true;
     }
@@ -250,7 +342,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         : `${run.counts.failed} failed → ${result.findings.length - blocking} cleared · ${blocking} blocking${result.infra ? " · investigation required" : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
-    log(`e2e-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
+    log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;
   } catch (e) {
     if (announce && lanes.length && context) {

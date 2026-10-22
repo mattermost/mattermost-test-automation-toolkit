@@ -98,7 +98,13 @@ const snapshotOf = (alias: string, served: string): boolean => served.length ===
 export const servedMatches = (requested: string, served: unknown): boolean =>
   typeof served === "string" && (served === requested || (!isSnapshot(requested) && snapshotOf(requested, served)));
 
-export const packKey = (model: string, pack: Pack): string => createHash("sha256").update(model + "\n" + JSON.stringify(pack)).digest("hex");
+// Pack fields that are evidence added after answers were keyed. Left out of the key, so an answer cached before the field
+// existed is still found for the same evidence: a re-run is not paid again, and no verdict moves with the field.
+const UNKEYED_FIELDS: ReadonlySet<string> = new Set(["same_test_other_platforms_this_run"]);
+export const packKey = (model: string, pack: Pack): string =>
+  createHash("sha256")
+    .update(model + "\n" + JSON.stringify(Object.fromEntries(Object.entries(pack).filter(([k]) => !UNKEYED_FIELDS.has(k)))))
+    .digest("hex");
 
 export interface ImageBlock {
   type: "image";

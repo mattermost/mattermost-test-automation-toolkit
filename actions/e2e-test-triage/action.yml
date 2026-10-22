@@ -1,5 +1,5 @@
 ---
-name: E2E triage
+name: E2E test triage
 description: >
   After an E2E run reported to Test System IO, decide whether each failure is the
   PR's fault from test history, ask Claude about the ones history can't settle,
@@ -107,6 +107,10 @@ inputs:
     description: Optional directory of JSON evidence the test run recorded per failed test ({file, title, full_title, notes, images}); PNG/JPEG only, at most two per test
     required: false
     default: ""
+  findings-file:
+    description: Optional path of a JSON file triage writes after every run, judged or not, for measuring its accuracy (schema 1, see the README). Holds no secret and only the first line of each error. Empty turns it off
+    required: false
+    default: ""
 outputs:
   published:
     description: Whether triage wrote its verdict to the required status
@@ -163,4 +167,5 @@ runs:
         TRIAGE_LANES: ${{ inputs.triage-lanes }}
         AI_PRICES: ${{ inputs.ai-prices }}
         ANSWERS_CACHE: ${{ inputs.answers-cache }}
+        FINDINGS_FILE: ${{ inputs.findings-file }}
       run: node "${{ github.action_path }}/dist/index.js"

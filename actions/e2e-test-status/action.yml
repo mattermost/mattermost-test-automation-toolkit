@@ -1,5 +1,5 @@
 ---
-name: Owned E2E status
+name: Owned E2E test status
 description: Publish a run-owned E2E status and refresh the cross-lane summary under the caller's SHA-scoped concurrency lock.
 inputs:
   composite-identity:

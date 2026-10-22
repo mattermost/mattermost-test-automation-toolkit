@@ -2,7 +2,7 @@
 
 Use this action for **every writer of a lane's required status**: claim pending
 before preparation, finish with the raw test result, and claim success for a
-skipped suite. `e2e-triage` uses the same guard for its verdict. Disable the TSIO
+skipped suite. `e2e-test-triage` uses the same guard for its verdict. Disable the TSIO
 begin/summary actions' status writes when adopting this writer.
 
 The latest owning run ID wins, then its attempt. Workflow source `github.sha`

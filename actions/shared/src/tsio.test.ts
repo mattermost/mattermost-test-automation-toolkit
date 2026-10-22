@@ -2,7 +2,8 @@
 // See LICENSE.txt for license information.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { DEFAULT_TSIO_BASE_URL, STAGING_TSIO_BASE_URL, compositeIdentityFrom, missingReports, tsioBase } from "./tsio.ts";
+import type { FetchImpl } from "./github.ts";
+import { DEFAULT_TSIO_BASE_URL, NoResultsError, STAGING_TSIO_BASE_URL, SupersededRunError, compositeIdentityFrom, fetchRun, missingReports, missingArrived, tsioBase } from "./tsio.ts";
 
 test("use-staging unset, false or empty keeps the shared instance or the given base URL", () => {
   assert.equal(tsioBase({}), DEFAULT_TSIO_BASE_URL);
@@ -44,4 +45,40 @@ test("a missing or non-JSON COMPOSITE_IDENTITY is named as such, not a bare Synt
   assert.throws(() => compositeIdentityFrom(""), /COMPOSITE_IDENTITY is missing/);
   assert.throws(() => compositeIdentityFrom("{bad"), /COMPOSITE_IDENTITY is not valid JSON/);
   assert.deepEqual(compositeIdentityFrom('{"repository":"o/r"}'), { repository: "o/r" }, "a valid identity is read as written");
+});
+
+// A TSIO that answers the report list and nothing else: fetchRun reads it first, and its groups decide the outcome.
+const groupsOnly = (reports: unknown[]): FetchImpl => (async (url: string) => {
+  if (String(url).includes("/reports?")) return Response.json({ reports });
+  throw new Error(`unexpected ${url}`);
+}) as FetchImpl;
+const commit = "beed9ae9f5732b81aedf0ad7b6bc86701253a387";
+const suite = "playwright-full-enterprise";
+const group = (gh_run_id: string, gh_run_attempt = "1", over: Record<string, unknown> = {}) => ({ id: `g-${gh_run_id}-${gh_run_attempt}`, repository: "mattermost/mattermost", commit, name: suite, gh_run_id, gh_run_attempt, status: "completed", ...over });
+const ours = { repository: "mattermost/mattermost", commit_sha: commit, name: suite, gh_run_id: "39637355358", gh_run_attempt: "1" };
+
+test("a group a newer dispatch took is superseded: the error names the newest replacement", async () => {
+  // mattermost run 39637355358 was replaced for this suite by 39641043177, and later by 39650000000.
+  const reports = [group("39641043177"), group("39650000000"), group("39640000000", "1", { name: "other-suite" })];
+  await assert.rejects(() => fetchRun(groupsOnly(reports), "http://tsio", ours), (e: unknown) =>
+    e instanceof SupersededRunError && e.replacement.gh_run_id === "39650000000" && e.replacement.gh_run_attempt === "1" &&
+    /no group for mattermost\/mattermost beed9ae playwright-full-enterprise run 39637355358 attempt 1 .*its group now belongs to run 39650000000 attempt 1/.test(e.message));
+});
+
+test("a newer attempt of the same run supersedes it too", async () => {
+  await assert.rejects(() => fetchRun(groupsOnly([group("39637355358", "2")]), "http://tsio", ours), (e: unknown) =>
+    e instanceof SupersededRunError && e.replacement.gh_run_id === "39637355358" && e.replacement.gh_run_attempt === "2");
+});
+
+test("no group a newer run took is no results: an older run's group, another suite or another commit does not supersede this run", async () => {
+  const older = [group("39637355357"), group("39641043177", "1", { name: "other-suite" }), group("39641043177", "1", { commit: "0000000" })];
+  await assert.rejects(() => fetchRun(groupsOnly(older), "http://tsio", ours), (e: unknown) =>
+    e instanceof NoResultsError && !(e instanceof SupersededRunError) && /no group for/.test(e.message));
+  await assert.rejects(() => fetchRun(groupsOnly([]), "http://tsio", ours), (e: unknown) => e instanceof NoResultsError && !(e instanceof SupersededRunError));
+});
+
+test("missing reports are counted as arrived of expected, or as a bare count when the expected count is unknown", () => {
+  assert.equal(missingArrived(null), null);
+  assert.equal(missingArrived({ expected: 3, received: 1, status: "in_progress" }), "1 of 3 reports arrived");
+  assert.equal(missingArrived({ expected: null, received: 2, status: "processing" }), "2 reports arrived (the expected count is unknown)");
 });

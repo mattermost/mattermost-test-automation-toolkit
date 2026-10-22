@@ -107,9 +107,9 @@ rules' outcome stands.
   mattermost's own E2E check; it never reads 100% while something failed.
   Enforce also sets the state (success only for `SUCCESS`); report-only keeps
   the state the check has, and writes nothing while it is still pending.
-- **Job summary**, only for a lane where something failed or a report is
-  missing, shortest first: a one-line answer, then the failed tests in
-  four fixed groups, one line each with why and the next step:
+- **Job summary**, for a lane where something failed, a report is missing, or
+  the lane is red with no failed test, shortest first: a one-line answer, then
+  the failed tests in four fixed groups, one line each with why and the next step:
   - **Your PR**: the PR edits the test, changes a file its error names, ran an
     out-of-date copy of it, or the model points to the PR's change. The model
     needs the same bar to name the PR as to clear a test: at least
@@ -122,6 +122,31 @@ rules' outcome stands.
     break; several commits are listed, none blamed).
   - **Flaky**: intermittent on master, failing the same way on 3+ other PRs, or
     cleared by the model. No PR is named.
+
+  A failed test that also failed on other platforms in the same run gets
+  "Also failed on <platforms> in this run: likely environment or a shared
+  cause" in its why, and the headline's line under it counts those tests. A
+  failed try counts, even one a retry recovered (TSIO's `flaky`), and the
+  wording says which: "Also failed on windows", "Also failed once on windows
+  in this run (passed on retry)", or both for a mixed run. A pass does not
+  count. This
+  changes no class or blocking, and needs no model. The other platforms come
+  from two places, and only for a run with failed tests: a desktop run's other
+  OS reports, which sit in the same TSIO group (a report's name names its OS, as
+  `e2e-on-ubuntu-latest` is linux), and a mobile run's sibling groups (one TSIO
+  read each, at most five). Nothing is read for a run with nothing failed.
+
+  **Not triaged** (a run a newer dispatch replaced, or one TSIO has no results
+  for): the summary says so and why. A replaced run writes no status and exits
+  0, since the newer run owns the lane. A run with no results keeps its lane's
+  state and gets the note "(not triaged: no results)" where this run owns the
+  status. Any other failure reads "triage could not finish" and exits 1.
+
+  **Red with no failed test:** when the lane's own status is red and no test
+  failed, the summary says a job outside the tests failed (setup, upload or
+  runner) and to re-run the failed jobs. When reports are missing it also gives
+  "N of M reports arrived". Triage writes no status for this lane: the lane's own
+  status stands.
 
   The evidence for each test (history, other PRs, the model's answer, who decided)
   is collapsed below.
@@ -137,7 +162,7 @@ rules' outcome stands.
       - name: ci/e2e-triage
         if: always() && steps.summary.outcome != 'success'
         continue-on-error: true
-        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-triage@<full sha>
+        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-test-triage@<full sha>
         with:
           composite-identity: ${{ needs.prepare-run.outputs.composite-identity-json }}
           status-context: ${{ inputs.context_name }}
@@ -206,6 +231,49 @@ PNG/JPEG files inside the directory are read, at most two per test and 3.5 MB
 each. A link in the directory that dangles, or that points outside it, is skipped
 with a warning, and the rest of the evidence still loads.
 
+## Findings file
+
+`findings-file` (default `""`, off) names a JSON file the action writes after
+every run: judged, superseded, with no results, or broken off. It is for measuring
+how often triage's answers are right, so a consumer can join it to the verdicts
+later. Nothing in it is a secret, and each error is only its first line (200
+characters at most). Fields, in `schema` 1:
+
+```json
+{
+  "schema": 1,
+  "repository": "mattermost/mattermost", "commit_sha": "<sha>", "pr": 5,
+  "lane": "playwright-full-enterprise", "status_context": "<context>",
+  "run_id": "39637355358", "run_attempt": "1",
+  "mode": "enforce | report-only",
+  "verdict": "SUCCESS | FAILURE | ACTION_REQUIRED | null",
+  "counts": { "total": 0, "passed": 0, "failed": 0, "flaky": 0, "skipped": 0 },
+  "ai": { "calls": 0, "cost_usd": 0, "model": "claude-sonnet-5-5 | null" },
+  "triaged": true,
+  "not_triaged_reason": null,
+  "findings": [{
+    "title": "", "full_title": "", "file": "specs/a.spec.ts",
+    "class": "REGRESSION", "blocking": true, "decision": "adjudicator_veto | null",
+    "reason": "", "error_first_line": "", "out_of_date": false,
+    "tries": { "ran": 1, "failed": 1 },
+    "other_lanes_failed": ["android"],
+    "ai": { "cause": "caused_by_pr | null", "confidence": 0.9, "cited": ["hunk_0"], "cleared": false }
+  }]
+}
+```
+
+- `mode` is the effective mode. For a run not triaged it is the requested mode,
+  since the PR's label is not read.
+- `triaged` is `true` exactly when `not_triaged_reason` is `null`. A run that is
+  not triaged has `verdict: null` and no `counts`. It has `counts` only when TSIO
+  was read.
+- `not_triaged_reason` starts with `superseded:`, `no_results:` or `error:`.
+- `ai.cost_usd` is `null` when a call's model is unpriced.
+- `ai.cleared` is `true` when the model cleared the test; `ai.cited` lists the
+  evidence it cited.
+
+Consumers check `schema` first. A future change to the shape bumps it.
+
 ## Trunk runs
 
 Without a PR number, the run is a trunk run. A failure that was already there in
@@ -227,7 +295,7 @@ npm run build --workspaces   # dist/index.js must not change: commit the rebuilt
 
 Enforcing triage now requires a recognized raw lane status owned by the same
 run, and cannot clear a pending raw status. It shares the guard with
-[`e2e-status`](../e2e-status/README.md). All producers of a given SHA's statuses
+[`e2e-test-status`](../e2e-test-status/README.md). All producers of a given SHA's statuses
 must hold the publication-job lock documented there, including this action and
 its cross-lane summary. Ownership checks alone cannot prevent a check/write
 race. Stale runs still produce diagnostic summaries but cannot update statuses.
