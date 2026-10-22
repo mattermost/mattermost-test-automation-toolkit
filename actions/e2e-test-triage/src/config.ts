@@ -68,6 +68,8 @@ export const laneOfReport = (name: string): string => {
   const rest = String(name).replace(/^e2e-on-/, "");
   return OS_OF_REPORT.find(([re]) => re.test(rest))?.[1] ?? rest;
 };
+/** The OS a report name stands for, or null when it names none (a worker or shard of the same lane, as on mattermost). */
+export const osOfReport = (name: string): string | null => OS_OF_REPORT.find(([re]) => re.test(String(name)))?.[1] ?? null;
 
 /**
  * TSIO's spec path relative to the repository, so it can be compared with the

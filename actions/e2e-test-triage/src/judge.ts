@@ -292,4 +292,5 @@ export function parseAnswer(text: string): Omit<Answer, "provenance"> {
   return { cause: a.cause as Cause, confidence: a.confidence, cited_evidence: a.cited_evidence.slice(0, 6), explanation: a.explanation.slice(0, 280) };
 }
 
-export const answerKey = (model: string, pack: Pack): string => `v3:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + SYSTEM, pack)}`;
+// v4: the pack gained pr.change_summary and this_pr_history.latest, and this_pr is citable only after a latest pass. Every v3 answer is a miss.
+export const answerKey = (model: string, pack: Pack): string => `v4:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + SYSTEM, pack)}`;

@@ -10,14 +10,14 @@ import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, Supers
 import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.ts";
 import { configFrom, DEFAULTS, historyLane, PR_SPEND_KEY } from "./config.ts";
 import { loadEvidence } from "./evidence.ts";
-import { fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate } from "./history.ts";
+import { fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { enrichFindings, siblingPlatforms } from "./enrich.ts";
 import { askModelBatch } from "./judge.ts";
 import { evaluateRun } from "./evaluate.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
 import { redact, secretsOf, writeFindings } from "./findings.ts";
 import { ledgerTotals } from "./pricing.ts";
-import { noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, statusDescription, supersededText } from "./render.ts";
+import { noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, statusDescription, statusLabels, supersededText } from "./render.ts";
 import type { AskFn, Config, Diff, HistoryLike } from "./types.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
@@ -154,6 +154,17 @@ async function laneIsRed(api: GhApi, id: TriageIdentity, context: string, log: (
   }
 }
 
+/** The repository's default branch, read when the base branch has too little history to judge by. Null when GitHub can't say. */
+async function defaultBranchOf(api: GhApi, repository: string, log: (message: string) => void): Promise<string | null> {
+  try {
+    const repo = (await api("GET", `/repos/${repository}`)) as { default_branch?: string | null } | null;
+    return repo?.default_branch || null;
+  } catch (e) {
+    log(`default branch unavailable: ${String(e).slice(0, 160)}`);
+    return null;
+  }
+}
+
 async function decideRun({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait }: TriageOptions, written: { summary: boolean }, seen: Seen): Promise<EvaluatedRun> {
   const cfg: Config = configFrom(env, log);
   const id = compositeIdentityFrom<TriageIdentity>(env.COMPOSITE_IDENTITY);
@@ -223,12 +234,25 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   try {
     let history: HistoryLike = new Map();
     let diff: Diff = { files: [], ok: false };
-    const trunkBranch: string | null | undefined = isTrunkRun ? id.branch : pull.base?.ref ?? null;
-    if (run.failing.length) {
+    // A PR's trunk is its base branch, when TSIO has enough of that branch's runs to judge by (a stacked PR's base often has
+    // too few); otherwise it is the repository's default branch, and the summary says so.
+    const prBase = isTrunkRun ? null : pull.base?.ref ?? null;
+    let trunkBranch: string | null | undefined = isTrunkRun ? id.branch : prBase;
+    // A failure with no test name has no history to read, so no history is asked for a run whose failures all lack one.
+    if (run.failing.some((t) => t.title.trim() !== "")) {
       [history, diff] = await Promise.all([
         fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg)),
         fetchChangedFiles(api, id, prNumber, log),
       ]);
+      const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;
+      if (prBase && baseRuns < cfg.minTrunkRuns) {
+        const fallback = await defaultBranchOf(api, id.repository, log);
+        if (fallback && fallback !== prBase) {
+          trunkBranch = fallback;
+          notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
+          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
+        }
+      }
     }
     // Answers from an earlier attempt at the same evidence, so a re-run does not pay twice. A cache that is not a
     // readable object, or a PR-spend entry that is corrupt, cannot say what the PR spent: that spend is unknown.
@@ -295,7 +319,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
     // Nothing failed and every report arrived, yet the lane is red: a job outside the tests failed. Its own status says so.
     const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
-    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing) });
+    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing);
     if (env.GITHUB_OUTPUT)
       appendFileSync(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}\nverdict=${result.verdict}\nblocking=${result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\n` +
@@ -336,10 +360,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     }
     if (announce && lanes.length) await settleLaneSummary();
     else if (announce) {
-      const blocking = result.findings.filter((f) => f.blocking).length;
+      // The same labels as the E2E check's text (see statusDescription).
       await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra && !result.findings.length
         ? `${run.counts.failed} failed · investigation required`
-        : `${run.counts.failed} failed → ${result.findings.length - blocking} cleared · ${blocking} blocking${result.infra ? " · investigation required" : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
+        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${result.infra ? " · investigation required" : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
     log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);

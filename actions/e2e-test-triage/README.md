@@ -102,8 +102,10 @@ rules' outcome stands.
 
 ## What the PR shows
 
-- **E2E check text**, in both modes: `(4 cleared by triage) 99.7% passed (1186
-  passed, 4 failed, 164 skipped)`. The rate is passed ÷ (passed + failed), as in
+- **E2E check text**, in both modes: `(2 flaky, 2 caused by PR) 99.7% passed (1186
+  passed, 4 failed, 164 skipped)`. The labels, each only when non-zero and in this
+  order: flaky, broken on main, caused by PR, out of date, needs investigation. The
+  rate is passed ÷ (passed + failed), as in
   mattermost's own E2E check; it never reads 100% while something failed.
   Enforce also sets the state (success only for `SUCCESS`); report-only keeps
   the state the check has, and writes nothing while it is still pending.
