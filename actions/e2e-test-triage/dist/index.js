@@ -41,7 +41,8 @@ function redReason(description = "") {
   if (missing) parts.push(`${missing} report(s) missing, re-run`);
   else if (/results incomplete/.test(d)) parts.push("results incomplete, re-run");
   else if (/re-run the failed jobs/.test(d)) parts.push("re-run the failed jobs");
-  if (/investigation required/.test(d)) parts.push("many failures in one run");
+  if (/environment errors, re-run/.test(d)) parts.push("environment errors, re-run");
+  else if (/investigation required|many failures in one run/.test(d)) parts.push("many failures in one run");
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
   return parts.length ? parts.join(", ") : "still red";
 }
@@ -2140,10 +2141,11 @@ function statusLabels(findings, failed = findings.length) {
   return STATUS_LABELS.filter((l) => counts.has(l)).map((l) => `${counts.get(l)} ${l}`);
 }
 var STATUS_MAX = 140;
+var runFlag = (infra) => /infrastructure errors/.test(infra) ? "mostly environment errors, re-run" : "many failures in one run";
 function statusDescription(verdict, findings, infra, counts, missing = null) {
   const pass = passLine(counts);
-  const head = infra && !findings.length ? "not triaged, investigation required" : statusLabels(findings, counts.failed ?? 0).join(", ");
-  const rest = [infra && findings.length ? "investigation required" : "", missing?.short ?? ""].filter(Boolean).join("; ");
+  const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0).join(", ");
+  const rest = [infra && findings.length ? runFlag(infra) : "", missing?.short ?? ""].filter(Boolean).join("; ");
   const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);
   const shown = head.length <= room ? head : room > 1 ? `${head.slice(0, room - 1).trimEnd()}\u2026` : "";
   const inner = [shown, rest].filter(Boolean).join("; ");
@@ -2413,7 +2415,7 @@ ai_output_tokens=${spend.output_tokens}
     }
     if (announce && lanes.length) await settleLaneSummary();
     else if (announce) {
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra && !result.findings.length ? `${run.counts.failed} failed \xB7 investigation required` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${result.infra ? " \xB7 investigation required" : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(result.infra)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${result.infra ? ` \xB7 ${runFlag(result.infra)}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
 `);

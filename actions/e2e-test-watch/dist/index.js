@@ -595,6 +595,277 @@ async function markBrokeBy({ findings, api, id, log = () => {
   }
 }
 
+// ../e2e-test-triage/src/render.ts
+var CODE_ESCAPES = { "|": "&#124;", "<": "&lt;", ">": "&gt;", "`": "&#96;" };
+var mdCode = (s) => String(s).replace(/[|<>`]/g, (c) => CODE_ESCAPES[c]).replace(/\r?\n/g, " ");
+var md = (s) => mdCode(
+  String(s).replace(/\\/g, "\\\\").replace(/[[\]*~]/g, (c) => `\\${c}`).replace(/&(?=#?\w+;)/g, "\\&").replace(/(?<![\p{L}\p{N}])_|_(?![\p{L}\p{N}])/gu, "\\_").replace(/^#/, "\\#")
+);
+var shortModel = (m) => String(m ?? "").replace(/^claude-/, "");
+var usd = (n) => n == null ? "?" : n === 0 ? "$0" : n < 0.01 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`;
+var tokens = (n) => n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n);
+var pct = (x) => `${Math.round(x * 100)}%`;
+var count = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+var sha7 = (c) => String(c ?? "").slice(0, 7);
+var fileOf = (f) => String(f.file ?? "").split("/").pop();
+var LIKELY = { flaky_environment: "flaky or environment", bug_on_master: "already broken on the default branch", test_bug: "a test bug" };
+function bucketOf(f) {
+  const brokeOnBase = f.class === "BROKEN_ON_TRUNK" || f.same_as_class === "BROKEN_ON_TRUNK";
+  if (f.blocking) {
+    if (f.out_of_date && f.class !== "OWNED_BY_PR") return "outdated";
+    const yours = f.class === "OWNED_BY_PR" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame" || f.class === "REGRESSION" && f.untouched === false;
+    if (yours) return "yours";
+    return brokeOnBase ? "broken" : "check";
+  }
+  if (brokeOnBase) return "broken";
+  const cause = f.decision === "adjudicator_unblock" ? f.judge?.cause : null;
+  return cause === "bug_on_master" || cause === "test_bug" ? "broken" : "flaky";
+}
+function brokeByText(b) {
+  if (!b?.commits?.length) return null;
+  const name = (c) => c.pr ? `#${c.pr}` : sha7(c.sha);
+  if (b.total === 1) return `${name(b.commits[0])}${b.commits[0].author ? ` (@${b.commits[0].author})` : ""}`;
+  if (b.total <= 5) return `one of ${b.commits.map(name).join(", ")}`;
+  return `one of ${b.total} commits merged between ${sha7(b.from)} and ${sha7(b.to)}`;
+}
+var PERCENT = (n) => `${Math.round(n * 100)}%`;
+var failedElsewhere = (f) => (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform);
+var alsoFailed = (f, tail) => {
+  const other = f.other_lanes ?? [];
+  const failed = other.filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform);
+  const once = other.filter((o) => o.result === "flaky").map((o) => o.platform);
+  if (failed.length && once.length) return ` Also failed on ${failed.join(", ")}, and once on ${once.join(", ")} (passed on retry), in this run${tail}`;
+  if (once.length) return ` Also failed once on ${once.join(", ")} in this run (passed on retry)${tail}`;
+  if (failed.length) return ` Also failed on ${failed.join(", ")} in this run${tail}`;
+  return "";
+};
+var SHARED_CAUSE = ": likely environment or a shared cause.";
+var PLAIN = ".";
+function whyNext(f, branch, pr) {
+  const t = f.trunk ?? { runs: 0, passes: 0, fails: 0, flaky: 0 };
+  const a = f.judge;
+  const ai = a ? `AI, ${PERCENT(a.confidence)} sure` : "";
+  switch (bucketOf(f)) {
+    case "yours":
+      if (f.class === "OWNED_BY_PR") return [`This ${pr ? "PR" : "commit"} edits the test.`, "Check your change to the test."];
+      if (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto") return [`Points to this PR's change (${ai}).`, "Check the change named in the evidence."];
+      return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and this PR changes a file its error names.`, "Check your change to that file."];
+    case "outdated": {
+      if (f.out_of_date?.streak) return [`Failed the same way on this PR's last ${f.out_of_date.streak} commits and never on ${branch}: the branch is behind or broken.`, `Merge ${branch} and re-run.`];
+      const c = f.out_of_date?.commit;
+      const where = c ? ` (${c.pr ? `#${c.pr}` : sha7(c.sha)}${c.date ? `, ${c.date}` : ""})` : "";
+      return [`${branch} changed this test${where} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
+    }
+    case "check":
+      if (f.decision === "evidence_incomplete" || f.identity_unresolved) return ["Its history could not be checked.", "Read the error, or re-run if it isn't your change."];
+      if (a?.cause === "caused_by_pr") return [`Might be this PR's change (${ai}), but not sure enough to say.`, "Read the error before re-running."];
+      if (a) return [`Looks ${LIKELY[a.cause] ?? a.cause} (${ai}), but not sure enough to clear.`, "Read the error before re-running."];
+      if (f.class === "INFRA_ERROR") return ["Failed on its environment (see the error), which this change could also have caused.", "Re-run; if it fails the same way again, check your change."];
+      if (f.class === "INSUFFICIENT_DATA") return [`Too little history on ${branch} to tell (${count(t.runs, "run")}).`, "Read the error before re-running."];
+      return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), no other PR fails it this way, and this ${pr ? "PR" : "commit"} doesn't change it or a file its error names.`, "Read the error before re-running."];
+    case "broken": {
+      const by = brokeByText(f.broke_by);
+      const why = f.decision === "adjudicator_unblock" ? `Already broken on ${branch} (${ai}).` : `Fails on ${branch}'s latest run too${by ? `; broke in ${by}` : ""}.`;
+      return [why, pr ? by ? `Nothing for you. Fix belongs to ${by}.` : "Nothing for you." : by ? `Fix belongs to ${by}.` : `Fix on ${branch}.`];
+    }
+    default: {
+      const allFailed = Boolean(f.tries && f.tries.ran >= 2 && f.tries.failed === f.tries.ran);
+      const next = allFailed ? "Re-run once before digging." : pr ? "Nothing for you." : "Fix the flaky test.";
+      if (allFailed && f.class === "FLAKY_ON_TRUNK") return [`Failed every try here; flaky on ${branch}.`, next];
+      if (f.decision === "adjudicator_unblock") return [`Looks ${LIKELY[a?.cause ?? ""] ?? "flaky"} (${ai}).`, next];
+      if (f.class === "SAME_FAILURE_AS_CLEARED") return [`Same error as "${f.same_as}", cleared above.`, next];
+      if (f.class === "INFRA_ERROR") return ["Failed on its environment (see the error), not on this change.", allFailed ? next : pr ? "Nothing for you; re-run if the lane must be green." : "Re-run when the environment recovers."];
+      if (f.class === "FLAKY_CROSS_PR") return [`Failed the same way on ${count(f.cross_pr.prs.length, "other PR")} while ${branch} passes.`, next];
+      const how = [t.fails && `failed ${t.fails}`, t.flaky && `passed only on retry ${t.flaky}`].filter(Boolean).join(" and ");
+      return [`Flaky on ${branch}: ${how} of the last ${t.runs} runs.`, next];
+    }
+  }
+}
+function decidedBy(f) {
+  const model = shortModel(f.judge?.provenance?.served_model ?? f.ai?.model);
+  if (f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame") return `AI (${model})${f.escalated ? ", second opinion" : ""}`;
+  if (f.judge || f.ai?.model) return `Rules; AI asked${f.escalated ? ", second opinion" : ""}`;
+  return "Rules";
+}
+function factsTable(f, branch, pr) {
+  const t = f.trunk;
+  const rows = [];
+  const edits = f.class === "OWNED_BY_PR";
+  rows.push([`Does this ${pr ? "PR" : "commit"} change the test?`, edits ? "Yes" : "No"]);
+  if (!edits && f.untouched != null) rows.push(["Does this PR change a file its error names?", f.untouched ? "No" : "Yes"]);
+  if (t) rows.push(t.runs ? [`${branch}, last ${count(t.runs, "run")}`, `Passed ${t.passes}, failed ${t.fails}${t.flaky ? `, passed on retry ${t.flaky}` : ""}${t.latest ? `. Latest: ${t.latest}` : ""}`] : [`${branch}`, "No runs on record"]);
+  if (f.broke_by) {
+    const b = f.broke_by;
+    rows.push([`Merged on ${branch} between its last pass and first failure`, `${count(b.total, "commit")} (${sha7(b.from)}\u2026${sha7(b.to)})${b.commits.length ? `: ${b.commits.map((c) => `${c.pr ? `#${c.pr}` : sha7(c.sha)}${c.author ? ` @${c.author}` : ""}`).join(", ")}` : ""}`]);
+  }
+  if (f.cross_pr) {
+    const ex = f.cross_pr.examples.slice(0, 3).join(", ");
+    rows.push(["Other PRs", f.cross_pr.prs.length ? `Failed with the same error on ${count(f.cross_pr.prs.length, "PR")}${ex ? `: ${ex}` : ""}` : f.cross_pr.passes ? `Never failed the same way in ${count(f.cross_pr.passes, "run")}` : "No runs on record"]);
+  }
+  if (pr && f.this_pr?.runs) {
+    const lp = f.this_pr.last_pass;
+    rows.push(["This PR's earlier runs", `Passed ${f.this_pr.passes} of ${f.this_pr.runs}${lp ? `. Last pass: ${sha7(lp.commit_sha)}, ${String(lp.created_at ?? "").slice(0, 16).replace("T", " ")}` : ""}`]);
+    const since = f.since_last_pass;
+    if (since) {
+      const cut = since.complete === false;
+      const listed = cut ? `${count(since.files.length, "file")} listed; GitHub lists at most ${COMPARE_FILE_CAP}, so more may have changed` : `${count(since.files.length, "file")}${since.files.length <= 3 ? `: ${since.files.join(", ")}` : `, for example ${since.files.slice(0, 3).join(", ")}`}`;
+      rows.push(["Changed on this PR since that pass", since.files.length ? `${listed}. ${since.related.length ? `Named in the test's error: ${since.related.map((r) => r.file).join(", ")}` : cut ? "None named in the files listed, which does not clear it" : "None named in the test's error"}` : "Nothing (same commit)"]);
+    }
+  }
+  if (f.other_lanes?.length) rows.push(["Same test, same run, other platforms", f.other_lanes.map((o) => `${o.platform}: ${o.result}`).join(", ")]);
+  if (f.tries?.ran) rows.push(["Tries in this run", f.tries.ran === 1 ? "Failed its only try" : f.tries.failed === f.tries.ran ? `Failed all ${f.tries.ran}` : `Failed ${f.tries.failed} of ${f.tries.ran}`]);
+  if (f.producer) rows.push(["Recorded by the run", [f.producer.images.length && count(f.producer.images.length, "screenshot"), f.producer.notes && `notes: ${f.producer.notes.slice(0, 200)}`].filter(Boolean).join("; ")]);
+  if (f.same_as) rows.push(["Same failure as", f.same_as]);
+  if (f.out_of_date?.streak) {
+    rows.push([`Failed the same way on this PR's last ${count(f.out_of_date.streak, "commit")}`, `Never on ${branch}; its latest run passed`]);
+  } else if (f.out_of_date) {
+    const c = f.out_of_date.commit;
+    rows.push([`Changed on ${branch} since this PR last merged it`, `Yes${c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}` : ""}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
+  }
+  if (f.decision === "evidence_incomplete" || f.identity_unresolved) rows.push(["Why history wasn't used", f.reason]);
+  const a = f.judge;
+  if (a) {
+    const verdict = a.cause === "caused_by_pr" ? "Caused by this PR" : `Not caused by this PR (${LIKELY[a.cause] ?? a.cause})`;
+    const blames = a.cause === "caused_by_pr";
+    const sure = f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame" ? `${pct(a.confidence)} sure, enough to decide` : blames ? `${pct(a.confidence)} sure; naming the PR needs 85% and a change it can point to` : f.decision === "advice" ? `${pct(a.confidence)} sure, but with nothing it could point to, so it can't clear` : `${pct(a.confidence)} sure; clearing needs 85% and evidence`;
+    const model = shortModel(a.provenance?.served_model ?? f.ai?.model);
+    rows.push([model ? `AI (${model})` : "AI", `${verdict}, ${sure}. ${a.explanation}`]);
+  }
+  rows.push(["Decided by", decidedBy(f)]);
+  return ["| Question | Answer |", "| --- | --- |", ...rows.map(([q, v]) => `| ${md(q)} | ${md(v)} |`)];
+}
+function passRate(counts) {
+  const passed = counts.passed ?? 0;
+  const ran = passed + (counts.failed ?? 0);
+  if (!passed) return "0%";
+  if (!counts.failed) return "100%";
+  return `${Math.min(99.9, Math.round(passed / ran * 1e3) / 10).toFixed(1)}%`;
+}
+var passLine = (counts) => `${passRate(counts)} passed (${counts.passed ?? 0} passed, ${counts.failed} failed, ${counts.skipped ?? 0} skipped)`;
+var RED_OUTSIDE = "No test failed. The lane is red because a job outside the tests failed (setup, upload or runner), or results are missing: re-run the failed jobs.";
+function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null }) {
+  const branch = trunkBranch || "the default branch";
+  const where = lane ? ` \xB7 ${md(lane)}` : "";
+  const groups = { yours: [], outdated: [], check: [], broken: [], flaky: [] };
+  for (const f of findings) groups[bucketOf(f)].push(f);
+  const { yours, outdated, check, broken, flaky } = groups;
+  const blockingBroken = broken.filter((f) => f.blocking).length;
+  const unrelatedBroken = broken.length - blockingBroken;
+  const unrelated = unrelatedBroken + flaky.length;
+  const outdatedLead = findings.length > 0 && outdated.length * 2 >= findings.length;
+  const staleText = outdated.length ? `${outdated.length} out of date` : "";
+  const needText = check.length ? `${check.length} need${check.length === 1 ? "s" : ""} a look` : "";
+  const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? laneRed ? "\u{1F534} red outside the tests" : "\u2705 nothing failed" : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : unnamed ? "\u{1F534} re-run the failed jobs" : check.length || outdated.length ? `\u{1F7E1} ${[needText, staleText].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
+  const lines = [`## E2E triage${where}: ${head}`, ""];
+  const several = findings.filter((f) => failedElsewhere(f).length > 0).length;
+  if (several) lines.push(`${count(several, "test")} failed on several platforms in this run.`, "");
+  lines.push(mode === "enforce" ? "> Triage sets the E2E check: it passes only when every failure is cleared." : "> **Report only.** This is triage's advice; it doesn't change the E2E check.", "");
+  for (const n of notes) lines.push(`> ${md(n)}`, "");
+  let say = "";
+  const arrived = [reportsArrived, missing?.text].filter(Boolean).join("; ");
+  if (unnamed) {
+    say = `Re-run the failed jobs: ${arrived || `${count(unnamed, "failed result")} with no test name`}.`;
+  } else if (!counts.failed) {
+    say = missing ? `Re-run the failed jobs: ${arrived}.` : laneRed ? RED_OUTSIDE : "No test failed.";
+  } else if (findings.length) {
+    const kinds = [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
+    say = `${count(yours.length + outdated.length + check.length + blockingBroken + unrelated, "failure")}: ` + [
+      yours.length && `${yours.length} may be caused by this ${pr ? "PR" : "commit"}`,
+      outdated.length && `${outdated.length} out of date`,
+      check.length && `${check.length} need${check.length === 1 ? "s" : ""} a look`,
+      blockingBroken && `${blockingBroken} still failing on ${branch}`,
+      unrelated && `${unrelated} look${unrelated === 1 ? "s" : ""} unrelated (${kinds})`
+    ].filter(Boolean).join("; ") + ".";
+    if (outdatedLead) say = `Merge ${branch} and re-run first. ${say}`;
+  }
+  if (infra) say = `${infra} ${say}`;
+  if (missing && counts.failed && !unnamed) say += ` Results incomplete: ${missing.text}; re-run the failed jobs before relying on this.`;
+  lines.push(`**${md(say.trim())}** ${passLine(counts)} \xB7 [run](${runURL})`, "");
+  const section = (title, list, heading = `${title} (${list.length})`) => {
+    if (!list.length) return;
+    lines.push(`### ${heading}`, "", "| Test | Why | Next step |", "| --- | --- | --- |");
+    for (const f of list) {
+      const [why, next] = whyNext(f, branch, pr);
+      const blamesPR = bucketOf(f) === "yours" || bucketOf(f) === "outdated";
+      lines.push(`| ${md(f.title)} \xB7 \`${mdCode(fileOf(f))}\` | ${md(why + alsoFailed(f, blamesPR ? PLAIN : SHARED_CAUSE))} | ${md(next)} |`);
+    }
+    lines.push("");
+  };
+  section(pr ? "Your PR" : "This commit", yours);
+  const streakOnly = outdated.length > 0 && outdated.every((f) => f.out_of_date?.streak);
+  section("Out of date", outdated, streakOnly ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}` : `Out of date (${outdated.length}): ${md(branch)} changed these tests after this PR last merged ${md(branch)}`);
+  section("Needs a look", check);
+  section(`Broken on ${md(branch)}`, broken);
+  section("Flaky", flaky);
+  const shown = [...yours, ...outdated, ...check, ...broken, ...flaky].slice(0, 30);
+  if (shown.length) {
+    lines.push("<details>", "<summary>Evidence for each test</summary>", "");
+    for (const f of shown) lines.push(`**${md(f.title)}** \xB7 \`${mdCode(fileOf(f))}\``, "", ...factsTable(f, branch, pr), "");
+    if (findings.length > shown.length) lines.push(`${findings.length - shown.length} more tests are not shown.`, "");
+    lines.push("</details>", "");
+  }
+  const spend = ledgerTotals(ai);
+  const sk = ai.skipped;
+  const skipped = [
+    sk.no_effect && `${sk.no_effect} with nothing the model could change`,
+    sk.duplicate && `${sk.duplicate} sharing another test's failure`,
+    sk.cached && `${sk.cached} answered before`,
+    sk.budget && `${sk.budget} over the ${ai.budgetLabel ?? "run budget"}`,
+    sk.cap && `${sk.cap} over the per-run limit`
+  ].filter(Boolean);
+  const used = spend.calls ? `${count(spend.calls, "call")} (${[...new Set(ai.calls.map((c) => shortModel(c.served_model)))].join(", ")}) \xB7 ${tokens(spend.input_tokens)} tokens in${spend.cached_tokens ? ` (${tokens(spend.cached_tokens)} cached)` : ""} \xB7 ${tokens(spend.output_tokens)} out \xB7 ${usd(spend.cost_usd)}` : "not used";
+  lines.push(`AI: ${used}${skipped.length ? ` \xB7 skipped: ${skipped.join(", ")}` : ""}`);
+  return lines.join("\n");
+}
+function renderUnfinished({ reason, lane = null }) {
+  const where = lane ? ` \xB7 ${md(lane)}` : "";
+  return [`## E2E triage${where}: \u26A0\uFE0F not triaged`, "", `**${md(`triage could not finish: ${reason}`)}** The E2E result stands.`, ""].join("\n");
+}
+function renderNotTriaged({ text, lane = null }) {
+  const where = lane ? ` \xB7 ${md(lane)}` : "";
+  return [`## E2E triage${where}: \u26A0\uFE0F not triaged`, "", `**${text}**`, ""].join("\n");
+}
+function supersededText(newerRunId, repository, lane) {
+  return `Not triaged: run [${md(newerRunId)}](https://github.com/${repository}/actions/runs/${newerRunId}) replaced this one for ${md(lane)}; see that run's triage.`;
+}
+function otherRunText(lane) {
+  return `Not triaged: another run of this commit replaced this one for ${md(lane)}.`;
+}
+function noResultsText(lane, commitSha) {
+  return `Not triaged: TSIO has no results for ${md(lane)} at ${sha7(commitSha)} (the tests may not have run).`;
+}
+var STATUS_LABELS = ["flaky", "broken on main", "caused by PR", "out of date", "needs investigation"];
+function statusLabelOf(f) {
+  if (f.blocking) {
+    if (f.out_of_date) return "out of date";
+    if (f.class === "OWNED_BY_PR" || f.judge?.cause === "caused_by_pr" && (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto")) return "caused by PR";
+    return "needs investigation";
+  }
+  if (f.class === "SAME_FAILURE_AS_CLEARED") return f.same_as_class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
+  if (f.decision === "adjudicator_unblock") return f.judge?.cause === "bug_on_master" ? "broken on main" : "flaky";
+  return f.class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
+}
+function statusLabels(findings, failed = findings.length) {
+  if (!findings.length) return failed ? ["re-run the failed jobs"] : [];
+  const counts = /* @__PURE__ */ new Map();
+  for (const f of findings) {
+    const label = statusLabelOf(f);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  return STATUS_LABELS.filter((l) => counts.has(l)).map((l) => `${counts.get(l)} ${l}`);
+}
+var STATUS_MAX = 140;
+var runFlag = (infra) => /infrastructure errors/.test(infra) ? "mostly environment errors, re-run" : "many failures in one run";
+function statusDescription(verdict, findings, infra, counts, missing = null) {
+  const pass = passLine(counts);
+  const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0).join(", ");
+  const rest = [infra && findings.length ? runFlag(infra) : "", missing?.short ?? ""].filter(Boolean).join("; ");
+  const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);
+  const shown = head.length <= room ? head : room > 1 ? `${head.slice(0, room - 1).trimEnd()}\u2026` : "";
+  const inner = [shown, rest].filter(Boolean).join("; ");
+  return inner ? `(${inner}) ${pass}` : pass;
+}
+
 // ../e2e-test-triage/src/triage.ts
 var import_node_fs3 = require("fs");
 
@@ -636,7 +907,8 @@ function redReason(description = "") {
   if (missing) parts.push(`${missing} report(s) missing, re-run`);
   else if (/results incomplete/.test(d)) parts.push("results incomplete, re-run");
   else if (/re-run the failed jobs/.test(d)) parts.push("re-run the failed jobs");
-  if (/investigation required/.test(d)) parts.push("many failures in one run");
+  if (/environment errors, re-run/.test(d)) parts.push("environment errors, re-run");
+  else if (/investigation required|many failures in one run/.test(d)) parts.push("many failures in one run");
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
   return parts.length ? parts.join(", ") : "still red";
 }
@@ -1884,276 +2156,6 @@ function writeFindings(facts, log) {
   }
 }
 
-// ../e2e-test-triage/src/render.ts
-var CODE_ESCAPES = { "|": "&#124;", "<": "&lt;", ">": "&gt;", "`": "&#96;" };
-var mdCode = (s) => String(s).replace(/[|<>`]/g, (c) => CODE_ESCAPES[c]).replace(/\r?\n/g, " ");
-var md = (s) => mdCode(
-  String(s).replace(/\\/g, "\\\\").replace(/[[\]*~]/g, (c) => `\\${c}`).replace(/&(?=#?\w+;)/g, "\\&").replace(/(?<![\p{L}\p{N}])_|_(?![\p{L}\p{N}])/gu, "\\_").replace(/^#/, "\\#")
-);
-var shortModel = (m) => String(m ?? "").replace(/^claude-/, "");
-var usd = (n) => n == null ? "?" : n === 0 ? "$0" : n < 0.01 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`;
-var tokens = (n) => n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n);
-var pct = (x) => `${Math.round(x * 100)}%`;
-var count = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
-var sha7 = (c) => String(c ?? "").slice(0, 7);
-var fileOf = (f) => String(f.file ?? "").split("/").pop();
-var LIKELY = { flaky_environment: "flaky or environment", bug_on_master: "already broken on the default branch", test_bug: "a test bug" };
-function bucketOf(f) {
-  const brokeOnBase = f.class === "BROKEN_ON_TRUNK" || f.same_as_class === "BROKEN_ON_TRUNK";
-  if (f.blocking) {
-    if (f.out_of_date && f.class !== "OWNED_BY_PR") return "outdated";
-    const yours = f.class === "OWNED_BY_PR" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame" || f.class === "REGRESSION" && f.untouched === false;
-    if (yours) return "yours";
-    return brokeOnBase ? "broken" : "check";
-  }
-  if (brokeOnBase) return "broken";
-  const cause = f.decision === "adjudicator_unblock" ? f.judge?.cause : null;
-  return cause === "bug_on_master" || cause === "test_bug" ? "broken" : "flaky";
-}
-function brokeByText(b) {
-  if (!b?.commits?.length) return null;
-  const name = (c) => c.pr ? `#${c.pr}` : sha7(c.sha);
-  if (b.total === 1) return `${name(b.commits[0])}${b.commits[0].author ? ` (@${b.commits[0].author})` : ""}`;
-  if (b.total <= 5) return `one of ${b.commits.map(name).join(", ")}`;
-  return `one of ${b.total} commits merged between ${sha7(b.from)} and ${sha7(b.to)}`;
-}
-var PERCENT = (n) => `${Math.round(n * 100)}%`;
-var failedElsewhere = (f) => (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform);
-var alsoFailed = (f, tail) => {
-  const other = f.other_lanes ?? [];
-  const failed = other.filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform);
-  const once = other.filter((o) => o.result === "flaky").map((o) => o.platform);
-  if (failed.length && once.length) return ` Also failed on ${failed.join(", ")}, and once on ${once.join(", ")} (passed on retry), in this run${tail}`;
-  if (once.length) return ` Also failed once on ${once.join(", ")} in this run (passed on retry)${tail}`;
-  if (failed.length) return ` Also failed on ${failed.join(", ")} in this run${tail}`;
-  return "";
-};
-var SHARED_CAUSE = ": likely environment or a shared cause.";
-var PLAIN = ".";
-function whyNext(f, branch, pr) {
-  const t = f.trunk ?? { runs: 0, passes: 0, fails: 0, flaky: 0 };
-  const a = f.judge;
-  const ai = a ? `AI, ${PERCENT(a.confidence)} sure` : "";
-  switch (bucketOf(f)) {
-    case "yours":
-      if (f.class === "OWNED_BY_PR") return [`This ${pr ? "PR" : "commit"} edits the test.`, "Check your change to the test."];
-      if (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto") return [`Points to this PR's change (${ai}).`, "Check the change named in the evidence."];
-      return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and this PR changes a file its error names.`, "Check your change to that file."];
-    case "outdated": {
-      if (f.out_of_date?.streak) return [`Failed the same way on this PR's last ${f.out_of_date.streak} commits and never on ${branch}: the branch is behind or broken.`, `Merge ${branch} and re-run.`];
-      const c = f.out_of_date?.commit;
-      const where = c ? ` (${c.pr ? `#${c.pr}` : sha7(c.sha)}${c.date ? `, ${c.date}` : ""})` : "";
-      return [`${branch} changed this test${where} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
-    }
-    case "check":
-      if (f.decision === "evidence_incomplete" || f.identity_unresolved) return ["Its history could not be checked.", "Read the error, or re-run if it isn't your change."];
-      if (a?.cause === "caused_by_pr") return [`Might be this PR's change (${ai}), but not sure enough to say.`, "Read the error before re-running."];
-      if (a) return [`Looks ${LIKELY[a.cause] ?? a.cause} (${ai}), but not sure enough to clear.`, "Read the error before re-running."];
-      if (f.class === "INFRA_ERROR") return ["Failed on its environment (see the error), which this change could also have caused.", "Re-run; if it fails the same way again, check your change."];
-      if (f.class === "INSUFFICIENT_DATA") return [`Too little history on ${branch} to tell (${count(t.runs, "run")}).`, "Read the error before re-running."];
-      return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), no other PR fails it this way, and this ${pr ? "PR" : "commit"} doesn't change it or a file its error names.`, "Read the error before re-running."];
-    case "broken": {
-      const by = brokeByText(f.broke_by);
-      const why = f.decision === "adjudicator_unblock" ? `Already broken on ${branch} (${ai}).` : `Fails on ${branch}'s latest run too${by ? `; broke in ${by}` : ""}.`;
-      return [why, pr ? by ? `Nothing for you. Fix belongs to ${by}.` : "Nothing for you." : by ? `Fix belongs to ${by}.` : `Fix on ${branch}.`];
-    }
-    default: {
-      const allFailed = Boolean(f.tries && f.tries.ran >= 2 && f.tries.failed === f.tries.ran);
-      const next = allFailed ? "Re-run once before digging." : pr ? "Nothing for you." : "Fix the flaky test.";
-      if (allFailed && f.class === "FLAKY_ON_TRUNK") return [`Failed every try here; flaky on ${branch}.`, next];
-      if (f.decision === "adjudicator_unblock") return [`Looks ${LIKELY[a?.cause ?? ""] ?? "flaky"} (${ai}).`, next];
-      if (f.class === "SAME_FAILURE_AS_CLEARED") return [`Same error as "${f.same_as}", cleared above.`, next];
-      if (f.class === "INFRA_ERROR") return ["Failed on its environment (see the error), not on this change.", allFailed ? next : pr ? "Nothing for you; re-run if the lane must be green." : "Re-run when the environment recovers."];
-      if (f.class === "FLAKY_CROSS_PR") return [`Failed the same way on ${count(f.cross_pr.prs.length, "other PR")} while ${branch} passes.`, next];
-      const how = [t.fails && `failed ${t.fails}`, t.flaky && `passed only on retry ${t.flaky}`].filter(Boolean).join(" and ");
-      return [`Flaky on ${branch}: ${how} of the last ${t.runs} runs.`, next];
-    }
-  }
-}
-function decidedBy(f) {
-  const model = shortModel(f.judge?.provenance?.served_model ?? f.ai?.model);
-  if (f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame") return `AI (${model})${f.escalated ? ", second opinion" : ""}`;
-  if (f.judge || f.ai?.model) return `Rules; AI asked${f.escalated ? ", second opinion" : ""}`;
-  return "Rules";
-}
-function factsTable(f, branch, pr) {
-  const t = f.trunk;
-  const rows = [];
-  const edits = f.class === "OWNED_BY_PR";
-  rows.push([`Does this ${pr ? "PR" : "commit"} change the test?`, edits ? "Yes" : "No"]);
-  if (!edits && f.untouched != null) rows.push(["Does this PR change a file its error names?", f.untouched ? "No" : "Yes"]);
-  if (t) rows.push(t.runs ? [`${branch}, last ${count(t.runs, "run")}`, `Passed ${t.passes}, failed ${t.fails}${t.flaky ? `, passed on retry ${t.flaky}` : ""}${t.latest ? `. Latest: ${t.latest}` : ""}`] : [`${branch}`, "No runs on record"]);
-  if (f.broke_by) {
-    const b = f.broke_by;
-    rows.push([`Merged on ${branch} between its last pass and first failure`, `${count(b.total, "commit")} (${sha7(b.from)}\u2026${sha7(b.to)})${b.commits.length ? `: ${b.commits.map((c) => `${c.pr ? `#${c.pr}` : sha7(c.sha)}${c.author ? ` @${c.author}` : ""}`).join(", ")}` : ""}`]);
-  }
-  if (f.cross_pr) {
-    const ex = f.cross_pr.examples.slice(0, 3).join(", ");
-    rows.push(["Other PRs", f.cross_pr.prs.length ? `Failed with the same error on ${count(f.cross_pr.prs.length, "PR")}${ex ? `: ${ex}` : ""}` : f.cross_pr.passes ? `Never failed the same way in ${count(f.cross_pr.passes, "run")}` : "No runs on record"]);
-  }
-  if (pr && f.this_pr?.runs) {
-    const lp = f.this_pr.last_pass;
-    rows.push(["This PR's earlier runs", `Passed ${f.this_pr.passes} of ${f.this_pr.runs}${lp ? `. Last pass: ${sha7(lp.commit_sha)}, ${String(lp.created_at ?? "").slice(0, 16).replace("T", " ")}` : ""}`]);
-    const since = f.since_last_pass;
-    if (since) {
-      const cut = since.complete === false;
-      const listed = cut ? `${count(since.files.length, "file")} listed; GitHub lists at most ${COMPARE_FILE_CAP}, so more may have changed` : `${count(since.files.length, "file")}${since.files.length <= 3 ? `: ${since.files.join(", ")}` : `, for example ${since.files.slice(0, 3).join(", ")}`}`;
-      rows.push(["Changed on this PR since that pass", since.files.length ? `${listed}. ${since.related.length ? `Named in the test's error: ${since.related.map((r) => r.file).join(", ")}` : cut ? "None named in the files listed, which does not clear it" : "None named in the test's error"}` : "Nothing (same commit)"]);
-    }
-  }
-  if (f.other_lanes?.length) rows.push(["Same test, same run, other platforms", f.other_lanes.map((o) => `${o.platform}: ${o.result}`).join(", ")]);
-  if (f.tries?.ran) rows.push(["Tries in this run", f.tries.ran === 1 ? "Failed its only try" : f.tries.failed === f.tries.ran ? `Failed all ${f.tries.ran}` : `Failed ${f.tries.failed} of ${f.tries.ran}`]);
-  if (f.producer) rows.push(["Recorded by the run", [f.producer.images.length && count(f.producer.images.length, "screenshot"), f.producer.notes && `notes: ${f.producer.notes.slice(0, 200)}`].filter(Boolean).join("; ")]);
-  if (f.same_as) rows.push(["Same failure as", f.same_as]);
-  if (f.out_of_date?.streak) {
-    rows.push([`Failed the same way on this PR's last ${count(f.out_of_date.streak, "commit")}`, `Never on ${branch}; its latest run passed`]);
-  } else if (f.out_of_date) {
-    const c = f.out_of_date.commit;
-    rows.push([`Changed on ${branch} since this PR last merged it`, `Yes${c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}` : ""}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
-  }
-  if (f.decision === "evidence_incomplete" || f.identity_unresolved) rows.push(["Why history wasn't used", f.reason]);
-  const a = f.judge;
-  if (a) {
-    const verdict = a.cause === "caused_by_pr" ? "Caused by this PR" : `Not caused by this PR (${LIKELY[a.cause] ?? a.cause})`;
-    const blames = a.cause === "caused_by_pr";
-    const sure = f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame" ? `${pct(a.confidence)} sure, enough to decide` : blames ? `${pct(a.confidence)} sure; naming the PR needs 85% and a change it can point to` : f.decision === "advice" ? `${pct(a.confidence)} sure, but with nothing it could point to, so it can't clear` : `${pct(a.confidence)} sure; clearing needs 85% and evidence`;
-    const model = shortModel(a.provenance?.served_model ?? f.ai?.model);
-    rows.push([model ? `AI (${model})` : "AI", `${verdict}, ${sure}. ${a.explanation}`]);
-  }
-  rows.push(["Decided by", decidedBy(f)]);
-  return ["| Question | Answer |", "| --- | --- |", ...rows.map(([q, v]) => `| ${md(q)} | ${md(v)} |`)];
-}
-function passRate(counts) {
-  const passed = counts.passed ?? 0;
-  const ran = passed + (counts.failed ?? 0);
-  if (!passed) return "0%";
-  if (!counts.failed) return "100%";
-  return `${Math.min(99.9, Math.round(passed / ran * 1e3) / 10).toFixed(1)}%`;
-}
-var passLine = (counts) => `${passRate(counts)} passed (${counts.passed ?? 0} passed, ${counts.failed} failed, ${counts.skipped ?? 0} skipped)`;
-var RED_OUTSIDE = "No test failed. The lane is red because a job outside the tests failed (setup, upload or runner), or results are missing: re-run the failed jobs.";
-function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null }) {
-  const branch = trunkBranch || "the default branch";
-  const where = lane ? ` \xB7 ${md(lane)}` : "";
-  const groups = { yours: [], outdated: [], check: [], broken: [], flaky: [] };
-  for (const f of findings) groups[bucketOf(f)].push(f);
-  const { yours, outdated, check, broken, flaky } = groups;
-  const blockingBroken = broken.filter((f) => f.blocking).length;
-  const unrelatedBroken = broken.length - blockingBroken;
-  const unrelated = unrelatedBroken + flaky.length;
-  const outdatedLead = findings.length > 0 && outdated.length * 2 >= findings.length;
-  const staleText = outdated.length ? `${outdated.length} out of date` : "";
-  const needText = check.length ? `${check.length} need${check.length === 1 ? "s" : ""} a look` : "";
-  const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? laneRed ? "\u{1F534} red outside the tests" : "\u2705 nothing failed" : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : unnamed ? "\u{1F534} re-run the failed jobs" : check.length || outdated.length ? `\u{1F7E1} ${[needText, staleText].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
-  const lines = [`## E2E triage${where}: ${head}`, ""];
-  const several = findings.filter((f) => failedElsewhere(f).length > 0).length;
-  if (several) lines.push(`${count(several, "test")} failed on several platforms in this run.`, "");
-  lines.push(mode === "enforce" ? "> Triage sets the E2E check: it passes only when every failure is cleared." : "> **Report only.** This is triage's advice; it doesn't change the E2E check.", "");
-  for (const n of notes) lines.push(`> ${md(n)}`, "");
-  let say = "";
-  const arrived = [reportsArrived, missing?.text].filter(Boolean).join("; ");
-  if (unnamed) {
-    say = `Re-run the failed jobs: ${arrived || `${count(unnamed, "failed result")} with no test name`}.`;
-  } else if (!counts.failed) {
-    say = missing ? `Re-run the failed jobs: ${arrived}.` : laneRed ? RED_OUTSIDE : "No test failed.";
-  } else if (findings.length) {
-    const kinds = [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
-    say = `${count(yours.length + outdated.length + check.length + blockingBroken + unrelated, "failure")}: ` + [
-      yours.length && `${yours.length} may be caused by this ${pr ? "PR" : "commit"}`,
-      outdated.length && `${outdated.length} out of date`,
-      check.length && `${check.length} need${check.length === 1 ? "s" : ""} a look`,
-      blockingBroken && `${blockingBroken} still failing on ${branch}`,
-      unrelated && `${unrelated} look${unrelated === 1 ? "s" : ""} unrelated (${kinds})`
-    ].filter(Boolean).join("; ") + ".";
-    if (outdatedLead) say = `Merge ${branch} and re-run first. ${say}`;
-  }
-  if (infra) say = `${infra} ${say}`;
-  if (missing && counts.failed && !unnamed) say += ` Results incomplete: ${missing.text}; re-run the failed jobs before relying on this.`;
-  lines.push(`**${md(say.trim())}** ${passLine(counts)} \xB7 [run](${runURL})`, "");
-  const section = (title, list, heading = `${title} (${list.length})`) => {
-    if (!list.length) return;
-    lines.push(`### ${heading}`, "", "| Test | Why | Next step |", "| --- | --- | --- |");
-    for (const f of list) {
-      const [why, next] = whyNext(f, branch, pr);
-      const blamesPR = bucketOf(f) === "yours" || bucketOf(f) === "outdated";
-      lines.push(`| ${md(f.title)} \xB7 \`${mdCode(fileOf(f))}\` | ${md(why + alsoFailed(f, blamesPR ? PLAIN : SHARED_CAUSE))} | ${md(next)} |`);
-    }
-    lines.push("");
-  };
-  section(pr ? "Your PR" : "This commit", yours);
-  const streakOnly = outdated.length > 0 && outdated.every((f) => f.out_of_date?.streak);
-  section("Out of date", outdated, streakOnly ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}` : `Out of date (${outdated.length}): ${md(branch)} changed these tests after this PR last merged ${md(branch)}`);
-  section("Needs a look", check);
-  section(`Broken on ${md(branch)}`, broken);
-  section("Flaky", flaky);
-  const shown = [...yours, ...outdated, ...check, ...broken, ...flaky].slice(0, 30);
-  if (shown.length) {
-    lines.push("<details>", "<summary>Evidence for each test</summary>", "");
-    for (const f of shown) lines.push(`**${md(f.title)}** \xB7 \`${mdCode(fileOf(f))}\``, "", ...factsTable(f, branch, pr), "");
-    if (findings.length > shown.length) lines.push(`${findings.length - shown.length} more tests are not shown.`, "");
-    lines.push("</details>", "");
-  }
-  const spend = ledgerTotals(ai);
-  const sk = ai.skipped;
-  const skipped = [
-    sk.no_effect && `${sk.no_effect} with nothing the model could change`,
-    sk.duplicate && `${sk.duplicate} sharing another test's failure`,
-    sk.cached && `${sk.cached} answered before`,
-    sk.budget && `${sk.budget} over the ${ai.budgetLabel ?? "run budget"}`,
-    sk.cap && `${sk.cap} over the per-run limit`
-  ].filter(Boolean);
-  const used = spend.calls ? `${count(spend.calls, "call")} (${[...new Set(ai.calls.map((c) => shortModel(c.served_model)))].join(", ")}) \xB7 ${tokens(spend.input_tokens)} tokens in${spend.cached_tokens ? ` (${tokens(spend.cached_tokens)} cached)` : ""} \xB7 ${tokens(spend.output_tokens)} out \xB7 ${usd(spend.cost_usd)}` : "not used";
-  lines.push(`AI: ${used}${skipped.length ? ` \xB7 skipped: ${skipped.join(", ")}` : ""}`);
-  return lines.join("\n");
-}
-function renderUnfinished({ reason, lane = null }) {
-  const where = lane ? ` \xB7 ${md(lane)}` : "";
-  return [`## E2E triage${where}: \u26A0\uFE0F not triaged`, "", `**${md(`triage could not finish: ${reason}`)}** The E2E result stands.`, ""].join("\n");
-}
-function renderNotTriaged({ text, lane = null }) {
-  const where = lane ? ` \xB7 ${md(lane)}` : "";
-  return [`## E2E triage${where}: \u26A0\uFE0F not triaged`, "", `**${text}**`, ""].join("\n");
-}
-function supersededText(newerRunId, repository, lane) {
-  return `Not triaged: run [${md(newerRunId)}](https://github.com/${repository}/actions/runs/${newerRunId}) replaced this one for ${md(lane)}; see that run's triage.`;
-}
-function otherRunText(lane) {
-  return `Not triaged: another run of this commit replaced this one for ${md(lane)}.`;
-}
-function noResultsText(lane, commitSha) {
-  return `Not triaged: TSIO has no results for ${md(lane)} at ${sha7(commitSha)} (the tests may not have run).`;
-}
-var STATUS_LABELS = ["flaky", "broken on main", "caused by PR", "out of date", "needs investigation"];
-function statusLabelOf(f) {
-  if (f.blocking) {
-    if (f.out_of_date) return "out of date";
-    if (f.class === "OWNED_BY_PR" || f.judge?.cause === "caused_by_pr" && (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto")) return "caused by PR";
-    return "needs investigation";
-  }
-  if (f.class === "SAME_FAILURE_AS_CLEARED") return f.same_as_class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
-  if (f.decision === "adjudicator_unblock") return f.judge?.cause === "bug_on_master" ? "broken on main" : "flaky";
-  return f.class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
-}
-function statusLabels(findings, failed = findings.length) {
-  if (!findings.length) return failed ? ["re-run the failed jobs"] : [];
-  const counts = /* @__PURE__ */ new Map();
-  for (const f of findings) {
-    const label = statusLabelOf(f);
-    counts.set(label, (counts.get(label) ?? 0) + 1);
-  }
-  return STATUS_LABELS.filter((l) => counts.has(l)).map((l) => `${counts.get(l)} ${l}`);
-}
-var STATUS_MAX = 140;
-function statusDescription(verdict, findings, infra, counts, missing = null) {
-  const pass = passLine(counts);
-  const head = infra && !findings.length ? "not triaged, investigation required" : statusLabels(findings, counts.failed ?? 0).join(", ");
-  const rest = [infra && findings.length ? "investigation required" : "", missing?.short ?? ""].filter(Boolean).join("; ");
-  const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);
-  const shown = head.length <= room ? head : room > 1 ? `${head.slice(0, room - 1).trimEnd()}\u2026` : "";
-  const inner = [shown, rest].filter(Boolean).join("; ");
-  return inner ? `(${inner}) ${pass}` : pass;
-}
-
 // ../e2e-test-triage/src/triage.ts
 var isPlainObject2 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var isPrSpend = (v) => isPlainObject2(v) && typeof v.pr === "number" && typeof v.usd === "number" && Number.isFinite(v.usd) && v.usd >= 0;
@@ -2417,7 +2419,7 @@ ai_output_tokens=${spend.output_tokens}
     }
     if (announce && lanes.length) await settleLaneSummary();
     else if (announce) {
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra && !result.findings.length ? `${run.counts.failed} failed \xB7 investigation required` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${result.infra ? " \xB7 investigation required" : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(result.infra)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${result.infra ? ` \xB7 ${runFlag(result.infra)}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
 `);
@@ -2899,7 +2901,7 @@ ${note}; nothing to watch.
       continue;
     }
     if (result.infra) {
-      notes.push(`${s.name}: infrastructure, not repaired (${result.infra})`);
+      notes.push(`${s.name}: ${runFlag(result.infra)}, not repaired (${result.infra})`);
       continue;
     }
     bySuite.push({ suite: s.name, findings: result.findings });

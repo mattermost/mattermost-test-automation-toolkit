@@ -11,14 +11,17 @@ fix only for what repeats:
 | Failed and then passed on retry in this run, and failed or flaked on trunk at least once before | fix (flaky) |
 | Failed for the first time in two or more lanes (suites) of the same run, e.g. enterprise and FIPS | fix (broken) |
 | Failed for the first time, in one lane | wait for the next run |
-| Run failed for environmental reasons | report only |
+| Half or more of the lane's failures are environment errors | report only: re-run |
+| 30 or more tests failed in the lane | report only: one shared cause is likely, so a person looks first |
 
 Broken specs whose break windows (last trunk pass to first trunk failure) overlap
 can't be told apart, so they go to one agent in one request; each flaky spec goes
 alone. A request carries the failing tests, their errors and trunk history, and the
 suspect commits: from the last commit where every failing test passed (or was
 skipped behind a flag) to the latest of their first failures. History is read only
-up to the run being watched, and only for the specs that will be sent.
+up to the run being watched, and only for the specs that will be sent. A break whose
+suspect commits overlap a request sent in the last `cause-hold-hours` (4) waits for
+that agent's PR instead of getting a second request.
 
 A spec is not requested within 24 hours of its last request, or while one of the
 agent's own PRs (its `label`) changes that exact file and was active in the last 3

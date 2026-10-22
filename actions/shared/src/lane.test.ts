@@ -17,7 +17,9 @@ test("the red reason reads the labels a status now carries", () => {
   assert.equal(redReason("(2 flaky, 2 caused by PR) 99.7% passed (1186 passed, 4 failed, 164 skipped)"), "2 cleared, 2 caused by PR");
   assert.equal(redReason("(1 broken on main, 4 needs investigation) 90.0% passed (9 passed, 5 failed, 0 skipped)"), "1 cleared, 4 to check");
   assert.equal(redReason("(1 out of date, 1 caused by PR) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, 1 out of date");
-  assert.equal(redReason("(3 flaky, 1 needs investigation; investigation required) 80.0% passed (4 passed, 1 failed, 0 skipped)"), "3 cleared, 1 to check, many failures in one run");
+  assert.equal(redReason("(3 flaky, 1 needs investigation; many failures in one run) 80.0% passed (4 passed, 1 failed, 0 skipped)"), "3 cleared, 1 to check, many failures in one run");
+  assert.equal(redReason("(17 flaky, 2 needs investigation; mostly environment errors, re-run) 96.9% passed (587 passed, 19 failed, 42 skipped)"), "17 cleared, 2 to check, environment errors, re-run");
+  assert.equal(redReason("(not triaged, mostly environment errors, re-run) 99.2% passed (240 passed, 2 failed, 3 skipped)"), "environment errors, re-run");
   assert.equal(redReason("(1 flaky; 2 report(s) missing) 0% passed (0 passed, 1 failed, 0 skipped)"), "1 cleared, 2 report(s) missing, re-run");
   assert.equal(redReason("(re-run the failed jobs; 1 report(s) missing) 0% passed (0 passed, 1 failed, 0 skipped)"), "1 report(s) missing, re-run");
   assert.equal(redReason("(re-run the failed jobs) 0% passed (0 passed, 1 failed, 0 skipped)"), "re-run the failed jobs");
@@ -27,6 +29,7 @@ test("the red reason still reads the wording a status written before the labels 
   assert.equal(redReason("(49 cleared by triage, 4 unresolved; investigation required) 91.3% passed (555 passed, 53 failed, 42 skipped)"), "49 cleared, 4 to check, many failures in one run");
   assert.equal(redReason("(0 cleared by triage; 1 report(s) missing) 100% passed (1 passed, 0 failed, 0 skipped)"), "1 report(s) missing, re-run");
   assert.equal(redReason("(not triaged, investigation required) 99.2% passed"), "many failures in one run");
+  assert.equal(redReason("(3 flaky, 1 needs investigation; investigation required) 80.0% passed (4 passed, 1 failed, 0 skipped)"), "3 cleared, 1 to check, many failures in one run");
   assert.equal(redReason("10 passed, 2 failed (not triaged: triage could not finish)"), "triage could not finish");
   assert.equal(redReason("(0 flaky) 100% passed (9 passed, 0 failed, 0 skipped)"), "still red", "nothing named is nothing to explain");
   assert.equal(redReason(undefined), "still red");

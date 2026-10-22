@@ -7,6 +7,7 @@ import type { Finding } from "../../e2e-test-triage/src/types.ts";
 import type { EvaluatedRun } from "../../e2e-test-triage/src/evaluate.ts";
 import { laneOf } from "../../e2e-test-triage/src/config.ts";
 import { fetchHistory } from "../../e2e-test-triage/src/history.ts";
+import { runFlag } from "../../e2e-test-triage/src/render.ts";
 import { triage } from "../../e2e-test-triage/src/triage.ts";
 import { gh } from "../../shared/src/github.ts";
 import type { Env, FetchImpl } from "../../shared/src/github.ts";
@@ -207,7 +208,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
       continue;
     }
     if (result.infra) {
-      notes.push(`${s.name}: infrastructure, not repaired (${result.infra})`);
+      notes.push(`${s.name}: ${runFlag(result.infra)}, not repaired (${result.infra})`);
       continue;
     }
     bySuite.push({ suite: s.name, findings: result.findings });
