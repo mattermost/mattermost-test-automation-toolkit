@@ -155,6 +155,12 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
 
 // ../shared/src/tsio.ts
 var FAILED_STATUSES = /* @__PURE__ */ new Set(["failed", "timedOut", "interrupted"]);
+var elsewhereKey = (file, title) => JSON.stringify([String(file ?? "").replace(/\\/g, "/"), String(title ?? "").replace(/\\/g, "/")]);
+async function tsioJson(fetchImpl, base, path) {
+  const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(6e4) });
+  if (!res.ok) throw new Error(`TSIO GET ${path}: ${res.status}`);
+  return await res.json();
+}
 var DEFAULT_TSIO_BASE_URL = "https://test-io.test.mattermost.com";
 var STAGING_TSIO_BASE_URL = "https://staging-test-io.test.mattermost.com";
 var withoutTrailingSlash = (url) => url.replace(/\/$/, "");
@@ -192,14 +198,31 @@ function compositeIdentityFrom(raw) {
     throw new Error(`COMPOSITE_IDENTITY is not valid JSON: ${String(e).slice(0, 120)}`);
   }
 }
+var newerRun = (a, b) => {
+  const run = BigInt(a.gh_run_id) - BigInt(b.gh_run_id);
+  return run !== BigInt(0) ? run > BigInt(0) : BigInt(a.gh_run_attempt) > BigInt(b.gh_run_attempt);
+};
+var SupersededRunError = class extends Error {
+  replacement;
+  constructor(message, replacement) {
+    super(message);
+    this.name = "SupersededRunError";
+    this.replacement = replacement;
+  }
+};
+var NoResultsError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "NoResultsError";
+  }
+};
 async function fetchRun(fetchImpl, base, id, reportName = null, wait = { attempts: 6, ms: 2e4 }) {
-  const get = async (path) => {
-    const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(6e4) });
-    if (!res.ok) throw new Error(`TSIO GET ${path}: ${res.status}`);
-    return await res.json();
-  };
   const q = new URLSearchParams({ repository: id.repository, commit: id.commit_sha, name: String(id.name), limit: "20" });
-  const { reports: groups = [] } = await get(`/reports?${q}`);
+  const { reports: groups = [] } = await tsioJson(fetchImpl, base, `/reports?${q}`);
+  return runFromGroups(fetchImpl, base, id, groups, reportName, wait);
+}
+async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wait = { attempts: 6, ms: 2e4 }) {
+  const get = (path) => tsioJson(fetchImpl, base, path);
   const runId = String(id.gh_run_id ?? "");
   const attempt = String(id.gh_run_attempt ?? "");
   if (!runId || !attempt)
@@ -207,8 +230,18 @@ async function fetchRun(fetchImpl, base, id, reportName = null, wait = { attempt
   const group = groups.find(
     (g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name && String(g.gh_run_id) === runId && String(g.gh_run_attempt) === attempt
   );
-  if (!group)
-    throw new Error(`TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`);
+  if (!group) {
+    const noGroup = `TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`;
+    const newest = /^\d+$/.test(runId) && /^\d+$/.test(attempt) ? groups.filter((g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name).map((g) => ({
+      gh_run_id: String(g.gh_run_id),
+      gh_run_attempt: String(g.gh_run_attempt),
+      gh_pr_number: g.gh_pr_number === void 0 ? void 0 : g.gh_pr_number === null || String(g.gh_pr_number) === "" ? null : String(g.gh_pr_number),
+      branch: g.branch === void 0 ? void 0 : g.branch
+    })).filter((r) => /^\d+$/.test(r.gh_run_id) && /^\d+$/.test(r.gh_run_attempt) && newerRun(r, { gh_run_id: runId, gh_run_attempt: attempt })).reduce((best, r) => !best || newerRun(r, best) ? r : best, null) : null;
+    if (newest)
+      throw new SupersededRunError(`${noGroup}; its group now belongs to run ${newest.gh_run_id} attempt ${newest.gh_run_attempt}`, newest);
+    throw new NoResultsError(noGroup);
+  }
   let missing = null;
   if (group.status !== "completed") {
     let detail = group;
@@ -229,6 +262,21 @@ async function fetchRun(fetchImpl, base, id, reportName = null, wait = { attempt
   const fileOf = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
   const reportOf = new Map(suites.map((s) => [s.id, s.report_name ?? null]));
   const suiteTitleOf = new Map(suites.map((s) => [s.id, s.title ?? ""]));
+  const perReport = /* @__PURE__ */ new Map();
+  for (const c of cases) {
+    const report = reportOf.get(c.suite_id) ?? "";
+    const identity = elsewhereKey(fileOf.get(c.suite_id) ?? "", c.full_title || c.title);
+    const key = JSON.stringify([report, identity]);
+    if (!perReport.has(key)) perReport.set(key, { report, identity, attempts: [] });
+    perReport.get(key).attempts.push(c);
+  }
+  const elsewhere = /* @__PURE__ */ new Map();
+  for (const { report, identity, attempts } of perReport.values()) {
+    attempts.sort((a, b) => a.retry_count - b.retry_count || a.ordinal - b.ordinal);
+    const { status } = outcomeWithDuplicates(attempts, (a) => reportOf.get(a.suite_id) ?? null);
+    if (!elsewhere.has(identity)) elsewhere.set(identity, []);
+    elsewhere.get(identity).push({ report, status });
+  }
   const scoped = reportName ? new Set(suites.filter((s) => String(s.report_name ?? "").startsWith(reportName)).map((s) => s.id)) : null;
   if (scoped && scoped.size === 0)
     throw new Error(`no report in group ${group.id} has a name starting with "${reportName}" (of ${new Set(suites.map((s) => s.report_name)).size} report name(s) present)`);
@@ -284,7 +332,7 @@ async function fetchRun(fetchImpl, base, id, reportName = null, wait = { attempt
     } else if (status === "skipped") skipped++;
     else if (status === "flaky") flaky++;
   }
-  return { group_id: group.id, failing, missing, outcomes, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
+  return { group_id: group.id, failing, missing, outcomes, elsewhere, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
 }
 
 // src/publish.ts

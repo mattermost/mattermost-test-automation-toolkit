@@ -5,6 +5,7 @@ import { identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
 import { BORDERLINE, classify, errorSignature, infraVerdict, sameFailure } from "./classify.ts";
 import { DEFAULTS, historyLane, repoPath } from "./config.ts";
+import { sameTestOnOtherReports } from "./enrich.ts";
 import { evidenceFor } from "./evidence.ts";
 import { buildPack, namesChangedFile } from "./pack.ts";
 import type { OtherFailure } from "./pack.ts";
@@ -39,6 +40,8 @@ export interface EvaluateParams {
   log?: (message: string) => void;
   evidence?: Evidence[];
   enrich?: ((findings: Finding[]) => Promise<void>) | null;
+  /** The same test on the run's sibling groups (see siblingPlatforms). Asked of every failing run, model or not. */
+  otherPlatforms?: ((findings: Finding[]) => Promise<void>) | null;
   outOfDate?: ((findings: Finding[]) => Promise<{ truncated: boolean }>) | null;
   brokeBy?: ((findings: Finding[]) => Promise<void>) | null;
 }
@@ -64,6 +67,7 @@ export async function evaluateRun({
   log = () => {},
   evidence = [],
   enrich = null,
+  otherPlatforms = null,
   outOfDate = null,
   brokeBy = null,
 }: EvaluateParams): Promise<EvaluatedRun> {
@@ -103,6 +107,17 @@ export async function evaluateRun({
       result.ownershipUnknown = !diff.ok;
       for (const f of result.findings)
         if (f.class !== "OWNED_BY_PR") Object.assign(f, { blocking: true, decision: "evidence_incomplete", reason: `${f.reason} ${blind}, so this could not be confirmed.` });
+    }
+    // The same test on the run's other platforms: this run's own reports (no call), then its sibling groups. Evidence
+    // only: the summary and the pack read it, and no class or blocking depends on it.
+    sameTestOnOtherReports(result.findings, run);
+    // Not on an infrastructure storm: the run is red for its environment, and sibling reads would only add calls.
+    if (otherPlatforms && !result.infra) {
+      try {
+        await otherPlatforms(result.findings);
+      } catch (e) {
+        log(`other platforms unavailable: ${String(e).slice(0, 200)}`);
+      }
     }
     // A failure in a test the base branch changed after this PR last merged it ran
     // the PR's old copy: it stays red, with "merge <base>" as the next step, and

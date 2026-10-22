@@ -61,6 +61,14 @@ export const laneOf = (name: string | null | undefined): string =>
     .replace(/^(mobile|desktop)-(pr|main|master)(-|$)/, "")
     .replace(/-(master|main|release(-cut)?)$/, "") || "default";
 
+// The OS a desktop report stands for, by the name it is uploaded under (the release version after it is ignored).
+const OS_OF_REPORT: [RegExp, string][] = [[/ubuntu/, "linux"], [/windows/, "windows"], [/macos/, "macos"]];
+/** The platform a report name stands for: "e2e-on-ubuntu-latest-1.0" is linux. Any other name keeps its name, without the e2e prefix. */
+export const laneOfReport = (name: string): string => {
+  const rest = String(name).replace(/^e2e-on-/, "");
+  return OS_OF_REPORT.find(([re]) => re.test(rest))?.[1] ?? rest;
+};
+
 /**
  * TSIO's spec path relative to the repository, so it can be compared with the
  * PR's changed files. `testRoot` is "." when TSIO's paths are already

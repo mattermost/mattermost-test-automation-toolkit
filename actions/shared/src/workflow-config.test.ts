@@ -23,14 +23,14 @@ rules:
 test("YAML is linted with yamllint and the monorepo's rules, not a downloaded script piped into bash", () => {
   const ci = read(".github/workflows/ci.yml");
   assert.doesNotMatch(ci, /actionlint|\|\s*bash/, "no script is fetched and run");
-  assert.match(ci, /yamllint==1\.38\.0/, "yamllint is pinned to an exact version");
-  assert.match(ci, /yamllint \.github\/workflows\/ actions\//, "the workflows and the actions are linted");
+  assert.doesNotMatch(ci, /pip install|setup-python/, "the runner image's yamllint is used, nothing is installed");
+  assert.match(ci, /runs-on: ubuntu-24\.04[\s\S]*run: yamllint \.github\/workflows\/ actions\//, "the workflows and the actions are linted");
   assert.equal(read(".yamllint"), MONOREPO_YAMLLINT);
 });
 
 test("every action the CI workflow uses is pinned to a full commit SHA", () => {
   const uses = [...read(".github/workflows/ci.yml").matchAll(/uses:\s*(\S+)/g)].map((m) => m[1]);
-  assert.equal(uses.length, 4, "checkout (twice), setup-node and setup-python");
+  assert.equal(uses.length, 3, "checkout (twice) and setup-node");
   for (const ref of uses) assert.match(ref, /@[0-9a-f]{40}$/, ref);
 });
 

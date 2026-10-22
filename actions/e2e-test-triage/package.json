@@ -1,5 +1,5 @@
 {
-  "name": "e2e-triage",
+  "name": "e2e-test-triage",
   "private": true,
   "version": "0.1.0",
   "main": "dist/index.js",

@@ -7,22 +7,24 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { canChange, decide, judge } from "./decision.ts";
 import { EXONERATED_ON_TRUNK, classify, errorSignature, infraVerdict, isInfraError, sameFailure } from "./classify.ts";
-import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, repoPath } from "./config.ts";
+import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, laneOfReport, repoPath } from "./config.ts";
 import { answerKey, askModelBatch, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
 import { fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate } from "./history.ts";
-import { codeExcerpt, enrichFindings, failingLine } from "./enrich.ts";
+import { codeExcerpt, enrichFindings, failingLine, sameTestOnOtherReports, siblingPlatforms } from "./enrich.ts";
 import { evidenceFor, loadEvidence } from "./evidence.ts";
 import { buildPack, compactError, evidenceIds, namesChangedFile } from "./pack.ts";
 import type { OtherFailure } from "./pack.ts";
 import { PRICES, costOf, newLedger, priceFor } from "./pricing.ts";
 import { bucketOf, passRate, renderSummary, statusDescription } from "./render.ts";
 import type { SummaryInput } from "./render.ts";
-import { verdictOf } from "./evaluate.ts";
-import { triage } from "./triage.ts";
+import { evaluateRun, verdictOf } from "./evaluate.ts";
+import { NotTriagedError, triage } from "./triage.ts";
+import { FINDINGS_SCHEMA, checkFindingsShape, redact } from "./findings.ts";
 import type { CommitStatus, Env, FetchImpl } from "../../shared/src/github.ts";
 import { laneSummary } from "../../shared/src/lane.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
-import { fetchRun, identityKey, missingReports } from "../../shared/src/tsio.ts";
+import { elsewhereKey, fetchRun, identityKey, missingReports } from "../../shared/src/tsio.ts";
+import type { RunResult } from "../../shared/src/tsio.ts";
 import type { Answer, BatchResult, CallRecord, Config, Evidence, Finding, Ledger, Observation, Pack, PrRef, SinceLastPass, TestRef, Usage } from "./types.ts";
 
 
@@ -710,6 +712,7 @@ test("a lane with nothing failed keeps its own status and writes no summary", as
   // mattermost-mobile#10172: green lanes were rewritten as "0 failed (0 cleared by
   // triage)", and a lane red outside its tests would have been turned green. Their
   // "nothing failed" summaries also filled the run page with boxes to scroll past.
+  // The lane's own status is green here: a red one with nothing failed has its own summary (see below).
   const statuses: StatusBody[] = [];
   const dir = mkdtempSync(join(tmpdir(), "triage-green-"));
   const summaryFile = join(dir, "s.md");
@@ -717,6 +720,7 @@ test("a lane with nothing failed keeps its own status and writes no summary", as
     env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryFile },
     fetchImpl: fakeFetch([
       ...runRoutes([spec("t1", "passed"), spec("t2", "passed")]),
+      ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/playwright", state: "success", target_url: "https://github.com/o/r/actions/runs/12" }])],
       ["/reports/history", () => Response.json({ observations: [] })],
       ["/pulls/5/files", () => Response.json([])],
       ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
@@ -1961,7 +1965,7 @@ test("a change list cut off at GitHub's 300-file limit is incomplete, so a pass 
     if (path.startsWith("/repos/o/r/compare/lastpass...head")) return { files: cut };
     throw new Error(`unexpected ${path}`);
   };
-  await enrichFindings({ findings: [f], api, fetchImpl: async () => { throw new Error("down"); }, base: "http://tsio", id: { repository: "o/r", commit_sha: "head", gh_run_id: "9", gh_run_attempt: "1", name: "pw" }, testRoot: ".", log: () => {} });
+  await enrichFindings({ findings: [f], api, id: { repository: "o/r", commit_sha: "head", gh_run_id: "9", gh_run_attempt: "1", name: "pw" }, testRoot: ".", log: () => {} });
   assert.equal(f.since_last_pass?.complete, false);
   const pack = buildPack(f, [], prCtx, []);
   assert.equal(evidenceIds(pack).includes("this_pr"), false, "the file that changed may be one the list cut off");
@@ -1992,8 +1996,8 @@ test("extra evidence: changes since the last pass, the code at the failure, othe
     const u = String(url);
     if (u.includes("/reports?") && !u.includes("name=")) return Response.json({ reports: [
       { id: "g-self", name: "pw", gh_run_id: "9", gh_run_attempt: "1" },
-      { id: "g-ios", name: "mobile-pr-detox-ios", gh_run_id: "9", gh_run_attempt: "1" },
-      { id: "g-old", name: "mobile-pr-detox-ios", gh_run_id: "8", gh_run_attempt: "1" },
+      { id: "g-ios", repository: "o/r", commit: "head", name: "mobile-pr-detox-ios", gh_run_id: "9", gh_run_attempt: "1", status: "completed" },
+      { id: "g-old", repository: "o/r", commit: "head", name: "mobile-pr-detox-ios", gh_run_id: "8", gh_run_attempt: "1", status: "completed" },
     ] });
     if (u.includes("name=mobile-pr-detox-ios")) return Response.json({ reports: [{ id: "g-ios", name: "mobile-pr-detox-ios", repository: "o/r", commit: "head", gh_run_id: "9", gh_run_attempt: "1", status: "completed", total_reports_expected: 1, reports: [{}] }] });
     if (u.includes("/reports/g-ios/suites")) return Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] });
@@ -2001,7 +2005,8 @@ test("extra evidence: changes since the last pass, the code at the failure, othe
     throw new Error(`unexpected ${u}`);
   };
   const logs: string[] = [];
-  await enrichFindings({ findings: [f], api, fetchImpl: tsio, base: "http://tsio", id: { repository: "o/r", commit_sha: "head", gh_run_id: "9", gh_run_attempt: "1", name: "pw" }, testRoot: ".", log: (m) => logs.push(m) });
+  await enrichFindings({ findings: [f], api, id: { repository: "o/r", commit_sha: "head", gh_run_id: "9", gh_run_attempt: "1", name: "pw" }, testRoot: ".", log: (m) => logs.push(m) });
+  await siblingPlatforms({ findings: [f], fetchImpl: tsio, base: "http://tsio", id: { repository: "o/r", commit_sha: "head", gh_run_id: "9", gh_run_attempt: "1", name: "pw" }, log: (m) => logs.push(m) });
   assert.deepEqual(f.since_last_pass?.files, [".github/ci.yml", "specs/a.spec.ts"]);
   assert.deepEqual(f.since_last_pass?.related.map((r) => r.file), ["specs/a.spec.ts"], "the spec itself changed since the pass");
   assert.equal(f.since_last_pass?.changes?.length, 2, "a small change set goes to the judge whole");
@@ -2012,10 +2017,10 @@ test("extra evidence: changes since the last pass, the code at the failure, othe
 
   // Every lookup can fail without failing triage: the fact is left out.
   const g: Finding = { ...classify(failing, [...trunkPasses(8), mine("passed", "lastpass", "2026-09-11T00:00:00Z")], [], undefined, 1) };
-  await enrichFindings({ findings: [g], api: async () => { throw new Error("down"); }, fetchImpl: async () => { throw new Error("down"); }, base: "http://tsio", id: { repository: "o/r", commit_sha: "head", gh_run_id: "9", gh_run_attempt: "1", name: "pw" }, testRoot: ".", log: (m) => logs.push(m) });
+  await enrichFindings({ findings: [g], api: async () => { throw new Error("down"); }, id: { repository: "o/r", commit_sha: "head", gh_run_id: "9", gh_run_attempt: "1", name: "pw" }, testRoot: ".", log: (m) => logs.push(m) });
   assert.equal(g.since_last_pass, undefined);
-  assert.equal(g.other_lanes, undefined);
-  assert.equal(logs.length, 2);
+  assert.equal(g.other_lanes, undefined, "other platforms are read by their own function, not by this one");
+  assert.equal(logs.length, 1, "the failed compare is logged; the sibling read is not part of this function");
 });
 
 test("the summary shows the facts behind each verdict and who decided", () => {
@@ -2749,4 +2754,383 @@ test("a stuck match needs the whole message to agree: a different wait in second
   assert.notEqual(f.class, "FLAKY_CROSS_PR", "three PRs that waited 5.0sec did not fail the same way");
   const same = classify(judgedTest(det), [...trunkPasses(8), ...failedOn([31, 32, 33], det)], []);
   assert.equal(same.class, "FLAKY_CROSS_PR", "the same wait is the same failure");
+});
+
+// ---- outcomes: a run triage does not judge says why; a red lane with no failed test says what to re-run ----
+const statusSink = (statuses: StatusBody[]): Route => ["/statuses/abc", (i) => { statuses.push(parsed<StatusBody>(bodyText(i))); return Response.json({}); }];
+test("a run a newer dispatch replaced is not triaged: the summary names that run, no status is written, and it is not a failure", async () => {
+  for (const mode of ["enforce", "report-only"]) {
+    await inTmp(async (dir) => {
+      const statuses: StatusBody[] = [];
+      const summaryPath = join(dir, "s.md");
+      const findingsPath = join(dir, "findings.json");
+      // This group is run 13's: a newer dispatch of the same commit and suite than the run triage was given (12).
+      const fetchImpl = fakeFetch([
+        ["/reports?", () => Response.json({ reports: [{ id: "g9", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "13", gh_run_attempt: "1", status: "completed", gh_pr_number: "5", branch: "pr-5" }] })],
+        statusSink(statuses),
+      ]);
+      await assert.rejects(() => triage({ env: { ...env, MODE: mode, GITHUB_STEP_SUMMARY: summaryPath, FINDINGS_FILE: findingsPath }, fetchImpl, log: () => {} }), NotTriagedError);
+      const summary = readFileSync(summaryPath, "utf8");
+      assert.match(summary, /^## E2E triage · playwright-full: ⚠️ not triaged$/m, mode);
+      assert.match(summary, /^\*\*Not triaged: run \[13\]\(https:\/\/github\.com\/o\/r\/actions\/runs\/13\) replaced this one for playwright-full; see that run's triage\.\*\*$/m, mode);
+      assert.deepEqual(statuses, [], `${mode}: the newer run owns the lane's status`);
+      const record = parsed<Record<string, unknown>>(readFileSync(findingsPath, "utf8"));
+      assert.deepEqual(checkFindingsShape(record), [], mode);
+      assert.equal(record.triaged, false, mode);
+      assert.match(String(record.not_triaged_reason), /^superseded: run 13 /, mode);
+    });
+  }
+});
+
+test("a run TSIO has no results for is not triaged: the summary says the tests may not have run, and the red status keeps its state with a note", async () => {
+  for (const mode of ["enforce", "report-only"]) {
+    await inTmp(async (dir) => {
+      const statuses: StatusBody[] = [];
+      const summaryPath = join(dir, "s.md");
+      const findingsPath = join(dir, "findings.json");
+      const fetchImpl = fakeFetch([["/reports?", () => Response.json({ reports: [] })], statusSink(statuses)]);
+      // The default status is failure from run 12, this run: the note goes on it and the state stays.
+      await assert.rejects(() => triage({ env: { ...env, MODE: mode, GITHUB_STEP_SUMMARY: summaryPath, FINDINGS_FILE: findingsPath }, fetchImpl, log: () => {} }), /no group for/, mode);
+      assert.match(readFileSync(summaryPath, "utf8"), /^\*\*Not triaged: TSIO has no results for playwright-full at abc \(the tests may not have run\)\.\*\*$/m, mode);
+      assert.deepEqual(statuses.map((s) => [s.context, s.state, s.description]), [["e2e-test/playwright", "failure", "(not triaged: no results)"]], mode);
+      const record = parsed<Record<string, unknown>>(readFileSync(findingsPath, "utf8"));
+      assert.equal(record.triaged, false, mode);
+      assert.match(String(record.not_triaged_reason), /^no_results: /, mode);
+    });
+  }
+});
+
+test("a lane red with no failed test says a job outside the tests failed, and writes no status", async () => {
+  await inTmp(async (dir) => {
+    const statuses: StatusBody[] = [];
+    const summaryPath = join(dir, "s.md");
+    // Every test passed, and the lane's own status is red (the fake's default, from this run).
+    await triage({
+      env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath },
+      fetchImpl: fakeFetch([...runRoutes([spec("t1", "passed")]), statusSink(statuses)]),
+      log: () => {},
+    });
+    const summary = readFileSync(summaryPath, "utf8");
+    assert.match(summary, /^## E2E triage · playwright-full: 🔴 red outside the tests$/m);
+    assert.match(summary, /^\*\*No test failed\. The lane is red because a job outside the tests failed \(setup, upload or runner\), or results are missing: re-run the failed jobs\.\*\*/m);
+    assert.deepEqual(statuses, [], "a verdict for a red lane that no test failed in would be a guess: nothing is written");
+  });
+});
+
+test("a red lane whose reports never all arrived says how many did, and keeps the missing-reports status", async () => {
+  await inTmp(async (dir) => {
+    const statuses: StatusBody[] = [];
+    const summaryPath = join(dir, "s.md");
+    const routes: Route[] = [
+      ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "in_progress", total_reports_expected: 2 }], total: 1 })],
+      ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+      ["/reports/g1/cases", () => Response.json(spec("t1", "passed"))],
+      ["/reports/g1", () => Response.json({ id: "g1", status: "in_progress", total_reports_expected: 2, reports: [{}] })],
+      statusSink(statuses),
+    ];
+    await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl: fakeFetch(routes), log: () => {}, wait: { attempts: 1, ms: 0 } });
+    assert.match(readFileSync(summaryPath, "utf8"), /^\*\*No test failed\. The lane is red because a job outside the tests failed \(setup, upload or runner\), or results are missing: re-run the failed jobs\. 1 of 2 reports arrived; 1 of 2 reports never uploaded, so the specs on those workers never ran\.\*\*/m);
+    assert.deepEqual(statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => [s.state, s.description]), [["failure", "(0 cleared by triage; 1 report(s) missing) 100% passed (1 passed, 0 failed, 0 skipped)"]]);
+  });
+});
+
+test("a test that also failed on other platforms in this run says so in its why, and adds one headline line", () => {
+  const onOthers = finding({ title: "t1", file: "specs/a.spec.ts", other_lanes: [{ platform: "android", result: "failed" }, { platform: "ios", result: "timedOut" }] });
+  const text = renderSummary({ findings: [onOthers], infra: null, runURL: "u", counts: { failed: 1, passed: 9 }, trunkBranch: "master" });
+  assert.match(text, /^## E2E triage: ✅ none caused by this PR$/m, "the bucket and the headline do not change");
+  assert.match(text, /^1 test failed on several platforms in this run\.$/m);
+  assert.match(text, /Also failed on android, ios in this run: likely environment or a shared cause\./);
+  // Passed elsewhere: no line and no why. (A failed try that a retry recovered does count: see the Windows test.)
+  const passedOn = finding({ title: "t1", file: "specs/a.spec.ts", other_lanes: [{ platform: "android", result: "passed" }, { platform: "ios", result: "passed" }] });
+  const quiet = renderSummary({ findings: [passedOn], infra: null, runURL: "u", counts: { failed: 1, passed: 9 }, trunkBranch: "master" });
+  assert.doesNotMatch(quiet, /several platforms|Also failed/);
+});
+
+test("the findings file is written for a judged run, with one shape and the failing tests in it", async () => {
+  await inTmp(async (dir) => {
+    const findingsPath = join(dir, "findings.json");
+    // Master fails the test too, so the rules clear it: no model, no token.
+    const statuses: StatusBody[] = [];
+    const fetchImpl = fakeFetch([...runRoutes([spec("t1", "failed")]), ["/reports/history", () => Response.json({ observations: trunkFailsAll(8) })], ["/pulls/5/files", () => Response.json([])], ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })], statusSink(statuses)]);
+    await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", FINDINGS_FILE: findingsPath }, fetchImpl, log: () => {} });
+    const record = parsed<Record<string, unknown>>(readFileSync(findingsPath, "utf8"));
+    assert.deepEqual(checkFindingsShape(record), []);
+    assert.equal(record.schema, 1);
+    assert.deepEqual([record.triaged, record.not_triaged_reason, record.verdict, record.mode], [true, null, "SUCCESS", "enforce"]);
+    assert.deepEqual([record.repository, record.commit_sha, record.pr, record.lane, record.status_context, record.run_id, record.run_attempt], ["o/r", "abc", 5, "playwright-full", "e2e-test/playwright", "12", "1"]);
+    assert.deepEqual(record.counts, { total: 1, passed: 0, failed: 1, flaky: 0, skipped: 0 });
+    assert.deepEqual(record.ai, { calls: 0, cost_usd: 0, model: null }, "no call, no cost, no model");
+    const [row] = parsed<{ findings: Record<string, unknown>[] }>(readFileSync(findingsPath, "utf8")).findings;
+    assert.deepEqual([row.title, row.file, row.class, row.blocking, row.error_first_line, row.tries, row.other_lanes_failed], ["t1", "specs/a.spec.ts", "BROKEN_ON_TRUNK", false, "Error: expected visible", { ran: 1, failed: 1 }, []]);
+  });
+});
+
+test("a run that breaks off writes a findings file that says why, with no token in it", async () => {
+  await inTmp(async (dir) => {
+    const findingsPath = join(dir, "findings.json");
+    const token = `ghp_${"x".repeat(36)}`;
+    const fetchImpl = fakeFetch([...runRoutes([spec("t1", "failed")]), ["/reports/history", () => { throw new Error(`history down, token ${token}`); }]]);
+    await assert.rejects(() => triage({ env: { ...env, MODE: "report-only", FINDINGS_FILE: findingsPath }, fetchImpl, log: () => {} }), /history down/);
+    const text = readFileSync(findingsPath, "utf8");
+    assert.equal(text.includes(token), false, "the token is never written");
+    const record = parsed<Record<string, unknown>>(text);
+    assert.deepEqual(checkFindingsShape(record), []);
+    assert.deepEqual([record.triaged, String(record.not_triaged_reason).startsWith("error: history down, token [redacted]")], [false, true]);
+  });
+});
+
+test("the findings file has one shape, and the shape check names what drifts from it", () => {
+  assert.equal(FINDINGS_SCHEMA, 1);
+  const good = { schema: 1, repository: "o/r", commit_sha: "abc", pr: null, lane: null, status_context: null, run_id: null, run_attempt: null, mode: "report-only", verdict: null, counts: null, ai: { calls: 0, cost_usd: null, model: null }, triaged: false, not_triaged_reason: "error: x", findings: [] };
+  assert.deepEqual(checkFindingsShape(good), []);
+  assert.ok(checkFindingsShape({ ...good, schema: 2 }).length > 0, "a different schema is named");
+  assert.ok(checkFindingsShape({ ...good, triaged: true, not_triaged_reason: null }).length > 0, "a triaged run has its verdict");
+  assert.ok(checkFindingsShape({ ...good, extra: 1 }).length > 0, "no field outside the schema");
+  assert.ok(checkFindingsShape({ ...good, findings: [{ title: "t", error_first_line: "a\nb" }] }).length > 0, "one line of error, never a stack");
+});
+
+test("tokens are redacted from the findings file: GitHub and Anthropic tokens, and the action's own secrets", () => {
+  assert.equal(redact("x ghp_abcdefghijklmnopqrstuvwxyz0123456789 y", []), "x [redacted] y");
+  assert.equal(redact("key sk-ant-api03-abcdefghijklmnop", []), "key [redacted]");
+  assert.equal(redact("auth Bearer abc.def.ghi", []), "auth [redacted]");
+  assert.equal(redact("saw S3CRET-VALUE twice", ["S3CRET-VALUE"]), "saw [redacted] twice");
+});
+
+// ---- other platforms: from the run's own reports (desktop: one group, one report per OS) and its sibling groups (mobile), model off ----
+test("a report name names its platform: the OS in it, else the name without the e2e prefix", () => {
+  assert.equal(laneOfReport("e2e-on-ubuntu-latest-1.0"), "linux");
+  assert.equal(laneOfReport("e2e-on-windows-2022-1.0"), "windows");
+  assert.equal(laneOfReport("e2e-on-macos-14-1.0"), "macos");
+  assert.equal(laneOfReport("e2e-on-something-else"), "something-else");
+});
+const oneGroupPerOS = (linux: string, windows: string, macos: string): Route[] => [
+  ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "desktop-pr", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+  ["/reports/g1/suites", () => Response.json({ suites: [
+    { id: "s-linux", file_path: "specs/a.spec.ts", report_name: "e2e-on-ubuntu-latest-1.0" },
+    { id: "s-windows", file_path: "specs/a.spec.ts", report_name: "e2e-on-windows-2022-1.0" },
+    { id: "s-macos", file_path: "specs/a.spec.ts", report_name: "e2e-on-macos-14-1.0" },
+  ] })],
+  ["/reports/g1/cases", () => Response.json([caseRow("t1", linux, 0, "s-linux"), caseRow("t1", windows, 0, "s-windows"), caseRow("t1", macos, 0, "s-macos")])],
+];
+const quietPR: Route[] = [
+  ["/reports/history", () => Response.json({ observations: [] })],
+  ["/pulls/5/files", () => Response.json([])],
+  ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+  ["/statuses/abc", () => Response.json({})],
+];
+test("desktop's one group holds every OS report: the same test that also failed on the others says so, model off", async () => {
+  const desktop = { ...env, ANTHROPIC_API_KEY: "", REPORT_NAME: "e2e-on-ubuntu-latest", LANE: "linux", COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "desktop-pr", gh_pr_number: 5 }) };
+  await inTmp(async (dir) => {
+    const summaryPath = join(dir, "s.md");
+    await triage({ env: { ...desktop, GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl: fakeFetch([...oneGroupPerOS("failed", "failed", "failed"), ...quietPR]), log: () => {} });
+    const text = readFileSync(summaryPath, "utf8");
+    assert.match(text, /Also failed on macos, windows in this run: likely environment or a shared cause\./, "the other two OS reports name the lanes, sorted");
+    assert.match(text, /^1 test failed on several platforms in this run\.$/m);
+  });
+});
+test("Windows writes the same test's full title with backslashes, and a failed try that retry recovered counts as failed there", async () => {
+  const desktop = { ...env, ANTHROPIC_API_KEY: "", REPORT_NAME: "e2e-on-ubuntu-latest", LANE: "linux", COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "desktop-pr", gh_pr_number: 5 }) };
+  const routes: Route[] = [
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "desktop-pr", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+    ["/reports/g1/suites", () => Response.json({ suites: [
+      { id: "s-linux", file_path: "specs/a.spec.ts", report_name: "e2e-on-ubuntu-latest-1.0" },
+      { id: "s-windows", file_path: "specs/a.spec.ts", report_name: "e2e-on-windows-2022-1.0" },
+    ] })],
+    ["/reports/g1/cases", () => Response.json([
+      { suite_id: "s-linux", title: "t1", full_title: "specs/a.spec.ts > t1", status: "failed", retry_count: 0, ordinal: 0, error_message: "Error: expected visible", error_stack: null },
+      { suite_id: "s-windows", title: "t1", full_title: "specs\\a.spec.ts > t1", status: "flaky", retry_count: 0, ordinal: 0, error_message: null, error_stack: null },
+    ])],
+  ];
+  await inTmp(async (dir) => {
+    const summaryPath = join(dir, "s.md");
+    await triage({ env: { ...desktop, GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl: fakeFetch([...routes, ...quietPR]), log: () => {} });
+    assert.match(readFileSync(summaryPath, "utf8"), /Also failed once on windows in this run \(passed on retry\): likely environment or a shared cause\./);
+  });
+});
+test("the other-platform wording says what each platform did: failed, once (passed on retry), or both", () => {
+  const sentence = (other_lanes: { platform: string; result: string }[]): string => {
+    const text = renderSummary({ findings: [finding({ title: "t1", file: "specs/a.spec.ts", other_lanes })], infra: null, runURL: "u", counts: { failed: 1, passed: 9 }, trunkBranch: "master" });
+    return text.match(/Also (?:failed|once)[^|]*?in this run[^|]*?\./)?.[0] ?? "";
+  };
+  assert.equal(sentence([{ platform: "macos", result: "failed" }, { platform: "windows", result: "timedOut" }]), "Also failed on macos, windows in this run: likely environment or a shared cause.");
+  assert.equal(sentence([{ platform: "windows", result: "flaky" }]), "Also failed once on windows in this run (passed on retry): likely environment or a shared cause.");
+  assert.equal(sentence([{ platform: "macos", result: "failed" }, { platform: "windows", result: "flaky" }]), "Also failed on macos, and once on windows (passed on retry), in this run: likely environment or a shared cause.");
+});
+test("a test that passed on the other OS reports has no other-platform line", async () => {
+  const desktop = { ...env, ANTHROPIC_API_KEY: "", REPORT_NAME: "e2e-on-ubuntu-latest", LANE: "linux", COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "desktop-pr", gh_pr_number: 5 }) };
+  await inTmp(async (dir) => {
+    const summaryPath = join(dir, "s.md");
+    await triage({ env: { ...desktop, GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl: fakeFetch([...oneGroupPerOS("failed", "passed", "passed"), ...quietPR]), log: () => {} });
+    const text = readFileSync(summaryPath, "utf8");
+    assert.doesNotMatch(text, /several platforms|Also failed/);
+  });
+});
+const siblingGroups = (self: string, ios: string): Route[] => [
+  ["/reports?", () => Response.json({ reports: [
+    { id: "g1", repository: "o/r", commit: "abc", name: "detox-android", gh_run_id: "12", gh_run_attempt: "1", status: "completed" },
+    { id: "g2", repository: "o/r", commit: "abc", name: "detox-ios", gh_run_id: "12", gh_run_attempt: "1", status: "completed" },
+  ], total: 2 })],
+  ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+  ["/reports/g1/cases", () => Response.json([caseRow("t1", self)])],
+  ["/reports/g2/suites", () => Response.json({ suites: [{ id: "s2", file_path: "specs/a.spec.ts" }] })],
+  ["/reports/g2/cases", () => Response.json([caseRow("t1", ios, 0, "s2")])],
+];
+const androidLane = { ...env, ANTHROPIC_API_KEY: "", COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "detox-android", gh_pr_number: 5 }) };
+test("a mobile lane's sibling groups name the same failure on the other platforms, with the model off", async () => {
+  await inTmp(async (dir) => {
+    const summaryPath = join(dir, "s.md");
+    await triage({ env: { ...androidLane, GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl: fakeFetch([...siblingGroups("failed", "failed"), ...quietPR]), log: () => {} });
+    assert.match(readFileSync(summaryPath, "utf8"), /Also failed on detox-ios in this run: likely environment or a shared cause\./);
+  });
+});
+test("a run with nothing failed reads no sibling group: no call for another platform", async () => {
+  const fetchImpl = fakeFetch([...siblingGroups("passed", "failed"), ...quietPR]);
+  await triage({ env: androidLane, fetchImpl, log: () => {} });
+  assert.equal(fetchImpl.calls.filter((c) => c.url.includes("/reports?")).length, 1, "only this lane's own report list");
+  assert.equal(fetchImpl.calls.filter((c) => c.url.includes("/reports/g2")).length, 0, "the sibling group is not read");
+});
+
+// ---- review fixes: wording on rows that blame this PR, the answer-cache key, sibling keys, deadline, superseded links, redaction ----
+test("a row that blames this PR never says the cause is environmental: the other platforms are named, neutrally", () => {
+  const yours = finding({ title: "t1", file: "specs/a.spec.ts", class: "OWNED_BY_PR", blocking: true, other_lanes: [{ platform: "windows", result: "failed" }] });
+  const text = renderSummary({ findings: [yours], infra: null, runURL: "u", counts: { failed: 1, passed: 9 }, trunkBranch: "master" });
+  const row = text.split("\n").find((l) => l.startsWith("| t1 ")) ?? "";
+  assert.match(row, /Also failed on windows in this run\./);
+  assert.doesNotMatch(row, /environment|shared cause/, "a change to this PR is not steered toward the environment");
+});
+
+test("the answer-cache key ignores the other-platform evidence, and equals the key HEAD computes for the same pack", () => {
+  const pack = { test: { title: "t1", full_title: null, suite: null, file: "specs/a.spec.ts", report_scope: null, report_name: null }, error: "Error: expected visible", engine: { class: "REGRESSION", reason: "r" }, trunk_history_14d: { runs: 8, fails: 0, flaky: 0, latest: "passed" }, cross_pr_failures_14d: { id: "cross_pr", other_prs_where_this_test_failed: [], other_pr_runs_where_it_passed: 0 }, pr: { number: 5, repository: "o/r", title: "t", changed_file_count: 1, changed_files: ["app/x.ts"], spec_file_changed_by_pr: false }, diff_hunks_of_files_named_in_error: [], other_failures_in_same_run: [] } as unknown as Pack;
+  const withOthers = { ...pack, same_test_other_platforms_this_run: { id: "other_platforms", results: [{ platform: "windows", result: "failed" }] } } as unknown as Pack;
+  assert.equal(answerKey("claude-sonnet-5-5", withOthers), answerKey("claude-sonnet-5-5", pack), "the evidence is not part of the key");
+  // Computed from HEAD (bdce26e) for this pack: a cached answer keeps its key, so no call is paid again.
+  assert.equal(answerKey("claude-sonnet-5-5", pack), "v3:66ab3c425fa3f89d6f1679608b3cf18e73dfcc21b54452686a07b50d08b4843e");
+});
+
+test("a sibling's same leaf title in another describe block is another test: no other-platform line", async () => {
+  const g1 = { id: "g1", repository: "o/r", commit: "abc", name: "detox-android", gh_run_id: "12", gh_run_attempt: "1", status: "completed" };
+  const g2 = { id: "g2", repository: "o/r", commit: "abc", name: "detox-ios", gh_run_id: "12", gh_run_attempt: "1", status: "completed" };
+  const fetchImpl = fakeFetch([
+    ["/reports?", () => Response.json({ reports: [g1, g2], total: 2 })],
+    ["/reports/g2/suites", () => Response.json({ suites: [{ id: "s2", file_path: "specs/a.spec.ts" }] })],
+    ["/reports/g2/cases", () => Response.json([{ suite_id: "s2", title: "t1", full_title: "B > t1", status: "failed", retry_count: 0, ordinal: 0, error_message: "Error: expected visible", error_stack: null }])],
+  ]);
+  const f = finding({ title: "t1", full_title: "A > t1", file: "specs/a.spec.ts", class: "REGRESSION", blocking: true });
+  await siblingPlatforms({ findings: [f], fetchImpl, base: "http://tsio", id: { repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "detox-android" }, log: () => {} });
+  assert.equal(f.other_lanes, undefined, "B > t1 is not A > t1");
+});
+
+test("the sibling reads share one deadline: a read that runs past it is skipped and logged, and the next is not started", async () => {
+  const g = (id: string, name: string) => ({ id, repository: "o/r", commit: "abc", name, gh_run_id: "12", gh_run_attempt: "1", status: "completed" });
+  const slowFetch: FetchImpl = async (url: string, init?: RequestInit) => {
+    const u = String(url);
+    if (u.includes("/reports/g2/")) await new Promise((r) => setTimeout(r, 300));
+    return fakeFetch([
+      ["/reports?", () => Response.json({ reports: [g("g1", "detox-android"), g("g2", "detox-ios"), g("g3", "detox-web")], total: 3 })],
+      ["/reports/g2/suites", () => Response.json({ suites: [{ id: "s2", file_path: "specs/a.spec.ts" }] })],
+      ["/reports/g2/cases", () => Response.json([caseRow("t1", "failed", 0, "s2")])],
+      ["/reports/g3/suites", () => Response.json({ suites: [{ id: "s3", file_path: "specs/a.spec.ts" }] })],
+      ["/reports/g3/cases", () => Response.json([caseRow("t1", "failed", 0, "s3")])],
+    ])(url, init);
+  };
+  const logs: string[] = [];
+  const f = finding({ title: "t1", file: "specs/a.spec.ts", class: "REGRESSION", blocking: true });
+  await siblingPlatforms({ findings: [f], fetchImpl: slowFetch, base: "http://tsio", id: { repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "detox-android" }, log: (m) => logs.push(m), deadlineMs: 100 });
+  assert.ok(logs.some((m) => /deadline/.test(m)), `the skipped read is logged: ${JSON.stringify(logs)}`);
+  assert.equal(f.other_lanes, undefined, "the read past the deadline adds nothing");
+});
+
+test("the sibling list is read once for the run, not once per sibling", async () => {
+  const g = (id: string, name: string) => ({ id, repository: "o/r", commit: "abc", name, gh_run_id: "12", gh_run_attempt: "1", status: "completed" });
+  const fetchImpl = fakeFetch([
+    ["/reports?", () => Response.json({ reports: [g("g1", "detox-android"), g("g2", "detox-ios"), g("g3", "detox-web")], total: 3 })],
+    ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+    ["/reports/g1/cases", () => Response.json([caseRow("t1", "failed")])],
+    ["/reports/g2/suites", () => Response.json({ suites: [{ id: "s2", file_path: "specs/a.spec.ts" }] })],
+    ["/reports/g2/cases", () => Response.json([caseRow("t1", "failed", 0, "s2")])],
+    ["/reports/g3/suites", () => Response.json({ suites: [{ id: "s3", file_path: "specs/a.spec.ts" }] })],
+    ["/reports/g3/cases", () => Response.json([caseRow("t1", "passed", 0, "s3")])],
+    ["/reports/history", () => Response.json({ observations: [] })],
+    ["/pulls/5/files", () => Response.json([])],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+    ["/statuses/abc", () => Response.json({})],
+  ]);
+  await triage({ env: androidLane, fetchImpl, log: () => {} });
+  const lists = fetchImpl.calls.filter((c) => c.url.includes("/reports?"));
+  assert.equal(lists.length, 2, "this lane's own list, and one list for its siblings");
+});
+
+test("a sibling read on an infrastructure storm is never started: the other platforms explain nothing there", async () => {
+  let asked = 0;
+  const failing = Array.from({ length: 40 }, (_, i) => ({ file: "specs/a.spec.ts", title: `t${i}`, full_title: null, suite_title: null, report_name: null, report_scope: null, identity_ambiguous: false, identity_unresolved: false, error: "Error: expected visible", tries: { ran: 1, failed: 1 } }));
+  const run = { group_id: "g1", failing, missing: null, outcomes: new Map(), elsewhere: new Map(), counts: { total: 40, passed: 0, failed: 40, flaky: 0, skipped: 0 } } as unknown as RunResult;
+  const result = await evaluateRun({ run, id: { repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "detox-android" }, prNumber: 5, history: new Map(), diff: { files: [], ok: true }, trunkBranch: "master", testRoot: ".", otherPlatforms: async () => { asked += 1; } });
+  assert.ok(result.infra, "forty failures are an infrastructure storm");
+  assert.equal(asked, 0, "no sibling read on a storm");
+});
+
+test("a case with no title does not break a run's read: the key for it is empty, not a crash", async () => {
+  const fetchImpl = fakeFetch([
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "detox-android", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+    ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+    ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: null, full_title: null, status: "passed", retry_count: 0, ordinal: 0, error_message: null, error_stack: null }])],
+  ]);
+  const run = await fetchRun(fetchImpl, "http://tsio", { repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "detox-android" }, null, { attempts: 1, ms: 0 });
+  assert.equal(run.counts.passed, 1);
+  assert.equal(elsewhereKey("specs/a.spec.ts", null as unknown as string), elsewhereKey("specs/a.spec.ts", ""));
+});
+
+test("a superseded run links to its replacement only when that run is of the same PR; another PR's replacement is named without a link", async () => {
+  for (const [pr, linked] of [["5", true], ["6", false]] as const) {
+    await inTmp(async (dir) => {
+      const statuses: StatusBody[] = [];
+      const summaryPath = join(dir, "s.md");
+      const fetchImpl = fakeFetch([
+        ["/reports?", () => Response.json({ reports: [{ id: "g9", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "13", gh_run_attempt: "1", status: "completed", gh_pr_number: pr, branch: "pr-5" }] })],
+        statusSink(statuses),
+      ]);
+      await assert.rejects(() => triage({ env: { ...env, MODE: "enforce", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl, log: () => {} }), NotTriagedError);
+      const summary = readFileSync(summaryPath, "utf8");
+      if (linked) assert.match(summary, /\*\*Not triaged: run \[13\]\(https:\/\/github\.com\/o\/r\/actions\/runs\/13\) replaced this one for playwright-full; see that run's triage\.\*\*/, pr);
+      else {
+        assert.match(summary, /\*\*Not triaged: another run of this commit replaced this one for playwright-full\.\*\*/, pr);
+        assert.doesNotMatch(summary, /actions\/runs\/13/, "no link to another PR's run");
+      }
+      assert.deepEqual(statuses, [], "no status either way");
+    });
+  }
+});
+
+test("zero failures with missing reports says both how many arrived and what never ran", async () => {
+  await inTmp(async (dir) => {
+    const statuses: StatusBody[] = [];
+    const summaryPath = join(dir, "s.md");
+    const routes: Route[] = [
+      ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "in_progress", total_reports_expected: 2 }], total: 1 })],
+      ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+      ["/reports/g1/cases", () => Response.json(spec("t1", "passed"))],
+      ["/reports/g1", () => Response.json({ id: "g1", status: "in_progress", total_reports_expected: 2, reports: [{}] })],
+      statusSink(statuses),
+    ];
+    await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl: fakeFetch(routes), log: () => {}, wait: { attempts: 1, ms: 0 } });
+    assert.match(readFileSync(summaryPath, "utf8"), /re-run the failed jobs\. 1 of 2 reports arrived; 1 of 2 reports never uploaded, so the specs on those workers never ran\.\*\*/m);
+  });
+});
+
+test("redaction strips a URL's query string and the value of any credential-named key, in any case", () => {
+  assert.equal(redact("see https://x.test/cb?code=abc&state=1 now", []), "see https://x.test/cb?[redacted] now");
+  assert.equal(redact("token=abc123 and password: hunter2", []), "token=[redacted] and password: [redacted]");
+  assert.equal(redact("Authorization: Bearer xyz.123", []), "Authorization: [redacted]");
+  assert.equal(redact("API_KEY=zzz", []), "API_KEY=[redacted]");
+  assert.equal(redact("license:abc", []), "license:[redacted]");
+  assert.equal(redact("SECRET=val", []), "SECRET=[redacted]");
+  assert.equal(redact("github_token=ghx", []), "github_token=[redacted]");
+  assert.equal(redact("status: passed; tokens are fine", []), "status: passed; tokens are fine", "ordinary text is untouched");
+});
+
+test("an other-platform entry keeps the worst result for its OS: failed over once over passed", () => {
+  const run = { elsewhere: new Map([[elsewhereKey("specs/a.spec.ts", "t1"), [{ report: "e2e-on-windows-2022-1.0", status: "passed" }, { report: "e2e-on-windows-11-1.0", status: "flaky" }, { report: "e2e-on-macos-14-1.0", status: "flaky" }, { report: "e2e-on-macos-15-1.0", status: "failed" }]]]) } as unknown as Pick<RunResult, "elsewhere">;
+  const f = finding({ title: "t1", file: "specs/a.spec.ts", report_name: "e2e-on-ubuntu-latest-1.0" });
+  sameTestOnOtherReports([f], run);
+  assert.deepEqual(f.other_lanes, [{ platform: "macos", result: "failed" }, { platform: "windows", result: "flaky" }]);
 });

@@ -1,6 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import { FAILED_STATUSES, isFailedTry } from "../../shared/src/tsio.ts";
 import { COMPARE_FILE_CAP } from "./config.ts";
 import { ledgerTotals, newLedger } from "./pricing.ts";
 import type { Counts, Finding, Ledger } from "./types.ts";
@@ -64,6 +65,26 @@ function brokeByText(b: Finding["broke_by"]): string | null {
 }
 
 const PERCENT = (n: number): string => `${Math.round(n * 100)}%`;
+
+/** The other platforms in this run where this test failed a try (a retry may have recovered it; a pass does not count). */
+export const failedElsewhere = (f: Finding): string[] => (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform);
+
+/**
+ * The sentence added to a why when the same test failed on other platforms in this run. Each platform is named by what
+ * it did: failed, or once (a failed try that a retry recovered). The tail says what it may mean: a shared cause is the
+ * likely one for a test that is not this PR's; a row that blames this PR gets the plain tail, which steers nowhere.
+ */
+const alsoFailed = (f: Finding, tail: string): string => {
+  const other = f.other_lanes ?? [];
+  const failed = other.filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform);
+  const once = other.filter((o) => o.result === "flaky").map((o) => o.platform);
+  if (failed.length && once.length) return ` Also failed on ${failed.join(", ")}, and once on ${once.join(", ")} (passed on retry), in this run${tail}`;
+  if (once.length) return ` Also failed once on ${once.join(", ")} in this run (passed on retry)${tail}`;
+  if (failed.length) return ` Also failed on ${failed.join(", ")} in this run${tail}`;
+  return "";
+};
+const SHARED_CAUSE = ": likely environment or a shared cause.";
+const PLAIN = ".";
 
 /** One line of why, and the next step, for a failed test. */
 function whyNext(f: Finding, branch: string, pr: boolean): [string, string] {
@@ -198,13 +219,20 @@ export interface SummaryInput {
   trunkBranch?: string | null;
   pr?: boolean;
   notes?: string[];
+  /** The lane's own status is red although no test failed (a job outside the tests did). */
+  laneRed?: boolean;
+  /** "2 of 3 reports arrived", for a run with missing reports (see missingArrived). */
+  reportsArrived?: string | null;
 }
+
+/** What a red lane with no failed test is to re-run: a job outside the tests, or reports that never arrived. */
+const RED_OUTSIDE = "No test failed. The lane is red because a job outside the tests failed (setup, upload or runner), or results are missing: re-run the failed jobs.";
 
 /**
  * The job summary, shortest first: a one-line answer, then the failed tests in four
  * groups (one line each: why and the next step), then the evidence, collapsed.
  */
-export function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [] }: SummaryInput): string {
+export function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null }: SummaryInput): string {
   const branch = trunkBranch || "the default branch";
   const where = lane ? ` · ${md(lane)}` : "";
   const groups: Record<Bucket, Finding[]> = { yours: [], outdated: [], check: [], broken: [], flaky: [] };
@@ -222,7 +250,7 @@ export function renderSummary({ findings, infra = null, runURL, counts, mode = "
   // The headline must agree with the verdict: blocking failures and missing reports are red, and "none caused"
   // is only said when nothing blocks.
   const head = infra ? "⚠️ needs investigation"
-    : !counts.failed && !missing ? "✅ nothing failed"
+    : !counts.failed && !missing ? (laneRed ? "🔴 red outside the tests" : "✅ nothing failed")
     : outdatedLead ? `🔴 merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}`
     : yours.length ? `🔴 ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}`
     : missing ? "🔴 results missing"
@@ -230,13 +258,19 @@ export function renderSummary({ findings, infra = null, runURL, counts, mode = "
     : blockingBroken ? `🔴 ${blockingBroken} still failing on ${md(branch)}`
     : `✅ none caused by this ${pr ? "PR" : "commit"}`;
   const lines = [`## E2E triage${where}: ${head}`, ""];
+  // Under the headline: how many failed tests also failed on other platforms in this run (see alsoFailed).
+  const several = findings.filter((f) => failedElsewhere(f).length > 0).length;
+  if (several) lines.push(`${count(several, "test")} failed on several platforms in this run.`, "");
   lines.push(mode === "enforce"
     ? "> Triage sets the E2E check: it passes only when every failure is cleared."
     : "> **Report only.** This is triage's advice; it doesn't change the E2E check.", "");
   for (const n of notes) lines.push(`> ${md(n)}`, "");
 
   let say = "";
-  if (!counts.failed) say = "No test failed.";
+  // Red with no failed test: say which job to re-run, and how many reports arrived when some never did.
+  // With missing reports, the count that arrived and what never ran: the reason the lane is red.
+  const arrived = missing ? `${[reportsArrived, missing.text].filter(Boolean).join("; ")}.` : "";
+  if (!counts.failed) say = missing || laneRed ? `${RED_OUTSIDE}${arrived ? ` ${arrived}` : ""}` : "No test failed.";
   else if (findings.length) {
     const kinds = [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
     say = `${count(yours.length + outdated.length + check.length + blockingBroken + unrelated, "failure")}: ` + [
@@ -249,7 +283,7 @@ export function renderSummary({ findings, infra = null, runURL, counts, mode = "
     if (outdatedLead) say = `Merge ${branch} and re-run first. ${say}`;
   }
   if (infra) say = `${infra} ${say}`;
-  if (missing) say += ` Results incomplete: ${missing.text}; re-run the failed jobs before relying on this.`;
+  if (missing && counts.failed) say += ` Results incomplete: ${missing.text}; re-run the failed jobs before relying on this.`;
   lines.push(`**${md(say.trim())}** ${passLine(counts)} · [run](${runURL})`, "");
 
   const section = (title: string, list: Finding[], heading = `${title} (${list.length})`): void => {
@@ -257,7 +291,9 @@ export function renderSummary({ findings, infra = null, runURL, counts, mode = "
     lines.push(`### ${heading}`, "", "| Test | Why | Next step |", "| --- | --- | --- |");
     for (const f of list) {
       const [why, next] = whyNext(f, branch, pr);
-      lines.push(`| ${md(f.title)} · \`${mdCode(fileOf(f))}\` | ${md(why)} | ${md(next)} |`);
+      // A row that blames this PR (or a base-branch change to its test) is not steered toward the environment.
+      const blamesPR = bucketOf(f) === "yours" || bucketOf(f) === "outdated";
+      lines.push(`| ${md(f.title)} · \`${mdCode(fileOf(f))}\` | ${md(why + alsoFailed(f, blamesPR ? PLAIN : SHARED_CAUSE))} | ${md(next)} |`);
     }
     lines.push("");
   };
@@ -295,6 +331,30 @@ export function renderSummary({ findings, infra = null, runURL, counts, mode = "
 export function renderUnfinished({ reason, lane = null }: { reason: string; lane?: string | null }): string {
   const where = lane ? ` · ${md(lane)}` : "";
   return [`## E2E triage${where}: ⚠️ not triaged`, "", `**${md(`triage could not finish: ${reason}`)}** The E2E result stands.`, ""].join("\n");
+}
+
+/**
+ * The job summary of a run triage did not judge on purpose (superseded, or no results at TSIO). `text` is the
+ * already-escaped sentence (see supersededText and noResultsText).
+ */
+export function renderNotTriaged({ text, lane = null }: { text: string; lane?: string | null }): string {
+  const where = lane ? ` · ${md(lane)}` : "";
+  return [`## E2E triage${where}: ⚠️ not triaged`, "", `**${text}**`, ""].join("\n");
+}
+
+/** The run a newer dispatch replaced: its number is the link to that run's own triage. */
+export function supersededText(newerRunId: string, repository: string, lane: string): string {
+  return `Not triaged: run [${md(newerRunId)}](https://github.com/${repository}/actions/runs/${newerRunId}) replaced this one for ${md(lane)}; see that run's triage.`;
+}
+
+/** A run another PR's lane replaced: named without a link, since its triage is not this lane's. */
+export function otherRunText(lane: string): string {
+  return `Not triaged: another run of this commit replaced this one for ${md(lane)}.`;
+}
+
+/** The run TSIO has no results for: the tests may not have run. */
+export function noResultsText(lane: string, commitSha: string): string {
+  return `Not triaged: TSIO has no results for ${md(lane)} at ${sha7(commitSha)} (the tests may not have run).`;
 }
 
 /** The E2E check's text: "(4 cleared by triage) 99.7% passed (1186 passed, 4 failed, 164 skipped)". */

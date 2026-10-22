@@ -1,5 +1,5 @@
 {
-  "name": "e2e-status",
+  "name": "e2e-test-status",
   "private": true,
   "version": "0.1.0",
   "main": "dist/index.js",

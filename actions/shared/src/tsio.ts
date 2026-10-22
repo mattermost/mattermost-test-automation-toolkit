@@ -4,6 +4,26 @@ import type { Env, FetchImpl } from "./github.ts";
 
 export const FAILED_STATUSES = new Set(["failed", "timedOut", "interrupted"]);
 
+/**
+ * Whether a test's result on another platform or report counts as a failure there: a failed try, which a retry may have
+ * recovered (TSIO's flaky), or a failure outright. Passed, or skipped, does not.
+ */
+export const isFailedTry = (status: string): boolean => FAILED_STATUSES.has(status) || status === "flaky";
+
+/**
+ * The key that matches one test across reports and platforms: its file and full title (or title), with Windows path
+ * separators read as "/", since Windows writes the same test's title with backslashes.
+ */
+export const elsewhereKey = (file: string | null | undefined, title: string | null | undefined): string =>
+  JSON.stringify([String(file ?? "").replace(/\\/g, "/"), String(title ?? "").replace(/\\/g, "/")]);
+
+/** One GET of TSIO's API; a failed status throws with the path, never a body. */
+async function tsioJson<T>(fetchImpl: FetchImpl, base: string, path: string): Promise<T> {
+  const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(60000) });
+  if (!res.ok) throw new Error(`TSIO GET ${path}: ${res.status}`);
+  return (await res.json()) as T;
+}
+
 export const DEFAULT_TSIO_BASE_URL = "https://test-io.test.mattermost.com";
 // The staging deployment that use-staging selects. Same URL as TSIO's own actions.
 export const STAGING_TSIO_BASE_URL = "https://staging-test-io.test.mattermost.com";
@@ -102,7 +122,8 @@ export interface Missing {
 
 type TsioId = string | number;
 
-interface TsioGroup {
+/** One TSIO group: a run's results for one lane. The PR and branch are read when TSIO sends them. */
+export interface TsioGroup {
   id: TsioId;
   repository: string;
   commit: string;
@@ -112,6 +133,8 @@ interface TsioGroup {
   status: string;
   total_reports_expected?: number | string | null;
   reports?: unknown[];
+  gh_pr_number?: number | string | null;
+  branch?: string | null;
 }
 
 interface TsioSuite {
@@ -151,7 +174,55 @@ export interface RunResult {
   failing: FailingTest[];
   missing: Missing | null;
   outcomes: Map<string, string>;
+  /**
+   * Every report's outcome for each test of the group, read before any report filter: keyed by [file, full title or
+   * title], each entry the report's name and the test's outcome there. Desktop uploads one report per OS into one group,
+   * so the same test on the other OSes is named from here with no further read.
+   */
+  elsewhere: Map<string, { report: string; status: string }[]>;
   counts: { total: number; passed: number; failed: number; flaky: number; skipped: number };
+}
+
+/** A GitHub run and attempt, as TSIO's group carries them. Digits only: they are compared as big integers. */
+export interface Replacement {
+  gh_run_id: string;
+  gh_run_attempt: string;
+  /** The replacement's PR as TSIO sent it: undefined when TSIO sent none, null for a run with no PR. */
+  gh_pr_number?: string | null;
+  /** The replacement's branch as TSIO sent it. */
+  branch?: string | null;
+}
+/** Whether run a is newer than run b: a later run id, or the same run's later attempt. */
+const newerRun = (a: Replacement, b: Replacement): boolean => {
+  const run = BigInt(a.gh_run_id) - BigInt(b.gh_run_id);
+  return run !== BigInt(0) ? run > BigInt(0) : BigInt(a.gh_run_attempt) > BigInt(b.gh_run_attempt);
+};
+/**
+ * TSIO holds the run's group, but a newer dispatch of the same commit and suite replaced it (see fetchRun). Its
+ * message keeps fetchRun's "no group for" wording, so a caller that only logs it reads the same as before.
+ */
+export class SupersededRunError extends Error {
+  readonly replacement: Replacement;
+  constructor(message: string, replacement: Replacement) {
+    super(message);
+    this.name = "SupersededRunError";
+    this.replacement = replacement;
+  }
+}
+/** TSIO holds no group for this run, and no newer run took its place: its results are not there (yet). */
+export class NoResultsError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NoResultsError";
+  }
+}
+
+/** "2 of 3 reports arrived" for a run with missing reports, or a bare count when the expected count is unknown; null if complete. */
+export function missingArrived(missing: Missing | null): string | null {
+  if (!missing) return null;
+  const { expected, received } = missing;
+  if (expected != null && received != null) return `${received} of ${expected} reports arrived`;
+  return `${received ?? "?"} reports arrived (the expected count is unknown)`;
 }
 
 /**
@@ -159,13 +230,17 @@ export interface RunResult {
  * uploads one per OS). `reportName` is a prefix: names end in a release version.
  */
 export async function fetchRun(fetchImpl: FetchImpl, base: string, id: CompositeIdentity, reportName: string | null = null, wait: Wait = { attempts: 6, ms: 20000 }): Promise<RunResult> {
-  const get = async <T>(path: string): Promise<T> => {
-    const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(60000) });
-    if (!res.ok) throw new Error(`TSIO GET ${path}: ${res.status}`);
-    return (await res.json()) as T;
-  };
   const q = new URLSearchParams({ repository: id.repository, commit: id.commit_sha, name: String(id.name), limit: "20" });
-  const { reports: groups = [] } = await get<{ reports?: TsioGroup[] }>(`/reports?${q}`);
+  const { reports: groups = [] } = await tsioJson<{ reports?: TsioGroup[] }>(fetchImpl, base, `/reports?${q}`);
+  return runFromGroups(fetchImpl, base, id, groups, reportName, wait);
+}
+
+/**
+ * The run's results from a group list already read. fetchRun is this after its one list call; a caller that reads
+ * several runs from one list (the sibling groups of a run) calls it directly, so the list is read once.
+ */
+export async function runFromGroups(fetchImpl: FetchImpl, base: string, id: CompositeIdentity, groups: TsioGroup[], reportName: string | null = null, wait: Wait = { attempts: 6, ms: 20000 }): Promise<RunResult> {
+  const get = <T>(path: string): Promise<T> => tsioJson<T>(fetchImpl, base, path);
   // Match the full identity ourselves: never trust the server's filtering, and
   // run id + attempt are what tell two runs of one suite on one commit apart.
   const runId = String(id.gh_run_id ?? "");
@@ -180,8 +255,26 @@ export async function fetchRun(fetchImpl: FetchImpl, base: string, id: Composite
       String(g.gh_run_id) === runId &&
       String(g.gh_run_attempt) === attempt,
   );
-  if (!group)
-    throw new Error(`TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`);
+  if (!group) {
+    const noGroup = `TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`;
+    // A newer run or attempt of this commit and suite took the group: this run is superseded, and the newest replacement is named.
+    // An older run's group, or one of another suite or commit, says nothing about this run.
+    const newest = /^\d+$/.test(runId) && /^\d+$/.test(attempt)
+      ? groups
+          .filter((g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name)
+          .map((g): Replacement => ({
+            gh_run_id: String(g.gh_run_id),
+            gh_run_attempt: String(g.gh_run_attempt),
+            gh_pr_number: g.gh_pr_number === undefined ? undefined : g.gh_pr_number === null || String(g.gh_pr_number) === "" ? null : String(g.gh_pr_number),
+            branch: g.branch === undefined ? undefined : g.branch,
+          }))
+          .filter((r) => /^\d+$/.test(r.gh_run_id) && /^\d+$/.test(r.gh_run_attempt) && newerRun(r, { gh_run_id: runId, gh_run_attempt: attempt }))
+          .reduce<Replacement | null>((best, r) => (!best || newerRun(r, best) ? r : best), null)
+      : null;
+    if (newest)
+      throw new SupersededRunError(`${noGroup}; its group now belongs to run ${newest.gh_run_id} attempt ${newest.gh_run_attempt}`, newest);
+    throw new NoResultsError(noGroup);
+  }
   // A worker that never uploaded leaves the group open for good. Wait a little for
   // late uploads, then read what arrived: the missing reports keep the run red (all
   // of it: a report-scoped run can't tell which scope a missing report belonged to).
@@ -205,6 +298,23 @@ export async function fetchRun(fetchImpl: FetchImpl, base: string, id: Composite
   const fileOf = new Map<TsioId, string>(suites.map((s): [TsioId, string] => [s.id, s.file_path ?? s.file ?? ""]));
   const reportOf = new Map<TsioId, string | null>(suites.map((s): [TsioId, string | null] => [s.id, s.report_name ?? null]));
   const suiteTitleOf = new Map<TsioId, string>(suites.map((s): [TsioId, string] => [s.id, s.title ?? ""]));
+  // Every report's outcome for each test, before the report filter: the same test on the group's other reports is named
+  // from here, with no further read. One outcome per test per report, by the same rule as the run's own outcomes.
+  const perReport = new Map<string, { report: string; identity: string; attempts: TsioCase[] }>();
+  for (const c of cases) {
+    const report = reportOf.get(c.suite_id) ?? "";
+    const identity = elsewhereKey(fileOf.get(c.suite_id) ?? "", c.full_title || c.title);
+    const key = JSON.stringify([report, identity]);
+    if (!perReport.has(key)) perReport.set(key, { report, identity, attempts: [] });
+    perReport.get(key)!.attempts.push(c);
+  }
+  const elsewhere = new Map<string, { report: string; status: string }[]>();
+  for (const { report, identity, attempts } of perReport.values()) {
+    attempts.sort((a, b) => a.retry_count - b.retry_count || a.ordinal - b.ordinal);
+    const { status } = outcomeWithDuplicates(attempts, (a) => reportOf.get(a.suite_id) ?? null);
+    if (!elsewhere.has(identity)) elsewhere.set(identity, []);
+    elsewhere.get(identity)!.push({ report, status });
+  }
   // A report filter that matches nothing must not read as a run with no failures.
   const scoped = reportName
     ? new Set<TsioId>(suites.filter((s) => String(s.report_name ?? "").startsWith(reportName)).map((s) => s.id))
@@ -272,7 +382,7 @@ export async function fetchRun(fetchImpl: FetchImpl, base: string, id: Composite
     else if (status === "flaky") flaky++;
   }
   // Passed includes retry-recovered tests, as the E2E statuses count them.
-  return { group_id: group.id, failing, missing, outcomes, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
+  return { group_id: group.id, failing, missing, outcomes, elsewhere, counts:{ total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
 }
 
 /** What a run is missing when some reports never arrived, long and short; null if complete. */
