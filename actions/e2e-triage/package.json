@@ -1,0 +1,16 @@
+{
+  "name": "e2e-triage",
+  "private": true,
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsup",
+    "tsc": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test src/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "25.6.0",
+    "tsup": "8.5.1",
+    "typescript": "6.0.3"
+  }
+}

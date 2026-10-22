@@ -32,7 +32,7 @@ permissions:
   contents: read
   pull-requests: write
   statuses: write
-  id-token: write # Required by claude-code-action for OIDC authentication
+  id-token: write  # Required by claude-code-action for OIDC authentication
 
 env:
   CLAUDE_MODEL: ${{ inputs.claude_model || vars.CLAUDE_MODEL || 'claude-sonnet-4-6' }}
@@ -72,7 +72,7 @@ jobs:
 
       # Required: claude-code-action needs a git directory to initialize.
       - name: ci/checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
 
@@ -148,7 +148,7 @@ jobs:
       - name: ci/analyze-tests
         id: ai-analysis
         continue-on-error: true
-        uses: anthropics/claude-code-action@a874e9ecd7bb36efdad65429c6b35815f5a08f10 # v1.0.210
+        uses: anthropics/claude-code-action@a874e9ecd7bb36efdad65429c6b35815f5a08f10  # v1.0.210
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           use_sticky_comment: "true"
