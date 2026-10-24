@@ -1303,8 +1303,9 @@ var differentError = (a, b) => {
 };
 function markEarlierFailures(findings) {
   const earlier = (a, ai, b, bi) => {
+    if (!a.report_name || a.report_name !== b.report_name) return false;
     const [oa, ob] = [a.ordinal, b.ordinal];
-    if ((a.report_name ?? "") === (b.report_name ?? "") && typeof oa === "number" && typeof ob === "number" && oa !== ob) return oa < ob;
+    if (typeof oa === "number" && typeof ob === "number" && oa !== ob) return oa < ob;
     return ai < bi;
   };
   for (const [i, f] of findings.entries()) {
@@ -2495,7 +2496,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     if (env.GITHUB_OUTPUT)
       (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}
 verdict=${result.verdict}
-blocking=${flag ? run.counts.failed : result.findings.filter((f) => f.blocking).length}
+blocking=${flag ? run.counts.failed : result.findings.filter((f) => f.blocking).length + (result.unnamed ?? 0)}
 exonerated=${result.findings.filter((f) => !f.blocking).length}
 description=${description}
 ai_calls=${spend.calls}

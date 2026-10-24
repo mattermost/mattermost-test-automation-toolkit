@@ -368,13 +368,15 @@ const differentError = (a: string | null | undefined, b: string | null | undefin
 /**
  * The first failure in a chain: for each finding, the earliest test of the same spec file that failed before it in
  * this run with a different error (its title, the first line of its error, and its class). A later test often fails
- * only because an earlier one's setup failed. Order is the tests' ordinals within one report, else the order the run
- * lists them. Evidence only: it changes no class or blocking (see chainClears).
+ * only because an earlier one's setup failed. Only tests of one known report chain: another report ran on another
+ * machine, and without report names neither ordinals nor list order say which ran first. Order is their ordinals,
+ * else the order the run lists them. Evidence only: it changes no class or blocking (see chainClears).
  */
 export function markEarlierFailures(findings: Finding[]): Finding[] {
   const earlier = (a: Finding, ai: number, b: Finding, bi: number): boolean => {
+    if (!a.report_name || a.report_name !== b.report_name) return false;
     const [oa, ob] = [a.ordinal, b.ordinal];
-    if ((a.report_name ?? "") === (b.report_name ?? "") && typeof oa === "number" && typeof ob === "number" && oa !== ob) return oa < ob;
+    if (typeof oa === "number" && typeof ob === "number" && oa !== ob) return oa < ob;
     return ai < bi;
   };
   for (const [i, f] of findings.entries()) {

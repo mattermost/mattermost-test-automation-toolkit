@@ -3686,8 +3686,10 @@ test("a desktop shard stub, end to end: no history, no model, the check red with
       ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: DESKTOP_STUB.title, status: "failed", retry_count: 0, ordinal: 0, error_message: null, error_stack: null }])],
       statusSink(statuses),
     ]);
-    const result = await triage({ env: { ...env, MODE: "enforce", TRIAGE_CONTEXT: "off", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl, log: () => {} });
+    const outputPath = join(dir, "o.txt");
+    const result = await triage({ env: { ...env, MODE: "enforce", TRIAGE_CONTEXT: "off", GITHUB_STEP_SUMMARY: summaryPath, GITHUB_OUTPUT: outputPath }, fetchImpl, log: () => {} });
     assert.equal(result.findings.length, 0);
+    assert.match(readFileSync(outputPath, "utf8"), /^verdict=FAILURE\nblocking=1\n/m, "the shard that never ran still blocks");
     assert.equal(result.verdict, "FAILURE");
     assert.equal(fetchImpl.calls.filter((c) => c.url.includes("/reports/history")).length, 0, "no history read");
     assert.equal(fetchImpl.calls.filter((c) => c.url.includes("api.anthropic.com")).length, 0, "no model call");
@@ -3807,7 +3809,7 @@ test("past the compare cap, a spec its directory shows changed is out of date, o
 test("the first failure in a chain: an earlier test of the same spec that failed another way, by ordinal, else run order", () => {
   const env1 = "Error: getaddrinfo ENOTFOUND second-server.test.mattermost.cloud\n    at GetAddrInfoReqWrap.onlookupall";
   const ui = 'Error: expect(locator).toBeVisible() failed: locator getByRole("listitem", { name: "Second server" })';
-  const mk = (title: string, error: string, ordinal?: number, file = "specs/servers.spec.ts"): Finding => Object.assign(classify({ file, title, error, ordinal }, trunkPasses(8), []), { repo_path: file });
+  const mk = (title: string, error: string, ordinal?: number, file = "specs/servers.spec.ts", report: string | null = "detox-ios"): Finding => Object.assign(classify({ file, title, error, ordinal }, trunkPasses(8), []), { repo_path: file, report_name: report });
   // Listed out of order; the ordinals say MM-T4691_2 ran first.
   const [t3, t2, t5, other] = markEarlierFailures([mk("MM-T4691_3", ui, 30), mk("MM-T4691_2", env1, 20), mk("MM-T4691_5", ui, 50), mk("MM-T1", ui, 10, "specs/other.spec.ts")]);
   assert.deepEqual(t3.earlier_failure, { title: "MM-T4691_2", error: "Error: getaddrinfo ENOTFOUND second-server.test.mattermost.cloud", class: "INFRA_ERROR" });
@@ -3820,6 +3822,9 @@ test("the first failure in a chain: an earlier test of the same spec that failed
   assert.equal(b.earlier_failure?.title, "first");
   // The same error earlier is not a chain.
   assert.equal(markEarlierFailures([mk("x", ui), mk("y", ui)])[1].earlier_failure, undefined);
+  // Another report ran on another machine; with no report names, nothing says which ran first.
+  assert.equal(markEarlierFailures([mk("first", env1, 1, undefined, "detox-android"), mk("second", ui, 2)])[1].earlier_failure, undefined);
+  assert.equal(markEarlierFailures([mk("first", env1, 1, undefined, null), mk("second", ui, 2, undefined, null)])[1].earlier_failure, undefined);
 });
 
 test("an earlier environment failure in the spec clears a later one only with a pass on another platform in this run", () => {
@@ -3860,7 +3865,8 @@ test("a chained failure end to end: the pack carries the earlier failure, and th
     { title: "MM-T4691_3", file: "specs/servers.spec.ts", error: ui },
     { title: "MM-T4691_2", file: "specs/servers.spec.ts", error: "Error: getaddrinfo ENOTFOUND second-server.test.mattermost.cloud" },
   ]);
-  const run = { ...base, failing: base.failing.map((t, i) => ({ ...t, ordinal: i === 0 ? 30 : 20 })) };
+  // One report, as TSIO names every suite's: the ordinals say MM-T4691_2 ran first.
+  const run = { ...base, failing: base.failing.map((t, i) => ({ ...t, report_name: "detox-ios", ordinal: i === 0 ? 30 : 20 })) };
   const history = new Map(run.failing.map((t): [string, Observation[]] => [identityKey(t), trunkPasses(8)]));
   const packs: Pack[] = [];
   const chain: Answer = { cause: "flaky_environment", confidence: 0.9, cited_evidence: ["earlier_failure_same_spec", "other_platforms"], explanation: "x" };
