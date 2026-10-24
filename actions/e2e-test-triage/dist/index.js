@@ -414,7 +414,8 @@ var DEFAULTS = {
   crossPRMinPRs: 3,
   minConfidence: 0.85,
   vetoMin: 0.9,
-  maxJudged: 8,
+  // Questions per run, asked 8 to a call (see JUDGED_PER_CALL), each call within what is left of the budget.
+  maxJudged: 24,
   // Ask about blocking findings the model can't clear, as advice only.
   advise: true,
   infraMinFailures: 30,
@@ -880,6 +881,7 @@ var EXONERATED = /* @__PURE__ */ new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "
 var EXONERATED_ON_TRUNK = /* @__PURE__ */ new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 var exoneratedSet = (isTrunkRun) => isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED;
 var BORDERLINE = /* @__PURE__ */ new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
+var JUDGED = /* @__PURE__ */ new Set([...BORDERLINE, "INFRA_ERROR"]);
 function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = null, lane = null, opts = {}) {
   const { isTrunkRun = false, groupId = null, trunkBranch = null, commitSha = null } = opts;
   const own = new Set(changedFiles);
@@ -1542,9 +1544,10 @@ function parseAnswer(text) {
 var answerKey = (model, pack) => `v4:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + SYSTEM, pack)}`;
 
 // src/decision.ts
-function unblocks(cause, cited, pack) {
+function unblocks(cause, cited, pack, cls = "") {
   const has = (...ids) => ids.some((id) => cited.includes(id));
   const trunk = pack.trunk_history_14d ?? {};
+  if (cause === "flaky_environment" && cls === "INFRA_ERROR") return has("cross_pr", "this_pr");
   if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error);
   if (cause === "bug_on_master") return has("cross_pr") || has("trunk_history_14d") && ((trunk.fails ?? 0) > 0 || (trunk.flaky ?? 0) > 0 || trunk.latest === "failed");
   if (cause === "test_bug") return has("this_pr");
@@ -1562,9 +1565,9 @@ function decide(cls, answer, pack, cfg = DEFAULTS, isTrunkRun = false, identityU
     if (a.cause === "caused_by_pr" && a.confidence >= cfg.vetoMin && hunk) return { blocking: true, decision: "adjudicator_veto", answer: a };
     return { blocking: false, decision: "engine", answer: a };
   }
-  if (BORDERLINE.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && unblocks(a.cause, cited, pack))
+  if (JUDGED.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && unblocks(a.cause, cited, pack, cls))
     return { blocking: false, decision: "adjudicator_unblock", answer: a };
-  if (BORDERLINE.has(cls) && a.cause === "caused_by_pr" && a.confidence >= cfg.minConfidence && hunk)
+  if (JUDGED.has(cls) && a.cause === "caused_by_pr" && a.confidence >= cfg.minConfidence && hunk)
     return { blocking: true, decision: "adjudicator_blame", answer: a };
   return { blocking: !EXON.has(cls), decision: "engine", answer: a };
 }
@@ -1572,7 +1575,8 @@ function canChange(cls, pack, isTrunkRun = false) {
   const ids = evidenceIds(pack);
   const hunk = ids.some((id) => id.startsWith("hunk_"));
   if (exoneratedSet(isTrunkRun).has(cls)) return hunk;
-  if (BORDERLINE.has(cls)) return CLEARING(ids);
+  if (cls === "INFRA_ERROR") return CLEARING(ids);
+  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error);
   return false;
 }
 function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
@@ -1580,32 +1584,34 @@ function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
   const known = new Set(evidenceIds(pack));
   const cited = answer.cited_evidence.filter((c) => known.has(c));
   const hunk = cited.some((c) => c.startsWith("hunk_"));
-  if (BORDERLINE.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
+  if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
   if (answer.confidence < cfg.escalateMin) return false;
   if (exoneratedSet(isTrunkRun).has(cls)) return answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.vetoMin;
-  return BORDERLINE.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && CLEARING(cited);
+  const clears = CLEARING(cited) || cls !== "INFRA_ERROR" && answer.cause === "flaky_environment" && isInfraError(pack.error);
+  return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && clears;
 }
+var JUDGED_PER_CALL = 8;
 async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
 }, isTrunkRun = false, ledger = newLedger()) {
   const groups = /* @__PURE__ */ new Map();
   for (const [i, f] of findings.entries()) {
     const pack = packs[i];
-    if (!pack || f.identity_unresolved || !(BORDERLINE.has(f.class) || exoneratedSet(isTrunkRun).has(f.class))) continue;
+    if (!pack || f.identity_unresolved || !(JUDGED.has(f.class) && f.blocking || exoneratedSet(isTrunkRun).has(f.class))) continue;
     const advisory = !canChange(f.class, pack, isTrunkRun);
-    if (advisory && !(cfg.advise && f.blocking && BORDERLINE.has(f.class))) {
+    if (advisory && !(cfg.advise && f.blocking && JUDGED.has(f.class))) {
       ledger.skipped.no_effect++;
       f.ai = { skipped: "nothing the model could change" };
       continue;
     }
     const sig = errorSignature(f.error);
-    const key = sig ? JSON.stringify([exoneratedSet(isTrunkRun).has(f.class), advisory, f.file, sig]) : `#${i}`;
+    const key = sig ? JSON.stringify([exoneratedSet(isTrunkRun).has(f.class), advisory, f.class === "INFRA_ERROR", f.file, sig]) : `#${i}`;
     const existing = groups.get(key);
     if (existing) {
       ledger.skipped.duplicate++;
       existing.members.push({ f, pack });
     } else groups.set(key, { lead: { f, pack }, members: [{ f, pack }], advisory });
   }
-  let pending = [...groups.values()].sort((a, b) => Number(a.advisory) - Number(b.advisory));
+  let pending = [...groups.values()].sort((a, b) => Number(a.advisory) - Number(b.advisory) || b.members.length - a.members.length);
   for (const g of pending.slice(cfg.maxJudged)) {
     ledger.skipped.cap++;
     for (const m of g.members) m.f.ai = { skipped: "over the per-run limit" };
@@ -1625,16 +1631,7 @@ async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
       Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
     }
   };
-  const ask = async (model, batch, retryMissing = true) => {
-    const fresh = [];
-    for (const g of batch) {
-      const cached = cachedAnswer(cfg.answers?.[answerKey(model, g.lead.pack)]);
-      if (cached) {
-        ledger.skipped.cached++;
-        g.answer = cached;
-      } else fresh.push(g);
-    }
-    if (!fresh.length) return;
+  const call = async (model, fresh, retryMissing) => {
     const chars = fresh.reduce((n, g) => n + JSON.stringify(g.lead.pack).length, SYSTEM.length);
     const images = fresh.reduce((n, g) => n + (PACK_IMAGES.get(g.lead.pack)?.length ?? 0), 0);
     const worst = costOf({ input_tokens: chars / 3 + images * 1600, output_tokens: expectedOutput(model, fresh.length) }, model, cfg.prices);
@@ -1678,6 +1675,17 @@ async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
       }
       for (const m of g.members) m.f.ai = { model, cost_usd: (m.f.ai?.cost_usd ?? 0) + share };
     }
+  };
+  const ask = async (model, batch, retryMissing = true) => {
+    const fresh = [];
+    for (const g of batch) {
+      const cached = cachedAnswer(cfg.answers?.[answerKey(model, g.lead.pack)]);
+      if (cached) {
+        ledger.skipped.cached++;
+        g.answer = cached;
+      } else fresh.push(g);
+    }
+    for (let i = 0; i < fresh.length; i += JUDGED_PER_CALL) await call(model, fresh.slice(i, i + JUDGED_PER_CALL), retryMissing);
     const isMissing = (e) => e?.missing === true;
     const missed = fresh.filter((g) => isMissing(g.error));
     if (retryMissing && missed.length) {
@@ -1703,8 +1711,9 @@ async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
 
 // src/evaluate.ts
 var verdictOf = (findings, infra) => {
-  if (infra) return "ACTION_REQUIRED";
-  return findings.some((f) => f.blocking) ? "FAILURE" : "SUCCESS";
+  const blocked = findings.some((f) => f.blocking);
+  if (infra && (blocked || !findings.length)) return "ACTION_REQUIRED";
+  return blocked ? "FAILURE" : "SUCCESS";
 };
 async function evaluateRun({
   run,
@@ -1745,6 +1754,12 @@ async function evaluateRun({
         commitSha: id.commit_sha
       });
     });
+    if (result.infra) {
+      const why = /infrastructure errors/.test(result.infra) ? "most of this run failed on its environment" : "many tests failed in this run";
+      for (const f of result.findings)
+        if (f.class === "INFRA_ERROR" && !f.blocking)
+          Object.assign(f, { blocking: true, reason: `Environment error, held for the judge: ${why}, which this change could also have caused (see the error).` });
+    }
     for (const f of result.findings) {
       const producer = evidenceFor(f, evidence);
       if (producer) f.producer = producer;
@@ -1785,10 +1800,10 @@ async function evaluateRun({
         log(`base branch history unavailable: ${String(e).slice(0, 200)}`);
       }
     }
-    if (!blind && ask && prNumber && !result.infra) {
+    if (!blind && ask && prNumber) {
       if (enrich) {
         try {
-          await enrich(result.findings.filter((f) => BORDERLINE.has(f.class) && !f.identity_unresolved && !f.out_of_date));
+          await enrich(result.findings.filter((f) => JUDGED.has(f.class) && f.blocking && !f.identity_unresolved && !f.out_of_date));
         } catch (e) {
           log(`extra evidence unavailable: ${String(e).slice(0, 200)}`);
         }
@@ -2029,9 +2044,10 @@ function passRate(counts) {
 }
 var passLine = (counts) => `${passRate(counts)} passed (${counts.passed ?? 0} passed, ${counts.failed} failed, ${counts.skipped ?? 0} skipped)`;
 var RED_OUTSIDE = "No test failed. The lane is red because a job outside the tests failed (setup, upload or runner), or results are missing: re-run the failed jobs.";
-function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null }) {
+function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null }) {
   const branch = trunkBranch || "the default branch";
   const where = lane ? ` \xB7 ${md(lane)}` : "";
+  const infra = activeFlag(runInfra, findings);
   const groups = { yours: [], outdated: [], check: [], broken: [], flaky: [] };
   for (const f of findings) groups[bucketOf(f)].push(f);
   const { yours, outdated, check, broken, flaky } = groups;
@@ -2142,8 +2158,10 @@ function statusLabels(findings, failed = findings.length) {
 }
 var STATUS_MAX = 140;
 var runFlag = (infra) => /infrastructure errors/.test(infra) ? "mostly environment errors, re-run" : "many failures in one run";
-function statusDescription(verdict, findings, infra, counts, missing = null) {
+var activeFlag = (infra, findings) => infra && (!findings.length || findings.some((f) => f.blocking)) ? infra : null;
+function statusDescription(verdict, findings, runInfra, counts, missing = null) {
   const pass = passLine(counts);
+  const infra = activeFlag(runInfra, findings);
   const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0).join(", ");
   const rest = [infra && findings.length ? runFlag(infra) : "", missing?.short ?? ""].filter(Boolean).join("; ");
   const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);
@@ -2377,10 +2395,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing);
+    const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
       (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}
 verdict=${result.verdict}
-blocking=${result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length}
+blocking=${flag ? run.counts.failed : result.findings.filter((f) => f.blocking).length}
 exonerated=${result.findings.filter((f) => !f.blocking).length}
 description=${description}
 ai_calls=${spend.calls}
@@ -2415,7 +2434,7 @@ ai_output_tokens=${spend.output_tokens}
     }
     if (announce && lanes.length) await settleLaneSummary();
     else if (announce) {
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(result.infra)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${result.infra ? ` \xB7 ${runFlag(result.infra)}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
 `);

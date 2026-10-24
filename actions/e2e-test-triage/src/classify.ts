@@ -17,6 +17,9 @@ export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_C
 export const EXONERATED_ON_TRUNK = new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 export const exoneratedSet = (isTrunkRun: boolean): Set<string> => (isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED);
 export const BORDERLINE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
+// Blocking findings the judge may clear or blame: the borderline ones, and an environment error still blocking (a repo
+// whose PRs can break their own environment, or one held on a run that failed mostly on its environment).
+export const JUDGED = new Set([...BORDERLINE, "INFRA_ERROR"]);
 
 export interface ClassifyOptions {
   isTrunkRun?: boolean;
@@ -300,7 +303,8 @@ function sameKey(error: string | null | undefined): string | null {
  * A blocked failure with the same spec and error as a cleared one shares its
  * cause, if the cleared test's own history shows that error without this PR.
  * Typical case: a shared setup breaks, and only some of the suite's tests are
- * old enough to have history. Runs after the judge, on PR runs only.
+ * old enough to have history. Runs after the judge, on PR runs only. An environment error is not
+ * matched: one still blocking is cleared by the judge's answer or not at all.
  */
 export function sameFailure(findings: Finding[]): Finding[] {
   const blamed = (f: Finding): boolean => f.judge?.cause === "caused_by_pr";

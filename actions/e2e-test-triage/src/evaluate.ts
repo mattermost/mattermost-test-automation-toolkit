@@ -3,7 +3,7 @@
 
 import { identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
-import { BORDERLINE, classify, errorSignature, infraVerdict, sameFailure } from "./classify.ts";
+import { BORDERLINE, classify, errorSignature, infraVerdict, JUDGED, sameFailure } from "./classify.ts";
 import { DEFAULTS, historyLane, repoPath } from "./config.ts";
 import { sameTestOnOtherReports } from "./enrich.ts";
 import { evidenceFor } from "./evidence.ts";
@@ -48,9 +48,11 @@ export interface EvaluateParams {
   brokeBy?: ((findings: Finding[]) => Promise<void>) | null;
 }
 
+/** A run flagged as a whole (see infraVerdict) is red for it while any failure still blocks, or when none is named. */
 export const verdictOf = (findings: Finding[], infra: string | null | undefined): string => {
-  if (infra) return "ACTION_REQUIRED";
-  return findings.some((f) => f.blocking) ? "FAILURE" : "SUCCESS";
+  const blocked = findings.some((f) => f.blocking);
+  if (infra && (blocked || !findings.length)) return "ACTION_REQUIRED";
+  return blocked ? "FAILURE" : "SUCCESS";
 };
 
 /** Decide a run from evidence already fetched. Writes nothing. */
@@ -79,8 +81,8 @@ export async function evaluateRun({
   // model. A run whose failures all lack names is red for them: it is counted, and not classified or asked.
   const named = run.failing.some((t) => t.title.trim() !== "");
   if (run.failing.length && !named) result.unnamed = run.failing.length;
-  // A run-level infra call still names each failure (an environment error is named, and the run stays red
-  // through its verdict); only the model is kept out of an infra run.
+  // A run-level infra call still names each failure, and the model is asked as on any run: the run is red while
+  // any failure still blocks.
   if (run.failing.length && named) {
     const files = (diff.files ?? []).map((f: ChangedFile) => ({ filename: f.filename, patch: f.patch }));
     const changed = files.map((f) => f.filename);
@@ -96,6 +98,14 @@ export async function evaluateRun({
         commitSha: id.commit_sha,
       });
     });
+    // A PR that breaks its own server fails every test on the environment. On a flagged run, an environment error
+    // the rules would clear (infraClears) is held instead: only the judge's answer clears it.
+    if (result.infra) {
+      const why = /infrastructure errors/.test(result.infra) ? "most of this run failed on its environment" : "many tests failed in this run";
+      for (const f of result.findings)
+        if (f.class === "INFRA_ERROR" && !f.blocking)
+          Object.assign(f, { blocking: true, reason: `Environment error, held for the judge: ${why}, which this change could also have caused (see the error).` });
+    }
     for (const f of result.findings) {
       const producer = evidenceFor(f, evidence);
       if (producer) f.producer = producer;
@@ -153,11 +163,11 @@ export async function evaluateRun({
         log(`base branch history unavailable: ${String(e).slice(0, 200)}`);
       }
     }
-    if (!blind && ask && prNumber && !result.infra) {
+    if (!blind && ask && prNumber) {
       // More facts for the failures the rules couldn't settle; a lookup that fails only leaves a fact out.
       if (enrich) {
         try {
-          await enrich(result.findings.filter((f) => BORDERLINE.has(f.class) && !f.identity_unresolved && !f.out_of_date));
+          await enrich(result.findings.filter((f) => JUDGED.has(f.class) && f.blocking && !f.identity_unresolved && !f.out_of_date));
         } catch (e) {
           log(`extra evidence unavailable: ${String(e).slice(0, 200)}`);
         }

@@ -18,6 +18,7 @@ import { PRICES, costOf, newLedger, priceFor } from "./pricing.ts";
 import { bucketOf, passRate, renderSummary, statusDescription, statusLabelOf, statusLabels } from "./render.ts";
 import type { SummaryInput } from "./render.ts";
 import { evaluateRun, verdictOf } from "./evaluate.ts";
+import type { EvaluatedRun, EvaluateParams } from "./evaluate.ts";
 import { NotTriagedError, triage } from "./triage.ts";
 import { FINDINGS_SCHEMA, checkFindingsShape, redact } from "./findings.ts";
 import type { CommitStatus, Env, FetchImpl } from "../../shared/src/github.ts";
@@ -25,7 +26,7 @@ import { laneSummary } from "../../shared/src/lane.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
 import { elsewhereKey, fetchRun, identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { RunResult } from "../../shared/src/tsio.ts";
-import type { Answer, BatchResult, CallRecord, Config, Evidence, Finding, Ledger, Observation, Pack, PrRef, SinceLastPass, TestRef, Usage } from "./types.ts";
+import type { Answer, AskFn, BatchResult, CallRecord, Config, Evidence, Finding, Ledger, Observation, Pack, PrRef, SinceLastPass, TestRef, Usage } from "./types.ts";
 
 
 // ---------------------------------------------------------------- fixtures and fakes
@@ -390,7 +391,7 @@ test("a claim that master is broken cannot unblock on its own", () => {
   const real = decide("REGRESSION", { cause: "bug_on_master", confidence: 0.99, cited_evidence: ["cross_pr"], explanation: "x" }, pack);
   assert.equal(real.blocking, false, "a checkable citation still clears it");
 });
-test("judge asks once per run, caps the findings it sends and survives an outage", async () => {
+test("judge asks up to 8 findings per call, caps the findings it sends and survives an outage", async () => {
   const make = () => Array.from({ length: 10 }, (_, i) => classify({ ...failing, title: `t${i}` }, [...trunkPasses(8), ...crossPR(31, 32)], [], undefined, 1));
   const packsOf = (findings: Finding[]) => findings.map((f) => buildPack(f, [], { number: 1, repository: "o/r", title: "", lane: "l" }, []));
   const answer: Answer = { cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "x" };
@@ -400,7 +401,7 @@ test("judge asks once per run, caps the findings it sends and survives an outage
   await judge(findings, packsOf(findings), async (packs, model) => {
     sent.push({ n: packs.length, model });
     return fixture<BatchResult>({ answers: packs.map(() => answer), usage: { input_tokens: 10000, output_tokens: 1000 } });
-  }, { ...DEFAULTS, escalationModel: "" }, () => {}, false, ledger);
+  }, { ...DEFAULTS, escalationModel: "", maxJudged: 8 }, () => {}, false, ledger);
   assert.deepEqual(sent, [{ n: 8, model: DEFAULTS.model }], "one call carries up to maxJudged findings");
   assert.equal(findings.filter((f) => f.decision === "adjudicator_unblock").length, 8);
   assert.equal(findings.slice(8).every((f) => f.blocking && !f.decision && f.ai?.skipped), true);
@@ -409,7 +410,7 @@ test("judge asks once per run, caps the findings it sends and survives an outage
 
   const down = make();
   await judge(down, packsOf(down), async () => { throw new Error("boom"); }, DEFAULTS, () => {});
-  assert.equal(down.filter((f) => f.decision === "unavailable").length, 8, "an outage leaves every asked finding on the rules' outcome");
+  assert.equal(down.filter((f) => f.decision === "unavailable").length, 10, "an outage leaves every asked finding on the rules' outcome");
   assert.equal(down.every((f) => f.blocking), true);
   assert.equal(verdictOf(down, null), "FAILURE");
 });
@@ -1783,10 +1784,12 @@ test("end to end: report-only never changes the check's state, and an owned spec
   const posted = fetchImpl.calls.filter((c) => c.url.includes("/statuses/")).map((c) => parsed<StatusBody>(bodyText(c.init)));
   assert.ok(keptRed(posted));
 });
-test("end to end: infra storm is red for the environment, not the PR, and asks no model", async () => {
+test("end to end: infra storm is red for the environment while the model does not clear its errors", async () => {
   const many = Array.from({ length: 6 }, (_, i) => [{ ...caseRow(`t${i}`, "failed"), error_message: "Error: server not healthy" }]);
+  const asked: number[] = [];
   const fetchImpl = fakeFetch([
     ...runRoutes(many),
+    ["api.anthropic.com", (init) => { asked.push(1); return modelReply(init, { cause: "flaky_environment", confidence: 0.5, cited_evidence: ["error"], explanation: "x" }); }],
     ["/reports/history", () => Response.json({ observations: [], has_more: false })],
     ["/issues/5/comments", (init) => (init.method === "POST" ? Response.json({ id: 1 }) : Response.json([]))],
     ["/pulls/5/files", () => Response.json([])],
@@ -1801,10 +1804,192 @@ test("end to end: infra storm is red for the environment, not the PR, and asks n
   assert.deepEqual(required.map((s) => s.state), ["failure"]);
   assert.equal(required.at(-1)?.description, "(6 needs investigation; mostly environment errors, re-run) 0% passed (0 passed, 6 failed, 0 skipped)");
   assert.equal(statuses.filter((s) => s.context === "e2e-test/playwright/triage").at(-1)?.description, "6 failed → 6 needs investigation · mostly environment errors, re-run");
-  // Each failure is still named (an environment error), and the storm asks no model.
+  // Each failure is still named (an environment error), and the model is asked about them in one call.
+  assert.equal(asked.length, 1);
   assert.equal(result.findings.length, 6);
   assert.ok(result.findings.every((f) => f.class === "INFRA_ERROR" && f.blocking === true), "named, but the run stays red");
 });
+// ---------------------------------------------------------------- flagged runs and the judge's capacity
+
+/** A run of failures as evaluateRun reads it: one spec per failure unless a file is given. */
+const runOf = (failures: { title: string; file: string; error: string }[]): RunResult => fixture<RunResult>({
+  group_id: "g1",
+  failing: failures.map((t) => ({ file: t.file, title: t.title, full_title: null, suite_title: null, report_name: null, report_scope: null, identity_ambiguous: false, identity_unresolved: false, error: t.error, tries: { ran: 1, failed: 1 } })),
+  missing: null,
+  outcomes: new Map(),
+  elsewhere: new Map(),
+  counts: { total: failures.length, passed: 0, failed: failures.length, flaky: 0, skipped: 0 },
+});
+const runId: CompositeIdentity = { repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "playwright-full" };
+const evaluate = (run: RunResult, over: Partial<EvaluateParams>): Promise<EvaluatedRun> =>
+  evaluateRun({ run, id: runId, prNumber: 5, history: new Map(), diff: { files: [], ok: true }, trunkBranch: "master", testRoot: ".", ...over });
+/** A model that answers each pack with `answer`, recording how many packs each call carried. */
+const answering = (answer: (p: Pack) => Answer, sent: number[] = []): AskFn => async (packs) => {
+  sent.push(packs.length);
+  return fixture<BatchResult>({ answers: packs.map(answer), usage: { input_tokens: 1000, output_tokens: 100 } });
+};
+const SERVER_DOWN = 'Error: server at "http://localhost:8065" is not healthy after 30 seconds of retries';
+const envAnswer: Answer = { cause: "flaky_environment", confidence: 0.95, cited_evidence: ["error"], explanation: "x" };
+const downRun = (n: number): RunResult => runOf(Array.from({ length: n }, (_, i) => ({ title: `t${i}`, file: `specs/s${i}.spec.ts`, error: SERVER_DOWN })));
+// One other PR that failed each of downRun's tests the same way: cross_pr evidence, short of the cross-PR flaky rule.
+const downHistory = (n: number): Map<string, Observation[]> => new Map(Array.from({ length: n }, (_, i): [string, Observation[]] => {
+  const at = { file: `specs/s${i}.spec.ts`, title: `t${i}` };
+  return [identityKey(at), [obs({ ...at, gh_pr_number: 7, status: "failed", commit_sha: "x7", error_excerpt: SERVER_DOWN })]];
+}));
+// An environment error is cleared only on evidence from elsewhere: here, the other PR that failed the same way.
+const envCrossAnswer: Answer = { ...envAnswer, cited_evidence: ["cross_pr", "error"] };
+
+test("a run flagged for environment errors asks the model, and is green once every failure is cleared, with no run flag", async () => {
+  const sent: number[] = [];
+  const result = await evaluate(downRun(4), { history: downHistory(4), cfg: { ...DEFAULTS, infraClears: true, escalationModel: "" }, ask: answering(() => envCrossAnswer, sent) });
+  assert.match(String(result.infra), /^4 of 4 failures are infrastructure errors/);
+  assert.deepEqual(sent, [4], "every held environment error is asked");
+  assert.ok(result.findings.every((f) => f.class === "INFRA_ERROR" && !f.blocking && f.decision === "adjudicator_unblock"));
+  assert.equal(result.verdict, "SUCCESS");
+  assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts), "(4 flaky) 0% passed (0 passed, 4 failed, 0 skipped)");
+  const text = renderSummary({ findings: result.findings, infra: result.infra, runURL: "u", counts: result.counts, trunkBranch: "master" });
+  assert.match(text, /✅ none caused by this PR/);
+  assert.doesNotMatch(text, /needs investigation|infrastructure errors/);
+  // The flag stands while a failure blocks, or when no failure is named.
+  assert.equal(verdictOf(result.findings, result.infra), "SUCCESS");
+  assert.equal(verdictOf([], result.infra), "ACTION_REQUIRED");
+  assert.equal(verdictOf([{ ...result.findings[0], blocking: true }], result.infra), "ACTION_REQUIRED");
+});
+
+test("a flagged run with one failure the model blames on the PR stays red, with the run flag", async () => {
+  const run = runOf([
+    ...[0, 1, 2].map((i) => ({ title: `t${i}`, file: `specs/s${i}.spec.ts`, error: SERVER_DOWN })),
+    { title: "t3", file: "specs/s3.spec.ts", error: `${SERVER_DOWN}: panic in server/app/startup.ts` },
+  ]);
+  const diff = { files: [{ filename: "server/app/startup.ts", patch: "@@ -1 +1 @@\n-ok()\n+panic()" }], ok: true };
+  const blame: Answer = { cause: "caused_by_pr", confidence: 0.9, cited_evidence: ["hunk_0"], explanation: "x" };
+  const result = await evaluate(run, { diff, history: downHistory(3), cfg: { ...DEFAULTS, infraClears: true, escalationModel: "" }, ask: answering((p) => (p.diff_hunks_of_files_named_in_error.length ? blame : envCrossAnswer)) });
+  assert.ok(result.infra);
+  assert.deepEqual(result.findings.map((f) => [f.decision, f.blocking]), [["adjudicator_unblock", false], ["adjudicator_unblock", false], ["adjudicator_unblock", false], ["adjudicator_blame", true]]);
+  assert.equal(result.verdict, "ACTION_REQUIRED");
+  assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts), "(3 flaky, 1 caused by PR; mostly environment errors, re-run) 0% passed (0 passed, 4 failed, 0 skipped)");
+});
+
+test("a flagged run holds environment errors the rules would clear: without the model they stay red", async () => {
+  const cfg: Config = { ...DEFAULTS, infraClears: true, escalationModel: "" };
+  const result = await evaluate(downRun(4), { cfg, ask: null });
+  assert.ok(result.findings.every((f) => f.class === "INFRA_ERROR" && f.blocking), "held, not cleared by the rule");
+  assert.match(result.findings[0].reason, /held for the judge: most of this run failed on its environment/);
+  assert.equal(result.verdict, "ACTION_REQUIRED");
+  assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts), "(4 needs investigation; mostly environment errors, re-run) 0% passed (0 passed, 4 failed, 0 skipped)");
+  // A model that is unavailable leaves them held.
+  const down = await evaluate(downRun(4), { cfg, ask: async () => { throw new Error("boom"); } });
+  assert.ok(down.findings.every((f) => f.blocking), "with nothing from elsewhere to cite, and the model down, they stay held");
+  assert.equal(down.verdict, "ACTION_REQUIRED");
+  // On a run that is not flagged, the rule still clears an environment error, and the model is not asked about it.
+  const classes: string[] = [];
+  const normal = await evaluate(runOf([
+    { title: "t0", file: "specs/s0.spec.ts", error: SERVER_DOWN },
+    ...[1, 2, 3].map((i) => ({ title: `t${i}`, file: `specs/s${i}.spec.ts`, error: "Error: expected visible" })),
+  ]), { cfg, ask: async (packs) => { classes.push(...packs.map((p) => p.engine.class)); return fixture<BatchResult>({ answers: packs.map(() => envAnswer), usage: { input_tokens: 1, output_tokens: 1 } }); } });
+  assert.equal(normal.infra, null);
+  assert.equal(normal.findings[0].class, "INFRA_ERROR");
+  assert.equal(normal.findings[0].blocking, false);
+  assert.equal(normal.findings[0].decision, undefined);
+  assert.ok(!classes.includes("INFRA_ERROR"), "a cleared environment error is not sent");
+});
+
+test("a storm of failures is judged: 24 questions in calls of 8, the rest over the per-run limit stay red with the flag", async () => {
+  const run = runOf(Array.from({ length: 30 }, (_, i) => ({ title: `t${i}`, file: `specs/s${i}.spec.ts`, error: "Error: expected visible" })));
+  const history = new Map(run.failing.map((t): [string, Observation[]] => [identityKey(t), [...trunkPasses(8), ...crossPR(31, 32)]]));
+  const sent: number[] = [];
+  const recurs: Answer = { cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "x" };
+  const result = await evaluate(run, { history, cfg: { ...DEFAULTS, escalationModel: "" }, ask: answering(() => recurs, sent) });
+  assert.match(String(result.infra), /^30 tests failed in one run/);
+  assert.deepEqual(sent, [8, 8, 8]);
+  assert.equal(result.findings.filter((f) => f.decision === "adjudicator_unblock").length, 24);
+  assert.ok(result.findings.slice(24).every((f) => f.blocking && f.ai?.skipped === "over the per-run limit"));
+  assert.equal(result.verdict, "ACTION_REQUIRED");
+  assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts), "(24 flaky, 6 needs investigation; many failures in one run) 0% passed (0 passed, 30 failed, 0 skipped)");
+});
+
+test("a blocking environment error (infraClears off) is the judge's to clear or blame on any run", async () => {
+  const cleared = await evaluate(downRun(1), { history: downHistory(1), cfg: { ...DEFAULTS, escalationModel: "" }, ask: answering(() => envCrossAnswer) });
+  // The error text alone never clears one: a PR that breaks the server fails every test with such an error.
+  const textOnly = await evaluate(downRun(1), { cfg: { ...DEFAULTS, escalationModel: "" }, ask: answering(() => envAnswer) });
+  assert.equal(textOnly.findings[0].blocking, true);
+  assert.equal(textOnly.verdict, "FAILURE");
+  assert.equal(cleared.infra, null);
+  assert.equal(cleared.findings[0].decision, "adjudicator_unblock");
+  assert.equal(cleared.findings[0].blocking, false);
+  assert.equal(cleared.verdict, "SUCCESS");
+  const run = runOf([{ title: "t0", file: "specs/s0.spec.ts", error: `${SERVER_DOWN}: panic in server/app/startup.ts` }]);
+  const diff = { files: [{ filename: "server/app/startup.ts", patch: "@@ -1 +1 @@\n-ok()\n+panic()" }], ok: true };
+  const blamed = await evaluate(run, { diff, cfg: { ...DEFAULTS, escalationModel: "" }, ask: answering(() => ({ cause: "caused_by_pr", confidence: 0.9, cited_evidence: ["hunk_0"], explanation: "x" })) });
+  assert.equal(blamed.findings[0].decision, "adjudicator_blame");
+  assert.equal(statusLabelOf(blamed.findings[0]), "caused by PR");
+  assert.equal(blamed.verdict, "FAILURE");
+  // The bar is the same as for any judged finding: sure enough, and a blame needs a change to point to.
+  const pack = buildPack(blamed.findings[0], diff.files, prCtx, []);
+  assert.equal(canChange("INFRA_ERROR", pack), true, "a related hunk: the model may blame it");
+  assert.equal(canChange("INFRA_ERROR", buildPack(textOnly.findings[0], [], prCtx, [])), false, "no other PR, earlier pass or hunk to cite: no answer can change it");
+  assert.equal(decide("INFRA_ERROR", envAnswer, pack).blocking, true, "the error text alone never clears it");
+  assert.equal(decide("INFRA_ERROR", { ...envAnswer, confidence: 0.8 }, pack).blocking, true, "below the threshold it stays red");
+  assert.equal(decide("INFRA_ERROR", { ...envAnswer, cause: "test_bug" }, pack).blocking, true, "a test bug needs this PR's earlier pass");
+  assert.equal(decide("INFRA_ERROR", { cause: "caused_by_pr", confidence: 0.95, cited_evidence: ["error"], explanation: "x" }, pack).decision, "engine", "no blame without a hunk");
+  assert.equal(decide("INFRA_ERROR", undefined, pack).blocking, true, "no answer leaves it red");
+});
+
+test("the judge asks 8 findings to a call, larger groups first, each call within what is left of the budget", async () => {
+  const recurs: Answer = { cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "x" };
+  const hist = [...trunkPasses(8), ...crossPR(31, 32)];
+  const sidebar = "Error: expected the channel sidebar to list the new channel";
+  const make = (): Finding[] => [
+    ...Array.from({ length: 19 }, (_, i) => classify({ ...failing, title: `t${i}`, file: `specs/s${i}.spec.ts` }, hist, [], undefined, 1)),
+    // Three tests of one spec with one distinctive error: one question, and it goes first.
+    ...[0, 1, 2].map((i) => classify({ file: "specs/big.spec.ts", title: `big${i}`, error: sidebar }, [...trunkPasses(8), ...crossPR(31, 32).map((o) => ({ ...o, error_excerpt: sidebar }))], [], undefined, 1)),
+  ];
+  const packsOf = (findings: Finding[]) => findings.map((f) => buildPack(f, [], prCtx, []));
+  const calls: string[][] = [];
+  const all = make();
+  await judge(all, packsOf(all), async (packs) => {
+    calls.push(packs.map((p) => p.test.title));
+    return fixture<BatchResult>({ answers: packs.map(() => recurs), usage: { input_tokens: 1000, output_tokens: 100 } });
+  }, { ...DEFAULTS, escalationModel: "" });
+  assert.deepEqual(calls.map((c) => c.length), [8, 8, 4], "20 questions in three calls");
+  assert.equal(calls[0][0], "big0", "the question that settles three tests is asked first");
+  assert.ok(all.every((f) => f.decision === "adjudicator_unblock"));
+
+  // A budget the first call uses up: its 8 questions are answered, and the other 12 are not asked.
+  const tight = make();
+  const ledger = newLedger();
+  const warnings: string[] = [];
+  let asked = 0;
+  await judge(tight, packsOf(tight), async (packs) => {
+    asked++;
+    return fixture<BatchResult>({ answers: packs.map(() => recurs), usage: { input_tokens: 50000, output_tokens: 0 } });
+  }, { ...DEFAULTS, escalationModel: "", budgetUsd: 0.1 }, (w) => warnings.push(w), false, ledger);
+  assert.equal(asked, 1);
+  assert.equal(ledger.calls[0].cost_usd, 0.1);
+  assert.equal(ledger.skipped.budget, 12);
+  assert.equal(tight.filter((f) => f.decision === "adjudicator_unblock").length, 10, "8 questions, one of them for 3 tests");
+  const skipped = tight.filter((f) => f.decision !== "adjudicator_unblock");
+  assert.equal(skipped.length, 12);
+  assert.ok(skipped.every((f) => f.blocking && /would cross the \$0\.1 run budget/.test(String(f.ai?.skipped))));
+  assert.equal(warnings.filter((w) => /model call skipped/.test(w)).length, 2, "each call is checked on its own");
+});
+
+test("the escalation pass asks its near misses in calls of 8 too", async () => {
+  const hist = [...trunkPasses(8), ...crossPR(31, 32)];
+  const findings = Array.from({ length: 10 }, (_, i) => classify({ ...failing, title: `t${i}`, file: `specs/s${i}.spec.ts` }, hist, [], undefined, 1));
+  const sent: { n: number; model: string }[] = [];
+  await judge(findings, findings.map((f) => buildPack(f, [], prCtx, [])), async (packs, model) => {
+    sent.push({ n: packs.length, model });
+    const confidence = model === DEFAULTS.model ? 0.7 : 0.95;
+    return fixture<BatchResult>({ answers: packs.map(() => ({ cause: "flaky_environment", confidence, cited_evidence: ["cross_pr"], explanation: "x" })), usage: { input_tokens: 1000, output_tokens: 100 } });
+  }, { ...DEFAULTS, escalationModel: "claude-fable-5-1", budgetUsd: 5 });
+  assert.deepEqual(sent, [
+    { n: 8, model: DEFAULTS.model }, { n: 2, model: DEFAULTS.model },
+    { n: 8, model: "claude-fable-5-1" }, { n: 2, model: "claude-fable-5-1" },
+  ]);
+  assert.ok(findings.every((f) => f.decision === "adjudicator_unblock" && f.escalated));
+});
+
 test("end to end: green run posts success and no comment", async () => {
   const fetchImpl = fakeFetch([
     ...runRoutes([spec("t1", "passed")]),

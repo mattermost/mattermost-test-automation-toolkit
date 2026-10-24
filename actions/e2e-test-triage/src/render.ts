@@ -238,9 +238,11 @@ const RED_OUTSIDE = "No test failed. The lane is red because a job outside the t
  * groups (Your PR, Out of date, Needs a look, Broken on the base branch, Flaky; one line each: why and the next
  * step), then the evidence, collapsed.
  */
-export function renderSummary({ findings, infra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null }: SummaryInput): string {
+export function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null }: SummaryInput): string {
   const branch = trunkBranch || "the default branch";
   const where = lane ? ` · ${md(lane)}` : "";
+  // A flagged run whose every failure was cleared reads as any other cleared run.
+  const infra = activeFlag(runInfra, findings);
   const groups: Record<Bucket, Finding[]> = { yours: [], outdated: [], check: [], broken: [], flaky: [] };
   for (const f of findings) groups[bucketOf(f)].push(f);
   const { yours, outdated, check, broken, flaky } = groups;
@@ -413,13 +415,18 @@ const STATUS_MAX = 140;
 /** Why a run-level verdict keeps the run red, in the check's words: the environment, or a storm of failures. */
 export const runFlag = (infra: string): string => (/infrastructure errors/.test(infra) ? "mostly environment errors, re-run" : "many failures in one run");
 
+/** The run-level flag while it still keeps the run red: some failure still blocks, or none is named. Null once every failure is cleared. */
+export const activeFlag = (infra: string | null | undefined, findings: Finding[]): string | null =>
+  infra && (!findings.length || findings.some((f) => f.blocking)) ? infra : null;
+
 /**
  * The E2E check's text: "(2 flaky, 2 caused by PR) 99.7% passed (1186 passed, 4 failed, 164 skipped)". Zero labels are
  * left out. The pass line is never shortened; past 140 characters the labels are, as the last resort.
  */
-export function statusDescription(verdict: string, findings: Finding[], infra: string | null | undefined, counts: Partial<Counts>, missing: SummaryMissing | null = null): string {
+export function statusDescription(verdict: string, findings: Finding[], runInfra: string | null | undefined, counts: Partial<Counts>, missing: SummaryMissing | null = null): string {
   const pass = passLine(counts);
-  // A run with many failures stays red, but still says what triage made of each one.
+  // A run with many failures says what triage made of each one, and its flag only while one still blocks.
+  const infra = activeFlag(runInfra, findings);
   const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0).join(", ");
   const rest = [infra && findings.length ? runFlag(infra) : "", missing?.short ?? ""].filter(Boolean).join("; ");
   const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);

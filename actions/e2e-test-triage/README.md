@@ -18,9 +18,9 @@ reads its recent history on the PR's base branch and on other PRs:
 
 | Finding | Meaning | Outcome |
 | --- | --- | --- |
-| `INFRA` | Mostly infrastructure errors, or 30+ failures | `ACTION_REQUIRED`, never cleared |
+| `INFRA` | Mostly infrastructure errors, or 30+ failures | Each failure is judged as on any run; `ACTION_REQUIRED` while any still blocks |
 | `OWNED_BY_PR` | The PR changed the failing spec | Blocking, never sent to the model |
-| `INFRA_ERROR` | The test's own error is its environment (test server down, a proxy page instead of JSON, a shard that never ran) | Cleared with `infra-clears: true`, otherwise blocking with "re-run" |
+| `INFRA_ERROR` | The test's own error is its environment (test server down, a proxy page instead of JSON, a shard that never ran) | Cleared with `infra-clears: true` (held on an `INFRA` run), otherwise blocking unless the model clears it |
 | `BROKEN_ON_TRUNK` | Master's latest run fails it too | Cleared |
 | `FLAKY_ON_TRUNK` | It is intermittent on master (see below) | Cleared |
 | `FLAKY_CROSS_PR` | 3+ other PRs fail it with the same error, and master passes it | Cleared |
@@ -49,7 +49,19 @@ before any data was collected; the 7-week replay found no wrong clear with them.
 **Environment errors:** `infra-clears: true` suits mobile and desktop, where the
 PR changes an app that runs against a separate test server. Leave it off where
 the PR can break the server itself (mattermost): there an unhealthy server may be
-the change, so the test is named and the developer re-runs.
+the change, so the test stays blocking and goes to the model, which clears it or
+names the PR by the same bar as any other failure.
+
+**A run flagged as a whole** (`INFRA`: at least half its failures are environment
+errors, or 30 or more failed) is triaged test by test like any other run, and the
+model is asked. A PR that breaks server startup fails every test on its
+environment, so on a flagged run an environment error is held even with
+`infra-clears: true`: it stays blocking until the model clears it, and the model
+clears an environment error only by citing the same failure on another PR or a
+pass on an earlier commit of this PR, never on its error text alone. Without the
+model (no key, over budget, an error) it stays blocking, and the run stays red as
+`ACTION_REQUIRED`. Once every failure is cleared, the run is `SUCCESS` like any
+other; missing reports still keep it red.
 
 **Lanes the base branch rarely runs:** history is read per lane. A lane master
 runs only sometimes (mattermost's subpath suite) has too little history to call
@@ -82,16 +94,20 @@ but never makes one alone, since the PR's own CI wrote it. It can veto a history
 clear only at 0.9 with a related diff hunk. If it fails or is unavailable, the
 rules' outcome stands.
 
-- All of a run's questions go in one request; tests with the same spec and error
-  share a question. A question the response leaves out is asked once more.
+- Tests with the same spec and error share a question. Up to 24 questions per run
+  are asked, 8 to a request: questions that can change the outcome first, then
+  those that settle the most tests. A question the response leaves out is asked
+  once more. Over 24, the rest keep the rules' outcome.
 - `escalation-model` (off by default) asks a second model once about an answer just
   short of the threshold, or one that blames the PR without citing a change.
 - A blocking failure the model has nothing to cite for is still asked
   (`ai-advice`), and its read is shown as advice. It never changes the outcome.
 - Spend is priced per call and shown in the summary and the `ai-cost-usd`
-  output. A call that could cross `ai-budget-usd` (1 per job) is not made, and
+  output. A request that could cross `ai-budget-usd` (1 per job) is not made, and
   neither is one past the lane's share of `pr-budget-usd` (2 per PR, split evenly
-  between the lanes in `triage-lanes`, across all the PR's commits). A model with
+  between the lanes in `triage-lanes`, across all the PR's commits). Each request
+  is checked on its own against what is left, so a big run gets the answers the
+  budget allows. A model with
   no price (not in the built-in table or `AI_PRICES`) has no bounded cost, so it
   is not called; a budget that is not a finite amount of 0 or more is replaced by
   its default with a warning. A response that is not used (cut off, or served by
@@ -107,9 +123,10 @@ rules' outcome stands.
   order: flaky, broken on main, caused by PR, out of date, needs investigation. The
   rate is passed ÷ (passed + failed), as in
   mattermost's own E2E check; it never reads 100% while something failed.
-  A run flagged as a whole stays red and says why after the labels: "mostly
-  environment errors, re-run" when at least half its failures are environment
-  errors, or "many failures in one run" at 30 or more.
+  A run flagged as a whole says why after the labels while any failure still
+  blocks: "mostly environment errors, re-run" when at least half its failures are
+  environment errors, or "many failures in one run" at 30 or more. Once every
+  failure is cleared, the flag is gone.
   Enforce also sets the state (success only for `SUCCESS`); report-only keeps
   the state the check has, and writes nothing while it is still pending.
 - **Job summary**, for a lane where something failed, a report is missing, or

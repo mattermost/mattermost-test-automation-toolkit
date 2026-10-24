@@ -17,7 +17,7 @@ import { evaluateRun } from "./evaluate.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
 import { redact, secretsOf, writeFindings } from "./findings.ts";
 import { ledgerTotals } from "./pricing.ts";
-import { noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
+import { activeFlag, noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
 import type { AskFn, Config, Diff, HistoryLike } from "./types.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
@@ -322,8 +322,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing);
+    // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
+    const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
-      appendFileSync(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}\nverdict=${result.verdict}\nblocking=${result.infra ? run.counts.failed : result.findings.filter((f) => f.blocking).length}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\n` +
+      appendFileSync(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}\nverdict=${result.verdict}\nblocking=${flag ? run.counts.failed : result.findings.filter((f) => f.blocking).length}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\n` +
         `ai_calls=${spend.calls}\nai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}\nai_input_tokens=${spend.input_tokens}\nai_output_tokens=${spend.output_tokens}\n`);
     // A lane with nothing failed or missing has nothing to report, so it writes no job
     // summary: the run page then shows only the lanes someone needs to read.
@@ -362,9 +364,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     if (announce && lanes.length) await settleLaneSummary();
     else if (announce) {
       // The same labels as the E2E check's text (see statusDescription).
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (result.infra && !result.findings.length
-        ? `${run.counts.failed} failed · not triaged, ${runFlag(result.infra)}`
-        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${result.infra ? ` · ${runFlag(result.infra)}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (flag && !result.findings.length
+        ? `${run.counts.failed} failed · not triaged, ${runFlag(flag)}`
+        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
     log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);

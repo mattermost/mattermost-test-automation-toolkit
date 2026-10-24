@@ -49,6 +49,16 @@ test("a lane summary reads red lanes by their labels and old wording alike, and 
   assert.deepEqual(lanes({ "e2e-test/detox-ios": st("success", "(0 flaky) 597 passed, 0 failed") }), { state: "success", description: "All lanes green" });
 });
 
+test("a flagged run reads the same way: its flag while a failure blocks, none once all are cleared", () => {
+  // Every failure cleared: no flag, green, and named as cleared by triage.
+  assert.deepEqual(lanes({ "e2e-test/playwright": st("success", "(4 flaky) 0% passed (0 passed, 4 failed, 0 skipped)") }),
+    { state: "success", description: "playwright cleared by triage · all lanes green" });
+  // One still blocks: the flag stays, after the labels.
+  assert.equal(redReason("(3 flaky, 1 caused by PR; mostly environment errors, re-run) 0% passed (0 passed, 4 failed, 0 skipped)"), "3 cleared, 1 caused by PR, environment errors, re-run");
+  assert.equal(redReason("(24 flaky, 6 needs investigation; many failures in one run) 0% passed (0 passed, 30 failed, 0 skipped)"), "24 cleared, 6 to check, many failures in one run");
+  assert.equal(redReason("(4 needs investigation; mostly environment errors, re-run) 0% passed (0 passed, 4 failed, 0 skipped)"), "4 to check, environment errors, re-run");
+});
+
 test("a lane that is pending keeps the PR-wide check pending, whatever its labels", () => {
   assert.deepEqual(lanes({ "e2e-test/detox-ios": st("pending", "(1 flaky) running"), "e2e-test/maestro-ios": st("failure", "(1 caused by PR) 0% passed") }),
     { state: "pending", description: "Triage is checking: waiting for detox-ios" });
