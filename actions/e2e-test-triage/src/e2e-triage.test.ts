@@ -10,7 +10,8 @@ import { EXONERATED_ON_TRUNK, classify, errorSignature, infraVerdict, isInfraErr
 import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, laneOfReport, repoPath } from "./config.ts";
 import { answerKey, askModelBatch, packKey, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
 import { OUT_OF_DATE_DIR_CAP, fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
-import { codeExcerpt, enrichFindings, failingLine, sameTestOnOtherReports, siblingPlatforms } from "./enrich.ts";
+import { commonSenseClear, onlyOnPlatform, platformOf } from "./common-sense.ts";
+import { codeExcerpt, enrichFindings, failingLine, prChangedSince, sameTestOnOtherReports, siblingPlatforms } from "./enrich.ts";
 import { evidenceFor, loadEvidence } from "./evidence.ts";
 import { CLEARING, buildPack, chainClears, changeCategory, changeSummary, compactError, evidenceIds, namesChangedFile } from "./pack.ts";
 import type { OtherFailure } from "./pack.ts";
@@ -3888,10 +3889,14 @@ test("a chained failure end to end: the pack carries the earlier failure, and th
   const history = new Map(run.failing.map((t): [string, Observation[]] => [identityKey(t), trunkPasses(8)]));
   const packs: Pack[] = [];
   const chain: Answer = { cause: "flaky_environment", confidence: 0.9, cited_evidence: ["earlier_failure_same_spec", "other_platforms"], explanation: "x" };
+  // An iOS-only change in the PR: common sense can't rule it out for an iOS failure, so the model is asked.
+  const iosOnly = { files: [{ filename: "ios/Podfile.lock", patch: "@@ -1 +1 @@\n-a\n+b" }], ok: true };
+  const otherPlatforms = async (fs: Finding[]): Promise<void> => { for (const f of fs) if (f.title === "MM-T4691_3") f.other_lanes = [{ platform: "detox-android", result: "passed" }]; };
   const result = await evaluate(run, {
     history,
+    diff: iosOnly,
     cfg: { ...DEFAULTS, escalationModel: "" },
-    otherPlatforms: async (fs) => { for (const f of fs) if (f.title === "MM-T4691_3") f.other_lanes = [{ platform: "macos", result: "passed" }]; },
+    otherPlatforms,
     ask: answering((p) => (packs.push(p), chain)),
   });
   const [later, earlier] = result.findings;
@@ -3904,4 +3909,109 @@ test("a chained failure end to end: the pack carries the earlier failure, and th
   assert.equal(earlier.decision, "advice", "the held environment error has nothing an answer could clear it with: advice only");
   assert.equal(earlier.blocking, true, "the environment error itself is never cleared by the chain");
   assert.equal(result.verdict, "FAILURE");
+  // Without the iOS-only change, common sense clears it before the model: Android passed this commit, the PR touches nothing.
+  const asked: string[] = [];
+  const plain = await evaluate(run, { history, cfg: { ...DEFAULTS, escalationModel: "" }, otherPlatforms, ask: answering((p) => (asked.push(p.test.title), chain)) });
+  assert.equal(plain.findings[0].decision, "rules_unblock");
+  assert.ok(!asked.includes("MM-T4691_3"), "settled without the model");
+});
+
+// ---------------------------------------------------------------- common sense: the same commit rules the PR out
+
+// A failure on linux that passed on the other two platforms of the same commit and passes on trunk (desktop #4033).
+const onePlatform = (over: Partial<Finding> = {}, history: Observation[] = trunkPasses(25)): Finding =>
+  Object.assign(classify(failing, history, [], undefined, 1), {
+    repo_path: "specs/a.spec.ts",
+    untouched: true,
+    report_name: "e2e-on-ubuntu-latest-6.0.0",
+    other_lanes: [{ platform: "macos", result: "passed" }, { platform: "windows", result: "passed" }],
+  }, over);
+const packOfFinding = (f: Finding, diff: { filename: string; patch?: string }[] = []): Pack => buildPack(f, diff.map((d) => ({ filename: d.filename, patch: d.patch ?? "" })), prCtx, []);
+
+test("platforms: a report names its platform, and a file reaches one platform only by its path", () => {
+  assert.deepEqual(["e2e-on-ubuntu-latest-6.0", "e2e-on-windows-2022", "e2e-on-macos-26", "detox-ios", "detox-android", "e2e-cypress / dispatch-run--21", null].map(platformOf), ["linux", "windows", "macos", "ios", "android", null, null]);
+  assert.ok(onlyOnPlatform("ios", "ios/Podfile.lock") && onlyOnPlatform("ios", "ios/Mattermost/AppDelegate.swift"));
+  assert.ok(onlyOnPlatform("android", "android/app/build.gradle") && onlyOnPlatform("linux", "src/main/linux/tray.ts") && onlyOnPlatform("windows", "scripts/win32/installer.nsh"));
+  assert.ok(!onlyOnPlatform("ios", "package.json") && !onlyOnPlatform("windows", "src/renderer/window.ts") && !onlyOnPlatform("linux", "src/debug.ts") && !onlyOnPlatform("macos", "src/machine.ts"));
+});
+
+test("common sense clears a test that failed on one platform only, passes on trunk, and that the PR doesn't touch (desktop #4033)", () => {
+  const f = onePlatform();
+  assert.equal(f.class, "REGRESSION");
+  assert.equal(commonSenseClear(f, packOfFinding(f), ["e2e/helpers/callsLogs.js", ".github/workflows/ci.yaml"]), "Failed only on linux: it passed on macos and windows on this same commit, passes on trunk (25 of 25 runs), and this PR changes nothing it uses.");
+});
+
+test("common sense never clears what the PR could have caused", () => {
+  const clears = (f: Finding, files: string[] = [], diff: { filename: string; patch?: string }[] = []): string | null => commonSenseClear(f, packOfFinding(f, diff), files);
+  assert.equal(clears(onePlatform({ other_lanes: [{ platform: "macos", result: "passed" }, { platform: "windows", result: "failed" }] })), null, "it failed on another platform too: a shared break (desktop #4020)");
+  assert.equal(clears(onePlatform({ other_lanes: [] })), null, "no other platform ran it (mattermost)");
+  assert.equal(clears(onePlatform({ other_lanes: [{ platform: "macos", result: "flaky" }] })), null, "a pass on retry elsewhere is not a pass");
+  assert.equal(clears(onePlatform({ untouched: false })), null, "the PR changes a file its error names");
+  assert.equal(clears(onePlatform(), [], [{ filename: "src/helper.ts", patch: "@@" }].map((d) => ({ ...d, filename: "specs/a.spec.ts" }))), null, "the PR edits the spec");
+  assert.equal(clears(onePlatform(), ["src/main/linux/tray.ts"]), null, "a linux-only change, for a linux failure");
+  assert.ok(clears(onePlatform(), ["ios/Podfile.lock"]), "an iOS-only change cannot break linux");
+  assert.equal(clears(onePlatform({ report_name: "detox-ios", other_lanes: [{ platform: "detox-android", result: "passed" }] }), ["ios/Podfile.lock"]), null, "an iOS-only change, for an iOS failure");
+  assert.equal(clears(onePlatform({ report_name: "worker-3" })), null, "a report that names no platform");
+  assert.equal(clears(onePlatform({}, trunkPasses(2))), null, "too little trunk history, and no pass on this PR");
+  for (const over of [{ blocking: false }, { identity_unresolved: true }, { out_of_date: { base: "master", behind: 1, commit: null } }, { decision: "evidence_incomplete" }] as Partial<Finding>[])
+    assert.equal(clears(onePlatform(over)), null, JSON.stringify(over));
+  assert.equal(commonSenseClear(onePlatform(), null, []), null, "no pack: the evidence is incomplete");
+  const env = Object.assign(classify({ ...failing, error: SERVER_DOWN }, trunkPasses(25), [], undefined, 1), { report_name: "e2e-on-ubuntu-latest", other_lanes: [{ platform: "macos", result: "passed" }] });
+  assert.equal(env.class, "INFRA_ERROR");
+  assert.equal(commonSenseClear(env, packOfFinding(env), []), null, "an environment error stays the judge's");
+});
+
+test("the PR's own changes since a pass: a file only the base branch changed, or whose own patch is the same, is not one", () => {
+  const now = [{ filename: "moved.ts", patch: "@@ -10,2 +10,3 @@\n+x" }, { filename: "edited.ts", patch: "@@ -1 +1 @@\n-y\n+z" }, { filename: "big.json" }];
+  const then = [{ filename: "moved.ts", patch: "@@ -4,2 +4,3 @@\n+x" }, { filename: "edited.ts", patch: "@@ -1 +1 @@\n-y\n+w" }, { filename: "reverted.ts", patch: "@@ +q" }, { filename: "big.json" }];
+  assert.deepEqual(prChangedSince(["moved.ts", "edited.ts", "from-base.ts", "reverted.ts", "big.json"], now, then), ["edited.ts", "reverted.ts", "big.json"],
+    "a base change only moved moved.ts's lines; from-base.ts is the base branch's; a reverted file and one too big to show are the PR's");
+});
+
+test("enrich tells the PR's own changes since its last pass from the base branch's", async () => {
+  const f: Finding = { ...classify(failing, [...trunkPasses(8), mine("passed", "lastpass", "2026-10-19T00:00:00Z")], [], undefined, 1), repo_path: "specs/a.spec.ts" };
+  const api = async (_method: string, path: string): Promise<unknown> => {
+    if (path.startsWith("/repos/o/r/compare/lastpass...head")) return { files: [{ filename: "package.json", patch: "@@ -5 +5 @@\n+emm" }, { filename: "app/calls.ts", patch: "@@ main" }] };
+    if (path.startsWith("/repos/o/r/compare/main...lastpass")) return { files: [{ filename: "package.json", patch: "@@ -3 +3 @@\n+emm" }] };
+    throw new Error(`unexpected ${path}`);
+  };
+  await enrichFindings({ findings: [f], api, id: { repository: "o/r", commit_sha: "head", gh_run_id: "9", gh_run_attempt: "1", name: "pw" }, testRoot: ".", prFiles: [{ filename: "package.json", patch: "@@ -9 +9 @@\n+emm" }], baseBranch: "main" });
+  assert.deepEqual(f.since_last_pass?.pr_changed, [], "the PR's own patch is as it was at the pass; app/calls.ts came from main");
+  const noBase: Finding = { ...classify(failing, [...trunkPasses(8), mine("passed", "lastpass", "2026-10-19T00:00:00Z")], [], undefined, 1), repo_path: "specs/a.spec.ts" };
+  await enrichFindings({ findings: [noBase], api, id: { repository: "o/r", commit_sha: "head", gh_run_id: "9", gh_run_attempt: "1", name: "pw" }, testRoot: "." });
+  assert.equal(noBase.since_last_pass?.pr_changed, undefined, "without the PR's diff nothing is told apart");
+});
+
+test("common sense clears a failure that passed here earlier on this PR, with nothing related the PR changed since, and passed on another platform (mobile #10248)", () => {
+  const history = [...trunkPasses(25), mine("passed", "b44f1b8aa", "2026-10-19T00:00:00Z")];
+  const ios = (since: Partial<SinceLastPass>): Finding => onePlatform({
+    report_name: "detox-ios",
+    other_lanes: [{ platform: "detox-android", result: "passed" }],
+    since_last_pass: fixture<SinceLastPass>({ files: ["ios/Podfile.lock", "package.json", "app/calls.ts"], related: [{ file: "app/calls.ts", patch: "@@" }], complete: true, ...since }),
+  }, history);
+  const prFiles = ["ios/Podfile.lock", "package.json", "package-lock.json"];
+  // Main merged in a related change, and the PR's own patches are as they were at the pass.
+  const merged = ios({ pr_changed: [] });
+  const pack = packOfFinding(merged);
+  assert.deepEqual(pack.this_pr_history?.changed_since_last_pass?.related_to_this_test, []);
+  assert.deepEqual(pack.this_pr_history?.changed_since_last_pass?.related_from_base, ["app/calls.ts"]);
+  assert.ok(evidenceIds(pack).includes("this_pr"));
+  assert.equal(commonSenseClear(merged, pack, prFiles), "Failed only on ios: it passed on detox-android on this same commit, and passed on ios earlier on this PR (b44f1b8) with nothing related this PR changed since.");
+  // A related change from the base branch counts only while trunk's latest run passed with it.
+  assert.ok(!evidenceIds({ ...pack, trunk_history_14d: { ...pack.trunk_history_14d, latest: "failed" } }).includes("this_pr"));
+  // The PR itself changed something related since the pass, or something only iOS runs, or what it changed is unknown.
+  assert.equal(commonSenseClear(ios({ pr_changed: ["app/calls.ts"] }), packOfFinding(ios({ pr_changed: ["app/calls.ts"] })), prFiles), null);
+  assert.equal(commonSenseClear(ios({ pr_changed: ["ios/Podfile.lock"] }), packOfFinding(ios({ pr_changed: ["ios/Podfile.lock"] })), prFiles), null);
+  assert.equal(commonSenseClear(ios({}), packOfFinding(ios({})), prFiles), null);
+});
+
+test("common sense works without the model: the run is green and says why", async () => {
+  const run = { ...runOf([{ title: "t1", file: "specs/a.spec.ts", error: "Error: Server views should finish reloading" }]) };
+  const linux = { ...run, failing: run.failing.map((t) => ({ ...t, report_name: "e2e-on-ubuntu-latest-6.0.0" })), counts: { total: 240, passed: 239, failed: 1, flaky: 0, skipped: 0 } };
+  const history = new Map([[identityKey(linux.failing[0]), trunkPasses(25)]]);
+  const result = await evaluate(linux, { history, ask: null, otherPlatforms: async (fs) => { for (const f of fs) f.other_lanes = [{ platform: "macos", result: "passed" }, { platform: "windows", result: "passed" }]; } });
+  assert.deepEqual(result.findings.map((f) => [f.class, f.blocking, f.decision]), [["REGRESSION", false, "rules_unblock"]]);
+  assert.equal(result.verdict, "SUCCESS");
+  assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts), "(1 flaky) 99.6% passed (239 passed, 1 failed, 0 skipped)");
+  assert.match(renderSummary({ findings: result.findings, infra: null, runURL: "u", counts: result.counts, trunkBranch: "master", pr: true }), /Failed only on linux: it passed on macos and windows on this same commit/);
 });

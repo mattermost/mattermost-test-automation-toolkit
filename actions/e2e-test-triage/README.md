@@ -84,6 +84,25 @@ anything flaky; `history-lane` makes it read a lane with the same tests, such as
 `playwright-full-enterprise`. Because a failure clears only with the same error,
 a break specific to that lane still goes to the model.
 
+**Failed on one platform only (common sense, with or without the model):** a
+regression or a test with too little history is cleared as flaky when the same
+commit shows the PR is not its cause. The same test passed on another platform of
+this same commit (iOS against Android, Linux against macOS and Windows) and failed
+on none, and **either**
+
+- it passed on this platform earlier on this PR, and nothing related that the
+  PR itself changed since: a file merged in from the base branch, or one whose
+  own patch is the same as at that pass, is the base branch's change, which
+  trunk runs (allowed while trunk's latest run of the test passed), **or**
+- it passes on trunk (a regression), and the PR changes nothing it uses: not the
+  spec, no file its error names.
+
+A PR that breaks shared code fails every platform, so the pass elsewhere is what
+rules the PR out. It never applies when the PR changes a file that reaches the
+failing platform only (`ios/`, `Podfile.lock`, `android/`, `*.gradle`, a path
+naming linux, windows or macos), to an environment error, or where no other
+platform ran the test (mattermost's lanes are workers of one platform).
+
 If the evidence is incomplete (changed files, test root, base branch, truncated
 history, report scope, or a test whose identity is ambiguous), nothing is
 cleared and the model is not asked. The same goes for the list of changes since
@@ -103,7 +122,7 @@ the bar and nothing in the diff could touch the test, 0.6 to 0.85 when something
 in the diff could, below 0.6 when the evidence is not enough. It clears a failure
 only at `min-confidence` (0.85) or more **and** with a citation a reviewer can
 open: other PRs failing the same way, or an earlier pass on this PR with nothing
-related changed since (for an environment cause, also an error that is clearly
+related the PR changed since (for an environment cause, also an error that is clearly
 infrastructural). What the test run recorded (`evidence-dir`) supports a clear
 but never makes one alone, since the PR's own CI wrote it.
 

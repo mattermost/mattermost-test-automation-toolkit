@@ -303,7 +303,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       prTitle: pull.title ?? "", lane: env.LANE || id.name, log,
       ask,
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
-      enrich: (findings) => enrichFindings({ findings, api, id, testRoot, log }),
+      // The PR's diff from its base tells its own changes since a pass from the base branch's (see prChangedSince).
+      enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, until: now.toISOString(), log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),

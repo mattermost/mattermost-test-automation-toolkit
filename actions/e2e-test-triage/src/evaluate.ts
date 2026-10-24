@@ -5,6 +5,7 @@ import { identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
 import { BORDERLINE, classify, errorSignature, infraVerdict, isShardPlaceholder, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, historyLane, repoPath } from "./config.ts";
+import { commonSenseClear } from "./common-sense.ts";
 import { sameTestOnOtherReports } from "./enrich.ts";
 import { evidenceFor } from "./evidence.ts";
 import { buildPack, namesChangedFile } from "./pack.ts";
@@ -169,7 +170,7 @@ export async function evaluateRun({
         log(`base branch history unavailable: ${String(e).slice(0, 200)}`);
       }
     }
-    if (!blind && ask && prNumber) {
+    if (!blind && prNumber) {
       // More facts for the failures the rules couldn't settle; a lookup that fails only leaves a fact out.
       if (enrich) {
         try {
@@ -183,7 +184,12 @@ export async function evaluateRun({
       const others: OtherFailure[] = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const pr: PrRef = { number: prNumber, repository: id.repository, title: prTitle, lane };
       const packs = result.findings.map((f) => (f.class === "OWNED_BY_PR" || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete" ? null : buildPack(f, files, pr, others, changeContext)));
-      await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
+      // Common sense before the model, with or without it: a failure the same commit shows is not the PR's is cleared.
+      for (const [i, f] of result.findings.entries()) {
+        const why = commonSenseClear(f, packs[i], changed);
+        if (why) Object.assign(f, { blocking: false, decision: "rules_unblock", reason: why });
+      }
+      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
     }
     if (!blind && prNumber) sameFailure(result.findings);
   }

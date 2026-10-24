@@ -206,6 +206,8 @@ export interface ThisPRHistory {
     related_to_this_test: string[];
     related_changes: { file: string; patch: string }[];
     changes?: { file: string; patch: string }[];
+    /** Related files that changed only because the base branch was merged in: trunk runs them, the PR did not change them. */
+    related_from_base?: string[];
   };
 }
 
@@ -230,6 +232,11 @@ export interface SinceLastPass {
   related: { file: string; patch: string }[];
   changes?: { file: string; patch: string }[];
   complete: boolean;
+  /**
+   * The files among `files` whose change is this PR's own: in the PR's diff now, with a patch that differs from the PR's
+   * diff at the last pass (or could not be compared). The rest came in from the base branch. Absent when unknown.
+   */
+  pr_changed?: string[];
 }
 
 export interface CommitRef {

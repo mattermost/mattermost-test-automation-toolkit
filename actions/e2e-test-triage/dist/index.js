@@ -1248,6 +1248,9 @@ function buildPack(finding, compareFiles, pr, others, ctx = NO_CHANGE_CONTEXT) {
 }
 function thisPrHistory(f) {
   const since = f.since_last_pass;
+  const own = since?.pr_changed ? new Set(since.pr_changed) : null;
+  const related = since ? since.related.filter((r) => !own || own.has(r.file)) : [];
+  const fromBase = since && own ? since.related.filter((r) => !own.has(r.file)).map((r) => r.file) : [];
   return {
     id: "this_pr",
     earlier_runs_on_this_pr: f.this_pr.runs,
@@ -1255,9 +1258,14 @@ function thisPrHistory(f) {
     failed: f.this_pr.fails,
     latest: f.this_pr.latest,
     last_passed: f.this_pr.last_pass ? { commit: f.this_pr.last_pass.commit_sha?.slice(0, 7) ?? null, at: f.this_pr.last_pass.created_at } : null,
-    ...since ? { changed_since_last_pass: { file_count: since.files.length, files: since.files.slice(0, 30), complete: since.complete !== false, related_to_this_test: since.related.map((r) => r.file), related_changes: since.related.slice(0, 3), ...since.changes?.length ? { changes: since.changes } : {} } } : {}
+    ...since ? { changed_since_last_pass: { file_count: since.files.length, files: since.files.slice(0, 30), complete: since.complete !== false, related_to_this_test: related.map((r) => r.file), related_changes: related.slice(0, 3), ...since.changes?.length ? { changes: since.changes } : {}, ...fromBase.length ? { related_from_base: fromBase.slice(0, 30) } : {} } } : {}
   };
 }
+var thisPrCitable = (pack) => {
+  const since = pack.this_pr_history?.changed_since_last_pass;
+  if (pack.this_pr_history?.latest !== "passed" || since?.complete !== true || since.related_to_this_test.length) return false;
+  return !since.related_from_base?.length || pack.trunk_history_14d?.latest === "passed";
+};
 var PACK_IMAGES = /* @__PURE__ */ new WeakMap();
 var evidenceIds = (pack) => [
   "test",
@@ -1269,8 +1277,9 @@ var evidenceIds = (pack) => [
   ...pack.diff_hunks_of_files_named_in_error.filter((h) => h.related).map((h) => h.id),
   ...pack.producer_evidence?.notes || pack.producer_evidence?.screenshots?.length ? ["producer"] : [],
   // Citable only when this PR's most recent earlier run of the test passed (a pass before a later failure does not count),
-  // and the complete list of what changed since that pass shows nothing related.
-  ...pack.this_pr_history?.latest === "passed" && pack.this_pr_history.changed_since_last_pass?.complete === true && !pack.this_pr_history.changed_since_last_pass.related_to_this_test.length ? ["this_pr"] : [],
+  // and the complete list of what changed since that pass shows nothing related that the PR changed. A related change
+  // the base branch brought in is allowed only while trunk's latest run of the test passed with it.
+  ...thisPrCitable(pack) ? ["this_pr"] : [],
   ...pack.same_test_other_platforms_this_run ? ["other_platforms"] : [],
   ...pack.earlier_failure_same_spec ? ["earlier_failure_same_spec"] : []
 ];
@@ -1356,16 +1365,29 @@ async function siblingPlatforms({
     log(`other platforms' results unavailable: ${String(e).slice(0, 160)}`);
   }
 }
+var patchBody = (patch) => patch == null ? null : patch.replace(/^@@ [^@]* @@/gm, "@@");
+function prChangedSince(since, prNow, prAtPass) {
+  const now = new Map(prNow.map((f) => [f.filename, patchBody(f.patch)]));
+  const then = new Map(prAtPass.map((f) => [f.filename, patchBody(f.patch)]));
+  return since.filter((file) => {
+    if (!now.has(file) && !then.has(file)) return false;
+    const [a, b] = [now.get(file), then.get(file)];
+    return a == null || b == null || a !== b;
+  });
+}
 async function enrichFindings({
   findings,
   api,
   id,
   testRoot,
+  prFiles = null,
+  baseBranch = null,
   log = () => {
   }
 }) {
   if (!findings.length) return;
   const compares = /* @__PURE__ */ new Map();
+  const atPass = /* @__PURE__ */ new Map();
   const sources = /* @__PURE__ */ new Map();
   for (const f of findings) {
     const last = f.this_pr?.last_pass;
@@ -1390,6 +1412,16 @@ async function enrichFindings({
             // A cut-off list cannot show that nothing related changed, so it never clears (see thisPrHistory).
             complete: cmp.complete
           };
+          if (cmp.complete && prFiles && baseBranch) {
+            if (!atPass.has(sha)) {
+              atPass.set(sha, await api("GET", `/repos/${id.repository}/compare/${encodeURIComponent(baseBranch)}...${sha}`).then((raw) => {
+                const listed = raw.files ?? [];
+                return listed.length < COMPARE_FILE_CAP ? listed : null;
+              }).catch((e) => (log(`this PR's changes at ${sha.slice(0, 7)} unavailable: ${String(e).slice(0, 160)}`), null)));
+            }
+            const then = atPass.get(sha);
+            if (then) f.since_last_pass.pr_changed = prChangedSince(f.since_last_pass.files, prFiles, then);
+          }
         }
       }
     }
@@ -1615,6 +1647,36 @@ function parseAnswer(text) {
   return { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence.slice(0, 6), explanation: a.explanation.slice(0, 280) };
 }
 var answerKey = (model, pack) => `v5:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + SYSTEM, pack)}`;
+
+// src/common-sense.ts
+var platformOf = (report) => {
+  const name = String(report ?? "");
+  return osOfReport(name) ?? (/(^|[^a-z])ios([^a-z]|$)/i.test(name) ? "ios" : /android/i.test(name) ? "android" : null);
+};
+var PLATFORM_FILES = {
+  ios: /(^|\/)ios\/|(^|\/)Podfile(\.lock)?$|\.(swift|m|mm|h|pbxproj|xcconfig|entitlements|plist|storyboard|xib)$|\.xc(odeproj|workspace)\//i,
+  android: /(^|\/)android\/|\.(gradle|kts|kt|java)$|(^|\/)gradle\.properties$|AndroidManifest\.xml$/i,
+  linux: /(^|[/_.-])(linux|ubuntu|debian|deb|rpm|snap|flatpak|appimage)([/_.-]|$)/i,
+  windows: /(^|[/_.-])(win|win32|win64|windows|msi|msix|appx|nsis)([/_.-]|$)|\.(ps1|bat|cmd)$/i,
+  macos: /(^|[/_.-])(mac|macos|darwin|osx|dmg|mas)([/_.-]|$)|\.(entitlements|plist)$/i
+};
+var onlyOnPlatform = (platform, file) => Boolean(PLATFORM_FILES[platform]?.test(file));
+function commonSenseClear(f, pack, prFiles) {
+  if (!pack || !f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete") return null;
+  const platform = platformOf(f.report_name);
+  const lanes = f.other_lanes ?? [];
+  const passedOn = lanes.filter((l) => l.result === "passed").map((l) => l.platform);
+  if (!platform || !PLATFORM_FILES[platform] || !passedOn.length || lanes.some((l) => FAILED_STATUSES.has(l.result))) return null;
+  const elsewhere = `passed on ${passedOn.join(" and ")} on this same commit`;
+  const since = f.since_last_pass;
+  if (since && evidenceIds(pack).includes("this_pr") && !(since.pr_changed ?? since.files).some((x) => onlyOnPlatform(platform, x))) {
+    const at = f.this_pr.last_pass?.commit_sha?.slice(0, 7);
+    return `Failed only on ${platform}: it ${elsewhere}, and passed on ${platform} earlier on this PR${at ? ` (${at})` : ""} with nothing related this PR changed since.`;
+  }
+  if (f.class === "REGRESSION" && f.untouched === true && !pack.diff_hunks_of_files_named_in_error.length && !pack.pr.spec_file_changed_by_pr && !prFiles.some((x) => onlyOnPlatform(platform, x)))
+    return `Failed only on ${platform}: it ${elsewhere}, passes on trunk (${f.trunk.passes} of ${f.trunk.runs} runs), and this PR changes nothing it uses.`;
+  return null;
+}
 
 // src/decision.ts
 function unblocks(cause, cited, pack, cls = "") {
@@ -1884,7 +1946,7 @@ async function evaluateRun({
         log(`base branch history unavailable: ${String(e).slice(0, 200)}`);
       }
     }
-    if (!blind && ask && prNumber) {
+    if (!blind && prNumber) {
       if (enrich) {
         try {
           await enrich(result.findings.filter((f) => JUDGED.has(f.class) && f.blocking && !f.identity_unresolved && !f.out_of_date));
@@ -1896,7 +1958,11 @@ async function evaluateRun({
       const others = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const pr = { number: prNumber, repository: id.repository, title: prTitle, lane };
       const packs = result.findings.map((f) => f.class === "OWNED_BY_PR" || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete" ? null : buildPack(f, files, pr, others, changeContext));
-      await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
+      for (const [i, f] of result.findings.entries()) {
+        const why = commonSenseClear(f, packs[i], changed);
+        if (why) Object.assign(f, { blocking: false, decision: "rules_unblock", reason: why });
+      }
+      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
     }
     if (!blind && prNumber) sameFailure(result.findings);
   }
@@ -2058,6 +2124,7 @@ function whyNext(f, branch, pr) {
       const allFailed = Boolean(f.tries && f.tries.ran >= 2 && f.tries.failed === f.tries.ran);
       const next = allFailed ? "Re-run once before digging." : pr ? "Nothing for you." : "Fix the flaky test.";
       if (allFailed && f.class === "FLAKY_ON_TRUNK") return [`Failed every try here; flaky on ${branch}.`, next];
+      if (f.decision === "rules_unblock") return [f.reason, next];
       if (f.decision === "adjudicator_unblock") return [`Looks ${LIKELY[a?.cause ?? ""] ?? "flaky"} (${ai}).`, next];
       if (f.class === "SAME_FAILURE_AS_CLEARED") return [`Same error as "${f.same_as}", cleared above.`, next];
       if (f.class === "INFRA_ERROR") return ["Failed on its environment (see the error), not on this change.", allFailed ? next : pr ? "Nothing for you; re-run if the lane must be green." : "Re-run when the environment recovers."];
@@ -2464,7 +2531,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       log,
       ask,
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
-      enrich: (findings) => enrichFindings({ findings, api, id, testRoot, log }),
+      // The PR's diff from its base tells its own changes since a pass from the base branch's (see prChangedSince).
+      enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, until: now.toISOString(), log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log })

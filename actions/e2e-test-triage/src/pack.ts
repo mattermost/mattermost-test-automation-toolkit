@@ -133,9 +133,13 @@ export function buildPack(finding: Finding, compareFiles: { filename: string; pa
   return pack;
 }
 
-// This PR's earlier runs of the test, and what changed between its last pass and now.
+// This PR's earlier runs of the test, and what changed between its last pass and now. Where the PR's own changes are
+// known, a related file that changed only because the base branch was merged in is listed apart: trunk runs it.
 function thisPrHistory(f: Finding): ThisPRHistory {
   const since = f.since_last_pass;
+  const own = since?.pr_changed ? new Set(since.pr_changed) : null;
+  const related = since ? since.related.filter((r) => !own || own.has(r.file)) : [];
+  const fromBase = since && own ? since.related.filter((r) => !own.has(r.file)).map((r) => r.file) : [];
   return {
     id: "this_pr",
     earlier_runs_on_this_pr: f.this_pr.runs,
@@ -144,10 +148,16 @@ function thisPrHistory(f: Finding): ThisPRHistory {
     latest: f.this_pr.latest,
     last_passed: f.this_pr.last_pass ? { commit: f.this_pr.last_pass.commit_sha?.slice(0, 7) ?? null, at: f.this_pr.last_pass.created_at } : null,
     ...(since
-      ? { changed_since_last_pass: { file_count: since.files.length, files: since.files.slice(0, 30), complete: since.complete !== false, related_to_this_test: since.related.map((r) => r.file), related_changes: since.related.slice(0, 3), ...(since.changes?.length ? { changes: since.changes } : {}) } }
+      ? { changed_since_last_pass: { file_count: since.files.length, files: since.files.slice(0, 30), complete: since.complete !== false, related_to_this_test: related.map((r) => r.file), related_changes: related.slice(0, 3), ...(since.changes?.length ? { changes: since.changes } : {}), ...(fromBase.length ? { related_from_base: fromBase.slice(0, 30) } : {}) } }
       : {}),
   };
 }
+
+const thisPrCitable = (pack: Pack): boolean => {
+  const since = pack.this_pr_history?.changed_since_last_pass;
+  if (pack.this_pr_history?.latest !== "passed" || since?.complete !== true || since.related_to_this_test.length) return false;
+  return !since.related_from_base?.length || pack.trunk_history_14d?.latest === "passed";
+};
 
 // Screenshot bytes travel beside the pack; the pack (and cache key) carries hashes.
 export const PACK_IMAGES = new WeakMap<Pack, EvidenceImage[]>();
@@ -163,8 +173,9 @@ export const evidenceIds = (pack: Pack): string[] => [
   ...pack.diff_hunks_of_files_named_in_error.filter((h) => h.related).map((h) => h.id),
   ...(pack.producer_evidence?.notes || pack.producer_evidence?.screenshots?.length ? ["producer"] : []),
   // Citable only when this PR's most recent earlier run of the test passed (a pass before a later failure does not count),
-  // and the complete list of what changed since that pass shows nothing related.
-  ...(pack.this_pr_history?.latest === "passed" && pack.this_pr_history.changed_since_last_pass?.complete === true && !pack.this_pr_history.changed_since_last_pass.related_to_this_test.length ? ["this_pr"] : []),
+  // and the complete list of what changed since that pass shows nothing related that the PR changed. A related change
+  // the base branch brought in is allowed only while trunk's latest run of the test passed with it.
+  ...(thisPrCitable(pack) ? ["this_pr"] : []),
   ...(pack.same_test_other_platforms_this_run ? ["other_platforms"] : []),
   ...(pack.earlier_failure_same_spec ? ["earlier_failure_same_spec"] : []),
 ];
