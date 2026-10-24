@@ -16,15 +16,12 @@ import type { Answer, BatchResult, Config, Finding, Ledger, Pack } from "./types
 export function unblocks(cause: string, cited: string[], pack: Pack, cls = ""): boolean {
   const has = (...ids: string[]): boolean => ids.some((id) => cited.includes(id));
   const trunk: Partial<Pack["trunk_history_14d"]> = pack.trunk_history_14d ?? {};
-  // An environment error is cleared only on a recurrence elsewhere or a pass earlier on this PR: a PR that breaks the
-  // server (startup, a crash) fails every test with exactly such an error, so neither the error text nor trunk's own
-  // failures (classify reads no trunk history for one, so they need not be this failure) ever clear one.
+  // A PR that breaks the server fails every test with an environment error, so its text never clears one; nor do trunk's
+  // failures, which classify does not read for one and so need not be this failure.
   if (cls === "INFRA_ERROR") {
     if (cause === "test_bug") return has("this_pr");
     return (cause === "flaky_environment" || cause === "bug_on_master") && has("cross_pr", "this_pr");
   }
-  // An earlier test of the spec that failed on its environment clears only with this test passing on another platform
-  // in this run (see chainClears).
   if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error) || (has("earlier_failure_same_spec") && chainClears(pack));
   if (cause === "bug_on_master") return has("cross_pr") || (has("trunk_history_14d") && ((trunk.fails ?? 0) > 0 || (trunk.flaky ?? 0) > 0 || trunk.latest === "failed"));
   if (cause === "test_bug") return has("this_pr");
@@ -100,7 +97,7 @@ interface Group {
   error?: unknown;
 }
 
-/** The most questions one model call carries: a bigger run is asked in several calls, each within the budget. */
+/** The most questions one model call carries; a bigger run is asked in several calls. */
 export const JUDGED_PER_CALL = 8;
 
 /**
@@ -123,9 +120,12 @@ export async function judge(
   const groups = new Map<string, Group>();
   // TSIO lists a run's failures in no fixed order. Visiting them in one makes the same run pick the same
   // questions, leads and batches every time, so a re-run asks the model what it asked before.
-  const id = (f: Finding): string[] => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title];
-  const before = (a: string[], b: string[]): number => { for (const [k, x] of a.entries()) if (x !== b[k]) return x < b[k] ? -1 : 1; return 0; };
-  const order = findings.map((_, i) => i).sort((a, b) => before(id(findings[a]), id(findings[b])) || a - b);
+  const sortKey = (f: Finding): string[] => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title];
+  const compareKeys = (a: string[], b: string[]): number => {
+    for (const [k, x] of a.entries()) if (x !== b[k]) return x < b[k] ? -1 : 1;
+    return 0;
+  };
+  const order = findings.map((_, i) => i).sort((a, b) => compareKeys(sortKey(findings[a]), sortKey(findings[b])) || a - b);
   for (const i of order) {
     const f = findings[i];
     const pack = packs[i];
@@ -166,7 +166,7 @@ export async function judge(
       Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
     }
   };
-  // One call: a batch of at most JUDGED_PER_CALL fresh questions, made only when its worst case fits what is left of the budget.
+  // One model call, made only when its worst case fits what is left of the budget.
   const call = async (model: string, fresh: Group[], retryMissing: boolean): Promise<void> => {
     const chars = fresh.reduce((n, g) => n + JSON.stringify(g.lead.pack).length, SYSTEM.length);
     const images = fresh.reduce((n, g) => n + (PACK_IMAGES.get(g.lead.pack)?.length ?? 0), 0);
@@ -222,7 +222,7 @@ export async function judge(
       for (const m of g.members) m.f.ai = { model, cost_usd: (m.f.ai?.cost_usd ?? 0) + share };
     }
   };
-  // Cached answers first; the rest in calls of at most JUDGED_PER_CALL, in order. A finding a response left out is asked once more, on its own.
+  // A finding a response left out is asked once more, on its own.
   const ask = async (model: string, batch: Group[], retryMissing = true): Promise<void> => {
     const fresh: Group[] = [];
     for (const g of batch) {

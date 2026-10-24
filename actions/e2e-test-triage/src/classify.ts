@@ -12,13 +12,10 @@ const INFRA_RE =
 export const isInfraError = (text: string | null | undefined): boolean => INFRA_RE.test(text ?? "");
 
 /**
- * A row that stands for a shard that produced no results, not a test that failed: it has no history, nothing to
- * judge, and nobody can investigate it as a test. The lane stays red for it and the next step is a re-run.
- * - no test name: a shard that reported a failure without naming a test.
+ * A failed row that stands for a shard with no results, not a test: nothing to judge, so the lane stays red for a re-run.
  * - desktop: e2e/utils/write-tsio-failure-stub.mjs writes "[<job name>] CI shard failure" in ci/tsio-shard-failure.ts
- *   after a job died or was cancelled before Playwright wrote results; TSIO keeps its error empty.
- * - mobile: detox/utils/merge-jest-results-for-tsio.js writes "spec did not run" for a spec assigned to a shard that
- *   uploaded nothing ("<spec> was assigned to a shard but produced no result. ...").
+ *   when a job died before Playwright wrote results; TSIO keeps its error empty.
+ * - mobile: detox/utils/merge-jest-results-for-tsio.js writes "spec did not run" for a spec whose shard uploaded nothing.
  */
 export function isShardPlaceholder(t: { file?: string | null; title: string; error?: string | null }): boolean {
   const title = t.title.trim();
@@ -34,8 +31,8 @@ export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_C
 export const EXONERATED_ON_TRUNK = new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 export const exoneratedSet = (isTrunkRun: boolean): Set<string> => (isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED);
 export const BORDERLINE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
-// Blocking findings the judge may clear or blame: the borderline ones, and an environment error still blocking (a repo
-// whose PRs can break their own environment, or one held on a run that failed mostly on its environment).
+// An environment error still blocking is judged too: its repo's PRs can break their own environment, or it was held on a
+// run that failed mostly on its environment.
 export const JUDGED = new Set([...BORDERLINE, "INFRA_ERROR"]);
 
 export interface ClassifyOptions {
@@ -354,11 +351,10 @@ export function sameFailure(findings: Finding[]): Finding[] {
   return findings;
 }
 
-/** The first line of an error, without colour codes, at most 200 characters. */
 export const errorFirstLine = (error: string | null | undefined): string =>
   (String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).find((l) => l.trim()) ?? "").trim().slice(0, 200);
 
-// Two errors that say different things: another failure key, or, where neither has a key, another first line.
+// Where neither error has a failure key, their first lines tell them apart.
 const differentError = (a: string | null | undefined, b: string | null | undefined): boolean => {
   const ka = failureKey(a);
   const kb = failureKey(b);
@@ -366,11 +362,10 @@ const differentError = (a: string | null | undefined, b: string | null | undefin
 };
 
 /**
- * The first failure in a chain: for each finding, the earliest test of the same spec file that failed before it in
- * this run with a different error (its title, the first line of its error, and its class). A later test often fails
- * only because an earlier one's setup failed. Only tests of one known report with distinct ordinals chain: another
- * report ran on another machine, and TSIO lists a run's failures in no fixed order, so without ordinals nothing says
- * which ran first. Evidence only: it changes no class or blocking (see chainClears).
+ * Marks each finding with the earliest test of its spec that failed before it in this run with another error: a later
+ * test often fails only because an earlier one's setup failed. Only tests of one known report with distinct ordinals
+ * chain: another report ran on another machine, and TSIO lists failures in no fixed order. Evidence only: it changes no
+ * class or blocking (see chainClears).
  */
 export function markEarlierFailures(findings: Finding[]): Finding[] {
   const earlier = (a: Finding, b: Finding): boolean =>

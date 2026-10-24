@@ -133,18 +133,17 @@ export async function siblingPlatforms({
 const patchBody = (patch: string | null | undefined): string | null => (patch == null ? null : patch.replace(/^@@ [^@]* @@/gm, "@@"));
 
 /**
- * Of the files changed since the last pass, those whose change is the PR's own: its diff lists the file now or at that
- * pass, and the two patches differ (a file it no longer changes is one it reverted). A file neither diff lists came in
- * from the base branch; so did the change to a file whose own patch is the same as at the pass. A patch either side
- * lacks (too large to show) counts as the PR's own.
+ * Of the files changed since the last pass, those whose change is the PR's own: a file the PR's diff now or at the pass
+ * lists, with patches that differ. The rest came in from the base branch. A patch too large to show counts as the PR's.
  */
 export function prChangedSince(since: string[], prNow: { filename: string; patch?: string | null }[], prAtPass: { filename: string; patch?: string | null }[]): string[] {
   const now = new Map(prNow.map((f) => [f.filename, patchBody(f.patch)]));
   const then = new Map(prAtPass.map((f) => [f.filename, patchBody(f.patch)]));
   return since.filter((file) => {
     if (!now.has(file) && !then.has(file)) return false;
-    const [a, b] = [now.get(file), then.get(file)];
-    return a == null || b == null || a !== b;
+    const patchNow = now.get(file);
+    const patchThen = then.get(file);
+    return patchNow == null || patchThen == null || patchNow !== patchThen;
   });
 }
 

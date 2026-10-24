@@ -103,8 +103,8 @@ export async function evaluateRun({
         commitSha: id.commit_sha,
       });
     });
-    // A PR that breaks its own server fails every test on the environment. On a flagged run, an environment error
-    // the rules would clear (infraClears) is held instead: only the judge's answer clears it.
+    // A PR that breaks its own server fails every test on the environment, so on a flagged run only the judge clears
+    // an environment error.
     if (result.infra) {
       const why = /infrastructure errors/.test(result.infra) ? "most of this run failed on its environment" : "many tests failed in this run";
       for (const f of result.findings)
@@ -179,7 +179,6 @@ export async function evaluateRun({
           log(`extra evidence unavailable: ${String(e).slice(0, 200)}`);
         }
       }
-      // The first failure in a chain: an earlier test of the same spec that failed another way (pack evidence).
       markEarlierFailures(result.findings);
       const others: OtherFailure[] = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const pr: PrRef = { number: prNumber, repository: id.repository, title: prTitle, lane };

@@ -240,9 +240,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // too few); otherwise it is the repository's default branch, and the summary says so.
     const prBase = isTrunkRun ? null : pull.base?.ref ?? null;
     let trunkBranch: string | null | undefined = isTrunkRun ? id.branch : prBase;
-    // A shard placeholder is not a test (see isShardPlaceholder): a run of placeholders only needs no history. Otherwise
-    // every failing row's file is asked for, placeholders' too, as before: TSIO counts its run window over the files
-    // asked for, so dropping a file would change which past runs the real tests are judged on.
+    // A run of shard placeholders only needs no history. Otherwise placeholders' files are asked for too: TSIO counts its
+    // run window over the files asked for, so dropping one would change which past runs the real tests are judged on.
     if (run.failing.some((t) => !isShardPlaceholder(t))) {
       [history, diff] = await Promise.all([
         fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg)),
@@ -303,7 +302,6 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       prTitle: pull.title ?? "", lane: env.LANE || id.name, log,
       ask,
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
-      // The PR's diff from its base tells its own changes since a pass from the base branch's (see prChangedSince).
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, until: now.toISOString(), log }),

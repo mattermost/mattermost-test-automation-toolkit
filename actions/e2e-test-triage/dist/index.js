@@ -1371,8 +1371,9 @@ function prChangedSince(since, prNow, prAtPass) {
   const then = new Map(prAtPass.map((f) => [f.filename, patchBody(f.patch)]));
   return since.filter((file) => {
     if (!now.has(file) && !then.has(file)) return false;
-    const [a, b] = [now.get(file), then.get(file)];
-    return a == null || b == null || a !== b;
+    const patchNow = now.get(file);
+    const patchThen = then.get(file);
+    return patchNow == null || patchThen == null || patchNow !== patchThen;
   });
 }
 async function enrichFindings({
@@ -1651,7 +1652,11 @@ var answerKey = (model, pack) => `v5:${packKey(model + "\n" + JSON.stringify(sam
 // src/common-sense.ts
 var platformOf = (report) => {
   const name = String(report ?? "");
-  return osOfReport(name) ?? (/(^|[^a-z])ios([^a-z]|$)/i.test(name) ? "ios" : /android/i.test(name) ? "android" : null);
+  const os = osOfReport(name);
+  if (os != null) return os;
+  if (/(^|[^a-z])ios([^a-z]|$)/i.test(name)) return "ios";
+  if (/android/i.test(name)) return "android";
+  return null;
 };
 var PLATFORM_FILES = {
   ios: /(^|\/)ios\/|(^|\/)Podfile(\.lock)?$|\.(swift|m|mm|h|pbxproj|xcconfig|entitlements|plist|storyboard|xib)$|\.xc(odeproj|workspace)\//i,
@@ -1732,12 +1737,12 @@ var JUDGED_PER_CALL = 8;
 async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
 }, isTrunkRun = false, ledger = newLedger()) {
   const groups = /* @__PURE__ */ new Map();
-  const id = (f) => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title];
-  const before = (a, b) => {
+  const sortKey = (f) => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title];
+  const compareKeys = (a, b) => {
     for (const [k, x] of a.entries()) if (x !== b[k]) return x < b[k] ? -1 : 1;
     return 0;
   };
-  const order = findings.map((_, i) => i).sort((a, b) => before(id(findings[a]), id(findings[b])) || a - b);
+  const order = findings.map((_, i) => i).sort((a, b) => compareKeys(sortKey(findings[a]), sortKey(findings[b])) || a - b);
   for (const i of order) {
     const f = findings[i];
     const pack = packs[i];
@@ -2531,7 +2536,6 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       log,
       ask,
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
-      // The PR's diff from its base tells its own changes since a pass from the base branch's (see prChangedSince).
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, until: now.toISOString(), log }),

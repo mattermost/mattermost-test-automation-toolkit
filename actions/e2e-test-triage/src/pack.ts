@@ -187,9 +187,8 @@ export const evidenceIds = (pack: Pack): string[] => [
 export const CLEARING = (ids: string[]): boolean => ids.some((c) => c.startsWith("hunk_")) || ids.includes("cross_pr") || ids.includes("this_pr");
 
 /**
- * Whether earlier_failure_same_spec can carry a flaky_environment clear: the earlier test failed on its environment
- * (INFRA_ERROR), and this test passed on another platform in this same run. A PR that breaks the server fails every
- * platform, so the pass elsewhere is what rules the PR out; the earlier failure alone never does.
+ * Whether earlier_failure_same_spec can carry a flaky_environment clear: the earlier test failed on its environment, and
+ * this test passed on another platform in this run. A PR that breaks the server fails every platform.
  */
 export const chainClears = (pack: Pack): boolean =>
   pack.earlier_failure_same_spec?.class === "INFRA_ERROR" && (pack.same_test_other_platforms_this_run?.results ?? []).some((r) => r.result === "passed");

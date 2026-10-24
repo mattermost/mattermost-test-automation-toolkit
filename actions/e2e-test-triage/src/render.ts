@@ -266,7 +266,6 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
     // Shard placeholders keep the lane red, so a look-only headline turns red and says to re-run.
     : check.length || outdated.length ? `${unnamed ? "🔴" : "🟡"} ${[needText, staleText, unnamed ? "re-run the failed jobs" : ""].filter(Boolean).join(", ")}`
     : blockingBroken ? `🔴 ${blockingBroken} still failing on ${md(branch)}`
-    // Shard placeholders keep the lane red whatever the tests beside them came to.
     : unnamed ? "🔴 re-run the failed jobs"
     : `✅ none caused by this ${pr ? "PR" : "commit"}`;
   const lines = [`## E2E triage${where}: ${head}`, ""];
@@ -299,7 +298,6 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
       unrelated && `${unrelated} look${unrelated === 1 ? "s" : ""} unrelated (${kinds})`,
     ].filter(Boolean).join("; ") + ".";
     if (outdatedLead) say = `Merge ${branch} and re-run first. ${say}`;
-    // Shard placeholders beside the tests: the jobs to re-run, after what triage made of the tests.
     if (unnamed) say += ` ${rerun}`;
   }
   if (infra) say = `${infra} ${say}`;

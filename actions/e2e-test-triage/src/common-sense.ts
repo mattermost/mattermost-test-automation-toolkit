@@ -10,7 +10,11 @@ import type { Finding, Pack } from "./types.ts";
 /** The platform a report ran on: a desktop OS by its report name, or a mobile one (detox-ios). Null for a worker of one lane. */
 export const platformOf = (report: string | null | undefined): string | null => {
   const name = String(report ?? "");
-  return osOfReport(name) ?? (/(^|[^a-z])ios([^a-z]|$)/i.test(name) ? "ios" : /android/i.test(name) ? "android" : null);
+  const os = osOfReport(name);
+  if (os != null) return os;
+  if (/(^|[^a-z])ios([^a-z]|$)/i.test(name)) return "ios";
+  if (/android/i.test(name)) return "android";
+  return null;
 };
 
 // Files whose change reaches one platform only, so a change to them can break that platform alone.
@@ -22,17 +26,13 @@ const PLATFORM_FILES: Record<string, RegExp> = {
   macos: /(^|[/_.-])(mac|macos|darwin|osx|dmg|mas)([/_.-]|$)|\.(entitlements|plist)$/i,
 };
 
-/** Whether a changed file reaches the given platform only (see PLATFORM_FILES). */
 export const onlyOnPlatform = (platform: string, file: string): boolean => Boolean(PLATFORM_FILES[platform]?.test(file));
 
 /**
- * A failure common sense clears without the model, because the same commit shows the PR is not its cause:
- * - the same test passed on another platform of this same commit, and failed on none, and
- * - no change it rests on reaches the failing platform alone, and
- * - either this PR passed the test here earlier and nothing related that the PR itself changed since (this_pr), or the
- *   test is stable on trunk (REGRESSION) and the PR changes nothing it uses: not the spec, no file its error names.
- * A PR that breaks the shared code fails every platform, so a pass on one is what rules the PR out. Returns why, or null.
- * Only a blocking borderline failure with complete evidence (it has a pack) is considered.
+ * Why the same commit shows the PR is not a blocking borderline failure's cause, or null. It must have passed on another
+ * platform of this commit and failed on none, with no change it rests on reaching the failing platform alone, and either
+ * passed here earlier on this PR with nothing related the PR changed since (this_pr), or be stable on trunk (REGRESSION)
+ * with the PR changing nothing it uses. A PR that breaks shared code fails every platform, so a pass on one rules it out.
  */
 export function commonSenseClear(f: Finding, pack: Pack | null | undefined, prFiles: string[]): string | null {
   if (!pack || !f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete") return null;

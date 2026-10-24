@@ -43,14 +43,13 @@ merged it is **out of date**: the PR ran its old copy of the test (for example
 against an app build from the base branch). It stays blocking, the summary names
 the base-branch commit that changed the test and says to merge the base branch,
 and the model is not asked. One GitHub compare of the PR's commit with the base
-branch finds these. GitHub lists at most 300 changed files per comparison, so if
-the base branch changed 300 or more since, a spec in the list is still out of
-date, and for the rest triage asks GitHub for the base branch's newest commit in
-each failing spec's directory since the merge base (up to the run's time, at most
-20 directories). A commit there marks the failure out of date with that commit;
-none leaves it to the usual rules. A spec no check settled (over 20 directories,
-an error, a merge base with no date) stays blocking as unchecked evidence (the
-summary says so), and the model is not asked about it.
+branch finds these. GitHub lists at most 300 changed files per comparison. Past
+that, a spec in the list is still out of date; for the rest, triage asks for the
+base branch's newest commit in each failing spec's directory since the merge base
+(up to the run's time, at most 20 directories). A commit there marks the failure
+out of date with that commit; none leaves it to the usual rules. A spec no check
+settled (over 20 directories, an error, a merge base with no date) stays blocking
+as unchecked evidence (the summary says so), and the model is not asked about it.
 
 **Flaky on master:** over master's last 50 runs (at least 5), failures plus
 passes that needed a retry, plus 1, divided by the runs plus 2, is 0.05 or more,
@@ -68,15 +67,14 @@ the change, so the test stays blocking and goes to the model, which clears it or
 names the PR by the same bar as any other failure.
 
 **A run flagged as a whole** (`INFRA`: at least half its failures are environment
-errors, or 30 or more failed) is triaged test by test like any other run, and the
-model is asked. A PR that breaks server startup fails every test on its
-environment, so on a flagged run an environment error is held even with
-`infra-clears: true`: it stays blocking until the model clears it, and the model
-clears an environment error only by citing the same failure on another PR or a
-pass on an earlier commit of this PR, never on its error text alone. Without the
-model (no key, over budget, an error) it stays blocking, and the run stays red as
-`ACTION_REQUIRED`. Once every failure is cleared, the run is `SUCCESS` like any
-other; missing reports still keep it red.
+errors, or 30 or more failed) is triaged test by test, and the model is asked. A
+PR that breaks server startup fails every test on its environment, so on a
+flagged run an environment error is held even with `infra-clears: true`: it stays
+blocking until the model clears it, which it does only by citing the same failure
+on another PR or a pass on an earlier commit of this PR, never on the error text
+alone. Without the model (no key, over budget, an error) it stays blocking and the
+run stays red as `ACTION_REQUIRED`. Once every failure is cleared the run is
+`SUCCESS`; missing reports still keep it red.
 
 **Lanes the base branch rarely runs:** history is read per lane. A lane master
 runs only sometimes (mattermost's subpath suite) has too little history to call
@@ -87,13 +85,13 @@ a break specific to that lane still goes to the model.
 **Failed on one platform only (common sense, with or without the model):** a
 regression or a test with too little history is cleared as flaky when the same
 commit shows the PR is not its cause. The same test passed on another platform of
-this same commit (iOS against Android, Linux against macOS and Windows) and failed
+the same commit (iOS against Android, Linux against macOS and Windows) and failed
 on none, and **either**
 
-- it passed on this platform earlier on this PR, and nothing related that the
-  PR itself changed since: a file merged in from the base branch, or one whose
-  own patch is the same as at that pass, is the base branch's change, which
-  trunk runs (allowed while trunk's latest run of the test passed), **or**
+- it passed on this platform earlier on this PR, and the PR itself changed
+  nothing related since (a file merged in from the base branch, or one whose own
+  patch is the same as at that pass, is the base branch's change, allowed while
+  trunk's latest run of the test passed), **or**
 - it passes on trunk (a regression), and the PR changes nothing it uses: not the
   spec, no file its error names.
 
@@ -122,19 +120,20 @@ the bar and nothing in the diff could touch the test, 0.6 to 0.85 when something
 in the diff could, below 0.6 when the evidence is not enough. It clears a failure
 only at `min-confidence` (0.85) or more **and** with a citation a reviewer can
 open: other PRs failing the same way, or an earlier pass on this PR with nothing
-related the PR changed since (for an environment cause, also an error that is clearly
-infrastructural). What the test run recorded (`evidence-dir`) supports a clear
-but never makes one alone, since the PR's own CI wrote it.
+related the PR changed since (for an environment cause, also an error that is
+clearly infrastructural). What the test run recorded (`evidence-dir`) supports a
+clear but never makes one alone, since the PR's own CI wrote it.
 
 **The first failure in a chain:** a later test in a spec often fails only because
-an earlier one's setup failed. Each question carries the earliest test of the same
-spec that failed before it in this run with another error (`earlier_failure_same_spec`:
-its title, its error's first line and its class; order is the tests' ordinals in
-one report, and tests without them never chain). For an environment cause it clears a
-`REGRESSION` or `INSUFFICIENT_DATA` failure only when that earlier failure is an
-`INFRA_ERROR` **and** the same test passed on another platform in this run: a PR
-that breaks the server fails every platform. It never clears an environment error
-itself, which still needs other PRs or an earlier pass on this PR.
+an earlier one's setup failed. Each question carries the earliest test of the
+same spec that failed before it in this run with another error
+(`earlier_failure_same_spec`: its title, its error's first line and its class).
+Order is the tests' ordinals within one report; tests without them never chain.
+For an environment cause it clears a `REGRESSION` or `INSUFFICIENT_DATA` failure
+only when that earlier failure is an `INFRA_ERROR` **and** the same test passed on
+another platform in this run: a PR that breaks the server fails every platform.
+It never clears an environment error itself, which still needs other PRs or an
+earlier pass on this PR.
 
 The model can veto a history clear only at 0.9 with a related diff hunk. If the
 model fails or is unavailable, the rules' outcome stands.
@@ -152,9 +151,8 @@ model fails or is unavailable, the rules' outcome stands.
   neither is one past the lane's share of `pr-budget-usd` (2 per PR, split evenly
   between the lanes in `triage-lanes`, across all the PR's commits). Each request
   is checked on its own against what is left, so a big run gets the answers the
-  budget allows. A model with
-  no price (not in the built-in table or `AI_PRICES`) has no bounded cost, so it
-  is not called; a budget that is not a finite amount of 0 or more is replaced by
+  budget allows. A model with no price (not in the built-in table or
+  `AI_PRICES`) has no bounded cost, so it is not called; a budget that is not a finite amount of 0 or more is replaced by
   its default with a warning. A response that is not used (cut off, or served by
   another model) is still billed: it counts in the spend, and it is not retried.
 - `answers-cache` lets a re-run reuse earlier answers and keeps the lane's spend
@@ -169,10 +167,10 @@ model fails or is unavailable, the rules' outcome stands.
   rate is passed ÷ (passed + failed), as in
   mattermost's own E2E check; it never reads 100% while something failed.
   Shard placeholders add "re-run the failed jobs" after the labels (alone when
-  every failure is one). A run flagged as a whole says why after the labels while any failure still
-  blocks: "mostly environment errors, re-run" when at least half its failures are
-  environment errors, or "many failures in one run" at 30 or more. Once every
-  failure is cleared, the flag is gone.
+  every failure is one). A run flagged as a whole says why after the labels while
+  any failure still blocks: "mostly environment errors, re-run" when at least half
+  its failures are environment errors, or "many failures in one run" at 30 or
+  more. Once every failure is cleared, the flag is gone.
   Enforce also sets the state (success only for `SUCCESS`); report-only keeps
   the state the check has, and writes nothing while it is still pending.
 - **Job summary**, for a lane where something failed, a report is missing, or
