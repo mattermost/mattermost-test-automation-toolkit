@@ -120,7 +120,7 @@ export async function judge(
   const groups = new Map<string, Group>();
   // TSIO lists a run's failures in no fixed order. Visiting them in one makes the same run pick the same
   // questions, leads and batches every time, so a re-run asks the model what it asked before.
-  const sortKey = (f: Finding): string[] => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title];
+  const sortKey = (f: Finding): string[] => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title, f.error ?? ""];
   const compareKeys = (a: string[], b: string[]): number => {
     for (const [k, x] of a.entries()) if (x !== b[k]) return x < b[k] ? -1 : 1;
     return 0;

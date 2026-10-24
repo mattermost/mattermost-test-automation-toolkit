@@ -1918,11 +1918,14 @@ test("the same run in another order asks the same questions in the same batches"
     const run = runOf(order);
     const history = new Map(run.failing.map((t): [string, Observation[]] => [identityKey(t), [...trunkPasses(8), ...crossPR(31, 32)]]));
     const batches: string[][] = [];
-    await evaluate(run, { history, cfg: { ...DEFAULTS, escalationModel: "" }, ask: async (packs, model) => { batches.push(packs.map((p) => `${p.test.file} ${p.test.title}`)); return answering(() => recurs)(packs, model); } });
+    await evaluate(run, { history, cfg: { ...DEFAULTS, escalationModel: "" }, ask: async (packs, model) => { batches.push(packs.map((p) => `${p.test.file} ${p.test.title} ${p.error}`)); return answering(() => recurs)(packs, model); } });
     return batches;
   };
   const forward = await asked(tests);
   assert.ok(forward.flat().length > 0);
+  // The same test twice with different errors: the error, not TSIO's order, picks the lead.
+  const twice = [{ title: "t0", file: "specs/s0.spec.ts", error: "Error: expected visible 2" }, { title: "t0", file: "specs/s0.spec.ts", error: "Error: expected visible 1" }];
+  assert.deepEqual(await asked([...twice].reverse()), await asked(twice));
   assert.deepEqual(await asked([...tests].reverse()), forward);
   assert.deepEqual(await asked([...tests.slice(17), ...tests.slice(0, 17)]), forward);
 });
@@ -3946,6 +3949,7 @@ test("common sense never clears what the PR could have caused", () => {
   assert.equal(clears(onePlatform({ other_lanes: [{ platform: "macos", result: "passed" }, { platform: "windows", result: "failed" }] })), null, "it failed on another platform too: a shared break (desktop #4020)");
   assert.equal(clears(onePlatform({ other_lanes: [] })), null, "no other platform ran it (mattermost)");
   assert.equal(clears(onePlatform({ other_lanes: [{ platform: "macos", result: "flaky" }] })), null, "a pass on retry elsewhere is not a pass");
+  assert.equal(clears(onePlatform({ other_lanes: [{ platform: "macos", result: "passed" }, { platform: "windows", result: "flaky" }] })), null, "it failed a try on another platform: the PR may make it unstable everywhere");
   assert.equal(clears(onePlatform({ untouched: false })), null, "the PR changes a file its error names");
   assert.equal(clears(onePlatform(), [], [{ filename: "src/helper.ts", patch: "@@" }].map((d) => ({ ...d, filename: "specs/a.spec.ts" }))), null, "the PR edits the spec");
   assert.equal(clears(onePlatform(), ["src/main/linux/tray.ts"]), null, "a linux-only change, for a linux failure");

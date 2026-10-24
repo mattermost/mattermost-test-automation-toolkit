@@ -39,7 +39,7 @@ export function commonSenseClear(f: Finding, pack: Pack | null | undefined, prFi
   const platform = platformOf(f.report_name);
   const lanes = f.other_lanes ?? [];
   const passedOn = lanes.filter((l) => l.result === "passed").map((l) => l.platform);
-  if (!platform || !PLATFORM_FILES[platform] || !passedOn.length || lanes.some((l) => FAILED_STATUSES.has(l.result))) return null;
+  if (!platform || !PLATFORM_FILES[platform] || !passedOn.length || lanes.some((l) => FAILED_STATUSES.has(l.result) || l.result === "flaky")) return null;
   const elsewhere = `passed on ${passedOn.join(" and ")} on this same commit`;
   const since = f.since_last_pass;
   // The PR's changes in place at the earlier pass ran on this platform then; only what it changed since can be new here.

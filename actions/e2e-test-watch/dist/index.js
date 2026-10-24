@@ -1953,7 +1953,7 @@ function commonSenseClear(f, pack, prFiles) {
   const platform = platformOf(f.report_name);
   const lanes = f.other_lanes ?? [];
   const passedOn = lanes.filter((l) => l.result === "passed").map((l) => l.platform);
-  if (!platform || !PLATFORM_FILES[platform] || !passedOn.length || lanes.some((l) => FAILED_STATUSES.has(l.result))) return null;
+  if (!platform || !PLATFORM_FILES[platform] || !passedOn.length || lanes.some((l) => FAILED_STATUSES.has(l.result) || l.result === "flaky")) return null;
   const elsewhere = `passed on ${passedOn.join(" and ")} on this same commit`;
   const since = f.since_last_pass;
   if (since && evidenceIds(pack).includes("this_pr") && !(since.pr_changed ?? since.files).some((x) => onlyOnPlatform(platform, x))) {
@@ -2019,7 +2019,7 @@ var JUDGED_PER_CALL = 8;
 async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
 }, isTrunkRun = false, ledger = newLedger()) {
   const groups = /* @__PURE__ */ new Map();
-  const sortKey = (f) => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title];
+  const sortKey = (f) => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title, f.error ?? ""];
   const compareKeys = (a, b) => {
     for (const [k, x] of a.entries()) if (x !== b[k]) return x < b[k] ? -1 : 1;
     return 0;
