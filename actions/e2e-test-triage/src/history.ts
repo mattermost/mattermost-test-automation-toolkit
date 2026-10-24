@@ -238,63 +238,119 @@ export async function fetchChangedFiles(api: GhApi, id: CompositeIdentity, prNum
 
 // ------------------------------------------------------------ out of date
 
-interface CompareResult {
-  ahead_by?: number;
-  files?: { filename: string }[];
-  commits?: { sha: string }[];
-}
-
 interface CommitRow {
   sha: string;
   commit?: { committer?: { date?: string | null } | null; author?: { date?: string | null } | null; message?: string | null } | null;
 }
 
+interface CompareResult {
+  ahead_by?: number;
+  files?: { filename: string }[];
+  commits?: { sha: string }[];
+  merge_base_commit?: CommitRow | null;
+}
+
+/** At most this many spec directories are asked about when the base branch's file list is cut off. */
+export const OUT_OF_DATE_DIR_CAP = 20;
+
+const commitRef = (c: CommitRow): NonNullable<OutOfDate["commit"]> => ({
+  sha: c.sha,
+  date: String(c.commit?.committer?.date ?? c.commit?.author?.date ?? "").slice(0, 10),
+  pr: Number(/\(#(\d+)\)/.exec(c.commit?.message ?? "")?.[1]) || null,
+});
+
+/** What markOutOfDate could not settle: `truncated` when the file list was cut off, and the failures left unchecked. */
+export interface OutOfDateResult {
+  truncated: boolean;
+  /** With `truncated`: the failures neither list nor directory check settled. Absent means all of them. */
+  unchecked?: Finding[];
+}
+
 /**
  * Marks failures whose spec the base branch changed after this PR last merged it.
  * One compare call lists what the base branch changed since the merge base; a
- * second, per spec, names the commit. If GitHub can't list every changed file
- * (its compare stops at 300), nothing is marked and the result is `truncated`:
- * the caller must then treat those failures as unchecked, not as unchanged.
+ * second, per spec, names the commit. GitHub's compare stops at 300 files: then a
+ * spec in the list is still marked, and for the rest each spec's directory is asked
+ * for a base-branch commit since the merge base (at most OUT_OF_DATE_DIR_CAP
+ * directories, up to `until`). Any commit marks the failure with it; none leaves it
+ * unmarked. A failure no check settled (the cap, an error, no merge base date) is
+ * returned in `unchecked`: the caller must treat it as unchecked, not as unchanged.
  */
 export async function markOutOfDate({
   findings,
   api,
   id,
   baseBranch,
+  until = null,
   log = () => {},
 }: {
   findings: Finding[];
   api: GhApi;
   id: CompositeIdentity;
   baseBranch: string | null | undefined;
+  /** The run's time: commits after it are not counted, so a replay reads what the run could have. */
+  until?: string | null;
   log?: (message: string) => void;
-}): Promise<{ truncated: boolean }> {
+}): Promise<OutOfDateResult> {
   if (!findings.length || !baseBranch) return { truncated: false };
   const cmp = (await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`)) as CompareResult | null;
   if (!cmp?.ahead_by) return { truncated: false };
   const files = cmp.files ?? [];
-  if (files.length >= COMPARE_FILE_CAP) {
-    log(`${baseBranch} changed ${files.length}+ files since this PR last merged it; too many to tell which tests changed`);
-    return { truncated: true };
-  }
+  const truncated = files.length >= COMPARE_FILE_CAP;
   const changed = new Set(files.map((x) => x.filename));
   const onBase = new Set((cmp.commits ?? []).map((c) => c.sha));
   const commits = new Map<string, OutOfDate["commit"]>();
+  const rest: Finding[] = [];
   for (const f of findings) {
     const path = f.repo_path;
-    if (!path || !changed.has(path)) continue;
+    if (!path || !changed.has(path)) {
+      if (truncated) rest.push(f);
+      continue;
+    }
     if (!commits.has(path)) {
       const log_ = (await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(path)}&per_page=10`).catch(() => [])) as CommitRow[] | null;
       const c = (log_ ?? []).find((x) => onBase.has(x.sha)) ?? null;
-      commits.set(path, c && {
-        sha: c.sha,
-        date: String(c.commit?.committer?.date ?? c.commit?.author?.date ?? "").slice(0, 10),
-        pr: Number(/\(#(\d+)\)/.exec(c.commit?.message ?? "")?.[1]) || null,
-      });
+      commits.set(path, c && commitRef(c));
     }
     f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: commits.get(path) ?? null };
   }
-  return { truncated: false };
+  if (!truncated) return { truncated: false };
+  // The list is cut off: a spec missing from it may still have changed. Its directory's commits since the merge base say.
+  const base = cmp.merge_base_commit;
+  const since = base?.commit?.committer?.date ?? base?.commit?.author?.date ?? null;
+  if (!since) {
+    log(`${baseBranch} changed ${files.length}+ files since this PR last merged it, and the merge base has no date; ${rest.length} failure(s) unchecked`);
+    return { truncated: true, unchecked: rest };
+  }
+  log(`${baseBranch} changed ${files.length}+ files since this PR last merged it; checking the failing specs' directories instead`);
+  const dirs = new Map<string, OutOfDate["commit"] | "unchecked">();
+  const unchecked: Finding[] = [];
+  for (const f of rest) {
+    const path = f.repo_path ?? "";
+    const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+    if (!dir) {
+      unchecked.push(f);
+      continue;
+    }
+    if (!dirs.has(dir)) {
+      if (dirs.size >= OUT_OF_DATE_DIR_CAP) {
+        unchecked.push(f);
+        continue;
+      }
+      const q = new URLSearchParams({ sha: baseBranch, path: dir, since, ...(until ? { until } : {}), per_page: "1" });
+      dirs.set(dir, await (api("GET", `/repos/${id.repository}/commits?${q}`) as Promise<unknown>)
+        .then((raw) => {
+          // The merge base itself is not a change since it: GitHub's since is inclusive.
+          const c = (Array.isArray(raw) ? (raw as CommitRow[]) : []).find((x) => x.sha !== base?.sha);
+          return c ? commitRef(c) : null;
+        })
+        .catch((e: unknown): "unchecked" => (log(`${baseBranch} commits in ${dir} unavailable: ${String(e).slice(0, 160)}`), "unchecked")));
+    }
+    const c = dirs.get(dir);
+    if (c === "unchecked") unchecked.push(f);
+    else if (c) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: c };
+  }
+  return { truncated: true, unchecked };
 }
 
 // ------------------------------------------------------------ broken by

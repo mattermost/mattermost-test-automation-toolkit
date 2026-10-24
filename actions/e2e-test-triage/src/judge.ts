@@ -48,6 +48,12 @@ Rules:
   PR, or changed_since_last_pass is marked complete: false (GitHub cut the list off), this history does not clear it.
 - same_test_other_platforms_this_run (id other_platforms) is the same test in the same run on other platforms. It
   passing elsewhere points to a platform or environment cause rather than shared code, but alone it does not clear.
+- earlier_failure_same_spec (id earlier_failure_same_spec) is an earlier test in the same spec file that failed in this
+  run with a different error: its title, its error's first line and the engine's class for it. An earlier test that
+  failed on its environment (class INFRA_ERROR: a server or host it could not reach) explains later failures that depend
+  on what it set up. It supports flaky_environment only when that class is INFRA_ERROR and this test passed on another
+  platform in this run (other_platforms), never alone: a PR that breaks the server fails every platform. With both, and
+  no part of the diff touching what the earlier test set up, it meets the requirement for flaky_environment.
 - tries_in_this_run says how many times the test ran in this run and how many failed. Failing every try means it
   failed consistently in this run, not that the PR caused it.
 - test_code_near_failure is the test's code around the failing line. Use it to say what the test was doing, for
@@ -99,11 +105,13 @@ export const servedMatches = (requested: string, served: unknown): boolean =>
   typeof served === "string" && (served === requested || (!isSnapshot(requested) && snapshotOf(requested, served)));
 
 // Pack fields that are evidence added after answers were keyed. Left out of the key, so an answer cached before the field
-// existed is still found for the same evidence: a re-run is not paid again, and no verdict moves with the field.
+// existed is still found for the same evidence: a re-run is not paid again, and no verdict moves with the field. With an
+// earlier failure in the spec they are keyed: a pass on another platform is then what lets an answer clear (chainClears),
+// so an answer given without one must not be reused once it arrives.
 const UNKEYED_FIELDS: ReadonlySet<string> = new Set(["same_test_other_platforms_this_run"]);
 export const packKey = (model: string, pack: Pack): string =>
   createHash("sha256")
-    .update(model + "\n" + JSON.stringify(Object.fromEntries(Object.entries(pack).filter(([k]) => !UNKEYED_FIELDS.has(k)))))
+    .update(model + "\n" + JSON.stringify(Object.fromEntries(Object.entries(pack).filter(([k]) => pack.earlier_failure_same_spec || !UNKEYED_FIELDS.has(k)))))
     .digest("hex");
 
 export interface ImageBlock {
@@ -292,5 +300,6 @@ export function parseAnswer(text: string): Omit<Answer, "provenance"> {
   return { cause: a.cause as Cause, confidence: a.confidence, cited_evidence: a.cited_evidence.slice(0, 6), explanation: a.explanation.slice(0, 280) };
 }
 
-// v4: the pack gained pr.change_summary and this_pr_history.latest, and this_pr is citable only after a latest pass. Every v3 answer is a miss.
-export const answerKey = (model: string, pack: Pack): string => `v4:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + SYSTEM, pack)}`;
+// v4: the pack gained pr.change_summary and this_pr_history.latest, and this_pr is citable only after a latest pass.
+// v5: the pack gained earlier_failure_same_spec and SYSTEM a rule for it, which can now clear. Every v4 answer is a miss.
+export const answerKey = (model: string, pack: Pack): string => `v5:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + SYSTEM, pack)}`;

@@ -330,6 +330,7 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
       failed++;
       const { suite_id: suiteId, title } = lastAttempt;
       const file = fileOf.get(suiteId) ?? "";
+      const first = attempts.find((a) => a.suite_id === suiteId);
       failing.push({
         file,
         title,
@@ -340,7 +341,8 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
         identity_ambiguous: testsPerLeaf.get(JSON.stringify([file, title])).size > 1,
         identity_unresolved: testsPerIdentity.get(identityKey({ file, title, full_title: lastAttempt.full_title, report_scope: reportName })).size > 1,
         error: [lastAttempt.error_message, lastAttempt.error_stack].filter(Boolean).join("\n"),
-        tries: { ran: attempts.filter((a) => a.status !== "skipped").length, failed: attempts.filter((a) => FAILED_STATUSES.has(a.status)).length }
+        tries: { ran: attempts.filter((a) => a.status !== "skipped").length, failed: attempts.filter((a) => FAILED_STATUSES.has(a.status)).length },
+        ...typeof first?.ordinal === "number" ? { ordinal: first.ordinal } : {}
       });
     } else if (status === "skipped") skipped++;
     else if (status === "flaky") flaky++;

@@ -11,12 +11,29 @@ const INFRA_RE =
 
 export const isInfraError = (text: string | null | undefined): boolean => INFRA_RE.test(text ?? "");
 
+/**
+ * A failed row that stands for a shard with no results, not a test: nothing to judge, so the lane stays red for a re-run.
+ * - desktop: e2e/utils/write-tsio-failure-stub.mjs writes "[<job name>] CI shard failure" in ci/tsio-shard-failure.ts
+ *   when a job died before Playwright wrote results; TSIO keeps its error empty.
+ * - mobile: detox/utils/merge-jest-results-for-tsio.js writes "spec did not run" for a spec whose shard uploaded nothing.
+ */
+export function isShardPlaceholder(t: { file?: string | null; title: string; error?: string | null }): boolean {
+  const title = t.title.trim();
+  const error = String(t.error ?? "").trim();
+  if (!title) return true;
+  if (/^\[[^\]]*\] CI shard failure$/.test(title) && (!error || /(?:^|\/)tsio-shard-failure\.ts$/.test(String(t.file ?? "")))) return true;
+  return title === "spec did not run" && /was assigned to a shard but produced no result/.test(error);
+}
+
 export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 // On a trunk run only flakiness clears: a failure still there from last time is a
 // standing breakage, and greening it would hide it.
 export const EXONERATED_ON_TRUNK = new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 export const exoneratedSet = (isTrunkRun: boolean): Set<string> => (isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED);
 export const BORDERLINE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
+// An environment error still blocking is judged too: its repo's PRs can break their own environment, or it was held on a
+// run that failed mostly on its environment.
+export const JUDGED = new Set([...BORDERLINE, "INFRA_ERROR"]);
 
 export interface ClassifyOptions {
   isTrunkRun?: boolean;
@@ -300,7 +317,8 @@ function sameKey(error: string | null | undefined): string | null {
  * A blocked failure with the same spec and error as a cleared one shares its
  * cause, if the cleared test's own history shows that error without this PR.
  * Typical case: a shared setup breaks, and only some of the suite's tests are
- * old enough to have history. Runs after the judge, on PR runs only.
+ * old enough to have history. Runs after the judge, on PR runs only. An environment error is not
+ * matched: one still blocking is cleared by the judge's answer or not at all.
  */
 export function sameFailure(findings: Finding[]): Finding[] {
   const blamed = (f: Finding): boolean => f.judge?.cause === "caused_by_pr";
@@ -329,6 +347,37 @@ export function sameFailure(findings: Finding[]): Finding[] {
       same_as_class: anchor.class,
       reason: `Fails with the same error as "${anchor.title}" in this spec, which history cleared (${anchor.class}): ${anchor.reason}`,
     });
+  }
+  return findings;
+}
+
+export const errorFirstLine = (error: string | null | undefined): string =>
+  (String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).find((l) => l.trim()) ?? "").trim().slice(0, 200);
+
+// Where neither error has a failure key, their first lines tell them apart.
+const differentError = (a: string | null | undefined, b: string | null | undefined): boolean => {
+  const ka = failureKey(a);
+  const kb = failureKey(b);
+  return ka.kind !== kb.kind || ka.key !== kb.key || (ka.key == null && errorFirstLine(a) !== errorFirstLine(b));
+};
+
+/**
+ * Marks each finding with the earliest test of its spec that failed before it in this run with another error: a later
+ * test often fails only because an earlier one's setup failed. Only tests of one known report with distinct ordinals
+ * chain: another report ran on another machine, and TSIO lists failures in no fixed order. Evidence only: it changes no
+ * class or blocking (see chainClears).
+ */
+export function markEarlierFailures(findings: Finding[]): Finding[] {
+  const earlier = (a: Finding, b: Finding): boolean =>
+    Boolean(a.report_name) && a.report_name === b.report_name && typeof a.ordinal === "number" && typeof b.ordinal === "number" && a.ordinal < b.ordinal;
+  for (const f of findings) {
+    const spec = f.repo_path ?? f.file;
+    let first: Finding | null = null;
+    for (const o of findings) {
+      if (o === f || (o.repo_path ?? o.file) !== spec || !earlier(o, f) || !differentError(o.error, f.error)) continue;
+      if (!first || earlier(o, first)) first = o;
+    }
+    if (first) f.earlier_failure = { title: (first.full_title || first.title).slice(0, 200), error: errorFirstLine(first.error), class: first.class };
   }
   return findings;
 }

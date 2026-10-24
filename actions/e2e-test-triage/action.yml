@@ -64,7 +64,8 @@ inputs:
     description: >-
       "true" clears a test whose own error is its environment (test server down, a proxy page
       instead of JSON): set it where the PR can't touch that environment (an app against a separate
-      test server). Otherwise such a test is named but stays blocking.
+      test server). Otherwise such a test stays blocking unless the model clears it. On a run that
+      failed mostly on its environment, or with 30 or more failures, it is held for the model either way.
     required: false
     default: "false"
   escalation-model:

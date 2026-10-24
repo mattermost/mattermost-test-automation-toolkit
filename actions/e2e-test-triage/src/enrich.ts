@@ -129,26 +129,52 @@ export async function siblingPlatforms({
   }
 }
 
+// A patch without its hunk headers' line numbers: a base-branch change elsewhere in the file moves those, not the change.
+const patchBody = (patch: string | null | undefined): string | null => (patch == null ? null : patch.replace(/^@@ [^@]* @@/gm, "@@"));
+
+/**
+ * Of the files changed since the last pass, those whose change is the PR's own: a file the PR's diff now or at the pass
+ * lists, with patches that differ. The rest came in from the base branch. A patch too large to show counts as the PR's.
+ */
+export function prChangedSince(since: string[], prNow: { filename: string; patch?: string | null }[], prAtPass: { filename: string; patch?: string | null }[]): string[] {
+  const now = new Map(prNow.map((f) => [f.filename, patchBody(f.patch)]));
+  const then = new Map(prAtPass.map((f) => [f.filename, patchBody(f.patch)]));
+  return since.filter((file) => {
+    if (!now.has(file) && !then.has(file)) return false;
+    const patchNow = now.get(file);
+    const patchThen = then.get(file);
+    return patchNow == null || patchThen == null || patchNow !== patchThen;
+  });
+}
+
 /**
  * Facts for the failures the rules couldn't settle, each from its own source:
- * what changed on this PR since the test last passed here (GitHub compare) and
- * the test's code near the failing line (GitHub contents).
+ * what changed on this PR since the test last passed here (GitHub compare), and of
+ * that what is the PR's own change (its diff from the base branch now and at that
+ * pass), and the test's code near the failing line (GitHub contents).
  */
 export async function enrichFindings({
   findings,
   api,
   id,
   testRoot,
+  prFiles = null,
+  baseBranch = null,
   log = () => {},
 }: {
   findings: Finding[];
   api: GhApi;
   id: CompositeIdentity;
   testRoot: string | null;
+  /** The PR's diff from its base branch now, complete. Without it (or the base branch) nothing is told apart. */
+  prFiles?: { filename: string; patch?: string | null }[] | null;
+  baseBranch?: string | null;
   log?: (message: string) => void;
 }): Promise<void> {
   if (!findings.length) return;
   const compares = new Map<string, { files: { filename: string; patch: string }[]; complete: boolean } | null>();
+  // The PR's diff from its base branch as it was at each last pass, complete, or null.
+  const atPass = new Map<string, { filename: string; patch?: string | null }[] | null>();
   const sources = new Map<string, string | null>();
   for (const f of findings) {
     const last = f.this_pr?.last_pass;
@@ -178,6 +204,19 @@ export async function enrichFindings({
             // A cut-off list cannot show that nothing related changed, so it never clears (see thisPrHistory).
             complete: cmp.complete,
           };
+          if (cmp.complete && prFiles && baseBranch) {
+            if (!atPass.has(sha)) {
+              // The base branch's merge base with the pass commit is the one the PR had then: this is the PR's diff at the pass.
+              atPass.set(sha, await (api("GET", `/repos/${id.repository}/compare/${encodeURIComponent(baseBranch)}...${sha}`) as Promise<unknown>)
+                .then((raw) => {
+                  const listed = (raw as CompareFiles).files ?? [];
+                  return listed.length < COMPARE_FILE_CAP ? listed : null;
+                })
+                .catch((e: unknown) => (log(`this PR's changes at ${sha.slice(0, 7)} unavailable: ${String(e).slice(0, 160)}`), null)));
+            }
+            const then = atPass.get(sha);
+            if (then) f.since_last_pass.pr_changed = prChangedSince(f.since_last_pass.files, prFiles, then);
+          }
         }
       }
     }

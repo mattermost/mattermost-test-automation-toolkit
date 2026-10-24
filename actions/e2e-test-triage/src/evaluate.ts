@@ -3,13 +3,15 @@
 
 import { identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
-import { BORDERLINE, classify, errorSignature, infraVerdict, sameFailure } from "./classify.ts";
+import { BORDERLINE, classify, errorSignature, infraVerdict, isShardPlaceholder, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, historyLane, repoPath } from "./config.ts";
+import { commonSenseClear } from "./common-sense.ts";
 import { sameTestOnOtherReports } from "./enrich.ts";
 import { evidenceFor } from "./evidence.ts";
 import { buildPack, namesChangedFile } from "./pack.ts";
 import type { OtherFailure } from "./pack.ts";
 import { judge } from "./decision.ts";
+import type { OutOfDateResult } from "./history.ts";
 import { newLedger } from "./pricing.ts";
 import type { AskFn, ChangedFile, Config, Diff, Evidence, Finding, HistoryLike, Ledger, PrRef } from "./types.ts";
 
@@ -23,7 +25,10 @@ export interface EvaluatedRun {
   historyTruncated?: boolean;
   ownershipUnknown?: boolean;
   missing: { text: string; short: string } | null;
-  /** Set when every failure names no test (shard-level): none is classified or sent to the model, and the lane is red. */
+  /**
+   * Failures that are shard placeholders, not tests (see isShardPlaceholder): none is classified or sent to the model,
+   * and the lane is red for them. Set beside findings when a run has both.
+   */
   unnamed?: number;
 }
 
@@ -44,13 +49,15 @@ export interface EvaluateParams {
   enrich?: ((findings: Finding[]) => Promise<void>) | null;
   /** The same test on the run's sibling groups (see siblingPlatforms). Asked of every failing run, model or not. */
   otherPlatforms?: ((findings: Finding[]) => Promise<void>) | null;
-  outOfDate?: ((findings: Finding[]) => Promise<{ truncated: boolean }>) | null;
+  outOfDate?: ((findings: Finding[]) => Promise<OutOfDateResult>) | null;
   brokeBy?: ((findings: Finding[]) => Promise<void>) | null;
 }
 
+/** A run flagged as a whole (see infraVerdict) is red for it while any failure still blocks, or when none is named. */
 export const verdictOf = (findings: Finding[], infra: string | null | undefined): string => {
-  if (infra) return "ACTION_REQUIRED";
-  return findings.some((f) => f.blocking) ? "FAILURE" : "SUCCESS";
+  const blocked = findings.some((f) => f.blocking);
+  if (infra && (blocked || !findings.length)) return "ACTION_REQUIRED";
+  return blocked ? "FAILURE" : "SUCCESS";
 };
 
 /** Decide a run from evidence already fetched. Writes nothing. */
@@ -74,17 +81,17 @@ export async function evaluateRun({
   brokeBy = null,
 }: EvaluateParams): Promise<EvaluatedRun> {
   const isTrunkRun = prNumber == null;
-  const result: EvaluatedRun = { verdict: "SUCCESS", findings: [], infra: infraVerdict(run.failing, cfg), counts: run.counts, ai: newLedger(), missing: null };
-  // A failure with no test name (a shard that reported nothing by name) has no history to read and nothing to show the
-  // model. A run whose failures all lack names is red for them: it is counted, and not classified or asked.
-  const named = run.failing.some((t) => t.title.trim() !== "");
-  if (run.failing.length && !named) result.unnamed = run.failing.length;
-  // A run-level infra call still names each failure (an environment error is named, and the run stays red
-  // through its verdict); only the model is kept out of an infra run.
-  if (run.failing.length && named) {
+  // A shard placeholder (no test name, a desktop shard stub, a mobile spec that did not run) has no history to read and
+  // nothing to show the model. The run is red for it: it is counted, and not classified, asked or flagged.
+  const tests = run.failing.filter((t) => !isShardPlaceholder(t));
+  const result: EvaluatedRun = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg), counts: run.counts, ai: newLedger(), missing: null };
+  if (run.failing.length > tests.length) result.unnamed = run.failing.length - tests.length;
+  // A run-level infra call still names each failure, and the model is asked as on any run: the run is red while
+  // any failure still blocks.
+  if (tests.length) {
     const files = (diff.files ?? []).map((f: ChangedFile) => ({ filename: f.filename, patch: f.patch }));
     const changed = files.map((f) => f.filename);
-    const withPaths = run.failing.map((t) => ({ ...t, repo_path: repoPath(testRoot, t.file) }));
+    const withPaths = tests.map((t) => ({ ...t, repo_path: repoPath(testRoot, t.file) }));
     const changeContext = { testRoot, failingSpecs: withPaths.map((t) => t.repo_path).filter((p): p is string => Boolean(p)) };
     const unresolved = (t: { identity_unresolved?: boolean }, key: string): boolean => Boolean(t.identity_unresolved) || (history.ambiguous?.has(key) ?? false);
     result.findings = withPaths.map((t) => {
@@ -96,6 +103,14 @@ export async function evaluateRun({
         commitSha: id.commit_sha,
       });
     });
+    // A PR that breaks its own server fails every test on the environment, so on a flagged run only the judge clears
+    // an environment error.
+    if (result.infra) {
+      const why = /infrastructure errors/.test(result.infra) ? "most of this run failed on its environment" : "many tests failed in this run";
+      for (const f of result.findings)
+        if (f.class === "INFRA_ERROR" && !f.blocking)
+          Object.assign(f, { blocking: true, reason: `Environment error, held for the judge: ${why}, which this change could also have caused (see the error).` });
+    }
     for (const f of result.findings) {
       const producer = evidenceFor(f, evidence);
       if (producer) f.producer = producer;
@@ -133,16 +148,18 @@ export async function evaluateRun({
     if (!blind && prNumber && outOfDate) {
       const candidates = result.findings.filter((f) => f.blocking && BORDERLINE.has(f.class) && !f.identity_unresolved && f.repo_path);
       // A failure whose change list is cut off or unreadable cannot be shown unchanged: it is unchecked, so red and never judged.
-      const unchecked = (because: string): void => {
-        for (const f of candidates) Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} ${because}; this could not be confirmed.` });
+      const unchecked = (list: Finding[], because: string): void => {
+        for (const f of list) Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} ${because}; this could not be confirmed.` });
       };
       try {
-        if ((await outOfDate(candidates))?.truncated)
-          unchecked("The base branch changed 300 or more files since this PR last merged it, so whether this test changed could not be checked");
+        const res = await outOfDate(candidates);
+        // A cut-off list leaves unchecked only what its directory check did not settle (all, when it names none).
+        if (res?.truncated)
+          unchecked(res.unchecked ?? candidates, "The base branch changed 300 or more files since this PR last merged it, so whether this test changed could not be checked");
       } catch (e) {
         // An error is not "nothing changed": the same fail-closed outcome as a cut-off list.
         log(`base branch changes unavailable: ${String(e).slice(0, 200)}`);
-        unchecked("The base branch's changes since this PR last merged it could not be read, so whether this test changed could not be checked");
+        unchecked(candidates, "The base branch's changes since this PR last merged it could not be read, so whether this test changed could not be checked");
       }
     }
     // Tests broken on the base branch: what merged between their last pass and first failure.
@@ -153,19 +170,25 @@ export async function evaluateRun({
         log(`base branch history unavailable: ${String(e).slice(0, 200)}`);
       }
     }
-    if (!blind && ask && prNumber && !result.infra) {
+    if (!blind && prNumber) {
       // More facts for the failures the rules couldn't settle; a lookup that fails only leaves a fact out.
       if (enrich) {
         try {
-          await enrich(result.findings.filter((f) => BORDERLINE.has(f.class) && !f.identity_unresolved && !f.out_of_date));
+          await enrich(result.findings.filter((f) => JUDGED.has(f.class) && f.blocking && !f.identity_unresolved && !f.out_of_date));
         } catch (e) {
           log(`extra evidence unavailable: ${String(e).slice(0, 200)}`);
         }
       }
+      markEarlierFailures(result.findings);
       const others: OtherFailure[] = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const pr: PrRef = { number: prNumber, repository: id.repository, title: prTitle, lane };
       const packs = result.findings.map((f) => (f.class === "OWNED_BY_PR" || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete" ? null : buildPack(f, files, pr, others, changeContext)));
-      await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
+      // Common sense before the model, with or without it: a failure the same commit shows is not the PR's is cleared.
+      for (const [i, f] of result.findings.entries()) {
+        const why = commonSenseClear(f, packs[i], changed);
+        if (why) Object.assign(f, { blocking: false, decision: "rules_unblock", reason: why });
+      }
+      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
     }
     if (!blind && prNumber) sameFailure(result.findings);
   }

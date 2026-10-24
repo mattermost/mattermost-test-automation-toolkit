@@ -1,22 +1,28 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import { BORDERLINE, errorSignature, exoneratedSet, isInfraError } from "./classify.ts";
+import { errorSignature, exoneratedSet, isInfraError, JUDGED } from "./classify.ts";
 import { DEFAULTS } from "./config.ts";
-import { CLEARING, evidenceIds, PACK_IMAGES } from "./pack.ts";
+import { chainClears, CLEARING, evidenceIds, PACK_IMAGES } from "./pack.ts";
 import { answerKey, cachedAnswer, expectedOutput, maxTokensFor, SYSTEM } from "./judge.ts";
 import { costOf, ledgerTotals, newLedger } from "./pricing.ts";
 import type { Answer, BatchResult, Config, Finding, Ledger, Pack } from "./types.ts";
 
 /**
- * What a non-PR cause must cite before it can clear a borderline finding, as the judge's rules
+ * What a non-PR cause must cite before it can clear a judged finding, as the judge's rules
  * require. A related hunk is not on the list: it is evidence the PR may be the cause. Producer
  * evidence is not either: the PR's own CI wrote it, so it supports a clear but cannot carry one.
  */
-export function unblocks(cause: string, cited: string[], pack: Pack): boolean {
+export function unblocks(cause: string, cited: string[], pack: Pack, cls = ""): boolean {
   const has = (...ids: string[]): boolean => ids.some((id) => cited.includes(id));
   const trunk: Partial<Pack["trunk_history_14d"]> = pack.trunk_history_14d ?? {};
-  if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error);
+  // A PR that breaks the server fails every test with an environment error, so its text never clears one; nor do trunk's
+  // failures, which classify does not read for one and so need not be this failure.
+  if (cls === "INFRA_ERROR") {
+    if (cause === "test_bug") return has("this_pr");
+    return (cause === "flaky_environment" || cause === "bug_on_master") && has("cross_pr", "this_pr");
+  }
+  if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error) || (has("earlier_failure_same_spec") && chainClears(pack));
   if (cause === "bug_on_master") return has("cross_pr") || (has("trunk_history_14d") && ((trunk.fails ?? 0) > 0 || (trunk.flaky ?? 0) > 0 || trunk.latest === "failed"));
   if (cause === "test_bug") return has("this_pr");
   return false;
@@ -44,24 +50,26 @@ export function decide(cls: string, answer: Answer | null | undefined, pack: Pac
     return { blocking: false, decision: "engine", answer: a };
   }
   // An unblock always needs a citation that exists in the pack.
-  if (BORDERLINE.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && unblocks(a.cause, cited, pack))
+  if (JUDGED.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && unblocks(a.cause, cited, pack, cls))
     return { blocking: false, decision: "adjudicator_unblock", answer: a };
   // Naming the PR takes the same bar as clearing it: sure enough, and a change in the
   // diff to point to. A weaker guess keeps the failure red as "needs a look".
-  if (BORDERLINE.has(cls) && a.cause === "caused_by_pr" && a.confidence >= cfg.minConfidence && hunk)
+  if (JUDGED.has(cls) && a.cause === "caused_by_pr" && a.confidence >= cfg.minConfidence && hunk)
     return { blocking: true, decision: "adjudicator_blame", answer: a };
   return { blocking: !EXON.has(cls), decision: "engine", answer: a };
 }
 
 /**
  * Whether any answer could change the outcome (see decide): a veto needs a related
- * hunk; an unblock needs a cross-PR recurrence, a pass earlier on this PR, or (flaky_environment) an infrastructure error.
+ * hunk; an unblock needs a cross-PR recurrence, a pass earlier on this PR, or (flaky_environment) an infrastructure error
+ * or an earlier environment failure in the spec with a pass on another platform (not for a held environment error).
  */
 export function canChange(cls: string, pack: Pack, isTrunkRun = false): boolean {
   const ids = evidenceIds(pack);
   const hunk = ids.some((id) => id.startsWith("hunk_"));
   if (exoneratedSet(isTrunkRun).has(cls)) return hunk;
-  if (BORDERLINE.has(cls)) return CLEARING(ids);
+  if (cls === "INFRA_ERROR") return CLEARING(ids);
+  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack);
   return false;
 }
 
@@ -73,10 +81,11 @@ function nearMiss(cls: string, answer: Answer | null | undefined, pack: Pack, cf
   const known = new Set(evidenceIds(pack));
   const cited = answer.cited_evidence.filter((c) => known.has(c));
   const hunk = cited.some((c) => c.startsWith("hunk_"));
-  if (BORDERLINE.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
+  if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
   if (answer.confidence < cfg.escalateMin) return false;
   if (exoneratedSet(isTrunkRun).has(cls)) return answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.vetoMin;
-  return BORDERLINE.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && CLEARING(cited);
+  const clears = CLEARING(cited) || (cls !== "INFRA_ERROR" && answer.cause === "flaky_environment" && (isInfraError(pack.error) || (cited.includes("earlier_failure_same_spec") && chainClears(pack))));
+  return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && clears;
 }
 
 /** A group of findings that share one question to the model: the first is asked, the others take its answer. */
@@ -88,12 +97,16 @@ interface Group {
   error?: unknown;
 }
 
+/** The most questions one model call carries; a bigger run is asked in several calls. */
+export const JUDGED_PER_CALL = 8;
+
 /**
- * Ask the model, in one call per model, about findings an answer could change.
- * Same spec and error share a question; cached answers are reused; a call that
- * could cross the budget is not made; near misses go once to the escalation
- * model. With cfg.advise, blocking findings it can't clear are asked too, as
- * advice only. Whatever the model doesn't settle keeps the rules' outcome.
+ * Ask the model about findings an answer could change, up to cfg.maxJudged questions, at most
+ * JUDGED_PER_CALL per call. Same spec and error share a question; questions that could change the
+ * outcome go first, then those that settle more tests; cached answers are reused; a call that could
+ * cross the budget is not made, and the calls before it stand; near misses go once to the escalation
+ * model. With cfg.advise, blocking findings it can't clear are asked too, as advice only. Whatever the
+ * model doesn't settle keeps the rules' outcome.
  */
 export async function judge(
   findings: Finding[],
@@ -105,24 +118,35 @@ export async function judge(
   ledger: Ledger = newLedger(),
 ): Promise<Finding[]> {
   const groups = new Map<string, Group>();
-  for (const [i, f] of findings.entries()) {
+  // TSIO lists a run's failures in no fixed order. Visiting them in one makes the same run pick the same
+  // questions, leads and batches every time, so a re-run asks the model what it asked before.
+  const sortKey = (f: Finding): string[] => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title, f.error ?? ""];
+  const compareKeys = (a: string[], b: string[]): number => {
+    for (const [k, x] of a.entries()) if (x !== b[k]) return x < b[k] ? -1 : 1;
+    return 0;
+  };
+  const order = findings.map((_, i) => i).sort((a, b) => compareKeys(sortKey(findings[a]), sortKey(findings[b])) || a - b);
+  for (const i of order) {
+    const f = findings[i];
     const pack = packs[i];
-    if (!pack || f.identity_unresolved || !(BORDERLINE.has(f.class) || exoneratedSet(isTrunkRun).has(f.class))) continue;
+    // An environment error the rules cleared is not asked; one still blocking is the judge's to clear or blame.
+    if (!pack || f.identity_unresolved || !((JUDGED.has(f.class) && f.blocking) || exoneratedSet(isTrunkRun).has(f.class))) continue;
     const advisory = !canChange(f.class, pack, isTrunkRun);
-    if (advisory && !(cfg.advise && f.blocking && BORDERLINE.has(f.class))) {
+    if (advisory && !(cfg.advise && f.blocking && JUDGED.has(f.class))) {
       ledger.skipped.no_effect++;
       f.ai = { skipped: "nothing the model could change" };
       continue;
     }
     const sig = errorSignature(f.error);
-    const key = sig ? JSON.stringify([exoneratedSet(isTrunkRun).has(f.class), advisory, f.file, sig]) : `#${i}`;
+    // An environment error never shares a question with another class: its own error is what may clear it.
+    const key = sig ? JSON.stringify([exoneratedSet(isTrunkRun).has(f.class), advisory, f.class === "INFRA_ERROR", f.file, sig]) : `#${i}`;
     const existing = groups.get(key);
     if (existing) {
       ledger.skipped.duplicate++;
       existing.members.push({ f, pack });
     } else groups.set(key, { lead: { f, pack }, members: [{ f, pack }], advisory });
   }
-  let pending = [...groups.values()].sort((a, b) => Number(a.advisory) - Number(b.advisory));
+  let pending = [...groups.values()].sort((a, b) => Number(a.advisory) - Number(b.advisory) || b.members.length - a.members.length);
   for (const g of pending.slice(cfg.maxJudged)) {
     ledger.skipped.cap++;
     for (const m of g.members) m.f.ai = { skipped: "over the per-run limit" };
@@ -142,17 +166,8 @@ export async function judge(
       Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
     }
   };
-  // A finding the response left out is asked once more, on its own.
-  const ask = async (model: string, batch: Group[], retryMissing = true): Promise<void> => {
-    const fresh: Group[] = [];
-    for (const g of batch) {
-      const cached = cachedAnswer(cfg.answers?.[answerKey(model, g.lead.pack)]);
-      if (cached) {
-        ledger.skipped.cached++;
-        g.answer = cached;
-      } else fresh.push(g);
-    }
-    if (!fresh.length) return;
+  // One model call, made only when its worst case fits what is left of the budget.
+  const call = async (model: string, fresh: Group[], retryMissing: boolean): Promise<void> => {
     const chars = fresh.reduce((n, g) => n + JSON.stringify(g.lead.pack).length, SYSTEM.length);
     const images = fresh.reduce((n, g) => n + (PACK_IMAGES.get(g.lead.pack)?.length ?? 0), 0);
     const worst = costOf({ input_tokens: chars / 3 + images * 1600, output_tokens: expectedOutput(model, fresh.length) }, model, cfg.prices);
@@ -206,6 +221,18 @@ export async function judge(
       }
       for (const m of g.members) m.f.ai = { model, cost_usd: (m.f.ai?.cost_usd ?? 0) + share };
     }
+  };
+  // A finding a response left out is asked once more, on its own.
+  const ask = async (model: string, batch: Group[], retryMissing = true): Promise<void> => {
+    const fresh: Group[] = [];
+    for (const g of batch) {
+      const cached = cachedAnswer(cfg.answers?.[answerKey(model, g.lead.pack)]);
+      if (cached) {
+        ledger.skipped.cached++;
+        g.answer = cached;
+      } else fresh.push(g);
+    }
+    for (let i = 0; i < fresh.length; i += JUDGED_PER_CALL) await call(model, fresh.slice(i, i + JUDGED_PER_CALL), retryMissing);
     const isMissing = (e: unknown): boolean => (e as { missing?: unknown } | null | undefined)?.missing === true;
     const missed = fresh.filter((g) => isMissing(g.error));
     if (retryMissing && missed.length) {

@@ -28,7 +28,8 @@ export const DEFAULTS: Config = {
   crossPRMinPRs: 3,
   minConfidence: 0.85,
   vetoMin: 0.9,
-  maxJudged: 8,
+  // Questions per run, asked 8 to a call (see JUDGED_PER_CALL), each call within what is left of the budget.
+  maxJudged: 24,
   // Ask about blocking findings the model can't clear, as advice only.
   advise: true,
   infraMinFailures: 30,
