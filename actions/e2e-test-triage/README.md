@@ -20,12 +20,23 @@ reads its recent history on the PR's base branch and on other PRs:
 | --- | --- | --- |
 | `INFRA` | Mostly infrastructure errors, or 30+ failures | Each failure is judged as on any run; `ACTION_REQUIRED` while any still blocks |
 | `OWNED_BY_PR` | The PR changed the failing spec | Blocking, never sent to the model |
-| `INFRA_ERROR` | The test's own error is its environment (test server down, a proxy page instead of JSON, a shard that never ran) | Cleared with `infra-clears: true` (held on an `INFRA` run), otherwise blocking unless the model clears it |
+| `INFRA_ERROR` | The test's own error is its environment (test server down, a proxy page instead of JSON) | Cleared with `infra-clears: true` (held on an `INFRA` run), otherwise blocking unless the model clears it |
 | `BROKEN_ON_TRUNK` | Master's latest run fails it too | Cleared |
 | `FLAKY_ON_TRUNK` | It is intermittent on master (see below) | Cleared |
 | `FLAKY_CROSS_PR` | 3+ other PRs fail it with the same error, and master passes it | Cleared |
 | `REGRESSION`, `INSUFFICIENT_DATA` | History can't clear it | Blocking, unless the model clears it with evidence |
 | `SAME_FAILURE_AS_CLEARED` | Same spec and error as a test history cleared in this run | Cleared |
+
+**Shard placeholders are not tests.** Some failed rows stand for a shard that
+produced no results: a row with no test name; desktop's
+`[<job name>] CI shard failure` in `ci/tsio-shard-failure.ts`
+(`write-tsio-failure-stub.mjs`, after a job died or was cancelled); and mobile's
+`spec did not run` with "<spec> was assigned to a shard but produced no result"
+(`merge-jest-results-for-tsio.js`). They are counted as failed but are not
+findings: no history is read for them, the model is not asked, and they do not
+make the run an `INFRA` run. The lane stays red and the check says "re-run the
+failed jobs", after the labels when the run also has real failures:
+`(1 flaky; re-run the failed jobs) 85.7% passed (...)`.
 
 A failure still blocking whose spec the base branch changed after the PR last
 merged it is **out of date**: the PR ran its old copy of the test (for example
@@ -33,9 +44,13 @@ against an app build from the base branch). It stays blocking, the summary names
 the base-branch commit that changed the test and says to merge the base branch,
 and the model is not asked. One GitHub compare of the PR's commit with the base
 branch finds these. GitHub lists at most 300 changed files per comparison, so if
-the base branch changed 300 or more since, nothing can be ruled out: those
-failures stay blocking as unchecked evidence (the summary says so), and the model
-is not asked about them.
+the base branch changed 300 or more since, a spec in the list is still out of
+date, and for the rest triage asks GitHub for the base branch's newest commit in
+each failing spec's directory since the merge base (up to the run's time, at most
+20 directories). A commit there marks the failure out of date with that commit;
+none leaves it to the usual rules. A spec no check settled (over 20 directories,
+an error, a merge base with no date) stays blocking as unchecked evidence (the
+summary says so), and the model is not asked about it.
 
 **Flaky on master:** over master's last 50 runs (at least 5), failures plus
 passes that needed a retry, plus 1, divided by the runs plus 2, is 0.05 or more,
@@ -90,7 +105,17 @@ only at `min-confidence` (0.85) or more **and** with a citation a reviewer can
 open: other PRs failing the same way, or an earlier pass on this PR with nothing
 related changed since (for an environment cause, also an error that is clearly
 infrastructural). What the test run recorded (`evidence-dir`) supports a clear
-but never makes one alone, since the PR's own CI wrote it. It can veto a history
+but never makes one alone, since the PR's own CI wrote it.
+
+**The first failure in a chain:** a later test in a spec often fails only because
+an earlier one's setup failed. Each question carries the earliest test of the same
+spec that failed before it in this run with another error (`earlier_failure_same_spec`:
+its title, its error's first line and its class; order is the tests' ordinals in
+their report, else the run's order). For an environment cause it clears a
+`REGRESSION` or `INSUFFICIENT_DATA` failure only when that earlier failure is an
+`INFRA_ERROR` **and** the same test passed on another platform in this run: a PR
+that breaks the server fails every platform. It never clears an environment error
+itself, which still needs other PRs or an earlier pass on this PR. It can veto a history
 clear only at 0.9 with a related diff hunk. If it fails or is unavailable, the
 rules' outcome stands.
 
@@ -123,7 +148,8 @@ rules' outcome stands.
   order: flaky, broken on main, caused by PR, out of date, needs investigation. The
   rate is passed ÷ (passed + failed), as in
   mattermost's own E2E check; it never reads 100% while something failed.
-  A run flagged as a whole says why after the labels while any failure still
+  Shard placeholders add "re-run the failed jobs" after the labels (alone when
+  every failure is one). A run flagged as a whole says why after the labels while any failure still
   blocks: "mostly environment errors, re-run" when at least half its failures are
   environment errors, or "many failures in one run" at 30 or more. Once every
   failure is cleared, the flag is gone.

@@ -38,6 +38,8 @@ export interface TestRef {
   identity_unresolved?: boolean;
   repo_path?: string | null;
   tries?: { ran: number; failed: number };
+  /** Where the test ran in its report (TSIO's case ordinal), when the run says. */
+  ordinal?: number | null;
 }
 
 /** A commit a TSIO-side or GitHub-side lookup named: its sha, and the PR merged in it when the message says so. */
@@ -91,12 +93,21 @@ export interface Finding extends TestRef {
   since_last_pass?: SinceLastPass;
   code_near_failure?: string | null;
   other_lanes?: { platform: string; result: string }[];
+  /** The earliest test of the same spec that failed before this one in this run, with another error (see markEarlierFailures). */
+  earlier_failure?: EarlierFailure;
   decision?: string;
   judge?: Answer | null;
   ai?: Ai;
   escalated?: boolean;
   same_as?: string;
   same_as_class?: string;
+}
+
+/** An earlier failure in the same spec and run: its title, the first line of its error, and its class. */
+export interface EarlierFailure {
+  title: string;
+  error: string;
+  class: string;
 }
 
 export interface Usage {
@@ -160,6 +171,7 @@ export interface Pack {
   producer_evidence?: { id: "producer"; notes: string; screenshots: { name: string; sha256: string }[] };
   this_pr_history?: ThisPRHistory;
   same_test_other_platforms_this_run?: { id: "other_platforms"; results: { platform: string; result: string }[] };
+  earlier_failure_same_spec?: { id: "earlier_failure_same_spec" } & EarlierFailure;
   tries_in_this_run?: { ran: number; failed: number };
   test_code_near_failure?: string;
 }

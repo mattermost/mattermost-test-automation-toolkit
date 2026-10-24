@@ -125,6 +125,7 @@ export function buildPack(finding: Finding, compareFiles: { filename: string; pa
     ...(finding.producer ? { producer_evidence: { id: "producer" as const, notes: finding.producer.notes, screenshots: finding.producer.images.map(({ name, sha256 }) => ({ name, sha256 })) } } : {}),
     ...(finding.this_pr?.runs ? { this_pr_history: thisPrHistory(finding) } : {}),
     ...(finding.other_lanes?.length ? { same_test_other_platforms_this_run: { id: "other_platforms" as const, results: finding.other_lanes } } : {}),
+    ...(finding.earlier_failure ? { earlier_failure_same_spec: { id: "earlier_failure_same_spec" as const, title: finding.earlier_failure.title, error: finding.earlier_failure.error, class: finding.earlier_failure.class } } : {}),
     ...(finding.tries?.ran ? { tries_in_this_run: finding.tries } : {}),
     ...(finding.code_near_failure ? { test_code_near_failure: finding.code_near_failure } : {}),
   };
@@ -165,9 +166,19 @@ export const evidenceIds = (pack: Pack): string[] => [
   // and the complete list of what changed since that pass shows nothing related.
   ...(pack.this_pr_history?.latest === "passed" && pack.this_pr_history.changed_since_last_pass?.complete === true && !pack.this_pr_history.changed_since_last_pass.related_to_this_test.length ? ["this_pr"] : []),
   ...(pack.same_test_other_platforms_this_run ? ["other_platforms"] : []),
+  ...(pack.earlier_failure_same_spec ? ["earlier_failure_same_spec"] : []),
 ];
 
 // Evidence that can change a blocked finding's outcome: a related hunk (a blame or a veto), other PRs failing the
 // same way, or this PR's own earlier pass. What the run recorded is left out: the PR's CI wrote it, so it supports
-// a clear but never carries one.
+// a clear but never carries one. An earlier failure in the same spec clears only as chainClears allows, which reads
+// the pack, not the ids.
 export const CLEARING = (ids: string[]): boolean => ids.some((c) => c.startsWith("hunk_")) || ids.includes("cross_pr") || ids.includes("this_pr");
+
+/**
+ * Whether earlier_failure_same_spec can carry a flaky_environment clear: the earlier test failed on its environment
+ * (INFRA_ERROR), and this test passed on another platform in this same run. A PR that breaks the server fails every
+ * platform, so the pass elsewhere is what rules the PR out; the earlier failure alone never does.
+ */
+export const chainClears = (pack: Pack): boolean =>
+  pack.earlier_failure_same_spec?.class === "INFRA_ERROR" && (pack.same_test_other_platforms_this_run?.results ?? []).some((r) => r.result === "passed");

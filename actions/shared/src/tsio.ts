@@ -167,6 +167,8 @@ export interface FailingTest {
   identity_unresolved: boolean;
   error: string;
   tries: { ran: number; failed: number };
+  /** Its first try's case ordinal in the report it is named by: where it ran there. Absent when TSIO sent none. */
+  ordinal?: number;
 }
 
 export interface RunResult {
@@ -366,6 +368,8 @@ export async function runFromGroups(fetchImpl: FetchImpl, base: string, id: Comp
       failed++;
       const { suite_id: suiteId, title } = lastAttempt;
       const file = fileOf.get(suiteId) ?? "";
+      // The first try in the report it is named by: ordinals are only comparable within one report.
+      const first = attempts.find((a) => a.suite_id === suiteId);
       failing.push({
         file,
         title,
@@ -377,6 +381,7 @@ export async function runFromGroups(fetchImpl: FetchImpl, base: string, id: Comp
         identity_unresolved: testsPerIdentity.get(identityKey({ file, title, full_title: lastAttempt.full_title, report_scope: reportName }))!.size > 1,
         error: [lastAttempt.error_message, lastAttempt.error_stack].filter(Boolean).join("\n"),
         tries: { ran: attempts.filter((a) => a.status !== "skipped").length, failed: attempts.filter((a) => FAILED_STATUSES.has(a.status)).length },
+        ...(typeof first?.ordinal === "number" ? { ordinal: first.ordinal } : {}),
       });
     } else if (status === "skipped") skipped++;
     else if (status === "flaky") flaky++;

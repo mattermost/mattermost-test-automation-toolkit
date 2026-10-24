@@ -226,7 +226,7 @@ export interface SummaryInput {
   laneRed?: boolean;
   /** "2 of 3 reports arrived", for a run with missing reports (see missingArrived). */
   reportsArrived?: string | null;
-  /** Failures that name no test (see evaluateRun): counted, not classified, and the lane is red for them. */
+  /** Shard placeholders (see isShardPlaceholder): counted, not classified, and the lane is red for them. */
   unnamed?: number | null;
 }
 
@@ -262,9 +262,10 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
     : outdatedLead ? `🔴 merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}`
     : yours.length ? `🔴 ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}`
     : missing ? "🔴 results missing"
-    : unnamed ? "🔴 re-run the failed jobs"
     : check.length || outdated.length ? `🟡 ${[needText, staleText].filter(Boolean).join(", ")}`
     : blockingBroken ? `🔴 ${blockingBroken} still failing on ${md(branch)}`
+    // Shard placeholders keep the lane red whatever the tests beside them came to.
+    : unnamed ? "🔴 re-run the failed jobs"
     : `✅ none caused by this ${pr ? "PR" : "commit"}`;
   const lines = [`## E2E triage${where}: ${head}`, ""];
   // Under the headline: how many failed tests also failed on other platforms in this run (see alsoFailed).
@@ -278,9 +279,10 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
   let say = "";
   // What arrived, and what never ran: the reason a lane with missing reports is red.
   const arrived = [reportsArrived, missing?.text].filter(Boolean).join("; ");
-  if (unnamed) {
-    // Failures that name no test: nothing is judged, so the line says which jobs to re-run, and what arrived.
-    say = `Re-run the failed jobs: ${arrived || `${count(unnamed, "failed result")} with no test name`}.`;
+  const rerun = unnamed ? `Re-run the failed jobs: ${arrived || `${count(unnamed, "failed result")} with no test name`}.` : "";
+  if (unnamed && !findings.length) {
+    // Shard placeholders only: nothing is judged, so the line says which jobs to re-run, and what arrived.
+    say = rerun;
   } else if (!counts.failed) {
     // Red with no failed test: the jobs to re-run. A missing report says how many arrived; a lane that is red for a job
     // outside the tests says that.
@@ -295,6 +297,8 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
       unrelated && `${unrelated} look${unrelated === 1 ? "s" : ""} unrelated (${kinds})`,
     ].filter(Boolean).join("; ") + ".";
     if (outdatedLead) say = `Merge ${branch} and re-run first. ${say}`;
+    // Shard placeholders beside the tests: the jobs to re-run, after what triage made of the tests.
+    if (unnamed) say += ` ${rerun}`;
   }
   if (infra) say = `${infra} ${say}`;
   if (missing && counts.failed && !unnamed) say += ` Results incomplete: ${missing.text}; re-run the failed jobs before relying on this.`;
@@ -396,12 +400,15 @@ export function statusLabelOf(f: Finding): StatusLabel {
   return f.class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
 }
 
+/** What a shard placeholder asks for (see isShardPlaceholder): the lane is red until its jobs are re-run. */
+export const RERUN = "re-run the failed jobs";
+
 /**
  * The status labels for a run, each with its count, in the fixed order and only where non-zero ("2 flaky, 2 caused by PR").
- * A run with failures and no findings (every failure names no test) is red for a re-run, and says so.
+ * A run with failures and no findings (every failure is a shard placeholder) is red for a re-run, and says so.
  */
 export function statusLabels(findings: Finding[], failed = findings.length): string[] {
-  if (!findings.length) return failed ? ["re-run the failed jobs"] : [];
+  if (!findings.length) return failed ? [RERUN] : [];
   const counts = new Map<StatusLabel, number>();
   for (const f of findings) {
     const label = statusLabelOf(f);
@@ -421,14 +428,15 @@ export const activeFlag = (infra: string | null | undefined, findings: Finding[]
 
 /**
  * The E2E check's text: "(2 flaky, 2 caused by PR) 99.7% passed (1186 passed, 4 failed, 164 skipped)". Zero labels are
- * left out. The pass line is never shortened; past 140 characters the labels are, as the last resort.
+ * left out. Shard placeholders beside findings add "re-run the failed jobs" after the labels ("(1 flaky; re-run the
+ * failed jobs) ..."). The pass line is never shortened; past 140 characters the labels are, as the last resort.
  */
-export function statusDescription(verdict: string, findings: Finding[], runInfra: string | null | undefined, counts: Partial<Counts>, missing: SummaryMissing | null = null): string {
+export function statusDescription(verdict: string, findings: Finding[], runInfra: string | null | undefined, counts: Partial<Counts>, missing: SummaryMissing | null = null, unnamed = 0): string {
   const pass = passLine(counts);
   // A run with many failures says what triage made of each one, and its flag only while one still blocks.
   const infra = activeFlag(runInfra, findings);
   const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0).join(", ");
-  const rest = [infra && findings.length ? runFlag(infra) : "", missing?.short ?? ""].filter(Boolean).join("; ");
+  const rest = [infra && findings.length ? runFlag(infra) : "", unnamed && findings.length ? RERUN : "", missing?.short ?? ""].filter(Boolean).join("; ");
   const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);
   const shown = head.length <= room ? head : room > 1 ? `${head.slice(0, room - 1).trimEnd()}…` : "";
   const inner = [shown, rest].filter(Boolean).join("; ");

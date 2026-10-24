@@ -3,7 +3,7 @@
 
 import { errorSignature, exoneratedSet, isInfraError, JUDGED } from "./classify.ts";
 import { DEFAULTS } from "./config.ts";
-import { CLEARING, evidenceIds, PACK_IMAGES } from "./pack.ts";
+import { chainClears, CLEARING, evidenceIds, PACK_IMAGES } from "./pack.ts";
 import { answerKey, cachedAnswer, expectedOutput, maxTokensFor, SYSTEM } from "./judge.ts";
 import { costOf, ledgerTotals, newLedger } from "./pricing.ts";
 import type { Answer, BatchResult, Config, Finding, Ledger, Pack } from "./types.ts";
@@ -19,7 +19,9 @@ export function unblocks(cause: string, cited: string[], pack: Pack, cls = ""): 
   // An environment error is cleared only on a recurrence elsewhere or a pass earlier on this PR: a PR that breaks the
   // server (startup, a crash) fails every test with exactly such an error, so the error text alone never clears one.
   if (cause === "flaky_environment" && cls === "INFRA_ERROR") return has("cross_pr", "this_pr");
-  if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error);
+  // An earlier test of the spec that failed on its environment clears only with this test passing on another platform
+  // in this run (see chainClears).
+  if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error) || (has("earlier_failure_same_spec") && chainClears(pack));
   if (cause === "bug_on_master") return has("cross_pr") || (has("trunk_history_14d") && ((trunk.fails ?? 0) > 0 || (trunk.flaky ?? 0) > 0 || trunk.latest === "failed"));
   if (cause === "test_bug") return has("this_pr");
   return false;
@@ -58,14 +60,15 @@ export function decide(cls: string, answer: Answer | null | undefined, pack: Pac
 
 /**
  * Whether any answer could change the outcome (see decide): a veto needs a related
- * hunk; an unblock needs a cross-PR recurrence, a pass earlier on this PR, or (flaky_environment) an infrastructure error.
+ * hunk; an unblock needs a cross-PR recurrence, a pass earlier on this PR, or (flaky_environment) an infrastructure error
+ * or an earlier environment failure in the spec with a pass on another platform (not for a held environment error).
  */
 export function canChange(cls: string, pack: Pack, isTrunkRun = false): boolean {
   const ids = evidenceIds(pack);
   const hunk = ids.some((id) => id.startsWith("hunk_"));
   if (exoneratedSet(isTrunkRun).has(cls)) return hunk;
   if (cls === "INFRA_ERROR") return CLEARING(ids);
-  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error);
+  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack);
   return false;
 }
 
@@ -80,7 +83,7 @@ function nearMiss(cls: string, answer: Answer | null | undefined, pack: Pack, cf
   if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
   if (answer.confidence < cfg.escalateMin) return false;
   if (exoneratedSet(isTrunkRun).has(cls)) return answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.vetoMin;
-  const clears = CLEARING(cited) || (cls !== "INFRA_ERROR" && answer.cause === "flaky_environment" && isInfraError(pack.error));
+  const clears = CLEARING(cited) || (cls !== "INFRA_ERROR" && answer.cause === "flaky_environment" && (isInfraError(pack.error) || (cited.includes("earlier_failure_same_spec") && chainClears(pack))));
   return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && clears;
 }
 

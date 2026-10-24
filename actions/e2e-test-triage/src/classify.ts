@@ -11,6 +11,23 @@ const INFRA_RE =
 
 export const isInfraError = (text: string | null | undefined): boolean => INFRA_RE.test(text ?? "");
 
+/**
+ * A row that stands for a shard that produced no results, not a test that failed: it has no history, nothing to
+ * judge, and nobody can investigate it as a test. The lane stays red for it and the next step is a re-run.
+ * - no test name: a shard that reported a failure without naming a test.
+ * - desktop: e2e/utils/write-tsio-failure-stub.mjs writes "[<job name>] CI shard failure" in ci/tsio-shard-failure.ts
+ *   after a job died or was cancelled before Playwright wrote results; TSIO keeps its error empty.
+ * - mobile: detox/utils/merge-jest-results-for-tsio.js writes "spec did not run" for a spec assigned to a shard that
+ *   uploaded nothing ("<spec> was assigned to a shard but produced no result. ...").
+ */
+export function isShardPlaceholder(t: { file?: string | null; title: string; error?: string | null }): boolean {
+  const title = t.title.trim();
+  const error = String(t.error ?? "").trim();
+  if (!title) return true;
+  if (/^\[[^\]]*\] CI shard failure$/.test(title) && (!error || /(?:^|\/)tsio-shard-failure\.ts$/.test(String(t.file ?? "")))) return true;
+  return title === "spec did not run" && /was assigned to a shard but produced no result/.test(error);
+}
+
 export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 // On a trunk run only flakiness clears: a failure still there from last time is a
 // standing breakage, and greening it would hide it.
@@ -333,6 +350,41 @@ export function sameFailure(findings: Finding[]): Finding[] {
       same_as_class: anchor.class,
       reason: `Fails with the same error as "${anchor.title}" in this spec, which history cleared (${anchor.class}): ${anchor.reason}`,
     });
+  }
+  return findings;
+}
+
+/** The first line of an error, without colour codes, at most 200 characters. */
+export const errorFirstLine = (error: string | null | undefined): string =>
+  (String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).find((l) => l.trim()) ?? "").trim().slice(0, 200);
+
+// Two errors that say different things: another failure key, or, where neither has a key, another first line.
+const differentError = (a: string | null | undefined, b: string | null | undefined): boolean => {
+  const ka = failureKey(a);
+  const kb = failureKey(b);
+  return ka.kind !== kb.kind || ka.key !== kb.key || (ka.key == null && errorFirstLine(a) !== errorFirstLine(b));
+};
+
+/**
+ * The first failure in a chain: for each finding, the earliest test of the same spec file that failed before it in
+ * this run with a different error (its title, the first line of its error, and its class). A later test often fails
+ * only because an earlier one's setup failed. Order is the tests' ordinals within one report, else the order the run
+ * lists them. Evidence only: it changes no class or blocking (see chainClears).
+ */
+export function markEarlierFailures(findings: Finding[]): Finding[] {
+  const earlier = (a: Finding, ai: number, b: Finding, bi: number): boolean => {
+    const [oa, ob] = [a.ordinal, b.ordinal];
+    if ((a.report_name ?? "") === (b.report_name ?? "") && typeof oa === "number" && typeof ob === "number" && oa !== ob) return oa < ob;
+    return ai < bi;
+  };
+  for (const [i, f] of findings.entries()) {
+    const spec = f.repo_path ?? f.file;
+    let first: { f: Finding; i: number } | null = null;
+    for (const [j, o] of findings.entries()) {
+      if (o === f || (o.repo_path ?? o.file) !== spec || !earlier(o, j, f, i) || !differentError(o.error, f.error)) continue;
+      if (!first || earlier(o, j, first.f, first.i)) first = { f: o, i: j };
+    }
+    if (first) f.earlier_failure = { title: (first.f.full_title || first.f.title).slice(0, 200), error: errorFirstLine(first.f.error), class: first.f.class };
   }
   return findings;
 }

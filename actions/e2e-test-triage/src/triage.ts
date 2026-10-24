@@ -8,6 +8,7 @@ import { laneName, laneSummary } from "../../shared/src/lane.ts";
 import { readStatuses, statusPublisher } from "../../shared/src/status.ts";
 import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, SupersededRunError, tsioBase } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.ts";
+import { isShardPlaceholder } from "./classify.ts";
 import { configFrom, DEFAULTS, historyLane, PR_SPEND_KEY } from "./config.ts";
 import { loadEvidence } from "./evidence.ts";
 import { fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
@@ -17,7 +18,7 @@ import { evaluateRun } from "./evaluate.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
 import { redact, secretsOf, writeFindings } from "./findings.ts";
 import { ledgerTotals } from "./pricing.ts";
-import { activeFlag, noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
+import { activeFlag, noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, RERUN, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
 import type { AskFn, Config, Diff, HistoryLike } from "./types.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
@@ -239,10 +240,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // too few); otherwise it is the repository's default branch, and the summary says so.
     const prBase = isTrunkRun ? null : pull.base?.ref ?? null;
     let trunkBranch: string | null | undefined = isTrunkRun ? id.branch : prBase;
-    // A failure with no test name has no history to read, so no history is asked for a run whose failures all lack one.
-    if (run.failing.some((t) => t.title.trim() !== "")) {
+    // A shard placeholder is not a test and has no history (see isShardPlaceholder): history is read for the tests only.
+    const tests = run.failing.filter((t) => !isShardPlaceholder(t));
+    if (tests.length) {
       [history, diff] = await Promise.all([
-        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg)),
+        fetchHistory(fetchImpl, base, id.repository, tests, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg)),
         fetchChangedFiles(api, id, prNumber, log),
       ]);
       const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;
@@ -251,7 +253,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         if (fallback && fallback !== prBase) {
           trunkBranch = fallback;
           notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
+          history = await fetchHistory(fetchImpl, base, id.repository, tests, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
         }
       }
     }
@@ -302,7 +304,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, log }),
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
-      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, log }),
+      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, until: now.toISOString(), log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
     });
     seen.result = result;
@@ -321,7 +323,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // Nothing failed and every report arrived, yet the lane is red: a job outside the tests failed. Its own status says so.
     const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null });
-    const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing);
+    const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0);
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
@@ -366,7 +368,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       // The same labels as the E2E check's text (see statusDescription).
       await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (flag && !result.findings.length
         ? `${run.counts.failed} failed · not triaged, ${runFlag(flag)}`
-        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
+        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${RERUN}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
     log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);

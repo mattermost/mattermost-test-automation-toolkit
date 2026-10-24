@@ -6,13 +6,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { canChange, decide, judge } from "./decision.ts";
-import { EXONERATED_ON_TRUNK, classify, errorSignature, infraVerdict, isInfraError, sameFailure } from "./classify.ts";
+import { EXONERATED_ON_TRUNK, classify, errorSignature, infraVerdict, isInfraError, isShardPlaceholder, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, laneOfReport, repoPath } from "./config.ts";
 import { answerKey, askModelBatch, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
-import { fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
+import { OUT_OF_DATE_DIR_CAP, fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { codeExcerpt, enrichFindings, failingLine, sameTestOnOtherReports, siblingPlatforms } from "./enrich.ts";
 import { evidenceFor, loadEvidence } from "./evidence.ts";
-import { CLEARING, buildPack, changeCategory, changeSummary, compactError, evidenceIds, namesChangedFile } from "./pack.ts";
+import { CLEARING, buildPack, chainClears, changeCategory, changeSummary, compactError, evidenceIds, namesChangedFile } from "./pack.ts";
 import type { OtherFailure } from "./pack.ts";
 import { PRICES, costOf, newLedger, priceFor } from "./pricing.ts";
 import { bucketOf, passRate, renderSummary, statusDescription, statusLabelOf, statusLabels } from "./render.ts";
@@ -2430,9 +2430,13 @@ test("the out-of-date rule stays out of the way when it can't be sure", async ()
   const other = await triage({ env: { ...env, TRIAGE_CONTEXT: "off" }, fetchImpl: fakeFetch(staleRoutes({ compare: { ahead_by: 3, files: [{ filename: "webapp/x.ts" }], commits: [{ sha: "m1" }] }, commits: [], asked })), log: () => {} });
   assert.equal(other.findings[0].out_of_date, undefined);
   assert.equal(asked.length, 1);
-  // GitHub stops listing at 300 files: the spec may be missing from the list, so nothing is marked.
+  // GitHub stops listing at 300 files. A spec in the cut-off list did change, so it is marked.
   const many = Array.from({ length: 300 }, (_, i) => ({ filename: i === 7 ? "specs/a.spec.ts" : `f${i}.ts` }));
-  const capped = await triage({ env: { ...env, TRIAGE_CONTEXT: "off" }, fetchImpl: fakeFetch(staleRoutes({ compare: { ahead_by: 400, files: many, commits: [] }, commits: [] })), log: () => {} });
+  const listed = await triage({ env: { ...env, TRIAGE_CONTEXT: "off" }, fetchImpl: fakeFetch(staleRoutes({ compare: { ahead_by: 400, files: many, commits: [] }, commits: [] })), log: () => {} });
+  assert.deepEqual(listed.findings[0].out_of_date, { base: "master", behind: 400, commit: null });
+  // A spec missing from it may be missing only because the list stopped; with no merge base to ask from, nothing is marked.
+  const others = Array.from({ length: 300 }, (_, i) => ({ filename: `f${i}.ts` }));
+  const capped = await triage({ env: { ...env, TRIAGE_CONTEXT: "off" }, fetchImpl: fakeFetch(staleRoutes({ compare: { ahead_by: 400, files: others, commits: [] }, commits: [] })), log: () => {} });
   assert.equal(capped.findings[0].out_of_date, undefined);
   assert.equal(capped.findings[0].decision, "evidence_incomplete", "not marked, but not cleared on that account either");
   // Up to date with master: nothing to compare.
@@ -3196,12 +3200,14 @@ test("a row that blames this PR never says the cause is environmental: the other
   assert.doesNotMatch(row, /environment|shared cause/, "a change to this PR is not steered toward the environment");
 });
 
-test("the answer-cache key ignores the other-platform evidence, and equals the key HEAD computes for the same pack", () => {
+test("the answer-cache key ignores the other-platform evidence, and is the v5 key for the same pack", () => {
   const pack = { test: { title: "t1", full_title: null, suite: null, file: "specs/a.spec.ts", report_scope: null, report_name: null }, error: "Error: expected visible", engine: { class: "REGRESSION", reason: "r" }, trunk_history_14d: { runs: 8, fails: 0, flaky: 0, latest: "passed" }, cross_pr_failures_14d: { id: "cross_pr", other_prs_where_this_test_failed: [], other_pr_runs_where_it_passed: 0 }, pr: { number: 5, repository: "o/r", title: "t", changed_file_count: 1, changed_files: ["app/x.ts"], spec_file_changed_by_pr: false }, diff_hunks_of_files_named_in_error: [], other_failures_in_same_run: [] } as unknown as Pack;
   const withOthers = { ...pack, same_test_other_platforms_this_run: { id: "other_platforms", results: [{ platform: "windows", result: "failed" }] } } as unknown as Pack;
   assert.equal(answerKey("claude-sonnet-5-5", withOthers), answerKey("claude-sonnet-5-5", pack), "the evidence is not part of the key");
-  // Computed from HEAD (bdce26e) for this pack: a cached answer keeps its key, so no call is paid again.
-  assert.equal(answerKey("claude-sonnet-5-5", pack), "v4:66ab3c425fa3f89d6f1679608b3cf18e73dfcc21b54452686a07b50d08b4843e");
+  // v5 for this pack: SYSTEM gained the earlier_failure_same_spec rule, so every v4 answer is a miss by design. A
+  // cached v5 answer keeps this key, so no call is paid again.
+  assert.match(answerKey("claude-sonnet-5-5", pack), /^v5:/);
+  assert.equal(answerKey("claude-sonnet-5-5", pack), "v5:bcf80891c4782faa31109b2aa041f4d7dcee0d874de8705f6cde091fe0bd8994");
 });
 
 test("a sibling's same leaf title in another describe block is another test: no other-platform line", async () => {
@@ -3605,4 +3611,223 @@ test("the status text is at most 140 characters, keeps its pass line whole, and 
   assert.match(text, /\) 90\.0% passed \(90 passed, 10 failed, 0 skipped\)$/, "the pass line is whole");
   assert.match(text, /^\(\d+ flaky/, "the labels are kept, shortened to fit");
   assert.ok(text.includes("…"), "shortened with an ellipsis");
+});
+
+// ---------------------------------------------------------------- shard placeholders, stale specs past the compare cap, chained failures
+
+// Verbatim titles and errors: desktop e2e/utils/write-tsio-failure-stub.mjs, mobile detox/utils/merge-jest-results-for-tsio.js.
+const DESKTOP_STUB = { file: "ci/tsio-shard-failure.ts", title: "[e2e-linux (2)] CI shard failure", error: "" };
+const MOBILE_STUB = { file: "detox/e2e/test/products/channels/x.e2e.ts", title: "spec did not run", error: "detox/e2e/test/products/channels/x.e2e.ts was assigned to a shard but produced no result. The shard uploaded nothing, or its Jest process died before reaching this spec." };
+
+test("shard placeholders are told from tests: no name, the desktop shard stub, and the mobile spec that did not run", () => {
+  assert.ok(isShardPlaceholder(DESKTOP_STUB));
+  assert.ok(isShardPlaceholder({ ...DESKTOP_STUB, error: "Playwright exited with code 1 and no results.json was written" }), "the stub's own file, whatever its reason");
+  assert.ok(isShardPlaceholder(MOBILE_STUB));
+  assert.ok(isShardPlaceholder({ file: "specs/a.spec.ts", title: "  ", error: "" }), "no test name");
+  assert.equal(isShardPlaceholder({ file: "specs/a.spec.ts", title: "[x] CI shard failure", error: "Error: expected visible" }), false, "a real test with an error is a test");
+  assert.equal(isShardPlaceholder({ ...MOBILE_STUB, error: "Error: expected visible" }), false, "the title alone is not enough");
+  assert.equal(isShardPlaceholder(failing), false);
+});
+
+test("a run of mobile specs that did not run is red for a re-run: no findings, no run flag, nothing judged", async () => {
+  let asked = 0;
+  const run = runOf([1, 2, 3].map((i) => ({ ...MOBILE_STUB, file: `detox/e2e/test/s${i}.e2e.ts` })));
+  const result = await evaluate(run, { ask: async () => { asked++; return fixture<BatchResult>({ answers: [] }); } });
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.unnamed, 3);
+  assert.equal(result.infra, null, "placeholders are not an environment storm of tests");
+  assert.equal(result.verdict, "FAILURE");
+  assert.equal(asked, 0);
+  assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts, null, result.unnamed), "(re-run the failed jobs) 0% passed (0 passed, 3 failed, 0 skipped)");
+  const text = renderSummary({ findings: result.findings, infra: result.infra, runURL: "u", counts: result.counts, trunkBranch: "master", unnamed: result.unnamed });
+  assert.match(text, /^## E2E triage: 🔴 re-run the failed jobs$/m);
+  assert.match(text, /^\*\*Re-run the failed jobs: 3 failed results with no test name\.\*\*/m);
+});
+
+test("a desktop shard stub, end to end: no history, no model, the check red with re-run the failed jobs", async () => {
+  await inTmp(async (dir) => {
+    const statuses: StatusBody[] = [];
+    const summaryPath = join(dir, "s.md");
+    const fetchImpl = fakeFetch([
+      ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+      ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: DESKTOP_STUB.file }] })],
+      ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: DESKTOP_STUB.title, status: "failed", retry_count: 0, ordinal: 0, error_message: null, error_stack: null }])],
+      statusSink(statuses),
+    ]);
+    const result = await triage({ env: { ...env, MODE: "enforce", TRIAGE_CONTEXT: "off", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl, log: () => {} });
+    assert.equal(result.findings.length, 0);
+    assert.equal(result.verdict, "FAILURE");
+    assert.equal(fetchImpl.calls.filter((c) => c.url.includes("/reports/history")).length, 0, "no history read");
+    assert.equal(fetchImpl.calls.filter((c) => c.url.includes("api.anthropic.com")).length, 0, "no model call");
+    assert.deepEqual(statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => [s.state, s.description]), [["failure", "(re-run the failed jobs) 0% passed (0 passed, 1 failed, 0 skipped)"]]);
+    assert.match(readFileSync(summaryPath, "utf8"), /^## E2E triage · playwright-full: 🔴 re-run the failed jobs$/m);
+  });
+});
+
+test("placeholders beside a real flaky failure: the flaky one is labelled, and the run is red with re-run the failed jobs", async () => {
+  const flakyError = 'Error: expect(locator).toHaveText(expected) failed: expected "Channel header" but received "Set a header"';
+  const real = { file: "specs/a.spec.ts", title: "t1", error: flakyError };
+  const run = { ...runOf([MOBILE_STUB, real, DESKTOP_STUB]), counts: { total: 21, passed: 18, failed: 3, flaky: 0, skipped: 0 } };
+  const history = new Map([[identityKey(real), [...trunkPasses(8), obs({ status: "failed", commit_sha: "s1", error_excerpt: flakyError })]]]);
+  const sent: string[] = [];
+  const result = await evaluate(run, { history, ask: async (packs) => { sent.push(...packs.map((p) => p.test.title)); return fixture<BatchResult>({ answers: [] }); } });
+  assert.deepEqual(result.findings.map((f) => [f.title, f.class, f.blocking]), [["t1", "FLAKY_ON_TRUNK", false]], "only the test is a finding");
+  assert.equal(result.unnamed, 2);
+  assert.ok(!sent.some((t) => t !== "t1"), "no placeholder is judged");
+  assert.equal(result.verdict, "FAILURE", "the placeholders keep the run red");
+  const description = statusDescription(result.verdict, result.findings, result.infra, result.counts, null, result.unnamed);
+  assert.equal(description, "(1 flaky; re-run the failed jobs) 85.7% passed (18 passed, 3 failed, 0 skipped)");
+  assert.ok(description.length <= 140);
+  const text = renderSummary({ findings: result.findings, infra: result.infra, runURL: "u", counts: result.counts, trunkBranch: "master", unnamed: result.unnamed });
+  assert.match(text, /^## E2E triage: 🔴 re-run the failed jobs$/m, "never 'none caused' while the lane is red");
+  assert.match(text, /\*\*1 failure: 1 looks unrelated \(1 flaky\)\. Re-run the failed jobs: 2 failed results with no test name\.\*\*/);
+  // The labels still give way first past 140 characters; the re-run stays whole.
+  const long = statusDescription("FAILURE", Array.from({ length: 40 }, (_, i) => finding({ title: `t${i}`, class: "REGRESSION", blocking: i % 2 === 0, decision: i % 4 === 0 ? "adjudicator_blame" : undefined, judge: i % 4 === 0 ? ({ cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "x" } as Finding["judge"]) : null, out_of_date: i % 3 === 0 ? { base: "master", behind: 1, commit: null } : undefined })), null, { passed: 900, failed: 42 }, { text: "x", short: "2 report(s) missing" }, 2);
+  assert.ok(long.length <= 140, `length ${long.length}`);
+  assert.match(long, /; re-run the failed jobs; 2 report\(s\) missing\) /);
+});
+
+/** A GitHub fake for markOutOfDate: a cut-off compare with a merge base, and each directory's commits since it. */
+function cutOffApi(dirCommits: Record<string, unknown[] | Error>, calls: URLSearchParams[] = [], mergeBase: unknown = { sha: "mb", commit: { committer: { date: "2026-09-01T10:00:00Z" } } }) {
+  return async (_method: string, path: string): Promise<unknown> => {
+    if (path.includes("/compare/abc...master")) return { ahead_by: 49, files: Array.from({ length: 300 }, (_, i) => ({ filename: `webapp/f${i}.ts` })), commits: [], merge_base_commit: mergeBase };
+    if (path.startsWith("/repos/o/r/commits?")) {
+      const q = new URLSearchParams(path.slice(path.indexOf("?") + 1));
+      calls.push(q);
+      const answer = dirCommits[q.get("path") ?? ""] ?? [];
+      if (answer instanceof Error) throw answer;
+      return answer;
+    }
+    throw new Error(`unexpected ${path}`);
+  };
+}
+const staleSpec = (path: string): Finding => Object.assign(classify({ file: path, title: "t", error: "Error: expected visible" }, trunkPasses(8), []), { repo_path: path });
+
+test("a cut-off compare checks each failing spec's directory since the merge base: a commit there marks it out of date", async () => {
+  const calls: URLSearchParams[] = [];
+  const rewrite = { sha: "m9", commit: { message: "Rewrite the server list specs (#31234)", committer: { date: "2026-10-02T08:00:00Z" } } };
+  const servers = staleSpec("e2e-tests/cypress/tests/integration/servers/list_spec.js");
+  const login = staleSpec("e2e-tests/cypress/tests/integration/login/login_spec.js");
+  // GitHub's since is inclusive: the merge base itself, touching the directory, is not a change since it.
+  const res = await markOutOfDate({ findings: [servers, login], api: cutOffApi({ "e2e-tests/cypress/tests/integration/servers": [rewrite], "e2e-tests/cypress/tests/integration/login": [{ sha: "mb", commit: { committer: { date: "2026-09-01T10:00:00Z" } } }] }, calls), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master", until: "2026-10-20T00:00:00.000Z" });
+  assert.deepEqual(servers.out_of_date, { base: "master", behind: 49, commit: { sha: "m9", date: "2026-10-02", pr: 31234 } });
+  assert.equal(login.out_of_date, undefined, "no commit in its directory since the merge base");
+  assert.deepEqual(res, { truncated: true, unchecked: [] }, "both settled: neither is left unchecked");
+  assert.deepEqual(calls.map((q) => [q.get("sha"), q.get("path"), q.get("since"), q.get("until"), q.get("per_page")]), [
+    ["master", "e2e-tests/cypress/tests/integration/servers", "2026-09-01T10:00:00Z", "2026-10-20T00:00:00.000Z", "1"],
+    ["master", "e2e-tests/cypress/tests/integration/login", "2026-09-01T10:00:00Z", "2026-10-20T00:00:00.000Z", "1"],
+  ]);
+});
+
+test("the directory check is capped at 20 directories, and a directory it could not read stays unchecked", async () => {
+  const specs = Array.from({ length: OUT_OF_DATE_DIR_CAP + 2 }, (_, i) => staleSpec(`specs/d${i}/x.spec.ts`));
+  const calls: URLSearchParams[] = [];
+  const res = await markOutOfDate({ findings: specs, api: cutOffApi({ "specs/d0": new Error("GitHub 502") }, calls), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master" });
+  assert.equal(calls.length, OUT_OF_DATE_DIR_CAP, "at most 20 directories are asked");
+  assert.equal(calls[0].get("until"), null, "no run time, no until");
+  assert.deepEqual((res.unchecked ?? []).map((f) => f.repo_path), ["specs/d0/x.spec.ts", "specs/d20/x.spec.ts", "specs/d21/x.spec.ts"]);
+  assert.ok(specs.every((f) => f.out_of_date === undefined));
+  // No merge base date to ask from: every spec the list did not name stays unchecked, and nothing is asked.
+  const none: URLSearchParams[] = [];
+  const blind = await markOutOfDate({ findings: [staleSpec("specs/d0/x.spec.ts")], api: cutOffApi({}, none, null), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master" });
+  assert.equal(blind.unchecked?.length, 1);
+  assert.equal(none.length, 0);
+});
+
+test("past the compare cap, a spec its directory shows changed is out of date, one with no change is judged, and an unread one is unchecked", async () => {
+  const run = runOf([
+    { title: "MM-T1", file: "specs/servers/list.spec.ts", error: "Error: expected visible" },
+    { title: "MM-T2", file: "specs/login/login.spec.ts", error: "Error: expected header" },
+    { title: "MM-T3", file: "specs/search/find.spec.ts", error: "Error: expected result" },
+  ]);
+  const history = new Map(run.failing.map((t): [string, Observation[]] => [identityKey(t), [...trunkPasses(8), ...crossPR(31)]]));
+  const rewrite = { sha: "m9", commit: { message: "Rewrite (#31234)", committer: { date: "2026-10-02T08:00:00Z" } } };
+  const api = cutOffApi({ "specs/servers": [rewrite], "specs/search": new Error("GitHub 502") });
+  const sent: string[] = [];
+  const result = await evaluate(run, { history, cfg: { ...DEFAULTS, escalationModel: "" }, outOfDate: (fs) => markOutOfDate({ findings: fs, api, id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master" }), ask: answering((p) => (sent.push(p.test.title), envAnswer)) });
+  const [servers, login, search] = result.findings;
+  assert.deepEqual(servers.out_of_date, { base: "master", behind: 49, commit: { sha: "m9", date: "2026-10-02", pr: 31234 } });
+  assert.equal(statusLabelOf(servers), "out of date");
+  assert.equal(login.out_of_date, undefined);
+  assert.notEqual(login.decision, "evidence_incomplete", "checked and unchanged: not unchecked");
+  assert.equal(search.decision, "evidence_incomplete");
+  assert.deepEqual(sent, ["MM-T2"], "only the checked, unchanged failure goes to the model");
+});
+
+test("the first failure in a chain: an earlier test of the same spec that failed another way, by ordinal, else run order", () => {
+  const env1 = "Error: getaddrinfo ENOTFOUND second-server.test.mattermost.cloud\n    at GetAddrInfoReqWrap.onlookupall";
+  const ui = 'Error: expect(locator).toBeVisible() failed: locator getByRole("listitem", { name: "Second server" })';
+  const mk = (title: string, error: string, ordinal?: number, file = "specs/servers.spec.ts"): Finding => Object.assign(classify({ file, title, error, ordinal }, trunkPasses(8), []), { repo_path: file });
+  // Listed out of order; the ordinals say MM-T4691_2 ran first.
+  const [t3, t2, t5, other] = markEarlierFailures([mk("MM-T4691_3", ui, 30), mk("MM-T4691_2", env1, 20), mk("MM-T4691_5", ui, 50), mk("MM-T1", ui, 10, "specs/other.spec.ts")]);
+  assert.deepEqual(t3.earlier_failure, { title: "MM-T4691_2", error: "Error: getaddrinfo ENOTFOUND second-server.test.mattermost.cloud", class: "INFRA_ERROR" });
+  assert.deepEqual(t5.earlier_failure, t3.earlier_failure, "the chain's first failure, not the previous one with the same error");
+  assert.equal(t2.earlier_failure, undefined, "nothing failed before it");
+  assert.equal(other.earlier_failure, undefined, "another spec is another chain");
+  // Without ordinals, the order the run lists them.
+  const [a, b] = markEarlierFailures([mk("first", env1), mk("second", ui)]);
+  assert.equal(a.earlier_failure, undefined);
+  assert.equal(b.earlier_failure?.title, "first");
+  // The same error earlier is not a chain.
+  assert.equal(markEarlierFailures([mk("x", ui), mk("y", ui)])[1].earlier_failure, undefined);
+});
+
+test("an earlier environment failure in the spec clears a later one only with a pass on another platform in this run", () => {
+  const f = classify({ file: "specs/servers.spec.ts", title: "MM-T4691_3", error: 'Error: expect(locator).toBeVisible() failed: locator getByRole("listitem", { name: "Second server" })' }, trunkPasses(8), [], undefined, 5);
+  assert.equal(f.class, "REGRESSION");
+  const earlier = { title: "MM-T4691_2", error: "Error: getaddrinfo ENOTFOUND second-server.test.mattermost.cloud", class: "INFRA_ERROR" };
+  const packOf = (over: Partial<Finding>): Pack => buildPack({ ...f, ...over }, [], prCtx, []);
+  const chain: Answer = { cause: "flaky_environment", confidence: 0.9, cited_evidence: ["earlier_failure_same_spec", "other_platforms"], explanation: "The earlier test could not reach the second server." };
+
+  const clears = packOf({ earlier_failure: earlier, other_lanes: [{ platform: "macos", result: "passed" }] });
+  assert.deepEqual(clears.earlier_failure_same_spec, { id: "earlier_failure_same_spec", ...earlier });
+  assert.ok(evidenceIds(clears).includes("earlier_failure_same_spec"));
+  assert.ok(chainClears(clears));
+  assert.equal(canChange("REGRESSION", clears), true, "a question the answer can settle, not advice");
+  assert.equal(decide("REGRESSION", chain, clears).decision, "adjudicator_unblock");
+  assert.equal(decide("REGRESSION", { ...chain, cited_evidence: ["other_platforms"] }, clears).blocking, true, "the chain must be cited");
+  assert.equal(decide("REGRESSION", { ...chain, cause: "test_bug" }, clears).blocking, true, "only flaky_environment");
+  assert.equal(decide("INFRA_ERROR", chain, clears).blocking, true, "a held environment error still needs cross_pr or this_pr");
+
+  // The same test failed on the other platform too: a PR that breaks the server fails every platform.
+  const failedElsewhere = packOf({ earlier_failure: earlier, other_lanes: [{ platform: "macos", result: "failed" }] });
+  assert.equal(chainClears(failedElsewhere), false);
+  assert.equal(canChange("REGRESSION", failedElsewhere), false);
+  assert.equal(decide("REGRESSION", chain, failedElsewhere).blocking, true);
+  assert.equal(decide("REGRESSION", chain, packOf({ earlier_failure: earlier })).blocking, true, "no other platform at all");
+  assert.equal(decide("REGRESSION", chain, packOf({ earlier_failure: earlier, other_lanes: [{ platform: "macos", result: "flaky" }] })).blocking, true, "a retry-recovered run is not a pass");
+
+  // An earlier failure that is not an environment error explains nothing about the environment.
+  const notInfra = packOf({ earlier_failure: { ...earlier, error: "Error: expected visible", class: "REGRESSION" }, other_lanes: [{ platform: "macos", result: "passed" }] });
+  assert.equal(chainClears(notInfra), false);
+  assert.equal(canChange("REGRESSION", notInfra), false);
+  assert.equal(decide("REGRESSION", chain, notInfra).blocking, true);
+});
+
+test("a chained failure end to end: the pack carries the earlier failure, and the model's answer citing it clears", async () => {
+  const ui = 'Error: expect(locator).toBeVisible() failed: locator getByRole("listitem", { name: "Second server" })';
+  const base = runOf([
+    { title: "MM-T4691_3", file: "specs/servers.spec.ts", error: ui },
+    { title: "MM-T4691_2", file: "specs/servers.spec.ts", error: "Error: getaddrinfo ENOTFOUND second-server.test.mattermost.cloud" },
+  ]);
+  const run = { ...base, failing: base.failing.map((t, i) => ({ ...t, ordinal: i === 0 ? 30 : 20 })) };
+  const history = new Map(run.failing.map((t): [string, Observation[]] => [identityKey(t), trunkPasses(8)]));
+  const packs: Pack[] = [];
+  const chain: Answer = { cause: "flaky_environment", confidence: 0.9, cited_evidence: ["earlier_failure_same_spec", "other_platforms"], explanation: "x" };
+  const result = await evaluate(run, {
+    history,
+    cfg: { ...DEFAULTS, escalationModel: "" },
+    otherPlatforms: async (fs) => { for (const f of fs) if (f.title === "MM-T4691_3") f.other_lanes = [{ platform: "macos", result: "passed" }]; },
+    ask: answering((p) => (packs.push(p), chain)),
+  });
+  const [later, earlier] = result.findings;
+  assert.equal(earlier.class, "INFRA_ERROR");
+  const packOf = (title: string): Pack | undefined => packs.find((p) => p.test.title === title);
+  assert.deepEqual(packOf("MM-T4691_3")?.earlier_failure_same_spec, { id: "earlier_failure_same_spec", title: "MM-T4691_2", error: "Error: getaddrinfo ENOTFOUND second-server.test.mattermost.cloud", class: "INFRA_ERROR" });
+  assert.equal(packOf("MM-T4691_2")?.earlier_failure_same_spec, undefined, "nothing failed before the first one");
+  assert.equal(later.decision, "adjudicator_unblock");
+  assert.equal(later.blocking, false);
+  assert.equal(earlier.decision, "advice", "the held environment error has nothing an answer could clear it with: advice only");
+  assert.equal(earlier.blocking, true, "the environment error itself is never cleared by the chain");
+  assert.equal(result.verdict, "FAILURE");
 });
