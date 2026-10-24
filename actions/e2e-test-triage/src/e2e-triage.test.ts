@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { canChange, decide, judge, unblocks } from "./decision.ts";
 import { EXONERATED_ON_TRUNK, classify, errorSignature, infraVerdict, isInfraError, isShardPlaceholder, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, laneOfReport, repoPath } from "./config.ts";
-import { answerKey, askModelBatch, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
+import { answerKey, askModelBatch, packKey, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
 import { OUT_OF_DATE_DIR_CAP, fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { codeExcerpt, enrichFindings, failingLine, sameTestOnOtherReports, siblingPlatforms } from "./enrich.ts";
 import { evidenceFor, loadEvidence } from "./evidence.ts";
@@ -3737,6 +3737,23 @@ test("placeholders beside a test still put their specs in the history query: TSI
   assert.deepEqual(result.findings.map((f) => f.title), ["t1"], "the placeholder is not a finding");
   assert.ok(sent.length > 0);
   for (const body of sent) assert.deepEqual([...(body.files ?? [])].sort(), [MOBILE_STUB.file, "specs/a.spec.ts"].sort());
+});
+
+test("a failure that needs a look beside a shard placeholder: the headline is red and says to re-run", () => {
+  const look = finding({ title: "t1", class: "REGRESSION", blocking: true });
+  const text = renderSummary({ findings: [look], infra: null, runURL: "u", counts: { total: 10, passed: 8, failed: 2, flaky: 0, skipped: 0 }, trunkBranch: "master", unnamed: 1 });
+  assert.match(text, /^## E2E triage: 🔴 1 needs a look, re-run the failed jobs$/m);
+  const alone = renderSummary({ findings: [look], infra: null, runURL: "u", counts: { total: 10, passed: 9, failed: 1, flaky: 0, skipped: 0 }, trunkBranch: "master" });
+  assert.match(alone, /^## E2E triage: 🟡 1 needs a look$/m, "without a placeholder it stays amber");
+});
+
+test("the answer cache keys the other platforms' results only where they can clear: beside an earlier failure in the spec", () => {
+  const f = classify({ file: "specs/servers.spec.ts", title: "MM-T4691_3", error: "Error: expected visible" }, trunkPasses(8), []);
+  const earlier = { title: "MM-T4691_2", error: "Error: getaddrinfo ENOTFOUND second-server", class: "INFRA_ERROR" };
+  const passed = [{ platform: "android", result: "passed" }];
+  const key = (over: Partial<Finding>): string => packKey("m", buildPack({ ...f, ...over }, [], prCtx, []));
+  assert.notEqual(key({ earlier_failure: earlier, other_lanes: passed }), key({ earlier_failure: earlier }), "a pass elsewhere arriving later asks again");
+  assert.equal(key({ other_lanes: passed }), key({}), "without the chain the field stays out of the key, as before");
 });
 
 /** A GitHub fake for markOutOfDate: a cut-off compare with a merge base, and each directory's commits since it. */

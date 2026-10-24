@@ -262,7 +262,8 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
     : outdatedLead ? `🔴 merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}`
     : yours.length ? `🔴 ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}`
     : missing ? "🔴 results missing"
-    : check.length || outdated.length ? `🟡 ${[needText, staleText].filter(Boolean).join(", ")}`
+    // Shard placeholders keep the lane red, so a look-only headline turns red and says to re-run.
+    : check.length || outdated.length ? `${unnamed ? "🔴" : "🟡"} ${[needText, staleText, unnamed ? "re-run the failed jobs" : ""].filter(Boolean).join(", ")}`
     : blockingBroken ? `🔴 ${blockingBroken} still failing on ${md(branch)}`
     // Shard placeholders keep the lane red whatever the tests beside them came to.
     : unnamed ? "🔴 re-run the failed jobs"

@@ -795,7 +795,7 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
   const outdatedLead = findings.length > 0 && outdated.length * 2 >= findings.length;
   const staleText = outdated.length ? `${outdated.length} out of date` : "";
   const needText = check.length ? `${check.length} need${check.length === 1 ? "s" : ""} a look` : "";
-  const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? laneRed ? "\u{1F534} red outside the tests" : "\u2705 nothing failed" : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : check.length || outdated.length ? `\u{1F7E1} ${[needText, staleText].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : unnamed ? "\u{1F534} re-run the failed jobs" : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
+  const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? laneRed ? "\u{1F534} red outside the tests" : "\u2705 nothing failed" : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : check.length || outdated.length ? `${unnamed ? "\u{1F534}" : "\u{1F7E1}"} ${[needText, staleText, unnamed ? "re-run the failed jobs" : ""].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : unnamed ? "\u{1F534} re-run the failed jobs" : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
   const lines = [`## E2E triage${where}: ${head}`, ""];
   const several = findings.filter((f) => failedElsewhere(f).length > 0).length;
   if (several) lines.push(`${count(several, "test")} failed on several platforms in this run.`, "");
@@ -1780,7 +1780,7 @@ var isSnapshot = (model) => /-\d{8}$/.test(String(model));
 var snapshotOf = (alias, served) => served.length === alias.length + 9 && served.startsWith(`${alias}-`) && isSnapshot(served);
 var servedMatches = (requested, served) => typeof served === "string" && (served === requested || !isSnapshot(requested) && snapshotOf(requested, served));
 var UNKEYED_FIELDS = /* @__PURE__ */ new Set(["same_test_other_platforms_this_run"]);
-var packKey = (model, pack) => (0, import_node_crypto2.createHash)("sha256").update(model + "\n" + JSON.stringify(Object.fromEntries(Object.entries(pack).filter(([k]) => !UNKEYED_FIELDS.has(k))))).digest("hex");
+var packKey = (model, pack) => (0, import_node_crypto2.createHash)("sha256").update(model + "\n" + JSON.stringify(Object.fromEntries(Object.entries(pack).filter(([k]) => pack.earlier_failure_same_spec || !UNKEYED_FIELDS.has(k))))).digest("hex");
 var imageBlock = (i) => ({ type: "image", source: { type: "base64", media_type: i.media_type, data: i.data } });
 var billedField = (e, key) => e?.[key];
 function rejected(err, msg) {
