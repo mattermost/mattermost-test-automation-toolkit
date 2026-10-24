@@ -745,20 +745,15 @@ var differentError = (a, b) => {
   return ka.kind !== kb.kind || ka.key !== kb.key || ka.key == null && errorFirstLine(a) !== errorFirstLine(b);
 };
 function markEarlierFailures(findings) {
-  const earlier = (a, ai, b, bi) => {
-    if (!a.report_name || a.report_name !== b.report_name) return false;
-    const [oa, ob] = [a.ordinal, b.ordinal];
-    if (typeof oa === "number" && typeof ob === "number" && oa !== ob) return oa < ob;
-    return ai < bi;
-  };
-  for (const [i, f] of findings.entries()) {
+  const earlier = (a, b) => Boolean(a.report_name) && a.report_name === b.report_name && typeof a.ordinal === "number" && typeof b.ordinal === "number" && a.ordinal < b.ordinal;
+  for (const f of findings) {
     const spec = f.repo_path ?? f.file;
     let first = null;
-    for (const [j, o] of findings.entries()) {
-      if (o === f || (o.repo_path ?? o.file) !== spec || !earlier(o, j, f, i) || !differentError(o.error, f.error)) continue;
-      if (!first || earlier(o, j, first.f, first.i)) first = { f: o, i: j };
+    for (const o of findings) {
+      if (o === f || (o.repo_path ?? o.file) !== spec || !earlier(o, f) || !differentError(o.error, f.error)) continue;
+      if (!first || earlier(o, first)) first = o;
     }
-    if (first) f.earlier_failure = { title: (first.f.full_title || first.f.title).slice(0, 200), error: errorFirstLine(first.f.error), class: first.f.class };
+    if (first) f.earlier_failure = { title: (first.full_title || first.title).slice(0, 200), error: errorFirstLine(first.error), class: first.class };
   }
   return findings;
 }

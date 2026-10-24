@@ -3823,7 +3823,7 @@ test("past the compare cap, a spec its directory shows changed is out of date, o
   assert.deepEqual(sent, ["MM-T2"], "only the checked, unchanged failure goes to the model");
 });
 
-test("the first failure in a chain: an earlier test of the same spec that failed another way, by ordinal, else run order", () => {
+test("the first failure in a chain: an earlier test of the same spec and report that failed another way, by ordinal", () => {
   const env1 = "Error: getaddrinfo ENOTFOUND second-server.test.mattermost.cloud\n    at GetAddrInfoReqWrap.onlookupall";
   const ui = 'Error: expect(locator).toBeVisible() failed: locator getByRole("listitem", { name: "Second server" })';
   const mk = (title: string, error: string, ordinal?: number, file = "specs/servers.spec.ts", report: string | null = "detox-ios"): Finding => Object.assign(classify({ file, title, error, ordinal }, trunkPasses(8), []), { repo_path: file, report_name: report });
@@ -3833,12 +3833,13 @@ test("the first failure in a chain: an earlier test of the same spec that failed
   assert.deepEqual(t5.earlier_failure, t3.earlier_failure, "the chain's first failure, not the previous one with the same error");
   assert.equal(t2.earlier_failure, undefined, "nothing failed before it");
   assert.equal(other.earlier_failure, undefined, "another spec is another chain");
-  // Without ordinals, the order the run lists them.
+  // TSIO lists failures in no fixed order: without ordinals, or with equal ones, nothing says which ran first.
   const [a, b] = markEarlierFailures([mk("first", env1), mk("second", ui)]);
   assert.equal(a.earlier_failure, undefined);
-  assert.equal(b.earlier_failure?.title, "first");
+  assert.equal(b.earlier_failure, undefined);
+  assert.equal(markEarlierFailures([mk("first", env1, 4), mk("second", ui, 4)])[1].earlier_failure, undefined);
   // The same error earlier is not a chain.
-  assert.equal(markEarlierFailures([mk("x", ui), mk("y", ui)])[1].earlier_failure, undefined);
+  assert.equal(markEarlierFailures([mk("x", ui, 1), mk("y", ui, 2)])[1].earlier_failure, undefined);
   // Another report ran on another machine; with no report names, nothing says which ran first.
   assert.equal(markEarlierFailures([mk("first", env1, 1, undefined, "detox-android"), mk("second", ui, 2)])[1].earlier_failure, undefined);
   assert.equal(markEarlierFailures([mk("first", env1, 1, undefined, null), mk("second", ui, 2, undefined, null)])[1].earlier_failure, undefined);

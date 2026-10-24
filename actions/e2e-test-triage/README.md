@@ -111,13 +111,14 @@ but never makes one alone, since the PR's own CI wrote it.
 an earlier one's setup failed. Each question carries the earliest test of the same
 spec that failed before it in this run with another error (`earlier_failure_same_spec`:
 its title, its error's first line and its class; order is the tests' ordinals in
-their report, else the run's order). For an environment cause it clears a
+one report, and tests without them never chain). For an environment cause it clears a
 `REGRESSION` or `INSUFFICIENT_DATA` failure only when that earlier failure is an
 `INFRA_ERROR` **and** the same test passed on another platform in this run: a PR
 that breaks the server fails every platform. It never clears an environment error
-itself, which still needs other PRs or an earlier pass on this PR. It can veto a history
-clear only at 0.9 with a related diff hunk. If it fails or is unavailable, the
-rules' outcome stands.
+itself, which still needs other PRs or an earlier pass on this PR.
+
+The model can veto a history clear only at 0.9 with a related diff hunk. If the
+model fails or is unavailable, the rules' outcome stands.
 
 - Tests with the same spec and error share a question. Up to 24 questions per run
   are asked, 8 to a request: questions that can change the outcome first, then

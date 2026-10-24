@@ -368,25 +368,21 @@ const differentError = (a: string | null | undefined, b: string | null | undefin
 /**
  * The first failure in a chain: for each finding, the earliest test of the same spec file that failed before it in
  * this run with a different error (its title, the first line of its error, and its class). A later test often fails
- * only because an earlier one's setup failed. Only tests of one known report chain: another report ran on another
- * machine, and without report names neither ordinals nor list order say which ran first. Order is their ordinals,
- * else the order the run lists them. Evidence only: it changes no class or blocking (see chainClears).
+ * only because an earlier one's setup failed. Only tests of one known report with distinct ordinals chain: another
+ * report ran on another machine, and TSIO lists a run's failures in no fixed order, so without ordinals nothing says
+ * which ran first. Evidence only: it changes no class or blocking (see chainClears).
  */
 export function markEarlierFailures(findings: Finding[]): Finding[] {
-  const earlier = (a: Finding, ai: number, b: Finding, bi: number): boolean => {
-    if (!a.report_name || a.report_name !== b.report_name) return false;
-    const [oa, ob] = [a.ordinal, b.ordinal];
-    if (typeof oa === "number" && typeof ob === "number" && oa !== ob) return oa < ob;
-    return ai < bi;
-  };
-  for (const [i, f] of findings.entries()) {
+  const earlier = (a: Finding, b: Finding): boolean =>
+    Boolean(a.report_name) && a.report_name === b.report_name && typeof a.ordinal === "number" && typeof b.ordinal === "number" && a.ordinal < b.ordinal;
+  for (const f of findings) {
     const spec = f.repo_path ?? f.file;
-    let first: { f: Finding; i: number } | null = null;
-    for (const [j, o] of findings.entries()) {
-      if (o === f || (o.repo_path ?? o.file) !== spec || !earlier(o, j, f, i) || !differentError(o.error, f.error)) continue;
-      if (!first || earlier(o, j, first.f, first.i)) first = { f: o, i: j };
+    let first: Finding | null = null;
+    for (const o of findings) {
+      if (o === f || (o.repo_path ?? o.file) !== spec || !earlier(o, f) || !differentError(o.error, f.error)) continue;
+      if (!first || earlier(o, first)) first = o;
     }
-    if (first) f.earlier_failure = { title: (first.f.full_title || first.f.title).slice(0, 200), error: errorFirstLine(first.f.error), class: first.f.class };
+    if (first) f.earlier_failure = { title: (first.full_title || first.title).slice(0, 200), error: errorFirstLine(first.error), class: first.class };
   }
   return findings;
 }
