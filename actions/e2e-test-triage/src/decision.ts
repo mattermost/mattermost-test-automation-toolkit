@@ -17,8 +17,12 @@ export function unblocks(cause: string, cited: string[], pack: Pack, cls = ""): 
   const has = (...ids: string[]): boolean => ids.some((id) => cited.includes(id));
   const trunk: Partial<Pack["trunk_history_14d"]> = pack.trunk_history_14d ?? {};
   // An environment error is cleared only on a recurrence elsewhere or a pass earlier on this PR: a PR that breaks the
-  // server (startup, a crash) fails every test with exactly such an error, so the error text alone never clears one.
-  if (cause === "flaky_environment" && cls === "INFRA_ERROR") return has("cross_pr", "this_pr");
+  // server (startup, a crash) fails every test with exactly such an error, so neither the error text nor trunk's own
+  // failures (classify reads no trunk history for one, so they need not be this failure) ever clear one.
+  if (cls === "INFRA_ERROR") {
+    if (cause === "test_bug") return has("this_pr");
+    return (cause === "flaky_environment" || cause === "bug_on_master") && has("cross_pr", "this_pr");
+  }
   // An earlier test of the spec that failed on its environment clears only with this test passing on another platform
   // in this run (see chainClears).
   if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error) || (has("earlier_failure_same_spec") && chainClears(pack));

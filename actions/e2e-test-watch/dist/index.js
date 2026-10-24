@@ -1905,7 +1905,10 @@ var answerKey = (model, pack) => `v5:${packKey(model + "\n" + JSON.stringify(sam
 function unblocks(cause, cited, pack, cls = "") {
   const has = (...ids) => ids.some((id) => cited.includes(id));
   const trunk = pack.trunk_history_14d ?? {};
-  if (cause === "flaky_environment" && cls === "INFRA_ERROR") return has("cross_pr", "this_pr");
+  if (cls === "INFRA_ERROR") {
+    if (cause === "test_bug") return has("this_pr");
+    return (cause === "flaky_environment" || cause === "bug_on_master") && has("cross_pr", "this_pr");
+  }
   if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error) || has("earlier_failure_same_spec") && chainClears(pack);
   if (cause === "bug_on_master") return has("cross_pr") || has("trunk_history_14d") && ((trunk.fails ?? 0) > 0 || (trunk.flaky ?? 0) > 0 || trunk.latest === "failed");
   if (cause === "test_bug") return has("this_pr");

@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { canChange, decide, judge } from "./decision.ts";
+import { canChange, decide, judge, unblocks } from "./decision.ts";
 import { EXONERATED_ON_TRUNK, classify, errorSignature, infraVerdict, isInfraError, isShardPlaceholder, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, laneOfReport, repoPath } from "./config.ts";
 import { answerKey, askModelBatch, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
@@ -1924,6 +1924,20 @@ test("the same run in another order asks the same questions in the same batches"
   assert.ok(forward.flat().length > 0);
   assert.deepEqual(await asked([...tests].reverse()), forward);
   assert.deepEqual(await asked([...tests.slice(17), ...tests.slice(0, 17)]), forward);
+});
+
+test("a blocking environment error is never cleared as broken on trunk by trunk's own failures", () => {
+  // classify reads no trunk history for an environment error, so a trunk failure there need not be this one.
+  const f = classify({ file: "specs/s0.spec.ts", title: "t0", error: SERVER_DOWN }, [], []);
+  assert.equal(f.class, "INFRA_ERROR");
+  const base = buildPack(f, [], { lane: "linux" } as PrRef, []);
+  const pack: Pack = { ...base, trunk_history_14d: { ...base.trunk_history_14d, fails: 1, latest: "failed" } };
+  const onTrunk: Answer = { cause: "bug_on_master", confidence: 0.95, cited_evidence: ["trunk_history_14d"], explanation: "x" };
+  assert.equal(decide("INFRA_ERROR", onTrunk, pack).blocking, true);
+  assert.equal(unblocks("bug_on_master", ["trunk_history_14d"], pack, "INFRA_ERROR"), false);
+  assert.equal(unblocks("bug_on_master", ["cross_pr"], pack, "INFRA_ERROR"), true, "the same failure on another PR still clears");
+  assert.equal(unblocks("test_bug", ["cross_pr"], pack, "INFRA_ERROR"), false, "a test bug still needs a pass earlier on this PR");
+  assert.equal(unblocks("bug_on_master", ["trunk_history_14d"], pack, "REGRESSION"), true, "other classes keep the trunk rule");
 });
 
 test("a blocking environment error (infraClears off) is the judge's to clear or blame on any run", async () => {
