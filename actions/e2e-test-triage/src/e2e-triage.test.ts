@@ -1895,7 +1895,8 @@ test("a flagged run holds environment errors the rules would clear: without the 
 });
 
 test("a storm of failures is judged: 24 questions in calls of 8, the rest over the per-run limit stay red with the flag", async () => {
-  const run = runOf(Array.from({ length: 30 }, (_, i) => ({ title: `t${i}`, file: `specs/s${i}.spec.ts`, error: "Error: expected visible" })));
+  // Padded so the specs' order is the list's: the judge picks among equals by spec, then title.
+  const run = runOf(Array.from({ length: 30 }, (_, i) => ({ title: `t${i}`, file: `specs/s${String(i).padStart(2, "0")}.spec.ts`, error: "Error: expected visible" })));
   const history = new Map(run.failing.map((t): [string, Observation[]] => [identityKey(t), [...trunkPasses(8), ...crossPR(31, 32)]]));
   const sent: number[] = [];
   const recurs: Answer = { cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "x" };
@@ -1906,6 +1907,23 @@ test("a storm of failures is judged: 24 questions in calls of 8, the rest over t
   assert.ok(result.findings.slice(24).every((f) => f.blocking && f.ai?.skipped === "over the per-run limit"));
   assert.equal(result.verdict, "ACTION_REQUIRED");
   assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts), "(24 flaky, 6 needs investigation; many failures in one run) 0% passed (0 passed, 30 failed, 0 skipped)");
+});
+
+test("the same run in another order asks the same questions in the same batches", async () => {
+  // TSIO lists a run's failures in no fixed order; the judge must not depend on it.
+  const tests = Array.from({ length: 30 }, (_, i) => ({ title: `t${i}`, file: `specs/s${i % 13}.spec.ts`, error: `Error: expected visible ${i % 3}` }));
+  const recurs: Answer = { cause: "flaky_environment", confidence: 0.95, cited_evidence: ["cross_pr"], explanation: "x" };
+  const asked = async (order: typeof tests): Promise<string[][]> => {
+    const run = runOf(order);
+    const history = new Map(run.failing.map((t): [string, Observation[]] => [identityKey(t), [...trunkPasses(8), ...crossPR(31, 32)]]));
+    const batches: string[][] = [];
+    await evaluate(run, { history, cfg: { ...DEFAULTS, escalationModel: "" }, ask: async (packs, model) => { batches.push(packs.map((p) => `${p.test.file} ${p.test.title}`)); return answering(() => recurs)(packs, model); } });
+    return batches;
+  };
+  const forward = await asked(tests);
+  assert.ok(forward.flat().length > 0);
+  assert.deepEqual(await asked([...tests].reverse()), forward);
+  assert.deepEqual(await asked([...tests.slice(17), ...tests.slice(0, 17)]), forward);
 });
 
 test("a blocking environment error (infraClears off) is the judge's to clear or blame on any run", async () => {
@@ -3685,6 +3703,24 @@ test("placeholders beside a real flaky failure: the flaky one is labelled, and t
   const long = statusDescription("FAILURE", Array.from({ length: 40 }, (_, i) => finding({ title: `t${i}`, class: "REGRESSION", blocking: i % 2 === 0, decision: i % 4 === 0 ? "adjudicator_blame" : undefined, judge: i % 4 === 0 ? ({ cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "x" } as Finding["judge"]) : null, out_of_date: i % 3 === 0 ? { base: "master", behind: 1, commit: null } : undefined })), null, { passed: 900, failed: 42 }, { text: "x", short: "2 report(s) missing" }, 2);
   assert.ok(long.length <= 140, `length ${long.length}`);
   assert.match(long, /; re-run the failed jobs; 2 report\(s\) missing\) /);
+});
+
+test("placeholders beside a test still put their specs in the history query: TSIO's run window is counted over the files asked for", async () => {
+  // Dropping a placeholder's spec moves the window back to older runs of the real test, so its evidence would change.
+  const sent: HistoryBody[] = [];
+  const fetchImpl = fakeFetch([
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+    ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }, { id: "s2", file_path: MOBILE_STUB.file }] })],
+    ["/reports/g1/cases", () => Response.json([...spec("t1", "failed"), { suite_id: "s2", title: MOBILE_STUB.title, status: "failed", retry_count: 0, ordinal: 1, error_message: MOBILE_STUB.error, error_stack: null }])],
+    ["/reports/history", (init) => { sent.push(parsed<HistoryBody>(bodyText(init))); return Response.json({ observations: trunkFailsAll(8) }); }],
+    ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+    ["/statuses/abc", () => Response.json({})],
+  ]);
+  const result = await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", TRIAGE_CONTEXT: "off" }, fetchImpl, log: () => {}, wait: { attempts: 1, ms: 0 } });
+  assert.deepEqual(result.findings.map((f) => f.title), ["t1"], "the placeholder is not a finding");
+  assert.ok(sent.length > 0);
+  for (const body of sent) assert.deepEqual([...(body.files ?? [])].sort(), [MOBILE_STUB.file, "specs/a.spec.ts"].sort());
 });
 
 /** A GitHub fake for markOutOfDate: a cut-off compare with a merge base, and each directory's commits since it. */

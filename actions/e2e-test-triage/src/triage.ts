@@ -240,11 +240,12 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // too few); otherwise it is the repository's default branch, and the summary says so.
     const prBase = isTrunkRun ? null : pull.base?.ref ?? null;
     let trunkBranch: string | null | undefined = isTrunkRun ? id.branch : prBase;
-    // A shard placeholder is not a test and has no history (see isShardPlaceholder): history is read for the tests only.
-    const tests = run.failing.filter((t) => !isShardPlaceholder(t));
-    if (tests.length) {
+    // A shard placeholder is not a test (see isShardPlaceholder): a run of placeholders only needs no history. Otherwise
+    // every failing row's file is asked for, placeholders' too, as before: TSIO counts its run window over the files
+    // asked for, so dropping a file would change which past runs the real tests are judged on.
+    if (run.failing.some((t) => !isShardPlaceholder(t))) {
       [history, diff] = await Promise.all([
-        fetchHistory(fetchImpl, base, id.repository, tests, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg)),
+        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg)),
         fetchChangedFiles(api, id, prNumber, log),
       ]);
       const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;
@@ -253,7 +254,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         if (fallback && fallback !== prBase) {
           trunkBranch = fallback;
           notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-          history = await fetchHistory(fetchImpl, base, id.repository, tests, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
+          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
         }
       }
     }

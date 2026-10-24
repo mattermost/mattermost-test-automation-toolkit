@@ -1671,7 +1671,14 @@ var JUDGED_PER_CALL = 8;
 async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
 }, isTrunkRun = false, ledger = newLedger()) {
   const groups = /* @__PURE__ */ new Map();
-  for (const [i, f] of findings.entries()) {
+  const id = (f) => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title];
+  const before = (a, b) => {
+    for (const [k, x] of a.entries()) if (x !== b[k]) return x < b[k] ? -1 : 1;
+    return 0;
+  };
+  const order = findings.map((_, i) => i).sort((a, b) => before(id(findings[a]), id(findings[b])) || a - b);
+  for (const i of order) {
+    const f = findings[i];
     const pack = packs[i];
     if (!pack || f.identity_unresolved || !(JUDGED.has(f.class) && f.blocking || exoneratedSet(isTrunkRun).has(f.class))) continue;
     const advisory = !canChange(f.class, pack, isTrunkRun);
@@ -2396,10 +2403,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     let diff = { files: [], ok: false };
     const prBase = isTrunkRun ? null : pull.base?.ref ?? null;
     let trunkBranch = isTrunkRun ? id.branch : prBase;
-    const tests = run.failing.filter((t) => !isShardPlaceholder(t));
-    if (tests.length) {
+    if (run.failing.some((t) => !isShardPlaceholder(t))) {
       [history, diff] = await Promise.all([
-        fetchHistory(fetchImpl, base, id.repository, tests, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg)),
+        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg)),
         fetchChangedFiles(api, id, prNumber, log)
       ]);
       const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;
@@ -2408,7 +2414,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
         if (fallback && fallback !== prBase) {
           trunkBranch = fallback;
           notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-          history = await fetchHistory(fetchImpl, base, id.repository, tests, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
+          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
         }
       }
     }

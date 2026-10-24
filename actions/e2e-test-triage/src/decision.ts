@@ -117,7 +117,13 @@ export async function judge(
   ledger: Ledger = newLedger(),
 ): Promise<Finding[]> {
   const groups = new Map<string, Group>();
-  for (const [i, f] of findings.entries()) {
+  // TSIO lists a run's failures in no fixed order. Visiting them in one makes the same run pick the same
+  // questions, leads and batches every time, so a re-run asks the model what it asked before.
+  const id = (f: Finding): string[] => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title];
+  const before = (a: string[], b: string[]): number => { for (const [k, x] of a.entries()) if (x !== b[k]) return x < b[k] ? -1 : 1; return 0; };
+  const order = findings.map((_, i) => i).sort((a, b) => before(id(findings[a]), id(findings[b])) || a - b);
+  for (const i of order) {
+    const f = findings[i];
     const pack = packs[i];
     // An environment error the rules cleared is not asked; one still blocking is the judge's to clear or blame.
     if (!pack || f.identity_unresolved || !((JUDGED.has(f.class) && f.blocking) || exoneratedSet(isTrunkRun).has(f.class))) continue;
