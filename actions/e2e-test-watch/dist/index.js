@@ -2713,7 +2713,7 @@ function prsChanging(touched, spec) {
 var REPAIR_PRS = `query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 50, after: $after) {
     pageInfo { hasNextPage endCursor }
-    nodes { ... on PullRequest { number title url baseRefName headRefName headRefOid mergeable updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } files(first: 100) { nodes { path } } } }
+    nodes { ... on PullRequest { number title url baseRefName headRefName headRefOid updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } files(first: 100) { nodes { path } } } }
   }
 }`;
 async function repairPRs(api, repository, label = DEFAULT_LABEL, { base = null, maxPages = 10 } = {}) {
@@ -2733,7 +2733,6 @@ async function repairPRs(api, repository, label = DEFAULT_LABEL, { base = null, 
   for (const p of prs) for (const f of p.files?.nodes ?? []) files.set(f.path, [...files.get(f.path) ?? [], p.number]);
   return { prs, files };
 }
-var conflictedRepairPRs = (own) => own.prs.filter((p) => p.mergeable === "CONFLICTING");
 
 // src/select.ts
 var ERROR_CHARS = 600;
@@ -3009,7 +3008,6 @@ function bundle(groups) {
 // src/watch.ts
 var MAX_TESTS = 40;
 var MAX_OPEN_PRS_TOUCHING = 10;
-var MAX_CONFLICTS_PER_RUN = 2;
 var HOLD_MS = 24 * HOUR;
 var OWN_PR_IDLE_MS = 3 * DAY;
 var REPORTS_PAGE = 100;
@@ -3045,7 +3043,7 @@ async function watch({ env, fetchImpl = fetch, log = console.error, now = /* @__
 ${note}; nothing to watch.
 `);
     writeOutputs(env, []);
-    return { decisions: [], conflicts: [], requests: [], notes: [note] };
+    return { decisions: [], requests: [], notes: [note] };
   }
   const id = { repository: String(env.REPOSITORY), commit_sha: first.commit, gh_run_id: env.GH_RUN_ID, gh_run_attempt: attempt, branch: trunk };
   const notes = [];
@@ -3204,9 +3202,7 @@ ${note}; nothing to watch.
     });
   }
   for (const g of flaky.slice(Math.max(0, flakyLeft))) skip(g, `skipped: flaky budget of ${maxFlakyPerDay} a day used`);
-  const { conflicts, out: conflictOut } = planConflicts({ own, ledger, now, runURL });
-  out.push(...conflictOut);
-  const lines = summaryLines({ commit: id.commit_sha, runURL, decisions, conflicts, notes });
+  const lines = summaryLines({ commit: id.commit_sha, runURL, decisions, notes });
   if (env.GITHUB_STEP_SUMMARY) (0, import_node_fs5.appendFileSync)(env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
   log(lines.join("\n"));
   if (env.PENDING_PATH) {
@@ -3215,47 +3211,14 @@ ${note}; nothing to watch.
   }
   const planned = out.map(({ id: rid, payload }) => ({ id: rid, payload }));
   writeOutputs(env, planned);
-  return { decisions, conflicts, requests: planned, notes };
+  return { decisions, requests: planned, notes };
 }
-function planConflicts({ own, ledger, now, runURL }) {
-  const conflicts = [];
-  const out = [];
-  let left = MAX_CONFLICTS_PER_RUN;
-  for (const pr of conflictedRepairPRs(own)) {
-    const held = ledger.find((r) => r.pr === pr.number && r.head === pr.headRefOid && now.getTime() - Date.parse(r.at) < HOLD_MS);
-    const c = { pr: pr.number, url: pr.url };
-    conflicts.push(c);
-    if (held) {
-      c.action = `skipped: sent ${utcMinute(held.at)} UTC for this head`;
-      continue;
-    }
-    if (left <= 0) {
-      c.action = `skipped: over ${MAX_CONFLICTS_PER_RUN} conflict requests in one run`;
-      continue;
-    }
-    left--;
-    const payload = { kind: "e2e-autofix-conflict", pr: pr.number, pr_url: pr.url, pr_branch: pr.headRefName, pr_head: pr.headRefOid };
-    c.action = "to send back";
-    out.push({ id: `conflict-${pr.number}`, payload, entry: { at: now.toISOString(), pr: pr.number, head: pr.headRefOid, run: runURL } });
-  }
-  return { conflicts, out };
-}
-function summaryLines({
-  commit,
-  runURL,
-  decisions,
-  conflicts,
-  notes
-}) {
+function summaryLines({ commit, runURL, decisions, notes }) {
   const lines = [`## E2E test watch: ${commit.slice(0, 9)} \xB7 [run](${runURL})`, ""];
   if (!decisions.length) lines.push("No failure needs a repair: nothing failed twice in a row or flaked repeatedly.");
   else {
     lines.push("| Specs | Kind | Tests | Action |", "| --- | --- | --- | --- |");
     for (const d of decisions) lines.push(`| ${d.specs.map((s) => `\`${s}\``).join("<br>")} | ${d.kind} | ${d.tests.length} | ${d.action} |`);
-  }
-  if (conflicts.length) {
-    lines.push("", "Fix PRs in conflict with trunk:", "", "| PR | Action |", "| --- | --- |");
-    for (const c of conflicts) lines.push(`| [#${c.pr}](${c.url}) | ${c.action} |`);
   }
   if (notes.length) lines.push("", ...notes.map((n) => `- ${n}`));
   return lines;
