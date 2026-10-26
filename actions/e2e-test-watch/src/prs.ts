@@ -36,7 +36,6 @@ export interface RepairPR extends PRActivity {
   baseRefName: string;
   headRefName: string;
   headRefOid: string;
-  mergeable: string;
   files?: { nodes?: { path: string }[] } | null;
   isCrossRepository?: boolean | null;
 }
@@ -158,7 +157,7 @@ export function prsChanging(touched: Map<string, number[]>, spec: string): numbe
 const REPAIR_PRS = `query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 50, after: $after) {
     pageInfo { hasNextPage endCursor }
-    nodes { ... on PullRequest { number title url baseRefName headRefName headRefOid mergeable updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } files(first: 100) { nodes { path } } } }
+    nodes { ... on PullRequest { number title url baseRefName headRefName headRefOid updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } files(first: 100) { nodes { path } } } }
   }
 }`;
 
@@ -166,7 +165,7 @@ const REPAIR_PRS = `query($q: String!, $after: String) {
  * The agent's open PRs (by label) into `base`, however long they have been idle: `prs` in search
  * order, `files` mapping each changed path to their numbers (as specsInOpenPRs does). Up to 100
  * changed files per PR: the agent's PRs fix one cause. A PR into another branch (a release
- * backport) neither fixes trunk nor is trunk's to keep mergeable.
+ * backport) doesn't fix trunk.
  */
 export async function repairPRs(
   api: GhApi,
@@ -193,6 +192,3 @@ export async function repairPRs(
   for (const p of prs) for (const f of p.files?.nodes ?? []) files.set(f.path, [...(files.get(f.path) ?? []), p.number]);
   return { prs, files };
 }
-
-/** The agent's open PRs whose branch no longer merges cleanly into trunk. */
-export const conflictedRepairPRs = (own: RepairPRs): RepairPR[] => own.prs.filter((p) => p.mergeable === "CONFLICTING"); // UNKNOWN: the next trunk run looks again

@@ -28,8 +28,9 @@ agent's own PRs (its `label`) changes that exact file and was active in the last
 days; if those PRs can't be read, nothing is requested. Other open PRs that change it
 go to the agent as `open_prs_touching`; fork PRs are dropped on read. Breaks all go
 out at once (`max-broken-per-run` is only a safety limit); flaky specs share
-`max-flaky-per-day`, those not requested this week first. An agent PR that now
-conflicts with trunk goes back to it once per PR head a day, up to 2 a run.
+`max-flaky-per-day`, those not requested this week first. The agent's PRs that
+later conflict with trunk are left to the PR's own automation (e.g. an
+`AI/ConflictsBabysit` label in `extra-labels`).
 
 The action never calls the agent: it writes `requests-file` (`[{"id", "payload"}]`),
 the caller sends each payload with its own credentials, and [`record`](record/action.yml)

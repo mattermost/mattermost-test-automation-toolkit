@@ -18,7 +18,7 @@ import { LEDGER_MS, readLedger, writeLedger } from "./ledger.ts";
 import type { LedgerEntry } from "./ledger.ts";
 import { DAY, HOUR, flakes, utcMinute } from "./model.ts";
 import type { Group, GroupTest, Kind } from "./model.ts";
-import { DEFAULT_LABEL, conflictedRepairPRs, lastActivity, prsChanging, prsTouching, repairPRs, specsInOpenPRs } from "./prs.ts";
+import { DEFAULT_LABEL, lastActivity, prsChanging, prsTouching, repairPRs, specsInOpenPRs } from "./prs.ts";
 import type { OpenPR, OpenPRs, RepairPRs } from "./prs.ts";
 import { addGroup, retryRecovered, selectCrossLane, selectRepairs, selectRetryFlakes } from "./select.ts";
 import { bundle, specRange, suspects, windowsOverlap } from "./range.ts";
@@ -26,8 +26,7 @@ import type { RangedGroup, WatchId } from "./range.ts";
 
 const MAX_TESTS = 40;
 const MAX_OPEN_PRS_TOUCHING = 10;
-const MAX_CONFLICTS_PER_RUN = 2;
-// How long a requested spec or conflicted PR head is left to its agent before it can be requested again.
+// How long a requested spec is left to its agent before it can be requested again.
 const HOLD_MS = 24 * HOUR;
 // An agent PR with no activity for longer than this stops blocking the spec it changes.
 const OWN_PR_IDLE_MS = 3 * DAY;
@@ -72,17 +71,6 @@ export interface FixPayload {
   labels: string[];
 }
 
-/** A conflict request's body: one of the agent's PRs no longer merges into trunk. */
-export interface ConflictPayload {
-  kind: "e2e-autofix-conflict";
-  pr: number;
-  pr_url: string;
-  pr_branch: string;
-  pr_head: string;
-}
-
-export type Payload = FixPayload | ConflictPayload;
-
 /** One spec's outcome in the job summary: sent, or the reason it was not. */
 export interface Decision {
   specs: string[];
@@ -91,29 +79,21 @@ export interface Decision {
   action: string;
 }
 
-/** One of the agent's PRs in conflict with trunk, with its outcome. */
-export interface ConflictRow {
-  pr: number;
-  url: string;
-  action?: string;
-}
-
 /** A request the workflow sends, with the ledger entry `record` keeps once it is accepted. */
 interface Outgoing {
   id: string;
-  payload: Payload;
+  payload: FixPayload;
   entry: LedgerEntry;
 }
 
 /** A request as the workflow reads it from the requests file. */
 export interface PlannedRequest {
   id: string;
-  payload: Payload;
+  payload: FixPayload;
 }
 
 export interface WatchResult {
   decisions: Decision[];
-  conflicts: ConflictRow[];
   requests: PlannedRequest[];
   notes: string[];
 }
@@ -168,7 +148,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     log(`${note}; nothing to watch`);
     if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `## E2E test watch\n\n${note}; nothing to watch.\n`);
     writeOutputs(env, []);
-    return { decisions: [], conflicts: [], requests: [], notes: [note] };
+    return { decisions: [], requests: [], notes: [note] };
   }
   const id: WatchId = { repository: String(env.REPOSITORY), commit_sha: first.commit, gh_run_id: env.GH_RUN_ID, gh_run_attempt: attempt, branch: trunk };
   const notes: string[] = [];
@@ -352,12 +332,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   }
   for (const g of flaky.slice(Math.max(0, flakyLeft))) skip(g, `skipped: flaky budget of ${maxFlakyPerDay} a day used`);
 
-  // The repair PRs the automation opened are its own to keep mergeable: a trunk merge that
-  // conflicts with one goes back to it, once per PR head within the hold.
-  const { conflicts, out: conflictOut } = planConflicts({ own, ledger, now, runURL });
-  out.push(...conflictOut);
-
-  const lines = summaryLines({ commit: id.commit_sha, runURL, decisions, conflicts, notes });
+  const lines = summaryLines({ commit: id.commit_sha, runURL, decisions, notes });
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
   log(lines.join("\n"));
   if (env.PENDING_PATH) {
@@ -366,64 +341,16 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   }
   const planned = out.map(({ id: rid, payload }) => ({ id: rid, payload }));
   writeOutputs(env, planned);
-  return { decisions, conflicts, requests: planned, notes };
+  return { decisions, requests: planned, notes };
 }
 
-/**
- * Conflict requests for the agent's own PRs that no longer merge into trunk: once per PR head within
- * HOLD_MS, and at most MAX_CONFLICTS_PER_RUN new ones per run. Returns the summary rows and the requests to send.
- */
-function planConflicts({ own, ledger, now, runURL }: { own: RepairPRs; ledger: LedgerEntry[]; now: Date; runURL: string }): {
-  conflicts: ConflictRow[];
-  out: Outgoing[];
-} {
-  const conflicts: ConflictRow[] = [];
-  const out: Outgoing[] = [];
-  let left = MAX_CONFLICTS_PER_RUN;
-  for (const pr of conflictedRepairPRs(own)) {
-    const held = ledger.find((r) => r.pr === pr.number && r.head === pr.headRefOid && now.getTime() - Date.parse(r.at) < HOLD_MS);
-    const c: ConflictRow = { pr: pr.number, url: pr.url };
-    conflicts.push(c);
-    // Not counted against the per-run limit: a PR already sent for its head can't starve the others.
-    if (held) {
-      c.action = `skipped: sent ${utcMinute(held.at)} UTC for this head`;
-      continue;
-    }
-    if (left <= 0) {
-      c.action = `skipped: over ${MAX_CONFLICTS_PER_RUN} conflict requests in one run`;
-      continue;
-    }
-    left--;
-    const payload: ConflictPayload = { kind: "e2e-autofix-conflict", pr: pr.number, pr_url: pr.url, pr_branch: pr.headRefName, pr_head: pr.headRefOid };
-    c.action = "to send back";
-    out.push({ id: `conflict-${pr.number}`, payload, entry: { at: now.toISOString(), pr: pr.number, head: pr.headRefOid, run: runURL } });
-  }
-  return { conflicts, out };
-}
-
-/** The job summary: what each spec got, the agent's PRs in conflict, and what could not be read. */
-function summaryLines({
-  commit,
-  runURL,
-  decisions,
-  conflicts,
-  notes,
-}: {
-  commit: string;
-  runURL: string;
-  decisions: Decision[];
-  conflicts: ConflictRow[];
-  notes: string[];
-}): string[] {
+/** The job summary: what each spec got, and what could not be read. */
+function summaryLines({ commit, runURL, decisions, notes }: { commit: string; runURL: string; decisions: Decision[]; notes: string[] }): string[] {
   const lines = [`## E2E test watch: ${commit.slice(0, 9)} · [run](${runURL})`, ""];
   if (!decisions.length) lines.push("No failure needs a repair: nothing failed twice in a row or flaked repeatedly.");
   else {
     lines.push("| Specs | Kind | Tests | Action |", "| --- | --- | --- | --- |");
     for (const d of decisions) lines.push(`| ${d.specs.map((s) => `\`${s}\``).join("<br>")} | ${d.kind} | ${d.tests.length} | ${d.action} |`);
-  }
-  if (conflicts.length) {
-    lines.push("", "Fix PRs in conflict with trunk:", "", "| PR | Action |", "| --- | --- |");
-    for (const c of conflicts) lines.push(`| [#${c.pr}](${c.url}) | ${c.action} |`);
   }
   if (notes.length) lines.push("", ...notes.map((n) => `- ${n}`));
   return lines;

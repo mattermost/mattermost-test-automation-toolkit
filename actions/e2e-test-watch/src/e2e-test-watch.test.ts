@@ -17,7 +17,7 @@ import { prsTouching, specsInOpenPRs } from "./prs.ts";
 import type { RepairPR } from "./prs.ts";
 import { readLedger } from "./ledger.ts";
 import { record, runGroups, watch } from "./watch.ts";
-import type { FixPayload, ConflictPayload, Payload } from "./watch.ts";
+import type { FixPayload } from "./watch.ts";
 import type { GroupTest, RangeEnd, RunRow } from "./model.ts";
 
 const trunkOf = (fails: number, flaky: number, passes: number) => ({ runs: 8, fails, flaky, passes, latest: "passed" });
@@ -298,21 +298,15 @@ const env = { REPOSITORY: "o/r", GH_RUN_ID: "12", BRANCH: "master", GITHUB_TOKEN
 const now = new Date("2026-10-03T00:00:00Z");
 const ledgerPath = (): string => join(mkdtempSync(join(tmpdir(), "watch-")), "ledger.json");
 
-/** The fix request in a payload, asserting the payload is one. */
-const asFix = (p: Payload | undefined): FixPayload => {
-  if (!p || p.kind !== "e2e-autofix") throw new Error(`not a fix request: ${JSON.stringify(p)}`);
-  return p;
-};
-
-/** The conflict request in a payload, asserting the payload is one. */
-const asConflict = (p: Payload | undefined): ConflictPayload => {
-  if (!p || p.kind !== "e2e-autofix-conflict") throw new Error(`not a conflict request: ${JSON.stringify(p)}`);
+/** The request in a payload, asserting there is one. */
+const asFix = (p: FixPayload | undefined): FixPayload => {
+  if (!p) throw new Error("no request");
   return p;
 };
 
 // One trunk run as the workflow does it: plan, send each request (into `hook`, answered with
 // `status`), then record what was accepted.
-async function run({ env: e, fetchImpl, now: at = now, hook = [], status = 200 }: { env: Record<string, string | undefined>; fetchImpl: FetchImpl; now?: Date; hook?: Payload[]; status?: number }) {
+async function run({ env: e, fetchImpl, now: at = now, hook = [], status = 200 }: { env: Record<string, string | undefined>; fetchImpl: FetchImpl; now?: Date; hook?: FixPayload[]; status?: number }) {
   const LEDGER_PATH = e.LEDGER_PATH ?? ledgerPath();
   const PENDING_PATH = `${LEDGER_PATH}.pending`;
   const result = await watch({ env: { ...e, LEDGER_PATH, PENDING_PATH }, fetchImpl, now: at, log: () => {} });
@@ -322,7 +316,7 @@ async function run({ env: e, fetchImpl, now: at = now, hook = [], status = 200 }
 }
 
 test("broken specs with one cause go to one agent with what broke them, and are not requested again while it works", async () => {
-  const hook: Payload[] = [];
+  const hook: FixPayload[] = [];
   const compared: string[] = [];
   const untils: string[] = [];
   const fetchImpl = routes({ compared, untils });
@@ -357,7 +351,7 @@ test("broken specs with one cause go to one agent with what broke them, and are 
 });
 
 test("a request the agent did not accept is not recorded, so the next run plans it again", async () => {
-  const hook: Payload[] = [];
+  const hook: FixPayload[] = [];
   const LEDGER_PATH = ledgerPath();
   const fetchImpl = routes({});
   await run({ env: { ...env, LEDGER_PATH }, fetchImpl, hook, status: 500 });
@@ -374,7 +368,7 @@ test("breaks all go out at once; flaky specs draw on a daily budget", async () =
     ...[1, 2, 3, 4, 5, 6, 30].map((h) => ({ at: at(h), specs: [`specs/flaky${h}.spec.ts`], kind: "flaky", run: "r" })),
     ...[1, 2, 3].map((h) => ({ at: at(h), specs: [`specs/broken${h}.spec.ts`], kind: "broken", run: "r" })),
   ] }));
-  const sent: Payload[] = [];
+  const sent: FixPayload[] = [];
   const used = await run({ env: { ...env, LEDGER_PATH: `${LEDGER_PATH}` }, fetchImpl: routes({ openPRFiles: [], recovered: true }), hook: sent });
   assert.deepEqual(used.decisions.map((d) => [d.kind, d.action]), [
     ["broken", "to request"],
@@ -395,14 +389,14 @@ test("breaks all go out at once; flaky specs draw on a daily budget", async () =
   assert.deepEqual(stopped.decisions.map((d) => d.action), ["skipped: over 0 broken requests in one run"]);
 
   // A release-branch run started from the same workflow is not trunk.
-  const release: Payload[] = [];
+  const release: FixPayload[] = [];
   const other = await run({ env, fetchImpl: routes({ openPRFiles: [], branch: "release-12.0" }), hook: release });
   assert.equal(release.length, 0);
   assert.deepEqual(other.notes, ["not a master run (pw-master@release-12.0)"]);
 });
 
 test("a first failure in two lanes of the same run is broken now; in one lane it waits", async () => {
-  const hook: Payload[] = [];
+  const hook: FixPayload[] = [];
   const lanes = ["pw-master", "pw-fips-master"];
   const { decisions } = await run({
     env: { ...env, SUITES: JSON.stringify(lanes.map(suite)) },
@@ -452,7 +446,7 @@ test("the suspect range covers every lane's break, ending at the latest lane's f
 });
 
 test("a test that failed and passed on retry is repaired as flaky only if it also flaked on trunk before", async () => {
-  const hook: Payload[] = [];
+  const hook: FixPayload[] = [];
   const { decisions } = await run({ env, fetchImpl: routes({ recovered: true }), hook });
   assert.deepEqual(decisions.map((d) => [d.specs, d.kind, d.action]), [
     [["specs/y/b.spec.ts"], "broken", "skipped: #41 (e2e-autofix) already changes it"],
@@ -465,30 +459,17 @@ test("a test that failed and passed on retry is repaired as flaky only if it als
   assert.match(flaky.tests[0].error, /toast not visible/, "the error is the failed attempt's");
 });
 
-test("a fix PR that conflicts with trunk goes back to the agent, once per PR head", async () => {
-  const hook: Payload[] = [];
+test("conflict requests a ledger still holds from before they moved to a label hold no spec", async () => {
   const LEDGER_PATH = ledgerPath();
-  const pr = (number: number, mergeable: string, head = `h${number}`): RepairPR => ({ number, url: `https://github.com/o/r/pull/${number}`, baseRefName: "master", headRefName: `fix/e2e-autofix-${number}`, headRefOid: head, mergeable, isCrossRepository: false });
-  const repairPRsList = [pr(50, "CONFLICTING"), pr(51, "MERGEABLE"), pr(52, "UNKNOWN")];
-  const first = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ repairPRs: repairPRsList }), hook });
-  assert.deepEqual(first.conflicts.map((c) => [c.pr, c.action]), [[50, "to send back"]], "only a known conflict is sent; UNKNOWN waits for the next run");
-  const sent = hook.filter((h) => h.kind === "e2e-autofix-conflict").map(asConflict);
-  assert.equal(sent.length, 1);
-  assert.deepEqual([sent[0].pr, sent[0].pr_branch, sent[0].pr_head], [50, "fix/e2e-autofix-50", "h50"]);
-  assert.equal(hook.filter((h) => h.kind === "e2e-autofix").length, 1, "a conflict request does not use up the fix cap");
-
-  // Next trunk run, same head still in conflict: its agent is on it.
-  const again = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ repairPRs: repairPRsList }), now: new Date(now.getTime() + 1800e3), hook });
-  assert.match(String(again.conflicts[0].action), /^skipped: sent .* for this head$/);
-  assert.equal(hook.filter((h) => h.kind === "e2e-autofix-conflict").length, 1);
-
-  // The agent pushed a merge, and a later trunk merge conflicts again: a new head is a new request.
-  await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ repairPRs: [pr(50, "CONFLICTING", "h50b")] }), now: new Date(now.getTime() + 3600e3), hook });
-  assert.equal(hook.filter((h) => h.kind === "e2e-autofix-conflict").length, 2);
+  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 3600e3).toISOString(), pr: 50, head: "h50", run: "r" }] }));
+  const hook: FixPayload[] = [];
+  const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRLabels: [] }), hook });
+  assert.deepEqual(decisions.map((d) => d.action), ["to request"]);
+  assert.equal(hook.length, 1);
 });
 
 test("someone else's open PR on a spec doesn't hold back the fix: the agent gets it to judge", async () => {
-  const hook: Payload[] = [];
+  const hook: FixPayload[] = [];
   // #41 is feature work (no autofix label) changing y/b.spec.ts; #43 targets a release branch.
   const { decisions } = await run({ env, fetchImpl: routes({ openPRLabels: [], releasePRFiles: ["specs/x/a.spec.ts"] }), hook });
   assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [[["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], "to request"]]);
@@ -496,20 +477,18 @@ test("someone else's open PR on a spec doesn't hold back the fix: the agent gets
 });
 
 test("a fork PR is never sent to the agent, and does not count as its own", async () => {
-  const hook: Payload[] = [];
+  const hook: FixPayload[] = [];
   // #42 is from a fork: it changes x/a.spec.ts and carries the agent's label. Its title and files stay out of the request.
   const { decisions } = await run({ env, fetchImpl: routes({ openPRLabels: [], forkPRFiles: ["specs/x/a.spec.ts"], forkPRLabels: ["e2e-autofix"] }), hook });
   assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [[["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], "to request"]], "the fork PR does not block x/a");
   assert.deepEqual(asFix(hook[0]).open_prs_touching, [{ number: 41, title: "PR 41", url: "https://github.com/o/r/pull/41" }], "the same-repo PR is listed; the fork PR is not");
 });
 
-test("a fork PR with the agent's label is not one of its PRs: no conflict request, no block", async () => {
-  const hook: Payload[] = [];
-  const fork = { number: 60, title: "fork", url: "https://github.com/o/r/pull/60", baseRefName: "master", headRefName: "fix/60", headRefOid: "h60", mergeable: "CONFLICTING", isCrossRepository: true, files: { nodes: [{ path: "specs/x/a.spec.ts" }] } };
-  const { decisions, conflicts } = await run({ env, fetchImpl: routes({ openPRFiles: [], repairPRs: [fork] }), hook });
-  assert.deepEqual(conflicts, [], "a fork PR is never sent back to the agent");
+test("a fork PR with the agent's label is not one of its PRs: it blocks nothing", async () => {
+  const hook: FixPayload[] = [];
+  const fork = { number: 60, title: "fork", url: "https://github.com/o/r/pull/60", baseRefName: "master", headRefName: "fix/60", headRefOid: "h60", isCrossRepository: true, files: { nodes: [{ path: "specs/x/a.spec.ts" }] } };
+  const { decisions } = await run({ env, fetchImpl: routes({ openPRFiles: [], repairPRs: [fork] }), hook });
   assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [[["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], "to request"]]);
-  assert.equal(hook.filter((h) => h.kind === "e2e-autofix-conflict").length, 0);
 });
 
 test("a break overlapping one handed over a few hours ago waits for that agent; later it is requested", async () => {
@@ -521,7 +500,7 @@ test("a break overlapping one handed over a few hours ago waits for that agent; 
     return path;
   };
   const overlapping = { from: Date.parse("2026-10-02T06:00:00Z"), to: Date.parse("2026-10-02T07:30:00Z") };
-  const hook: Payload[] = [];
+  const hook: FixPayload[] = [];
   const held = await run({ env: { ...env, LEDGER_PATH: ledgerWith(overlapping) }, fetchImpl: routes({ openPRFiles: [] }), hook });
   assert.deepEqual(held.decisions.map((d) => d.action), ["skipped: may be the break requested 2026-10-02 23:00 UTC (overlapping suspect commits)"]);
   assert.equal(hook.length, 0);
@@ -567,7 +546,7 @@ test("a bundle with a member whose break is older than the history has no suspec
 });
 
 test("a spec whose history can't be read waits for the next run instead of going out unbundled", async () => {
-  const hook: Payload[] = [];
+  const hook: FixPayload[] = [];
   const { decisions } = await run({ env, fetchImpl: routes({ openPRFiles: [], historyFailFor: "x/a.spec.ts" }), hook });
   assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [
     [["specs/x/a.spec.ts"], "skipped: history unavailable (Error: TSIO history 503)"],
@@ -583,7 +562,6 @@ const ownPR = (number: number, path: string, over: Record<string, unknown> = {})
   baseRefName: "master",
   headRefName: `fix/${number}`,
   headRefOid: `h${number}`,
-  mergeable: "MERGEABLE",
   isCrossRepository: false,
   updatedAt: "2026-10-02T23:00:00Z",
   files: { nodes: [{ path }] },
@@ -595,18 +573,17 @@ test("an agent PR blocks the exact spec it changes while active, not its directo
   const sibling = await run({ env, fetchImpl: routes({ openPRFiles: [], repairPRs: [ownPR(9, "specs/z/helpers.ts")] }), hook: [] });
   assert.deepEqual(sibling.decisions.map((d) => [d.specs.slice().sort(), d.action]), [[["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], "to request"]], "a helper beside the spec does not block it");
 
-  // The spec itself: skipped; the release-branch backport changes it too but is not trunk's, so it neither blocks nor conflicts.
-  const backport = ownPR(10, "specs/x/a.spec.ts", { baseRefName: "release-12.0", mergeable: "CONFLICTING" });
+  // The spec itself: skipped; the release-branch backport changes it too but is not trunk's, so it doesn't block.
+  const backport = ownPR(10, "specs/x/a.spec.ts", { baseRefName: "release-12.0" });
   const exact = await run({ env, fetchImpl: routes({ openPRFiles: [], repairPRs: [ownPR(9, "specs/z/c.spec.ts"), backport] }), hook: [] });
   assert.deepEqual(exact.decisions.map((d) => [d.specs, d.action]), [
     [["specs/z/c.spec.ts"], "skipped: #9 (e2e-autofix) already changes it"],
     [["specs/x/a.spec.ts", "specs/y/b.spec.ts"], "to request"],
   ]);
-  assert.deepEqual(exact.conflicts, []);
 });
 
 test("a labelled open PR beside a spec, not on it, does not block the spec; it is still listed for the agent", async () => {
-  const hook: Payload[] = [];
+  const hook: FixPayload[] = [];
   // #41 carries the label and changes y/helpers.ts, beside y/b.spec.ts.
   const { decisions } = await run({ env, fetchImpl: routes({ openPRFiles: ["specs/y/helpers.ts"] }), hook });
   assert.deepEqual(decisions.map((d) => [d.specs.slice().sort(), d.action]), [[["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], "to request"]]);
@@ -652,17 +629,6 @@ test("the hold still limits duplicates for a spec whose agent PR is idle", async
   ]);
 });
 
-test("conflicts already sent for their head don't use up the per-run limit", async () => {
-  const LEDGER_PATH = ledgerPath();
-  const sentAt = new Date(now.getTime() - 3600e3).toISOString();
-  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [50, 51].map((n) => ({ at: sentAt, pr: n, head: `h${n}`, run: "r" })) }));
-  const pr = (number: number): RepairPR => ({ number, url: `https://github.com/o/r/pull/${number}`, baseRefName: "master", headRefName: `fix/${number}`, headRefOid: `h${number}`, mergeable: "CONFLICTING", isCrossRepository: false });
-  const { conflicts } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ repairPRs: [pr(50), pr(51), pr(52), pr(53), pr(54)] }), hook: [] });
-  assert.deepEqual(conflicts.map((c) => [c.pr, String(c.action).split(" ")[0] + (String(c.action).includes("over") ? " over" : "")]), [
-    [50, "skipped:"], [51, "skipped:"], [52, "to"], [53, "to"], [54, "skipped: over"],
-  ]);
-});
-
 test("the flaky budget goes to specs not requested this week before the ones that were", async () => {
   // Both flaked once before. v/e was requested two days ago (past the 24-hour hold) and is still flaky; u/f never was.
   const ledgerWithE = (): string => {
@@ -687,7 +653,7 @@ test("when the agent's own PRs can't be read, no fix request goes out", async ()
   const fetchImpl = routes({ openPRFiles: [] });
   const failing: FetchImpl = async (url, init = {}) =>
     String(url).includes("/graphql") && (JSON.parse(String(init.body)) as { query: string }).query.includes("search(") ? Response.json({ errors: [{ message: "rate limited" }] }) : fetchImpl(url, init);
-  const hook: Payload[] = [];
+  const hook: FixPayload[] = [];
   const { decisions, notes } = await run({ env, fetchImpl: failing, hook });
   assert.equal(hook.length, 0);
   assert.ok(decisions.every((d) => d.action === "skipped: the agent's own PRs could not be read"));
@@ -702,7 +668,7 @@ test("the agent's own PRs are read past the first page", async () => {
       const { query, variables } = JSON.parse(String(init.body)) as { query: string; variables: { after?: string | null } };
       if (query.includes("search(")) {
         pages.push(variables.after);
-        const pr = (n: number, path: string) => ({ number: n, title: "fix", url: `https://github.com/o/r/pull/${n}`, baseRefName: "master", headRefName: `fix/${n}`, headRefOid: `h${n}`, mergeable: "MERGEABLE", isCrossRepository: false, files: { nodes: [{ path }] } });
+        const pr = (n: number, path: string) => ({ number: n, title: "fix", url: `https://github.com/o/r/pull/${n}`, baseRefName: "master", headRefName: `fix/${n}`, headRefOid: `h${n}`, isCrossRepository: false, files: { nodes: [{ path }] } });
         return Response.json({ data: { search: variables.after ? { pageInfo: { hasNextPage: false }, nodes: [pr(9, "specs/z/c.spec.ts")] } : { pageInfo: { hasNextPage: true, endCursor: "p2" }, nodes: [pr(8, "specs/q/other.ts")] } } });
       }
     }
@@ -729,7 +695,7 @@ test("more open agent PRs than the search reads is treated like not reading them
     }
     return fetchImpl(url, init);
   };
-  const hook: Payload[] = [];
+  const hook: FixPayload[] = [];
   const { decisions } = await run({ env, fetchImpl: endless, hook });
   assert.equal(hook.length, 0);
   assert.ok(decisions.every((d) => d.action === "skipped: the agent's own PRs could not be read"));

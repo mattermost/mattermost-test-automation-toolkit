@@ -10,8 +10,8 @@ import type { Kind } from "./model.ts";
 export const LEDGER_MS = 7 * DAY;
 
 /**
- * A request sent by an earlier run: a fix request { at, specs, kind, window?, run } (window: a break's run times,
- * `from` null for -Infinity), or a conflict request { at, pr, head, run }.
+ * A request sent by an earlier run: { at, specs, kind, window?, run } (window: a break's run times, `from` null for
+ * -Infinity). Entries without specs, from conflict requests before they moved to a label, match no spec.
  */
 export interface LedgerEntry {
   at: string;
@@ -19,8 +19,6 @@ export interface LedgerEntry {
   kind?: Kind;
   window?: { from: number | null; to: number };
   run?: string;
-  pr?: number;
-  head?: string;
 }
 
 /**

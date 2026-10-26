@@ -24,7 +24,7 @@ inputs:
     description: 'JSON list of the run''s suites: [{"name": "<TSIO report group name>", "test_root": "<spec root>", "report_name": "<optional prefix>"}]'
     required: true
   github-token:
-    description: Token to read PRs (dedupe, suspect commits, conflicts); never sent elsewhere
+    description: Token to read PRs (dedupe, suspect commits); never sent elsewhere
     required: true
   label:
     description: Label the agent puts on its PRs; used to find them, and passed in each request
