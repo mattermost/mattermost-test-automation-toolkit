@@ -823,14 +823,14 @@ test("one triage check for the whole PR summarises every lane", async () => {
     "e2e-test/maestro-ios": st("success", "6 passed, 1 failed (1 cleared by triage), 1 skipped"),
     "e2e-test/detox-ipad": st("success", "19 passed, 0 skipped"),
     "e2e-test/maestro-android": null,
-  }), { state: "failure", description: "detox-ios: 2 cleared, 5 to check · maestro-ios cleared by triage" });
+  }), { state: "failure", description: "detox-ios: 2 not caused by PR, 5 to check · maestro-ios cleared by triage" });
   // mattermost#38601: every failure cleared, but two runners timed out without a report.
   assert.deepEqual(lanes({ "e2e-test/playwright-full/enterprise": st("failure", "1119 passed, 26 failed (26 cleared by triage), 118 skipped; 2 report(s) missing") }),
-    { state: "failure", description: "playwright-full/enterprise: 26 cleared, 2 report(s) missing, re-run" });
+    { state: "failure", description: "playwright-full/enterprise: 26 not caused by PR, 2 report(s) missing, re-run" });
   assert.deepEqual(lanes({ "e2e-test/detox-ios": st("failure", "49 passed, 132 failed (not triaged, investigation required), 29 skipped") }),
     { state: "failure", description: "detox-ios: many failures in one run" });
   assert.deepEqual(lanes({ "e2e-test/detox-android": st("failure", "(49 cleared by triage, 4 unresolved; investigation required) 91.3% passed (555 passed, 53 failed, 42 skipped)") }),
-    { state: "failure", description: "detox-android: 49 cleared, 4 to check, many failures in one run" });
+    { state: "failure", description: "detox-android: 49 not caused by PR, 4 to check, many failures in one run" });
   assert.deepEqual(lanes({ "e2e/linux": st("failure", "10 passed, 2 failed (not triaged: triage could not finish)") }),
     { state: "failure", description: "linux: triage could not finish" });
   assert.deepEqual(lanes({ "e2e-test/maestro-ios": st("success", "6 passed, 1 failed (1 cleared by triage), 1 skipped"), "e2e-test/detox-ios": st("success", "597 passed, 0 failed (0 cleared by triage)") }),
@@ -2577,12 +2577,13 @@ test("report-only writes triage's line on the E2E check but keeps the state the 
     const posted: StatusBody[] = [];
     const routes: Route[] = [
       ...judgedRoutes({ statuses: posted }),
-      ["/commits/abc/statuses", () => Response.json(current ? [{ context: "e2e-test/playwright", state: current, description: "98.5% passed (1303/1323)", target_url: "https://github.com/o/r/actions/runs/12" }] : [])],
+      ["/commits/abc/statuses", () => Response.json(current ? [{ context: "e2e-test/playwright", state: current, description: "98.5% passed (1303/1323)", target_url: "https://test-io.test.mattermost.com/reports/o/r/pr-5/abc/playwright?gh_run_id=12&status_run_id=12&status_run_attempt=1" }] : [])],
     ];
     await triage({ env: { ...env, MODE: "report-only" }, fetchImpl: fakeFetch(routes), log: () => {} });
     return posted;
   };
-  // The failure is cleared, but a red check stays red: report only never turns red green.
+  // The failure is cleared, but a red check stays red: report only never turns red green. The link moves from the
+  // report to this run, whose summary says why each failure is or isn't the PR's.
   assert.deepEqual(await run("failure"), [{ state: "failure", context: "e2e-test/playwright", description: "(1 flaky) 0% passed (0 passed, 1 failed, 0 skipped)", target_url: "https://github.com/o/r/actions/runs/12?status_run_id=12&status_run_attempt=1" }]);
   // A check a waiver label already turned green stays green.
   assert.deepEqual((await run("success")).map((s) => s.state), ["success"]);

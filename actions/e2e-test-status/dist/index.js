@@ -33,7 +33,7 @@ function redReason(description = "") {
   const d = String(description);
   const { cleared, caused, outdated, check } = namedIn(d);
   const parts = [];
-  if (cleared) parts.push(`${cleared} cleared`);
+  if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (outdated) parts.push(`${outdated} out of date`);
   if (check) parts.push(`${check} to check`);

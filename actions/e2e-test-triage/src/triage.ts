@@ -352,12 +352,13 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       }, "triage");
     }
     // Report only: triage's line goes on the E2E check, but the check keeps the state it
-    // has now. Red stays red, and a check a waiver label turned green stays green.
+    // has now. Red stays red, and a check a waiver label turned green stays green. Its link
+    // moves to this run, whose summary explains each failure.
     if (!enforce && context && (run.failing.length > 0 || Boolean(run.missing))) {
       try {
         const current = (await readStatuses(api, id)).find((r) => r.context === context);
         // The publisher also refuses a check another run or attempt owns.
-        if (current && current.state !== "pending") await publisher.write({ state: current.state, description, target_url: current.target_url || runURL }, "triage");
+        if (current && current.state !== "pending") await publisher.write({ state: current.state, description, target_url: runURL }, "triage");
         else log(`${context} has no final state yet; its text is left as it is`);
       } catch (e) {
         log(`triage's line not written on ${context}: ${String(e).slice(0, 200)}`);
