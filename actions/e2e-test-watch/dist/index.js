@@ -945,7 +945,7 @@ function redReason(description = "") {
   const d = String(description);
   const { cleared, caused, outdated, check } = namedIn(d);
   const parts = [];
-  if (cleared) parts.push(`${cleared} cleared`);
+  if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (outdated) parts.push(`${outdated} out of date`);
   if (check) parts.push(`${check} to check`);
@@ -2590,7 +2590,7 @@ ai_output_tokens=${spend.output_tokens}
     if (!enforce && context && (run.failing.length > 0 || Boolean(run.missing))) {
       try {
         const current = (await readStatuses(api, id)).find((r) => r.context === context);
-        if (current && current.state !== "pending") await publisher.write({ state: current.state, description, target_url: current.target_url || runURL }, "triage");
+        if (current && current.state !== "pending") await publisher.write({ state: current.state, description, target_url: runURL }, "triage");
         else log(`${context} has no final state yet; its text is left as it is`);
       } catch (e) {
         log(`triage's line not written on ${context}: ${String(e).slice(0, 200)}`);
