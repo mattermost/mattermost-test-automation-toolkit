@@ -154,8 +154,11 @@ export interface MessageReply {
   content?: { type: string; text?: string }[];
 }
 
-/** One Messages API request, retried on transient failures. No cache marker: the prompt is below Haiku's minimum. */
-async function requestModel(
+/**
+ * One Messages API request, retried on transient failures. No cache marker: the prompt is below Haiku's minimum.
+ * The judge's system prompt unless another is given (the re-run check's).
+ */
+export async function requestModel(
   fetchImpl: FetchImpl,
   apiKey: string,
   model: string,
@@ -163,11 +166,12 @@ async function requestModel(
   schema: object,
   maxTokens: number,
   timeoutMs: number,
+  system: string = SYSTEM,
 ): Promise<MessageReply> {
   const body = {
     model,
     max_tokens: maxTokens,
-    system: SYSTEM,
+    system,
     messages: [{ role: "user", content }],
     output_config: { format: { type: "json_schema", schema }, ...(model.startsWith("claude-haiku") ? {} : { effort: "medium" }) },
     ...samplingFor(model),

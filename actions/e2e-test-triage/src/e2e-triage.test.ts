@@ -3771,6 +3771,8 @@ test("with re-runs allowed, a lane red only for jobs that sent no results asks f
         ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "mobile-pr-detox-ios", gh_run_id: "12", gh_run_attempt: attempt, status: "completed" }], total: 1 })],
         ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: MOBILE_STUB.file }] })],
         ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: MOBILE_STUB.title, status: "failed", retry_count: 0, ordinal: 0, error_message: MOBILE_STUB.error, error_stack: null }])],
+        ["/actions/runs/12/attempts/", () => Response.json({ total_count: 1, jobs: [{ id: 7, name: "Detox iOS E2E / iOS / machine-1", status: "completed", conclusion: "failure", steps: [{ name: "ci/prepare-node-deps", conclusion: "failure" }] }] })],
+        ["/actions/jobs/7/logs", () => new Response("npm error code ECONNRESET")],
         statusSink(statuses),
       ]);
       const id = { ...parsed<CompositeIdentity>(env.COMPOSITE_IDENTITY), name: "mobile-pr-detox-ios", gh_run_attempt: attempt };
@@ -3944,6 +3946,8 @@ test("the triage check says re-running too while an automatic re-run is on its w
     ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: MOBILE_STUB.file }] })],
     ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: MOBILE_STUB.title, status: "failed", retry_count: 0, ordinal: 0, error_message: MOBILE_STUB.error, error_stack: null }])],
     ["/pulls/5", () => Response.json({ title: "t", base: { ref: "main" }, labels: [] })],
+    ["/actions/runs/12/attempts/", () => Response.json({ total_count: 1, jobs: [{ id: 7, name: "Detox iOS E2E / iOS / machine-1", status: "completed", conclusion: "failure", steps: [{ name: "ci/prepare-node-deps", conclusion: "failure" }] }] })],
+    ["/actions/jobs/7/logs", () => new Response("npm error code ECONNRESET")],
     statusSink(statuses),
   ]);
   const id = { ...parsed<CompositeIdentity>(env.COMPOSITE_IDENTITY), name: "mobile-pr-detox-ios" };

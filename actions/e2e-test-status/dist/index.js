@@ -37,10 +37,12 @@ function redReason(description = "") {
   if (caused) parts.push(`${caused} caused by PR`);
   if (outdated) parts.push(`${outdated} out of date`);
   if (check) parts.push(`${check} to check`);
+  const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";
   const missing = /(\d+) report\(s\) missing/.exec(d)?.[1];
   const notRun = Number(/(\d+) not run\b/.exec(d)?.[1] ?? 0);
-  if (missing) parts.push(`${missing} report(s) missing, ${again}`);
+  if (held) parts.push(`not re-run: ${held}`);
+  else if (missing) parts.push(`${missing} report(s) missing, ${again}`);
   else if (/results incomplete/.test(d)) parts.push(`results incomplete, ${again}`);
   else if (notRun && /re-run(?:ning)? the failed jobs/.test(d) && !parts.length) parts.push(`${notRun} spec${notRun === 1 ? "" : "s"} did not run, ${again}`);
   else if (/re-running the failed jobs/.test(d)) parts.push("re-running the failed jobs");

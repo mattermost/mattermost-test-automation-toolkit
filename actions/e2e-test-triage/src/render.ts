@@ -249,6 +249,8 @@ export interface SummaryInput {
   notRunRerun?: number | null;
   /** The automatic re-run triage asked for, when it did. */
   rerun?: Rerun | null;
+  /** The re-run check, when one ran (see decideRerun): why there was no automatic re-run. */
+  rerunCheck?: { rerun: boolean; held: string | null; reason: string } | null;
 }
 
 /** What a red lane with no failed test is to re-run: a job outside the tests, or reports that never arrived. */
@@ -259,7 +261,7 @@ const RED_OUTSIDE = "No test failed. The lane is red because a job outside the t
  * groups (Your PR, Out of date, Needs a look, Broken on the base branch, Flaky; one line each: why and the next
  * step), then the evidence, collapsed.
  */
-export function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null, notRun = null, notRunRerun = null, rerun = null }: SummaryInput): string {
+export function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null, notRun = null, notRunRerun = null, rerun = null, rerunCheck = null }: SummaryInput): string {
   const branch = trunkBranch || "the default branch";
   const where = lane ? ` · ${md(lane)}` : "";
   // A flagged run whose every failure was cleared reads as any other cleared run.
@@ -325,6 +327,8 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
   }
   if (infra) say = `${infra} ${say}`;
   if (missing && counts.failed && !unnamed) say += ` Results incomplete: ${missing.text}; ${rerun ? "re-running the failed jobs automatically" : "re-run the failed jobs"} before relying on this.`;
+  if (rerunCheck && !rerunCheck.rerun)
+    say += rerunCheck.held ? ` Not re-run automatically: ${rerunCheck.reason}. That looks like the change, not the runner: fix it, then re-run the failed jobs.` : ` Not re-run automatically: ${rerunCheck.reason}.`;
   lines.push(`**${md(say.trim())}** ${passLine(counts, notRun ?? 0)} · [run](${runURL})`, "");
 
   const section = (title: string, list: Finding[], heading = `${title} (${list.length})`): void => {
@@ -456,12 +460,14 @@ export const activeFlag = (infra: string | null | undefined, findings: Finding[]
  * left out. Shard placeholders beside findings add "re-run the failed jobs" after the labels ("(1 flaky; re-run the
  * failed jobs) ..."). The pass line counts specs that never ran apart from the failed. It is never shortened; past 140 characters the labels are, as the last resort.
  */
-export function statusDescription(verdict: string, findings: Finding[], runInfra: string | null | undefined, counts: Partial<Counts>, missing: SummaryMissing | null = null, unnamed = 0, notRun = 0, rerun: Rerun | null = null): string {
+export function statusDescription(verdict: string, findings: Finding[], runInfra: string | null | undefined, counts: Partial<Counts>, missing: SummaryMissing | null = null, unnamed = 0, notRun = 0, rerun: Rerun | null = null, held: string | null = null): string {
   const pass = passLine(counts, notRun);
+  // A held re-run says why on the check; an automatic one says it is on its way.
+  const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
   // A run with many failures says what triage made of each one, and its flag only while one still blocks.
   const infra = activeFlag(runInfra, findings);
-  const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0).map((l) => (l === RERUN && rerun ? RERUNNING : l)).join(", ");
-  const rest = [infra && findings.length ? runFlag(infra) : "", unnamed && findings.length ? (rerun ? RERUNNING : RERUN) : "", missing?.short ?? ""].filter(Boolean).join("; ");
+  const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0).map((l) => (l === RERUN ? again : l)).join(", ");
+  const rest = [infra && findings.length ? runFlag(infra) : "", unnamed && findings.length ? again : "", missing?.short ?? ""].filter(Boolean).join("; ");
   const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);
   const shown = head.length <= room ? head : room > 1 ? `${head.slice(0, room - 1).trimEnd()}…` : "";
   const inner = [shown, rest].filter(Boolean).join("; ");

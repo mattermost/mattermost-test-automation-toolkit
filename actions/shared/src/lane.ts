@@ -47,11 +47,13 @@ export function redReason(description: string | null | undefined = ""): string {
   if (caused) parts.push(`${caused} caused by PR`);
   if (outdated) parts.push(`${outdated} out of date`);
   if (check) parts.push(`${check} to check`);
-  // Triage asked for the re-run itself, or a person has to.
+  // Triage asked for the re-run itself, held it for a fix, or a person has to.
+  const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";
   const missing = /(\d+) report\(s\) missing/.exec(d)?.[1];
   const notRun = Number(/(\d+) not run\b/.exec(d)?.[1] ?? 0);
-  if (missing) parts.push(`${missing} report(s) missing, ${again}`);
+  if (held) parts.push(`not re-run: ${held}`);
+  else if (missing) parts.push(`${missing} report(s) missing, ${again}`);
   else if (/results incomplete/.test(d)) parts.push(`results incomplete, ${again}`);
   // "N not run" counts every spec that did not run, re-run or not: it names the re-run alone, when nothing else is named.
   else if (notRun && /re-run(?:ning)? the failed jobs/.test(d) && !parts.length) parts.push(`${notRun} spec${notRun === 1 ? "" : "s"} did not run, ${again}`);

@@ -324,6 +324,17 @@ The last attempt says "re-run the failed jobs" as before. The `rerun` output say
 whether this run asked, and the marker names the attempts the lane allows in all
 (`rerun-attempts` + 1) for the listener.
 
+Before asking, triage reads the run's failed and cancelled jobs (skipping jobs that
+only report on the others) and each one's failed step and that step's last log
+lines. A network, runner or host failure, or a setup step that failed or hung, is
+re-run. A build failure, a test server that did not start, or dependencies that
+did not install hold the re-run: the check reads `(not re-run: the build failed)`
+and the summary quotes the line. A job neither settles (a test run that hung) is
+asked of the model once per run; without an answer a person decides, as before.
+The log is the job's own output and is never taken as an instruction. The triage
+job needs `actions: read` to read the jobs; without it nothing is re-run
+automatically.
+
 ## Step log
 
 The step log has one line per finding: blocking or cleared, its class and decision, the

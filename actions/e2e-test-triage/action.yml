@@ -116,7 +116,8 @@ inputs:
     description: >-
       How many times a lane red only for jobs that sent no results (a shard that reported nothing, missing reports) may have its
       failed jobs re-run automatically before a person is asked to. Triage uploads a marker artifact for the
-      e2e-test-rerun action, which a workflow_run listener in the repo calls. 0 (the default) turns it off
+      e2e-test-rerun action, which a workflow_run listener in the repo calls. Before asking, the dead jobs' failed steps
+      and logs are read: a build or test-server failure holds the re-run (needs actions: read). 0 (the default) turns it off
     required: false
     default: "0"
 outputs:
