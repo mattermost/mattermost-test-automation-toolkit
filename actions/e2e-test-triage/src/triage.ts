@@ -18,7 +18,7 @@ import { evaluateRun } from "./evaluate.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
 import { findingLogLine, redact, secretsOf, writeFindings } from "./findings.ts";
 import { ledgerTotals } from "./pricing.ts";
-import { activeFlag, noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, RERUN, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
+import { activeFlag, noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, RERUN, RERUNNING, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
 import type { AskFn, Config, Diff, HistoryLike, SpecHistory } from "./types.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
@@ -386,10 +386,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     }
     if (announce && lanes.length) await settleLaneSummary();
     else if (announce) {
-      // The same labels as the E2E check's text (see statusDescription).
+      // The same labels as the E2E check's text (see statusDescription), and its re-run wording.
+      const again = rerun ? RERUNNING : RERUN;
       await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (flag && !result.findings.length
         ? `${run.counts.failed} failed · not triaged, ${runFlag(flag)}`
-        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${RERUN}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
+        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));

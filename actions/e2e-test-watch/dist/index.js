@@ -2737,7 +2737,8 @@ ai_output_tokens=${spend.output_tokens}
     }
     if (announce && lanes.length) await settleLaneSummary();
     else if (announce) {
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${RERUN}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
+      const again = rerun ? RERUNNING : RERUN;
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).map((l) => l === RERUN ? again : l).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${again}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
 `);

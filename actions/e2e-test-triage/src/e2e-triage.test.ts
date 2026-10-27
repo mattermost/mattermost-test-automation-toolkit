@@ -3935,6 +3935,21 @@ test("end to end, a skipped spec with an intermittent history turns the lane gre
   });
 });
 
+test("the triage check says re-running too while an automatic re-run is on its way", async () => {
+  const statuses: StatusBody[] = [];
+  const fetchImpl = fakeFetch([
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "mobile-pr-detox-ios", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+    ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: MOBILE_STUB.file }] })],
+    ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: MOBILE_STUB.title, status: "failed", retry_count: 0, ordinal: 0, error_message: MOBILE_STUB.error, error_stack: null }])],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "main" }, labels: [] })],
+    statusSink(statuses),
+  ]);
+  const id = { ...parsed<CompositeIdentity>(env.COMPOSITE_IDENTITY), name: "mobile-pr-detox-ios" };
+  await triage({ env: { ...env, COMPOSITE_IDENTITY: JSON.stringify(id), MODE: "enforce", RERUN_ATTEMPTS: "1" }, fetchImpl, log: () => {} });
+  const check = statuses.filter((s) => s.context === "e2e-test/playwright/triage" && s.state !== "pending").map((s) => s.description);
+  assert.deepEqual(check, ["1 failed → re-running the failed jobs"]);
+});
+
 test("a lane a named test already blocks asks for no re-run, though a shard beside it sent nothing", async () => {
   await inTmp(async (dir) => {
     const outputPath = join(dir, "o.txt");
