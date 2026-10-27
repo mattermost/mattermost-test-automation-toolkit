@@ -34,6 +34,8 @@ export const DEFAULTS: Config = {
   advise: true,
   infraMinFailures: 30,
   infraClears: false,
+  // A lane red only for jobs that sent no results is re-run this many times before a person is asked to (see e2e-test-rerun).
+  rerunAttempts: 0,
   historyLane: null,
   // Re-asks an answer between escalateMin and the threshold, or one that blames the PR
   // without citing a change. Off ("") until the share of answers in that band shows a
@@ -114,6 +116,14 @@ function amountFrom(raw: string | undefined, fallback: number, name: string, war
   return fallback;
 }
 
+function attemptsFrom(raw: string | undefined, warn: (message: string) => void): number {
+  if (raw == null || String(raw).trim() === "") return DEFAULTS.rerunAttempts;
+  const n = Number(raw);
+  if (Number.isInteger(n) && n >= 0) return n;
+  warn(`RERUN_ATTEMPTS ${JSON.stringify(raw)} is not a whole number of 0 or more; using ${DEFAULTS.rerunAttempts}`);
+  return DEFAULTS.rerunAttempts;
+}
+
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const isPrice = (v: unknown): boolean => typeof v === "number" && Number.isFinite(v) && v >= 0;
 const PRICE_FIELDS = ["input", "output", "cache_write", "cache_read"] as const;
@@ -166,6 +176,7 @@ export function configFrom(env: Env, warn: (message: string) => void = () => {})
     reportOnlyLabel: (env.REPORT_ONLY_LABEL ?? DEFAULTS.reportOnlyLabel).trim(),
     advise: env.AI_ADVICE ? env.AI_ADVICE !== "false" : DEFAULTS.advise,
     infraClears: env.INFRA_CLEARS === "true",
+    rerunAttempts: attemptsFrom(env.RERUN_ATTEMPTS, warn),
     historyLane: (env.HISTORY_LANE || "").trim() || null,
     prices,
   };

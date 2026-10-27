@@ -108,6 +108,7 @@ function whyNext(f: Finding, branch: string, pr: boolean): [string, string] {
       if (a) return [`Looks ${LIKELY[a.cause] ?? a.cause} (${ai}), but not sure enough to clear.`, "Read the error before re-running."];
       if (f.class === "INFRA_ERROR") return ["Failed on its environment (see the error), which this change could also have caused.", "Re-run; if it fails the same way again, check your change."];
       if (f.class === "INSUFFICIENT_DATA") return [`Too little history on ${branch} to tell (${count(t.runs, "run")}).`, "Read the error before re-running."];
+      if (f.class === "NOT_RUN") return [f.reason, "Read why the shard's Jest process stopped, then re-run."];
       return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), no other PR fails it this way, and this ${pr ? "PR" : "commit"} doesn't change it or a file its error names.`, "Read the error before re-running."];
     case "broken": {
       const by = brokeByText(f.broke_by);
@@ -122,6 +123,7 @@ function whyNext(f: Finding, branch: string, pr: boolean): [string, string] {
       if (f.decision === "rules_unblock") return [f.reason, next];
       if (f.decision === "adjudicator_unblock") return [`Looks ${LIKELY[a?.cause ?? ""] ?? "flaky"} (${ai}).`, next];
       if (f.class === "SAME_FAILURE_AS_CLEARED") return [`Same error as "${f.same_as}", cleared above.`, next];
+      if (f.class === "FLAKY_NOT_RUN") return [f.reason, next];
       if (f.class === "INFRA_ERROR") return ["Failed on its environment (see the error), not on this change.", allFailed ? next : pr ? "Nothing for you; re-run if the lane must be green." : "Re-run when the environment recovers."];
       if (f.class === "FLAKY_CROSS_PR") return [`Failed the same way on ${count(f.cross_pr.prs.length, "other PR")} while ${branch} passes.`, next];
       const how = [t.fails && `failed ${t.fails}`, t.flaky && `passed only on retry ${t.flaky}`].filter(Boolean).join(" and ");
@@ -203,7 +205,19 @@ export function passRate(counts: Partial<Counts>): string {
   return `${Math.min(99.9, Math.round((passed / ran) * 1000) / 10).toFixed(1)}%`;
 }
 
-export const passLine = (counts: Partial<Counts>): string => `${passRate(counts)} passed (${counts.passed ?? 0} passed, ${counts.failed} failed, ${counts.skipped ?? 0} skipped)`;
+/** The counts, with their rate. Specs that never ran are counted apart from the failed, and the rate is left out: it would count them as failed. */
+export const passLine = (counts: Partial<Counts>, notRun = 0): string => notRun
+  ? `${counts.passed ?? 0} passed, ${Math.max(0, (counts.failed ?? 0) - notRun)} failed, ${notRun} not run, ${counts.skipped ?? 0} skipped`
+  : `${passRate(counts)} passed (${counts.passed ?? 0} passed, ${counts.failed} failed, ${counts.skipped ?? 0} skipped)`;
+
+/** An automatic re-run of the failed jobs triage asked for: the attempt it starts, of how many the repo allows. */
+export interface Rerun {
+  attempt: number;
+  of: number;
+}
+
+/** Why specs that never ran keep the lane red (see isSpecNotRun). */
+const notRunText = (n: number): string => `${count(n, "spec")} did not run, no result from ${n === 1 ? "its" : "their"} CI job`;
 
 export interface SummaryMissing {
   text: string;
@@ -229,6 +243,14 @@ export interface SummaryInput {
   reportsArrived?: string | null;
   /** Shard placeholders (see isShardPlaceholder): counted, not classified, and the lane is red for them. */
   unnamed?: number | null;
+  /** Every spec that never ran (see isSpecNotRun), for the pass line. */
+  notRun?: number | null;
+  /** Of the placeholders, the specs that never ran: the ones the re-run line names. */
+  notRunRerun?: number | null;
+  /** The automatic re-run triage asked for, when it did. */
+  rerun?: Rerun | null;
+  /** The re-run check, when one ran (see decideRerun): why there was no automatic re-run. */
+  rerunCheck?: { rerun: boolean; held: string | null; reason: string } | null;
 }
 
 /** What a red lane with no failed test is to re-run: a job outside the tests, or reports that never arrived. */
@@ -239,7 +261,7 @@ const RED_OUTSIDE = "No test failed. The lane is red because a job outside the t
  * groups (Your PR, Out of date, Needs a look, Broken on the base branch, Flaky; one line each: why and the next
  * step), then the evidence, collapsed.
  */
-export function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null }: SummaryInput): string {
+export function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null, notRun = null, notRunRerun = null, rerun = null, rerunCheck = null }: SummaryInput): string {
   const branch = trunkBranch || "the default branch";
   const where = lane ? ` · ${md(lane)}` : "";
   // A flagged run whose every failure was cleared reads as any other cleared run.
@@ -266,7 +288,7 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
     // Shard placeholders keep the lane red, so a look-only headline turns red and says to re-run.
     : check.length || outdated.length ? `${unnamed ? "🔴" : "🟡"} ${[needText, staleText, unnamed ? "re-run the failed jobs" : ""].filter(Boolean).join(", ")}`
     : blockingBroken ? `🔴 ${blockingBroken} still failing on ${md(branch)}`
-    : unnamed ? "🔴 re-run the failed jobs"
+    : unnamed ? `🔴 ${notRunRerun && !findings.length ? `${count(notRunRerun, "spec")} did not run, ` : ""}${rerun ? RERUNNING : RERUN}`
     : `✅ none caused by this ${pr ? "PR" : "commit"}`;
   const lines = [`## E2E triage${where}: ${head}`, ""];
   // Under the headline: how many failed tests also failed on other platforms in this run (see alsoFailed).
@@ -280,14 +302,17 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
   let say = "";
   // What arrived, and what never ran: the reason a lane with missing reports is red.
   const arrived = [reportsArrived, missing?.text].filter(Boolean).join("; ");
-  const rerun = unnamed ? `Re-run the failed jobs: ${arrived || `${count(unnamed, "failed result")} with no test name`}.` : "";
+  const nameless = (unnamed ?? 0) - (notRunRerun ?? 0);
+  const placeholders = [notRunRerun ? notRunText(notRunRerun) : "", nameless > 0 ? `${count(nameless, "failed result")} with no test name` : ""].filter(Boolean).join("; ");
+  const again = rerun ? `Re-running the failed jobs automatically (attempt ${rerun.attempt} of ${rerun.of}), then triaging the new results` : "Re-run the failed jobs";
+  const rerunLine = unnamed ? `${again}: ${arrived || placeholders}.` : "";
   if (unnamed && !findings.length) {
     // Shard placeholders only: nothing is judged, so the line says which jobs to re-run, and what arrived.
-    say = rerun;
+    say = rerunLine;
   } else if (!counts.failed) {
     // Red with no failed test: the jobs to re-run. A missing report says how many arrived; a lane that is red for a job
     // outside the tests says that.
-    say = missing ? `Re-run the failed jobs: ${arrived}.` : laneRed ? RED_OUTSIDE : "No test failed.";
+    say = missing ? `${again}: ${arrived}.` : laneRed ? RED_OUTSIDE : "No test failed.";
   } else if (findings.length) {
     const kinds = [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
     say = `${count(yours.length + outdated.length + check.length + blockingBroken + unrelated, "failure")}: ` + [
@@ -298,11 +323,13 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
       unrelated && `${unrelated} look${unrelated === 1 ? "s" : ""} unrelated (${kinds})`,
     ].filter(Boolean).join("; ") + ".";
     if (outdatedLead) say = `Merge ${branch} and re-run first. ${say}`;
-    if (unnamed) say += ` ${rerun}`;
+    if (unnamed) say += ` ${rerunLine}`;
   }
   if (infra) say = `${infra} ${say}`;
-  if (missing && counts.failed && !unnamed) say += ` Results incomplete: ${missing.text}; re-run the failed jobs before relying on this.`;
-  lines.push(`**${md(say.trim())}** ${passLine(counts)} · [run](${runURL})`, "");
+  if (missing && counts.failed && !unnamed) say += ` Results incomplete: ${missing.text}; ${rerun ? "re-running the failed jobs automatically" : "re-run the failed jobs"} before relying on this.`;
+  if (rerunCheck && !rerunCheck.rerun)
+    say += rerunCheck.held ? ` Not re-run automatically: ${rerunCheck.reason}. That looks like the change, not the runner: fix it, then re-run the failed jobs.` : ` Not re-run automatically: ${rerunCheck.reason}.`;
+  lines.push(`**${md(say.trim())}** ${passLine(counts, notRun ?? 0)} · [run](${runURL})`, "");
 
   const section = (title: string, list: Finding[], heading = `${title} (${list.length})`): void => {
     if (!list.length) return;
@@ -402,6 +429,8 @@ export function statusLabelOf(f: Finding): StatusLabel {
 
 /** What a shard placeholder asks for (see isShardPlaceholder): the lane is red until its jobs are re-run. */
 export const RERUN = "re-run the failed jobs";
+/** The same, when triage asked for the re-run itself (see Rerun). */
+export const RERUNNING = "re-running the failed jobs";
 
 /**
  * The status labels for a run, each with its count, in the fixed order and only where non-zero ("2 flaky, 2 caused by PR").
@@ -429,14 +458,16 @@ export const activeFlag = (infra: string | null | undefined, findings: Finding[]
 /**
  * The E2E check's text: "(2 flaky, 2 caused by PR) 99.7% passed (1186 passed, 4 failed, 164 skipped)". Zero labels are
  * left out. Shard placeholders beside findings add "re-run the failed jobs" after the labels ("(1 flaky; re-run the
- * failed jobs) ..."). The pass line is never shortened; past 140 characters the labels are, as the last resort.
+ * failed jobs) ..."). The pass line counts specs that never ran apart from the failed. It is never shortened; past 140 characters the labels are, as the last resort.
  */
-export function statusDescription(verdict: string, findings: Finding[], runInfra: string | null | undefined, counts: Partial<Counts>, missing: SummaryMissing | null = null, unnamed = 0): string {
-  const pass = passLine(counts);
+export function statusDescription(verdict: string, findings: Finding[], runInfra: string | null | undefined, counts: Partial<Counts>, missing: SummaryMissing | null = null, unnamed = 0, notRun = 0, rerun: Rerun | null = null, held: string | null = null): string {
+  const pass = passLine(counts, notRun);
+  // A held re-run says why on the check; an automatic one says it is on its way.
+  const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
   // A run with many failures says what triage made of each one, and its flag only while one still blocks.
   const infra = activeFlag(runInfra, findings);
-  const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0).join(", ");
-  const rest = [infra && findings.length ? runFlag(infra) : "", unnamed && findings.length ? RERUN : "", missing?.short ?? ""].filter(Boolean).join("; ");
+  const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0).map((l) => (l === RERUN ? again : l)).join(", ");
+  const rest = [infra && findings.length ? runFlag(infra) : "", unnamed && findings.length ? again : "", missing?.short ?? ""].filter(Boolean).join("; ");
   const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);
   const shown = head.length <= room ? head : room > 1 ? `${head.slice(0, room - 1).trimEnd()}…` : "";
   const inner = [shown, rest].filter(Boolean).join("; ");

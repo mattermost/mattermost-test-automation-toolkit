@@ -2,10 +2,10 @@
 // See LICENSE.txt for license information.
 
 import type { FetchImpl, GhApi } from "../../shared/src/github.ts";
-import { identityKey, outcomeOf } from "../../shared/src/tsio.ts";
+import { FAILED_STATUSES, identityKey, outcomeOf, outcomeWithDuplicates } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
 import { CHANGED_FILES_MAX_PAGES, COMPARE_FILE_CAP, DEFAULTS, HISTORY_MAX_FILES, HISTORY_MAX_PAGES, HISTORY_PER_PAGE, laneOf } from "./config.ts";
-import type { BrokeBy, ChangedFile, Config, Finding, Observation, OutOfDate, TestRef } from "./types.ts";
+import type { BrokeBy, ChangedFile, Config, Finding, Observation, OutOfDate, SpecHistory, SpecRun, TestRef } from "./types.ts";
 
 /** TSIO's history for a run's tests: rows by test identity, with the flags the rules read. */
 export interface History extends Map<string, Observation[]> {
@@ -38,6 +38,62 @@ async function postHistory(fetchImpl: FetchImpl, url: string, body: Record<strin
     }
   }
   throw failure;
+}
+
+/**
+ * Past runs of whole spec files in this lane, one outcome per run: not run where its "spec did not run" placeholder is,
+ * failed where a test failed every try, passed otherwise. For the specs a stopped Jest process skipped (see classifyNotRun).
+ */
+export async function fetchSpecRuns(
+  fetchImpl: FetchImpl,
+  base: string,
+  repository: string,
+  files: string[],
+  until: string,
+  cfg: Config = DEFAULTS,
+  lane: string | null = null,
+  reportName: string | null = null,
+): Promise<SpecHistory> {
+  const history: SpecHistory = { byFile: new Map(), truncated: false };
+  const wanted = [...new Set(files.filter(Boolean))].slice(0, HISTORY_MAX_FILES);
+  // Per file and run: whether its placeholder is there, and each test's attempts.
+  const runs = new Map<string, Map<string, { notRun: boolean; tests: Map<string, Observation[]> }>>();
+  for (let page = 1; page <= HISTORY_MAX_PAGES && wanted.length; page++) {
+    const body: Record<string, unknown> = { repository, until, files: wanted, page, per_page: HISTORY_PER_PAGE, runs: cfg.crossPRRuns };
+    if (reportName) body.report = reportName;
+    const res = await postHistory(fetchImpl, `${base}/api/v1/reports/history`, body);
+    if (!res.ok) throw new Error(`TSIO history ${res.status}`);
+    const { observations = [], has_more: hasMore } = (await res.json()) as HistoryPage;
+    for (const o of observations) {
+      if (o.group_id == null || !wanted.includes(o.file)) continue;
+      if (lane != null && o.name != null && laneOf(o.name) !== lane) continue;
+      if (!runs.has(o.file)) runs.set(o.file, new Map());
+      const byGroup = runs.get(o.file)!;
+      const group = String(o.group_id);
+      if (!byGroup.has(group)) byGroup.set(group, { notRun: false, tests: new Map() });
+      const run = byGroup.get(group)!;
+      if (o.title === "spec did not run") run.notRun = true;
+      else {
+        const key = JSON.stringify([o.report_name ?? "", o.full_title || o.title]);
+        if (!run.tests.has(key)) run.tests.set(key, []);
+        run.tests.get(key)!.push(o);
+      }
+    }
+    if (!hasMore) break;
+    if (page === HISTORY_MAX_PAGES) history.truncated = true;
+  }
+  for (const [file, byGroup] of runs) {
+    const outcomes: SpecRun[] = [];
+    for (const [group_id, run] of byGroup) {
+      // As the run reader does: a pass beside a fail at the same retry level of one report does not excuse the fail.
+      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count), (a) => a.report_name ?? null).status);
+      // A run where every test was skipped is no pass (see classifyNotRun).
+      const status = run.notRun ? "not_run" : results.some((s) => FAILED_STATUSES.has(s)) ? "failed" : results.every((s) => s === "skipped") ? "skipped" : "passed";
+      outcomes.push({ group_id, status });
+    }
+    history.byFile.set(file, outcomes);
+  }
+  return history;
 }
 
 /**

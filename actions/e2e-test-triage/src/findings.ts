@@ -109,6 +109,18 @@ function rowOf(f: Finding, secrets: string[]): FindingRow {
   };
 }
 
+/**
+ * One finding as one step-log line: blocking or cleared, its class and decision, the model's cause and confidence and the
+ * evidence it cited (- when it was not asked), then the test and the reason. The step log is the one record every run keeps.
+ */
+export function findingLogLine(f: Finding, n: number, of: number, secrets: string[]): string {
+  const row = rowOf(f, secrets);
+  const ai = row.ai.cause ? `${row.ai.cause}@${row.ai.confidence ?? "?"}` : "-";
+  const cited = row.ai.cited.length ? row.ai.cited.join(",") : "-";
+  const line = `e2e-test-triage: finding ${n}/${of} ${row.blocking ? "blocking" : "cleared"} ${row.class} decision=${row.decision ?? "-"} ai=${ai} cited=${cited} "${clip(row.title, 120)}" · ${clip(row.file, 100)}: ${row.reason}`;
+  return clip(line.replace(/\s+/g, " "), 500);
+}
+
 /** The action's own secrets, as set in the environment: what the summary and the findings file must never print. */
 export const secretsOf = (env: Env): string[] => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY].filter((s): s is string => Boolean(s));
 

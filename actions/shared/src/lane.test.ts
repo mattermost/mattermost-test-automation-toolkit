@@ -23,6 +23,15 @@ test("the red reason reads the labels a status now carries", () => {
   assert.equal(redReason("(1 flaky; 2 report(s) missing) 0% passed (0 passed, 1 failed, 0 skipped)"), "1 not caused by PR, 2 report(s) missing, re-run");
   assert.equal(redReason("(re-run the failed jobs; 1 report(s) missing) 0% passed (0 passed, 1 failed, 0 skipped)"), "1 report(s) missing, re-run");
   assert.equal(redReason("(re-run the failed jobs) 0% passed (0 passed, 1 failed, 0 skipped)"), "re-run the failed jobs");
+  assert.equal(redReason("(re-run the failed jobs) 615 passed, 0 failed, 2 not run, 17 skipped"), "2 specs did not run, re-run");
+  assert.equal(redReason("(1 flaky; re-run the failed jobs) 18 passed, 2 failed, 1 not run, 0 skipped"), "1 not caused by PR, re-run the failed jobs");
+  assert.equal(redReason("(re-run the failed jobs; 1 report(s) missing) 0 passed, 0 failed, 1 not run, 0 skipped"), "1 report(s) missing, re-run", "missing reports say more than the specs they left unrun");
+  assert.equal(redReason("(re-running the failed jobs) 615 passed, 0 failed, 2 not run, 17 skipped"), "2 specs did not run, re-running");
+  assert.equal(redReason("(re-running the failed jobs; 1 report(s) missing) 0% passed (0 passed, 1 failed, 0 skipped)"), "1 report(s) missing, re-running");
+  assert.equal(redReason("(re-running the failed jobs) 0% passed (0 passed, 1 failed, 0 skipped)"), "re-running the failed jobs");
+  assert.equal(redReason("(not re-run: the build failed) 615 passed, 0 failed, 2 not run, 17 skipped"), "not re-run: the build failed", "a held re-run names why");
+  assert.equal(redReason("(1 flaky, 1 needs investigation) 10 passed, 1 failed, 1 not run, 0 skipped"), "1 not caused by PR, 1 to check", "a spec that did not run is not a re-run unless the status asks for one");
+  assert.equal(redReason("(1 flaky; re-run the failed jobs) 10 passed, 1 failed, 3 not run, 0 skipped"), "1 not caused by PR, re-run the failed jobs", "beside other labels the not-run count is not all re-run");
 });
 
 test("the red reason still reads the wording a status written before the labels carries", () => {

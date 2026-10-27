@@ -33,10 +33,20 @@ produced no results: a row with no test name; desktop's
 (`write-tsio-failure-stub.mjs`, after a job died or was cancelled); and mobile's
 `spec did not run` with "<spec> was assigned to a shard but produced no result"
 (`merge-jest-results-for-tsio.js`). They are counted as failed but are not
-findings: no history is read for them, the model is not asked, and they do not
-make the run an `INFRA` run. The lane stays red and the check says "re-run the
-failed jobs", after the labels when the run also has real failures:
+findings: no test history is read for them, the model is not asked, and they do
+not make the run an `INFRA` run. The lane stays red and the check says "re-run
+the failed jobs", after the labels when the run also has real failures:
 `(1 flaky; re-run the failed jobs) 85.7% passed (...)`.
+
+A mobile `spec did not run` row is counted as "not run", not failed. When no spec
+of its shard reported (the shard ran or uploaded nothing), or the row does not say,
+it stays a placeholder and the shard is re-run. When other specs of its shard
+reported (its Jest process stopped before reaching it), it is judged by its spec
+file's own runs: `NOT_RUN` (blocking) when the change edits it, when that can't be
+checked, or when its history can't be read. Otherwise it is `FLAKY_NOT_RUN`
+(cleared, and the run can be green) when it also did not run in another recent run
+and passed where it ran (at least `minTrunkRuns` runs, failing in at most 1 of 20),
+or when it skipped every test in all its recent runs, and `NOT_RUN` when not.
 
 A failure still blocking whose spec the base branch changed after the PR last
 merged it is **out of date**: the PR ran its old copy of the test (for example
@@ -109,7 +119,8 @@ nothing related changed, so it does not clear a failure.
 
 If some of the run's reports never uploaded (a worker died), triage waits about
 two minutes for them, then judges what arrived and says how many are missing.
-Specs that never ran can't be vouched for, so that run never comes out green.
+Tests in reports that never arrived can't be vouched for, so that run never comes
+out green.
 
 ## The model
 
@@ -300,6 +311,35 @@ pass on this PR, or an infrastructure error for an environment cause). Only
 PNG/JPEG files inside the directory are read, at most two per test and 3.5 MB
 each. A link in the directory that dangles, or that points outside it, is skipped
 with a warning, and the rest of the evidence still loads.
+
+## Automatic re-runs
+
+`rerun-attempts` (default `0`, off) lets a lane that is red only because jobs sent no
+results (a shard that reported nothing, reports that never arrived; no test blocks) be
+re-run instead of asking a person to. While the run's attempt is within the allowance,
+the check reads "re-running the failed jobs" and triage uploads a marker artifact; the
+`e2e-test-rerun` action, called from a `workflow_run` listener once the run has
+finished, re-runs the failed jobs, and the new attempt is triaged on its own results.
+The last attempt says "re-run the failed jobs" as before. The `rerun` output says
+whether this run asked, and the marker names the attempts the lane allows in all
+(`rerun-attempts` + 1) for the listener.
+
+Before asking, triage reads the run's failed and cancelled jobs (skipping jobs that
+only report on the others) and each one's failed step and that step's last log
+lines. A network, runner or host failure, or a setup step that failed or hung, is
+re-run. A build failure, a test server that did not start, or dependencies that
+did not install hold the re-run: the check reads `(not re-run: the build failed)`
+and the summary quotes the line. A job neither settles (a test run that hung) is
+asked of the model once per run; without an answer a person decides, as before.
+The log is the job's own output and is never taken as an instruction. The triage
+job needs `actions: read` to read the jobs; without it nothing is re-run
+automatically.
+
+## Step log
+
+The step log has one line per finding: blocking or cleared, its class and decision, the
+model's cause and confidence and what it cited (`-` when it was not asked), the test and
+the reason.
 
 ## Findings file
 

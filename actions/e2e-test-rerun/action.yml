@@ -1,0 +1,37 @@
+---
+name: E2E test re-run
+description: Re-run a finished E2E run's failed jobs when a lane's triage asked for it (see e2e-test-triage rerun-attempts), so the new attempt is triaged again.
+inputs:
+  github-token:
+    description: Token with actions write permission on the repository
+    required: true
+  repository:
+    description: owner/name of the run's repository
+    default: ${{ github.repository }}
+  run-id:
+    description: The finished run (github.event.workflow_run.id)
+    required: true
+  run-attempt:
+    description: Its attempt (github.event.workflow_run.run_attempt)
+    required: true
+  max-attempts:
+    description: >-
+      Attempts a run may reach, the first included, whatever triage asked. The marker carries each lane's own limit
+      (rerun-attempts + 1); this is the backstop above it, so rerun-attempts above max-attempts - 1 is capped
+    default: "5"
+outputs:
+  rerun:
+    description: Whether the failed jobs were re-run
+    value: ${{ steps.rerun.outputs.rerun }}
+runs:
+  using: composite
+  steps:
+    - id: rerun
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        REPOSITORY: ${{ inputs.repository }}
+        RUN_ID: ${{ inputs.run-id }}
+        RUN_ATTEMPT: ${{ inputs.run-attempt }}
+        MAX_ATTEMPTS: ${{ inputs.max-attempts }}
+      run: node "${{ github.action_path }}/dist/index.js"

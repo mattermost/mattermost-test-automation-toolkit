@@ -6,28 +6,28 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { canChange, decide, judge, unblocks } from "./decision.ts";
-import { EXONERATED_ON_TRUNK, classify, errorSignature, infraVerdict, isInfraError, isShardPlaceholder, markEarlierFailures, sameFailure } from "./classify.ts";
+import { EXONERATED_ON_TRUNK, classify, classifyNotRun, errorSignature, infraVerdict, isInfraError, isShardPlaceholder, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, laneOfReport, repoPath } from "./config.ts";
 import { answerKey, askModelBatch, packKey, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
-import { OUT_OF_DATE_DIR_CAP, fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
+import { OUT_OF_DATE_DIR_CAP, fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { commonSenseClear, onlyOnPlatform, platformOf } from "./common-sense.ts";
 import { codeExcerpt, enrichFindings, failingLine, prChangedSince, sameTestOnOtherReports, siblingPlatforms } from "./enrich.ts";
 import { evidenceFor, loadEvidence } from "./evidence.ts";
 import { CLEARING, buildPack, chainClears, changeCategory, changeSummary, compactError, evidenceIds, namesChangedFile } from "./pack.ts";
 import type { OtherFailure } from "./pack.ts";
 import { PRICES, costOf, newLedger, priceFor } from "./pricing.ts";
-import { bucketOf, passRate, renderSummary, statusDescription, statusLabelOf, statusLabels } from "./render.ts";
+import { bucketOf, passLine, passRate, renderSummary, statusDescription, statusLabelOf, statusLabels } from "./render.ts";
 import type { SummaryInput } from "./render.ts";
 import { evaluateRun, verdictOf } from "./evaluate.ts";
 import type { EvaluatedRun, EvaluateParams } from "./evaluate.ts";
 import { NotTriagedError, triage } from "./triage.ts";
-import { FINDINGS_SCHEMA, checkFindingsShape, redact } from "./findings.ts";
+import { FINDINGS_SCHEMA, checkFindingsShape, findingLogLine, redact } from "./findings.ts";
 import type { CommitStatus, Env, FetchImpl } from "../../shared/src/github.ts";
 import { laneSummary } from "../../shared/src/lane.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
 import { elsewhereKey, fetchRun, identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { RunResult } from "../../shared/src/tsio.ts";
-import type { Answer, AskFn, BatchResult, CallRecord, Config, Evidence, Finding, Ledger, Observation, Pack, PrRef, SinceLastPass, TestRef, Usage } from "./types.ts";
+import type { Answer, AskFn, BatchResult, CallRecord, Config, Evidence, Finding, Ledger, Observation, Pack, PrRef, SinceLastPass, SpecRun, TestRef, Usage } from "./types.ts";
 
 
 // ---------------------------------------------------------------- fixtures and fakes
@@ -218,6 +218,22 @@ test("on trunk, an intermittent failure whose last run passed is a flake and cle
   assert.equal(f.class, "FLAKY_ON_TRUNK");
   assert.equal(f.blocking, false);
 });
+test("on trunk, a pass on retry does not end a streak; a test that keeps failing and passing is a flake", () => {
+  // mattermost release-12.1 run 40292449090: passed every run to 10-21 14:43, then failed every try in each run but one,
+  // which passed on its retest (flaky). Every try failed here too.
+  const run = (status: string, i: number) => obs({ commit_sha: `r${i}`, status, created_at: `2026-10-${String(26 - i).padStart(2, "0")}T00:00:00Z`, branch: "release-12.1" });
+  const opts = { isTrunkRun: true, trunkBranch: "release-12.1" };
+  const real = ["flaky", ...Array(7).fill("failed"), ...Array(5).fill("passed")].map(run);
+  const f = classify({ ...failing, tries: { ran: 4, failed: 4 } }, real, [], undefined, null, null, opts);
+  assert.equal(f.class, "BROKEN_ON_TRUNK");
+  assert.equal(f.blocking, true);
+  assert.match(f.reason, /failed or passed only on retry in each of the previous 8 trunk runs/);
+  // Half its runs fail, but never two in a row: intermittent, so a flake.
+  const alternating = Array.from({ length: 12 }, (_, i) => (i % 2 ? "failed" : "passed")).map(run);
+  assert.equal(classify(failing, alternating, [], undefined, null, null, opts).class, "FLAKY_ON_TRUNK");
+  // Two runs rescued by a retry, with no failure: still a flake.
+  assert.equal(classify(failing, ["flaky", "flaky", ...Array(8).fill("passed")].map(run), [], undefined, null, null, opts).class, "FLAKY_ON_TRUNK");
+});
 test("a run is never part of its own history", () => {
   // On a trunk run the current group has no PR number; only the group id keeps it out of its own history.
   const history = [obs({ group_id: "self", status: "failed" }), ...trunkPasses(8)];
@@ -296,6 +312,14 @@ test("a test that failed on its environment is named so; it clears only where th
   assert.equal(configFrom({ INFRA_CLEARS: "true" }).infraClears, true);
   assert.equal(configFrom({}).infraClears, false);
 });
+test("automatic re-runs are off unless the repo allows them; a count that is not a whole number of 0 or more is refused", () => {
+  assert.equal(configFrom({}).rerunAttempts, 0);
+  assert.equal(configFrom({ RERUN_ATTEMPTS: "2" }).rerunAttempts, 2);
+  const warned: string[] = [];
+  assert.equal(configFrom({ RERUN_ATTEMPTS: "1.5" }, (m) => warned.push(m)).rerunAttempts, 0);
+  assert.equal(configFrom({ RERUN_ATTEMPTS: "-1" }, (m) => warned.push(m)).rerunAttempts, 0);
+  assert.equal(warned.length, 2);
+});
 test("a lane the trunk rarely runs is judged against the lane it borrows history from", () => {
   const sub = fixture<CompositeIdentity>({ repository: "o/r", name: "playwright-full-enterprise-subpath" });
   assert.equal(historyLane(sub, configFrom({})), "playwright-full-enterprise-subpath");
@@ -368,6 +392,12 @@ test("the server's refusal to attach a file is an environment error; a failed ap
   assert.equal(isInfraError('apiCreatePostWithImageAttachment: upload failed: {"type":"https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-502/"}'), true);
   assert.equal(isInfraError("Test Failed: 10.0sec timeout expired without matching of given matcher: not null"), false);
   assert.equal(isInfraError("Error: expected the attachment to be shown after upload"), false);
+});
+test("the harness giving up on a test-server API call is an environment error; a UI wait that runs out is not", () => {
+  // desktop master run 40398808902, MM-T5748: the harness aborted the call after 30 s.
+  assert.equal(isInfraError("ApiRequestError: POST /api/v4/custom_profile_attributes/fields failed: 408 Request timed out after 30000ms"), true);
+  assert.equal(isInfraError("TimeoutError: page.click: Timeout 30000ms exceeded."), false);
+  assert.equal(isInfraError("Error: expect(locator).toBeVisible() failed: Timed out 10000ms waiting for expect"), false);
 });
 test("a server's own not-ready answer to the test's setup call is environment, even when the identity is unresolved", () => {
   // mattermost-mobile: {"id":"app.pap.is_ready.app_error","message":"Access control service is not ready."} from the server.
@@ -777,6 +807,23 @@ test("only an explicit, valid enforce mode changes the E2E check's state", async
   await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", TRIAGE_CONTEXT: "off" }, fetchImpl: fakeFetch(routes(quiet)), log: () => {} });
   assert.deepEqual(quiet.map((s) => s.context), ["e2e-test/playwright"]);
 });
+test("the step log has one line per finding: its class, decision, the model's cause and confidence, and what it cited", async () => {
+  const logs: string[] = [];
+  const routes: Route[] = [
+    ...runRoutes([spec("t1", "failed"), spec("t2", "failed")]),
+    ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
+    ["/pulls/5/files", () => Response.json([])],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+    ["/statuses/abc", () => Response.json({})],
+  ];
+  await triage({ env: { ...env, ANTHROPIC_API_KEY: "", TRIAGE_CONTEXT: "off" }, fetchImpl: fakeFetch(routes), log: (m) => logs.push(m) });
+  const lines = logs.filter((l) => l.startsWith("e2e-test-triage: finding"));
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /^e2e-test-triage: finding 1\/2 blocking REGRESSION decision=- ai=- cited=- "t1" · specs\/a\.spec\.ts: Fails here/);
+  const judged = findingLogLine(finding({ title: "t3", class: "REGRESSION", blocking: false, decision: "adjudicator_unblock", judge: { cause: "flaky_environment", confidence: 0.91, cited_evidence: ["cross_pr", "this_pr"], explanation: "x" } as Finding["judge"] }), 1, 1, []);
+  assert.match(judged, /^e2e-test-triage: finding 1\/1 cleared REGRESSION decision=adjudicator_unblock ai=flaky_environment@0\.91 cited=cross_pr,this_pr "t3"/);
+  assert.ok(findingLogLine(finding({ title: "x".repeat(900) }), 1, 1, []).length <= 500, "one line, bounded");
+});
 test("a failure history can't explain is a likely regression only when the PR touches it", async () => {
   const routes = (files: unknown[], error?: string): Route[] => [
     ...runRoutes([spec("t1", "failed").map((row) => (error ? { ...row, error_message: error } : row))]),
@@ -907,6 +954,24 @@ test("history counts runs, not attempts", async () => {
   const history = await fetchHistory(fakeFetch([["/reports/history", () => Response.json({ observations: rows })]]), "http://tsio", "o/r", [t], "2026-09-17T00:00:00Z", DEFAULTS, "master");
   assert.equal(history.ambiguous.has(identityKey(t)), false, "a retest is not a second test");
   assert.deepEqual(history.get(identityKey(t))!.map((o) => [o.group_id, o.status]).sort(), [["g1", "flaky"], ["g2", "failed"], ["g3", "passed"]]);
+});
+test("a retest on the same worker is not a second test when history rows carry their ordinal", async () => {
+  // mattermost group 01a17502 (PR 39408): the banner test failed twice on worker chrome-26 (ordinals 5 and 6), and its
+  // retest unit passed on chrome-26 at retry 0 (ordinal 37). Without the ordinal the retest has the first attempt's key.
+  const t: TestRef = { ...failing, full_title: "A > t1" };
+  const row = (over: Partial<Observation>) => obs({ full_title: "A > t1", suite_title: "A", name: "playwright-full", report_name: "chrome-26", ...over });
+  const rows = [
+    row({ group_id: "g1", status: "failed", retry_count: 0, ordinal: 5 }),
+    row({ group_id: "g1", status: "failed", retry_count: 1, ordinal: 6 }),
+    row({ group_id: "g1", status: "passed", retry_count: 0, ordinal: 37 }),
+    row({ group_id: "g2", status: "passed", retry_count: 0, ordinal: 4 }),
+  ];
+  const history = await fetchHistory(fakeFetch([["/reports/history", () => Response.json({ observations: rows })]]), "http://tsio", "o/r", [t], "2026-09-17T00:00:00Z", DEFAULTS, "master");
+  assert.equal(history.ambiguous.has(identityKey(t)), false);
+  assert.deepEqual(history.get(identityKey(t))!.map((o) => o.group_id).sort(), ["g1", "g2"], "both runs are history, each once");
+  const unordered = rows.map(({ ordinal: _ordinal, ...o }) => o);
+  const blind = await fetchHistory(fakeFetch([["/reports/history", () => Response.json({ observations: unordered })]]), "http://tsio", "o/r", [t], "2026-09-17T00:00:00Z", DEFAULTS, "master");
+  assert.equal(blind.ambiguous.has(identityKey(t)), true, "without ordinals it cannot be told from two tests sharing a name, so it fails closed");
 });
 test("a run's duplicate executions at one retry level cannot hide a fail; a pass on a later retry still excuses it", async () => {
   // mattermost-mobile: one spec reported by two suites of one group, both at retry 0: one passed, one failed.
@@ -3666,19 +3731,58 @@ test("shard placeholders are told from tests: no name, the desktop shard stub, a
   assert.equal(isShardPlaceholder(failing), false);
 });
 
-test("a run of mobile specs that did not run is red for a re-run: no findings, no run flag, nothing judged", async () => {
+test("a run of mobile specs that did not run is red for a re-run: no findings, no run flag, nothing judged, and they are not run, not failed", async () => {
   let asked = 0;
   const run = runOf([1, 2, 3].map((i) => ({ ...MOBILE_STUB, file: `detox/e2e/test/s${i}.e2e.ts` })));
   const result = await evaluate(run, { ask: async () => { asked++; return fixture<BatchResult>({ answers: [] }); } });
   assert.deepEqual(result.findings, []);
   assert.equal(result.unnamed, 3);
+  assert.equal(result.notRun, 3);
   assert.equal(result.infra, null, "placeholders are not an environment storm of tests");
   assert.equal(result.verdict, "FAILURE");
   assert.equal(asked, 0);
-  assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts, null, result.unnamed), "(re-run the failed jobs) 0% passed (0 passed, 3 failed, 0 skipped)");
-  const text = renderSummary({ findings: result.findings, infra: result.infra, runURL: "u", counts: result.counts, trunkBranch: "master", unnamed: result.unnamed });
-  assert.match(text, /^## E2E triage: 🔴 re-run the failed jobs$/m);
-  assert.match(text, /^\*\*Re-run the failed jobs: 3 failed results with no test name\.\*\*/m);
+  assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts, null, result.unnamed, result.notRun), "(re-run the failed jobs) 0 passed, 0 failed, 3 not run, 0 skipped");
+  const text = renderSummary({ findings: result.findings, infra: result.infra, runURL: "u", counts: result.counts, trunkBranch: "master", unnamed: result.unnamed, notRun: result.notRun, notRunRerun: result.notRunRerun });
+  assert.match(text, /^## E2E triage: 🔴 3 specs did not run, re-run the failed jobs$/m);
+  assert.match(text, /^\*\*Re-run the failed jobs: 3 specs did not run, no result from their CI job\.\*\* 0 passed, 0 failed, 3 not run, 0 skipped · /m);
+});
+
+test("a lane red only for specs that never ran says so, without a pass rate that counts them as failed", () => {
+  const counts = { total: 634, passed: 615, failed: 2, flaky: 1, skipped: 17 };
+  const description = statusDescription("FAILURE", [], null, counts, null, 2, 2);
+  assert.equal(description, "(re-run the failed jobs) 615 passed, 0 failed, 2 not run, 17 skipped");
+  assert.ok(description.length <= 140, `length ${description.length}`);
+  assert.equal(statusDescription("FAILURE", [], null, { ...counts, failed: 3 }, null, 1, 1), "(re-run the failed jobs) 615 passed, 2 failed, 1 not run, 17 skipped", "only the spec that did not run leaves the failed count");
+  assert.equal(passLine(counts), "99.7% passed (615 passed, 2 failed, 17 skipped)", "a run with every spec run keeps its rate");
+});
+
+test("with re-runs allowed, a lane red only for jobs that sent no results asks for one, and says so; the last attempt does not", async () => {
+  const counts = { total: 634, passed: 615, failed: 2, flaky: 1, skipped: 17 };
+  assert.equal(statusDescription("FAILURE", [], null, counts, null, 2, 2, { attempt: 2, of: 2 }), "(re-running the failed jobs) 615 passed, 0 failed, 2 not run, 17 skipped");
+  assert.equal(statusDescription("FAILURE", [], null, { passed: 0, failed: 1, skipped: 0 }, null, 1, 0, { attempt: 2, of: 2 }), "(re-running the failed jobs) 0% passed (0 passed, 1 failed, 0 skipped)");
+  const text = renderSummary({ findings: [], runURL: "u", counts, trunkBranch: "master", unnamed: 2, notRun: 2, notRunRerun: 2, rerun: { attempt: 2, of: 2 } });
+  assert.match(text, /^## E2E triage: 🔴 2 specs did not run, re-running the failed jobs$/m);
+  assert.match(text, /^\*\*Re-running the failed jobs automatically \(attempt 2 of 2\), then triaging the new results: 2 specs did not run, no result from their CI job\.\*\*/m);
+  for (const [attempt, expected] of [["1", "true"], ["2", "false"]]) {
+    await inTmp(async (dir) => {
+      const statuses: StatusBody[] = [];
+      const outputPath = join(dir, "o.txt");
+      const fetchImpl = fakeFetch([
+        ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "mobile-pr-detox-ios", gh_run_id: "12", gh_run_attempt: attempt, status: "completed" }], total: 1 })],
+        ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: MOBILE_STUB.file }] })],
+        ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: MOBILE_STUB.title, status: "failed", retry_count: 0, ordinal: 0, error_message: MOBILE_STUB.error, error_stack: null }])],
+        ["/actions/runs/12/attempts/", () => Response.json({ total_count: 1, jobs: [{ id: 7, name: "Detox iOS E2E / iOS / machine-1", status: "completed", conclusion: "failure", steps: [{ name: "ci/prepare-node-deps", conclusion: "failure" }] }] })],
+        ["/actions/jobs/7/logs", () => new Response("npm error code ECONNRESET")],
+        statusSink(statuses),
+      ]);
+      const id = { ...parsed<CompositeIdentity>(env.COMPOSITE_IDENTITY), name: "mobile-pr-detox-ios", gh_run_attempt: attempt };
+      await triage({ env: { ...env, COMPOSITE_IDENTITY: JSON.stringify(id), MODE: "enforce", RERUN_ATTEMPTS: "1", TRIAGE_CONTEXT: "off", GITHUB_OUTPUT: outputPath }, fetchImpl, log: () => {} });
+      assert.match(readFileSync(outputPath, "utf8"), new RegExp(`^rerun=${expected}$`, "m"), `attempt ${attempt}`);
+      if (expected === "true") assert.match(readFileSync(outputPath, "utf8"), /^rerun_of=2$/m, "the marker carries the lane's limit to the listener");
+      const description = statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => s.description)[0];
+      assert.match(String(description), expected === "true" ? /^\(re-running the failed jobs\) / : /^\(re-run the failed jobs\) /, `attempt ${attempt}`);
+    });
+  }
 });
 
 test("a desktop shard stub, end to end: no history, no model, the check red with re-run the failed jobs", async () => {
@@ -3712,18 +3816,163 @@ test("placeholders beside a real flaky failure: the flaky one is labelled, and t
   const result = await evaluate(run, { history, ask: async (packs) => { sent.push(...packs.map((p) => p.test.title)); return fixture<BatchResult>({ answers: [] }); } });
   assert.deepEqual(result.findings.map((f) => [f.title, f.class, f.blocking]), [["t1", "FLAKY_ON_TRUNK", false]], "only the test is a finding");
   assert.equal(result.unnamed, 2);
+  assert.equal(result.notRun, 1, "only the mobile spec did not run; the desktop stub is a shard with no results");
   assert.ok(!sent.some((t) => t !== "t1"), "no placeholder is judged");
   assert.equal(result.verdict, "FAILURE", "the placeholders keep the run red");
-  const description = statusDescription(result.verdict, result.findings, result.infra, result.counts, null, result.unnamed);
-  assert.equal(description, "(1 flaky; re-run the failed jobs) 85.7% passed (18 passed, 3 failed, 0 skipped)");
+  const description = statusDescription(result.verdict, result.findings, result.infra, result.counts, null, result.unnamed, result.notRun);
+  assert.equal(description, "(1 flaky; re-run the failed jobs) 18 passed, 2 failed, 1 not run, 0 skipped", "the pass line counts the spec that did not run");
   assert.ok(description.length <= 140);
-  const text = renderSummary({ findings: result.findings, infra: result.infra, runURL: "u", counts: result.counts, trunkBranch: "master", unnamed: result.unnamed });
+  const text = renderSummary({ findings: result.findings, infra: result.infra, runURL: "u", counts: result.counts, trunkBranch: "master", unnamed: result.unnamed, notRun: result.notRun, notRunRerun: result.notRunRerun });
   assert.match(text, /^## E2E triage: 🔴 re-run the failed jobs$/m, "never 'none caused' while the lane is red");
-  assert.match(text, /\*\*1 failure: 1 looks unrelated \(1 flaky\)\. Re-run the failed jobs: 2 failed results with no test name\.\*\*/);
+  assert.match(text, /\*\*1 failure: 1 looks unrelated \(1 flaky\)\. Re-run the failed jobs: 1 spec did not run, no result from its CI job; 1 failed result with no test name\.\*\*/);
   // The labels still give way first past 140 characters; the re-run stays whole.
   const long = statusDescription("FAILURE", Array.from({ length: 40 }, (_, i) => finding({ title: `t${i}`, class: "REGRESSION", blocking: i % 2 === 0, decision: i % 4 === 0 ? "adjudicator_blame" : undefined, judge: i % 4 === 0 ? ({ cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "x" } as Finding["judge"]) : null, out_of_date: i % 3 === 0 ? { base: "master", behind: 1, commit: null } : undefined })), null, { passed: 900, failed: 42 }, { text: "x", short: "2 report(s) missing" }, 2);
   assert.ok(long.length <= 140, `length ${long.length}`);
   assert.match(long, /; re-run the failed jobs; 2 report\(s\) missing\) /);
+  const longNotRun = statusDescription("FAILURE", Array.from({ length: 40 }, (_, i) => finding({ title: `t${i}`, class: "REGRESSION", blocking: true })), "infrastructure errors", { passed: 1186, failed: 342, skipped: 164 }, { text: "x", short: "2 report(s) missing" }, 302, 300);
+  assert.ok(longNotRun.length <= 140, `length ${longNotRun.length}`);
+  assert.match(longNotRun, /; mostly environment errors, re-run; re-run the failed jobs; 2 report\(s\) missing\) 1186 passed, 42 failed, 300 not run, 164 skipped$/);
+});
+
+// Written by mattermost-mobile's merge script once it knows each spec's shard.
+const STOPPED = { ...MOBILE_STUB, error: `${MOBILE_STUB.file} was assigned to a shard but produced no result: other specs of its shard reported, so its Jest process stopped before reaching this spec.` };
+const SILENT = { ...MOBILE_STUB, error: `${MOBILE_STUB.file} was assigned to a shard but produced no result: no spec of its shard reported, so the shard ran or uploaded nothing.` };
+const specRuns = (statuses: string[]): SpecRun[] => statuses.map((status, i) => ({ group_id: `h${i}`, status: status as SpecRun["status"] }));
+
+test("a spec whose Jest process stopped before it is flaky when it also did not run before and passed every time it ran", () => {
+  const cleared = classifyNotRun(STOPPED, specRuns(["not_run", ...Array(6).fill("passed"), "not_run"]), DEFAULTS, "g1");
+  assert.deepEqual([cleared.class, cleared.blocking], ["FLAKY_NOT_RUN", false]);
+  assert.match(cleared.reason, /as it did in 2 of the last 8 runs; it passed in all 6 where it ran/);
+  const blocked = (statuses: string[]) => classifyNotRun(STOPPED, specRuns(statuses), DEFAULTS, "g1");
+  assert.match(blocked(Array(8).fill("passed")).reason, /which it has not done in the last 8 runs/, "first time");
+  assert.match(blocked(["not_run", "failed", ...Array(6).fill("passed")]).reason, /it failed in 1 of the 7 recent runs where it ran/);
+  // One failure in 96 runs where it ran (mm_blocks_ephemeral's history) is still passing.
+  const rare = classifyNotRun(STOPPED, specRuns(["not_run", "failed", ...Array(95).fill("passed")]), DEFAULTS, "g1");
+  assert.deepEqual([rare.class, rare.blocking], ["FLAKY_NOT_RUN", false], "one failure in 96 is still passing");
+  assert.match(rare.reason, /^Did not run: its Jest process stopped before reaching it, as it did in 1 of the last 97 runs; it passed in 95 of the 96 where it ran\./);
+  assert.match(blocked(["not_run", "passed", "passed"]).reason, /it ran in only 2 recent runs/);
+  for (const f of [blocked(Array(8).fill("passed")), classifyNotRun(STOPPED, null, DEFAULTS, "g1")]) assert.deepEqual([f.class, f.blocking], ["NOT_RUN", true]);
+  assert.equal(classifyNotRun(STOPPED, [{ group_id: "g1", status: "not_run" }, ...specRuns(Array(6).fill("passed"))], DEFAULTS, "g1").class, "NOT_RUN", "this run is not its own history");
+  assert.equal(classifyNotRun(STOPPED, [{ group_id: "7", status: "not_run" }, ...specRuns(Array(6).fill("passed"))], DEFAULTS, 7).class, "NOT_RUN", "nor when TSIO sends its id as a number");
+  // A run where every test was skipped is not a pass: 3 passes and 10 skipped runs are 3 runs, too few.
+  assert.match(blocked(["not_run", ...Array(3).fill("passed"), ...Array(10).fill("skipped")]).reason, /it ran in only 3 recent runs/);
+  // mm_blocks_incoming_webhook skips every test on CI (no stable webhook ingress), so missing it loses nothing.
+  const alwaysSkipped = classifyNotRun(STOPPED, specRuns(["not_run", ...Array(96).fill("skipped")]), DEFAULTS, "g1");
+  assert.deepEqual([alwaysSkipped.class, alwaysSkipped.blocking], ["FLAKY_NOT_RUN", false]);
+  assert.match(alwaysSkipped.reason, /it skipped every test in all 96 recent runs where it was reached, so nothing was lost/);
+  // A spec this change edits has to run, and one whose change list could not be read is not cleared either.
+  const history = specRuns(["not_run", ...Array(6).fill("passed")]);
+  assert.match(classifyNotRun(STOPPED, history, DEFAULTS, "g1", true).reason, /this change edits it, so it has to run/);
+  assert.match(classifyNotRun(STOPPED, history, DEFAULTS, "g1", null).reason, /whether this change edits it could not be checked/);
+  for (const edited of [true, null]) assert.equal(classifyNotRun(STOPPED, history, DEFAULTS, "g1", edited).blocking, true);
+});
+
+test("a spec's runs are read from the whole file: not run where its placeholder is, failed where a test failed every try", async () => {
+  const row = (group_id: string, title: string, status: string, retry_count = 0, name = "mobile-pr-detox-ios") => obs({ file: MOBILE_STUB.file, title, full_title: `S > ${title}`, group_id, status, retry_count, name });
+  const rows = [
+    row("g1", "spec did not run", "failed"),
+    row("g2", "a", "passed"), row("g2", "b", "passed"),
+    row("g3", "a", "failed"), row("g3", "a", "failed", 1),
+    row("g4", "a", "failed"), row("g4", "a", "passed", 1),
+    row("g5", "a", "failed", 0, "mobile-pr-detox-android"),
+    row("g6", "a", "skipped"), row("g6", "b", "skipped"),
+    // One spec reported twice in one run at the same retry: the pass beside the fail cannot excuse it, as in the run reader.
+    row("g7", "a", "failed"), row("g7", "a", "passed"),
+  ];
+  const history = await fetchSpecRuns(fakeFetch([["/reports/history", () => Response.json({ observations: rows })]]), "http://tsio", "o/r", [MOBILE_STUB.file], "2026-10-26T00:00:00Z", DEFAULTS, laneOf("mobile-pr-detox-ios"));
+  assert.equal(history.truncated, false);
+  assert.deepEqual(history.byFile.get(MOBILE_STUB.file)!.map((r) => [r.group_id, r.status]), [["g1", "not_run"], ["g2", "passed"], ["g3", "failed"], ["g4", "passed"], ["g6", "skipped"], ["g7", "failed"]], "another lane's run is not this lane's history, and a run where every test was skipped is no pass");
+});
+
+test("a lane whose only failures are specs a stopped Jest process skipped is green when they are flaky that way; a silent shard is re-run", async () => {
+  const history = specRuns(["not_run", ...Array(6).fill("passed")]);
+  const counts = { total: 634, passed: 615, failed: 1, flaky: 0, skipped: 17 };
+  const result = await evaluate({ ...runOf([STOPPED]), counts }, { specHistory: { byFile: new Map([[STOPPED.file, history]]), truncated: false } });
+  assert.equal(result.verdict, "SUCCESS");
+  assert.equal(result.unnamed, undefined, "not a placeholder to re-run");
+  assert.equal(result.notRun, 1);
+  assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts, null, result.unnamed ?? 0, result.notRun ?? 0), "(1 flaky) 615 passed, 0 failed, 1 not run, 17 skipped");
+  // A shard that sent nothing ran none of its specs: it is re-run, whatever their history says. So is an old-wording
+  // placeholder, which cannot say which it was.
+  for (const t of [SILENT, MOBILE_STUB]) {
+    const silent = await evaluate({ ...runOf([t]), counts }, { specHistory: { byFile: new Map([[t.file, history]]), truncated: false } });
+    assert.deepEqual([silent.verdict, silent.unnamed, silent.notRunRerun, silent.findings.length], ["FAILURE", 1, 1, 0], t.error);
+  }
+  const edited = await evaluate({ ...runOf([STOPPED]), counts }, { specHistory: { byFile: new Map([[STOPPED.file, history]]), truncated: false }, diff: { files: [{ filename: STOPPED.file }], ok: true } });
+  assert.deepEqual([edited.verdict, edited.findings[0].class], ["FAILURE", "NOT_RUN"], "a spec the PR edits is held");
+  const truncated = await evaluate({ ...runOf([STOPPED]), counts }, { specHistory: { byFile: new Map([[STOPPED.file, history]]), truncated: true } });
+  assert.deepEqual([truncated.verdict, truncated.findings[0].class], ["FAILURE", "NOT_RUN"], "cut-off history clears nothing");
+});
+
+test("the re-run line counts only the specs it re-runs, beside a held one and a desktop stub", () => {
+  const held = classifyNotRun(STOPPED, specRuns(Array(8).fill("passed")), DEFAULTS, "g1");
+  const counts = { total: 10, passed: 6, failed: 4, flaky: 0, skipped: 0 };
+  // 1 held stopped spec (a finding), 2 silent-shard specs and 1 desktop stub (placeholders, re-run).
+  const text = renderSummary({ findings: [held], runURL: "u", counts, trunkBranch: "main", unnamed: 3, notRun: 3, notRunRerun: 2 });
+  assert.match(text, /Re-run the failed jobs: 2 specs did not run, no result from their CI job; 1 failed result with no test name\./);
+  const onlyPlaceholders = renderSummary({ findings: [], runURL: "u", counts, trunkBranch: "main", unnamed: 2, notRun: 3, notRunRerun: 2 });
+  assert.match(onlyPlaceholders, /^## E2E triage: 🔴 2 specs did not run, re-run the failed jobs$/m);
+});
+
+test("end to end, a skipped spec with an intermittent history turns the lane green, and nothing asks for a re-run", async () => {
+  await inTmp(async (dir) => {
+    const statuses: StatusBody[] = [];
+    const outputPath = join(dir, "o.txt");
+    const logs: string[] = [];
+    const past = (group_id: string, title: string) => obs({ file: STOPPED.file, title, full_title: `S > ${title}`, group_id, status: title === "a" ? "passed" : "failed", name: "mobile-pr-detox-ios" });
+    const history = [past("h0", "spec did not run"), ...Array.from({ length: 6 }, (_, i) => past(`h${i + 1}`, "a"))];
+    const fetchImpl = fakeFetch([
+      ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "mobile-pr-detox-ios", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+      ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: STOPPED.file }] })],
+      ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: STOPPED.title, status: "failed", retry_count: 0, ordinal: 0, error_message: STOPPED.error, error_stack: null }])],
+      ["/reports/history", () => Response.json({ observations: history })],
+      ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+      ["/pulls/5", () => Response.json({ title: "t", base: { ref: "main" }, labels: [] })],
+      statusSink(statuses),
+    ]);
+    const id = { ...parsed<CompositeIdentity>(env.COMPOSITE_IDENTITY), name: "mobile-pr-detox-ios" };
+    const result = await triage({ env: { ...env, COMPOSITE_IDENTITY: JSON.stringify(id), MODE: "enforce", RERUN_ATTEMPTS: "1", TRIAGE_CONTEXT: "off", GITHUB_OUTPUT: outputPath }, fetchImpl, log: (m) => logs.push(m) });
+    assert.equal(result.verdict, "SUCCESS");
+    assert.match(readFileSync(outputPath, "utf8"), /^rerun=false$/m);
+    assert.deepEqual(statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => [s.state, s.description]), [["success", "(1 flaky) 0 passed, 0 failed, 1 not run, 0 skipped"]]);
+    assert.ok(logs.some((l) => /finding 1\/1 cleared FLAKY_NOT_RUN/.test(l)));
+  });
+});
+
+test("the triage check says re-running too while an automatic re-run is on its way", async () => {
+  const statuses: StatusBody[] = [];
+  const fetchImpl = fakeFetch([
+    ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "mobile-pr-detox-ios", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+    ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: MOBILE_STUB.file }] })],
+    ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: MOBILE_STUB.title, status: "failed", retry_count: 0, ordinal: 0, error_message: MOBILE_STUB.error, error_stack: null }])],
+    ["/pulls/5", () => Response.json({ title: "t", base: { ref: "main" }, labels: [] })],
+    ["/actions/runs/12/attempts/", () => Response.json({ total_count: 1, jobs: [{ id: 7, name: "Detox iOS E2E / iOS / machine-1", status: "completed", conclusion: "failure", steps: [{ name: "ci/prepare-node-deps", conclusion: "failure" }] }] })],
+    ["/actions/jobs/7/logs", () => new Response("npm error code ECONNRESET")],
+    statusSink(statuses),
+  ]);
+  const id = { ...parsed<CompositeIdentity>(env.COMPOSITE_IDENTITY), name: "mobile-pr-detox-ios" };
+  await triage({ env: { ...env, COMPOSITE_IDENTITY: JSON.stringify(id), MODE: "enforce", RERUN_ATTEMPTS: "1" }, fetchImpl, log: () => {} });
+  const check = statuses.filter((s) => s.context === "e2e-test/playwright/triage" && s.state !== "pending").map((s) => s.description);
+  assert.deepEqual(check, ["1 failed → re-running the failed jobs"]);
+});
+
+test("a lane a named test already blocks asks for no re-run, though a shard beside it sent nothing", async () => {
+  await inTmp(async (dir) => {
+    const outputPath = join(dir, "o.txt");
+    const fetchImpl = fakeFetch([
+      ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+      ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }, { id: "s2", file_path: SILENT.file }] })],
+      ["/reports/g1/cases", () => Response.json([...spec("t1", "failed"), { suite_id: "s2", title: SILENT.title, status: "failed", retry_count: 0, ordinal: 1, error_message: SILENT.error, error_stack: null }])],
+      ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
+      ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+      ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+      ["/statuses/abc", () => Response.json({})],
+    ]);
+    const result = await triage({ env: { ...env, ANTHROPIC_API_KEY: "", RERUN_ATTEMPTS: "1", TRIAGE_CONTEXT: "off", GITHUB_OUTPUT: outputPath }, fetchImpl, log: () => {}, wait: { attempts: 1, ms: 0 } });
+    assert.equal(result.unnamed, 1, "the silent shard's spec is still a placeholder");
+    assert.ok(result.findings.some((f) => f.blocking), "t1 blocks");
+    assert.match(readFileSync(outputPath, "utf8"), /^rerun=false$/m);
+  });
 });
 
 test("placeholders beside a test still put their specs in the history query: TSIO's run window is counted over the files asked for", async () => {

@@ -82,3 +82,33 @@ test("missing reports are counted as arrived of expected, or as a bare count whe
   assert.equal(missingArrived({ expected: 3, received: 1, status: "in_progress" }), "1 of 3 reports arrived");
   assert.equal(missingArrived({ expected: null, received: 2, status: "processing" }), "2 reports arrived (the expected count is unknown)");
 });
+
+// A TSIO that serves one group's detail, suites and cases; the list answers with the group itself.
+const oneGroup = (detail: Record<string, unknown>): FetchImpl => (async (url: string) => {
+  const u = String(url);
+  if (u.includes("/reports?")) return Response.json({ reports: [{ ...detail, orchestration: undefined }] });
+  if (u.endsWith("/suites")) return Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] });
+  if (u.includes("/cases")) return Response.json([{ suite_id: "s1", title: "t1", status: "passed", retry_count: 0, ordinal: 0, error_message: null, error_stack: null }]);
+  if (u.includes(`/reports/${detail.id}`)) return Response.json(detail);
+  throw new Error(`unexpected ${url}`);
+}) as FetchImpl;
+const run40417095173 = (over: Record<string, unknown>) =>
+  group("39637355358", "1", { status: "incomplete", total_reports_expected: 40, reports: Array.from({ length: 39 }, () => ({})), test_stats: { total: 1309 }, ...over });
+const settled = (counts: Record<string, number>, total = 1309) => ({ status: "completed", total_units: 421, counts: { pending: 0, leased: 0, completed_pass: 419, completed_fail: 0, completed_skipped: 2, abandoned: 0, ...counts }, tests: { total } });
+
+test("a group whose orchestration ran every unit is complete although a worker never uploaded: its units went to other workers", async () => {
+  // mattermost run 40417095173: 39 of 40 reports, but all 421 units finished, so nothing is missing.
+  const run = await fetchRun(oneGroup(run40417095173({ orchestration: settled({}) })), "http://tsio", ours, null, { attempts: 1, ms: 0 });
+  assert.equal(run.missing, null);
+});
+
+test("a group whose orchestration left units pending, leased or abandoned is still missing reports", async () => {
+  for (const left of [{ pending: 3 }, { leased: 1 }, { abandoned: 2 }] as Record<string, number>[]) {
+    const run = await fetchRun(oneGroup(run40417095173({ orchestration: { ...settled(left), status: left.abandoned ? "completed" : "running" } })), "http://tsio", ours, null, { attempts: 1, ms: 0 });
+    assert.deepEqual(run.missing, { expected: 40, received: 39, status: "incomplete" }, JSON.stringify(left));
+  }
+  const lost = await fetchRun(oneGroup(run40417095173({ orchestration: settled({}, 1320) })), "http://tsio", ours, null, { attempts: 1, ms: 0 });
+  assert.deepEqual(lost.missing, { expected: 40, received: 39, status: "incomplete" }, "every unit ran, but 11 tests' results never arrived");
+  const without = await fetchRun(oneGroup(run40417095173({})), "http://tsio", ours, null, { attempts: 1, ms: 0 });
+  assert.deepEqual(without.missing, { expected: 40, received: 39, status: "incomplete" }, "no orchestration: the report count decides");
+});
