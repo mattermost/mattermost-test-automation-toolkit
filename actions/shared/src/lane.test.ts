@@ -72,3 +72,12 @@ test("a lane that is pending keeps the PR-wide check pending, whatever its label
   assert.deepEqual(lanes({ "e2e-test/detox-ios": st("pending", "(1 flaky) running"), "e2e-test/maestro-ios": st("failure", "(1 caused by PR) 0% passed") }),
     { state: "pending", description: "Triage is checking: waiting for detox-ios" });
 });
+
+test("a red check triage does not cover keeps the aggregate from saying all lanes green", () => {
+  const green = { context: "e2e-test/playwright-full/enterprise", status: st("success", "100% passed (1315)") };
+  const upgrade = { context: "e2e-test/playwright-full/enterprise/upgrade-from-release-11.10", status: st("failure", "99.8% passed, 2 failed") };
+  assert.deepEqual(laneSummary([green], [upgrade]), { state: "success", description: "triaged lanes green · not triaged: playwright-full/enterprise/upgrade-from-release-11.10 red" });
+  assert.deepEqual(laneSummary([green], [{ ...upgrade, status: st("pending", "running") }]), { state: "success", description: "All lanes green" }, "a running check is not red yet");
+  assert.equal(laneSummary([{ context: "e2e-test/cypress-full/enterprise", status: st("failure", "(1 caused by PR) 99.9% passed") }], [upgrade]).description,
+    "cypress-full/enterprise: 1 caused by PR · not triaged: playwright-full/enterprise/upgrade-from-release-11.10 red");
+});

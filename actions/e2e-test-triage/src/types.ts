@@ -97,6 +97,8 @@ export interface Finding extends TestRef {
   cross_pr: CrossPRStats;
   failure_signatures: string[];
   trunk_break: TrunkBreak | null;
+  /** FIXED_ON_TRUNK: trunk's last failing run of the ended streak, and its first pass after it. */
+  trunk_fixed?: { last_fail: At | null; first_pass: At | null };
   this_pr: ThisPRStats;
   untouched?: boolean;
   producer?: Evidence;
@@ -264,6 +266,8 @@ export interface OutOfDate {
   commit: CommitRef | null;
   /** The branch-state hold: this PR failed the same way on its last `streak` commits (this run included), never on the base. */
   streak?: number;
+  /** The base branch fixed this failure at `commit` (see markFixedOnTrunk), after this PR last merged it. */
+  fixed?: boolean;
 }
 
 export interface BrokeByCommit {

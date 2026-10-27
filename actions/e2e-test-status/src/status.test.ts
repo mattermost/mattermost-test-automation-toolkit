@@ -268,3 +268,10 @@ test("an invalid COMPOSITE_IDENTITY is named before any GitHub call", async () =
     /COMPOSITE_IDENTITY is not valid JSON/,
   );
 });
+
+test("the aggregate names a red E2E check under its own prefix that triage does not cover, and nothing else", async () => {
+  const upgrade = "e2e-test/playwright-full/enterprise/upgrade-from-release-11.10";
+  const f = fixture([status("20", "1", "success"), status("20", "1", "success", other), status("20", "1", "failure", upgrade), status("20", "1", "failure", "ci/build")]);
+  await f.writer().summarize(lanes, "e2e-test/triage", laneSummary);
+  assert.equal((f.posts.at(-1) as CommitStatus).description, "triaged lanes green · not triaged: playwright-full/enterprise/upgrade-from-release-11.10 red");
+});

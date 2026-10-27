@@ -100,6 +100,7 @@ function whyNext(f: Finding, branch: string, pr: boolean): [string, string] {
       if (f.out_of_date?.streak) return [`Failed the same way on this PR's last ${f.out_of_date.streak} commits and never on ${branch}: the branch is behind or broken.`, `Merge ${branch} and re-run.`];
       const c = f.out_of_date?.commit;
       const where = c ? ` (${c.pr ? `#${c.pr}` : sha7(c.sha)}${c.date ? `, ${c.date}` : ""})` : "";
+      if (f.out_of_date?.fixed) return [`${branch} fixed this failure${where} after this PR last merged ${branch}, so this branch still has it.`, `Merge ${branch} and re-run.`];
       return [`${branch} changed this test${where} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
     }
     case "check":

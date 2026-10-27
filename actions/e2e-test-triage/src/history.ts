@@ -302,7 +302,7 @@ interface CommitRow {
 interface CompareResult {
   ahead_by?: number;
   files?: { filename: string }[];
-  commits?: { sha: string }[];
+  commits?: CommitRow[];
   merge_base_commit?: CommitRow | null;
 }
 
@@ -314,6 +314,37 @@ const commitRef = (c: CommitRow): NonNullable<OutOfDate["commit"]> => ({
   date: String(c.commit?.committer?.date ?? c.commit?.author?.date ?? "").slice(0, 10),
   pr: Number(/\(#(\d+)\)/.exec(c.commit?.message ?? "")?.[1]) || null,
 });
+
+/**
+ * FIXED_ON_TRUNK failures: trunk fixed them after a run of failures. One compare lists the base commits this PR lacks.
+ * Lacking trunk's first passing commit, it lacks the fix: out of date, merge the base. Having it, the failure is not that
+ * break: a REGRESSION for the judge. When the list is cut off and doesn't name that commit, it stays unchecked.
+ */
+export async function markFixedOnTrunk({ findings, api, id, baseBranch, log = () => {} }: {
+  findings: Finding[];
+  api: GhApi;
+  id: Pick<CompositeIdentity, "repository" | "commit_sha">;
+  baseBranch: string | null | undefined;
+  log?: (message: string) => void;
+}): Promise<void> {
+  if (!findings.length) return;
+  const unchecked = (f: Finding, because: string): void => void Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} ${because}` });
+  const cmp = baseBranch ? (await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`)) as CompareResult | null : null;
+  const lacking = new Map((cmp?.commits ?? []).map((c): [string, CommitRow] => [c.sha, c]));
+  const complete = cmp != null && (cmp.ahead_by ?? 0) <= lacking.size;
+  for (const f of findings) {
+    const sha = f.trunk_fixed?.first_pass?.commit_sha;
+    const fix = sha ? lacking.get(sha) : undefined;
+    if (fix) {
+      f.out_of_date = { base: baseBranch!, behind: cmp!.ahead_by ?? null, commit: commitRef(fix), fixed: true };
+    } else if (sha && complete) {
+      Object.assign(f, { class: "REGRESSION", reason: `${f.reason} This branch has that fix (${sha.slice(0, 7)}) and still fails the same way.` });
+    } else {
+      log(`whether this PR has ${baseBranch}'s fix for ${f.title} is unknown`);
+      unchecked(f, `Whether this branch has that fix could not be checked.`);
+    }
+  }
+}
 
 /** What markOutOfDate could not settle: `truncated` when the file list was cut off, and the failures left unchecked. */
 export interface OutOfDateResult {

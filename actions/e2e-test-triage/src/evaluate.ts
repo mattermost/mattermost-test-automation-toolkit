@@ -54,6 +54,7 @@ export interface EvaluateParams {
   /** The same test on the run's sibling groups (see siblingPlatforms). Asked of every failing run, model or not. */
   otherPlatforms?: ((findings: Finding[]) => Promise<void>) | null;
   outOfDate?: ((findings: Finding[]) => Promise<OutOfDateResult>) | null;
+  fixedOnTrunk?: ((findings: Finding[]) => Promise<void>) | null;
   brokeBy?: ((findings: Finding[]) => Promise<void>) | null;
   /** Past runs of the specs a stopped Jest process skipped (see classifyNotRun); null when they could not be read. */
   specHistory?: SpecHistory | null;
@@ -84,6 +85,7 @@ export async function evaluateRun({
   enrich = null,
   otherPlatforms = null,
   outOfDate = null,
+  fixedOnTrunk = null,
   brokeBy = null,
   specHistory = null,
 }: EvaluateParams): Promise<EvaluatedRun> {
@@ -181,6 +183,16 @@ export async function evaluateRun({
         // An error is not "nothing changed": the same fail-closed outcome as a cut-off list.
         log(`base branch changes unavailable: ${String(e).slice(0, 200)}`);
         unchecked(candidates, "The base branch's changes since this PR last merged it could not be read, so whether this test changed could not be checked");
+      }
+    }
+    // A break the base branch fixed: out of date where this branch lacks the fix, the judge's where it has it.
+    if (!blind && prNumber && fixedOnTrunk) {
+      const fixed = result.findings.filter((f) => f.class === "FIXED_ON_TRUNK" && !f.identity_unresolved);
+      try {
+        await fixedOnTrunk(fixed);
+      } catch (e) {
+        log(`base branch commits unavailable: ${String(e).slice(0, 200)}`);
+        for (const f of fixed) Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} Whether this branch has that fix could not be checked.` });
       }
     }
     // Tests broken on the base branch: what merged between their last pass and first failure.

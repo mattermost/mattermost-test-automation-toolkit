@@ -52,14 +52,17 @@ function redReason(description = "") {
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
   return parts.length ? parts.join(", ") : "still red";
 }
-function laneSummary(lanes) {
+function laneSummary(lanes, untriaged = []) {
   const seen = lanes.filter((l) => Boolean(l.status));
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}` };
   const red = seen.filter((l) => l.status.state !== "success");
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText].filter(Boolean).join(" \xB7 ") };
+  const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending");
+  const otherText = otherRed.length ? `not triaged: ${otherRed.map((l) => laneName(l.context)).join(", ")} red` : "";
+  if (red.length) return { state: "failure", description: [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText, otherText].filter(Boolean).join(" \xB7 ") };
+  if (otherText) return { state: "success", description: [clearedText, "triaged lanes green", otherText].filter(Boolean).join(" \xB7 ") };
   return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
 }
 
@@ -147,7 +150,10 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
     const rows = await readStatuses(api, id);
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return;
-    await post({ ...summarizeLanes(latest), context: summaryContext }, snapshotOwner());
+    const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
+    const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
+    const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
+    await post({ ...summarizeLanes(latest, untriaged), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,
@@ -264,14 +270,14 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
   );
   if (!group) {
     const noGroup = `TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`;
-    const newest = /^\d+$/.test(runId) && /^\d+$/.test(attempt) ? groups.filter((g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name).map((g) => ({
+    const newest2 = /^\d+$/.test(runId) && /^\d+$/.test(attempt) ? groups.filter((g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name).map((g) => ({
       gh_run_id: String(g.gh_run_id),
       gh_run_attempt: String(g.gh_run_attempt),
       gh_pr_number: g.gh_pr_number === void 0 ? void 0 : g.gh_pr_number === null || String(g.gh_pr_number) === "" ? null : String(g.gh_pr_number),
       branch: g.branch === void 0 ? void 0 : g.branch
     })).filter((r) => /^\d+$/.test(r.gh_run_id) && /^\d+$/.test(r.gh_run_attempt) && newerRun(r, { gh_run_id: runId, gh_run_attempt: attempt })).reduce((best, r) => !best || newerRun(r, best) ? r : best, null) : null;
-    if (newest)
-      throw new SupersededRunError(`${noGroup}; its group now belongs to run ${newest.gh_run_id} attempt ${newest.gh_run_attempt}`, newest);
+    if (newest2)
+      throw new SupersededRunError(`${noGroup}; its group now belongs to run ${newest2.gh_run_id} attempt ${newest2.gh_run_attempt}`, newest2);
     throw new NoResultsError(noGroup);
   }
   let missing = null;
@@ -287,10 +293,15 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
       missing = { expected, received, status: detail.status };
     }
   }
-  const [{ suites = [] }, cases] = await Promise.all([
+  const [{ suites: uploaded = [] }, allCases] = await Promise.all([
     get(`/reports/${group.id}/suites`),
     get(`/reports/${group.id}/cases`)
   ]);
+  const newest = /* @__PURE__ */ new Map();
+  for (const s of uploaded) if (s.report_name && s.report_id && (newest.get(s.report_name) ?? "") < s.report_id) newest.set(s.report_name, s.report_id);
+  const suites = uploaded.filter((s) => !s.report_name || !s.report_id || newest.get(s.report_name) === s.report_id);
+  const kept = new Set(suites.map((s) => s.id));
+  const cases = allCases.filter((c) => kept.has(c.suite_id));
   const fileOf2 = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
   const reportOf = new Map(suites.map((s) => [s.id, s.report_name ?? null]));
   const suiteTitleOf = new Map(suites.map((s) => [s.id, s.title ?? ""]));
@@ -584,6 +595,7 @@ function classifyNotRun(test, runs, cfg, groupId, edited = false) {
   if (!notRun) return out("NOT_RUN", `${why}, which it has not done in the last ${others.length} runs.`, true);
   return out("FLAKY_NOT_RUN", `${why}, as it did in ${notRun} of the last ${others.length} runs; it passed in ${failed ? `${ran.length - failed} of the` : "all"} ${ran.length} where it ran.`, false);
 }
+var FIXED_STREAK = 3;
 var EXONERATED = /* @__PURE__ */ new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 var EXONERATED_ON_TRUNK = /* @__PURE__ */ new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 var exoneratedSet = (isTrunkRun) => isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED;
@@ -688,6 +700,15 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
       return out("REGRESSION", `Trunk fails this test too, but with another error ("${trunkError.slice(0, 160)}"); this one may be the PR's.`, true);
     return out("BROKEN_ON_TRUNK", `Trunk's latest run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}, ${latestTrunk.created_at?.slice(0, 10) ?? "unknown date"}) fails this test too.`, false);
   }
+  let recent = 0;
+  while (recent < trunk.length && trunk[recent].status === "passed") recent++;
+  let broken = 0;
+  const sameSignature = (excerpt) => ownSignature == null || errorSignature(excerpt) == null || errorSignature(excerpt) === ownSignature;
+  while (recent + broken < trunk.length && FAILED_STATUSES.has(trunk[recent + broken].status) && sameSignature(trunk[recent + broken].error_excerpt)) broken++;
+  if (recent && broken >= FIXED_STREAK)
+    return Object.assign(out("FIXED_ON_TRUNK", `${trunkBranch || "Trunk"} failed this test the same way in ${broken} runs in a row, then passed from ${trunk[recent - 1].commit_sha?.slice(0, 7) ?? "unknown"} on: trunk fixed it.`, true), {
+      trunk_fixed: { last_fail: at(trunk[recent]), first_pass: at(trunk[recent - 1]) }
+    });
   const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
   if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0 && laplace >= cfg.pMin && latestTrunk?.status !== "failed") {
     const trunkError = otherError(trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky"));
@@ -1162,6 +1183,26 @@ var commitRef = (c) => ({
   date: String(c.commit?.committer?.date ?? c.commit?.author?.date ?? "").slice(0, 10),
   pr: Number(/\(#(\d+)\)/.exec(c.commit?.message ?? "")?.[1]) || null
 });
+async function markFixedOnTrunk({ findings, api, id, baseBranch, log = () => {
+} }) {
+  if (!findings.length) return;
+  const unchecked = (f, because) => void Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} ${because}` });
+  const cmp = baseBranch ? await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`) : null;
+  const lacking = new Map((cmp?.commits ?? []).map((c) => [c.sha, c]));
+  const complete = cmp != null && (cmp.ahead_by ?? 0) <= lacking.size;
+  for (const f of findings) {
+    const sha = f.trunk_fixed?.first_pass?.commit_sha;
+    const fix = sha ? lacking.get(sha) : void 0;
+    if (fix) {
+      f.out_of_date = { base: baseBranch, behind: cmp.ahead_by ?? null, commit: commitRef(fix), fixed: true };
+    } else if (sha && complete) {
+      Object.assign(f, { class: "REGRESSION", reason: `${f.reason} This branch has that fix (${sha.slice(0, 7)}) and still fails the same way.` });
+    } else {
+      log(`whether this PR has ${baseBranch}'s fix for ${f.title} is unknown`);
+      unchecked(f, `Whether this branch has that fix could not be checked.`);
+    }
+  }
+}
 async function markOutOfDate({
   findings,
   api,
@@ -1980,6 +2021,7 @@ async function evaluateRun({
   enrich = null,
   otherPlatforms = null,
   outOfDate = null,
+  fixedOnTrunk = null,
   brokeBy = null,
   specHistory = null
 }) {
@@ -2051,6 +2093,15 @@ async function evaluateRun({
       } catch (e) {
         log(`base branch changes unavailable: ${String(e).slice(0, 200)}`);
         unchecked(candidates, "The base branch's changes since this PR last merged it could not be read, so whether this test changed could not be checked");
+      }
+    }
+    if (!blind && prNumber && fixedOnTrunk) {
+      const fixed = result.findings.filter((f) => f.class === "FIXED_ON_TRUNK" && !f.identity_unresolved);
+      try {
+        await fixedOnTrunk(fixed);
+      } catch (e) {
+        log(`base branch commits unavailable: ${String(e).slice(0, 200)}`);
+        for (const f of fixed) Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} Whether this branch has that fix could not be checked.` });
       }
     }
     if (!blind && brokeBy) {
@@ -2356,6 +2407,7 @@ function whyNext(f, branch, pr) {
       if (f.out_of_date?.streak) return [`Failed the same way on this PR's last ${f.out_of_date.streak} commits and never on ${branch}: the branch is behind or broken.`, `Merge ${branch} and re-run.`];
       const c = f.out_of_date?.commit;
       const where = c ? ` (${c.pr ? `#${c.pr}` : sha7(c.sha)}${c.date ? `, ${c.date}` : ""})` : "";
+      if (f.out_of_date?.fixed) return [`${branch} fixed this failure${where} after this PR last merged ${branch}, so this branch still has it.`, `Merge ${branch} and re-run.`];
       return [`${branch} changed this test${where} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
     }
     case "check":
@@ -2804,6 +2856,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, until: now.toISOString(), log }),
+      fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory
     });

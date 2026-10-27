@@ -11,7 +11,7 @@ import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.t
 import { isShardPlaceholder, isSpecNotRun, isSpecStopped } from "./classify.ts";
 import { configFrom, DEFAULTS, historyLane, PR_SPEND_KEY } from "./config.ts";
 import { loadEvidence } from "./evidence.ts";
-import { fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
+import { fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markFixedOnTrunk, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { enrichFindings, siblingPlatforms } from "./enrich.ts";
 import { askModelBatch } from "./judge.ts";
 import { evaluateRun } from "./evaluate.ts";
@@ -320,6 +320,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, until: now.toISOString(), log }),
+      fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory,
     });

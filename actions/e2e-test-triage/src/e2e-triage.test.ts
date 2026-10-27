@@ -9,7 +9,7 @@ import { canChange, decide, judge, unblocks } from "./decision.ts";
 import { EXONERATED_ON_TRUNK, classify, classifyNotRun, errorSignature, infraVerdict, isInfraError, isShardPlaceholder, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, laneOfReport, repoPath } from "./config.ts";
 import { answerKey, askModelBatch, packKey, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
-import { OUT_OF_DATE_DIR_CAP, fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
+import { OUT_OF_DATE_DIR_CAP, fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markFixedOnTrunk, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { commonSenseClear, onlyOnPlatform, platformOf } from "./common-sense.ts";
 import { codeExcerpt, enrichFindings, failingLine, prChangedSince, sameTestOnOtherReports, siblingPlatforms } from "./enrich.ts";
 import { evidenceFor, loadEvidence } from "./evidence.ts";
@@ -22,7 +22,7 @@ import { evaluateRun, verdictOf } from "./evaluate.ts";
 import type { EvaluatedRun, EvaluateParams } from "./evaluate.ts";
 import { NotTriagedError, triage } from "./triage.ts";
 import { FINDINGS_SCHEMA, checkFindingsShape, findingLogLine, redact } from "./findings.ts";
-import type { CommitStatus, Env, FetchImpl } from "../../shared/src/github.ts";
+import type { CommitStatus, Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { laneSummary } from "../../shared/src/lane.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
 import { elsewhereKey, fetchRun, identityKey, missingReports } from "../../shared/src/tsio.ts";
@@ -4268,4 +4268,58 @@ test("common sense works without the model: the run is green and says why", asyn
   assert.equal(result.verdict, "SUCCESS");
   assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts), "(1 flaky) 99.6% passed (239 passed, 1 failed, 0 skipped)");
   assert.match(renderSummary({ findings: result.findings, infra: null, runURL: "u", counts: result.counts, trunkBranch: "master", pr: true }), /Failed only on linux: it passed on macos and windows on this same commit/);
+});
+
+// ---------------------------------------------------------------- a break trunk fixed (mattermost#39376 on the FIPS lanes)
+
+const trunkRun = (sha: string, day: number, status = "passed", error_excerpt: string | null = null): Observation =>
+  obs({ commit_sha: sha, status, created_at: `2026-10-${day}T00:00:00Z`, error_excerpt });
+// Newest first: three passes since p1, after four same-error failures, after older passes.
+const fixedOnTrunkHistory = (err = "Error: expected visible"): Observation[] => [
+  trunkRun("p3", 27), trunkRun("p2", 26), trunkRun("p1", 25),
+  trunkRun("f4", 24, "failed", err), trunkRun("f3", 23, "failed", err), trunkRun("f2", 22, "failed", err), trunkRun("f1", 21, "failed", err),
+  ...trunkPasses(4),
+];
+const fixCompare = (shas: string[], aheadBy = shas.length): GhApi => async (_method, path) => {
+  if (!path.startsWith("/repos/o/r/compare/abc...master")) throw new Error(`unexpected ${path}`);
+  return { ahead_by: aheadBy, commits: shas.map((sha) => ({ sha, commit: { message: sha === "p1" ? "Pin FIPS base images to OpenSSL 3 (#39418)" : "x", committer: { date: "2026-10-26T12:47:46Z" } } })) };
+};
+
+test("a same-error streak on trunk that trunk has passed since is a fix there, not a flake", () => {
+  const f = classify(failing, fixedOnTrunkHistory(), [], undefined, 5);
+  assert.equal(f.class, "FIXED_ON_TRUNK");
+  assert.equal(f.blocking, true);
+  assert.deepEqual([f.trunk_fixed?.last_fail?.commit_sha, f.trunk_fixed?.first_pass?.commit_sha], ["f4", "p1"]);
+  const not = (history: Observation[], why: string): void => assert.notEqual(classify(failing, history, [], undefined, 5).class, "FIXED_ON_TRUNK", why);
+  not([trunkRun("p2", 26), trunkRun("p1", 25), trunkRun("f2", 24, "failed"), trunkRun("f1", 23, "failed"), ...trunkPasses(8)], "two failures in a row are a flake's");
+  not([trunkRun("p3", 27), trunkRun("f3", 26, "failed"), trunkRun("p2", 25), trunkRun("f2", 24, "failed"), trunkRun("p1", 23), trunkRun("f1", 22, "failed"), ...trunkPasses(4)], "failing and passing in turn");
+  const ownError = { ...failing, error: "TypeError: Cannot read properties of undefined (reading 'id')" };
+  assert.equal(classify(ownError, fixedOnTrunkHistory("TypeError: Cannot read properties of undefined (reading 'id')"), [], undefined, 5).class, "FIXED_ON_TRUNK", "the same distinctive error");
+  assert.notEqual(classify(ownError, fixedOnTrunkHistory("TypeError: Cannot read properties of null (reading 'name')"), [], undefined, 5).class, "FIXED_ON_TRUNK", "trunk's streak was another failure");
+  not([trunkRun("f5", 28, "failed"), ...fixedOnTrunkHistory()], "trunk fails it again now");
+});
+
+test("a branch without trunk's fix is out of date; with it, the same failure goes to the judge", async () => {
+  const fixedOne = (): Finding => classify(failing, fixedOnTrunkHistory(), [], undefined, 5);
+  const id = { repository: "o/r", commit_sha: "abc" };
+  const stale = fixedOne();
+  await markFixedOnTrunk({ findings: [stale], api: fixCompare(["m1", "p1", "m2"]), id, baseBranch: "master" });
+  assert.deepEqual(stale.out_of_date, { base: "master", behind: 3, commit: { sha: "p1", date: "2026-10-26", pr: 39418 }, fixed: true });
+  assert.equal(statusLabelOf(stale), "out of date");
+  assert.match(renderSummary({ findings: [stale], infra: null, runURL: "u", counts: { failed: 1, passed: 9 }, trunkBranch: "master" }), /master fixed this failure \(#39418, 2026-10-26\) after this PR last merged master, so this branch still has it\./);
+  const current = fixedOne();
+  await markFixedOnTrunk({ findings: [current], api: fixCompare(["m1", "m2"]), id, baseBranch: "master" });
+  assert.equal(current.class, "REGRESSION", "it has the fix and fails anyway");
+  assert.equal(current.blocking, true);
+  const cutOff = fixedOne();
+  await markFixedOnTrunk({ findings: [cutOff], api: fixCompare(["m1", "m2"], 400), id, baseBranch: "master" });
+  assert.equal(cutOff.decision, "evidence_incomplete", "a cut-off list can't show the branch has the fix");
+});
+
+test("end to end: the trunk-fixed failure on a stale branch reads out of date, never flaky", async () => {
+  const run = runOf([{ title: "t1", file: "specs/a.spec.ts", error: "Error: expected visible" }]);
+  const history = new Map([[identityKey(run.failing[0]), fixedOnTrunkHistory()]]);
+  const result = await evaluate(run, { history, ask: null, fixedOnTrunk: (fs) => markFixedOnTrunk({ findings: fs, api: fixCompare(["p1"]), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master" }) });
+  assert.deepEqual(result.findings.map((f) => [f.class, f.blocking, statusLabelOf(f)]), [["FIXED_ON_TRUNK", true, "out of date"]]);
+  assert.match(statusDescription(result.verdict, result.findings, result.infra, result.counts), /^\(1 out of date\)/);
 });

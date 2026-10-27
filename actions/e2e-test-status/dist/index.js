@@ -52,14 +52,17 @@ function redReason(description = "") {
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
   return parts.length ? parts.join(", ") : "still red";
 }
-function laneSummary(lanes) {
+function laneSummary(lanes, untriaged = []) {
   const seen = lanes.filter((l) => Boolean(l.status));
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}` };
   const red = seen.filter((l) => l.status.state !== "success");
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText].filter(Boolean).join(" \xB7 ") };
+  const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending");
+  const otherText = otherRed.length ? `not triaged: ${otherRed.map((l) => laneName(l.context)).join(", ")} red` : "";
+  if (red.length) return { state: "failure", description: [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText, otherText].filter(Boolean).join(" \xB7 ") };
+  if (otherText) return { state: "success", description: [clearedText, "triaged lanes green", otherText].filter(Boolean).join(" \xB7 ") };
   return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
 }
 
@@ -147,7 +150,10 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
     const rows = await readStatuses(api, id);
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return;
-    await post({ ...summarizeLanes(latest), context: summaryContext }, snapshotOwner());
+    const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
+    const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
+    const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
+    await post({ ...summarizeLanes(latest, untriaged), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,
@@ -257,14 +263,14 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
   );
   if (!group) {
     const noGroup = `TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`;
-    const newest = /^\d+$/.test(runId) && /^\d+$/.test(attempt) ? groups.filter((g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name).map((g) => ({
+    const newest2 = /^\d+$/.test(runId) && /^\d+$/.test(attempt) ? groups.filter((g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name).map((g) => ({
       gh_run_id: String(g.gh_run_id),
       gh_run_attempt: String(g.gh_run_attempt),
       gh_pr_number: g.gh_pr_number === void 0 ? void 0 : g.gh_pr_number === null || String(g.gh_pr_number) === "" ? null : String(g.gh_pr_number),
       branch: g.branch === void 0 ? void 0 : g.branch
     })).filter((r) => /^\d+$/.test(r.gh_run_id) && /^\d+$/.test(r.gh_run_attempt) && newerRun(r, { gh_run_id: runId, gh_run_attempt: attempt })).reduce((best, r) => !best || newerRun(r, best) ? r : best, null) : null;
-    if (newest)
-      throw new SupersededRunError(`${noGroup}; its group now belongs to run ${newest.gh_run_id} attempt ${newest.gh_run_attempt}`, newest);
+    if (newest2)
+      throw new SupersededRunError(`${noGroup}; its group now belongs to run ${newest2.gh_run_id} attempt ${newest2.gh_run_attempt}`, newest2);
     throw new NoResultsError(noGroup);
   }
   let missing = null;
@@ -280,10 +286,15 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
       missing = { expected, received, status: detail.status };
     }
   }
-  const [{ suites = [] }, cases] = await Promise.all([
+  const [{ suites: uploaded = [] }, allCases] = await Promise.all([
     get(`/reports/${group.id}/suites`),
     get(`/reports/${group.id}/cases`)
   ]);
+  const newest = /* @__PURE__ */ new Map();
+  for (const s of uploaded) if (s.report_name && s.report_id && (newest.get(s.report_name) ?? "") < s.report_id) newest.set(s.report_name, s.report_id);
+  const suites = uploaded.filter((s) => !s.report_name || !s.report_id || newest.get(s.report_name) === s.report_id);
+  const kept = new Set(suites.map((s) => s.id));
+  const cases = allCases.filter((c) => kept.has(c.suite_id));
   const fileOf = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
   const reportOf = new Map(suites.map((s) => [s.id, s.report_name ?? null]));
   const suiteTitleOf = new Map(suites.map((s) => [s.id, s.title ?? ""]));

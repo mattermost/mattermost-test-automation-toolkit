@@ -158,6 +158,7 @@ export interface TsioSuite {
   file_path?: string | null;
   file?: string | null;
   report_name?: string | null;
+  report_id?: string | null;
   title?: string | null;
 }
 
@@ -309,10 +310,17 @@ export async function runFromGroups(fetchImpl: FetchImpl, base: string, id: Comp
       missing = { expected, received, status: detail.status };
     }
   }
-  const [{ suites = [] }, cases] = await Promise.all([
+  const [{ suites: uploaded = [] }, allCases] = await Promise.all([
     get<{ suites?: TsioSuite[] }>(`/reports/${group.id}/suites`),
     get<TsioCase[]>(`/reports/${group.id}/cases`),
   ]);
+  // A re-run uploads its jobs' reports again under the same names: the newest report of a name replaces the earlier
+  // attempt's (report ids are UUIDv7, so they sort by upload time). No run uploads two reports of one name otherwise.
+  const newest = new Map<string, string>();
+  for (const s of uploaded) if (s.report_name && s.report_id && (newest.get(s.report_name) ?? "") < s.report_id) newest.set(s.report_name, s.report_id);
+  const suites = uploaded.filter((s) => !s.report_name || !s.report_id || newest.get(s.report_name) === s.report_id);
+  const kept = new Set(suites.map((s) => s.id));
+  const cases = allCases.filter((c) => kept.has(c.suite_id));
   const fileOf = new Map<TsioId, string>(suites.map((s): [TsioId, string] => [s.id, s.file_path ?? s.file ?? ""]));
   const reportOf = new Map<TsioId, string | null>(suites.map((s): [TsioId, string | null] => [s.id, s.report_name ?? null]));
   const suiteTitleOf = new Map<TsioId, string>(suites.map((s): [TsioId, string] => [s.id, s.title ?? ""]));

@@ -70,6 +70,23 @@ failure is a `REGRESSION` for the model to judge. The same holds for
 `BROKEN_ON_TRUNK`. **Other PRs:** the last 200 PR runs. These are starting values, set
 before any data was collected; the 7-week replay found no wrong clear with them.
 
+**Fixed on master:** master failed the test the same way in at least 3 runs in a
+row and has passed since. That is a break master fixed, not a flake: a branch
+without master's first passing commit is held as out of date ("master fixed this
+failure (#PR, date) after this PR last merged master"), and one that has it goes
+to the model as a `REGRESSION`. If the base branch's commit list is cut off, it
+stays unchecked.
+
+**Re-runs:** a re-run uploads its jobs' reports again under the same names; the
+newest report of a name replaces the earlier attempt's, so a shard that failed on
+attempt 1 and passed on its re-run is read as passed.
+
+**Checks triage doesn't cover:** the PR-wide check names any red E2E check under
+its own prefix that is not one of `triage-lanes` (an upgrade or policy lane), e.g.
+"triaged lanes green · not triaged: playwright-full/enterprise/upgrade-… red",
+instead of saying all lanes are green. Its state is unchanged; that check's own
+status still gates the PR.
+
 **Environment errors:** `infra-clears: true` suits mobile and desktop, where the
 PR changes an app that runs against a separate test server. Leave it off where
 the PR can break the server itself (mattermost): there an unhealthy server may be

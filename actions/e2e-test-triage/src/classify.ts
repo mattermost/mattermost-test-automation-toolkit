@@ -68,6 +68,9 @@ export function classifyNotRun(test: TestRef, runs: SpecRun[] | null, cfg: Confi
   return out("FLAKY_NOT_RUN", `${why}, as it did in ${notRun} of the last ${others.length} runs; it passed in ${failed ? `${ran.length - failed} of the` : "all"} ${ran.length} where it ran.`, false);
 }
 
+// Same-error trunk failures in a row, ended by passes, that read as a fix on trunk rather than a flake.
+const FIXED_STREAK = 3;
+
 export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 // On a trunk run only flakiness clears: a failure still there from last time is a
 // standing breakage, and greening it would hide it.
@@ -231,6 +234,18 @@ export function classify(
       return out("REGRESSION", `Trunk fails this test too, but with another error ("${trunkError.slice(0, 160)}"); this one may be the PR's.`, true);
     return out("BROKEN_ON_TRUNK", `Trunk's latest run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}, ${latestTrunk.created_at?.slice(0, 10) ?? "unknown date"}) fails this test too.`, false);
   }
+  // Trunk failed the same way run after run, and has passed since: a break trunk fixed, not a flake. A branch without
+  // that fix still fails; markFixedOnTrunk checks whether this PR has it.
+  let recent = 0;
+  while (recent < trunk.length && trunk[recent].status === "passed") recent++;
+  let broken = 0;
+  // The same failure by its signature, as the flaky rule compares trunk's errors (see otherError); an unknown one counts.
+  const sameSignature = (excerpt: string | null | undefined): boolean => ownSignature == null || errorSignature(excerpt) == null || errorSignature(excerpt) === ownSignature;
+  while (recent + broken < trunk.length && FAILED_STATUSES.has(trunk[recent + broken].status) && sameSignature(trunk[recent + broken].error_excerpt)) broken++;
+  if (recent && broken >= FIXED_STREAK)
+    return Object.assign(out("FIXED_ON_TRUNK", `${trunkBranch || "Trunk"} failed this test the same way in ${broken} runs in a row, then passed from ${trunk[recent - 1].commit_sha?.slice(0, 7) ?? "unknown"} on: trunk fixed it.`, true), {
+      trunk_fixed: { last_fail: at(trunk[recent]), first_pass: at(trunk[recent - 1]) },
+    });
   const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
   if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0 && laplace >= cfg.pMin && latestTrunk?.status !== "failed") {
     const trunkError = otherError(trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky"));
