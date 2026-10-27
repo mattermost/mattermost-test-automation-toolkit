@@ -2519,7 +2519,7 @@ test("a test the base branch changed after the PR last merged it is out of date:
     assert.deepEqual(asked, [], "the model is not asked about it");
     assert.deepEqual(statuses.map((s) => s.state), ["failure"]);
     const summaryText = readFileSync(join(dir, "s.md"), "utf8");
-    assert.match(summaryText, /### Out of date \(1\): master changed these tests after this PR last merged master/);
+    assert.match(summaryText, /### Out of date \(1\): master changed these tests, or fixed these failures, after this PR last merged master/);
     assert.match(summaryText, /\| master changed this test \(#39127, 2026-10-13\) after this PR last merged master, so the PR ran its old copy\. \| Merge master and re-run\. \|/);
     assert.match(summaryText, /Changed on master since this PR last merged it \| Yes: m1 \(#39127\) on 2026-10-13\. This PR is 25 commits behind/);
   });
@@ -2556,7 +2556,7 @@ test("an out-of-date failure is its own group: merge and re-run, never the PR's 
   assert.equal(bucketOf(ownedByPR("b")), "yours");
   const text = summary({ findings: [stale], counts: { passed: 9, failed: 1 }, runURL: "u", trunkBranch: "master" });
   assert.match(text, /^## E2E triage: 🔴 merge master and re-run: 1 out of date$/m);
-  assert.match(text, /^### Out of date \(1\): master changed these tests after this PR last merged master$/m);
+  assert.match(text, /^### Out of date \(1\): master changed these tests, or fixed these failures, after this PR last merged master$/m);
   assert.match(text, /\| master changed this test \(#39127, 2026-10-13\) after this PR last merged master, so the PR ran its old copy\. \| Merge master and re-run\. \|/);
   assert.match(text, /\*\*Merge master and re-run first\. 1 failure: 1 out of date\.\*\*/);
   assert.doesNotMatch(text, /may be caused by this PR|Your PR/);
@@ -4274,8 +4274,11 @@ test("common sense works without the model: the run is green and says why", asyn
 
 const trunkRun = (sha: string, day: number, status = "passed", error_excerpt: string | null = null): Observation =>
   obs({ commit_sha: sha, status, created_at: `2026-10-${day}T00:00:00Z`, error_excerpt });
+// The Cypress stuck step from mattermost#39376: each run's selector names its own post id.
+const stuckOn = (postId: string): string => `AssertionError: Timed out retrying after 30000ms: Expected to find element: \`#CENTER_actions_button_${postId}\`, but never found it.`;
+const stuckTest = { ...failing, error: stuckOn("4j9jsuqqytnz8x37pnir3dmeqc") };
 // Newest first: three passes since p1, after four same-error failures, after older passes.
-const fixedOnTrunkHistory = (err = "Error: expected visible"): Observation[] => [
+const fixedOnTrunkHistory = (err = stuckOn("1xpbzs3wdbf3xb8nzkswcuuqhc")): Observation[] => [
   trunkRun("p3", 27), trunkRun("p2", 26), trunkRun("p1", 25),
   trunkRun("f4", 24, "failed", err), trunkRun("f3", 23, "failed", err), trunkRun("f2", 22, "failed", err), trunkRun("f1", 21, "failed", err),
   ...trunkPasses(4),
@@ -4286,40 +4289,49 @@ const fixCompare = (shas: string[], aheadBy = shas.length): GhApi => async (_met
 };
 
 test("a same-error streak on trunk that trunk has passed since is a fix there, not a flake", () => {
-  const f = classify(failing, fixedOnTrunkHistory(), [], undefined, 5);
-  assert.equal(f.class, "FIXED_ON_TRUNK");
+  const f = classify(stuckTest, fixedOnTrunkHistory(), [], undefined, 5);
+  assert.equal(f.class, "FIXED_ON_TRUNK", "the same stuck step, whatever post id the selector names");
   assert.equal(f.blocking, true);
   assert.deepEqual([f.trunk_fixed?.last_fail?.commit_sha, f.trunk_fixed?.first_pass?.commit_sha], ["f4", "p1"]);
-  const not = (history: Observation[], why: string): void => assert.notEqual(classify(failing, history, [], undefined, 5).class, "FIXED_ON_TRUNK", why);
-  not([trunkRun("p2", 26), trunkRun("p1", 25), trunkRun("f2", 24, "failed"), trunkRun("f1", 23, "failed"), ...trunkPasses(8)], "two failures in a row are a flake's");
-  not([trunkRun("p3", 27), trunkRun("f3", 26, "failed"), trunkRun("p2", 25), trunkRun("f2", 24, "failed"), trunkRun("p1", 23), trunkRun("f1", 22, "failed"), ...trunkPasses(4)], "failing and passing in turn");
+  const not = (history: Observation[], why: string): void => assert.notEqual(classify(stuckTest, history, [], undefined, 5).class, "FIXED_ON_TRUNK", why);
+  assert.notEqual(classify(failing, fixedOnTrunkHistory("Error: expected visible"), [], undefined, 5).class, "FIXED_ON_TRUNK", "a generic error is no evidence of the same break");
+  not(fixedOnTrunkHistory(stuckOn("1xpbzs3wdbf3xb8nzkswcuuqhc").replace("CENTER_actions_button", "RHS_COMMENT_actions_button")), "another stuck step");
+  const stuck = stuckOn("1xpbzs3wdbf3xb8nzkswcuuqhc");
+  not([trunkRun("p2", 26), trunkRun("p1", 25), trunkRun("f2", 24, "failed", stuck), trunkRun("f1", 23, "failed", stuck), ...trunkPasses(8)], "two failures in a row are a flake's");
+  not([trunkRun("p3", 27), trunkRun("f3", 26, "failed", stuck), trunkRun("p2", 25), trunkRun("f2", 24, "failed", stuck), trunkRun("p1", 23), trunkRun("f1", 22, "failed", stuck), ...trunkPasses(4)], "failing and passing in turn");
   const ownError = { ...failing, error: "TypeError: Cannot read properties of undefined (reading 'id')" };
   assert.equal(classify(ownError, fixedOnTrunkHistory("TypeError: Cannot read properties of undefined (reading 'id')"), [], undefined, 5).class, "FIXED_ON_TRUNK", "the same distinctive error");
   assert.notEqual(classify(ownError, fixedOnTrunkHistory("TypeError: Cannot read properties of null (reading 'name')"), [], undefined, 5).class, "FIXED_ON_TRUNK", "trunk's streak was another failure");
-  not([trunkRun("f5", 28, "failed"), ...fixedOnTrunkHistory()], "trunk fails it again now");
+  not([trunkRun("f5", 28, "failed", stuck), ...fixedOnTrunkHistory()], "trunk fails it again now");
 });
 
 test("a branch without trunk's fix is out of date; with it, the same failure goes to the judge", async () => {
-  const fixedOne = (): Finding => classify(failing, fixedOnTrunkHistory(), [], undefined, 5);
+  const fixedOne = (): Finding => classify(stuckTest, fixedOnTrunkHistory(), [], undefined, 5);
   const id = { repository: "o/r", commit_sha: "abc" };
+  // The branch lacks trunk's last failing commit, so it lacks the fix that came after it.
   const stale = fixedOne();
-  await markFixedOnTrunk({ findings: [stale], api: fixCompare(["m1", "p1", "m2"]), id, baseBranch: "master" });
-  assert.deepEqual(stale.out_of_date, { base: "master", behind: 3, commit: { sha: "p1", date: "2026-10-26", pr: 39418 }, fixed: true });
+  await markFixedOnTrunk({ findings: [stale], api: fixCompare(["m1", "f4", "p1", "m2"]), id, baseBranch: "master" });
+  assert.deepEqual(stale.out_of_date, { base: "master", behind: 4, commit: { sha: "p1", date: "2026-10-26", pr: 39418 }, fixed: true });
   assert.equal(statusLabelOf(stale), "out of date");
   assert.match(renderSummary({ findings: [stale], infra: null, runURL: "u", counts: { failed: 1, passed: 9 }, trunkBranch: "master" }), /master fixed this failure \(#39418, 2026-10-26\) after this PR last merged master, so this branch still has it\./);
   const current = fixedOne();
   await markFixedOnTrunk({ findings: [current], api: fixCompare(["m1", "m2"]), id, baseBranch: "master" });
   assert.equal(current.class, "REGRESSION", "it has the fix and fails anyway");
   assert.equal(current.blocking, true);
+  // It has the last failure but not the first pass: the fix may be in either, so nothing is settled.
+  const between = fixedOne();
+  await markFixedOnTrunk({ findings: [between], api: fixCompare(["p1"]), id, baseBranch: "master" });
+  assert.equal(between.decision, "evidence_incomplete");
+  assert.equal(between.out_of_date, undefined);
   const cutOff = fixedOne();
   await markFixedOnTrunk({ findings: [cutOff], api: fixCompare(["m1", "m2"], 400), id, baseBranch: "master" });
   assert.equal(cutOff.decision, "evidence_incomplete", "a cut-off list can't show the branch has the fix");
 });
 
 test("end to end: the trunk-fixed failure on a stale branch reads out of date, never flaky", async () => {
-  const run = runOf([{ title: "t1", file: "specs/a.spec.ts", error: "Error: expected visible" }]);
+  const run = runOf([{ title: "t1", file: "specs/a.spec.ts", error: stuckTest.error }]);
   const history = new Map([[identityKey(run.failing[0]), fixedOnTrunkHistory()]]);
-  const result = await evaluate(run, { history, ask: null, fixedOnTrunk: (fs) => markFixedOnTrunk({ findings: fs, api: fixCompare(["p1"]), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master" }) });
+  const result = await evaluate(run, { history, ask: null, fixedOnTrunk: (fs) => markFixedOnTrunk({ findings: fs, api: fixCompare(["f4", "p1"]), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master" }) });
   assert.deepEqual(result.findings.map((f) => [f.class, f.blocking, statusLabelOf(f)]), [["FIXED_ON_TRUNK", true, "out of date"]]);
   assert.match(statusDescription(result.verdict, result.findings, result.infra, result.counts), /^\(1 out of date\)/);
 });

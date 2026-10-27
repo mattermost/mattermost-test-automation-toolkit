@@ -289,7 +289,7 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
   ]);
   const newest = /* @__PURE__ */ new Map();
   for (const s of uploaded) if (s.report_name && s.report_id && (newest.get(s.report_name) ?? "") < s.report_id) newest.set(s.report_name, s.report_id);
-  const suites = uploaded.filter((s) => !s.report_name || !s.report_id || newest.get(s.report_name) === s.report_id);
+  const suites = uploaded.filter((s) => !s.report_name || (s.report_id ? newest.get(s.report_name) === s.report_id : !newest.has(s.report_name)));
   const kept = new Set(suites.map((s) => s.id));
   const cases = allCases.filter((c) => kept.has(c.suite_id));
   const fileOf2 = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
@@ -608,12 +608,13 @@ async function markFixedOnTrunk({ findings, api, id, baseBranch, log = () => {
   const lacking = new Map((cmp?.commits ?? []).map((c) => [c.sha, c]));
   const complete = cmp != null && (cmp.ahead_by ?? 0) <= lacking.size;
   for (const f of findings) {
-    const sha = f.trunk_fixed?.first_pass?.commit_sha;
-    const fix = sha ? lacking.get(sha) : void 0;
-    if (fix) {
-      f.out_of_date = { base: baseBranch, behind: cmp.ahead_by ?? null, commit: commitRef(fix), fixed: true };
-    } else if (sha && complete) {
-      Object.assign(f, { class: "REGRESSION", reason: `${f.reason} This branch has that fix (${sha.slice(0, 7)}) and still fails the same way.` });
+    const lastFail = f.trunk_fixed?.last_fail?.commit_sha;
+    const firstPass = f.trunk_fixed?.first_pass?.commit_sha;
+    if (lastFail && lacking.has(lastFail)) {
+      const pass = firstPass ? lacking.get(firstPass) : void 0;
+      f.out_of_date = { base: baseBranch, behind: cmp.ahead_by ?? null, commit: pass ? commitRef(pass) : null, fixed: true };
+    } else if (firstPass && complete && !lacking.has(firstPass)) {
+      Object.assign(f, { class: "REGRESSION", reason: `${f.reason} This branch has that fix (by ${firstPass.slice(0, 7)}) and still fails the same way.` });
     } else {
       log(`whether this PR has ${baseBranch}'s fix for ${f.title} is unknown`);
       unchecked(f, `Whether this branch has that fix could not be checked.`);
@@ -925,7 +926,7 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
   };
   section(pr ? "Your PR" : "This commit", yours);
   const streakOnly = outdated.length > 0 && outdated.every((f) => f.out_of_date?.streak);
-  section("Out of date", outdated, streakOnly ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}` : `Out of date (${outdated.length}): ${md(branch)} changed these tests after this PR last merged ${md(branch)}`);
+  section("Out of date", outdated, streakOnly ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}` : `Out of date (${outdated.length}): ${md(branch)} changed these tests, or fixed these failures, after this PR last merged ${md(branch)}`);
   section("Needs a look", check);
   section(`Broken on ${md(branch)}`, broken);
   section("Flaky", flaky);
@@ -1057,13 +1058,13 @@ function redReason(description = "") {
 }
 function laneSummary(lanes, untriaged = []) {
   const seen = lanes.filter((l) => Boolean(l.status));
+  const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
+  const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
   const waiting = seen.filter((l) => l.status.state === "pending");
-  if (waiting.length) return { state: "pending", description: `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}` };
+  if (waiting.length) return { state: "pending", description: [`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`, otherText].filter(Boolean).join(" \xB7 ") };
   const red = seen.filter((l) => l.status.state !== "success");
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending");
-  const otherText = otherRed.length ? `not triaged: ${otherRed.map((l) => laneName(l.context)).join(", ")} red` : "";
   if (red.length) return { state: "failure", description: [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText, otherText].filter(Boolean).join(" \xB7 ") };
   if (otherText) return { state: "success", description: [clearedText, "triaged lanes green", otherText].filter(Boolean).join(" \xB7 ") };
   return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
@@ -1331,8 +1332,13 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
   let recent = 0;
   while (recent < trunk.length && trunk[recent].status === "passed") recent++;
   let broken = 0;
-  const sameSignature = (excerpt) => ownSignature == null || errorSignature(excerpt) == null || errorSignature(excerpt) === ownSignature;
-  while (recent + broken < trunk.length && FAILED_STATUSES.has(trunk[recent + broken].status) && sameSignature(trunk[recent + broken].error_excerpt)) broken++;
+  const breakKey = (error) => {
+    const k = failureKey(error);
+    return k.kind === "distinctive" || k.kind === "stuck" ? `${k.kind}:${String(k.key).replace(/(?<![a-z0-9])[a-z0-9]{26}(?![a-z0-9])/g, "<id>")}` : null;
+  };
+  const ownBreak = breakKey(test.error);
+  const sameBreak = (excerpt) => Boolean(excerpt) && (ownSignature ? errorSignature(excerpt) === ownSignature : ownBreak != null && breakKey(excerpt) === ownBreak);
+  while (recent + broken < trunk.length && FAILED_STATUSES.has(trunk[recent + broken].status) && sameBreak(trunk[recent + broken].error_excerpt)) broken++;
   if (recent && broken >= FIXED_STREAK)
     return Object.assign(out("FIXED_ON_TRUNK", `${trunkBranch || "Trunk"} failed this test the same way in ${broken} runs in a row, then passed from ${trunk[recent - 1].commit_sha?.slice(0, 7) ?? "unknown"} on: trunk fixed it.`, true), {
       trunk_fixed: { last_fail: at(trunk[recent]), first_pass: at(trunk[recent - 1]) }

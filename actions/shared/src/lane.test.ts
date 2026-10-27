@@ -80,4 +80,8 @@ test("a red check triage does not cover keeps the aggregate from saying all lane
   assert.deepEqual(laneSummary([green], [{ ...upgrade, status: st("pending", "running") }]), { state: "success", description: "All lanes green" }, "a running check is not red yet");
   assert.equal(laneSummary([{ context: "e2e-test/cypress-full/enterprise", status: st("failure", "(1 caused by PR) 99.9% passed") }], [upgrade]).description,
     "cypress-full/enterprise: 1 caused by PR · not triaged: playwright-full/enterprise/upgrade-from-release-11.10 red");
+  const many = ["a", "b", "c"].map((n) => ({ context: `e2e-test/upgrade-${n}`, status: st("failure", "x") }));
+  assert.equal(laneSummary([green], many).description, "triaged lanes green · not triaged: upgrade-a, upgrade-b +1 red", "two names at most");
+  assert.equal(laneSummary([{ ...green, status: st("pending", "running") }], [upgrade]).description,
+    "Triage is checking: waiting for playwright-full/enterprise · not triaged: playwright-full/enterprise/upgrade-from-release-11.10 red", "named while a lane runs too");
 });

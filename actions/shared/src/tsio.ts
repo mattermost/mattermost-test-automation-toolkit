@@ -318,7 +318,7 @@ export async function runFromGroups(fetchImpl: FetchImpl, base: string, id: Comp
   // attempt's (report ids are UUIDv7, so they sort by upload time). No run uploads two reports of one name otherwise.
   const newest = new Map<string, string>();
   for (const s of uploaded) if (s.report_name && s.report_id && (newest.get(s.report_name) ?? "") < s.report_id) newest.set(s.report_name, s.report_id);
-  const suites = uploaded.filter((s) => !s.report_name || !s.report_id || newest.get(s.report_name) === s.report_id);
+  const suites = uploaded.filter((s) => !s.report_name || (s.report_id ? newest.get(s.report_name) === s.report_id : !newest.has(s.report_name)));
   const kept = new Set(suites.map((s) => s.id));
   const cases = allCases.filter((c) => kept.has(c.suite_id));
   const fileOf = new Map<TsioId, string>(suites.map((s): [TsioId, string] => [s.id, s.file_path ?? s.file ?? ""]));

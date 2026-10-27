@@ -348,7 +348,7 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
   const streakOnly = outdated.length > 0 && outdated.every((f) => f.out_of_date?.streak);
   section("Out of date", outdated, streakOnly
     ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}`
-    : `Out of date (${outdated.length}): ${md(branch)} changed these tests after this PR last merged ${md(branch)}`);
+    : `Out of date (${outdated.length}): ${md(branch)} changed these tests, or fixed these failures, after this PR last merged ${md(branch)}`);
   section("Needs a look", check);
   section(`Broken on ${md(branch)}`, broken);
   section("Flaky", flaky);

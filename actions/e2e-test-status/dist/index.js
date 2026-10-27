@@ -54,13 +54,13 @@ function redReason(description = "") {
 }
 function laneSummary(lanes, untriaged = []) {
   const seen = lanes.filter((l) => Boolean(l.status));
+  const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
+  const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
   const waiting = seen.filter((l) => l.status.state === "pending");
-  if (waiting.length) return { state: "pending", description: `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}` };
+  if (waiting.length) return { state: "pending", description: [`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`, otherText].filter(Boolean).join(" \xB7 ") };
   const red = seen.filter((l) => l.status.state !== "success");
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending");
-  const otherText = otherRed.length ? `not triaged: ${otherRed.map((l) => laneName(l.context)).join(", ")} red` : "";
   if (red.length) return { state: "failure", description: [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText, otherText].filter(Boolean).join(" \xB7 ") };
   if (otherText) return { state: "success", description: [clearedText, "triaged lanes green", otherText].filter(Boolean).join(" \xB7 ") };
   return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
@@ -292,7 +292,7 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
   ]);
   const newest = /* @__PURE__ */ new Map();
   for (const s of uploaded) if (s.report_name && s.report_id && (newest.get(s.report_name) ?? "") < s.report_id) newest.set(s.report_name, s.report_id);
-  const suites = uploaded.filter((s) => !s.report_name || !s.report_id || newest.get(s.report_name) === s.report_id);
+  const suites = uploaded.filter((s) => !s.report_name || (s.report_id ? newest.get(s.report_name) === s.report_id : !newest.has(s.report_name)));
   const kept = new Set(suites.map((s) => s.id));
   const cases = allCases.filter((c) => kept.has(c.suite_id));
   const fileOf = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));

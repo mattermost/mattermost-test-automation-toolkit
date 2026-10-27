@@ -239,9 +239,17 @@ export function classify(
   let recent = 0;
   while (recent < trunk.length && trunk[recent].status === "passed") recent++;
   let broken = 0;
-  // The same failure by its signature, as the flaky rule compares trunk's errors (see otherError); an unknown one counts.
-  const sameSignature = (excerpt: string | null | undefined): boolean => ownSignature == null || errorSignature(excerpt) == null || errorSignature(excerpt) === ownSignature;
-  while (recent + broken < trunk.length && FAILED_STATUSES.has(trunk[recent + broken].status) && sameSignature(trunk[recent + broken].error_excerpt)) broken++;
+  // The same failure: the same distinctive signature, or the same distinctive error or stuck step with Mattermost's
+  // 26-character ids masked (a selector names each run's own post). A bare timeout or an unknown error is no evidence of
+  // the same break, so it ends the streak.
+  const breakKey = (error: string | null | undefined): string | null => {
+    const k = failureKey(error);
+    return k.kind === "distinctive" || k.kind === "stuck" ? `${k.kind}:${String(k.key).replace(/(?<![a-z0-9])[a-z0-9]{26}(?![a-z0-9])/g, "<id>")}` : null;
+  };
+  const ownBreak = breakKey(test.error);
+  const sameBreak = (excerpt: string | null | undefined): boolean =>
+    Boolean(excerpt) && (ownSignature ? errorSignature(excerpt) === ownSignature : ownBreak != null && breakKey(excerpt) === ownBreak);
+  while (recent + broken < trunk.length && FAILED_STATUSES.has(trunk[recent + broken].status) && sameBreak(trunk[recent + broken].error_excerpt)) broken++;
   if (recent && broken >= FIXED_STREAK)
     return Object.assign(out("FIXED_ON_TRUNK", `${trunkBranch || "Trunk"} failed this test the same way in ${broken} runs in a row, then passed from ${trunk[recent - 1].commit_sha?.slice(0, 7) ?? "unknown"} on: trunk fixed it.`, true), {
       trunk_fixed: { last_fail: at(trunk[recent]), first_pass: at(trunk[recent - 1]) },

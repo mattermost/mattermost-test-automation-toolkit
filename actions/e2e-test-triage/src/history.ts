@@ -316,9 +316,11 @@ const commitRef = (c: CommitRow): NonNullable<OutOfDate["commit"]> => ({
 });
 
 /**
- * FIXED_ON_TRUNK failures: trunk fixed them after a run of failures. One compare lists the base commits this PR lacks.
- * Lacking trunk's first passing commit, it lacks the fix: out of date, merge the base. Having it, the failure is not that
- * break: a REGRESSION for the judge. When the list is cut off and doesn't name that commit, it stays unchecked.
+ * FIXED_ON_TRUNK failures: trunk fixed them after a run of failures. The fix landed after trunk's last failing commit
+ * and by its first passing one, so one compare (the base commits this PR lacks) settles two cases: lacking the last
+ * failing commit, the PR lacks the fix (out of date, merge the base); having the first passing one, it has the fix and
+ * still fails (a REGRESSION for the judge). Anything else (it has the last failure but not the first pass, or a cut-off
+ * list) stays unchecked.
  */
 export async function markFixedOnTrunk({ findings, api, id, baseBranch, log = () => {} }: {
   findings: Finding[];
@@ -333,12 +335,14 @@ export async function markFixedOnTrunk({ findings, api, id, baseBranch, log = ()
   const lacking = new Map((cmp?.commits ?? []).map((c): [string, CommitRow] => [c.sha, c]));
   const complete = cmp != null && (cmp.ahead_by ?? 0) <= lacking.size;
   for (const f of findings) {
-    const sha = f.trunk_fixed?.first_pass?.commit_sha;
-    const fix = sha ? lacking.get(sha) : undefined;
-    if (fix) {
-      f.out_of_date = { base: baseBranch!, behind: cmp!.ahead_by ?? null, commit: commitRef(fix), fixed: true };
-    } else if (sha && complete) {
-      Object.assign(f, { class: "REGRESSION", reason: `${f.reason} This branch has that fix (${sha.slice(0, 7)}) and still fails the same way.` });
+    const lastFail = f.trunk_fixed?.last_fail?.commit_sha;
+    const firstPass = f.trunk_fixed?.first_pass?.commit_sha;
+    if (lastFail && lacking.has(lastFail)) {
+      // Named by trunk's first passing commit: the fix is at or before it.
+      const pass = firstPass ? lacking.get(firstPass) : undefined;
+      f.out_of_date = { base: baseBranch!, behind: cmp!.ahead_by ?? null, commit: pass ? commitRef(pass) : null, fixed: true };
+    } else if (firstPass && complete && !lacking.has(firstPass)) {
+      Object.assign(f, { class: "REGRESSION", reason: `${f.reason} This branch has that fix (by ${firstPass.slice(0, 7)}) and still fails the same way.` });
     } else {
       log(`whether this PR has ${baseBranch}'s fix for ${f.title} is unknown`);
       unchecked(f, `Whether this branch has that fix could not be checked.`);
