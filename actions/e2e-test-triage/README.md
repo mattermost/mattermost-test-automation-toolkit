@@ -303,10 +303,10 @@ with a warning, and the rest of the evidence still loads.
 
 ## Findings file
 
-A mobile spec whose shard's Jest process stopped before reaching it (other specs of the
-shard reported) is judged by its own runs: flaky when it also did not run in another
-recent run and passed in every run where it ran (at least `minTrunkRuns` of them),
-otherwise blocking. It is never re-run for.
+A mobile spec that did not run, whatever stopped its shard, is judged by its own runs:
+flaky when it also did not run in another recent run and passed where it ran (at least
+`minTrunkRuns` runs, failing in at most 1 of 20). One it does not clear blocks when its
+shard's Jest process stopped before it, and is re-run when its shard sent nothing.
 
 `rerun-attempts` (default `0`, off) lets a lane that is red only because jobs sent no
 results (a shard that reported nothing, reports that never arrived) be re-run instead of

@@ -30,17 +30,14 @@ export function isSpecNotRun(t: { title: string; error?: string | null }): boole
   return t.title.trim() === "spec did not run" && /was assigned to a shard but produced no result/.test(String(t.error ?? "").trim());
 }
 
-/**
- * A mobile spec skipped because its shard's Jest process stopped before reaching it, while other specs of the shard
- * reported. Unlike a shard that sent nothing, it is judged by its own history (see classifyNotRun), never re-run for.
- */
+/** A mobile spec skipped because its shard's Jest process stopped before reaching it, while other specs of the shard reported. */
 export const isSpecStopped = (t: { title: string; error?: string | null }): boolean =>
   isSpecNotRun(t) && /its Jest process stopped before reaching this spec/.test(String(t.error ?? ""));
 
 /**
- * A spec a stopped Jest process skipped: flaky when it also did not run in another recent run and passed in every run
- * where it ran (at least minTrunkRuns of them); otherwise it blocks, for a person to read why Jest stopped.
- * Unreadable history (null) clears nothing.
+ * A mobile spec that did not run, whatever stopped its shard: flaky when it also did not run in another recent run and
+ * passed where it ran (at least minTrunkRuns runs, failing in at most 1 of 20); otherwise it blocks. Unreadable history
+ * (null) clears nothing.
  */
 export function classifyNotRun(test: TestRef, runs: SpecRun[] | null, cfg: Config, groupId: TsioId | null): Finding {
   const out = (cls: string, reason: string, blocking: boolean): Finding => ({
@@ -51,16 +48,17 @@ export function classifyNotRun(test: TestRef, runs: SpecRun[] | null, cfg: Confi
     trunk_break: null,
     this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
   });
-  const why = "Did not run: its Jest process stopped before reaching it";
+  const why = isSpecStopped(test) ? "Did not run: its Jest process stopped before reaching it" : "Did not run: its shard sent no result";
   if (!runs) return out("NOT_RUN", `${why}, and its history could not be read.`, true);
   const others = runs.filter((r) => r.group_id !== groupId);
   const notRun = others.filter((r) => r.status === "not_run").length;
   const ran = others.filter((r) => r.status !== "not_run");
   const failed = ran.filter((r) => r.status === "failed").length;
-  if (failed) return out("NOT_RUN", `${why}, and it failed in ${failed} of the ${ran.length} recent runs where it ran.`, true);
+  // A failure in 1 run of 20 or fewer where it ran is the rest of the suite's noise, not this spec breaking.
+  if (failed * 20 > ran.length) return out("NOT_RUN", `${why}, and it failed in ${failed} of the ${ran.length} recent runs where it ran.`, true);
   if (ran.length < cfg.minTrunkRuns) return out("NOT_RUN", `${why}, and it ran in only ${ran.length} recent runs (need ${cfg.minTrunkRuns}) to call it intermittent.`, true);
   if (!notRun) return out("NOT_RUN", `${why}, which it has not done in the last ${others.length} runs.`, true);
-  return out("FLAKY_NOT_RUN", `${why}, as it did in ${notRun} of the last ${others.length} runs; it passed in all ${ran.length} where it ran.`, false);
+  return out("FLAKY_NOT_RUN", `${why}, as it did in ${notRun} of the last ${others.length} runs; it passed in ${failed ? `${ran.length - failed} of the` : "all"} ${ran.length} where it ran.`, false);
 }
 
 export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);

@@ -8,7 +8,7 @@ import { laneName, laneSummary } from "../../shared/src/lane.ts";
 import { readStatuses, statusPublisher } from "../../shared/src/status.ts";
 import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, SupersededRunError, tsioBase } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.ts";
-import { isShardPlaceholder, isSpecStopped } from "./classify.ts";
+import { isShardPlaceholder, isSpecNotRun } from "./classify.ts";
 import { configFrom, DEFAULTS, historyLane, PR_SPEND_KEY } from "./config.ts";
 import { loadEvidence } from "./evidence.ts";
 import { fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
@@ -257,12 +257,12 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         }
       }
     }
-    // The specs a stopped Jest process skipped are judged by their files' past runs; unreadable history clears none.
+    // Specs that did not run are judged by their files' past runs; unreadable history clears none. It asks for every
+    // failing file, as fetchHistory does: TSIO counts its run window over the files asked for.
     let specHistory: SpecHistory | null = null;
-    const stopped = run.failing.filter(isSpecStopped);
-    if (stopped.length) {
+    if (run.failing.some(isSpecNotRun)) {
       try {
-        specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, stopped.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), reportName);
+        specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, run.failing.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), reportName);
       } catch (e) {
         log(`history of the specs that did not run unavailable: ${String(e).slice(0, 200)}`);
       }

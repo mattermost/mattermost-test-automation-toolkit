@@ -90,9 +90,12 @@ export async function evaluateRun({
   // nothing to show the model. The run is red for it: it is counted, and not classified, asked or flagged.
   const tests = run.failing.filter((t) => !isShardPlaceholder(t));
   const result: EvaluatedRun = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg), counts: run.counts, ai: newLedger(), missing: null };
-  // A spec a stopped Jest process skipped is judged by its own history below; the other placeholders are re-run.
-  const stopped = run.failing.filter(isSpecStopped);
-  if (run.failing.length > tests.length + stopped.length) result.unnamed = run.failing.length - tests.length - stopped.length;
+  // A mobile spec that did not run is judged by its own history (see classifyNotRun). One it does not clear is held when
+  // its shard's Jest process stopped before it, and re-run, as a placeholder, when its shard sent nothing.
+  const notRunSpecs = run.failing.filter(isSpecNotRun).map((t) => ({ t, f: classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id) }));
+  const judgedNotRun = notRunSpecs.filter(({ t, f }) => !f.blocking || isSpecStopped(t)).map(({ f }) => f);
+  const placeholders = run.failing.length - tests.length - judgedNotRun.length;
+  if (placeholders) result.unnamed = placeholders;
   const notRun = run.failing.filter(isSpecNotRun).length;
   if (notRun) result.notRun = notRun;
   // A run-level infra call still names each failure, and the model is asked as on any run: the run is red while
@@ -201,7 +204,7 @@ export async function evaluateRun({
     }
     if (!blind && prNumber) sameFailure(result.findings);
   }
-  for (const t of stopped) result.findings.push(classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id));
+  result.findings.push(...judgedNotRun);
   result.verdict = verdictOf(result.findings, result.infra);
   // Specs that never ran can't be vouched for, whatever happened to the rest.
   result.missing = missingReports(run.missing);

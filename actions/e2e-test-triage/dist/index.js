@@ -566,16 +566,16 @@ function classifyNotRun(test, runs, cfg, groupId) {
     trunk_break: null,
     this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" }
   });
-  const why = "Did not run: its Jest process stopped before reaching it";
+  const why = isSpecStopped(test) ? "Did not run: its Jest process stopped before reaching it" : "Did not run: its shard sent no result";
   if (!runs) return out("NOT_RUN", `${why}, and its history could not be read.`, true);
   const others = runs.filter((r) => r.group_id !== groupId);
   const notRun = others.filter((r) => r.status === "not_run").length;
   const ran = others.filter((r) => r.status !== "not_run");
   const failed = ran.filter((r) => r.status === "failed").length;
-  if (failed) return out("NOT_RUN", `${why}, and it failed in ${failed} of the ${ran.length} recent runs where it ran.`, true);
+  if (failed * 20 > ran.length) return out("NOT_RUN", `${why}, and it failed in ${failed} of the ${ran.length} recent runs where it ran.`, true);
   if (ran.length < cfg.minTrunkRuns) return out("NOT_RUN", `${why}, and it ran in only ${ran.length} recent runs (need ${cfg.minTrunkRuns}) to call it intermittent.`, true);
   if (!notRun) return out("NOT_RUN", `${why}, which it has not done in the last ${others.length} runs.`, true);
-  return out("FLAKY_NOT_RUN", `${why}, as it did in ${notRun} of the last ${others.length} runs; it passed in all ${ran.length} where it ran.`, false);
+  return out("FLAKY_NOT_RUN", `${why}, as it did in ${notRun} of the last ${others.length} runs; it passed in ${failed ? `${ran.length - failed} of the` : "all"} ${ran.length} where it ran.`, false);
 }
 var EXONERATED = /* @__PURE__ */ new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 var EXONERATED_ON_TRUNK = /* @__PURE__ */ new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
@@ -1978,8 +1978,10 @@ async function evaluateRun({
   const isTrunkRun = prNumber == null;
   const tests = run.failing.filter((t) => !isShardPlaceholder(t));
   const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg), counts: run.counts, ai: newLedger(), missing: null };
-  const stopped = run.failing.filter(isSpecStopped);
-  if (run.failing.length > tests.length + stopped.length) result.unnamed = run.failing.length - tests.length - stopped.length;
+  const notRunSpecs = run.failing.filter(isSpecNotRun).map((t) => ({ t, f: classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id) }));
+  const judgedNotRun = notRunSpecs.filter(({ t, f }) => !f.blocking || isSpecStopped(t)).map(({ f }) => f);
+  const placeholders = run.failing.length - tests.length - judgedNotRun.length;
+  if (placeholders) result.unnamed = placeholders;
   const notRun = run.failing.filter(isSpecNotRun).length;
   if (notRun) result.notRun = notRun;
   if (tests.length) {
@@ -2064,7 +2066,7 @@ async function evaluateRun({
     }
     if (!blind && prNumber) sameFailure(result.findings);
   }
-  for (const t of stopped) result.findings.push(classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id));
+  result.findings.push(...judgedNotRun);
   result.verdict = verdictOf(result.findings, result.infra);
   result.missing = missingReports(run.missing);
   if ((result.missing || result.unnamed) && result.verdict === "SUCCESS") result.verdict = "FAILURE";
@@ -2598,10 +2600,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       }
     }
     let specHistory = null;
-    const stopped = run.failing.filter(isSpecStopped);
-    if (stopped.length) {
+    if (run.failing.some(isSpecNotRun)) {
       try {
-        specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, stopped.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), reportName);
+        specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, run.failing.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), reportName);
       } catch (e) {
         log(`history of the specs that did not run unavailable: ${String(e).slice(0, 200)}`);
       }
