@@ -77,6 +77,18 @@ export interface ThisPRStats {
 }
 
 /** One test's verdict input: the test, its class and reason, and the history statistics behind them. */
+/** One past run of a spec file: it did not run (its placeholder), a test in it failed every try, or it passed. */
+export interface SpecRun {
+  group_id: string;
+  status: "not_run" | "failed" | "passed";
+}
+
+/** Past runs of the specs a stopped Jest process skipped, by file (see fetchSpecRuns). */
+export interface SpecHistory {
+  byFile: Map<string, SpecRun[]>;
+  truncated: boolean;
+}
+
 export interface Finding extends TestRef {
   class: string;
   reason: string;
@@ -320,6 +332,8 @@ export interface Config {
   advise: boolean;
   infraMinFailures: number;
   infraClears: boolean;
+  /** Re-runs of the failed jobs triage may ask for when only placeholders or missing reports keep a lane red (0: none). */
+  rerunAttempts: number;
   historyLane: string | null;
   escalationModel: string;
   escalateMin: number;

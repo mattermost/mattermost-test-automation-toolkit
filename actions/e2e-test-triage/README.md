@@ -303,6 +303,23 @@ with a warning, and the rest of the evidence still loads.
 
 ## Findings file
 
+A mobile spec whose shard's Jest process stopped before reaching it (other specs of the
+shard reported) is judged by its own runs: flaky when it also did not run in another
+recent run and passed in every run where it ran (at least `minTrunkRuns` of them),
+otherwise blocking. It is never re-run for.
+
+`rerun-attempts` (default `0`, off) lets a lane that is red only because jobs sent no
+results (a shard that reported nothing, reports that never arrived) be re-run instead of
+asking a person to. While the run's attempt is within the allowance, the check reads "re-running
+the failed jobs" and triage uploads a marker artifact; the `e2e-test-rerun` action, called
+from a `workflow_run` listener once the run has finished, re-runs the failed jobs, and the
+new attempt is triaged on its own results. The last attempt says "re-run the failed jobs"
+as before. The `rerun` output says whether this run asked.
+
+The step log has one line per finding: blocking or cleared, its class and decision, the
+model's cause and confidence and what it cited (`-` when it was not asked), the test and
+the reason.
+
 `findings-file` (default `""`, off) names a JSON file the action writes after
 every run: judged, superseded, with no results, or broken off. It is for measuring
 how often triage's answers are right, so a consumer can join it to the verdicts

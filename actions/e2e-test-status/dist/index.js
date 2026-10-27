@@ -37,9 +37,13 @@ function redReason(description = "") {
   if (caused) parts.push(`${caused} caused by PR`);
   if (outdated) parts.push(`${outdated} out of date`);
   if (check) parts.push(`${check} to check`);
+  const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";
   const missing = /(\d+) report\(s\) missing/.exec(d)?.[1];
-  if (missing) parts.push(`${missing} report(s) missing, re-run`);
-  else if (/results incomplete/.test(d)) parts.push("results incomplete, re-run");
+  const notRun = Number(/(\d+) not run\b/.exec(d)?.[1] ?? 0);
+  if (missing) parts.push(`${missing} report(s) missing, ${again}`);
+  else if (/results incomplete/.test(d)) parts.push(`results incomplete, ${again}`);
+  else if (notRun) parts.push(`${notRun} spec${notRun === 1 ? "" : "s"} did not run, ${again}`);
+  else if (/re-running the failed jobs/.test(d)) parts.push("re-running the failed jobs");
   else if (/re-run the failed jobs/.test(d)) parts.push("re-run the failed jobs");
   if (/environment errors, re-run/.test(d)) parts.push("environment errors, re-run");
   else if (/investigation required|many failures in one run/.test(d)) parts.push("many failures in one run");
@@ -211,6 +215,12 @@ function compositeIdentityFrom(raw) {
     throw new Error(`COMPOSITE_IDENTITY is not valid JSON: ${String(e).slice(0, 120)}`);
   }
 }
+var finished = (g) => {
+  if (g.status === "completed") return true;
+  const o = g.orchestration;
+  const ran = o?.tests?.total;
+  return o?.status === "completed" && !o.counts?.pending && !o.counts?.leased && !o.counts?.abandoned && typeof ran === "number" && ran === g.test_stats?.total;
+};
 var newerRun = (a, b) => {
   const run = BigInt(a.gh_run_id) - BigInt(b.gh_run_id);
   return run !== BigInt(0) ? run > BigInt(0) : BigInt(a.gh_run_attempt) > BigInt(b.gh_run_attempt);
@@ -258,11 +268,11 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
   let missing = null;
   if (group.status !== "completed") {
     let detail = group;
-    for (let i = 0; i < wait.attempts && detail.status !== "completed"; i++) {
+    for (let i = 0; i < wait.attempts && !finished(detail); i++) {
       await new Promise((r) => setTimeout(r, wait.ms));
       detail = await get(`/reports/${group.id}`);
     }
-    if (detail.status !== "completed") {
+    if (!finished(detail)) {
       const expected = Number(detail.total_reports_expected ?? group.total_reports_expected) || null;
       const received = Array.isArray(detail.reports) ? detail.reports.length : null;
       missing = { expected, received, status: detail.status };

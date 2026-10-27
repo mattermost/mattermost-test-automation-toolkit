@@ -112,6 +112,13 @@ inputs:
     description: Optional path of a JSON file triage writes after every run, judged or not, for measuring its accuracy (schema 1, see the README). Holds no secret and only the first line of each error. Empty turns it off
     required: false
     default: ""
+  rerun-attempts:
+    description: >-
+      How many times a lane red only for jobs that sent no results (a shard that reported nothing, missing reports) may have its
+      failed jobs re-run automatically before a person is asked to. Triage uploads a marker artifact for the
+      e2e-test-rerun action, which a workflow_run listener in the repo calls. 0 (the default) turns it off
+    required: false
+    default: "0"
 outputs:
   published:
     description: Whether triage wrote its verdict to the required status
@@ -137,6 +144,9 @@ outputs:
   ai-cost-usd:
     description: Their cost in USD at list price, or "unknown" for an unpriced model
     value: ${{ steps.triage.outputs.ai_cost_usd }}
+  rerun:
+    description: Whether triage asked for the failed jobs to be re-run (see rerun-attempts)
+    value: ${{ steps.triage.outputs.rerun }}
 runs:
   using: composite
   steps:
@@ -169,4 +179,27 @@ runs:
         AI_PRICES: ${{ inputs.ai-prices }}
         ANSWERS_CACHE: ${{ inputs.answers-cache }}
         FINDINGS_FILE: ${{ inputs.findings-file }}
+        RERUN_ATTEMPTS: ${{ inputs.rerun-attempts }}
       run: node "${{ github.action_path }}/dist/index.js"
+    # The request for a re-run, for e2e-test-rerun: one marker per lane and attempt, named so the listener can tell
+    # this attempt's requests from an earlier one's.
+    - id: marker
+      if: ${{ !cancelled() && steps.triage.outputs.rerun == 'true' }}
+      shell: bash
+      env:
+        STATUS_CONTEXT: ${{ inputs.status-context }}
+        DESCRIPTION: ${{ steps.triage.outputs.description }}
+      run: |
+        lane=$(printf '%s' "$STATUS_CONTEXT" | tr -c 'A-Za-z0-9._-' '-')
+        dir="$RUNNER_TEMP/e2e-triage-rerun"
+        mkdir -p "$dir"
+        jq -n --arg context "$STATUS_CONTEXT" --arg description "$DESCRIPTION" --arg attempt "$GITHUB_RUN_ATTEMPT" \
+          '{status_context: $context, description: $description, attempt: ($attempt | tonumber)}' > "$dir/request.json"
+        echo "name=e2e-triage-rerun-attempt-${GITHUB_RUN_ATTEMPT}-${lane}" >> "$GITHUB_OUTPUT"
+        echo "path=$dir/request.json" >> "$GITHUB_OUTPUT"
+    - if: ${{ !cancelled() && steps.marker.outputs.name != '' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      with:
+        name: ${{ steps.marker.outputs.name }}
+        path: ${{ steps.marker.outputs.path }}
+        retention-days: 1

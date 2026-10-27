@@ -135,7 +135,23 @@ export interface TsioGroup {
   reports?: unknown[];
   gh_pr_number?: number | string | null;
   branch?: string | null;
+  /** A lane that leases work units to its workers: a dead worker's units go to the others. Sent on the group's own read. */
+  orchestration?: { status?: string; counts?: { pending?: number; leased?: number; abandoned?: number }; tests?: { total?: number } } | null;
+  test_stats?: { total?: number } | null;
 }
+
+/**
+ * Whether every result is in: TSIO closed the group, or its orchestration ran every unit (none pending, leased or
+ * abandoned) and the group holds as many tests as the orchestration ran. A worker that died after its units were
+ * re-leased never uploads, so its report never arrives.
+ */
+const finished = (g: TsioGroup): boolean => {
+  if (g.status === "completed") return true;
+  const o = g.orchestration;
+  const ran = o?.tests?.total;
+  return o?.status === "completed" && !o.counts?.pending && !o.counts?.leased && !o.counts?.abandoned &&
+    typeof ran === "number" && ran === g.test_stats?.total;
+};
 
 export interface TsioSuite {
   id: TsioId;
@@ -283,11 +299,11 @@ export async function runFromGroups(fetchImpl: FetchImpl, base: string, id: Comp
   let missing: Missing | null = null;
   if (group.status !== "completed") {
     let detail: TsioGroup = group;
-    for (let i = 0; i < wait.attempts && detail.status !== "completed"; i++) {
+    for (let i = 0; i < wait.attempts && !finished(detail); i++) {
       await new Promise<void>((r) => setTimeout(r, wait.ms));
       detail = await get<TsioGroup>(`/reports/${group.id}`);
     }
-    if (detail.status !== "completed") {
+    if (!finished(detail)) {
       const expected = Number(detail.total_reports_expected ?? group.total_reports_expected) || null;
       const received = Array.isArray(detail.reports) ? detail.reports.length : null;
       missing = { expected, received, status: detail.status };

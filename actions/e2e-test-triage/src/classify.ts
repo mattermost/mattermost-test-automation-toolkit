@@ -3,11 +3,11 @@
 
 import { FAILED_STATUSES } from "../../shared/src/tsio.ts";
 import { DEFAULTS, laneOf } from "./config.ts";
-import type { At, Config, Finding, Observation, TestRef, TsioId } from "./types.ts";
+import type { At, Config, Finding, Observation, SpecRun, TestRef, TsioId } from "./types.ts";
 
 // The last alternative: a mobile spec whose shard uploaded nothing never ran.
 const INFRA_RE =
-  /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready/i;
+  /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready|failed: 408 Request timed out after \d+ ?ms/i;
 
 export const isInfraError = (text: string | null | undefined): boolean => INFRA_RE.test(text ?? "");
 
@@ -22,7 +22,45 @@ export function isShardPlaceholder(t: { file?: string | null; title: string; err
   const error = String(t.error ?? "").trim();
   if (!title) return true;
   if (/^\[[^\]]*\] CI shard failure$/.test(title) && (!error || /(?:^|\/)tsio-shard-failure\.ts$/.test(String(t.file ?? "")))) return true;
-  return title === "spec did not run" && /was assigned to a shard but produced no result/.test(error);
+  return isSpecNotRun(t);
+}
+
+/** The mobile placeholder: a spec assigned to a shard that produced no result for it, so it never ran. */
+export function isSpecNotRun(t: { title: string; error?: string | null }): boolean {
+  return t.title.trim() === "spec did not run" && /was assigned to a shard but produced no result/.test(String(t.error ?? "").trim());
+}
+
+/**
+ * A mobile spec skipped because its shard's Jest process stopped before reaching it, while other specs of the shard
+ * reported. Unlike a shard that sent nothing, it is judged by its own history (see classifyNotRun), never re-run for.
+ */
+export const isSpecStopped = (t: { title: string; error?: string | null }): boolean =>
+  isSpecNotRun(t) && /its Jest process stopped before reaching this spec/.test(String(t.error ?? ""));
+
+/**
+ * A spec a stopped Jest process skipped: flaky when it also did not run in another recent run and passed in every run
+ * where it ran (at least minTrunkRuns of them); otherwise it blocks, for a person to read why Jest stopped.
+ * Unreadable history (null) clears nothing.
+ */
+export function classifyNotRun(test: TestRef, runs: SpecRun[] | null, cfg: Config, groupId: TsioId | null): Finding {
+  const out = (cls: string, reason: string, blocking: boolean): Finding => ({
+    ...test, class: cls, reason, blocking,
+    trunk: { runs: 0, fails: 0, flaky: 0, passes: 0, latest: "" },
+    cross_pr: { prs: [], examples: [], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
+  });
+  const why = "Did not run: its Jest process stopped before reaching it";
+  if (!runs) return out("NOT_RUN", `${why}, and its history could not be read.`, true);
+  const others = runs.filter((r) => r.group_id !== groupId);
+  const notRun = others.filter((r) => r.status === "not_run").length;
+  const ran = others.filter((r) => r.status !== "not_run");
+  const failed = ran.filter((r) => r.status === "failed").length;
+  if (failed) return out("NOT_RUN", `${why}, and it failed in ${failed} of the ${ran.length} recent runs where it ran.`, true);
+  if (ran.length < cfg.minTrunkRuns) return out("NOT_RUN", `${why}, and it ran in only ${ran.length} recent runs (need ${cfg.minTrunkRuns}) to call it intermittent.`, true);
+  if (!notRun) return out("NOT_RUN", `${why}, which it has not done in the last ${others.length} runs.`, true);
+  return out("FLAKY_NOT_RUN", `${why}, as it did in ${notRun} of the last ${others.length} runs; it passed in all ${ran.length} where it ran.`, false);
 }
 
 export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
@@ -170,8 +208,14 @@ export function classify(
   if (isTrunkRun) {
     if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status))
       return out("BROKEN_ON_TRUNK", `Still failing: the previous ${lane ?? "trunk"} run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}) failed this test too. That is a streak, not a flake.`, true);
+    // A pass on retry does not end a streak: failing or needing a retry in each recent run, one of them a failure, is a
+    // break a retry sometimes gets past. Failing and passing in turn is a flake.
+    let rough = 0;
+    while (rough < trunk.length && (FAILED_STATUSES.has(trunk[rough].status) || trunk[rough].status === "flaky")) rough++;
+    if (rough >= 2 && trunk.slice(0, rough).some((o) => FAILED_STATUSES.has(o.status)))
+      return out("BROKEN_ON_TRUNK", `Still failing: failed or passed only on retry in each of the previous ${rough} ${lane ?? "trunk"} runs. A pass on retry is not a fix.`, true);
     if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0)
-      return out("FLAKY_ON_TRUNK", `Intermittent on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the previous ${trunk.length} runs, and the last one passed.`, false);
+      return out("FLAKY_ON_TRUNK", `Intermittent on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the previous ${trunk.length} runs, and the last one passed${latestTrunk?.status === "flaky" ? " on retry" : ""}.`, false);
     if (trunk.length < cfg.minTrunkRuns)
       return out("INSUFFICIENT_DATA", `Only ${trunk.length} earlier trunk runs (need ${cfg.minTrunkRuns}); cannot tell a flake from a new break.`, true);
     return out("REGRESSION", `New on trunk: passed in all ${trunk.length} previous runs.`, true);

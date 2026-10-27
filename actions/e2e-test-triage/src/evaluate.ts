@@ -3,7 +3,7 @@
 
 import { identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
-import { BORDERLINE, classify, errorSignature, infraVerdict, isShardPlaceholder, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
+import { BORDERLINE, classify, classifyNotRun, errorSignature, infraVerdict, isShardPlaceholder, isSpecNotRun, isSpecStopped, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, historyLane, repoPath } from "./config.ts";
 import { commonSenseClear } from "./common-sense.ts";
 import { sameTestOnOtherReports } from "./enrich.ts";
@@ -13,7 +13,7 @@ import type { OtherFailure } from "./pack.ts";
 import { judge } from "./decision.ts";
 import type { OutOfDateResult } from "./history.ts";
 import { newLedger } from "./pricing.ts";
-import type { AskFn, ChangedFile, Config, Diff, Evidence, Finding, HistoryLike, Ledger, PrRef } from "./types.ts";
+import type { AskFn, ChangedFile, Config, Diff, Evidence, Finding, HistoryLike, Ledger, PrRef, SpecHistory } from "./types.ts";
 
 /** What evaluateRun returns: the verdict, the findings, and the facts the summary needs. */
 export interface EvaluatedRun {
@@ -30,6 +30,8 @@ export interface EvaluatedRun {
    * and the lane is red for them. Set beside findings when a run has both.
    */
   unnamed?: number;
+  /** Of those placeholders, the specs that never ran (see isSpecNotRun): counted as not run, not failed. */
+  notRun?: number;
 }
 
 export interface EvaluateParams {
@@ -51,6 +53,8 @@ export interface EvaluateParams {
   otherPlatforms?: ((findings: Finding[]) => Promise<void>) | null;
   outOfDate?: ((findings: Finding[]) => Promise<OutOfDateResult>) | null;
   brokeBy?: ((findings: Finding[]) => Promise<void>) | null;
+  /** Past runs of the specs a stopped Jest process skipped (see classifyNotRun); null when they could not be read. */
+  specHistory?: SpecHistory | null;
 }
 
 /** A run flagged as a whole (see infraVerdict) is red for it while any failure still blocks, or when none is named. */
@@ -79,13 +83,18 @@ export async function evaluateRun({
   otherPlatforms = null,
   outOfDate = null,
   brokeBy = null,
+  specHistory = null,
 }: EvaluateParams): Promise<EvaluatedRun> {
   const isTrunkRun = prNumber == null;
   // A shard placeholder (no test name, a desktop shard stub, a mobile spec that did not run) has no history to read and
   // nothing to show the model. The run is red for it: it is counted, and not classified, asked or flagged.
   const tests = run.failing.filter((t) => !isShardPlaceholder(t));
   const result: EvaluatedRun = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg), counts: run.counts, ai: newLedger(), missing: null };
-  if (run.failing.length > tests.length) result.unnamed = run.failing.length - tests.length;
+  // A spec a stopped Jest process skipped is judged by its own history below; the other placeholders are re-run.
+  const stopped = run.failing.filter(isSpecStopped);
+  if (run.failing.length > tests.length + stopped.length) result.unnamed = run.failing.length - tests.length - stopped.length;
+  const notRun = run.failing.filter(isSpecNotRun).length;
+  if (notRun) result.notRun = notRun;
   // A run-level infra call still names each failure, and the model is asked as on any run: the run is red while
   // any failure still blocks.
   if (tests.length) {
@@ -192,6 +201,7 @@ export async function evaluateRun({
     }
     if (!blind && prNumber) sameFailure(result.findings);
   }
+  for (const t of stopped) result.findings.push(classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id));
   result.verdict = verdictOf(result.findings, result.infra);
   // Specs that never ran can't be vouched for, whatever happened to the rest.
   result.missing = missingReports(run.missing);

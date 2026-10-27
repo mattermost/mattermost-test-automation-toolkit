@@ -8,18 +8,18 @@ import { laneName, laneSummary } from "../../shared/src/lane.ts";
 import { readStatuses, statusPublisher } from "../../shared/src/status.ts";
 import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, SupersededRunError, tsioBase } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.ts";
-import { isShardPlaceholder } from "./classify.ts";
+import { isShardPlaceholder, isSpecStopped } from "./classify.ts";
 import { configFrom, DEFAULTS, historyLane, PR_SPEND_KEY } from "./config.ts";
 import { loadEvidence } from "./evidence.ts";
-import { fetchChangedFiles, fetchHistory, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
+import { fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { enrichFindings, siblingPlatforms } from "./enrich.ts";
 import { askModelBatch } from "./judge.ts";
 import { evaluateRun } from "./evaluate.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
-import { redact, secretsOf, writeFindings } from "./findings.ts";
+import { findingLogLine, redact, secretsOf, writeFindings } from "./findings.ts";
 import { ledgerTotals } from "./pricing.ts";
 import { activeFlag, noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, RERUN, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
-import type { AskFn, Config, Diff, HistoryLike } from "./types.ts";
+import type { AskFn, Config, Diff, HistoryLike, SpecHistory } from "./types.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
 export interface TriageIdentity extends CompositeIdentity {
@@ -257,6 +257,16 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         }
       }
     }
+    // The specs a stopped Jest process skipped are judged by their files' past runs; unreadable history clears none.
+    let specHistory: SpecHistory | null = null;
+    const stopped = run.failing.filter(isSpecStopped);
+    if (stopped.length) {
+      try {
+        specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, stopped.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), reportName);
+      } catch (e) {
+        log(`history of the specs that did not run unavailable: ${String(e).slice(0, 200)}`);
+      }
+    }
     // Answers from an earlier attempt at the same evidence, so a re-run does not pay twice. A cache that is not a
     // readable object, or a PR-spend entry that is corrupt, cannot say what the PR spent: that spend is unknown.
     let unknownSpend: string | null = null;
@@ -306,6 +316,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, until: now.toISOString(), log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
+      specHistory,
     });
     seen.result = result;
     const spend = ledgerTotals(result.ai);
@@ -322,12 +333,16 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
     // Nothing failed and every report arrived, yet the lane is red: a job outside the tests failed. Its own status says so.
     const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
-    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null });
-    const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0);
+    // Placeholders and missing reports are no test's result. Within the repo's allowance the failed jobs are re-run, and the
+    // new attempt is triaged again (see e2e-test-rerun); the last attempt asks a person.
+    const attempt = Number(id.gh_run_attempt) || 1;
+    const rerun = (result.unnamed || result.missing) && attempt <= cfg.rerunAttempts ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
+    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, rerun });
+    const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun);
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
-      appendFileSync(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}\nverdict=${result.verdict}\nblocking=${flag ? run.counts.failed : result.findings.filter((f) => f.blocking).length + (result.unnamed ?? 0)}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\n` +
+      appendFileSync(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}\nverdict=${result.verdict}\nblocking=${flag ? run.counts.failed : result.findings.filter((f) => f.blocking).length + (result.unnamed ?? 0)}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\nrerun=${Boolean(rerun)}\n` +
         `ai_calls=${spend.calls}\nai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}\nai_input_tokens=${spend.input_tokens}\nai_output_tokens=${spend.output_tokens}\n`);
     // A lane with nothing failed or missing has nothing to report, so it writes no job
     // summary: the run page then shows only the lanes someone needs to read.
@@ -372,6 +387,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${RERUN}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
+    result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));
     log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;
   } catch (e) {
