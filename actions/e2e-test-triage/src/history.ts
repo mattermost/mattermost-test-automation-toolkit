@@ -2,7 +2,7 @@
 // See LICENSE.txt for license information.
 
 import type { FetchImpl, GhApi } from "../../shared/src/github.ts";
-import { FAILED_STATUSES, identityKey, outcomeOf } from "../../shared/src/tsio.ts";
+import { FAILED_STATUSES, identityKey, outcomeOf, outcomeWithDuplicates } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
 import { CHANGED_FILES_MAX_PAGES, COMPARE_FILE_CAP, DEFAULTS, HISTORY_MAX_FILES, HISTORY_MAX_PAGES, HISTORY_PER_PAGE, laneOf } from "./config.ts";
 import type { BrokeBy, ChangedFile, Config, Finding, Observation, OutOfDate, SpecHistory, SpecRun, TestRef } from "./types.ts";
@@ -85,7 +85,8 @@ export async function fetchSpecRuns(
   for (const [file, byGroup] of runs) {
     const outcomes: SpecRun[] = [];
     for (const [group_id, run] of byGroup) {
-      const results = [...run.tests.values()].map((attempts) => outcomeOf([...attempts].sort((a, b) => a.retry_count - b.retry_count)).status);
+      // As the run reader does: a pass beside a fail at the same retry level of one report does not excuse the fail.
+      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count), (a) => a.report_name ?? null).status);
       // A run where every test was skipped is no pass (see classifyNotRun).
       const status = run.notRun ? "not_run" : results.some((s) => FAILED_STATUSES.has(s)) ? "failed" : results.every((s) => s === "skipped") ? "skipped" : "passed";
       outcomes.push({ group_id, status });

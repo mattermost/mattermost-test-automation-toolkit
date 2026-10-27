@@ -3873,10 +3873,12 @@ test("a spec's runs are read from the whole file: not run where its placeholder 
     row("g4", "a", "failed"), row("g4", "a", "passed", 1),
     row("g5", "a", "failed", 0, "mobile-pr-detox-android"),
     row("g6", "a", "skipped"), row("g6", "b", "skipped"),
+    // One spec reported twice in one run at the same retry: the pass beside the fail cannot excuse it, as in the run reader.
+    row("g7", "a", "failed"), row("g7", "a", "passed"),
   ];
   const history = await fetchSpecRuns(fakeFetch([["/reports/history", () => Response.json({ observations: rows })]]), "http://tsio", "o/r", [MOBILE_STUB.file], "2026-10-26T00:00:00Z", DEFAULTS, laneOf("mobile-pr-detox-ios"));
   assert.equal(history.truncated, false);
-  assert.deepEqual(history.byFile.get(MOBILE_STUB.file)!.map((r) => [r.group_id, r.status]), [["g1", "not_run"], ["g2", "passed"], ["g3", "failed"], ["g4", "passed"], ["g6", "skipped"]], "another lane's run is not this lane's history, and a run where every test was skipped is no pass");
+  assert.deepEqual(history.byFile.get(MOBILE_STUB.file)!.map((r) => [r.group_id, r.status]), [["g1", "not_run"], ["g2", "passed"], ["g3", "failed"], ["g4", "passed"], ["g6", "skipped"], ["g7", "failed"]], "another lane's run is not this lane's history, and a run where every test was skipped is no pass");
 });
 
 test("a lane whose only failures are specs that did not run is green when they are flaky that way, and is not re-run for them", async () => {
