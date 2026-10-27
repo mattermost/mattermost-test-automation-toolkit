@@ -85,8 +85,10 @@ export async function fetchSpecRuns(
   for (const [file, byGroup] of runs) {
     const outcomes: SpecRun[] = [];
     for (const [group_id, run] of byGroup) {
-      const failed = [...run.tests.values()].some((attempts) => FAILED_STATUSES.has(outcomeOf([...attempts].sort((a, b) => a.retry_count - b.retry_count)).status));
-      outcomes.push({ group_id, status: run.notRun ? "not_run" : failed ? "failed" : "passed" });
+      const results = [...run.tests.values()].map((attempts) => outcomeOf([...attempts].sort((a, b) => a.retry_count - b.retry_count)).status);
+      // A run where every test was skipped is no pass (see classifyNotRun).
+      const status = run.notRun ? "not_run" : results.some((s) => FAILED_STATUSES.has(s)) ? "failed" : results.every((s) => s === "skipped") ? "skipped" : "passed";
+      outcomes.push({ group_id, status });
     }
     history.byFile.set(file, outcomes);
   }

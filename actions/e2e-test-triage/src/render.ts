@@ -243,8 +243,10 @@ export interface SummaryInput {
   reportsArrived?: string | null;
   /** Shard placeholders (see isShardPlaceholder): counted, not classified, and the lane is red for them. */
   unnamed?: number | null;
-  /** Of those placeholders, the specs that never ran (see isSpecNotRun). */
+  /** Every spec that never ran (see isSpecNotRun), for the pass line. */
   notRun?: number | null;
+  /** Of the placeholders, the specs that never ran: the ones the re-run line names. */
+  notRunRerun?: number | null;
   /** The automatic re-run triage asked for, when it did. */
   rerun?: Rerun | null;
 }
@@ -257,7 +259,7 @@ const RED_OUTSIDE = "No test failed. The lane is red because a job outside the t
  * groups (Your PR, Out of date, Needs a look, Broken on the base branch, Flaky; one line each: why and the next
  * step), then the evidence, collapsed.
  */
-export function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null, notRun = null, rerun = null }: SummaryInput): string {
+export function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null, notRun = null, notRunRerun = null, rerun = null }: SummaryInput): string {
   const branch = trunkBranch || "the default branch";
   const where = lane ? ` · ${md(lane)}` : "";
   // A flagged run whose every failure was cleared reads as any other cleared run.
@@ -284,7 +286,7 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
     // Shard placeholders keep the lane red, so a look-only headline turns red and says to re-run.
     : check.length || outdated.length ? `${unnamed ? "🔴" : "🟡"} ${[needText, staleText, unnamed ? "re-run the failed jobs" : ""].filter(Boolean).join(", ")}`
     : blockingBroken ? `🔴 ${blockingBroken} still failing on ${md(branch)}`
-    : unnamed ? `🔴 ${notRun && !findings.length ? `${count(notRun, "spec")} did not run, ` : ""}${rerun ? RERUNNING : RERUN}`
+    : unnamed ? `🔴 ${notRunRerun && !findings.length ? `${count(notRunRerun, "spec")} did not run, ` : ""}${rerun ? RERUNNING : RERUN}`
     : `✅ none caused by this ${pr ? "PR" : "commit"}`;
   const lines = [`## E2E triage${where}: ${head}`, ""];
   // Under the headline: how many failed tests also failed on other platforms in this run (see alsoFailed).
@@ -298,8 +300,8 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
   let say = "";
   // What arrived, and what never ran: the reason a lane with missing reports is red.
   const arrived = [reportsArrived, missing?.text].filter(Boolean).join("; ");
-  const nameless = (unnamed ?? 0) - (notRun ?? 0);
-  const placeholders = [notRun ? notRunText(notRun) : "", nameless > 0 ? `${count(nameless, "failed result")} with no test name` : ""].filter(Boolean).join("; ");
+  const nameless = (unnamed ?? 0) - (notRunRerun ?? 0);
+  const placeholders = [notRunRerun ? notRunText(notRunRerun) : "", nameless > 0 ? `${count(nameless, "failed result")} with no test name` : ""].filter(Boolean).join("; ");
   const again = rerun ? `Re-running the failed jobs automatically (attempt ${rerun.attempt} of ${rerun.of}), then triaging the new results` : "Re-run the failed jobs";
   const rerunLine = unnamed ? `${again}: ${arrived || placeholders}.` : "";
   if (unnamed && !findings.length) {

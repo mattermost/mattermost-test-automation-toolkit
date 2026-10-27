@@ -3742,7 +3742,7 @@ test("a run of mobile specs that did not run is red for a re-run: no findings, n
   assert.equal(result.verdict, "FAILURE");
   assert.equal(asked, 0);
   assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts, null, result.unnamed, result.notRun), "(re-run the failed jobs) 0 passed, 0 failed, 3 not run, 0 skipped");
-  const text = renderSummary({ findings: result.findings, infra: result.infra, runURL: "u", counts: result.counts, trunkBranch: "master", unnamed: result.unnamed, notRun: result.notRun });
+  const text = renderSummary({ findings: result.findings, infra: result.infra, runURL: "u", counts: result.counts, trunkBranch: "master", unnamed: result.unnamed, notRun: result.notRun, notRunRerun: result.notRunRerun });
   assert.match(text, /^## E2E triage: 🔴 3 specs did not run, re-run the failed jobs$/m);
   assert.match(text, /^\*\*Re-run the failed jobs: 3 specs did not run, no result from their CI job\.\*\* 0 passed, 0 failed, 3 not run, 0 skipped · /m);
 });
@@ -3760,7 +3760,7 @@ test("with re-runs allowed, a lane red only for jobs that sent no results asks f
   const counts = { total: 634, passed: 615, failed: 2, flaky: 1, skipped: 17 };
   assert.equal(statusDescription("FAILURE", [], null, counts, null, 2, 2, { attempt: 2, of: 2 }), "(re-running the failed jobs) 615 passed, 0 failed, 2 not run, 17 skipped");
   assert.equal(statusDescription("FAILURE", [], null, { passed: 0, failed: 1, skipped: 0 }, null, 1, 0, { attempt: 2, of: 2 }), "(re-running the failed jobs) 0% passed (0 passed, 1 failed, 0 skipped)");
-  const text = renderSummary({ findings: [], runURL: "u", counts, trunkBranch: "master", unnamed: 2, notRun: 2, rerun: { attempt: 2, of: 2 } });
+  const text = renderSummary({ findings: [], runURL: "u", counts, trunkBranch: "master", unnamed: 2, notRun: 2, notRunRerun: 2, rerun: { attempt: 2, of: 2 } });
   assert.match(text, /^## E2E triage: 🔴 2 specs did not run, re-running the failed jobs$/m);
   assert.match(text, /^\*\*Re-running the failed jobs automatically \(attempt 2 of 2\), then triaging the new results: 2 specs did not run, no result from their CI job\.\*\*/m);
   for (const [attempt, expected] of [["1", "true"], ["2", "false"]]) {
@@ -3819,7 +3819,7 @@ test("placeholders beside a real flaky failure: the flaky one is labelled, and t
   const description = statusDescription(result.verdict, result.findings, result.infra, result.counts, null, result.unnamed, result.notRun);
   assert.equal(description, "(1 flaky; re-run the failed jobs) 18 passed, 2 failed, 1 not run, 0 skipped", "the pass line counts the spec that did not run");
   assert.ok(description.length <= 140);
-  const text = renderSummary({ findings: result.findings, infra: result.infra, runURL: "u", counts: result.counts, trunkBranch: "master", unnamed: result.unnamed, notRun: result.notRun });
+  const text = renderSummary({ findings: result.findings, infra: result.infra, runURL: "u", counts: result.counts, trunkBranch: "master", unnamed: result.unnamed, notRun: result.notRun, notRunRerun: result.notRunRerun });
   assert.match(text, /^## E2E triage: 🔴 re-run the failed jobs$/m, "never 'none caused' while the lane is red");
   assert.match(text, /\*\*1 failure: 1 looks unrelated \(1 flaky\)\. Re-run the failed jobs: 1 spec did not run, no result from its CI job; 1 failed result with no test name\.\*\*/);
   // The labels still give way first past 140 characters; the re-run stays whole.
@@ -3850,6 +3850,18 @@ test("a spec whose Jest process stopped before it is flaky when it also did not 
   assert.match(blocked(["not_run", "passed", "passed"]).reason, /it ran in only 2 recent runs/);
   for (const f of [blocked(Array(8).fill("passed")), classifyNotRun(STOPPED, null, DEFAULTS, "g1")]) assert.deepEqual([f.class, f.blocking], ["NOT_RUN", true]);
   assert.equal(classifyNotRun(STOPPED, [{ group_id: "g1", status: "not_run" }, ...specRuns(Array(6).fill("passed"))], DEFAULTS, "g1").class, "NOT_RUN", "this run is not its own history");
+  assert.equal(classifyNotRun(STOPPED, [{ group_id: "7", status: "not_run" }, ...specRuns(Array(6).fill("passed"))], DEFAULTS, 7).class, "NOT_RUN", "nor when TSIO sends its id as a number");
+  // A run where every test was skipped is not a pass: 3 passes and 10 skipped runs are 3 runs, too few.
+  assert.match(blocked(["not_run", ...Array(3).fill("passed"), ...Array(10).fill("skipped")]).reason, /it ran in only 3 recent runs/);
+  // mattermost-mobile#10267: mm_blocks_incoming_webhook skips every test on CI (no stable webhook ingress), so missing it loses nothing.
+  const alwaysSkipped = classifyNotRun(SILENT, specRuns(["not_run", ...Array(96).fill("skipped")]), DEFAULTS, "g1");
+  assert.deepEqual([alwaysSkipped.class, alwaysSkipped.blocking], ["FLAKY_NOT_RUN", false]);
+  assert.match(alwaysSkipped.reason, /it skipped every test in all 96 recent runs where it was reached, so nothing was lost/);
+  // A spec this change edits has to run, and one whose change list could not be read is not cleared either.
+  const history = specRuns(["not_run", ...Array(6).fill("passed")]);
+  assert.match(classifyNotRun(STOPPED, history, DEFAULTS, "g1", true).reason, /this change edits it, so it has to run/);
+  assert.match(classifyNotRun(STOPPED, history, DEFAULTS, "g1", null).reason, /whether this change edits it could not be checked/);
+  for (const edited of [true, null]) assert.equal(classifyNotRun(STOPPED, history, DEFAULTS, "g1", edited).blocking, true);
 });
 
 test("a spec's runs are read from the whole file: not run where its placeholder is, failed where a test failed every try", async () => {
@@ -3860,10 +3872,11 @@ test("a spec's runs are read from the whole file: not run where its placeholder 
     row("g3", "a", "failed"), row("g3", "a", "failed", 1),
     row("g4", "a", "failed"), row("g4", "a", "passed", 1),
     row("g5", "a", "failed", 0, "mobile-pr-detox-android"),
+    row("g6", "a", "skipped"), row("g6", "b", "skipped"),
   ];
   const history = await fetchSpecRuns(fakeFetch([["/reports/history", () => Response.json({ observations: rows })]]), "http://tsio", "o/r", [MOBILE_STUB.file], "2026-10-26T00:00:00Z", DEFAULTS, laneOf("mobile-pr-detox-ios"));
   assert.equal(history.truncated, false);
-  assert.deepEqual(history.byFile.get(MOBILE_STUB.file)!.map((r) => [r.group_id, r.status]), [["g1", "not_run"], ["g2", "passed"], ["g3", "failed"], ["g4", "passed"]], "another lane's run is not this lane's history");
+  assert.deepEqual(history.byFile.get(MOBILE_STUB.file)!.map((r) => [r.group_id, r.status]), [["g1", "not_run"], ["g2", "passed"], ["g3", "failed"], ["g4", "passed"], ["g6", "skipped"]], "another lane's run is not this lane's history, and a run where every test was skipped is no pass");
 });
 
 test("a lane whose only failures are specs that did not run is green when they are flaky that way, and is not re-run for them", async () => {
@@ -3878,8 +3891,20 @@ test("a lane whose only failures are specs that did not run is green when they a
   assert.deepEqual([silent.verdict, silent.findings.map((f) => f.class)], ["SUCCESS", ["FLAKY_NOT_RUN"]], "a shard that sent nothing is judged the same way");
   const firstTime = await evaluate({ ...runOf([SILENT]), counts }, { specHistory: { byFile: new Map([[SILENT.file, specRuns(Array(6).fill("passed"))]]), truncated: false } });
   assert.deepEqual([firstTime.verdict, firstTime.unnamed, firstTime.findings.length], ["FAILURE", 1, 0], "one the history does not clear is re-run, as a placeholder");
+  const edited = await evaluate({ ...runOf([STOPPED]), counts }, { specHistory: { byFile: new Map([[STOPPED.file, history]]), truncated: false }, diff: { files: [{ filename: STOPPED.file }], ok: true } });
+  assert.deepEqual([edited.verdict, edited.findings[0].class], ["FAILURE", "NOT_RUN"], "a spec the PR edits is held");
   const truncated = await evaluate({ ...runOf([STOPPED]), counts }, { specHistory: { byFile: new Map([[STOPPED.file, history]]), truncated: true } });
   assert.deepEqual([truncated.verdict, truncated.findings[0].class], ["FAILURE", "NOT_RUN"], "cut-off history clears nothing");
+});
+
+test("the re-run line counts only the specs it re-runs, beside a held one and a desktop stub", () => {
+  const held = classifyNotRun(STOPPED, specRuns(Array(8).fill("passed")), DEFAULTS, "g1");
+  const counts = { total: 10, passed: 6, failed: 4, flaky: 0, skipped: 0 };
+  // 1 held stopped spec (a finding), 2 silent-shard specs and 1 desktop stub (placeholders, re-run).
+  const text = renderSummary({ findings: [held], runURL: "u", counts, trunkBranch: "main", unnamed: 3, notRun: 3, notRunRerun: 2 });
+  assert.match(text, /Re-run the failed jobs: 2 specs did not run, no result from their CI job; 1 failed result with no test name\./);
+  const onlyPlaceholders = renderSummary({ findings: [], runURL: "u", counts, trunkBranch: "main", unnamed: 2, notRun: 3, notRunRerun: 2 });
+  assert.match(onlyPlaceholders, /^## E2E triage: 🔴 2 specs did not run, re-run the failed jobs$/m);
 });
 
 test("end to end, a skipped spec with an intermittent history turns the lane green, and nothing asks for a re-run", async () => {
@@ -3894,6 +3919,7 @@ test("end to end, a skipped spec with an intermittent history turns the lane gre
       ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: STOPPED.file }] })],
       ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: STOPPED.title, status: "failed", retry_count: 0, ordinal: 0, error_message: STOPPED.error, error_stack: null }])],
       ["/reports/history", () => Response.json({ observations: history })],
+      ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
       ["/pulls/5", () => Response.json({ title: "t", base: { ref: "main" }, labels: [] })],
       statusSink(statuses),
     ]);

@@ -421,8 +421,9 @@ async function fetchSpecRuns(fetchImpl, base, repository, files, until, cfg = DE
   for (const [file, byGroup] of runs) {
     const outcomes = [];
     for (const [group_id, run] of byGroup) {
-      const failed = [...run.tests.values()].some((attempts) => FAILED_STATUSES.has(outcomeOf([...attempts].sort((a, b) => a.retry_count - b.retry_count)).status));
-      outcomes.push({ group_id, status: run.notRun ? "not_run" : failed ? "failed" : "passed" });
+      const results = [...run.tests.values()].map((attempts) => outcomeOf([...attempts].sort((a, b) => a.retry_count - b.retry_count)).status);
+      const status = run.notRun ? "not_run" : results.some((s) => FAILED_STATUSES.has(s)) ? "failed" : results.every((s) => s === "skipped") ? "skipped" : "passed";
+      outcomes.push({ group_id, status });
     }
     history.byFile.set(file, outcomes);
   }
@@ -840,7 +841,7 @@ function passRate(counts) {
 var passLine = (counts, notRun = 0) => notRun ? `${counts.passed ?? 0} passed, ${Math.max(0, (counts.failed ?? 0) - notRun)} failed, ${notRun} not run, ${counts.skipped ?? 0} skipped` : `${passRate(counts)} passed (${counts.passed ?? 0} passed, ${counts.failed} failed, ${counts.skipped ?? 0} skipped)`;
 var notRunText = (n) => `${count(n, "spec")} did not run, no result from ${n === 1 ? "its" : "their"} CI job`;
 var RED_OUTSIDE = "No test failed. The lane is red because a job outside the tests failed (setup, upload or runner), or results are missing: re-run the failed jobs.";
-function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null, notRun = null, rerun = null }) {
+function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null, notRun = null, notRunRerun = null, rerun = null }) {
   const branch = trunkBranch || "the default branch";
   const where = lane ? ` \xB7 ${md(lane)}` : "";
   const infra = activeFlag(runInfra, findings);
@@ -853,7 +854,7 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
   const outdatedLead = findings.length > 0 && outdated.length * 2 >= findings.length;
   const staleText = outdated.length ? `${outdated.length} out of date` : "";
   const needText = check.length ? `${check.length} need${check.length === 1 ? "s" : ""} a look` : "";
-  const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? laneRed ? "\u{1F534} red outside the tests" : "\u2705 nothing failed" : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : check.length || outdated.length ? `${unnamed ? "\u{1F534}" : "\u{1F7E1}"} ${[needText, staleText, unnamed ? "re-run the failed jobs" : ""].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : unnamed ? `\u{1F534} ${notRun && !findings.length ? `${count(notRun, "spec")} did not run, ` : ""}${rerun ? RERUNNING : RERUN}` : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
+  const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? laneRed ? "\u{1F534} red outside the tests" : "\u2705 nothing failed" : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : check.length || outdated.length ? `${unnamed ? "\u{1F534}" : "\u{1F7E1}"} ${[needText, staleText, unnamed ? "re-run the failed jobs" : ""].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : unnamed ? `\u{1F534} ${notRunRerun && !findings.length ? `${count(notRunRerun, "spec")} did not run, ` : ""}${rerun ? RERUNNING : RERUN}` : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
   const lines = [`## E2E triage${where}: ${head}`, ""];
   const several = findings.filter((f) => failedElsewhere(f).length > 0).length;
   if (several) lines.push(`${count(several, "test")} failed on several platforms in this run.`, "");
@@ -861,8 +862,8 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
   for (const n of notes) lines.push(`> ${md(n)}`, "");
   let say = "";
   const arrived = [reportsArrived, missing?.text].filter(Boolean).join("; ");
-  const nameless = (unnamed ?? 0) - (notRun ?? 0);
-  const placeholders = [notRun ? notRunText(notRun) : "", nameless > 0 ? `${count(nameless, "failed result")} with no test name` : ""].filter(Boolean).join("; ");
+  const nameless = (unnamed ?? 0) - (notRunRerun ?? 0);
+  const placeholders = [notRunRerun ? notRunText(notRunRerun) : "", nameless > 0 ? `${count(nameless, "failed result")} with no test name` : ""].filter(Boolean).join("; ");
   const again = rerun ? `Re-running the failed jobs automatically (attempt ${rerun.attempt} of ${rerun.of}), then triaging the new results` : "Re-run the failed jobs";
   const rerunLine = unnamed ? `${again}: ${arrived || placeholders}.` : "";
   if (unnamed && !findings.length) {
@@ -1015,7 +1016,7 @@ function redReason(description = "") {
   const notRun = Number(/(\d+) not run\b/.exec(d)?.[1] ?? 0);
   if (missing) parts.push(`${missing} report(s) missing, ${again}`);
   else if (/results incomplete/.test(d)) parts.push(`results incomplete, ${again}`);
-  else if (notRun) parts.push(`${notRun} spec${notRun === 1 ? "" : "s"} did not run, ${again}`);
+  else if (notRun && /re-run(?:ning)? the failed jobs/.test(d) && !parts.length) parts.push(`${notRun} spec${notRun === 1 ? "" : "s"} did not run, ${again}`);
   else if (/re-running the failed jobs/.test(d)) parts.push("re-running the failed jobs");
   else if (/re-run the failed jobs/.test(d)) parts.push("re-run the failed jobs");
   if (/environment errors, re-run/.test(d)) parts.push("environment errors, re-run");
@@ -1157,7 +1158,7 @@ function isSpecNotRun(t) {
   return t.title.trim() === "spec did not run" && /was assigned to a shard but produced no result/.test(String(t.error ?? "").trim());
 }
 var isSpecStopped = (t) => isSpecNotRun(t) && /its Jest process stopped before reaching this spec/.test(String(t.error ?? ""));
-function classifyNotRun(test, runs, cfg, groupId) {
+function classifyNotRun(test, runs, cfg, groupId, edited = false) {
   const out = (cls, reason, blocking) => ({
     ...test,
     class: cls,
@@ -1170,11 +1171,16 @@ function classifyNotRun(test, runs, cfg, groupId) {
     this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" }
   });
   const why = isSpecStopped(test) ? "Did not run: its Jest process stopped before reaching it" : "Did not run: its shard sent no result";
+  if (edited === null) return out("NOT_RUN", `${why}, and whether this change edits it could not be checked.`, true);
+  if (edited) return out("NOT_RUN", `${why}, and this change edits it, so it has to run.`, true);
   if (!runs) return out("NOT_RUN", `${why}, and its history could not be read.`, true);
-  const others = runs.filter((r) => r.group_id !== groupId);
+  const others = runs.filter((r) => r.group_id !== String(groupId));
   const notRun = others.filter((r) => r.status === "not_run").length;
-  const ran = others.filter((r) => r.status !== "not_run");
+  const ran = others.filter((r) => r.status === "passed" || r.status === "failed");
+  const skipped = others.filter((r) => r.status === "skipped").length;
   const failed = ran.filter((r) => r.status === "failed").length;
+  if (!ran.length && skipped >= cfg.minTrunkRuns)
+    return out("FLAKY_NOT_RUN", `${why}, but it skipped every test in all ${skipped} recent runs where it was reached, so nothing was lost.`, false);
   if (failed * 20 > ran.length) return out("NOT_RUN", `${why}, and it failed in ${failed} of the ${ran.length} recent runs where it ran.`, true);
   if (ran.length < cfg.minTrunkRuns) return out("NOT_RUN", `${why}, and it ran in only ${ran.length} recent runs (need ${cfg.minTrunkRuns}) to call it intermittent.`, true);
   if (!notRun) return out("NOT_RUN", `${why}, which it has not done in the last ${others.length} runs.`, true);
@@ -2267,10 +2273,17 @@ async function evaluateRun({
   const isTrunkRun = prNumber == null;
   const tests = run.failing.filter((t) => !isShardPlaceholder(t));
   const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg), counts: run.counts, ai: newLedger(), missing: null };
-  const notRunSpecs = run.failing.filter(isSpecNotRun).map((t) => ({ t, f: classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id) }));
+  const changedFiles = new Set((diff.files ?? []).map((f) => f.filename));
+  const editedBy = (file) => {
+    const path = repoPath(testRoot, file);
+    return diff.ok && path != null ? changedFiles.has(path) : null;
+  };
+  const notRunSpecs = run.failing.filter(isSpecNotRun).map((t) => ({ t, f: classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id, editedBy(t.file)) }));
   const judgedNotRun = notRunSpecs.filter(({ t, f }) => !f.blocking || isSpecStopped(t)).map(({ f }) => f);
   const placeholders = run.failing.length - tests.length - judgedNotRun.length;
   if (placeholders) result.unnamed = placeholders;
+  const notRunRerun = notRunSpecs.length - judgedNotRun.length;
+  if (notRunRerun) result.notRunRerun = notRunRerun;
   const notRun = run.failing.filter(isSpecNotRun).length;
   if (notRun) result.notRun = notRun;
   if (tests.length) {
@@ -2602,6 +2615,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
           history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
         }
       }
+    } else if (run.failing.some(isSpecNotRun)) {
+      diff = await fetchChangedFiles(api, id, prNumber, log);
     }
     let specHistory = null;
     if (run.failing.some(isSpecNotRun)) {
@@ -2678,7 +2693,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
     const attempt = Number(id.gh_run_attempt) || 1;
     const rerun = (result.unnamed || result.missing) && attempt <= cfg.rerunAttempts ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
-    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, rerun });
+    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun);
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)

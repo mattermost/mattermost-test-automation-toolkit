@@ -256,6 +256,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
           history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
         }
       }
+    } else if (run.failing.some(isSpecNotRun)) {
+      // A spec that did not run is never cleared while the change edits it (see classifyNotRun).
+      diff = await fetchChangedFiles(api, id, prNumber, log);
     }
     // Specs that did not run are judged by their files' past runs; unreadable history clears none. It asks for every
     // failing file, as fetchHistory does: TSIO counts its run window over the files asked for.
@@ -337,7 +340,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // new attempt is triaged again (see e2e-test-rerun); the last attempt asks a person.
     const attempt = Number(id.gh_run_attempt) || 1;
     const rerun = (result.unnamed || result.missing) && attempt <= cfg.rerunAttempts ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
-    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, rerun });
+    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun);
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);

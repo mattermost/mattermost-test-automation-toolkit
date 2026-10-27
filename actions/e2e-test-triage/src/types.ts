@@ -77,10 +77,10 @@ export interface ThisPRStats {
 }
 
 /** One test's verdict input: the test, its class and reason, and the history statistics behind them. */
-/** One past run of a spec file: it did not run (its placeholder), a test in it failed every try, or it passed. */
+/** One past run of a spec file: it did not run (its placeholder), a test failed every try, every test was skipped, or it passed. */
 export interface SpecRun {
   group_id: string;
-  status: "not_run" | "failed" | "passed";
+  status: "not_run" | "failed" | "skipped" | "passed";
 }
 
 /** Past runs of the specs a stopped Jest process skipped, by file (see fetchSpecRuns). */

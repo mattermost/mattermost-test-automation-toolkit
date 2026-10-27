@@ -30,8 +30,10 @@ export interface EvaluatedRun {
    * and the lane is red for them. Set beside findings when a run has both.
    */
   unnamed?: number;
-  /** Of those placeholders, the specs that never ran (see isSpecNotRun): counted as not run, not failed. */
+  /** Every spec that never ran (see isSpecNotRun): counted as not run, not failed, whether judged or re-run. */
   notRun?: number;
+  /** Of the placeholders, the specs that never ran and are re-run because their history did not clear them. */
+  notRunRerun?: number;
 }
 
 export interface EvaluateParams {
@@ -92,10 +94,18 @@ export async function evaluateRun({
   const result: EvaluatedRun = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg), counts: run.counts, ai: newLedger(), missing: null };
   // A mobile spec that did not run is judged by its own history (see classifyNotRun). One it does not clear is held when
   // its shard's Jest process stopped before it, and re-run, as a placeholder, when its shard sent nothing.
-  const notRunSpecs = run.failing.filter(isSpecNotRun).map((t) => ({ t, f: classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id) }));
+  // Like OWNED_BY_PR: a spec this change edits has to run; unknown when the change list or the test root is.
+  const changedFiles = new Set((diff.files ?? []).map((f: ChangedFile) => f.filename));
+  const editedBy = (file: string): boolean | null => {
+    const path = repoPath(testRoot, file);
+    return diff.ok && path != null ? changedFiles.has(path) : null;
+  };
+  const notRunSpecs = run.failing.filter(isSpecNotRun).map((t) => ({ t, f: classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id, editedBy(t.file)) }));
   const judgedNotRun = notRunSpecs.filter(({ t, f }) => !f.blocking || isSpecStopped(t)).map(({ f }) => f);
   const placeholders = run.failing.length - tests.length - judgedNotRun.length;
   if (placeholders) result.unnamed = placeholders;
+  const notRunRerun = notRunSpecs.length - judgedNotRun.length;
+  if (notRunRerun) result.notRunRerun = notRunRerun;
   const notRun = run.failing.filter(isSpecNotRun).length;
   if (notRun) result.notRun = notRun;
   // A run-level infra call still names each failure, and the model is asked as on any run: the run is red while

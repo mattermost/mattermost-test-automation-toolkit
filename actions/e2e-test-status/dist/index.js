@@ -42,7 +42,7 @@ function redReason(description = "") {
   const notRun = Number(/(\d+) not run\b/.exec(d)?.[1] ?? 0);
   if (missing) parts.push(`${missing} report(s) missing, ${again}`);
   else if (/results incomplete/.test(d)) parts.push(`results incomplete, ${again}`);
-  else if (notRun) parts.push(`${notRun} spec${notRun === 1 ? "" : "s"} did not run, ${again}`);
+  else if (notRun && /re-run(?:ning)? the failed jobs/.test(d) && !parts.length) parts.push(`${notRun} spec${notRun === 1 ? "" : "s"} did not run, ${again}`);
   else if (/re-running the failed jobs/.test(d)) parts.push("re-running the failed jobs");
   else if (/re-run the failed jobs/.test(d)) parts.push("re-run the failed jobs");
   if (/environment errors, re-run/.test(d)) parts.push("environment errors, re-run");

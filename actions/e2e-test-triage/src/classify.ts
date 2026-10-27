@@ -36,10 +36,11 @@ export const isSpecStopped = (t: { title: string; error?: string | null }): bool
 
 /**
  * A mobile spec that did not run, whatever stopped its shard: flaky when it also did not run in another recent run and
- * passed where it ran (at least minTrunkRuns runs, failing in at most 1 of 20); otherwise it blocks. Unreadable history
- * (null) clears nothing.
+ * passed where it ran (at least minTrunkRuns runs, failing in at most 1 of 20), or when it skipped every test in all its
+ * recent runs (nothing was lost). It blocks when this change edits it (`edited`; null when that could not be checked),
+ * and otherwise. Unreadable history (null) clears nothing.
  */
-export function classifyNotRun(test: TestRef, runs: SpecRun[] | null, cfg: Config, groupId: TsioId | null): Finding {
+export function classifyNotRun(test: TestRef, runs: SpecRun[] | null, cfg: Config, groupId: TsioId | null, edited: boolean | null = false): Finding {
   const out = (cls: string, reason: string, blocking: boolean): Finding => ({
     ...test, class: cls, reason, blocking,
     trunk: { runs: 0, fails: 0, flaky: 0, passes: 0, latest: "" },
@@ -49,11 +50,17 @@ export function classifyNotRun(test: TestRef, runs: SpecRun[] | null, cfg: Confi
     this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
   });
   const why = isSpecStopped(test) ? "Did not run: its Jest process stopped before reaching it" : "Did not run: its shard sent no result";
+  if (edited === null) return out("NOT_RUN", `${why}, and whether this change edits it could not be checked.`, true);
+  if (edited) return out("NOT_RUN", `${why}, and this change edits it, so it has to run.`, true);
   if (!runs) return out("NOT_RUN", `${why}, and its history could not be read.`, true);
-  const others = runs.filter((r) => r.group_id !== groupId);
+  // TSIO may send the run's id as a number; history keeps ids as strings.
+  const others = runs.filter((r) => r.group_id !== String(groupId));
   const notRun = others.filter((r) => r.status === "not_run").length;
-  const ran = others.filter((r) => r.status !== "not_run");
+  const ran = others.filter((r) => r.status === "passed" || r.status === "failed");
+  const skipped = others.filter((r) => r.status === "skipped").length;
   const failed = ran.filter((r) => r.status === "failed").length;
+  if (!ran.length && skipped >= cfg.minTrunkRuns)
+    return out("FLAKY_NOT_RUN", `${why}, but it skipped every test in all ${skipped} recent runs where it was reached, so nothing was lost.`, false);
   // A failure in 1 run of 20 or fewer where it ran is the rest of the suite's noise, not this spec breaking.
   if (failed * 20 > ran.length) return out("NOT_RUN", `${why}, and it failed in ${failed} of the ${ran.length} recent runs where it ran.`, true);
   if (ran.length < cfg.minTrunkRuns) return out("NOT_RUN", `${why}, and it ran in only ${ran.length} recent runs (need ${cfg.minTrunkRuns}) to call it intermittent.`, true);
