@@ -2,8 +2,11 @@
 // See LICENSE.txt for license information.
 import type { Env, FetchImpl } from "../../shared/src/github.ts";
 
-/** The marker e2e-test-triage uploads when a lane is red only for jobs that sent no results (see its rerun-attempts). */
-const MARKER = /^e2e-triage-rerun-attempt-(\d+)-(.+)$/;
+/**
+ * The marker e2e-test-triage uploads when a lane is red only for jobs that sent no results: the attempt that asks, the
+ * attempts its rerun-attempts allows in all, and the lane.
+ */
+const MARKER = /^e2e-triage-rerun-attempt-(\d+)-of-(\d+)-(.+)$/;
 
 export interface RerunOptions {
   env: Env;
@@ -33,7 +36,7 @@ export async function requestRerun({ env, fetchImpl = fetch, log = console.log }
   const repo = String(env.REPOSITORY ?? "");
   const runId = String(env.RUN_ID ?? "");
   const attempt = Number(env.RUN_ATTEMPT);
-  const max = Number(env.MAX_ATTEMPTS ?? 3);
+  const max = Number(env.MAX_ATTEMPTS ?? 5);
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) refuse(`repository ${JSON.stringify(repo)} is not owner/name`);
   if (!/^\d+$/.test(runId)) refuse(`run id ${JSON.stringify(runId)} is not a number`);
   if (!Number.isInteger(attempt) || attempt < 1) refuse(`run attempt ${JSON.stringify(env.RUN_ATTEMPT)} is not 1 or more`);
@@ -53,18 +56,19 @@ export async function requestRerun({ env, fetchImpl = fetch, log = console.log }
     artifacts.push(...rows);
     if (!rows.length || artifacts.length >= total) break;
   }
-  const lanes = artifacts
+  const asks = artifacts
     .filter((a) => !a.expired)
     .map((a) => MARKER.exec(a.name))
-    .filter((m): m is RegExpExecArray => m != null && Number(m[1]) === attempt)
-    .map((m) => m[2])
-    .sort();
+    .filter((m): m is RegExpExecArray => m != null && Number(m[1]) === attempt);
+  const lanes = asks.map((m) => m[3]).sort();
+  // The lanes' own limit, and max-attempts as the backstop.
+  const limit = Math.min(max, ...asks.map((m) => Number(m[2])));
   let result: RerunResult;
   if (!lanes.length) result = { rerun: false, reason: `no lane asked for a re-run on attempt ${attempt}` };
-  else if (attempt >= max) result = { rerun: false, reason: `attempt ${attempt} is the last of ${max}; a person re-runs it` };
+  else if (attempt >= limit) result = { rerun: false, reason: `attempt ${attempt} is the last of ${limit}; a person re-runs it` };
   else {
     await call("POST", `/repos/${repo}/actions/runs/${runId}/rerun-failed-jobs`);
-    result = { rerun: true, reason: `re-running the failed jobs for ${lanes.join(", ")} (attempt ${attempt + 1} of ${max})` };
+    result = { rerun: true, reason: `re-running the failed jobs for ${lanes.join(", ")} (attempt ${attempt + 1} of ${limit})` };
   }
   log(`e2e-test-rerun: ${result.reason}`);
   return result;

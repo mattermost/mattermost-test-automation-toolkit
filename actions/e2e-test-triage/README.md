@@ -39,13 +39,13 @@ the failed jobs", after the labels when the run also has real failures:
 `(1 flaky; re-run the failed jobs) 85.7% passed (...)`.
 
 A mobile `spec did not run` row is first judged by its spec file's own runs,
-whatever stopped its shard, and counted as "not run", not failed. It is
-`FLAKY_NOT_RUN` (cleared, and the run can be green) when it also did not run in
-another recent run and passed where it ran (at least `minTrunkRuns` runs, failing
-in at most 1 of 20), or when it skipped every test in all its recent runs. It is
-`NOT_RUN` (blocking) when the change edits it or that can't be checked, or when
-its shard's Jest process stopped before it and its runs do not clear it. A spec
-from a shard that sent nothing, and its runs do not clear, stays a placeholder.
+whatever stopped its shard, and counted as "not run", not failed. It is `NOT_RUN`
+(blocking) when the change edits it, when that can't be checked, or when its
+history can't be read. Otherwise it is `FLAKY_NOT_RUN` (cleared, and the run can be
+green) when it also did not run in another recent run and passed where it ran (at
+least `minTrunkRuns` runs, failing in at most 1 of 20), or when it skipped every
+test in all its recent runs. One its runs do not clear is `NOT_RUN` when its shard's
+Jest process stopped before it, and stays a placeholder when its shard sent nothing.
 
 A failure still blocking whose spec the base branch changed after the PR last
 merged it is **out of date**: the PR ran its old copy of the test (for example
@@ -320,7 +320,8 @@ the check reads "re-running the failed jobs" and triage uploads a marker artifac
 `e2e-test-rerun` action, called from a `workflow_run` listener once the run has
 finished, re-runs the failed jobs, and the new attempt is triaged on its own results.
 The last attempt says "re-run the failed jobs" as before. The `rerun` output says
-whether this run asked.
+whether this run asked, and the marker names the attempts the lane allows in all
+(`rerun-attempts` + 1) for the listener.
 
 ## Step log
 

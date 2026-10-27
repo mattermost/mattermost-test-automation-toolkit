@@ -181,21 +181,22 @@ runs:
         FINDINGS_FILE: ${{ inputs.findings-file }}
         RERUN_ATTEMPTS: ${{ inputs.rerun-attempts }}
       run: node "${{ github.action_path }}/dist/index.js"
-    # The request for a re-run, for e2e-test-rerun: one marker per lane and attempt, named so the listener can tell
-    # this attempt's requests from an earlier one's.
+    # The request for a re-run, for e2e-test-rerun: one marker per lane and attempt, named with the attempt and the
+    # attempts the lane allows in all, so the listener acts on this attempt's requests within the lane's limit.
     - id: marker
       if: ${{ !cancelled() && steps.triage.outputs.rerun == 'true' }}
       shell: bash
       env:
         STATUS_CONTEXT: ${{ inputs.status-context }}
         DESCRIPTION: ${{ steps.triage.outputs.description }}
+        RERUN_OF: ${{ steps.triage.outputs.rerun_of }}
       run: |
         lane=$(printf '%s' "$STATUS_CONTEXT" | tr -c 'A-Za-z0-9._-' '-')
         dir="$RUNNER_TEMP/e2e-triage-rerun"
         mkdir -p "$dir"
         jq -n --arg context "$STATUS_CONTEXT" --arg description "$DESCRIPTION" --arg attempt "$GITHUB_RUN_ATTEMPT" \
           '{status_context: $context, description: $description, attempt: ($attempt | tonumber)}' > "$dir/request.json"
-        echo "name=e2e-triage-rerun-attempt-${GITHUB_RUN_ATTEMPT}-${lane}" >> "$GITHUB_OUTPUT"
+        echo "name=e2e-triage-rerun-attempt-${GITHUB_RUN_ATTEMPT}-of-${RERUN_OF}-${lane}" >> "$GITHUB_OUTPUT"
         echo "path=$dir/request.json" >> "$GITHUB_OUTPUT"
     - if: ${{ !cancelled() && steps.marker.outputs.name != '' }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

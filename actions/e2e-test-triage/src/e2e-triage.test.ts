@@ -3776,6 +3776,7 @@ test("with re-runs allowed, a lane red only for jobs that sent no results asks f
       const id = { ...parsed<CompositeIdentity>(env.COMPOSITE_IDENTITY), name: "mobile-pr-detox-ios", gh_run_attempt: attempt };
       await triage({ env: { ...env, COMPOSITE_IDENTITY: JSON.stringify(id), MODE: "enforce", RERUN_ATTEMPTS: "1", TRIAGE_CONTEXT: "off", GITHUB_OUTPUT: outputPath }, fetchImpl, log: () => {} });
       assert.match(readFileSync(outputPath, "utf8"), new RegExp(`^rerun=${expected}$`, "m"), `attempt ${attempt}`);
+      if (expected === "true") assert.match(readFileSync(outputPath, "utf8"), /^rerun_of=2$/m, "the marker carries the lane's limit to the listener");
       const description = statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => s.description)[0];
       assert.match(String(description), expected === "true" ? /^\(re-running the failed jobs\) / : /^\(re-run the failed jobs\) /, `attempt ${attempt}`);
     });

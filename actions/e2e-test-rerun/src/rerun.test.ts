@@ -26,14 +26,14 @@ const posts = (calls: Call[]) => calls.filter((c) => c.method === "POST").length
 
 test("a lane's request for this attempt re-runs the run's failed jobs once, whatever the number of lanes asking", async () => {
   // mattermost-mobile run 40301634711: detox-ios's shard machine-1 died on npm ci, so two specs never ran.
-  const gh = github([{ name: "e2e-triage-rerun-attempt-1-e2e-test-detox-ios" }, { name: "e2e-triage-rerun-attempt-1-e2e-test-detox-android" }, { name: "jest-results-1" }]);
+  const gh = github([{ name: "e2e-triage-rerun-attempt-1-of-3-e2e-test-detox-ios" }, { name: "e2e-triage-rerun-attempt-1-of-3-e2e-test-detox-android" }, { name: "jest-results-1" }]);
   const result = await requestRerun({ env: env("1"), fetchImpl: gh.fetchImpl, log: () => {} });
   assert.deepEqual(result, { rerun: true, reason: "re-running the failed jobs for e2e-test-detox-android, e2e-test-detox-ios (attempt 2 of 3)" });
   assert.equal(posts(gh.calls), 1);
 });
 
 test("an earlier attempt's request, an expired one, or none at all re-runs nothing", async () => {
-  for (const artifacts of [[{ name: "e2e-triage-rerun-attempt-1-e2e-test-detox-ios" }], [{ name: "e2e-triage-rerun-attempt-2-e2e-test-detox-ios", expired: true }], [{ name: "jest-results-1" }]]) {
+  for (const artifacts of [[{ name: "e2e-triage-rerun-attempt-1-of-3-e2e-test-detox-ios" }], [{ name: "e2e-triage-rerun-attempt-2-of-3-e2e-test-detox-ios", expired: true }], [{ name: "jest-results-1" }]]) {
     const gh = github(artifacts);
     const result = await requestRerun({ env: env("2"), fetchImpl: gh.fetchImpl, log: () => {} });
     assert.deepEqual(result, { rerun: false, reason: "no lane asked for a re-run on attempt 2" }, JSON.stringify(artifacts));
@@ -42,13 +42,22 @@ test("an earlier attempt's request, an expired one, or none at all re-runs nothi
 });
 
 test("requests are read from every page of the run's artifacts", async () => {
-  const gh = github([{ name: "a" }, { name: "b" }, { name: "e2e-triage-rerun-attempt-1-e2e-test-detox-ios" }], 3);
+  const gh = github([{ name: "a" }, { name: "b" }, { name: "e2e-triage-rerun-attempt-1-of-3-e2e-test-detox-ios" }], 3);
   assert.equal((await requestRerun({ env: env("1"), fetchImpl: gh.fetchImpl, log: () => {} })).rerun, true);
+});
+
+test("the marker carries the lane's own limit, so the listener re-runs every attempt rerun-attempts allows", async () => {
+  // rerun-attempts 3: four attempts in all; attempt 3 asks, and is re-run.
+  const third = github([{ name: "e2e-triage-rerun-attempt-3-of-4-e2e-test-detox-ios" }]);
+  assert.deepEqual(await requestRerun({ env: env("3", { MAX_ATTEMPTS: "5" }), fetchImpl: third.fetchImpl, log: () => {} }), { rerun: true, reason: "re-running the failed jobs for e2e-test-detox-ios (attempt 4 of 4)" });
+  // A marker for its own last attempt is not acted on.
+  const last = github([{ name: "e2e-triage-rerun-attempt-4-of-4-e2e-test-detox-ios" }]);
+  assert.deepEqual(await requestRerun({ env: env("4", { MAX_ATTEMPTS: "5" }), fetchImpl: last.fetchImpl, log: () => {} }), { rerun: false, reason: "attempt 4 is the last of 4; a person re-runs it" });
 });
 
 test("the last attempt the repo allows is never re-run, whatever triage asked", async () => {
   // A backstop: triage stops asking on its own last attempt; a misconfigured lane must not loop.
-  const gh = github([{ name: "e2e-triage-rerun-attempt-3-e2e-test-detox-ios" }]);
+  const gh = github([{ name: "e2e-triage-rerun-attempt-3-of-9-e2e-test-detox-ios" }]);
   const result = await requestRerun({ env: env("3"), fetchImpl: gh.fetchImpl, log: () => {} });
   assert.deepEqual(result, { rerun: false, reason: "attempt 3 is the last of 3; a person re-runs it" });
   assert.equal(posts(gh.calls), 0);

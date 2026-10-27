@@ -15,8 +15,10 @@ inputs:
     description: Its attempt (github.event.workflow_run.run_attempt)
     required: true
   max-attempts:
-    description: Attempts a run may reach, the first included; the last one is never re-run whatever triage asked. A backstop for rerun-attempts
-    default: "3"
+    description: >-
+      Attempts a run may reach, the first included, whatever triage asked. The marker carries each lane's own limit
+      (rerun-attempts + 1); this is the backstop above it, so rerun-attempts above max-attempts - 1 is capped
+    default: "5"
 outputs:
   rerun:
     description: Whether the failed jobs were re-run

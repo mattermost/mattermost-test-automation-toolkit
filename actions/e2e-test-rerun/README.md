@@ -7,8 +7,8 @@ attempt exists. The jobs that depend on them, triage included, run again, so the
 results. GitHub only re-runs a finished run, which is why this runs from a `workflow_run` listener and not from
 triage itself.
 
-The run's last attempt is never re-run: triage stops asking once `rerun-attempts` is used up, and `max-attempts`
-is the backstop.
+The run's last attempt is never re-run: the marker carries the lane's limit (`rerun-attempts` + 1), and
+`max-attempts` (default 5) is the backstop above it.
 
 ```yaml
 name: E2E re-run

@@ -2704,6 +2704,7 @@ blocking=${flag ? run.counts.failed : result.findings.filter((f) => f.blocking).
 exonerated=${result.findings.filter((f) => !f.blocking).length}
 description=${description}
 rerun=${Boolean(rerun)}
+rerun_of=${rerun?.of ?? ""}
 ai_calls=${spend.calls}
 ai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}
 ai_input_tokens=${spend.input_tokens}
