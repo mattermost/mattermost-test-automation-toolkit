@@ -3932,6 +3932,25 @@ test("end to end, a skipped spec with an intermittent history turns the lane gre
   });
 });
 
+test("a lane a named test already blocks asks for no re-run, though a shard beside it sent nothing", async () => {
+  await inTmp(async (dir) => {
+    const outputPath = join(dir, "o.txt");
+    const fetchImpl = fakeFetch([
+      ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+      ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }, { id: "s2", file_path: SILENT.file }] })],
+      ["/reports/g1/cases", () => Response.json([...spec("t1", "failed"), { suite_id: "s2", title: SILENT.title, status: "failed", retry_count: 0, ordinal: 1, error_message: SILENT.error, error_stack: null }])],
+      ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
+      ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+      ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+      ["/statuses/abc", () => Response.json({})],
+    ]);
+    const result = await triage({ env: { ...env, ANTHROPIC_API_KEY: "", RERUN_ATTEMPTS: "1", TRIAGE_CONTEXT: "off", GITHUB_OUTPUT: outputPath }, fetchImpl, log: () => {}, wait: { attempts: 1, ms: 0 } });
+    assert.equal(result.unnamed, 1, "the silent shard's spec is still a placeholder");
+    assert.ok(result.findings.some((f) => f.blocking), "t1 blocks");
+    assert.match(readFileSync(outputPath, "utf8"), /^rerun=false$/m);
+  });
+});
+
 test("placeholders beside a test still put their specs in the history query: TSIO's run window is counted over the files asked for", async () => {
   // Dropping a placeholder's spec moves the window back to older runs of the real test, so its evidence would change.
   const sent: HistoryBody[] = [];

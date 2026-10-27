@@ -2688,7 +2688,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
     const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
     const attempt = Number(id.gh_run_attempt) || 1;
-    const rerun = (result.unnamed || result.missing) && attempt <= cfg.rerunAttempts ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
+    const onlyNoResults = (result.unnamed || result.missing) && !result.findings.some((f) => f.blocking);
+    const rerun = onlyNoResults && attempt <= cfg.rerunAttempts ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun);
     const flag = activeFlag(result.infra, result.findings);

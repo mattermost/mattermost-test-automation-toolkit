@@ -336,10 +336,12 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
     // Nothing failed and every report arrived, yet the lane is red: a job outside the tests failed. Its own status says so.
     const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
-    // Placeholders and missing reports are no test's result. Within the repo's allowance the failed jobs are re-run, and the
-    // new attempt is triaged again (see e2e-test-rerun); the last attempt asks a person.
+    // A lane red only for placeholders and missing reports, no test's result. Within the repo's allowance the failed jobs
+    // are re-run, and the new attempt is triaged again (see e2e-test-rerun); the last attempt asks a person. A lane a test
+    // already blocks is not re-run: the re-run would not turn it green.
     const attempt = Number(id.gh_run_attempt) || 1;
-    const rerun = (result.unnamed || result.missing) && attempt <= cfg.rerunAttempts ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
+    const onlyNoResults = (result.unnamed || result.missing) && !result.findings.some((f) => f.blocking);
+    const rerun = onlyNoResults && attempt <= cfg.rerunAttempts ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun);
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
