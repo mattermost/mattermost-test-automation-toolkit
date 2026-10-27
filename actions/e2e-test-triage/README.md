@@ -38,14 +38,15 @@ not make the run an `INFRA` run. The lane stays red and the check says "re-run
 the failed jobs", after the labels when the run also has real failures:
 `(1 flaky; re-run the failed jobs) 85.7% passed (...)`.
 
-A mobile `spec did not run` row is first judged by its spec file's own runs,
-whatever stopped its shard, and counted as "not run", not failed. It is `NOT_RUN`
-(blocking) when the change edits it, when that can't be checked, or when its
-history can't be read. Otherwise it is `FLAKY_NOT_RUN` (cleared, and the run can be
-green) when it also did not run in another recent run and passed where it ran (at
-least `minTrunkRuns` runs, failing in at most 1 of 20), or when it skipped every
-test in all its recent runs. One its runs do not clear is `NOT_RUN` when its shard's
-Jest process stopped before it, and stays a placeholder when its shard sent nothing.
+A mobile `spec did not run` row is counted as "not run", not failed. When no spec
+of its shard reported (the shard ran or uploaded nothing), or the row does not say,
+it stays a placeholder and the shard is re-run. When other specs of its shard
+reported (its Jest process stopped before reaching it), it is judged by its spec
+file's own runs: `NOT_RUN` (blocking) when the change edits it, when that can't be
+checked, or when its history can't be read. Otherwise it is `FLAKY_NOT_RUN`
+(cleared, and the run can be green) when it also did not run in another recent run
+and passed where it ran (at least `minTrunkRuns` runs, failing in at most 1 of 20),
+or when it skipped every test in all its recent runs, and `NOT_RUN` when not.
 
 A failure still blocking whose spec the base branch changed after the PR last
 merged it is **out of date**: the PR ran its old copy of the test (for example

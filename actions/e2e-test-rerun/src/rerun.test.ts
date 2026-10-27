@@ -1,7 +1,12 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import type { FetchImpl } from "../../shared/src/github.ts";
 import { requestRerun } from "./rerun.ts";
 
@@ -68,5 +73,24 @@ test("a run id, attempt, repository or limit that is not what GitHub sends is re
     const gh = github([]);
     await assert.rejects(requestRerun({ env: env("1", over), fetchImpl: gh.fetchImpl, log: () => {} }), /e2e-test-rerun:/, JSON.stringify(over));
     assert.equal(gh.calls.length, 0);
+  }
+});
+
+test("the marker e2e-test-triage's action uploads is one this action acts on: names agree end to end", async () => {
+  // Run the marker step exactly as triage's action.yml has it, and hand the artifact name it writes to the listener.
+  const action = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../e2e-test-triage/action.yml"), "utf8");
+  const step = action.slice(action.indexOf("- id: marker"));
+  const script = step.slice(step.indexOf("run: |") + "run: |".length, step.indexOf("\n    - ")).split("\n").map((l) => l.replace(/^ {8}/, "")).join("\n");
+  const dir = mkdtempSync(join(tmpdir(), "rerun-marker-"));
+  try {
+    const output = join(dir, "output");
+    writeFileSync(output, "");
+    execFileSync("bash", ["-e", "-c", script], { env: { ...process.env, STATUS_CONTEXT: "e2e-test/detox-ios", DESCRIPTION: "(re-running the failed jobs) 615 passed", RERUN_OF: "2", GITHUB_RUN_ATTEMPT: "1", RUNNER_TEMP: dir, GITHUB_OUTPUT: output } });
+    const name = /^name=(.*)$/m.exec(readFileSync(output, "utf8"))?.[1] ?? "";
+    assert.equal(name, "e2e-triage-rerun-attempt-1-of-2-e2e-test-detox-ios");
+    const gh = github([{ name }]);
+    assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl: gh.fetchImpl, log: () => {} }), { rerun: true, reason: "re-running the failed jobs for e2e-test-detox-ios (attempt 2 of 2)" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

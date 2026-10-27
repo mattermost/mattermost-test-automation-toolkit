@@ -3844,18 +3844,18 @@ test("a spec whose Jest process stopped before it is flaky when it also did not 
   const blocked = (statuses: string[]) => classifyNotRun(STOPPED, specRuns(statuses), DEFAULTS, "g1");
   assert.match(blocked(Array(8).fill("passed")).reason, /which it has not done in the last 8 runs/, "first time");
   assert.match(blocked(["not_run", "failed", ...Array(6).fill("passed")]).reason, /it failed in 1 of the 7 recent runs where it ran/);
-  // mattermost-mobile#10267: mm_blocks_ephemeral did not run in 1 other run and failed once in 96 runs where it ran.
-  const rare = classifyNotRun(SILENT, specRuns(["not_run", "failed", ...Array(95).fill("passed")]), DEFAULTS, "g1");
+  // One failure in 96 runs where it ran (mm_blocks_ephemeral's history) is still passing.
+  const rare = classifyNotRun(STOPPED, specRuns(["not_run", "failed", ...Array(95).fill("passed")]), DEFAULTS, "g1");
   assert.deepEqual([rare.class, rare.blocking], ["FLAKY_NOT_RUN", false], "one failure in 96 is still passing");
-  assert.match(rare.reason, /^Did not run: its shard sent no result, as it did in 1 of the last 97 runs; it passed in 95 of the 96 where it ran\./);
+  assert.match(rare.reason, /^Did not run: its Jest process stopped before reaching it, as it did in 1 of the last 97 runs; it passed in 95 of the 96 where it ran\./);
   assert.match(blocked(["not_run", "passed", "passed"]).reason, /it ran in only 2 recent runs/);
   for (const f of [blocked(Array(8).fill("passed")), classifyNotRun(STOPPED, null, DEFAULTS, "g1")]) assert.deepEqual([f.class, f.blocking], ["NOT_RUN", true]);
   assert.equal(classifyNotRun(STOPPED, [{ group_id: "g1", status: "not_run" }, ...specRuns(Array(6).fill("passed"))], DEFAULTS, "g1").class, "NOT_RUN", "this run is not its own history");
   assert.equal(classifyNotRun(STOPPED, [{ group_id: "7", status: "not_run" }, ...specRuns(Array(6).fill("passed"))], DEFAULTS, 7).class, "NOT_RUN", "nor when TSIO sends its id as a number");
   // A run where every test was skipped is not a pass: 3 passes and 10 skipped runs are 3 runs, too few.
   assert.match(blocked(["not_run", ...Array(3).fill("passed"), ...Array(10).fill("skipped")]).reason, /it ran in only 3 recent runs/);
-  // mattermost-mobile#10267: mm_blocks_incoming_webhook skips every test on CI (no stable webhook ingress), so missing it loses nothing.
-  const alwaysSkipped = classifyNotRun(SILENT, specRuns(["not_run", ...Array(96).fill("skipped")]), DEFAULTS, "g1");
+  // mm_blocks_incoming_webhook skips every test on CI (no stable webhook ingress), so missing it loses nothing.
+  const alwaysSkipped = classifyNotRun(STOPPED, specRuns(["not_run", ...Array(96).fill("skipped")]), DEFAULTS, "g1");
   assert.deepEqual([alwaysSkipped.class, alwaysSkipped.blocking], ["FLAKY_NOT_RUN", false]);
   assert.match(alwaysSkipped.reason, /it skipped every test in all 96 recent runs where it was reached, so nothing was lost/);
   // A spec this change edits has to run, and one whose change list could not be read is not cleared either.
@@ -3882,7 +3882,7 @@ test("a spec's runs are read from the whole file: not run where its placeholder 
   assert.deepEqual(history.byFile.get(MOBILE_STUB.file)!.map((r) => [r.group_id, r.status]), [["g1", "not_run"], ["g2", "passed"], ["g3", "failed"], ["g4", "passed"], ["g6", "skipped"], ["g7", "failed"]], "another lane's run is not this lane's history, and a run where every test was skipped is no pass");
 });
 
-test("a lane whose only failures are specs that did not run is green when they are flaky that way, and is not re-run for them", async () => {
+test("a lane whose only failures are specs a stopped Jest process skipped is green when they are flaky that way; a silent shard is re-run", async () => {
   const history = specRuns(["not_run", ...Array(6).fill("passed")]);
   const counts = { total: 634, passed: 615, failed: 1, flaky: 0, skipped: 17 };
   const result = await evaluate({ ...runOf([STOPPED]), counts }, { specHistory: { byFile: new Map([[STOPPED.file, history]]), truncated: false } });
@@ -3890,10 +3890,12 @@ test("a lane whose only failures are specs that did not run is green when they a
   assert.equal(result.unnamed, undefined, "not a placeholder to re-run");
   assert.equal(result.notRun, 1);
   assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts, null, result.unnamed ?? 0, result.notRun ?? 0), "(1 flaky) 615 passed, 0 failed, 1 not run, 17 skipped");
-  const silent = await evaluate({ ...runOf([SILENT]), counts }, { specHistory: { byFile: new Map([[SILENT.file, history]]), truncated: false } });
-  assert.deepEqual([silent.verdict, silent.findings.map((f) => f.class)], ["SUCCESS", ["FLAKY_NOT_RUN"]], "a shard that sent nothing is judged the same way");
-  const firstTime = await evaluate({ ...runOf([SILENT]), counts }, { specHistory: { byFile: new Map([[SILENT.file, specRuns(Array(6).fill("passed"))]]), truncated: false } });
-  assert.deepEqual([firstTime.verdict, firstTime.unnamed, firstTime.findings.length], ["FAILURE", 1, 0], "one the history does not clear is re-run, as a placeholder");
+  // A shard that sent nothing ran none of its specs: it is re-run, whatever their history says. So is an old-wording
+  // placeholder, which cannot say which it was.
+  for (const t of [SILENT, MOBILE_STUB]) {
+    const silent = await evaluate({ ...runOf([t]), counts }, { specHistory: { byFile: new Map([[t.file, history]]), truncated: false } });
+    assert.deepEqual([silent.verdict, silent.unnamed, silent.notRunRerun, silent.findings.length], ["FAILURE", 1, 1, 0], t.error);
+  }
   const edited = await evaluate({ ...runOf([STOPPED]), counts }, { specHistory: { byFile: new Map([[STOPPED.file, history]]), truncated: false }, diff: { files: [{ filename: STOPPED.file }], ok: true } });
   assert.deepEqual([edited.verdict, edited.findings[0].class], ["FAILURE", "NOT_RUN"], "a spec the PR edits is held");
   const truncated = await evaluate({ ...runOf([STOPPED]), counts }, { specHistory: { byFile: new Map([[STOPPED.file, history]]), truncated: true } });

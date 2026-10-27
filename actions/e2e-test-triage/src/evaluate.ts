@@ -92,19 +92,18 @@ export async function evaluateRun({
   // nothing to show the model. The run is red for it: it is counted, and not classified, asked or flagged.
   const tests = run.failing.filter((t) => !isShardPlaceholder(t));
   const result: EvaluatedRun = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg), counts: run.counts, ai: newLedger(), missing: null };
-  // A mobile spec that did not run is judged by its own history (see classifyNotRun). One it does not clear is held when
-  // its shard's Jest process stopped before it, and re-run, as a placeholder, when its shard sent nothing.
+  // A shard that sent nothing ran none of its specs: they stay placeholders and the shard is re-run. A spec its shard's
+  // Jest process stopped before (the shard ran) is judged by its own history (see classifyNotRun), never re-run for.
   // Like OWNED_BY_PR: a spec this change edits has to run; unknown when the change list or the test root is.
   const changedFiles = new Set((diff.files ?? []).map((f: ChangedFile) => f.filename));
   const editedBy = (file: string): boolean | null => {
     const path = repoPath(testRoot, file);
     return diff.ok && path != null ? changedFiles.has(path) : null;
   };
-  const notRunSpecs = run.failing.filter(isSpecNotRun).map((t) => ({ t, f: classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id, editedBy(t.file)) }));
-  const judgedNotRun = notRunSpecs.filter(({ t, f }) => !f.blocking || isSpecStopped(t)).map(({ f }) => f);
+  const judgedNotRun = run.failing.filter(isSpecStopped).map((t) => classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id, editedBy(t.file)));
   const placeholders = run.failing.length - tests.length - judgedNotRun.length;
   if (placeholders) result.unnamed = placeholders;
-  const notRunRerun = notRunSpecs.length - judgedNotRun.length;
+  const notRunRerun = run.failing.filter((t) => isSpecNotRun(t) && !isSpecStopped(t)).length;
   if (notRunRerun) result.notRunRerun = notRunRerun;
   const notRun = run.failing.filter(isSpecNotRun).length;
   if (notRun) result.notRun = notRun;

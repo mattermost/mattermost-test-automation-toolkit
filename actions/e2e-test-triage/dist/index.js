@@ -1989,11 +1989,10 @@ async function evaluateRun({
     const path = repoPath(testRoot, file);
     return diff.ok && path != null ? changedFiles.has(path) : null;
   };
-  const notRunSpecs = run.failing.filter(isSpecNotRun).map((t) => ({ t, f: classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id, editedBy(t.file)) }));
-  const judgedNotRun = notRunSpecs.filter(({ t, f }) => !f.blocking || isSpecStopped(t)).map(({ f }) => f);
+  const judgedNotRun = run.failing.filter(isSpecStopped).map((t) => classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id, editedBy(t.file)));
   const placeholders = run.failing.length - tests.length - judgedNotRun.length;
   if (placeholders) result.unnamed = placeholders;
-  const notRunRerun = notRunSpecs.length - judgedNotRun.length;
+  const notRunRerun = run.failing.filter((t) => isSpecNotRun(t) && !isSpecStopped(t)).length;
   if (notRunRerun) result.notRunRerun = notRunRerun;
   const notRun = run.failing.filter(isSpecNotRun).length;
   if (notRun) result.notRun = notRun;
@@ -2611,11 +2610,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
           history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
         }
       }
-    } else if (run.failing.some(isSpecNotRun)) {
+    } else if (run.failing.some(isSpecStopped)) {
       diff = await fetchChangedFiles(api, id, prNumber, log);
     }
     let specHistory = null;
-    if (run.failing.some(isSpecNotRun)) {
+    if (run.failing.some(isSpecStopped)) {
       try {
         specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, run.failing.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), reportName);
       } catch (e) {

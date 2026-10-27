@@ -8,7 +8,7 @@ import { laneName, laneSummary } from "../../shared/src/lane.ts";
 import { readStatuses, statusPublisher } from "../../shared/src/status.ts";
 import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, SupersededRunError, tsioBase } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.ts";
-import { isShardPlaceholder, isSpecNotRun } from "./classify.ts";
+import { isShardPlaceholder, isSpecNotRun, isSpecStopped } from "./classify.ts";
 import { configFrom, DEFAULTS, historyLane, PR_SPEND_KEY } from "./config.ts";
 import { loadEvidence } from "./evidence.ts";
 import { fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markOutOfDate, trunkRunsOn } from "./history.ts";
@@ -256,14 +256,14 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
           history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
         }
       }
-    } else if (run.failing.some(isSpecNotRun)) {
-      // A spec that did not run is never cleared while the change edits it (see classifyNotRun).
+    } else if (run.failing.some(isSpecStopped)) {
+      // A skipped spec is never cleared while the change edits it (see classifyNotRun).
       diff = await fetchChangedFiles(api, id, prNumber, log);
     }
-    // Specs that did not run are judged by their files' past runs; unreadable history clears none. It asks for every
-    // failing file, as fetchHistory does: TSIO counts its run window over the files asked for.
+    // Specs a stopped Jest process skipped are judged by their files' past runs; unreadable history clears none. It asks
+    // for every failing file, as fetchHistory does: TSIO counts its run window over the files asked for.
     let specHistory: SpecHistory | null = null;
-    if (run.failing.some(isSpecNotRun)) {
+    if (run.failing.some(isSpecStopped)) {
       try {
         specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, run.failing.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), reportName);
       } catch (e) {

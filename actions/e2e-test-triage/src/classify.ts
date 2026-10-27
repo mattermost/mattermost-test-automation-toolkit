@@ -35,10 +35,10 @@ export const isSpecStopped = (t: { title: string; error?: string | null }): bool
   isSpecNotRun(t) && /its Jest process stopped before reaching this spec/.test(String(t.error ?? ""));
 
 /**
- * A mobile spec that did not run, whatever stopped its shard: flaky when it also did not run in another recent run and
- * passed where it ran (at least minTrunkRuns runs, failing in at most 1 of 20), or when it skipped every test in all its
- * recent runs (nothing was lost). It blocks when this change edits it (`edited`; null when that could not be checked),
- * and otherwise. Unreadable history (null) clears nothing.
+ * A mobile spec its shard's Jest process stopped before (see isSpecStopped): flaky when it also did not run in another
+ * recent run and passed where it ran (at least minTrunkRuns runs, failing in at most 1 of 20), or when it skipped every
+ * test in all its recent runs (nothing was lost). It blocks when this change edits it (`edited`; null when that could
+ * not be checked), and otherwise. Unreadable history (null) clears nothing. A shard that sent nothing is re-run instead.
  */
 export function classifyNotRun(test: TestRef, runs: SpecRun[] | null, cfg: Config, groupId: TsioId | null, edited: boolean | null = false): Finding {
   const out = (cls: string, reason: string, blocking: boolean): Finding => ({
