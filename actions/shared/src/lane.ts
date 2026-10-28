@@ -86,7 +86,8 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = []): 
   const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
   const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
   const waiting = seen.filter((l) => l.status.state === "pending");
-  if (waiting.length) return { state: "pending", description: [`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`, otherText].filter(Boolean).join(" · ") };
+  // A red check triage does not cover is named first: the 140-character status cuts the waiting lanes, never its name.
+  if (waiting.length) return { state: "pending", description: [otherText, `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`].filter(Boolean).join(" · ") };
   const red = seen.filter((l) => l.status.state !== "success");
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";

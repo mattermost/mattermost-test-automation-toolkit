@@ -4626,7 +4626,7 @@ test("a release run asks its own question, allows only its causes, and is keyed 
   assert.equal(bodies[0].system, SYSTEM_RELEASE);
   assert.deepEqual(bodies[0].output_config.format.schema.properties.answers?.items.properties.cause?.enum, ["app_bug", "test_bug", "flaky_environment", "server_compat"]);
   const text = contentText(bodies[0].messages[0].content);
-  assert.match(text, /"release":\{"id":"release","branch":"v6\.3\.2-rc\.2","base":"master","history_branch":"master"\}/);
+  assert.match(text, /"release":\{"id":"release","branch":"v6\.3\.2-rc\.2","base":"master","history_branch":"master","server":"11\.11\.3"\}/, "each finding carries its lane's server version");
   assert.doesNotMatch(text, /"pr":|diff_hunks/);
   assert.equal((res.answers[0] as Answer).cause, "test_bug");
   assert.throws(() => parseAnswer(JSON.stringify({ cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "x" }), ["app_bug", "test_bug", "flaky_environment", "server_compat"]), /unknown cause/);
@@ -4680,4 +4680,28 @@ test("a row names at most three other lanes, then how many more", () => {
   assert.match(text, /Also failed on a, b, c and 2 more in this run/);
   const four = renderSummary({ findings: [finding({ title: "t1", file: "specs/a.spec.ts", other_lanes: lanes.slice(0, 4) })], counts: { failed: 1, passed: 9 }, runURL: "u", trunkBranch: "master" });
   assert.match(four, /Also failed on a, b, c, d in this run/);
+});
+
+test("a timeout is broken on trunk only stuck at the step trunk's streak is stuck at; a bare one never is", () => {
+  const stuck = (selector: string): string => `Error: locator.click: Timeout 15000ms exceeded.\nCall log:\n  - waiting for locator('${selector}')`;
+  const broken = (excerpt: string): Observation[] => [obs({ status: "failed", commit_sha: "b1", error_excerpt: excerpt }), obs({ status: "failed", commit_sha: "b2", error_excerpt: excerpt }), ...trunkPasses(6)];
+  assert.equal(classify({ ...failing, error: stuck("#save") }, broken(stuck("#save")), []).class, "BROKEN_ON_TRUNK");
+  const other = classify({ ...failing, error: stuck("#save") }, broken(stuck("#cancel")), []);
+  assert.deepEqual([other.class, other.blocking], ["REGRESSION", true]);
+  assert.match(other.reason, /^Trunk fails this test too, but never stuck at this step; there it failed with "Error: locator\.click: Timeout 15000ms exceeded\."/);
+  const bare = classify({ ...failing, error: "Test timeout of 60000ms exceeded." }, broken("Test timeout of 60000ms exceeded."), []);
+  assert.deepEqual([bare.class, bare.blocking], ["REGRESSION", true], "a timeout that names no step is not shown to be trunk's");
+  // A per-run id in the step (a Cypress post id) is the same step.
+  const post = (id: string): string => `AssertionError: Timed out retrying after 30000ms: Expected to find element: \`#CENTER_actions_button_${id}\`, but never found it.`;
+  assert.equal(classify({ ...failing, error: post("a".repeat(26)) }, broken(post("b".repeat(26))), []).class, "BROKEN_ON_TRUNK");
+});
+
+test("a failure trunk fixed that this branch has the fix for is read for ownership as any regression", async () => {
+  const run = runOf([{ title: "t1", file: "specs/a.spec.ts", error: stuckTest.error }]);
+  const history = new Map([[identityKey(run.failing[0]), fixedOnTrunkHistory()]]);
+  const fixedHere = async (fs: Finding[]): Promise<void> => { for (const f of fs) Object.assign(f, { class: "REGRESSION" }); };
+  const named = await evaluate(run, { history, ask: null, diff: { files: [{ filename: "webapp/components/post/actions_button.tsx" }], ok: true }, fixedOnTrunk: fixedHere });
+  assert.deepEqual([named.findings[0].class, named.findings[0].untouched], ["REGRESSION", false], "the PR changes a file its error names");
+  const clean = await evaluate(run, { history, ask: null, diff: { files: [{ filename: "app/other.ts" }], ok: true }, fixedOnTrunk: fixedHere });
+  assert.equal(clean.findings[0].untouched, true);
 });

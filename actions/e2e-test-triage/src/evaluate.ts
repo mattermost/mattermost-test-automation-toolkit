@@ -210,6 +210,8 @@ export async function evaluateRun({
         log(`base branch commits unavailable: ${String(e).slice(0, 200)}`);
         for (const f of fixed) Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} Whether this branch has that fix could not be checked.` });
       }
+      // One the branch has the fix for is a REGRESSION now: whether the PR touches it is read as for any other.
+      for (const f of fixed) if (diff.ok && f.class === "REGRESSION" && f.untouched === undefined) f.untouched = !changed.some((name) => namesChangedFile(f, name));
     }
     // Tests broken on the base branch: what merged between their last pass and first failure.
     if (!blind && brokeBy) {

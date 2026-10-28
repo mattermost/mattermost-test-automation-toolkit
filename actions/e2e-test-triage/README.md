@@ -21,7 +21,7 @@ reads its recent history on the PR's base branch and on other PRs:
 | `INFRA` | Mostly infrastructure errors, or 30+ failures | Each failure is judged as on any run; `ACTION_REQUIRED` while any still blocks |
 | `OWNED_BY_PR` | The PR changed the failing spec | Blocking, never sent to the model |
 | `INFRA_ERROR` | The test's own error is its environment (test server down, a proxy page instead of JSON) | Cleared with `infra-clears: true` (held on an `INFRA` run), otherwise blocking unless the model clears it |
-| `BROKEN_ON_TRUNK` | Master's latest run fails it too | Cleared |
+| `BROKEN_ON_TRUNK` | Master's latest run fails it too, the same way (see below) | Cleared |
 | `FLAKY_ON_TRUNK` | It is intermittent on master (see below) | Cleared |
 | `FLAKY_CROSS_PR` | 3+ other PRs fail it with the same error, and master passes it | Cleared |
 | `REGRESSION`, `INSUFFICIENT_DATA` | History can't clear it | Blocking, unless the model clears it with evidence |
@@ -70,15 +70,18 @@ a failure with an error to compare (a distinctive error, or a timeout's stuck
 step) needs a master failure with that error (Mattermost's 26-character ids
 masked). One master only failed another
 way, or with nothing to compare (a hook timeout, no error), is a `REGRESSION`
-for the model to judge. `BROKEN_ON_TRUNK` needs the same when every failure of
-master's current streak has an error to compare. **Other PRs:** the last 200 PR
+for the model to judge. `BROKEN_ON_TRUNK` needs the same: a timeout must be stuck
+at the step master's current streak is stuck at (a bare timeout, which names no
+step, never is), and a distinctive error must not differ from every error of the
+streak. **Other PRs:** the last 200 PR
 runs. These are starting values, set before any data was collected; the 7-week
 replay found no wrong clear with them.
 
-**Storm runs' failures are left out of history:** a past run where 30 or more
-tests failed, and at least a tenth of its tests (TSIO counts a run over all its
-reports: every OS of a desktop run, and retests), failed on its environment or a
-shared break, and its failures say nothing about one test. Before the rules run,
+**Storm runs' failures are left out of history:** a past run is a storm by count
+alone: 30 or more tests failed, and at least a tenth of its tests (TSIO counts a
+run over all its reports: every OS of a desktop run, and retests). The reason for
+the bar: that many failures in one run usually mean its environment or a shared
+break failed, so they say little about one test. Before the rules run,
 each other run with a failed try in the history is read once, newest first (at
 most 100, within 30 seconds); a storm's failed tries are left out, and so are
 those of a run that can't be read in time. Kept: a pass in a storm, this PR's own

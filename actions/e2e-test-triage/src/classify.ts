@@ -232,6 +232,15 @@ export function classify(
     return out("REGRESSION", `New on trunk: passed in all ${trunk.length} previous runs.`, true);
   }
   if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status)) {
+    // A timeout is trunk's break only stuck at the same step (ids masked), as the flaky rule compares it; one that names
+    // no step can't be shown to be the same failure.
+    if (ownKey.kind === "stuck" || ownKey.kind === "bare") {
+      const rows = trunk.slice(0, streak);
+      if (ownKey.kind === "bare" || !rows.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
+        const there = rows.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
+        return out("REGRESSION", `Trunk fails this test too, but ${ownKey.kind === "bare" ? "this timeout names no step to compare" : "never stuck at this step"}${there ? `; there it failed with "${there.slice(0, 160)}"` : ""}; this one may be the PR's.`, true);
+      }
+    }
     const trunkError = otherError(trunk.slice(0, streak));
     if (trunkError)
       return out("REGRESSION", `Trunk fails this test too, but with another error ("${trunkError.slice(0, 160)}"); this one may be the PR's.`, true);

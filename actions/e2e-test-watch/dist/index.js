@@ -1159,7 +1159,7 @@ function laneSummary(lanes, untriaged = []) {
   const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
   const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
   const waiting = seen.filter((l) => l.status.state === "pending");
-  if (waiting.length) return { state: "pending", description: [`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`, otherText].filter(Boolean).join(" \xB7 ") };
+  if (waiting.length) return { state: "pending", description: [otherText, `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`].filter(Boolean).join(" \xB7 ") };
   const red = seen.filter((l) => l.status.state !== "success");
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
@@ -1423,6 +1423,13 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
     return out("REGRESSION", `New on trunk: passed in all ${trunk.length} previous runs.`, true);
   }
   if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status)) {
+    if (ownKey.kind === "stuck" || ownKey.kind === "bare") {
+      const rows = trunk.slice(0, streak);
+      if (ownKey.kind === "bare" || !rows.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
+        const there = rows.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
+        return out("REGRESSION", `Trunk fails this test too, but ${ownKey.kind === "bare" ? "this timeout names no step to compare" : "never stuck at this step"}${there ? `; there it failed with "${there.slice(0, 160)}"` : ""}; this one may be the PR's.`, true);
+      }
+    }
     const trunkError = otherError(trunk.slice(0, streak));
     if (trunkError)
       return out("REGRESSION", `Trunk fails this test too, but with another error ("${trunkError.slice(0, 160)}"); this one may be the PR's.`, true);
@@ -2220,10 +2227,10 @@ async function askModelBatch(fetchImpl, apiKey, model, packs, timeoutMs = 9e4) {
   const hunks = [...new Map(packs.flatMap((p) => p.diff_hunks_of_files_named_in_error).map((h) => [h.id, h])).values()];
   const release = isRelease(packs[0]);
   const items = packs.map((p, i) => {
-    const { pr, diff_hunks_of_files_named_in_error: own, release: _, ...rest } = p;
+    const { pr, diff_hunks_of_files_named_in_error: own, ...rest } = p;
     return release ? { id: ids[i], valid_evidence_ids: evidenceIds(p), ...rest } : { id: ids[i], valid_evidence_ids: evidenceIds(p), related_hunks: own.map((h) => h.id), ...rest };
   });
-  const shared = release ? { release: { ...packs[0].release, server: void 0 } } : { pr: packs[0].pr, diff_hunks: hunks };
+  const shared = release ? {} : { pr: packs[0].pr, diff_hunks: hunks };
   const text = `Shared context for every finding (JSON):
 ${JSON.stringify(shared)}
 
@@ -2619,6 +2626,7 @@ async function evaluateRun({
         log(`base branch commits unavailable: ${String(e).slice(0, 200)}`);
         for (const f of fixed) Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} Whether this branch has that fix could not be checked.` });
       }
+      for (const f of fixed) if (diff.ok && f.class === "REGRESSION" && f.untouched === void 0) f.untouched = !changed.some((name) => namesChangedFile(f, name));
     }
     if (!blind && brokeBy) {
       try {

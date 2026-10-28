@@ -296,11 +296,11 @@ export async function askModelBatch(fetchImpl: FetchImpl, apiKey: string, model:
   const hunks = [...new Map<string, Hunk>(packs.flatMap((p) => p.diff_hunks_of_files_named_in_error).map((h): [string, Hunk] => [h.id, h])).values()];
   const release = isRelease(packs[0]);
   const items = packs.map((p, i) => {
-    const { pr, diff_hunks_of_files_named_in_error: own, release: _, ...rest } = p;
+    const { pr, diff_hunks_of_files_named_in_error: own, ...rest } = p;
     return release ? { id: ids[i], valid_evidence_ids: evidenceIds(p), ...rest } : { id: ids[i], valid_evidence_ids: evidenceIds(p), related_hunks: own.map((h) => h.id), ...rest };
   });
-  // A release run shares its release (the lane's server version stays on each finding); a PR run its PR and diff.
-  const shared = release ? { release: { ...packs[0].release, server: undefined } } : { pr: packs[0].pr, diff_hunks: hunks };
+  // A release run's findings each carry their release, with the lane's server version; a PR run shares its PR and diff.
+  const shared = release ? {} : { pr: packs[0].pr, diff_hunks: hunks };
   const text = `Shared context for every finding (JSON):\n${JSON.stringify(shared)}\n\n` +
     `Findings (JSON). Answer every finding by its id, citing only that finding's valid_evidence_ids. ` +
     `Return exactly ${ids.length} answer(s), one for each of: ${ids.join(", ")}.\n${JSON.stringify(items)}`;

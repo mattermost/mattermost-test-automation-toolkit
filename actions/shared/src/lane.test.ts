@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { CommitStatus } from "./github.ts";
 import { laneName, laneSummary, redReason } from "./lane.ts";
+import type { LaneStatus } from "./lane.ts";
 
 const st = (state: string, description: string): CommitStatus => ({ state, description }) as CommitStatus;
 const lanes = (rows: Record<string, CommitStatus | null>) => laneSummary(Object.entries(rows).map(([context, status]) => ({ context, status })));
@@ -84,5 +85,12 @@ test("a red check triage does not cover keeps the aggregate from saying all lane
   const many = ["a", "b", "c"].map((n) => ({ context: `e2e-test/upgrade-${n}`, status: st("failure", "x") }));
   assert.equal(laneSummary([green], many).description, "triaged lanes green · not triaged: upgrade-a, upgrade-b +1 red", "two names at most");
   assert.equal(laneSummary([{ ...green, status: st("pending", "running") }], [upgrade]).description,
-    "Triage is checking: waiting for playwright-full/enterprise · not triaged: playwright-full/enterprise/upgrade-from-release-11.10 red", "named while a lane runs too");
+    "not triaged: playwright-full/enterprise/upgrade-from-release-11.10 red · Triage is checking: waiting for playwright-full/enterprise", "named while a lane runs too, first");
+});
+
+test("a red check triage does not cover keeps its whole name in the 140-character status while lanes run", () => {
+  const pending = (context: string): LaneStatus => ({ context, status: { context, state: "pending", description: "", target_url: "" } as CommitStatus });
+  const upgrade = { context: "e2e-test/playwright-full/enterprise/upgrade-from-release-11.10", status: { context: "x", state: "failure", description: "", target_url: "" } as CommitStatus };
+  const description = laneSummary([pending("e2e-test/playwright-full/enterprise"), pending("e2e-test/cypress-full/enterprise")], [upgrade]).description.slice(0, 140);
+  assert.ok(description.includes("playwright-full/enterprise/upgrade-from-release-11.10 red"), description);
 });
