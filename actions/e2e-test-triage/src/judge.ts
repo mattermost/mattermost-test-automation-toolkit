@@ -119,11 +119,11 @@ Evidence:
 
 Rules:
 - Cite only evidence items by their id from the pack. Never invent commits, versions, files or errors.
-- test_bug with high confidence requires base_change whose diff fixes what this failure shows.
+- test_bug with high confidence requires base_change with a diff that fixes what this failure shows.
 - server_compat with high confidence requires other_platforms showing this test passing against another server version
   on this build, and failing against this lane's version.
-- flaky_environment with high confidence requires cross_pr, an error that is clearly infrastructural, or trunk history
-  failing the same way; it is ruled out when the test failed every try here and failed on every other lane.
+- flaky_environment with high confidence requires cross_pr or an error that is clearly infrastructural; it is ruled out
+  when the test failed every try here and failed on every other lane.
 - app_bug: the error is about the app's behavior and no evidence points to the test, the environment or a server
   version.
 - confidence: 0.9 or higher when the cited evidence meets the requirement above and nothing points to another cause;

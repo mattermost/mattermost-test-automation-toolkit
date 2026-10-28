@@ -48,6 +48,8 @@ export type Bucket = "yours" | "outdated" | "check" | "broken" | "flaky";
 export function bucketOf(f: Finding): Bucket {
   const brokeOnBase = f.class === "BROKEN_ON_TRUNK" || f.same_as_class === "BROKEN_ON_TRUNK";
   if (f.blocking) {
+    // A release run's app bug is named before anything else, as its label is (see statusLabelOf).
+    if (f.judge?.cause === "app_bug" && f.decision === "adjudicator_blame") return "yours";
     // A stale copy of the test is not the PR's change: it is merged, not explained.
     if (f.out_of_date && f.class !== "OWNED_BY_PR") return "outdated";
     const yours = f.class === "OWNED_BY_PR" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame"

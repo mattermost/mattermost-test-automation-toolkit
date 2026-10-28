@@ -38,10 +38,11 @@ export interface Decision {
 
 /**
  * What a release run's answer may change (see SYSTEM_RELEASE), held to its rules here, not to the answer's word. Sure
- * enough (minConfidence) and citing what its cause requires, a test bug (the default branch's change to the test),
- * a server incompatibility (a pass against another server version on this build) or an environment (other PRs failing
- * the same way, an infrastructure error, or the history failing it) clears; an environment never does for a test that
- * failed every try here and on every other lane. An app bug is named and stays red. Anything else stays red unnamed.
+ * enough (minConfidence) and citing what its cause requires, a test bug (the default branch's change to the test, with
+ * its diff), a server incompatibility (a pass against another server version on this build) or an environment (other
+ * PRs failing the same way, or an infrastructure error) clears; an environment never does for a test that failed every
+ * try here and on every other lane, and the history, which may be another line of code, never carries one. An app bug
+ * is named and stays red. Anything else stays red unnamed.
  */
 export function decideRelease(answer: Answer, pack: Pack, cfg: Config = DEFAULTS): Decision {
   const known = new Set(evidenceIds(pack));
@@ -52,11 +53,10 @@ export function decideRelease(answer: Answer, pack: Pack, cfg: Config = DEFAULTS
   const own = pack.release?.server ?? null;
   const tries = pack.tries_in_this_run;
   const everywhere = Boolean(tries && tries.ran >= 1 && tries.failed === tries.ran && lanes.length && lanes.every((l) => FAILED_STATUSES.has(l.result)));
-  const trunk = pack.trunk_history_14d;
   const clears =
-    a.cause === "test_bug" ? cited.includes("base_change")
+    a.cause === "test_bug" ? cited.includes("base_change") && Boolean(pack.base_change?.diff)
     : a.cause === "server_compat" ? cited.includes("other_platforms") && own != null && lanes.some((l) => l.result === "passed" && serverOf(l.platform) != null && serverOf(l.platform) !== own)
-    : a.cause === "flaky_environment" ? !everywhere && (cited.includes("cross_pr") || isInfraError(pack.error) || (cited.includes("trunk_history_14d") && trunk.fails + trunk.flaky > 0))
+    : a.cause === "flaky_environment" ? !everywhere && (cited.includes("cross_pr") || isInfraError(pack.error))
     : false;
   if (sure && clears) return { blocking: false, decision: "adjudicator_unblock", answer: a };
   if (sure && a.cause === "app_bug") return { blocking: true, decision: "adjudicator_blame", answer: a };

@@ -156,11 +156,11 @@ failing line, its tries, the same test on every other lane of the run (each OS Ã
 server version), the history, and the default branch's commits to the test since
 the branch was cut, with the file's diff. Its answer clears the failure only at 85%
 confidence and only with the evidence its cause requires, checked in code: a test
-bug cites the default branch's change to the test; a server compat cites the other
+bug cites the default branch's change to the test, with its diff; a server compat cites the other
 lanes, where the test passes against another server version on this build; flaky
-cites other PRs failing the same way, an infrastructure error, or the history
-failing it, and is never accepted for a test that failed every try here and on
-every other lane. An app bug at 85% is named ("app bug") and stays red; anything
+cites other PRs failing the same way or an infrastructure error (the history, which
+may be another line of code, never carries it), and is never accepted for a test
+that failed every try here and on every other lane. An app bug at 85% is named ("app bug") and stays red; anything
 else stays red as needs investigation. The check names what was found:
 `(1 test bug, 2 server compat, 1 app bug)`.
 

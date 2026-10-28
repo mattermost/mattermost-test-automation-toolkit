@@ -4594,6 +4594,8 @@ test("a release answer clears only on the evidence its cause requires; an app bu
   const plain = releasePack(releaseFinding(), releaseRef, []);
   const d = (a: Answer, p = plain) => { const r = decideRelease(a, p); return [r.blocking, r.decision]; };
   assert.deepEqual(d(answer("test_bug", ["base_change"]), stale), [false, "adjudicator_unblock"], "master fixed the test since the cut");
+  const noDiff = releasePack(releaseFinding({ out_of_date: { ...fixedOnMaster, diff: undefined } }), releaseRef, []);
+  assert.deepEqual(d(answer("test_bug", ["base_change"]), noDiff), [true, "engine"], "a change to the file without its diff (too large, or found by directory) shows no fix");
   assert.deepEqual(d(answer("test_bug", ["error", "test"])), [true, "engine"], "a test bug with no fix on master is a guess");
   assert.deepEqual(d(answer("test_bug", ["base_change"], 0.8), stale), [true, "engine"], "not sure enough");
   assert.deepEqual(d(answer("test_bug", ["base_change"])), [true, "engine"], "base_change cited but not in the pack");
@@ -4605,6 +4607,10 @@ test("a release answer clears only on the evidence its cause requires; an app bu
   assert.deepEqual(d(answer("flaky_environment", ["cross_pr"]), everywhere), [true, "engine"], "failed every try here and on every other lane: not flaky");
   assert.deepEqual(d(answer("app_bug", ["error"])), [true, "adjudicator_blame"]);
   assert.deepEqual(d(answer("app_bug", ["error"], 0.7)), [true, "engine"], "a weak app-bug guess is not named");
+  const failingOnMaster = releasePack(releaseFinding({ trunk: { runs: 9, fails: 2, flaky: 1, passes: 6, latest: "passed" } }), releaseRef, []);
+  assert.deepEqual(d(answer("flaky_environment", ["trunk_history_14d"]), failingOnMaster), [true, "engine"], "master's history is another line of code: it carries no clear");
+  const blamed = { ...releaseFinding({ out_of_date: fixedOnMaster }), decision: "adjudicator_blame", judge: answer("app_bug", ["error"]) };
+  assert.deepEqual([bucketOf(blamed), statusLabelOf(blamed)], ["yours", "app bug"], "an app bug is shown as one even where master also changed the test");
   assert.deepEqual(decide("REGRESSION", answer("test_bug", ["base_change"]), stale).blocking, false, "decide sends a release pack to its own rules");
 });
 
