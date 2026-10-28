@@ -330,12 +330,13 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const apiKey = env.ANTHROPIC_API_KEY;
     const ask: AskFn | null = apiKey && !prSpendUnknown ? (packs, model) => askModelBatch(fetchImpl, apiKey, model, packs) : null;
     const result = await evaluateRun({
-      run, id, prNumber, history, diff, trunkBranch, branchBase, testRoot, cfg,
+      run, id, prNumber, history, diff, trunkBranch, branchBase, branchName: branchBase ? id.branch ?? null : null, testRoot, cfg,
       prTitle: pull.title ?? "", lane: env.LANE || id.name, log,
       ask,
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
-      otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
+      // A release run's matrix (OS x server version) is wider than a PR's platforms.
+      otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log, limit: branchBase ? 20 : 5 }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),

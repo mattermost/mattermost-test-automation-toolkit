@@ -30,7 +30,13 @@ const count = (n: number, word: string): string => `${n} ${word}${n === 1 ? "" :
 const sha7 = (c: string | null | undefined): string => String(c ?? "").slice(0, 7);
 const fileOf = (f: Finding): string | undefined => String(f.file ?? "").split("/").pop();
 
-const LIKELY: Record<string, string> = { flaky_environment: "flaky or environment", bug_on_master: "already broken on the default branch", test_bug: "a test bug" };
+const LIKELY: Record<string, string> = { flaky_environment: "flaky or environment", bug_on_master: "already broken on the default branch", test_bug: "a test bug", server_compat: "a server-version incompatibility", app_bug: "an app bug" };
+// What a release run's owner does with a failure the model cleared, by its cause.
+const RELEASE_NEXT: Record<string, string> = {
+  test_bug: "Backport the test fix, or ignore it for this release.",
+  server_compat: "Check that this release supports that server version, or skip the test there.",
+  flaky_environment: "Re-run to confirm.",
+};
 
 /**
  * Which of five groups a failed test falls in. The names are fixed so people learn them:
@@ -51,6 +57,8 @@ export function bucketOf(f: Finding): Bucket {
     return brokeOnBase ? "broken" : "check";
   }
   if (brokeOnBase) return "broken";
+  // A release run's cleared failure is not an app bug, whatever the model named it.
+  if (f.release) return "flaky";
   const cause = f.decision === "adjudicator_unblock" ? f.judge?.cause : null;
   return cause === "bug_on_master" || cause === "test_bug" ? "broken" : "flaky";
 }
@@ -74,13 +82,15 @@ export const failedElsewhere = (f: Finding): string[] => (f.other_lanes ?? []).f
  * it did: failed, or once (a failed try that a retry recovered). The tail says what it may mean: a shared cause is the
  * likely one for a test that is not this PR's; a row that blames this PR gets the plain tail, which steers nowhere.
  */
+// At most three names, then how many more: a release run's matrix can name fifteen lanes.
+const fewOf = (names: string[]): string => (names.length > 4 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", "));
 const alsoFailed = (f: Finding, tail: string): string => {
   const other = f.other_lanes ?? [];
-  const failed = other.filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform);
-  const once = other.filter((o) => o.result === "flaky").map((o) => o.platform);
-  if (failed.length && once.length) return ` Also failed on ${failed.join(", ")}, and once on ${once.join(", ")} (passed on retry), in this run${tail}`;
-  if (once.length) return ` Also failed once on ${once.join(", ")} in this run (passed on retry)${tail}`;
-  if (failed.length) return ` Also failed on ${failed.join(", ")} in this run${tail}`;
+  const failed = fewOf(other.filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform));
+  const once = fewOf(other.filter((o) => o.result === "flaky").map((o) => o.platform));
+  if (failed && once) return ` Also failed on ${failed}, and once on ${once} (passed on retry), in this run${tail}`;
+  if (once) return ` Also failed once on ${once} in this run (passed on retry)${tail}`;
+  if (failed) return ` Also failed on ${failed} in this run${tail}`;
   return "";
 };
 const SHARED_CAUSE = ": likely environment or a shared cause.";
@@ -97,6 +107,7 @@ function whyNext(f: Finding, branch: string, pr: boolean, branchRun: string | nu
   switch (bucketOf(f)) {
     case "yours":
       if (f.class === "OWNED_BY_PR") return [`This ${pr ? "PR" : "commit"} edits the test.`, "Check your change to the test."];
+      if (a?.cause === "app_bug" && f.decision === "adjudicator_blame") return [`Looks like an app bug in this build (${ai}): ${a.explanation}`, "Read the error, and file it against this release if it holds."];
       if (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto") return [`Points to this PR's change (${ai}).`, "Check the change named in the evidence."];
       return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and this PR changes a file its error names.`, "Check your change to that file."];
     case "outdated": {
@@ -129,6 +140,7 @@ function whyNext(f: Finding, branch: string, pr: boolean, branchRun: string | nu
       const next = allFailed ? "Re-run once before digging." : pr ? "Nothing for you." : "Fix the flaky test.";
       if (allFailed && f.class === "FLAKY_ON_TRUNK") return [`Failed every try here; flaky on ${branch}.`, next];
       if (f.decision === "rules_unblock") return [f.reason, next];
+      if (f.release && f.decision === "adjudicator_unblock" && a) return [`Looks like ${LIKELY[a.cause] ?? a.cause} (${ai}): ${a.explanation}`, RELEASE_NEXT[a.cause] ?? "Nothing for you."];
       if (f.decision === "adjudicator_unblock") return [`Looks ${LIKELY[a?.cause ?? ""] ?? "flaky"} (${ai}).`, next];
       if (f.class === "SAME_FAILURE_AS_CLEARED") return [`Same error as "${f.same_as}", cleared above.`, next];
       if (f.class === "FLAKY_NOT_RUN") return [f.reason, next];
@@ -196,8 +208,9 @@ function factsTable(f: Finding, branch: string, pr: boolean, branchRun: string |
   if (f.decision === "evidence_incomplete" || f.identity_unresolved) rows.push(["Why history wasn't used", f.reason]);
   const a = f.judge;
   if (a) {
-    const verdict = a.cause === "caused_by_pr" ? "Caused by this PR" : `Not caused by this PR (${LIKELY[a.cause] ?? a.cause})`;
-    const blames = a.cause === "caused_by_pr";
+    const verdict = a.cause === "caused_by_pr" ? "Caused by this PR" : a.cause === "app_bug" ? "An app bug in this build"
+      : f.release ? `Not an app bug (${LIKELY[a.cause] ?? a.cause})` : `Not caused by this PR (${LIKELY[a.cause] ?? a.cause})`;
+    const blames = a.cause === "caused_by_pr" || a.cause === "app_bug";
     const sure = f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame" ? `${pct(a.confidence)} sure, enough to decide`
       : blames ? `${pct(a.confidence)} sure; naming the PR needs 85% and a change it can point to`
       : f.decision === "advice" ? `${pct(a.confidence)} sure, but ${f.failed_everywhere ? "a failure on every try and on another platform is not cleared" : "with nothing it could point to, so it can't clear"}`
@@ -309,6 +322,7 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
     : check.length || outdated.length ? `${unnamed ? "🔴" : "🟡"} ${[needText, staleText, unnamed ? "re-run the failed jobs" : ""].filter(Boolean).join(", ")}`
     : blockingBroken ? `🔴 ${blockingBroken} still failing on ${md(branch)}`
     : unnamed ? `🔴 ${notRunRerun && !findings.length ? `${count(notRunRerun, "spec")} did not run, ` : ""}${rerun ? RERUNNING : RERUN}`
+    : branchRun ? "✅ no app bug found"
     : `✅ none caused by this ${pr ? "PR" : "commit"}`;
   const lines = [`## E2E triage${where}: ${head}`, ""];
   // Under the headline: how many failed tests also failed on other platforms in this run (see alsoFailed).
@@ -334,14 +348,16 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
     // outside the tests says that.
     say = missing ? `${again}: ${arrived}.` : laneRed ? RED_OUTSIDE : "No test failed.";
   } else if (findings.length) {
-    const kinds = [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
+    // A release run's cleared failures are named by what the model found (test bug, server compat, flaky).
+    const kinds = branchRun ? statusLabels([...broken.filter((f) => !f.blocking), ...flaky]).join(", ")
+      : [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
     say = `${count(yours.length + outdated.length + check.length + blockingBroken + unrelated, "failure")}: ` + [
       yours.length && `${yours.length} may be caused by this ${pr ? "PR" : "commit"}`,
       fixedCount && `${fixedCount} fixed on ${branch}`,
       outdated.length - fixedCount && `${outdated.length - fixedCount} out of date`,
       check.length && `${check.length} need${check.length === 1 ? "s" : ""} a look`,
       blockingBroken && `${blockingBroken} still failing on ${branch}`,
-      unrelated && `${unrelated} look${unrelated === 1 ? "s" : ""} unrelated (${kinds})`,
+      unrelated && (branchRun ? `${unrelated} not ${unrelated === 1 ? "an app bug" : "app bugs"} (${kinds})` : `${unrelated} look${unrelated === 1 ? "s" : ""} unrelated (${kinds})`),
     ].filter(Boolean).join("; ") + ".";
     if (outdatedLead) say = branchRun ? `Backport ${staleBase}'s test changes to ${branchRun}, or ignore them for this release. ${say}` : `Merge ${branch} and re-run first. ${say}`;
     if (unnamed) say += ` ${rerunLine}`;
@@ -376,7 +392,7 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
       : `Out of date (${outdated.length}): ${md(branch)} changed these tests, or fixed these failures, after this PR last merged ${md(branch)}`);
   section("Needs a look", check);
   section(`Broken on ${md(branch)}`, broken);
-  section("Flaky", flaky);
+  section(branchRun ? "Not an app bug" : "Flaky", flaky);
 
   const shown = [...yours, ...outdated, ...check, ...broken, ...flaky].slice(0, 30);
   if (shown.length) {
@@ -433,7 +449,7 @@ export function noResultsText(lane: string, commitSha: string): string {
 }
 
 /** The five labels the E2E check's text uses, in the order it lists them. */
-export const STATUS_LABELS = ["flaky", "broken on main", "caused by PR", "fixed on main", "out of date", "needs investigation"] as const;
+export const STATUS_LABELS = ["flaky", "broken on main", "test bug", "server compat", "caused by PR", "app bug", "fixed on main", "out of date", "needs investigation"] as const;
 export type StatusLabel = (typeof STATUS_LABELS)[number];
 
 /**
@@ -445,12 +461,20 @@ export type StatusLabel = (typeof STATUS_LABELS)[number];
  */
 export function statusLabelOf(f: Finding): StatusLabel {
   if (f.blocking) {
+    if (f.judge?.cause === "app_bug" && f.decision === "adjudicator_blame") return "app bug";
     if (f.out_of_date) return f.out_of_date.fixed ? "fixed on main" : "out of date";
     if (f.class === "OWNED_BY_PR" || (f.judge?.cause === "caused_by_pr" && (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto"))) return "caused by PR";
     return "needs investigation";
   }
   if (f.class === "SAME_FAILURE_AS_CLEARED") return f.same_as_class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
-  if (f.decision === "adjudicator_unblock") return f.judge?.cause === "bug_on_master" ? "broken on main" : "flaky";
+  if (f.decision === "adjudicator_unblock") {
+    const cause = f.judge?.cause;
+    if (cause === "bug_on_master") return "broken on main";
+    // A release run names what the model found; a PR run keeps "flaky" for anything not the PR's.
+    if (f.release && cause === "test_bug") return "test bug";
+    if (cause === "server_compat") return "server compat";
+    return "flaky";
+  }
   return f.class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
 }
 

@@ -8,8 +8,8 @@ import { DEFAULTS, historyLane, repoPath } from "./config.ts";
 import { commonSenseClear } from "./common-sense.ts";
 import { sameTestOnOtherReports } from "./enrich.ts";
 import { evidenceFor } from "./evidence.ts";
-import { buildPack, namesChangedFile } from "./pack.ts";
-import type { OtherFailure } from "./pack.ts";
+import { buildPack, namesChangedFile, releasePack } from "./pack.ts";
+import type { OtherFailure, ReleaseRef } from "./pack.ts";
 import { judge } from "./decision.ts";
 import type { OutOfDateResult } from "./history.ts";
 import { newLedger } from "./pricing.ts";
@@ -45,6 +45,8 @@ export interface EvaluateParams {
   trunkBranch: string | null | undefined;
   /** A run with no PR on a branch other than the default: the default branch, which its copies of the tests are checked against. */
   branchBase?: string | null;
+  /** That run's own branch, for the model's question (see releasePack). */
+  branchName?: string | null;
   testRoot: string | null;
   cfg?: Config;
   prTitle?: string;
@@ -78,6 +80,7 @@ export async function evaluateRun({
   diff,
   trunkBranch,
   branchBase = null,
+  branchName = null,
   testRoot,
   cfg = DEFAULTS,
   prTitle = "",
@@ -159,7 +162,7 @@ export async function evaluateRun({
     }
     // The same test on the run's other platforms: this run's own reports (no call), then its sibling groups. The summary
     // and the pack read it, and a failure that failed every try here and on another platform is held.
-    sameTestOnOtherReports(result.findings, run);
+    sameTestOnOtherReports(result.findings, run, Boolean(branchBase));
     // Not on an infrastructure storm: the run is red for its environment, and sibling reads would only add calls.
     if (otherPlatforms && !result.infra) {
       try {
@@ -234,6 +237,24 @@ export async function evaluateRun({
         const why = commonSenseClear(f, packs[i], changed);
         if (why) Object.assign(f, { blocking: false, decision: "rules_unblock", reason: why });
       }
+      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
+    }
+    if (!blind && !prNumber && branchBase) {
+      // A release branch's run: what kind of failure each held one is (app bug, test bug, environment, server version;
+      // see SYSTEM_RELEASE), on its own evidence. decideRelease clears only what that evidence carries.
+      for (const f of result.findings) f.release = true;
+      const held = result.findings.filter((f) => f.blocking && f.class !== "OWNED_BY_PR" && !f.identity_unresolved && f.decision !== "evidence_incomplete");
+      if (enrich) {
+        try {
+          await enrich(held);
+        } catch (e) {
+          log(`extra evidence unavailable: ${String(e).slice(0, 200)}`);
+        }
+      }
+      markEarlierFailures(result.findings);
+      const others: OtherFailure[] = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
+      const release: ReleaseRef = { repository: id.repository, name: id.name ?? "", branch: branchName || "this branch", base: branchBase, historyBranch: trunkBranch || branchBase, lane };
+      const packs = result.findings.map((f) => (held.includes(f) ? releasePack(f, release, others, changeContext) : null));
       if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
     }
     if (!blind && prNumber) sameFailure(result.findings);

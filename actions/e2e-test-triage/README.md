@@ -148,6 +148,22 @@ That history is another line of code: it is evidence, and never clears a failure
 the release branch by itself. A spec a stopped Jest process skipped stays `NOT_RUN`
 there: the build never ran it.
 
+**What kind of failure (release branches, with the model):** every failure still
+held on a release branch's run is asked one question: is it an **app bug**, a
+**test bug**, **flaky or environment**, or a **server compat** problem (it
+depends on a server version)? The model gets the error, the test's code at the
+failing line, its tries, the same test on every other lane of the run (each OS ×
+server version), the history, and the default branch's commits to the test since
+the branch was cut, with the file's diff. Its answer clears the failure only at 85%
+confidence and only with the evidence its cause requires, checked in code: a test
+bug cites the default branch's change to the test; a server compat cites the other
+lanes, where the test passes against another server version on this build; flaky
+cites other PRs failing the same way, an infrastructure error, or the history
+failing it, and is never accepted for a test that failed every try here and on
+every other lane. An app bug at 85% is named ("app bug") and stays red; anything
+else stays red as needs investigation. The check names what was found:
+`(1 test bug, 2 server compat, 1 app bug)`.
+
 **Lanes the base branch rarely runs:** history is read per lane. A lane master
 runs only sometimes (mattermost's subpath suite) has too little history to call
 anything flaky; `history-lane` makes it read a lane with the same tests, such as
@@ -236,7 +252,8 @@ model fails or is unavailable, the rules' outcome stands.
 
 - **E2E check text**, in both modes: `(2 flaky, 2 caused by PR) 99.7% passed (1186
   passed, 4 failed, 164 skipped)`. The labels, each only when non-zero and in this
-  order: flaky, broken on main, caused by PR, fixed on main, out of date, needs investigation. The
+  order: flaky, broken on main, test bug, server compat, caused by PR, app bug, fixed on main, out of
+  date, needs investigation (test bug, server compat and app bug only on a release branch). The
   rate is passed ÷ (passed + failed), as in
   mattermost's own E2E check; it never reads 100% while something failed.
   Shard placeholders add "re-run the failed jobs" after the labels (alone when

@@ -107,6 +107,8 @@ export interface Finding extends TestRef {
   since_last_pass?: SinceLastPass;
   code_near_failure?: string | null;
   other_lanes?: { platform: string; result: string }[];
+  /** A failure of a release branch's run: the model is asked what kind of failure it is (see SYSTEM_RELEASE). */
+  release?: boolean;
   /** The other platforms of this commit where it also failed, after failing every try here (see holdFailedEverywhere). */
   failed_everywhere?: string[];
   /** The earliest test of the same spec that failed before this one in this run, with another error (see markEarlierFailures). */
@@ -134,7 +136,7 @@ export interface Usage {
   [key: string]: unknown;
 }
 
-export type Cause = "caused_by_pr" | "flaky_environment" | "bug_on_master" | "test_bug";
+export type Cause = "caused_by_pr" | "flaky_environment" | "bug_on_master" | "test_bug" | "app_bug" | "server_compat";
 
 export interface Provenance {
   requested_model?: string;
@@ -190,6 +192,10 @@ export interface Pack {
   earlier_failure_same_spec?: { id: "earlier_failure_same_spec" } & EarlierFailure;
   tries_in_this_run?: { ran: number; failed: number };
   test_code_near_failure?: string;
+  /** A release branch's run (see releasePack): what the run is, instead of a PR. */
+  release?: { id: "release"; branch: string; base: string; history_branch: string; server: string | null };
+  /** The default branch changed the test's file after the release branch was cut: its commits, and the file's diff since. */
+  base_change?: { id: "base_change"; commits: string[]; diff: string | null };
 }
 
 /** The PR's changed files in one category: how many, and up to 20 of their paths. */
@@ -268,6 +274,8 @@ export interface OutOfDate {
   commit: CommitRef | null;
   /** The base branch's earlier commits to the test since this PR (or branch) last had it, newest first, after `commit` (at most 4). */
   also?: CommitRef[];
+  /** The test file's diff on the base branch since the merge base, as GitHub's compare gave it (cut to 4000 characters). */
+  diff?: string;
   /** The branch-state hold: this PR failed the same way on its last `streak` commits (this run included), never on the base. */
   streak?: number;
   /** The failure first passed on the base branch at `commit` (see markFixedOnTrunk), after this PR last merged it. */

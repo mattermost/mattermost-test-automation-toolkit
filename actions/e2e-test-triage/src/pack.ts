@@ -133,6 +133,36 @@ export function buildPack(finding: Finding, compareFiles: { filename: string; pa
   return pack;
 }
 
+/** What a release branch's run is, for its packs (see releasePack). */
+export interface ReleaseRef {
+  repository: string;
+  /** The run's name (its TSIO group): a mobile lane's names its server version when its reports don't. */
+  name: string;
+  branch: string;
+  base: string;
+  historyBranch: string;
+  lane?: string;
+}
+
+// The server version a lane ran against, from its report or group name: "e2e-on-ubuntu-latest-11.11.3", "...-Server_12.0.1".
+export const serverOf = (name: string | null | undefined): string | null => /(\d+\.\d+\.\d+(?:-rc\d+)?)/.exec(String(name ?? ""))?.[1] ?? null;
+
+/**
+ * A release branch's pack: the finding's own evidence as buildPack gives it, without a PR, and with the release's facts
+ * (its branch, the default branch it was cut from, the lane's server version) and, when the default branch changed the
+ * test since the cut, those commits and the file's diff.
+ */
+export function releasePack(finding: Finding, release: ReleaseRef, others: OtherFailure[], ctx: ChangeContext = NO_CHANGE_CONTEXT): Pack {
+  const pack = buildPack(finding, [], { number: null, repository: release.repository, title: "", lane: release.lane }, others, ctx);
+  const ood = finding.out_of_date && !finding.out_of_date.streak && !finding.out_of_date.fixed ? finding.out_of_date : null;
+  const ref = (c: { sha: string; pr: number | null; date?: string | null }): string => `${c.pr ? `#${c.pr}` : c.sha.slice(0, 7)}${c.date ? ` (${c.date})` : ""}`;
+  return {
+    ...pack,
+    release: { id: "release", branch: release.branch, base: release.base, history_branch: release.historyBranch, server: serverOf(finding.report_name) ?? serverOf(release.name) },
+    ...(ood ? { base_change: { id: "base_change" as const, commits: [ood.commit, ...(ood.also ?? [])].filter((c): c is NonNullable<typeof c> => Boolean(c)).map(ref), diff: ood.diff ?? null } } : {}),
+  };
+}
+
 // This PR's earlier runs of the test, and what changed between its last pass and now. Where the PR's own changes are
 // known, a related file that changed only because the base branch was merged in is listed apart: trunk runs it.
 function thisPrHistory(f: Finding): ThisPRHistory {
@@ -169,7 +199,8 @@ export const evidenceIds = (pack: Pack): string[] => [
   "engine",
   "trunk_history_14d",
   ...(pack.cross_pr_failures_14d?.other_prs_where_this_test_failed?.length ? ["cross_pr"] : []),
-  "pr.changed_files",
+  // A release run has no PR: its own facts take the PR's place.
+  ...(pack.release ? ["release", ...(pack.base_change ? ["base_change"] : [])] : ["pr.changed_files"]),
   ...pack.diff_hunks_of_files_named_in_error.filter((h) => h.related).map((h) => h.id),
   ...(pack.producer_evidence?.notes || pack.producer_evidence?.screenshots?.length ? ["producer"] : []),
   // Citable only when this PR's most recent earlier run of the test passed (a pass before a later failure does not count),

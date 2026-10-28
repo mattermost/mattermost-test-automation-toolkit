@@ -55,9 +55,17 @@ function addOtherLane(f: Finding, platform: string, result: string): void {
  * The same test on the run's other reports, read from the group fetchRun already loaded (desktop: one group, one report
  * per OS). No call is made. A report is another platform only when its name differs from the finding's own.
  */
-export function sameTestOnOtherReports(findings: Finding[], run: Pick<RunResult, "elsewhere">): void {
+export function sameTestOnOtherReports(findings: Finding[], run: Pick<RunResult, "elsewhere">, everyReport = false): void {
   for (const f of findings) {
     const own = f.report_name ?? "";
+    if (everyReport) {
+      // A release run's lanes are OS x server version (desktop CMT: one group, one report per lane): each other report is
+      // another lane, named by OS and server. A shard of this lane ("<own>-1-of-3") is not.
+      const others = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? [])
+        .filter((o) => o.report !== "" && o.report !== own && !o.report.startsWith(`${own}-`) && !own.startsWith(`${o.report}-`));
+      for (const o of [...others].sort((a, b) => a.report.localeCompare(b.report))) addOtherLane(f, o.report.replace(/^e2e-on-/, ""), o.status);
+      continue;
+    }
     const ownOs = osOfReport(own);
     // Another platform only: a report that names no OS, or the same OS, is a worker or retest of this lane, not a
     // second platform (mattermost reports are per worker; desktop shards one OS across reports).
@@ -73,9 +81,9 @@ export const SIBLING_DEADLINE_MS = 30_000;
 
 /**
  * The same test on the run's sibling groups (mobile: one group per lane, all in one run). One list of the run's groups
- * is read for all of them, and each sibling's group is read from it (at most five). Every read shares one deadline. Asked
- * of a run with failures only, and by the caller, never on an infrastructure storm. Evidence for the summary and the
- * pack: no verdict depends on it.
+ * is read for all of them, and each sibling's group is read from it (at most `limit`). Every read shares one deadline.
+ * Asked of a run with failures only, and by the caller, never on an infrastructure storm. Evidence for the summary and
+ * the pack; holdFailedEverywhere and a release run's judge read it.
  */
 export async function siblingPlatforms({
   findings,
@@ -84,6 +92,7 @@ export async function siblingPlatforms({
   id,
   log = () => {},
   deadlineMs = SIBLING_DEADLINE_MS,
+  limit = 5,
 }: {
   findings: Finding[];
   fetchImpl: FetchImpl;
@@ -91,6 +100,8 @@ export async function siblingPlatforms({
   id: CompositeIdentity;
   log?: (message: string) => void;
   deadlineMs?: number;
+  /** The most sibling groups read: a release run's matrix has more lanes than a PR's platforms. */
+  limit?: number;
 }): Promise<void> {
   if (!findings.length) return;
   const deadline = Date.now() + deadlineMs;
@@ -112,7 +123,7 @@ export async function siblingPlatforms({
       })(),
     );
     if (listed === "late") return log(`${laterMessage}; none was read`);
-    const siblings = listed.filter((g) => String(g.gh_run_id) === String(id.gh_run_id) && String(g.gh_run_attempt) === String(id.gh_run_attempt) && g.name !== id.name).slice(0, 5);
+    const siblings = listed.filter((g) => String(g.gh_run_id) === String(id.gh_run_id) && String(g.gh_run_attempt) === String(id.gh_run_attempt) && g.name !== id.name).slice(0, limit);
     for (const g of siblings) {
       if (Date.now() >= deadline) return log(`${laterMessage}; ${g.name} and the rest were not read`);
       const read = await bySomeDeadline(runFromGroups(fetchImpl, base, { ...id, name: g.name }, listed, null, { attempts: 1, ms: 0 }).catch((e: unknown) => (log(`results of ${g.name} unavailable: ${String(e).slice(0, 160)}`), null)));

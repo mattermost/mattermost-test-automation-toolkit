@@ -390,7 +390,7 @@ interface CommitRow {
 
 interface CompareResult {
   ahead_by?: number;
-  files?: { filename: string }[];
+  files?: { filename: string; patch?: string }[];
   commits?: CommitRow[];
   merge_base_commit?: CommitRow | null;
 }
@@ -494,7 +494,8 @@ export async function markOutOfDate({
       commits.set(path, { commit: c ? commitRef(c) : null, also: rest.slice(0, 4).map(commitRef) });
     }
     const { commit, also } = commits.get(path) ?? { commit: null, also: [] };
-    f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit, ...(also.length ? { also } : {}) };
+    const diff = files.find((x) => x.filename === path)?.patch;
+    f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit, ...(also.length ? { also } : {}), ...(diff ? { diff: diff.slice(0, 4000) } : {}) };
   }
   if (!truncated) return { truncated: false };
   // The list is cut off: a spec missing from it may still have changed. Its directory's commits since the merge base say.

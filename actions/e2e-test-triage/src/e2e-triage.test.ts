@@ -5,15 +5,15 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { canChange, decide, judge, unblocks } from "./decision.ts";
+import { canChange, decide, decideRelease, judge, unblocks } from "./decision.ts";
 import { EXONERATED_ON_TRUNK, classify, classifyNotRun, errorSignature, holdFailedEverywhere, infraVerdict, isInfraError, isShardPlaceholder, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, laneOfReport, repoPath } from "./config.ts";
-import { answerKey, askModelBatch, packKey, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
+import { SYSTEM_RELEASE, answerKey, askModelBatch, packKey, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
 import { OUT_OF_DATE_DIR_CAP, dropStormRuns, fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markFixedOnTrunk, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { commonSenseClear, onlyOnPlatform, platformOf } from "./common-sense.ts";
 import { codeExcerpt, enrichFindings, failingLine, prChangedSince, sameTestOnOtherReports, siblingPlatforms } from "./enrich.ts";
 import { evidenceFor, loadEvidence } from "./evidence.ts";
-import { CLEARING, buildPack, chainClears, changeCategory, changeSummary, compactError, evidenceIds, namesChangedFile } from "./pack.ts";
+import { CLEARING, buildPack, chainClears, changeCategory, changeSummary, compactError, evidenceIds, namesChangedFile, releasePack, serverOf } from "./pack.ts";
 import type { OtherFailure } from "./pack.ts";
 import { PRICES, costOf, newLedger, priceFor } from "./pricing.ts";
 import { bucketOf, passLine, passRate, renderSummary, statusDescription, statusLabelOf, statusLabels } from "./render.ts";
@@ -23,7 +23,7 @@ import type { EvaluatedRun, EvaluateParams } from "./evaluate.ts";
 import { NotTriagedError, triage } from "./triage.ts";
 import { FINDINGS_SCHEMA, checkFindingsShape, findingLogLine, redact } from "./findings.ts";
 import type { CommitStatus, Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
-import { laneSummary } from "../../shared/src/lane.ts";
+import { laneSummary, redReason } from "../../shared/src/lane.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
 import { elsewhereKey, fetchRun, identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { RunResult } from "../../shared/src/tsio.ts";
@@ -63,7 +63,7 @@ interface Part {
 }
 
 interface SchemaBody {
-  properties: { answers?: { items: { properties: { id: unknown } } } };
+  properties: { answers?: { items: { properties: { id: unknown; cause?: { enum?: string[] } } } } };
 }
 
 interface MessageBody {
@@ -4482,7 +4482,8 @@ test("a flaky run in history keeps the error of its failed try, which trunk's co
 // ---------------------------------------------------------------- a release branch's run (CMT)
 
 // desktop CMT on v6.3.2-rc.2: master fixed the failing tests after release-6.3 was cut, and the branch had no history.
-const releaseRoutes = ({ histories, compare, asked = [], statuses = [], master = trunkPasses(8) }: { histories: HistoryBody[]; compare: unknown; asked?: string[]; statuses?: StatusBody[]; master?: Observation[] }): Route[] => [
+const releaseRoutes = ({ histories, compare, asked = [], statuses = [], master = trunkPasses(8), answer = null, bodies = [] }: { histories: HistoryBody[]; compare: unknown; asked?: string[]; statuses?: StatusBody[]; master?: Observation[]; answer?: Partial<Answer> | null; bodies?: MessageBody[] }): Route[] => [
+  ...(answer ? [["api.anthropic.com", (init: RequestInit | undefined) => { bodies.push(parsed<MessageBody>(bodyText(init))); return modelReply(init, answer); }] as Route] : []),
   ...runRoutes([spec("t1", "failed")], "cmt-desktop"),
   ["/reports/history", (init) => { const body = parsed<HistoryBody>(bodyText(init)); histories.push(body); return Response.json({ observations: body.branch === "master" ? master : [] }); }],
   ["/compare/abc...master", () => { asked.push("compare"); return Response.json(compare); }],
@@ -4567,4 +4568,105 @@ test("an out-of-date test names every base-branch commit to it since the branch 
     assert.match(text, /master changed this test \(#3957, 2026-08-27; also #3960, #3923\) after release-6\.3 branched from it/);
     assert.match(text, /Yes: c3 \(#3957\) on 2026-08-27, and earlier #3960, #3923\./);
   });
+});
+
+// ---------------------------------------------------------------- a release branch's run: what kind of failure (CMT)
+
+const releaseRef = { repository: "o/r", name: "cmt-desktop", branch: "v6.3.2-rc.2", base: "master", historyBranch: "master" };
+const releaseFinding = (over: Partial<Finding> = {}): Finding => ({ ...classify({ ...failing, report_name: "e2e-on-ubuntu-latest-11.11.3", tries: { ran: 2, failed: 2 } }, trunkPasses(8), []), release: true, blocking: true, ...over });
+const fixedOnMaster = { base: "master", behind: 61, commit: { sha: "c3", date: "2026-08-27", pr: 3957 }, also: [{ sha: "c2", date: "2026-08-26", pr: 3960 }], diff: "@@ -12 +12 @@\n-const PNG = 'bad'\n+const PNG = 'valid'" };
+
+test("a release pack carries the release, the default branch's change to the test, and every lane; no PR", () => {
+  const pack = releasePack(releaseFinding({ out_of_date: fixedOnMaster, other_lanes: [{ platform: "ubuntu-latest-10.11.25", result: "failed" }] }), releaseRef, []);
+  assert.deepEqual(pack.release, { id: "release", branch: "v6.3.2-rc.2", base: "master", history_branch: "master", server: "11.11.3" });
+  assert.deepEqual(pack.base_change, { id: "base_change", commits: ["#3957 (2026-08-27)", "#3960 (2026-08-26)"], diff: fixedOnMaster.diff });
+  const ids = evidenceIds(pack);
+  assert.ok(ids.includes("release") && ids.includes("base_change") && ids.includes("other_platforms"));
+  assert.ok(!ids.includes("pr.changed_files"), "there is no PR to cite");
+  assert.equal(releasePack(releaseFinding(), releaseRef, []).base_change, undefined, "no change on master: nothing to cite");
+  assert.equal(serverOf("mobile-release-detox-android-Server_12.1.0-rc2"), "12.1.0-rc2");
+  assert.equal(releasePack(releaseFinding({ report_name: null }), { ...releaseRef, name: "mobile-release-detox-ios-Server_12.0.1" }, []).release?.server, "12.0.1", "a mobile lane names its server in its group");
+});
+
+test("a release answer clears only on the evidence its cause requires; an app bug is named and stays red", () => {
+  const answer = (cause: Answer["cause"], cited: string[], confidence = 0.92): Answer => ({ cause, confidence, cited_evidence: cited, explanation: "x" });
+  const stale = releasePack(releaseFinding({ out_of_date: fixedOnMaster }), releaseRef, []);
+  const plain = releasePack(releaseFinding(), releaseRef, []);
+  const d = (a: Answer, p = plain) => { const r = decideRelease(a, p); return [r.blocking, r.decision]; };
+  assert.deepEqual(d(answer("test_bug", ["base_change"]), stale), [false, "adjudicator_unblock"], "master fixed the test since the cut");
+  assert.deepEqual(d(answer("test_bug", ["error", "test"])), [true, "engine"], "a test bug with no fix on master is a guess");
+  assert.deepEqual(d(answer("test_bug", ["base_change"], 0.8), stale), [true, "engine"], "not sure enough");
+  assert.deepEqual(d(answer("test_bug", ["base_change"])), [true, "engine"], "base_change cited but not in the pack");
+  const lanes = (...results: [string, string][]): Pack => releasePack(releaseFinding({ other_lanes: results.map(([platform, result]) => ({ platform, result })) }), releaseRef, []);
+  assert.deepEqual(d(answer("server_compat", ["other_platforms"]), lanes(["ubuntu-latest-12.1.0-rc2", "passed"], ["macos-26-11.11.3", "failed"])), [false, "adjudicator_unblock"], "passes against another server version");
+  assert.deepEqual(d(answer("server_compat", ["other_platforms"]), lanes(["macos-26-11.11.3", "passed"])), [true, "engine"], "a pass on another OS of the same server is not a server version");
+  assert.deepEqual(d(answer("flaky_environment", ["cross_pr"]), releasePack(releaseFinding({ cross_pr: { prs: [7], examples: ["PR 7 (abc, 10-01)"], passes: 3 } }), releaseRef, [])), [false, "adjudicator_unblock"]);
+  const everywhere = releasePack(releaseFinding({ cross_pr: { prs: [7], examples: ["PR 7 (abc, 10-01)"], passes: 3 }, other_lanes: [{ platform: "windows-2022-11.11.3", result: "failed" }] }), releaseRef, []);
+  assert.deepEqual(d(answer("flaky_environment", ["cross_pr"]), everywhere), [true, "engine"], "failed every try here and on every other lane: not flaky");
+  assert.deepEqual(d(answer("app_bug", ["error"])), [true, "adjudicator_blame"]);
+  assert.deepEqual(d(answer("app_bug", ["error"], 0.7)), [true, "engine"], "a weak app-bug guess is not named");
+  assert.deepEqual(decide("REGRESSION", answer("test_bug", ["base_change"]), stale).blocking, false, "decide sends a release pack to its own rules");
+});
+
+test("a release run asks its own question, allows only its causes, and is keyed apart from a PR's", async () => {
+  const pack = releasePack(releaseFinding({ out_of_date: fixedOnMaster }), releaseRef, []);
+  const bodies: MessageBody[] = [];
+  const res = await askModelBatch(async (_u, init) => { bodies.push(parsed<MessageBody>(bodyText(init))); return modelReply(init, { cause: "test_bug", confidence: 0.95, cited_evidence: ["base_change"], explanation: "Stale fixture." }); }, "k", DEFAULTS.model, [pack]);
+  assert.equal(bodies[0].system, SYSTEM_RELEASE);
+  assert.deepEqual(bodies[0].output_config.format.schema.properties.answers?.items.properties.cause?.enum, ["app_bug", "test_bug", "flaky_environment", "server_compat"]);
+  const text = contentText(bodies[0].messages[0].content);
+  assert.match(text, /"release":\{"id":"release","branch":"v6\.3\.2-rc\.2","base":"master","history_branch":"master"\}/);
+  assert.doesNotMatch(text, /"pr":|diff_hunks/);
+  assert.equal((res.answers[0] as Answer).cause, "test_bug");
+  assert.throws(() => parseAnswer(JSON.stringify({ cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "x" }), ["app_bug", "test_bug", "flaky_environment", "server_compat"]), /unknown cause/);
+  const prPack = buildPack(releaseFinding(), [], prCtx, []);
+  assert.notEqual(answerKey(DEFAULTS.model, pack), answerKey(DEFAULTS.model, { ...pack, release: undefined, base_change: undefined }), "the question is part of the key");
+  assert.ok(answerKey(DEFAULTS.model, prPack).startsWith("v5:"));
+});
+
+test("end to end: a release run's stale test is cleared as a test bug, and an app bug is named, on the check and in the summary", async () => {
+  await inTmp(async (dir) => {
+    const compare = { ahead_by: 61, files: [{ filename: "specs/a.spec.ts", patch: "@@ -1 +1 @@\n-old\n+fixed" }], commits: [{ sha: "m1" }] };
+    const statuses: StatusBody[] = [];
+    const bodies: MessageBody[] = [];
+    const env = { ...releaseEnv("release-6.3"), ANTHROPIC_API_KEY: "AK", GITHUB_STEP_SUMMARY: join(dir, "s.md") };
+    const testBug = await triage({ env, fetchImpl: fakeFetch(releaseRoutes({ histories: [], compare, statuses, bodies, answer: { cause: "test_bug", confidence: 0.95, cited_evidence: ["base_change"], explanation: "The old fixture is invalid; master replaced it." } })), log: () => {} });
+    const [f] = testBug.findings;
+    assert.deepEqual([f.blocking, f.decision, statusLabelOf(f)], [false, "adjudicator_unblock", "test bug"]);
+    assert.equal(testBug.verdict, "SUCCESS");
+    assert.match(statuses.at(-1)?.description ?? "", /^\(1 test bug\) /);
+    assert.match(contentText(bodies[0].messages[0].content), /"base_change":\{"id":"base_change","commits":\["#4012 \(2026-10-01\)"\],"diff":"@@ -1 \+1 @@\\n-old\\n\+fixed"\}/);
+    const text = readFileSync(join(dir, "s.md"), "utf8");
+    assert.match(text, /\| Looks like a test bug \(AI, 95% sure\): The old fixture is invalid; master replaced it\. \| Backport the test fix, or ignore it for this release\. \|/);
+    assert.match(text, /Not an app bug \(a test bug\), 95% sure/);
+    assert.match(text, /^## E2E triage · [^:]+: ✅ no app bug found$/m);
+    assert.match(text, /\*\*1 failure: 1 not an app bug \(1 test bug\)\.\*\*/);
+    assert.match(text, /^### Not an app bug \(1\)$/m);
+
+    const appStatuses: StatusBody[] = [];
+    const appBug = await triage({ env, fetchImpl: fakeFetch(releaseRoutes({ histories: [], compare: { ahead_by: 61, files: [], commits: [] }, statuses: appStatuses, answer: { cause: "app_bug", confidence: 0.9, cited_evidence: ["error"], explanation: "The preview modal never opens." } })), log: () => {} });
+    assert.deepEqual([appBug.findings[0].blocking, statusLabelOf(appBug.findings[0])], [true, "app bug"]);
+    assert.match(appStatuses.at(-1)?.description ?? "", /^\(1 app bug\) /);
+    assert.equal(redReason(appStatuses.at(-1)?.description), "1 app bug");
+    assert.match(readFileSync(join(dir, "s.md"), "utf8"), /\| Looks like an app bug in this build \(AI, 90% sure\): The preview modal never opens\. \| Read the error, and file it against this release if it holds\. \|/);
+  });
+});
+
+test("a release run's lanes are every other report of the run, by OS and server version; a shard of its own is not", () => {
+  const f = finding({ title: "t1", file: "specs/a.spec.ts", report_name: "e2e-on-ubuntu-latest-11.11.3" });
+  const elsewhere = new Map([[elsewhereKey("specs/a.spec.ts", "t1"), [
+    { report: "e2e-on-ubuntu-latest-10.11.25", status: "passed" },
+    { report: "e2e-on-macos-26-11.11.3", status: "failed" },
+    { report: "e2e-on-ubuntu-latest-11.11.3-2-of-2", status: "failed" },
+  ]]]);
+  sameTestOnOtherReports([f], { elsewhere } as unknown as RunResult, true);
+  assert.deepEqual(f.other_lanes, [{ platform: "macos-26-11.11.3", result: "failed" }, { platform: "ubuntu-latest-10.11.25", result: "passed" }]);
+});
+
+test("a row names at most three other lanes, then how many more", () => {
+  const lanes = ["a", "b", "c", "d", "e"].map((platform) => ({ platform, result: "failed" }));
+  const text = renderSummary({ findings: [finding({ title: "t1", file: "specs/a.spec.ts", other_lanes: lanes })], counts: { failed: 1, passed: 9 }, runURL: "u", trunkBranch: "master" });
+  assert.match(text, /Also failed on a, b, c and 2 more in this run/);
+  const four = renderSummary({ findings: [finding({ title: "t1", file: "specs/a.spec.ts", other_lanes: lanes.slice(0, 4) })], counts: { failed: 1, passed: 9 }, runURL: "u", trunkBranch: "master" });
+  assert.match(four, /Also failed on a, b, c, d in this run/);
 });
