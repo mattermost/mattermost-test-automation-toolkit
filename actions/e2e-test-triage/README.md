@@ -134,6 +134,19 @@ alone. Without the model (no key, over budget, an error) it stays blocking and t
 run stays red as `ACTION_REQUIRED`. Once every failure is cleared the run is
 `SUCCESS`; missing reports still keep it red.
 
+**Release branches (CMT):** a run with no PR on a branch other than the default
+(a release candidate's compatibility matrix) runs that branch's own copies of the
+tests, which the default branch may have fixed since the branch was cut. Every
+failure held there is checked against the default branch: one whose spec master
+changed since the branch was cut is **out of date** ("master changed this test
+(#PR, date) after release-6.3 branched from it, so this run used release-6.3's old
+copy"; next step: backport the test change, or ignore it for this release). With
+fewer than 5 earlier runs of its own, history is read from the default branch;
+`history-lane` and `history-report` (a report-name prefix such as
+`e2e-on-ubuntu-latest` for `e2e-on-ubuntu-latest-11.11.3`) make its runs match.
+That history is another line of code: it is evidence, and never clears a failure on
+the release branch by itself.
+
 **Lanes the base branch rarely runs:** history is read per lane. A lane master
 runs only sometimes (mattermost's subpath suite) has too little history to call
 anything flaky; `history-lane` makes it read a lane with the same tests, such as

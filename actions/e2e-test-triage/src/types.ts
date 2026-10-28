@@ -341,6 +341,8 @@ export interface Config {
   /** Re-runs of the failed jobs triage may ask for when only placeholders or missing reports keep a lane red (0: none). */
   rerunAttempts: number;
   historyLane: string | null;
+  /** The report-name prefix history is read under, when the run's own report name is narrower (HISTORY_REPORT). */
+  historyReport: string | null;
   escalationModel: string;
   escalateMin: number;
   budgetUsd: number;

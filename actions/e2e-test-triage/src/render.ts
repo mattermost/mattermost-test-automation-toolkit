@@ -87,7 +87,7 @@ const SHARED_CAUSE = ": likely environment or a shared cause.";
 const PLAIN = ".";
 
 /** One line of why, and the next step, for a failed test. */
-function whyNext(f: Finding, branch: string, pr: boolean): [string, string] {
+function whyNext(f: Finding, branch: string, pr: boolean, branchRun: string | null = null): [string, string] {
   const t = f.trunk ?? { runs: 0, passes: 0, fails: 0, flaky: 0 };
   const a = f.judge;
   const ai = a ? `AI, ${PERCENT(a.confidence)} sure` : "";
@@ -101,6 +101,8 @@ function whyNext(f: Finding, branch: string, pr: boolean): [string, string] {
       const c = f.out_of_date?.commit;
       const where = c ? ` (${c.pr ? `#${c.pr}` : sha7(c.sha)}${c.date ? `, ${c.date}` : ""})` : "";
       if (f.out_of_date?.fixed) return [`The failure first passed on ${branch}${where} after this PR last merged ${branch}, so this branch still has it.`, `Merge ${branch} and re-run.`];
+      const base = f.out_of_date?.base ?? branch;
+      if (branchRun) return [`${base} changed this test${where} after ${branchRun} branched from it, so this run used ${branchRun}'s old copy.`, `Backport the test change to ${branchRun}, or ignore it for this release.`];
       return [`${branch} changed this test${where} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
     }
     case "check":
@@ -142,7 +144,7 @@ function decidedBy(f: Finding): string {
 }
 
 /** The facts behind one test's verdict, one question per row. */
-function factsTable(f: Finding, branch: string, pr: boolean): string[] {
+function factsTable(f: Finding, branch: string, pr: boolean, branchRun: string | null = null): string[] {
   const t = f.trunk;
   const rows: [string, string][] = [];
   const edits = f.class === "OWNED_BY_PR";
@@ -180,7 +182,11 @@ function factsTable(f: Finding, branch: string, pr: boolean): string[] {
     rows.push([`Failed the same way on this PR's last ${count(f.out_of_date.streak, "commit")}`, `Never on ${branch}; its latest run passed`]);
   } else if (f.out_of_date) {
     const c = f.out_of_date.commit;
-    rows.push([`Changed on ${branch} since this PR last merged it`, `Yes${c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}` : ""}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
+    const which = c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}` : "";
+    const base = f.out_of_date.base ?? branch;
+    rows.push(branchRun
+      ? [`Changed on ${base} since ${branchRun} branched`, `Yes${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test`]
+      : [`Changed on ${branch} since this PR last merged it`, `Yes${which}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
   }
   if (f.decision === "evidence_incomplete" || f.identity_unresolved) rows.push(["Why history wasn't used", f.reason]);
   const a = f.judge;
@@ -238,6 +244,8 @@ export interface SummaryInput {
   lane?: string | null;
   trunkBranch?: string | null;
   pr?: boolean;
+  /** A run with no PR on a branch other than the default (see branchBase): its name, for the out-of-date wording. */
+  branchRun?: string | null;
   notes?: string[];
   /** The lane's own status is red although no test failed (a job outside the tests did). */
   laneRed?: boolean;
@@ -263,7 +271,7 @@ const RED_OUTSIDE = "No test failed. The lane is red because a job outside the t
  * groups (Your PR, Out of date, Needs a look, Broken on the base branch, Flaky; one line each: why and the next
  * step), then the evidence, collapsed.
  */
-export function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null, notRun = null, notRunRerun = null, rerun = null, rerunCheck = null }: SummaryInput): string {
+export function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, branchRun = null, notes = [], laneRed = false, reportsArrived = null, unnamed = null, notRun = null, notRunRerun = null, rerun = null, rerunCheck = null }: SummaryInput): string {
   const branch = trunkBranch || "the default branch";
   const where = lane ? ` · ${md(lane)}` : "";
   // A flagged run whose every failure was cleared reads as any other cleared run.
@@ -282,10 +290,13 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
   const fixedCount = outdated.filter((f) => f.out_of_date?.fixed).length;
   const staleText = [fixedCount && `${fixedCount} fixed on ${md(branch)}`, outdated.length - fixedCount && `${outdated.length - fixedCount} out of date`].filter(Boolean).join(", ");
   const needText = check.length ? `${check.length} need${check.length === 1 ? "s" : ""} a look` : "";
+  // A release branch's run is out of date with the default branch it was cut from, not with its own history.
+  const staleBase = outdated.find((f) => f.out_of_date?.base)?.out_of_date?.base ?? branch;
   // The headline must agree with the verdict: blocking failures and missing reports are red, and "none caused"
   // is only said when nothing blocks.
   const head = infra ? "⚠️ needs investigation"
     : !counts.failed && !missing ? (laneRed ? "🔴 red outside the tests" : "✅ nothing failed")
+    : outdatedLead && branchRun ? `🔴 ${staleText}: ${md(staleBase)} changed these tests after ${md(branchRun)} branched${needText ? `, ${needText}` : ""}`
     : outdatedLead ? `🔴 merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}`
     : yours.length ? `🔴 ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}`
     : missing ? "🔴 results missing"
@@ -327,7 +338,7 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
       blockingBroken && `${blockingBroken} still failing on ${branch}`,
       unrelated && `${unrelated} look${unrelated === 1 ? "s" : ""} unrelated (${kinds})`,
     ].filter(Boolean).join("; ") + ".";
-    if (outdatedLead) say = `Merge ${branch} and re-run first. ${say}`;
+    if (outdatedLead) say = branchRun ? `Backport ${staleBase}'s test changes to ${branchRun}, or ignore them for this release. ${say}` : `Merge ${branch} and re-run first. ${say}`;
     if (unnamed) say += ` ${rerunLine}`;
   }
   if (infra) say = `${infra} ${say}`;
@@ -340,7 +351,7 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
     if (!list.length) return;
     lines.push(`### ${heading}`, "", "| Test | Why | Next step |", "| --- | --- | --- |");
     for (const f of list) {
-      const [why, next] = whyNext(f, branch, pr);
+      const [why, next] = whyNext(f, branch, pr, branchRun);
       // A row that blames this PR (or a base-branch change to its test), or is held for failing everywhere, is not
       // steered toward the environment.
       const plain = bucketOf(f) === "yours" || bucketOf(f) === "outdated" || Boolean(f.failed_everywhere);
@@ -351,7 +362,9 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
   section(pr ? "Your PR" : "This commit", yours);
   // A branch-state hold changed nothing on the base: its heading says what it is.
   const streakOnly = outdated.length > 0 && outdated.every((f) => f.out_of_date?.streak);
-  section("Out of date", outdated, streakOnly
+  section("Out of date", outdated, branchRun
+    ? `Out of date (${outdated.length}): ${md(staleBase)} changed these tests after ${md(branchRun)} branched from it`
+    : streakOnly
     ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}`
     : fixedCount === outdated.length
       ? `Fixed on ${md(branch)} (${outdated.length}): ${md(branch)} fixed these failures after this PR last merged ${md(branch)}`
@@ -363,7 +376,7 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
   const shown = [...yours, ...outdated, ...check, ...broken, ...flaky].slice(0, 30);
   if (shown.length) {
     lines.push("<details>", "<summary>Evidence for each test</summary>", "");
-    for (const f of shown) lines.push(`**${md(f.title)}** · \`${mdCode(fileOf(f))}\``, "", ...factsTable(f, branch, pr), "");
+    for (const f of shown) lines.push(`**${md(f.title)}** · \`${mdCode(fileOf(f))}\``, "", ...factsTable(f, branch, pr, branchRun), "");
     if (findings.length > shown.length) lines.push(`${findings.length - shown.length} more tests are not shown.`, "");
     lines.push("</details>", "");
   }

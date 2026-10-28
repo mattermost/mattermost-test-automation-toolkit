@@ -43,6 +43,8 @@ export interface EvaluateParams {
   history: HistoryLike;
   diff: Diff;
   trunkBranch: string | null | undefined;
+  /** A run with no PR on a branch other than the default: the default branch, which its copies of the tests are checked against. */
+  branchBase?: string | null;
   testRoot: string | null;
   cfg?: Config;
   prTitle?: string;
@@ -75,6 +77,7 @@ export async function evaluateRun({
   history,
   diff,
   trunkBranch,
+  branchBase = null,
   testRoot,
   cfg = DEFAULTS,
   prTitle = "",
@@ -166,11 +169,20 @@ export async function evaluateRun({
       }
     }
     holdFailedEverywhere(result.findings);
+    // A release branch judged on its default branch's history: that is another line of code, so its flakiness or breaks
+    // say nothing about this branch's failure. They stay evidence; nothing clears on them.
+    const releaseOnBase = Boolean(branchBase && trunkBranch === branchBase);
+    if (releaseOnBase)
+      for (const f of result.findings)
+        if (!f.blocking && f.class !== "INFRA_ERROR")
+          Object.assign(f, { blocking: true, reason: `${f.reason} That is ${branchBase}'s history, not this branch's, so it does not clear a failure here.` });
     // A failure in a test the base branch changed after this PR last merged it ran
     // the PR's old copy: it stays red, with "merge <base>" as the next step, and
-    // is not sent to the model.
-    if (!blind && prNumber && outOfDate) {
-      const candidates = result.findings.filter((f) => f.blocking && BORDERLINE.has(f.class) && !f.identity_unresolved && f.repo_path);
+    // is not sent to the model. A release branch's run is checked the same way
+    // against the default branch, which may have fixed the test since the branch was cut.
+    if (!blind && (prNumber || branchBase) && outOfDate) {
+      // On a release branch every held failure is checked: its own copy of the test is what failed, whatever its history.
+      const candidates = result.findings.filter((f) => f.blocking && (branchBase ? f.class !== "OWNED_BY_PR" : BORDERLINE.has(f.class)) && !f.identity_unresolved && f.repo_path);
       // A failure whose change list is cut off or unreadable cannot be shown unchanged: it is unchecked, so red and never judged.
       const unchecked = (list: Finding[], because: string): void => {
         for (const f of list) Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} ${because}; this could not be confirmed.` });

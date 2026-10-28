@@ -37,6 +37,7 @@ export const DEFAULTS: Config = {
   // A lane red only for jobs that sent no results is re-run this many times before a person is asked to (see e2e-test-rerun).
   rerunAttempts: 0,
   historyLane: null,
+  historyReport: null,
   // Re-asks an answer between escalateMin and the threshold, or one that blames the PR
   // without citing a change. Off ("") until the share of answers in that band shows a
   // second model is worth its price (Fable 5.1 costs 5x Sonnet 5.5 per token).
@@ -178,6 +179,7 @@ export function configFrom(env: Env, warn: (message: string) => void = () => {})
     infraClears: env.INFRA_CLEARS === "true",
     rerunAttempts: attemptsFrom(env.RERUN_ATTEMPTS, warn),
     historyLane: (env.HISTORY_LANE || "").trim() || null,
+    historyReport: (env.HISTORY_REPORT || "").trim() || null,
     prices,
   };
 }

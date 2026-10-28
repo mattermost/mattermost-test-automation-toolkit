@@ -60,6 +60,13 @@ inputs:
       (e.g. playwright-full-enterprise for a subpath suite); empty for the run's own lane
     required: false
     default: ""
+  history-report:
+    description: >-
+      Report-name prefix the history is read under, when the run's own report name carries what
+      the base branch's runs don't (a CMT lane's server version: e2e-on-ubuntu-latest for
+      e2e-on-ubuntu-latest-11.11.3); empty for report-name
+    required: false
+    default: ""
   infra-clears:
     description: >-
       "true" clears a test whose own error is its environment (test server down, a proxy page
@@ -174,6 +181,7 @@ runs:
         REPORT_ONLY_LABEL: ${{ inputs.report-only-label }}
         AI_ADVICE: ${{ inputs.ai-advice }}
         HISTORY_LANE: ${{ inputs.history-lane }}
+        HISTORY_REPORT: ${{ inputs.history-report }}
         INFRA_CLEARS: ${{ inputs.infra-clears }}
         TRIAGE_CONTEXT: ${{ inputs.triage-status-context }}
         TRIAGE_LANES: ${{ inputs.triage-lanes }}

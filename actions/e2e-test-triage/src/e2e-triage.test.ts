@@ -4474,3 +4474,78 @@ test("a flaky run in history keeps the error of its failed try, which trunk's co
   assert.equal(classify({ ...failing, error }, [...trunkPasses(8), row], []).class, "FLAKY_ON_TRUNK", "master retried past this same error");
 });
 
+
+// ---------------------------------------------------------------- a release branch's run (CMT)
+
+// desktop CMT on v6.3.2-rc.2: master fixed the failing tests after release-6.3 was cut, and the branch had no history.
+const releaseRoutes = ({ histories, compare, asked = [], statuses = [], master = trunkPasses(8) }: { histories: HistoryBody[]; compare: unknown; asked?: string[]; statuses?: StatusBody[]; master?: Observation[] }): Route[] => [
+  ...runRoutes([spec("t1", "failed")], "cmt-desktop"),
+  ["/reports/history", (init) => { const body = parsed<HistoryBody>(bodyText(init)); histories.push(body); return Response.json({ observations: body.branch === "master" ? master : [] }); }],
+  ["/compare/abc...master", () => { asked.push("compare"); return Response.json(compare); }],
+  ["/commits?sha=master&path=specs%2Fa.spec.ts", () => Response.json([{ sha: "m1", commit: { message: "ci(e2e): restore 12.0 master E2E (#4012)", committer: { date: "2026-10-01T09:00:00Z" } } }])],
+  ["/statuses/abc", (i) => { statuses.push(parsed<StatusBody>(bodyText(i))); return Response.json({}); }],
+  ["/commits/abc/statuses", () => Response.json([{ context: "e2e/cmt", state: "failure", target_url: "https://github.com/o/r/actions/runs/12" }])],
+  ["/commits/abc", () => Response.json({ files: [] })],
+  ["/repos/o/r", () => { asked.push("repo"); return Response.json({ default_branch: "master" }); }],
+];
+const releaseEnv = (branch: string) => ({
+  ...env,
+  COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "cmt-desktop", branch }),
+  STATUS_CONTEXT: "e2e/cmt",
+  TRIAGE_CONTEXT: "off",
+  ANTHROPIC_API_KEY: "",
+});
+
+test("a release branch's run checks its tests against the default branch: a test master changed since is out of date", async () => {
+  await inTmp(async (dir) => {
+    const histories: HistoryBody[] = [];
+    const statuses: StatusBody[] = [];
+    const compare = { ahead_by: 61, files: [{ filename: "specs/a.spec.ts" }], commits: [{ sha: "m1" }] };
+    const result = await triage({ env: { ...releaseEnv("release-6.3"), GITHUB_STEP_SUMMARY: join(dir, "s.md") }, fetchImpl: fakeFetch(releaseRoutes({ histories, compare, statuses })), log: () => {} });
+    assert.deepEqual(histories.map((h) => h.branch).filter(Boolean), ["release-6.3", "master"], "too little history on the branch: master's is read");
+    const [f] = result.findings;
+    assert.equal(f.blocking, true);
+    assert.deepEqual(f.out_of_date, { base: "master", behind: 61, commit: { sha: "m1", date: "2026-10-01", pr: 4012 } });
+    assert.equal(statusLabelOf(f), "out of date");
+    assert.match(statuses.at(-1)?.description ?? "", /^\(1 out of date\) /);
+    const text = readFileSync(join(dir, "s.md"), "utf8");
+    assert.match(text, /^## E2E triage · [^:]+: 🔴 1 out of date: master changed these tests after release-6\.3 branched$/m);
+    assert.match(text, /History is read from master, the default branch: release-6\.3 has 0 earlier runs of these tests, fewer than 5\./);
+    assert.match(text, /^### Out of date \(1\): master changed these tests after release-6\.3 branched from it$/m);
+    assert.match(text, /\| master changed this test \(#4012, 2026-10-01\) after release-6\.3 branched from it, so this run used release-6\.3's old copy\. \| Backport the test change to release-6\.3, or ignore it for this release\. \|/);
+    assert.match(text, /\| Changed on master since release-6\.3 branched \| Yes: m1 \(#4012\) on 2026-10-01\. release-6\.3 is 61 commits behind master, so it ran its old copy of the test \|/);
+    assert.match(text, /Backport master's test changes to release-6\.3, or ignore them for this release\./);
+    assert.doesNotMatch(text, /this PR|Merge master/);
+  });
+});
+
+test("a release branch's test master did not change keeps its call; master's own run is not compared with itself", async () => {
+  const histories: HistoryBody[] = [];
+  const unchanged = await triage({ env: releaseEnv("release-6.3"), fetchImpl: fakeFetch(releaseRoutes({ histories, compare: { ahead_by: 61, files: [{ filename: "app/x.ts" }], commits: [] } })), log: () => {} });
+  assert.equal(unchanged.findings[0].out_of_date, undefined);
+  assert.equal(unchanged.findings[0].class, "REGRESSION", "judged on master's history: it passes there");
+  const asked: string[] = [];
+  const master = await triage({ env: releaseEnv("master"), fetchImpl: fakeFetch(releaseRoutes({ histories: [], compare: { ahead_by: 3, files: [{ filename: "specs/a.spec.ts" }], commits: [] }, asked })), log: () => {} });
+  assert.deepEqual(asked, ["repo"], "the default branch is read, and never compared with itself");
+  assert.equal(master.findings[0].out_of_date, undefined);
+});
+
+test("history-report reads history under a wider report name than the run's own", async () => {
+  const histories: HistoryBody[] = [];
+  await triage({ env: { ...releaseEnv("release-6.3"), REPORT_NAME: "e2e-on-ubuntu-latest-11.11.3", HISTORY_REPORT: "e2e-on-ubuntu-latest" }, fetchImpl: fakeFetch([
+    ...releaseRoutes({ histories, compare: { ahead_by: 0, files: [], commits: [] } }).filter(([m]) => m !== "/reports/g1/suites"),
+    ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts", report_name: "e2e-on-ubuntu-latest-11.11.3" }] })],
+  ]), log: () => {} });
+  assert.deepEqual([...new Set(histories.map((h) => h.report))], ["e2e-on-ubuntu-latest"]);
+});
+
+test("master's flakiness never clears a release branch's failure: it is another line of code", async () => {
+  // desktop CMT: master flakes on MM-T4054 with the same error; v6.3.2-rc.2 failed it 30 of 30 tries, on its stale copy.
+  const master = [...trunkPasses(8), obs({ status: "flaky", commit_sha: "f1", error_excerpt: "Error: expected visible" })];
+  const fixed = await triage({ env: releaseEnv("release-6.3"), fetchImpl: fakeFetch(releaseRoutes({ histories: [], master, compare: { ahead_by: 61, files: [{ filename: "specs/a.spec.ts" }], commits: [{ sha: "m1" }] } })), log: () => {} });
+  const [f] = fixed.findings;
+  assert.deepEqual([f.class, f.blocking, statusLabelOf(f)], ["FLAKY_ON_TRUNK", true, "out of date"], "held, and checked against master: master changed the test");
+  assert.match(f.reason, /That is master's history, not this branch's, so it does not clear a failure here\.$/);
+  const unchanged = await triage({ env: releaseEnv("release-6.3"), fetchImpl: fakeFetch(releaseRoutes({ histories: [], master, compare: { ahead_by: 61, files: [], commits: [] } })), log: () => {} });
+  assert.deepEqual([unchanged.findings[0].blocking, statusLabelOf(unchanged.findings[0])], [true, "needs investigation"]);
+});

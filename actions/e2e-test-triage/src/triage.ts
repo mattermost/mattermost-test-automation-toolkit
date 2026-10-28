@@ -180,6 +180,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   // Not guessed: a wrong root makes every spec look untouched.
   const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
   const reportName = env.REPORT_NAME || null;
+  const historyReport = cfg.historyReport || reportName;
   const run = await fetchRun(fetchImpl, base, id, reportName, wait);
   seen.run = run;
   const context = env.STATUS_CONTEXT;
@@ -242,20 +243,35 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // too few); otherwise it is the repository's default branch, and the summary says so.
     const prBase = isTrunkRun ? null : pull.base?.ref ?? null;
     let trunkBranch: string | null | undefined = isTrunkRun ? id.branch : prBase;
+    // A run with no PR on a branch other than the default (a release candidate's CMT) runs that branch's own copies of
+    // the tests, which the default branch may have changed since: the default branch is its base.
+    let branchBase: string | null = null;
     // A run of shard placeholders only needs no history. Otherwise placeholders' files are asked for too: TSIO counts its
     // run window over the files asked for, so dropping one would change which past runs the real tests are judged on.
     if (run.failing.some((t) => !isShardPlaceholder(t))) {
       [history, diff] = await Promise.all([
-        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg)),
+        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)),
         fetchChangedFiles(api, id, prNumber, log),
       ]);
+      if (isTrunkRun && id.branch) {
+        const fallback = await defaultBranchOf(api, id.repository, log);
+        if (fallback && fallback !== id.branch) {
+          branchBase = fallback;
+          const ownRuns = trunkRunsOn(history, id.branch);
+          if (ownRuns < cfg.minTrunkRuns) {
+            trunkBranch = fallback;
+            notes.push(`History is read from ${fallback}, the default branch: ${id.branch} has ${ownRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
+            history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg));
+          }
+        }
+      }
       const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;
       if (prBase && baseRuns < cfg.minTrunkRuns) {
         const fallback = await defaultBranchOf(api, id.repository, log);
         if (fallback && fallback !== prBase) {
           trunkBranch = fallback;
           notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
+          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg));
         }
       }
       await dropStormRuns({ history, fetchImpl, base, minFailures: cfg.infraMinFailures, trunkBranch, own: run.group_id, pr: prNumber, log });
@@ -268,7 +284,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     let specHistory: SpecHistory | null = null;
     if (run.failing.some(isSpecStopped)) {
       try {
-        specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, run.failing.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), reportName);
+        specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, run.failing.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), historyReport);
       } catch (e) {
         log(`history of the specs that did not run unavailable: ${String(e).slice(0, 200)}`);
       }
@@ -314,13 +330,13 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const apiKey = env.ANTHROPIC_API_KEY;
     const ask: AskFn | null = apiKey && !prSpendUnknown ? (packs, model) => askModelBatch(fetchImpl, apiKey, model, packs) : null;
     const result = await evaluateRun({
-      run, id, prNumber, history, diff, trunkBranch, testRoot, cfg,
+      run, id, prNumber, history, diff, trunkBranch, branchBase, testRoot, cfg,
       prTitle: pull.title ?? "", lane: env.LANE || id.name, log,
       ask,
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
-      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, until: now.toISOString(), log }),
+      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory,
@@ -358,7 +374,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
     const rerun = rerunCheck?.rerun ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = rerunCheck?.held ?? null;
-    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
+    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);

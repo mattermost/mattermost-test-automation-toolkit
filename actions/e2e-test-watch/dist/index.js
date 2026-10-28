@@ -63,6 +63,7 @@ var DEFAULTS = {
   // A lane red only for jobs that sent no results is re-run this many times before a person is asked to (see e2e-test-rerun).
   rerunAttempts: 0,
   historyLane: null,
+  historyReport: null,
   // Re-asks an answer between escalateMin and the threshold, or one that blames the PR
   // without citing a change. Off ("") until the share of answers in that band shows a
   // second model is worth its price (Fable 5.1 costs 5x Sonnet 5.5 per token).
@@ -164,6 +165,7 @@ function configFrom(env, warn = () => {
     infraClears: env.INFRA_CLEARS === "true",
     rerunAttempts: attemptsFrom(env.RERUN_ATTEMPTS, warn),
     historyLane: (env.HISTORY_LANE || "").trim() || null,
+    historyReport: (env.HISTORY_REPORT || "").trim() || null,
     prices
   };
 }
@@ -823,7 +825,7 @@ var alsoFailed = (f, tail) => {
 };
 var SHARED_CAUSE = ": likely environment or a shared cause.";
 var PLAIN = ".";
-function whyNext(f, branch, pr) {
+function whyNext(f, branch, pr, branchRun = null) {
   const t = f.trunk ?? { runs: 0, passes: 0, fails: 0, flaky: 0 };
   const a = f.judge;
   const ai = a ? `AI, ${PERCENT(a.confidence)} sure` : "";
@@ -837,6 +839,8 @@ function whyNext(f, branch, pr) {
       const c = f.out_of_date?.commit;
       const where = c ? ` (${c.pr ? `#${c.pr}` : sha7(c.sha)}${c.date ? `, ${c.date}` : ""})` : "";
       if (f.out_of_date?.fixed) return [`The failure first passed on ${branch}${where} after this PR last merged ${branch}, so this branch still has it.`, `Merge ${branch} and re-run.`];
+      const base = f.out_of_date?.base ?? branch;
+      if (branchRun) return [`${base} changed this test${where} after ${branchRun} branched from it, so this run used ${branchRun}'s old copy.`, `Backport the test change to ${branchRun}, or ignore it for this release.`];
       return [`${branch} changed this test${where} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
     }
     case "check":
@@ -874,7 +878,7 @@ function decidedBy(f) {
   if (f.judge || f.ai?.model) return `Rules; AI asked${f.escalated ? ", second opinion" : ""}`;
   return "Rules";
 }
-function factsTable(f, branch, pr) {
+function factsTable(f, branch, pr, branchRun = null) {
   const t = f.trunk;
   const rows = [];
   const edits = f.class === "OWNED_BY_PR";
@@ -907,7 +911,9 @@ function factsTable(f, branch, pr) {
     rows.push([`Failed the same way on this PR's last ${count(f.out_of_date.streak, "commit")}`, `Never on ${branch}; its latest run passed`]);
   } else if (f.out_of_date) {
     const c = f.out_of_date.commit;
-    rows.push([`Changed on ${branch} since this PR last merged it`, `Yes${c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}` : ""}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
+    const which = c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}` : "";
+    const base = f.out_of_date.base ?? branch;
+    rows.push(branchRun ? [`Changed on ${base} since ${branchRun} branched`, `Yes${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test`] : [`Changed on ${branch} since this PR last merged it`, `Yes${which}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
   }
   if (f.decision === "evidence_incomplete" || f.identity_unresolved) rows.push(["Why history wasn't used", f.reason]);
   const a = f.judge;
@@ -931,7 +937,7 @@ function passRate(counts) {
 var passLine = (counts, notRun = 0) => notRun ? `${counts.passed ?? 0} passed, ${Math.max(0, (counts.failed ?? 0) - notRun)} failed, ${notRun} not run, ${counts.skipped ?? 0} skipped` : `${passRate(counts)} passed (${counts.passed ?? 0} passed, ${counts.failed} failed, ${counts.skipped ?? 0} skipped)`;
 var notRunText = (n) => `${count(n, "spec")} did not run, no result from ${n === 1 ? "its" : "their"} CI job`;
 var RED_OUTSIDE = "No test failed. The lane is red because a job outside the tests failed (setup, upload or runner), or results are missing: re-run the failed jobs.";
-function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, notes = [], laneRed = false, reportsArrived = null, unnamed = null, notRun = null, notRunRerun = null, rerun = null, rerunCheck = null }) {
+function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode = "report-only", ai = newLedger(), missing = null, lane = null, trunkBranch = null, pr = true, branchRun = null, notes = [], laneRed = false, reportsArrived = null, unnamed = null, notRun = null, notRunRerun = null, rerun = null, rerunCheck = null }) {
   const branch = trunkBranch || "the default branch";
   const where = lane ? ` \xB7 ${md(lane)}` : "";
   const infra = activeFlag(runInfra, findings);
@@ -945,7 +951,8 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
   const fixedCount = outdated.filter((f) => f.out_of_date?.fixed).length;
   const staleText = [fixedCount && `${fixedCount} fixed on ${md(branch)}`, outdated.length - fixedCount && `${outdated.length - fixedCount} out of date`].filter(Boolean).join(", ");
   const needText = check.length ? `${check.length} need${check.length === 1 ? "s" : ""} a look` : "";
-  const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? laneRed ? "\u{1F534} red outside the tests" : "\u2705 nothing failed" : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : check.length || outdated.length ? `${unnamed ? "\u{1F534}" : "\u{1F7E1}"} ${[needText, staleText, unnamed ? "re-run the failed jobs" : ""].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : unnamed ? `\u{1F534} ${notRunRerun && !findings.length ? `${count(notRunRerun, "spec")} did not run, ` : ""}${rerun ? RERUNNING : RERUN}` : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
+  const staleBase = outdated.find((f) => f.out_of_date?.base)?.out_of_date?.base ?? branch;
+  const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? laneRed ? "\u{1F534} red outside the tests" : "\u2705 nothing failed" : outdatedLead && branchRun ? `\u{1F534} ${staleText}: ${md(staleBase)} changed these tests after ${md(branchRun)} branched${needText ? `, ${needText}` : ""}` : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : check.length || outdated.length ? `${unnamed ? "\u{1F534}" : "\u{1F7E1}"} ${[needText, staleText, unnamed ? "re-run the failed jobs" : ""].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : unnamed ? `\u{1F534} ${notRunRerun && !findings.length ? `${count(notRunRerun, "spec")} did not run, ` : ""}${rerun ? RERUNNING : RERUN}` : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
   const lines = [`## E2E triage${where}: ${head}`, ""];
   const several = findings.filter((f) => failedElsewhere(f).length > 0).length;
   if (several) lines.push(`${count(several, "test")} failed on several platforms in this run.`, "");
@@ -971,7 +978,7 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
       blockingBroken && `${blockingBroken} still failing on ${branch}`,
       unrelated && `${unrelated} look${unrelated === 1 ? "s" : ""} unrelated (${kinds})`
     ].filter(Boolean).join("; ") + ".";
-    if (outdatedLead) say = `Merge ${branch} and re-run first. ${say}`;
+    if (outdatedLead) say = branchRun ? `Backport ${staleBase}'s test changes to ${branchRun}, or ignore them for this release. ${say}` : `Merge ${branch} and re-run first. ${say}`;
     if (unnamed) say += ` ${rerunLine}`;
   }
   if (infra) say = `${infra} ${say}`;
@@ -983,7 +990,7 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
     if (!list.length) return;
     lines.push(`### ${heading}`, "", "| Test | Why | Next step |", "| --- | --- | --- |");
     for (const f of list) {
-      const [why, next] = whyNext(f, branch, pr);
+      const [why, next] = whyNext(f, branch, pr, branchRun);
       const plain = bucketOf(f) === "yours" || bucketOf(f) === "outdated" || Boolean(f.failed_everywhere);
       lines.push(`| ${md(f.title)} \xB7 \`${mdCode(fileOf(f))}\` | ${md(why + alsoFailed(f, plain ? PLAIN : SHARED_CAUSE))} | ${md(next)} |`);
     }
@@ -991,14 +998,14 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
   };
   section(pr ? "Your PR" : "This commit", yours);
   const streakOnly = outdated.length > 0 && outdated.every((f) => f.out_of_date?.streak);
-  section("Out of date", outdated, streakOnly ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}` : fixedCount === outdated.length ? `Fixed on ${md(branch)} (${outdated.length}): ${md(branch)} fixed these failures after this PR last merged ${md(branch)}` : `Out of date (${outdated.length}): ${md(branch)} changed these tests, or fixed these failures, after this PR last merged ${md(branch)}`);
+  section("Out of date", outdated, branchRun ? `Out of date (${outdated.length}): ${md(staleBase)} changed these tests after ${md(branchRun)} branched from it` : streakOnly ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}` : fixedCount === outdated.length ? `Fixed on ${md(branch)} (${outdated.length}): ${md(branch)} fixed these failures after this PR last merged ${md(branch)}` : `Out of date (${outdated.length}): ${md(branch)} changed these tests, or fixed these failures, after this PR last merged ${md(branch)}`);
   section("Needs a look", check);
   section(`Broken on ${md(branch)}`, broken);
   section("Flaky", flaky);
   const shown = [...yours, ...outdated, ...check, ...broken, ...flaky].slice(0, 30);
   if (shown.length) {
     lines.push("<details>", "<summary>Evidence for each test</summary>", "");
-    for (const f of shown) lines.push(`**${md(f.title)}** \xB7 \`${mdCode(fileOf(f))}\``, "", ...factsTable(f, branch, pr), "");
+    for (const f of shown) lines.push(`**${md(f.title)}** \xB7 \`${mdCode(fileOf(f))}\``, "", ...factsTable(f, branch, pr, branchRun), "");
     if (findings.length > shown.length) lines.push(`${findings.length - shown.length} more tests are not shown.`, "");
     lines.push("</details>", "");
   }
@@ -2398,6 +2405,7 @@ async function evaluateRun({
   history,
   diff,
   trunkBranch,
+  branchBase = null,
   testRoot,
   cfg = DEFAULTS,
   prTitle = "",
@@ -2470,8 +2478,14 @@ async function evaluateRun({
       }
     }
     holdFailedEverywhere(result.findings);
-    if (!blind && prNumber && outOfDate) {
-      const candidates = result.findings.filter((f) => f.blocking && BORDERLINE.has(f.class) && !f.identity_unresolved && f.repo_path);
+    const releaseOnBase = Boolean(branchBase && trunkBranch === branchBase);
+    if (releaseOnBase) {
+      for (const f of result.findings)
+        if (!f.blocking && f.class !== "INFRA_ERROR")
+          Object.assign(f, { blocking: true, reason: `${f.reason} That is ${branchBase}'s history, not this branch's, so it does not clear a failure here.` });
+    }
+    if (!blind && (prNumber || branchBase) && outOfDate) {
+      const candidates = result.findings.filter((f) => f.blocking && (branchBase ? f.class !== "OWNED_BY_PR" : BORDERLINE.has(f.class)) && !f.identity_unresolved && f.repo_path);
       const unchecked = (list, because) => {
         for (const f of list) Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} ${because}; this could not be confirmed.` });
       };
@@ -2831,6 +2845,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
   const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
   const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
   const reportName = env.REPORT_NAME || null;
+  const historyReport = cfg.historyReport || reportName;
   const run = await fetchRun(fetchImpl, base, id, reportName, wait);
   seen.run = run;
   const context = env.STATUS_CONTEXT;
@@ -2881,18 +2896,31 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     let diff = { files: [], ok: false };
     const prBase = isTrunkRun ? null : pull.base?.ref ?? null;
     let trunkBranch = isTrunkRun ? id.branch : prBase;
+    let branchBase = null;
     if (run.failing.some((t) => !isShardPlaceholder(t))) {
       [history, diff] = await Promise.all([
-        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg)),
+        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)),
         fetchChangedFiles(api, id, prNumber, log)
       ]);
+      if (isTrunkRun && id.branch) {
+        const fallback = await defaultBranchOf(api, id.repository, log);
+        if (fallback && fallback !== id.branch) {
+          branchBase = fallback;
+          const ownRuns = trunkRunsOn(history, id.branch);
+          if (ownRuns < cfg.minTrunkRuns) {
+            trunkBranch = fallback;
+            notes.push(`History is read from ${fallback}, the default branch: ${id.branch} has ${ownRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
+            history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg));
+          }
+        }
+      }
       const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;
       if (prBase && baseRuns < cfg.minTrunkRuns) {
         const fallback = await defaultBranchOf(api, id.repository, log);
         if (fallback && fallback !== prBase) {
           trunkBranch = fallback;
           notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
+          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg));
         }
       }
       await dropStormRuns({ history, fetchImpl, base, minFailures: cfg.infraMinFailures, trunkBranch, own: run.group_id, pr: prNumber, log });
@@ -2902,7 +2930,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     let specHistory = null;
     if (run.failing.some(isSpecStopped)) {
       try {
-        specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, run.failing.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), reportName);
+        specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, run.failing.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), historyReport);
       } catch (e) {
         log(`history of the specs that did not run unavailable: ${String(e).slice(0, 200)}`);
       }
@@ -2947,6 +2975,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       history,
       diff,
       trunkBranch,
+      branchBase,
       testRoot,
       cfg,
       prTitle: pull.title ?? "",
@@ -2956,7 +2985,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log }),
-      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: trunkBranch, until: now.toISOString(), log }),
+      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory
@@ -2987,7 +3016,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
     const rerun = rerunCheck?.rerun ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = rerunCheck?.held ?? null;
-    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
+    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
     const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
