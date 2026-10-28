@@ -132,10 +132,8 @@ Rules:
   happened. No evidence ids and no percentages.`;
 
 const RELEASE_CAUSES: readonly Cause[] = ["app_bug", "test_bug", "flaky_environment", "server_compat"];
-// A pack is a release run's when it carries the release's facts: its question, causes and key differ.
-const isRelease = (pack: Pack): boolean => Boolean(pack.release);
-export const systemFor = (pack: Pack): string => (isRelease(pack) ? SYSTEM_RELEASE : SYSTEM);
-const causesFor = (pack: Pack): readonly Cause[] => (isRelease(pack) ? RELEASE_CAUSES : CAUSES);
+export const systemFor = (pack: Pack): string => (pack.release ? SYSTEM_RELEASE : SYSTEM);
+const causesFor = (pack: Pack): readonly Cause[] => (pack.release ? RELEASE_CAUSES : CAUSES);
 
 // Models that accept temperature (newer ones reject it with a 400).
 const TEMPERATURE_MODELS = ["claude-haiku-4-5", "claude-opus-4-6", "claude-sonnet-4-6"];
@@ -163,10 +161,11 @@ export const servedMatches = (requested: string, served: unknown): boolean =>
 // existed is still found for the same evidence: a re-run is not paid again, and no verdict moves with the field. With an
 // earlier failure in the spec they are keyed: a pass on another platform is then what lets an answer clear (chainClears),
 // so an answer given without one must not be reused once it arrives.
+// A release pack keys them too: its rules read the other lanes.
 const UNKEYED_FIELDS: ReadonlySet<string> = new Set(["same_test_other_platforms_this_run"]);
 export const packKey = (model: string, pack: Pack): string =>
   createHash("sha256")
-    .update(model + "\n" + JSON.stringify(Object.fromEntries(Object.entries(pack).filter(([k]) => pack.earlier_failure_same_spec || !UNKEYED_FIELDS.has(k)))))
+    .update(model + "\n" + JSON.stringify(Object.fromEntries(Object.entries(pack).filter(([k]) => pack.release || pack.earlier_failure_same_spec || !UNKEYED_FIELDS.has(k)))))
     .digest("hex");
 
 export interface ImageBlock {
@@ -294,12 +293,12 @@ const isMissing = (e: unknown): boolean => Boolean((e as { missing?: unknown } |
 export async function askModelBatch(fetchImpl: FetchImpl, apiKey: string, model: string, packs: Pack[], timeoutMs = 90000): Promise<BatchResult> {
   const ids = packs.map((_, i) => `f${i + 1}`);
   const hunks = [...new Map<string, Hunk>(packs.flatMap((p) => p.diff_hunks_of_files_named_in_error).map((h): [string, Hunk] => [h.id, h])).values()];
-  const release = isRelease(packs[0]);
+  const release = Boolean(packs[0].release);
   const items = packs.map((p, i) => {
     const { pr, diff_hunks_of_files_named_in_error: own, ...rest } = p;
-    return release ? { id: ids[i], valid_evidence_ids: evidenceIds(p), ...rest } : { id: ids[i], valid_evidence_ids: evidenceIds(p), related_hunks: own.map((h) => h.id), ...rest };
+    return { id: ids[i], valid_evidence_ids: evidenceIds(p), ...(release ? {} : { related_hunks: own.map((h) => h.id) }), ...rest };
   });
-  // A release run's findings each carry their release, with the lane's server version; a PR run shares its PR and diff.
+  // A release run's findings each carry their own release; a PR run shares its PR and diff.
   const shared = release ? {} : { pr: packs[0].pr, diff_hunks: hunks };
   const text = `Shared context for every finding (JSON):\n${JSON.stringify(shared)}\n\n` +
     `Findings (JSON). Answer every finding by its id, citing only that finding's valid_evidence_ids. ` +
@@ -335,15 +334,16 @@ export async function askModelBatch(fetchImpl: FetchImpl, apiKey: string, model:
 }
 
 /**
- * An answer kept from an earlier attempt, with the model that gave it (its provenance). An entry that does not
- * parse, or that was kept without the model that answered, is a miss: it is asked again, never trusted or thrown on.
+ * An answer kept from an earlier attempt for this pack, with the model that gave it (its provenance). An entry that does
+ * not parse with the causes the pack's question allows, or that was kept without the model that answered, is a miss: it
+ * is asked again, never trusted or thrown on.
  */
-export function cachedAnswer(entry: unknown, causes: readonly Cause[] = CAUSES): Answer | null {
+export function cachedAnswer(entry: unknown, pack: Pack): Answer | null {
   try {
     // The cache file is written by this action; its fields are checked here before use.
     const provenance = (entry as { provenance?: { served_model?: unknown } } | null | undefined)?.provenance;
     if (typeof provenance?.served_model !== "string") return null;
-    return { ...parseAnswer(JSON.stringify(entry), causes), provenance: provenance as Provenance };
+    return { ...parseAnswer(JSON.stringify(entry), causesFor(pack)), provenance: provenance as Provenance };
   } catch {
     return null;
   }
@@ -367,6 +367,3 @@ export function parseAnswer(text: string, causes: readonly Cause[] = CAUSES): Om
 // v5: the pack gained earlier_failure_same_spec and SYSTEM a rule for it, which can now clear. Every v4 answer is a miss.
 // A release pack is keyed with its own question, so a PR answer is never reused for it.
 export const answerKey = (model: string, pack: Pack): string => `v5:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + systemFor(pack), pack)}`;
-
-/** A kept answer for this pack, validated against the causes its question allows (see cachedAnswer). */
-export const cachedAnswerFor = (entry: unknown, pack: Pack): Answer | null => cachedAnswer(entry, causesFor(pack));

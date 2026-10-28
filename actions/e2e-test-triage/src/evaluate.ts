@@ -172,19 +172,16 @@ export async function evaluateRun({
       }
     }
     holdFailedEverywhere(result.findings);
-    // A release branch judged on its default branch's history: that is another line of code, so its flakiness or breaks
-    // say nothing about this branch's failure. They stay evidence; nothing clears on them.
-    const releaseOnBase = Boolean(branchBase && trunkBranch === branchBase);
-    if (releaseOnBase)
+    // A release branch judged on its default branch's history: another line of code, so nothing clears on it.
+    if (branchBase && trunkBranch === branchBase)
       for (const f of result.findings)
         if (!f.blocking && f.class !== "INFRA_ERROR")
           Object.assign(f, { blocking: true, reason: `${f.reason} That is ${branchBase}'s history, not this branch's, so it does not clear a failure here.` });
     // A failure in a test the base branch changed after this PR last merged it ran
     // the PR's old copy: it stays red, with "merge <base>" as the next step, and
     // is not sent to the model. A release branch's run is checked the same way
-    // against the default branch, which may have fixed the test since the branch was cut.
+    // against the default branch, and for every held failure, whatever its history.
     if (!blind && (prNumber || branchBase) && outOfDate) {
-      // On a release branch every held failure is checked: its own copy of the test is what failed, whatever its history.
       const candidates = result.findings.filter((f) => f.blocking && (branchBase ? f.class !== "OWNED_BY_PR" : BORDERLINE.has(f.class)) && !f.identity_unresolved && f.repo_path);
       // A failure whose change list is cut off or unreadable cannot be shown unchanged: it is unchecked, so red and never judged.
       const unchecked = (list: Finding[], because: string): void => {
@@ -242,8 +239,7 @@ export async function evaluateRun({
       if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
     }
     if (!blind && !prNumber && branchBase) {
-      // A release branch's run: what kind of failure each held one is (app bug, test bug, environment, server version;
-      // see SYSTEM_RELEASE), on its own evidence. decideRelease clears only what that evidence carries.
+      // A release branch's run: what kind of failure each held one is (see SYSTEM_RELEASE and decideRelease).
       for (const f of result.findings) f.release = true;
       const held = result.findings.filter((f) => f.blocking && f.class !== "OWNED_BY_PR" && !f.identity_unresolved && f.decision !== "evidence_incomplete");
       if (enrich) {
@@ -261,8 +257,7 @@ export async function evaluateRun({
     }
     if (!blind && prNumber) sameFailure(result.findings);
   }
-  // A release branch's spec that never ran is untested in that build: other runs' skips and passes, which are not this
-  // branch's (spec history has no branch), do not clear it.
+  // A release branch's spec that never ran is untested in that build: spec history, which has no branch, does not clear it.
   if (branchBase)
     for (const f of judgedNotRun)
       if (!f.blocking) Object.assign(f, { class: "NOT_RUN", blocking: true, reason: `${f.reason} On a release branch that does not clear it: this build never ran the spec.` });

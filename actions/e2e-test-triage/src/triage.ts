@@ -246,6 +246,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // A run with no PR on a branch other than the default (a release candidate's CMT) runs that branch's own copies of
     // the tests, which the default branch may have changed since: the default branch is its base.
     let branchBase: string | null = null;
+    if (isTrunkRun && id.branch && run.failing.length) {
+      const defaultBranch = await defaultBranchOf(api, id.repository, log);
+      if (defaultBranch && defaultBranch !== id.branch) branchBase = defaultBranch;
+    }
     // A run of shard placeholders only needs no history. Otherwise placeholders' files are asked for too: TSIO counts its
     // run window over the files asked for, so dropping one would change which past runs the real tests are judged on.
     if (run.failing.some((t) => !isShardPlaceholder(t))) {
@@ -253,16 +257,12 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)),
         fetchChangedFiles(api, id, prNumber, log),
       ]);
-      if (isTrunkRun && id.branch) {
-        const fallback = await defaultBranchOf(api, id.repository, log);
-        if (fallback && fallback !== id.branch) {
-          branchBase = fallback;
-          const ownRuns = trunkRunsOn(history, id.branch);
-          if (ownRuns < cfg.minTrunkRuns) {
-            trunkBranch = fallback;
-            notes.push(`History is read from ${fallback}, the default branch: ${id.branch} has ${ownRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-            history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg));
-          }
+      if (branchBase && id.branch) {
+        const ownRuns = trunkRunsOn(history, id.branch);
+        if (ownRuns < cfg.minTrunkRuns) {
+          trunkBranch = branchBase;
+          notes.push(`History is read from ${branchBase}, the default branch: ${id.branch} has ${ownRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
+          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg));
         }
       }
       const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;

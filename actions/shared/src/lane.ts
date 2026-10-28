@@ -27,8 +27,8 @@ interface Named {
   check: number;
 }
 
-// The labels are "flaky", "broken on main", "test bug", "server compat", "caused by PR", "app bug", "fixed on main", "out of date" and
-// "needs investigation"; "cleared by triage"
+// The labels are "flaky", "broken on main", "test bug", "server compat", "caused by PR", "app bug", "fixed on main",
+// "out of date" and "needs investigation"; "cleared by triage"
 // and "unresolved" are what a status written before them said.
 function namedIn(description: string | null | undefined): Named {
   const d = String(description ?? "");
@@ -81,12 +81,11 @@ export function redReason(description: string | null | undefined = ""): string {
  */
 export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = []): LaneSummary {
   const seen = lanes.filter((l): l is { context: string; status: CommitStatus } => Boolean(l.status));
-  // A red check triage does not cover keeps "all lanes green" from being said; its own state still gates the PR. Two
-  // names at most, so the 140-character status keeps the count.
+  // A red check triage does not cover keeps "all lanes green" from being said; its own state still gates the PR.
   const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
   const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
   const waiting = seen.filter((l) => l.status.state === "pending");
-  // A red check triage does not cover is named first: the 140-character status cuts the waiting lanes, never its name.
+  // Named first: the 140-character status cuts the waiting lanes, never its name.
   if (waiting.length) return { state: "pending", description: [otherText, `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`].filter(Boolean).join(" · ") };
   const red = seen.filter((l) => l.status.state !== "success");
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);

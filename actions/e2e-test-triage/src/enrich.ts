@@ -59,11 +59,11 @@ export function sameTestOnOtherReports(findings: Finding[], run: Pick<RunResult,
   for (const f of findings) {
     const own = f.report_name ?? "";
     if (everyReport) {
-      // A release run's lanes are OS x server version (desktop CMT: one group, one report per lane): each other report is
-      // another lane, named by OS and server. A shard of this lane ("<own>-1-of-3") is not.
+      // A release run's lanes are OS x server version, one report each: every other report is another lane, but a shard
+      // of this lane ("<own>-1-of-3") is not.
       const others = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? [])
         .filter((o) => o.report !== "" && o.report !== own && !o.report.startsWith(`${own}-`) && !own.startsWith(`${o.report}-`));
-      for (const o of [...others].sort((a, b) => a.report.localeCompare(b.report))) addOtherLane(f, o.report.replace(/^e2e-on-/, ""), o.status);
+      for (const o of others.sort((a, b) => a.report.localeCompare(b.report))) addOtherLane(f, o.report.replace(/^e2e-on-/, ""), o.status);
       continue;
     }
     const ownOs = osOfReport(own);
@@ -100,7 +100,7 @@ export async function siblingPlatforms({
   id: CompositeIdentity;
   log?: (message: string) => void;
   deadlineMs?: number;
-  /** The most sibling groups read: a release run's matrix has more lanes than a PR's platforms. */
+  /** The most sibling groups read. */
   limit?: number;
 }): Promise<void> {
   if (!findings.length) return;

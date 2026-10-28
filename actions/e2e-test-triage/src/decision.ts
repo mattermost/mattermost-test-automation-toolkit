@@ -5,7 +5,7 @@ import { FAILED_STATUSES } from "../../shared/src/tsio.ts";
 import { errorSignature, exoneratedSet, isInfraError, JUDGED } from "./classify.ts";
 import { DEFAULTS } from "./config.ts";
 import { chainClears, CLEARING, evidenceIds, PACK_IMAGES, serverOf } from "./pack.ts";
-import { answerKey, cachedAnswerFor, expectedOutput, maxTokensFor, systemFor } from "./judge.ts";
+import { answerKey, cachedAnswer, expectedOutput, maxTokensFor, systemFor } from "./judge.ts";
 import { costOf, ledgerTotals, newLedger } from "./pricing.ts";
 import type { Answer, BatchResult, Config, Finding, Ledger, Pack } from "./types.ts";
 
@@ -37,12 +37,9 @@ export interface Decision {
 }
 
 /**
- * What a release run's answer may change (see SYSTEM_RELEASE), held to its rules here, not to the answer's word. Sure
- * enough (minConfidence) and citing what its cause requires, a test bug (the default branch's change to the test, with
- * its diff), a server incompatibility (a pass against another server version on this build) or an environment (other
- * PRs failing the same way, or an infrastructure error) clears; an environment never does for a test that failed every
- * try here and on every other lane, and the history, which may be another line of code, never carries one. An app bug
- * is named and stays red. Anything else stays red unnamed.
+ * What a release run's answer may change (see SYSTEM_RELEASE). Sure enough and citing what its cause requires, a test
+ * bug, a server incompatibility or an environment (never for a test that failed everywhere) clears; the history, another
+ * line of code, never carries a clear. An app bug is named and stays red. Anything else stays red unnamed.
  */
 export function decideRelease(answer: Answer, pack: Pack, cfg: Config = DEFAULTS): Decision {
   const known = new Set(evidenceIds(pack));
@@ -160,7 +157,7 @@ export async function judge(
     const f = findings[i];
     const pack = packs[i];
     // An environment error the rules cleared is not asked; one still blocking is the judge's to clear or blame.
-    // A release run asks about every failure still held: its question is what kind of failure it is, whatever the class.
+    // A release run asks about every failure still held, whatever the class.
     if (!pack || f.identity_unresolved || !(pack.release ? f.blocking : (JUDGED.has(f.class) && f.blocking) || exoneratedSet(isTrunkRun).has(f.class))) continue;
     const advisory = !pack.release && !canChange(f.class, pack, isTrunkRun);
     if (advisory && !(cfg.advise && f.blocking && JUDGED.has(f.class))) {
@@ -194,8 +191,7 @@ export async function judge(
         continue;
       }
       const d = decide(m.f.class, answer, m.pack, cfg, isTrunkRun, false);
-      // A failure held as failing everywhere (see holdFailedEverywhere) may be blamed on the PR, never cleared. A release
-      // run's rules (decideRelease) read the other lanes themselves.
+      // A failure held as failing everywhere may be blamed on the PR, never cleared; decideRelease reads the lanes itself.
       if (m.f.failed_everywhere && !d.blocking && !m.pack.release) Object.assign(m.f, { decision: "advice", judge: d.answer });
       else Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
     }
@@ -260,7 +256,7 @@ export async function judge(
   const ask = async (model: string, batch: Group[], retryMissing = true): Promise<void> => {
     const fresh: Group[] = [];
     for (const g of batch) {
-      const cached = cachedAnswerFor(cfg.answers?.[answerKey(model, g.lead.pack)], g.lead.pack);
+      const cached = cachedAnswer(cfg.answers?.[answerKey(model, g.lead.pack)], g.lead.pack);
       if (cached) {
         ledger.skipped.cached++;
         g.answer = cached;

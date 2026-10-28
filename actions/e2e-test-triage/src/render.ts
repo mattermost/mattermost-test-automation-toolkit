@@ -79,13 +79,13 @@ const PERCENT = (n: number): string => `${Math.round(n * 100)}%`;
 /** The other platforms in this run where this test failed a try (a retry may have recovered it; a pass does not count). */
 export const failedElsewhere = (f: Finding): string[] => (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform);
 
+// Up to four names; past that, three and how many more (a release run's matrix can name fifteen lanes).
+const fewOf = (names: string[]): string => (names.length > 4 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", "));
 /**
  * The sentence added to a why when the same test failed on other platforms in this run. Each platform is named by what
  * it did: failed, or once (a failed try that a retry recovered). The tail says what it may mean: a shared cause is the
  * likely one for a test that is not this PR's; a row that blames this PR gets the plain tail, which steers nowhere.
  */
-// At most three names, then how many more: a release run's matrix can name fifteen lanes.
-const fewOf = (names: string[]): string => (names.length > 4 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", "));
 const alsoFailed = (f: Finding, tail: string): string => {
   const other = f.other_lanes ?? [];
   const failed = fewOf(other.filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform));
@@ -450,16 +450,16 @@ export function noResultsText(lane: string, commitSha: string): string {
   return `Not triaged: TSIO has no results for ${md(lane)} at ${sha7(commitSha)} (the tests may not have run).`;
 }
 
-/** The five labels the E2E check's text uses, in the order it lists them. */
+/** The labels the E2E check's text uses, in the order it lists them. */
 export const STATUS_LABELS = ["flaky", "broken on main", "test bug", "server compat", "caused by PR", "app bug", "fixed on main", "out of date", "needs investigation"] as const;
 export type StatusLabel = (typeof STATUS_LABELS)[number];
 
 /**
- * The label of one finding. Blocking: fixed on main (the base branch fixed the failure after this PR last merged it),
- * out of date (a stale copy, or the branch-state hold), caused by this PR (the PR
+ * The label of one finding. Blocking: app bug (a release run's judge names one), fixed on main (the base branch fixed the
+ * failure after this PR last merged it), out of date (a stale copy, or the branch-state hold), caused by this PR (the PR
  * edits the spec, or the judge blames or vetoes it), otherwise needs investigation. Cleared: broken on main (a trunk
- * break, or the judge's bug_on_master), otherwise flaky (trunk or cross-PR flakes, the environment, a test bug, or the
- * same failure as one of those).
+ * break, or the judge's bug_on_master), test bug or server compat (the judge's, on a release run), otherwise flaky
+ * (trunk or cross-PR flakes, the environment, a PR run's test bug, or the same failure as one of those).
  */
 export function statusLabelOf(f: Finding): StatusLabel {
   if (f.blocking) {
@@ -472,7 +472,6 @@ export function statusLabelOf(f: Finding): StatusLabel {
   if (f.decision === "adjudicator_unblock") {
     const cause = f.judge?.cause;
     if (cause === "bug_on_master") return "broken on main";
-    // A release run names what the model found; a PR run keeps "flaky" for anything not the PR's.
     if (f.release && cause === "test_bug") return "test bug";
     if (cause === "server_compat") return "server compat";
     return "flaky";

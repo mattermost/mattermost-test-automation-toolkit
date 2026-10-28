@@ -33,7 +33,7 @@ produced no results: a row with no test name; desktop's
 (`write-tsio-failure-stub.mjs`, after a job died or was cancelled); and mobile's
 `spec did not run` with "<spec> was assigned to a shard but produced no result"
 (`merge-jest-results-for-tsio.js`) and `CI infrastructure failure` in
-`ci/<job>.stub` (its `write-tsio-failure-stub.mjs`). They are counted as failed but are not
+`ci/<job>.stub` (`write-tsio-failure-stub.mjs`). They are counted as failed but are not
 findings: no test history is read for them, the model is not asked, and they do
 not make the run an `INFRA` run. The lane stays red and the check says "re-run
 the failed jobs", after the labels when the run also has real failures:
@@ -66,50 +66,44 @@ as unchecked evidence (the summary says so), and the model is not asked about it
 passes that needed a retry, plus 1, divided by the runs plus 2, is 0.05 or more,
 and the latest run passed. One failure counts with 38 or fewer runs; two or more
 always count. It clears the PR's failure only when master failed the same way:
-a failure with an error to compare (a distinctive error, or a timeout's stuck
-step) needs a master failure with that error (Mattermost's 26-character ids
-masked). One master only failed another
+a distinctive error or a timeout's stuck step needs a master failure with that
+error (Mattermost's 26-character ids masked). One master failed only another
 way, or with nothing to compare (a hook timeout, no error), is a `REGRESSION`
 for the model to judge. `BROKEN_ON_TRUNK` needs the same: a timeout must be stuck
-at the step master's current streak is stuck at (a bare timeout, which names no
-step, never is), and a distinctive error must not differ from every error of the
-streak. **Other PRs:** the last 200 PR
-runs. These are starting values, set before any data was collected; the 7-week
-replay found no wrong clear with them.
+at the step master's latest run is stuck at (a bare timeout never is), and a
+distinctive error must not differ from every error of the streak. **Other PRs:**
+the last 200 PR runs. These are starting values, set before any data was
+collected; the 7-week replay found no wrong clear with them.
 
-**Storm runs' failures are left out of history:** a past run is a storm by count
-alone: 30 or more tests failed, and at least a tenth of its tests (TSIO counts a
-run over all its reports: every OS of a desktop run, and retests). The reason for
-the bar: that many failures in one run usually mean its environment or a shared
-break failed, so they say little about one test. Before the rules run,
-each other run with a failed try in the history is read once, newest first (at
-most 100, within 30 seconds); a storm's failed tries are left out, and so are
-those of a run that can't be read in time. Kept: a pass in a storm, this PR's own
-runs, and each test's current failing streak on master, which is a standing break
-whatever its size (master's own triage still calls it broken, and a PR still sees
-it as broken on master). A flaky run keeps the error of its failed try, so
-master retrying past this same error counts as failing the same way. On mobile main, 201 of the 244 tests that
-failed from 15 to 28 October failed only in 3 such runs, and each of those counted
-as that test's flakiness.
+**Storm runs' failures are left out of history:** a past run is a storm when 30
+or more tests failed, and at least a tenth of its tests (TSIO counts a run over
+all its reports: every OS of a desktop run, and retests). That many failures
+usually mean its environment or a shared break failed, so they say little about
+one test. Before the rules run, each other run with a failed try in the history
+is read once, newest first (at most 100, within 30 seconds); a storm's failed
+tries are left out, and so are those of a run that can't be read in time. Kept:
+a pass in a storm, this PR's own runs, and each test's current failing streak on
+master, a standing break whatever its size. A flaky run keeps the error of its
+failed try, so master retrying past this same error counts as failing the same
+way. On mobile main, 201 of the 244 tests that failed from 15 to 28 October
+failed only in 3 such runs, and each of those counted as that test's flakiness.
 
 **Failed everywhere is not cleared by a guess:** a test that failed every try here
 (at least two) and failed on another platform of the same commit (iOS and Android,
 Linux and Windows, or the enterprise and FIPS lanes) is never cleared by the model
-or a same-failure match; the model may still name the PR. A flake rarely fails
-every try on two platforms, and a change to shared code does. A rules clear stands
-only where master or 3+ other PRs failed it the same way: that is their flake (a
-desktop test master fails on two OSes). One that rests on nothing comparable (a
-bare timeout) is held as `REGRESSION`, needs investigation. A break on master, an
-environment error, and a spec the PR edits keep their own calls. Each condition
-alone changes nothing: a test failing every try on one platform is often its
-environment.
+or a same-failure match; the model may still name the PR. A flake rarely does
+that, and a change to shared code does. A rules clear stands only where master or
+3+ other PRs failed it the same way; one that rests on nothing comparable (a bare
+timeout) is held as `REGRESSION`, needs investigation. A break on master, an
+environment error, and a spec the PR edits keep their own calls. Either condition
+alone changes nothing.
 
 **Fixed on master:** master failed the test the same way in at least 3 runs in a
 row and has passed since. That is a break master fixed, not a flake: a branch
 without master's last failing commit is held as **fixed on main** ("The failure
 first passed on master (#PR, date) after this PR last merged master"), and one
-that has master's first passing commit goes to the model as a `REGRESSION`. If the base branch's commit list is cut off, it
-stays unchecked.
+that has master's first passing commit goes to the model as a `REGRESSION`. If
+the base branch's commit list is cut off, it stays unchecked.
 
 **Re-runs:** a re-run uploads its jobs' reports again under the same names; the
 newest report of a name replaces the earlier attempt's, so a shard that failed on
@@ -118,8 +112,8 @@ attempt 1 and passed on its re-run is read as passed.
 **Checks triage doesn't cover:** the PR-wide check names any red E2E check under
 its own prefix that is not one of `triage-lanes` (an upgrade or policy lane), e.g.
 "triaged lanes green · not triaged: playwright-full/enterprise/upgrade-… red",
-instead of saying all lanes are green. Its state is unchanged; that check's own
-status still gates the PR.
+instead of saying all lanes are green. Its state is unchanged: that check's own
+status gates the PR.
 
 **Environment errors:** `infra-clears: true` suits mobile and desktop, where the
 PR changes an app that runs against a separate test server. Leave it off where
@@ -147,25 +141,24 @@ copy"; next step: backport the test change, or ignore it for this release). With
 fewer than 5 earlier runs of its own, history is read from the default branch;
 `history-lane` and `history-report` (a report-name prefix such as
 `e2e-on-ubuntu-latest` for `e2e-on-ubuntu-latest-11.11.3`) make its runs match.
-That history is another line of code: it is evidence, and never clears a failure on
-the release branch by itself. A spec a stopped Jest process skipped stays `NOT_RUN`
+That history is another line of code: it is evidence, and never clears a failure
+on the release branch. A spec a stopped Jest process skipped stays `NOT_RUN`
 there: the build never ran it.
 
 **What kind of failure (release branches, with the model):** every failure still
-held on a release branch's run is asked one question: is it an **app bug**, a
-**test bug**, **flaky or environment**, or a **server compat** problem (it
-depends on a server version)? The model gets the error, the test's code at the
-failing line, its tries, the same test on every other lane of the run (each OS ×
-server version), the history, and the default branch's commits to the test since
-the branch was cut, with the file's diff. Its answer clears the failure only at 85%
-confidence and only with the evidence its cause requires, checked in code: a test
-bug cites the default branch's change to the test, with its diff; a server compat cites the other
-lanes, where the test passes against another server version on this build; flaky
-cites other PRs failing the same way or an infrastructure error (the history, which
-may be another line of code, never carries it), and is never accepted for a test
-that failed every try here and on every other lane. An app bug at 85% is named ("app bug") and stays red; anything
-else stays red as needs investigation. The check names what was found:
-`(1 test bug, 2 server compat, 1 app bug)`.
+held on a release branch's run is asked: is it an **app bug**, a **test bug**,
+**flaky or environment**, or a **server compat** problem? The model gets the
+error, the test's code at the failing line, its tries, the same test on every
+other lane (each OS × server version), the history, and the default branch's
+commits to the test since the cut, with the file's diff. Its answer clears the
+failure only at 85% confidence and with the evidence its cause requires, checked
+in code: a test bug cites the default branch's change to the test, with its diff;
+server compat cites the other lanes, where the test passes against another
+server version on this build; flaky cites other PRs failing the same way or an
+infrastructure error (never the history), and is never accepted for a test that
+failed every try here and on every other lane. An app bug at 85% is named ("app
+bug") and stays red; anything else stays red as needs investigation. The check
+names what was found: `(1 test bug, 2 server compat, 1 app bug)`.
 
 **Lanes the base branch rarely runs:** history is read per lane. A lane master
 runs only sometimes (mattermost's subpath suite) has too little history to call
@@ -255,8 +248,9 @@ model fails or is unavailable, the rules' outcome stands.
 
 - **E2E check text**, in both modes: `(2 flaky, 2 caused by PR) 99.7% passed (1186
   passed, 4 failed, 164 skipped)`. The labels, each only when non-zero and in this
-  order: flaky, broken on main, test bug, server compat, caused by PR, app bug, fixed on main, out of
-  date, needs investigation (test bug, server compat and app bug only on a release branch). The
+  order: flaky, broken on main, test bug, server compat, caused by PR, app bug,
+  fixed on main, out of date, needs investigation (test bug, server compat and
+  app bug only on a release branch). The
   rate is passed ÷ (passed + failed), as in
   mattermost's own E2E check; it never reads 100% while something failed.
   Shard placeholders add "re-run the failed jobs" after the labels (alone when
@@ -292,9 +286,9 @@ model fails or is unavailable, the rules' outcome stands.
   failed try counts, even one a retry recovered (TSIO's `flaky`), and the
   wording says which: "Also failed on windows", "Also failed once on windows
   in this run (passed on retry)", or both for a mixed run. A pass does not
-  count. The
-  line and the count need no model; a test that failed every try here and failed
-  on another platform may be held (see "Failed everywhere is not cleared by a guess"). The other platforms come
+  count. The line and the count need no model; a test that failed every try here
+  and on another platform may be held (see "Failed everywhere is not cleared by a
+  guess"). The other platforms come
   from two places, and only for a run with failed tests: a desktop run's other
   OS reports, which sit in the same TSIO group (a report's name names its OS, as
   `e2e-on-ubuntu-latest` is linux), and a mobile run's sibling groups (one TSIO

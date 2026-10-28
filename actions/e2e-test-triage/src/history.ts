@@ -262,11 +262,6 @@ export interface ChangedFiles {
   ok: boolean;
 }
 
-/**
- * The PR's changed files (a trunk run: the commit's), and `ok`: whether the list
- * is complete. An incomplete list looks like "touched nothing", so callers clear
- * nothing unless ok is true.
- */
 /** The most past runs dropStormRuns reads, how many at once, and how long all its reads may take. */
 export const STORM_READS = 100;
 const STORM_READ_BATCH = 10;
@@ -274,13 +269,11 @@ export const STORM_DEADLINE_MS = 30_000;
 
 /**
  * Leaves out of history the failed tries of past storm runs: at least `minFailures` tests failed, and at least a tenth of
- * the run's tests (TSIO sums a run over all its reports: every OS of a desktop run, and retests). A storm failed on its
- * environment or a shared break, and its failures say nothing about one test; counted as trunk's instability or another
- * PR's same failure, they would clear a PR's real failure. Kept: a pass in a storm, this PR's own runs (`pr`), and each
- * test's current failing streak on trunk (its latest trunk runs, while each failed a try), which is a standing break
- * whatever its size. Only other runs with a failed try are read, newest first, once each, the current run's own group
- * (`own`) aside. A run that can't be read, past STORM_READS or the deadline, is treated as a storm, so an unread storm
- * clears nothing. Returns the groups whose failures were left out.
+ * the run's tests (TSIO sums a run over all its reports). A storm's failures say nothing about one test, and counted as
+ * trunk's instability or another PR's same failure they would clear a PR's real failure. Kept: a pass in a storm, this
+ * PR's own runs (`pr`), and each test's current failing streak on trunk, a standing break whatever its size. Other runs
+ * with a failed try are read newest first, once each, the current run's own group (`own`) aside. A run that can't be
+ * read, past STORM_READS or the deadline, is treated as a storm. Returns the groups whose failures were left out.
  */
 export async function dropStormRuns({
   history,
@@ -349,11 +342,16 @@ export async function dropStormRuns({
   const dropped = new Set(list.filter((g) => !quiet.has(g)));
   if (!dropped.size) return dropped;
   for (const [key, rows] of history) history.set(key, rows.filter((o) => !counted(o) || !dropped.has(String(o.group_id))));
-  const unread = dropped.size - [...dropped].filter((g) => storms.has(g)).length;
-  log(`history: left out the failures of ${dropped.size - unread} storm run(s)${unread ? ` and of ${unread} that could not be read` : ""}`);
+  const unread = dropped.size - storms.size;
+  log(`history: left out the failures of ${storms.size} storm run(s)${unread ? ` and of ${unread} that could not be read` : ""}`);
   return dropped;
 }
 
+/**
+ * The PR's changed files (a trunk run: the commit's), and `ok`: whether the list
+ * is complete. An incomplete list looks like "touched nothing", so callers clear
+ * nothing unless ok is true.
+ */
 export async function fetchChangedFiles(api: GhApi, id: CompositeIdentity, prNumber: number | null, log: (message: string) => void = () => {}): Promise<ChangedFiles> {
   try {
     if (prNumber) {
@@ -405,11 +403,9 @@ const commitRef = (c: CommitRow): NonNullable<OutOfDate["commit"]> => ({
 });
 
 /**
- * FIXED_ON_TRUNK failures: trunk fixed them after a run of failures. The fix landed after trunk's last failing commit
- * and by its first passing one, so one compare (the base commits this PR lacks) settles two cases: lacking the last
- * failing commit, the PR lacks the fix (out of date, merge the base); having the first passing one, it has the fix and
- * still fails (a REGRESSION for the judge). Anything else (it has the last failure but not the first pass, or a cut-off
- * list) stays unchecked.
+ * FIXED_ON_TRUNK failures: the fix landed after trunk's last failing commit and by its first passing one. Lacking the
+ * last failing commit, the PR lacks the fix (out of date); having the first passing one, it has the fix and still fails
+ * (a REGRESSION for the judge). Anything else, or a cut-off compare, stays unchecked.
  */
 export async function markFixedOnTrunk({ findings, api, id, baseBranch, log = () => {} }: {
   findings: Finding[];
@@ -419,7 +415,6 @@ export async function markFixedOnTrunk({ findings, api, id, baseBranch, log = ()
   log?: (message: string) => void;
 }): Promise<void> {
   if (!findings.length) return;
-  const unchecked = (f: Finding, because: string): void => void Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} ${because}` });
   const cmp = baseBranch ? (await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`)) as CompareResult | null : null;
   const lacking = new Map((cmp?.commits ?? []).map((c): [string, CommitRow] => [c.sha, c]));
   const complete = cmp != null && (cmp.ahead_by ?? 0) <= lacking.size;
@@ -434,7 +429,7 @@ export async function markFixedOnTrunk({ findings, api, id, baseBranch, log = ()
       Object.assign(f, { class: "REGRESSION", reason: `${f.reason} This branch has that fix (by ${firstPass.slice(0, 7)}) and still fails the same way.` });
     } else {
       log(`whether this PR has ${baseBranch}'s fix for ${f.title} is unknown`);
-      unchecked(f, `Whether this branch has that fix could not be checked.`);
+      Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} Whether this branch has that fix could not be checked.` });
     }
   }
 }
@@ -490,8 +485,8 @@ export async function markOutOfDate({
     if (!commits.has(path)) {
       const log_ = (await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(path)}&per_page=10`).catch(() => [])) as CommitRow[] | null;
       // Every base commit to the test since the merge base: the newest names the change, the rest show what else changed it.
-      const [c, ...rest] = (log_ ?? []).filter((x) => onBase.has(x.sha));
-      commits.set(path, { commit: c ? commitRef(c) : null, also: rest.slice(0, 4).map(commitRef) });
+      const [c, ...earlier] = (log_ ?? []).filter((x) => onBase.has(x.sha));
+      commits.set(path, { commit: c ? commitRef(c) : null, also: earlier.slice(0, 4).map(commitRef) });
     }
     const { commit, also } = commits.get(path) ?? { commit: null, also: [] };
     const diff = files.find((x) => x.filename === path)?.patch;

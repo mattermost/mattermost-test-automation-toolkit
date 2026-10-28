@@ -137,7 +137,7 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     const rows = await readStatuses(api, id);
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return;
-    // The other E2E checks under the aggregate's prefix (an upgrade lane, a policy lane): not triaged, but named when red.
+    // The other E2E checks under the aggregate's prefix (an upgrade lane, a policy lane): named when red.
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));

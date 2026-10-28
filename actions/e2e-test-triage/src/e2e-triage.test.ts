@@ -4363,6 +4363,7 @@ test("end to end: the trunk-fixed failure on a stale branch reads fixed on main,
   assert.match(both, /^## E2E triage: 🔴 merge master and re-run: 1 fixed on master, 1 out of date$/m);
   assert.match(both, /^### Out of date \(2\): master changed these tests, or fixed these failures/m);
 });
+
 // ---------------------------------------------------------------- failing everywhere, storm runs
 
 test("failing every try here and on another platform of this commit is never cleared by the model", async () => {
@@ -4482,7 +4483,6 @@ test("a flaky run in history keeps the error of its failed try, which trunk's co
   assert.deepEqual([row.status, row.error_excerpt], ["flaky", error]);
   assert.equal(classify({ ...failing, error }, [...trunkPasses(8), row], []).class, "FLAKY_ON_TRUNK", "master retried past this same error");
 });
-
 
 // ---------------------------------------------------------------- a release branch's run (CMT)
 
@@ -4630,9 +4630,9 @@ test("a release run asks its own question, allows only its causes, and is keyed 
   assert.doesNotMatch(text, /"pr":|diff_hunks/);
   assert.equal((res.answers[0] as Answer).cause, "test_bug");
   assert.throws(() => parseAnswer(JSON.stringify({ cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "x" }), ["app_bug", "test_bug", "flaky_environment", "server_compat"]), /unknown cause/);
-  const prPack = buildPack(releaseFinding(), [], prCtx, []);
   assert.notEqual(answerKey(DEFAULTS.model, pack), answerKey(DEFAULTS.model, { ...pack, release: undefined, base_change: undefined }), "the question is part of the key");
-  assert.ok(answerKey(DEFAULTS.model, prPack).startsWith("v5:"));
+  // A release answer reads the other lanes (server compat, failed everywhere): one given before they arrived is not reused.
+  assert.notEqual(answerKey(DEFAULTS.model, pack), answerKey(DEFAULTS.model, { ...pack, same_test_other_platforms_this_run: { id: "other_platforms", results: [{ platform: "macos-26-12.0.1", result: "passed" }] } }));
 });
 
 test("end to end: a release run's stale test is cleared as a test bug, and an app bug is named, on the check and in the summary", async () => {
@@ -4688,7 +4688,10 @@ test("a timeout is broken on trunk only stuck at the step trunk's streak is stuc
   assert.equal(classify({ ...failing, error: stuck("#save") }, broken(stuck("#save")), []).class, "BROKEN_ON_TRUNK");
   const other = classify({ ...failing, error: stuck("#save") }, broken(stuck("#cancel")), []);
   assert.deepEqual([other.class, other.blocking], ["REGRESSION", true]);
-  assert.match(other.reason, /^Trunk fails this test too, but never stuck at this step; there it failed with "Error: locator\.click: Timeout 15000ms exceeded\."/);
+  assert.match(other.reason, /^Trunk fails this test too, but not stuck at this step; its latest run failed with "Error: locator\.click: Timeout 15000ms exceeded\."/);
+  // Only trunk's latest failure counts: an older row stuck at this step is not trunk's current break.
+  const moved = [obs({ status: "failed", commit_sha: "b0", error_excerpt: stuck("#cancel") }), obs({ status: "failed", commit_sha: "b1", error_excerpt: stuck("#save") }), ...trunkPasses(6)];
+  assert.equal(classify({ ...failing, error: stuck("#save") }, moved, []).class, "REGRESSION");
   const bare = classify({ ...failing, error: "Test timeout of 60000ms exceeded." }, broken("Test timeout of 60000ms exceeded."), []);
   assert.deepEqual([bare.class, bare.blocking], ["REGRESSION", true], "a timeout that names no step is not shown to be trunk's");
   // A per-run id in the step (a Cypress post id) is the same step.
@@ -4704,4 +4707,13 @@ test("a failure trunk fixed that this branch has the fix for is read for ownersh
   assert.deepEqual([named.findings[0].class, named.findings[0].untouched], ["REGRESSION", false], "the PR changes a file its error names");
   const clean = await evaluate(run, { history, ask: null, diff: { files: [{ filename: "app/other.ts" }], ok: true }, fixedOnTrunk: fixedHere });
   assert.equal(clean.findings[0].untouched, true);
+});
+
+test("a release run whose only failure is a spec Jest never reached still knows its base, and keeps the spec red", async () => {
+  const asked: string[] = [];
+  const routes = releaseRoutes({ histories: [], compare: { ahead_by: 0, files: [], commits: [] }, asked })
+    .map(([m, r]): Route => (m === "/reports/g1/cases" ? [m, () => Response.json([{ suite_id: "s1", title: STOPPED.title, status: "failed", retry_count: 0, ordinal: 0, error_message: STOPPED.error, error_stack: null }])] : [m, r]));
+  const result = await triage({ env: releaseEnv("release-6.3"), fetchImpl: fakeFetch(routes), log: () => {} });
+  assert.ok(asked.includes("repo"), "the default branch is read before the placeholder-only exit");
+  assert.deepEqual(result.findings.map((f) => [f.class, f.blocking]), [["NOT_RUN", true]]);
 });

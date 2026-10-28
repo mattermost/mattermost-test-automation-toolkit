@@ -232,31 +232,25 @@ export function classify(
     return out("REGRESSION", `New on trunk: passed in all ${trunk.length} previous runs.`, true);
   }
   if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status)) {
-    // A timeout is trunk's break only stuck at the same step (ids masked), as the flaky rule compares it; one that names
-    // no step can't be shown to be the same failure.
-    if (ownKey.kind === "stuck" || ownKey.kind === "bare") {
-      const rows = trunk.slice(0, streak);
-      if (ownKey.kind === "bare" || !rows.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
-        const there = rows.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
-        return out("REGRESSION", `Trunk fails this test too, but ${ownKey.kind === "bare" ? "this timeout names no step to compare" : "never stuck at this step"}${there ? `; there it failed with "${there.slice(0, 160)}"` : ""}; this one may be the PR's.`, true);
-      }
+    // A timeout is trunk's break only stuck where trunk's latest run is stuck (ids masked); a bare one never is.
+    if (ownKey.kind === "bare" || (ownKey.kind === "stuck" && !sameFirstLine(maskIds(latestTrunk.error_excerpt), maskIds(test.error)))) {
+      const there = errorFirstLine(latestTrunk.error_excerpt);
+      return out("REGRESSION", `Trunk fails this test too, but ${ownKey.kind === "bare" ? "this timeout names no step to compare" : "not stuck at this step"}${there ? `; its latest run failed with "${there.slice(0, 160)}"` : ""}; this one may be the PR's.`, true);
     }
     const trunkError = otherError(trunk.slice(0, streak));
     if (trunkError)
       return out("REGRESSION", `Trunk fails this test too, but with another error ("${trunkError.slice(0, 160)}"); this one may be the PR's.`, true);
     return out("BROKEN_ON_TRUNK", `Trunk's latest run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}, ${latestTrunk.created_at?.slice(0, 10) ?? "unknown date"}) fails this test too.`, false);
   }
-  // Trunk failed the same way run after run, and has passed since: a break trunk fixed, not a flake. A branch without
-  // that fix still fails; markFixedOnTrunk checks whether this PR has it.
+  // Trunk failed the same way run after run, and has passed since: a break trunk fixed, not a flake. markFixedOnTrunk
+  // checks whether this PR has the fix.
   let recent = 0;
   while (recent < trunk.length && trunk[recent].status === "passed") recent++;
   let broken = 0;
-  // The same failure: the same distinctive signature, or the same distinctive error or stuck step with Mattermost's
-  // 26-character ids masked (a selector names each run's own post). A bare timeout or an unknown error is no evidence of
-  // the same break, so it ends the streak.
+  // A bare timeout or an unusable error is no evidence of the same break, so it ends the streak.
   const breakKey = (error: string | null | undefined): string | null => {
     const k = failureKey(error);
-    return k.kind === "distinctive" || k.kind === "stuck" ? `${k.kind}:${String(k.key).replace(/(?<![a-z0-9])[a-z0-9]{26}(?![a-z0-9])/g, "<id>")}` : null;
+    return k.kind === "distinctive" || k.kind === "stuck" ? `${k.kind}:${maskIds(k.key)}` : null;
   };
   const ownBreak = breakKey(test.error);
   const sameBreak = (excerpt: string | null | undefined): boolean =>
@@ -443,12 +437,10 @@ export function sameFailure(findings: Finding[]): Finding[] {
 }
 
 /**
- * A failure that failed every try here, and failed on another platform of this same commit, is not flakiness: a flake
- * rarely fails every try on two platforms at once, and a change to shared code does. Neither the model nor sameFailure
- * may clear it; the model may still name the PR. A rules clear is undone only where it rests on no failure seen the same
- * way (a bare timeout, an error too short to compare): one trunk or other PRs failed with this error is their flake, as
- * is a desktop test master fails on two OSes. A break on trunk, an environment error, and a failure this change owns or
- * that is out of date keep their own calls.
+ * A failure that failed every try here and on another platform of this commit is not flakiness: a flake rarely does
+ * that, a change to shared code does. Neither the model nor sameFailure may clear it. A rules clear is undone only where
+ * it rests on no failure seen the same way (a bare timeout, an error too short to compare). A break on trunk, an
+ * environment error, and a failure this change owns or that is out of date keep their own calls.
  */
 export function holdFailedEverywhere(findings: Finding[]): Finding[] {
   const flaky = new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);

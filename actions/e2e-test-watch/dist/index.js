@@ -627,8 +627,8 @@ async function dropStormRuns({
   const dropped = new Set(list.filter((g) => !quiet.has(g)));
   if (!dropped.size) return dropped;
   for (const [key, rows] of history) history.set(key, rows.filter((o) => !counted(o) || !dropped.has(String(o.group_id))));
-  const unread = dropped.size - [...dropped].filter((g) => storms.has(g)).length;
-  log(`history: left out the failures of ${dropped.size - unread} storm run(s)${unread ? ` and of ${unread} that could not be read` : ""}`);
+  const unread = dropped.size - storms.size;
+  log(`history: left out the failures of ${storms.size} storm run(s)${unread ? ` and of ${unread} that could not be read` : ""}`);
   return dropped;
 }
 async function fetchChangedFiles(api, id, prNumber, log = () => {
@@ -667,7 +667,6 @@ var commitRef = (c) => ({
 async function markFixedOnTrunk({ findings, api, id, baseBranch, log = () => {
 } }) {
   if (!findings.length) return;
-  const unchecked = (f, because) => void Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} ${because}` });
   const cmp = baseBranch ? await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`) : null;
   const lacking = new Map((cmp?.commits ?? []).map((c) => [c.sha, c]));
   const complete = cmp != null && (cmp.ahead_by ?? 0) <= lacking.size;
@@ -681,7 +680,7 @@ async function markFixedOnTrunk({ findings, api, id, baseBranch, log = () => {
       Object.assign(f, { class: "REGRESSION", reason: `${f.reason} This branch has that fix (by ${firstPass.slice(0, 7)}) and still fails the same way.` });
     } else {
       log(`whether this PR has ${baseBranch}'s fix for ${f.title} is unknown`);
-      unchecked(f, `Whether this branch has that fix could not be checked.`);
+      Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} Whether this branch has that fix could not be checked.` });
     }
   }
 }
@@ -711,8 +710,8 @@ async function markOutOfDate({
     }
     if (!commits.has(path)) {
       const log_ = await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(path)}&per_page=10`).catch(() => []);
-      const [c, ...rest2] = (log_ ?? []).filter((x) => onBase.has(x.sha));
-      commits.set(path, { commit: c ? commitRef(c) : null, also: rest2.slice(0, 4).map(commitRef) });
+      const [c, ...earlier] = (log_ ?? []).filter((x) => onBase.has(x.sha));
+      commits.set(path, { commit: c ? commitRef(c) : null, also: earlier.slice(0, 4).map(commitRef) });
     }
     const { commit, also } = commits.get(path) ?? { commit: null, also: [] };
     const diff = files.find((x) => x.filename === path)?.patch;
@@ -1423,12 +1422,9 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
     return out("REGRESSION", `New on trunk: passed in all ${trunk.length} previous runs.`, true);
   }
   if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status)) {
-    if (ownKey.kind === "stuck" || ownKey.kind === "bare") {
-      const rows = trunk.slice(0, streak);
-      if (ownKey.kind === "bare" || !rows.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
-        const there = rows.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
-        return out("REGRESSION", `Trunk fails this test too, but ${ownKey.kind === "bare" ? "this timeout names no step to compare" : "never stuck at this step"}${there ? `; there it failed with "${there.slice(0, 160)}"` : ""}; this one may be the PR's.`, true);
-      }
+    if (ownKey.kind === "bare" || ownKey.kind === "stuck" && !sameFirstLine(maskIds(latestTrunk.error_excerpt), maskIds(test.error))) {
+      const there = errorFirstLine(latestTrunk.error_excerpt);
+      return out("REGRESSION", `Trunk fails this test too, but ${ownKey.kind === "bare" ? "this timeout names no step to compare" : "not stuck at this step"}${there ? `; its latest run failed with "${there.slice(0, 160)}"` : ""}; this one may be the PR's.`, true);
     }
     const trunkError = otherError(trunk.slice(0, streak));
     if (trunkError)
@@ -1440,7 +1436,7 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
   let broken = 0;
   const breakKey = (error) => {
     const k = failureKey(error);
-    return k.kind === "distinctive" || k.kind === "stuck" ? `${k.kind}:${String(k.key).replace(/(?<![a-z0-9])[a-z0-9]{26}(?![a-z0-9])/g, "<id>")}` : null;
+    return k.kind === "distinctive" || k.kind === "stuck" ? `${k.kind}:${maskIds(k.key)}` : null;
   };
   const ownBreak = breakKey(test.error);
   const sameBreak = (excerpt) => Boolean(excerpt) && (ownSignature ? errorSignature(excerpt) === ownSignature : ownBreak != null && breakKey(excerpt) === ownBreak);
@@ -1892,7 +1888,7 @@ function sameTestOnOtherReports(findings, run, everyReport = false) {
     const own = f.report_name ?? "";
     if (everyReport) {
       const others2 = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? []).filter((o) => o.report !== "" && o.report !== own && !o.report.startsWith(`${own}-`) && !own.startsWith(`${o.report}-`));
-      for (const o of [...others2].sort((a, b) => a.report.localeCompare(b.report))) addOtherLane(f, o.report.replace(/^e2e-on-/, ""), o.status);
+      for (const o of others2.sort((a, b) => a.report.localeCompare(b.report))) addOtherLane(f, o.report.replace(/^e2e-on-/, ""), o.status);
       continue;
     }
     const ownOs = osOfReport(own);
@@ -2144,9 +2140,8 @@ Rules:
 - explanation: one or two plain sentences, at most 200 characters, written for the release owner: what most likely
   happened. No evidence ids and no percentages.`;
 var RELEASE_CAUSES = ["app_bug", "test_bug", "flaky_environment", "server_compat"];
-var isRelease = (pack) => Boolean(pack.release);
-var systemFor = (pack) => isRelease(pack) ? SYSTEM_RELEASE : SYSTEM;
-var causesFor = (pack) => isRelease(pack) ? RELEASE_CAUSES : CAUSES;
+var systemFor = (pack) => pack.release ? SYSTEM_RELEASE : SYSTEM;
+var causesFor = (pack) => pack.release ? RELEASE_CAUSES : CAUSES;
 var TEMPERATURE_MODELS = ["claude-haiku-4-5", "claude-opus-4-6", "claude-sonnet-4-6"];
 var samplingFor = (model) => TEMPERATURE_MODELS.some((m) => model === m || String(model).startsWith(`${m}-`)) ? { temperature: 0 } : {};
 var thinks = (model) => !("temperature" in samplingFor(model));
@@ -2159,7 +2154,7 @@ var isSnapshot = (model) => /-\d{8}$/.test(String(model));
 var snapshotOf = (alias, served) => served.length === alias.length + 9 && served.startsWith(`${alias}-`) && isSnapshot(served);
 var servedMatches = (requested, served) => typeof served === "string" && (served === requested || !isSnapshot(requested) && snapshotOf(requested, served));
 var UNKEYED_FIELDS = /* @__PURE__ */ new Set(["same_test_other_platforms_this_run"]);
-var packKey = (model, pack) => (0, import_node_crypto2.createHash)("sha256").update(model + "\n" + JSON.stringify(Object.fromEntries(Object.entries(pack).filter(([k]) => pack.earlier_failure_same_spec || !UNKEYED_FIELDS.has(k))))).digest("hex");
+var packKey = (model, pack) => (0, import_node_crypto2.createHash)("sha256").update(model + "\n" + JSON.stringify(Object.fromEntries(Object.entries(pack).filter(([k]) => pack.release || pack.earlier_failure_same_spec || !UNKEYED_FIELDS.has(k))))).digest("hex");
 var imageBlock = (i) => ({ type: "image", source: { type: "base64", media_type: i.media_type, data: i.data } });
 var billedField = (e, key) => e?.[key];
 function rejected(err, msg) {
@@ -2225,10 +2220,10 @@ function batchSchema(ids, causes = CAUSES) {
 async function askModelBatch(fetchImpl, apiKey, model, packs, timeoutMs = 9e4) {
   const ids = packs.map((_, i) => `f${i + 1}`);
   const hunks = [...new Map(packs.flatMap((p) => p.diff_hunks_of_files_named_in_error).map((h) => [h.id, h])).values()];
-  const release = isRelease(packs[0]);
+  const release = Boolean(packs[0].release);
   const items = packs.map((p, i) => {
     const { pr, diff_hunks_of_files_named_in_error: own, ...rest } = p;
-    return release ? { id: ids[i], valid_evidence_ids: evidenceIds(p), ...rest } : { id: ids[i], valid_evidence_ids: evidenceIds(p), related_hunks: own.map((h) => h.id), ...rest };
+    return { id: ids[i], valid_evidence_ids: evidenceIds(p), ...release ? {} : { related_hunks: own.map((h) => h.id) }, ...rest };
   });
   const shared = release ? {} : { pr: packs[0].pr, diff_hunks: hunks };
   const text = `Shared context for every finding (JSON):
@@ -2263,11 +2258,11 @@ ${JSON.stringify(items)}`;
     throw rejected(e instanceof Error ? e : new Error(`reply is not usable: ${String(e).slice(0, 120)}`), msg);
   }
 }
-function cachedAnswer(entry, causes = CAUSES) {
+function cachedAnswer(entry, pack) {
   try {
     const provenance = entry?.provenance;
     if (typeof provenance?.served_model !== "string") return null;
-    return { ...parseAnswer(JSON.stringify(entry), causes), provenance };
+    return { ...parseAnswer(JSON.stringify(entry), causesFor(pack)), provenance };
   } catch {
     return null;
   }
@@ -2283,7 +2278,6 @@ function parseAnswer(text, causes = CAUSES) {
   return { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence.slice(0, 6), explanation: a.explanation.slice(0, 280) };
 }
 var answerKey = (model, pack) => `v5:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + systemFor(pack), pack)}`;
-var cachedAnswerFor = (entry, pack) => cachedAnswer(entry, causesFor(pack));
 
 // ../e2e-test-triage/src/common-sense.ts
 var platformOf = (report) => {
@@ -2481,7 +2475,7 @@ async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
   const ask = async (model, batch, retryMissing = true) => {
     const fresh = [];
     for (const g of batch) {
-      const cached = cachedAnswerFor(cfg.answers?.[answerKey(model, g.lead.pack)], g.lead.pack);
+      const cached = cachedAnswer(cfg.answers?.[answerKey(model, g.lead.pack)], g.lead.pack);
       if (cached) {
         ledger.skipped.cached++;
         g.answer = cached;
@@ -2598,8 +2592,7 @@ async function evaluateRun({
       }
     }
     holdFailedEverywhere(result.findings);
-    const releaseOnBase = Boolean(branchBase && trunkBranch === branchBase);
-    if (releaseOnBase) {
+    if (branchBase && trunkBranch === branchBase) {
       for (const f of result.findings)
         if (!f.blocking && f.class !== "INFRA_ERROR")
           Object.assign(f, { blocking: true, reason: `${f.reason} That is ${branchBase}'s history, not this branch's, so it does not clear a failure here.` });
@@ -3039,21 +3032,21 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const prBase = isTrunkRun ? null : pull.base?.ref ?? null;
     let trunkBranch = isTrunkRun ? id.branch : prBase;
     let branchBase = null;
+    if (isTrunkRun && id.branch && run.failing.length) {
+      const defaultBranch = await defaultBranchOf(api, id.repository, log);
+      if (defaultBranch && defaultBranch !== id.branch) branchBase = defaultBranch;
+    }
     if (run.failing.some((t) => !isShardPlaceholder(t))) {
       [history, diff] = await Promise.all([
         fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)),
         fetchChangedFiles(api, id, prNumber, log)
       ]);
-      if (isTrunkRun && id.branch) {
-        const fallback = await defaultBranchOf(api, id.repository, log);
-        if (fallback && fallback !== id.branch) {
-          branchBase = fallback;
-          const ownRuns = trunkRunsOn(history, id.branch);
-          if (ownRuns < cfg.minTrunkRuns) {
-            trunkBranch = fallback;
-            notes.push(`History is read from ${fallback}, the default branch: ${id.branch} has ${ownRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-            history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg));
-          }
+      if (branchBase && id.branch) {
+        const ownRuns = trunkRunsOn(history, id.branch);
+        if (ownRuns < cfg.minTrunkRuns) {
+          trunkBranch = branchBase;
+          notes.push(`History is read from ${branchBase}, the default branch: ${id.branch} has ${ownRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
+          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg));
         }
       }
       const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;
