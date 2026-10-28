@@ -113,6 +113,8 @@ async function route(f: Fixture, url: string, init: RequestInit = {}): Promise<R
   if (p.endsWith("/suites")) return Response.json({ suites: f.suites });
   if (p.endsWith("/cases")) return Response.json(f.cases);
   if (p.endsWith("/history")) return Response.json({ observations: f.history, has_more: f.truncated });
+  // A past run's own counts (dropStormRuns): a quiet run, not a storm.
+  if (/^\/api\/v1\/reports\/(?:old-\d+|sibling)$/.test(p)) return Response.json({ test_stats: { total: 10, failed: 1 } });
   if (p.endsWith("/pulls/5")) return Response.json({ title: "Change", base: { ref: "master" } });
   if (p.endsWith("/pulls/5/files")) return f.diffError ? new Response("unavailable", { status: 503 }) : Response.json(f.files);
   if (p.endsWith("/statuses")) return Response.json([{ context: f.env.STATUS_CONTEXT, state: "failure", target_url: `https://github.com/o/r/actions/runs/${f.id.gh_run_id}` }]);

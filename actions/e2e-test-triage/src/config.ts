@@ -37,10 +37,11 @@ export const DEFAULTS: Config = {
   // A lane red only for jobs that sent no results is re-run this many times before a person is asked to (see e2e-test-rerun).
   rerunAttempts: 0,
   historyLane: null,
+  historyReport: null,
   // Re-asks an answer between escalateMin and the threshold, or one that blames the PR
-  // without citing a change. Off ("") until the share of answers in that band shows a
-  // second model is worth its price (Fable 5.1 costs 5x Sonnet 5.5 per token).
-  escalationModel: "",
+  // without citing a change. Replays of real desktop runs (2026-10-29): Sonnet 5.5 fell just
+  // short on 2 of 19 findings (0.8, 0.72) and Opus 5.5 settled both, at about $0.03 each.
+  escalationModel: "claude-opus-5-5",
   escalateMin: 0.6,
   // Per-run spend ceiling; a call that could cross it is not made.
   budgetUsd: 1,
@@ -161,16 +162,18 @@ export function pricesFrom(raw: string, warn: (message: string) => void = () => 
 }
 
 /**
- * Engine settings from the action's environment. An empty ESCALATION_MODEL turns escalation off.
+ * Engine settings from the action's environment. An empty CLAUDE_MODEL or ESCALATION_MODEL takes the default, so either
+ * can come from a repository variable that may be unset; ESCALATION_MODEL=off turns escalation off.
  * `warn` receives each setting that was invalid and replaced.
  */
 export function configFrom(env: Env, warn: (message: string) => void = () => {}): Config {
   const prices = env.AI_PRICES ? pricesFrom(env.AI_PRICES, warn) : PRICES;
+  const escalation = env.ESCALATION_MODEL?.trim();
   return {
     ...DEFAULTS,
     minConfidence: confidenceFrom(env.MIN_CONFIDENCE, warn),
-    model: env.CLAUDE_MODEL || DEFAULTS.model,
-    escalationModel: env.ESCALATION_MODEL ?? DEFAULTS.escalationModel,
+    model: env.CLAUDE_MODEL?.trim() || DEFAULTS.model,
+    escalationModel: escalation === "off" ? "" : escalation || DEFAULTS.escalationModel,
     budgetUsd: amountFrom(env.AI_BUDGET_USD, DEFAULTS.budgetUsd, "AI_BUDGET_USD", warn),
     prBudgetUsd: amountFrom(env.PR_BUDGET_USD, DEFAULTS.prBudgetUsd, "PR_BUDGET_USD", warn),
     reportOnlyLabel: (env.REPORT_ONLY_LABEL ?? DEFAULTS.reportOnlyLabel).trim(),
@@ -178,6 +181,7 @@ export function configFrom(env: Env, warn: (message: string) => void = () => {})
     infraClears: env.INFRA_CLEARS === "true",
     rerunAttempts: attemptsFrom(env.RERUN_ATTEMPTS, warn),
     historyLane: (env.HISTORY_LANE || "").trim() || null,
+    historyReport: (env.HISTORY_REPORT || "").trim() || null,
     prices,
   };
 }

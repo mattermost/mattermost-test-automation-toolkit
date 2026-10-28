@@ -112,3 +112,27 @@ test("a group whose orchestration left units pending, leased or abandoned is sti
   const without = await fetchRun(oneGroup(run40417095173({})), "http://tsio", ours, null, { attempts: 1, ms: 0 });
   assert.deepEqual(without.missing, { expected: 40, received: 39, status: "incomplete" }, "no orchestration: the report count decides");
 });
+
+test("a re-run's report replaces the earlier attempt's of the same name: its stub no longer counts", async () => {
+  // desktop#4054: shard 1/3 sent only a stub on attempt 1; its re-run uploaded passing results under the same report name.
+  const shard = "e2e-on-ubuntu-latest-12.1.0-rc2-1-of-3";
+  const fetchImpl = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/suites")) return Response.json({ suites: [
+      { id: "s-stub", file_path: "ci/tsio-shard-failure.ts", report_name: shard, report_id: "01a17e00-9600-7910-a53e-bc2c474fe7cc" },
+      { id: "s-noid", file_path: "ci/tsio-shard-failure.ts", report_name: shard, report_id: null },
+      { id: "s-rerun", file_path: "calls/calls_functionality.test.ts", report_name: shard, report_id: "01a17e19-e8d5-7857-a70a-cce3ce5daed6" },
+      { id: "s-other", file_path: "login.test.ts", report_name: "e2e-on-ubuntu-latest-12.1.0-rc2-2-of-3", report_id: "01a17dee-ea28-0000-0000-000000000000" },
+    ] });
+    if (u.includes("/cases")) return Response.json([
+      { suite_id: "s-stub", title: "[e2e-linux (1)] CI shard failure", status: "failed", retry_count: 0, ordinal: 0 },
+      { suite_id: "s-noid", title: "[e2e-linux (1)] CI shard failure", status: "failed", retry_count: 0, ordinal: 0 },
+      { suite_id: "s-rerun", title: "MM-T1", status: "passed", retry_count: 0, ordinal: 0 },
+      { suite_id: "s-other", title: "MM-T2", status: "passed", retry_count: 0, ordinal: 0 },
+    ]);
+    return Response.json({ reports: [group(ours.gh_run_id)], total: 1 });
+  }) as FetchImpl;
+  const run = await fetchRun(fetchImpl, "http://tsio", ours, null, { attempts: 1, ms: 0 });
+  assert.deepEqual(run.failing, []);
+  assert.deepEqual(run.counts, { total: 2, passed: 2, failed: 0, flaky: 0, skipped: 0 });
+});

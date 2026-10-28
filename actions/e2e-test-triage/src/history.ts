@@ -2,7 +2,7 @@
 // See LICENSE.txt for license information.
 
 import type { FetchImpl, GhApi } from "../../shared/src/github.ts";
-import { FAILED_STATUSES, identityKey, outcomeOf, outcomeWithDuplicates } from "../../shared/src/tsio.ts";
+import { FAILED_STATUSES, identityKey, isFailedTry, outcomeOf, outcomeWithDuplicates, tsioJson } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
 import { CHANGED_FILES_MAX_PAGES, COMPARE_FILE_CAP, DEFAULTS, HISTORY_MAX_FILES, HISTORY_MAX_PAGES, HISTORY_PER_PAGE, laneOf } from "./config.ts";
 import type { BrokeBy, ChangedFile, Config, Finding, Observation, OutOfDate, SpecHistory, SpecRun, TestRef } from "./types.ts";
@@ -216,8 +216,10 @@ export async function fetchHistory(
     for (const attempts of runs.values()) {
       attempts.sort((a, b) => a.retry_count - b.retry_count);
       const { status, last } = outcomeOf(attempts);
-      // Every run in `runs` has at least one attempt, so the outcome always has a last one.
-      collapsed.push({ ...last!, status });
+      // Every run in `runs` has at least one attempt, so the outcome always has a last one. A flaky run's last attempt is
+      // its pass: it keeps the error of its last failed try, which is what the rules compare.
+      const failedTry = status === "flaky" ? attempts.filter((a) => FAILED_STATUSES.has(a.status)).at(-1) : undefined;
+      collapsed.push({ ...last!, status, ...(failedTry?.error_excerpt ? { error_excerpt: failedTry.error_excerpt } : {}) });
     }
     byTest.set(key, collapsed);
   }
@@ -258,6 +260,91 @@ export function trunkRunsOn(history: Map<string, Observation[]>, branch: string)
 export interface ChangedFiles {
   files: ChangedFile[];
   ok: boolean;
+}
+
+/** The most past runs dropStormRuns reads, how many at once, and how long all its reads may take. */
+export const STORM_READS = 100;
+const STORM_READ_BATCH = 10;
+export const STORM_DEADLINE_MS = 30_000;
+
+/**
+ * Leaves out of history the failed tries of past storm runs: at least `minFailures` tests failed, and at least a tenth of
+ * the run's tests (TSIO sums a run over all its reports). A storm's failures say nothing about one test, and counted as
+ * trunk's instability or another PR's same failure they would clear a PR's real failure. Kept: a pass in a storm, this
+ * PR's own runs (`pr`), and each test's current failing streak on trunk, a standing break whatever its size. Other runs
+ * with a failed try are read newest first, once each, the current run's own group (`own`) aside. A run that can't be
+ * read, past STORM_READS or the deadline, is treated as a storm. Returns the groups whose failures were left out.
+ */
+export async function dropStormRuns({
+  history,
+  fetchImpl,
+  base,
+  minFailures,
+  trunkBranch = null,
+  own = null,
+  pr = null,
+  log = () => {},
+  deadlineMs = STORM_DEADLINE_MS,
+}: {
+  history: Map<string, Observation[]>;
+  fetchImpl: FetchImpl;
+  base: string;
+  minFailures: number;
+  trunkBranch?: string | null;
+  own?: string | number | null;
+  pr?: number | string | null;
+  log?: (message: string) => void;
+  deadlineMs?: number;
+}): Promise<Set<string>> {
+  // Compare PR numbers as numbers: identities built with jq carry them as strings.
+  const prOf = (o: Observation): number | null => (o.gh_pr_number == null || o.gh_pr_number === "" ? null : Number(o.gh_pr_number));
+  const isOwn = (o: Observation): boolean => o.group_id != null && String(o.group_id) === String(own);
+  const isTrunk = (o: Observation): boolean => prOf(o) == null && (trunkBranch == null || o.branch === trunkBranch);
+  // Rows are newest first (see fetchHistory): each test's trunk rows from the latest, while they failed a try.
+  const streak = new Set<Observation>();
+  for (const rows of history.values()) {
+    for (const o of rows) {
+      // A skipped run is no trial, as in classify: it neither starts nor ends the streak.
+      if (isOwn(o) || !isTrunk(o) || o.status === "skipped") continue;
+      if (!isFailedTry(o.status)) break;
+      streak.add(o);
+    }
+  }
+  const counted = (o: Observation): boolean => o.group_id != null && !isOwn(o) && isFailedTry(o.status) && !streak.has(o) && (pr == null || prOf(o) !== Number(pr));
+  const newest = new Map<string, number>();
+  for (const rows of history.values())
+    for (const o of rows)
+      if (counted(o)) newest.set(String(o.group_id), Math.max(newest.get(String(o.group_id)) ?? 0, Date.parse(o.created_at ?? "") || 0));
+  const list = [...newest.keys()].sort((a, b) => newest.get(b)! - newest.get(a)!);
+  const storms = new Set<string>();
+  const quiet = new Set<string>();
+  const deadline = Date.now() + deadlineMs;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, deadlineMs);
+  });
+  try {
+    for (let i = 0; i < Math.min(list.length, STORM_READS) && Date.now() < deadline; i += STORM_READ_BATCH) {
+      const batch = list.slice(i, Math.min(i + STORM_READ_BATCH, STORM_READS)).map(async (g) => {
+        try {
+          const { test_stats: t } = await tsioJson<{ test_stats?: { total?: number; failed?: number } | null }>(fetchImpl, base, `/reports/${encodeURIComponent(g)}`);
+          const failed = t?.failed ?? 0;
+          (failed >= minFailures && failed * 10 >= (t?.total ?? 0) ? storms : quiet).add(g);
+        } catch {
+          // Unread: left out below with the storms.
+        }
+      });
+      await Promise.race([Promise.all(batch), late]);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+  const dropped = new Set(list.filter((g) => !quiet.has(g)));
+  if (!dropped.size) return dropped;
+  for (const [key, rows] of history) history.set(key, rows.filter((o) => !counted(o) || !dropped.has(String(o.group_id))));
+  const unread = dropped.size - storms.size;
+  log(`history: left out the failures of ${storms.size} storm run(s)${unread ? ` and of ${unread} that could not be read` : ""}`);
+  return dropped;
 }
 
 /**
@@ -301,8 +388,8 @@ interface CommitRow {
 
 interface CompareResult {
   ahead_by?: number;
-  files?: { filename: string }[];
-  commits?: { sha: string }[];
+  files?: { filename: string; patch?: string }[];
+  commits?: CommitRow[];
   merge_base_commit?: CommitRow | null;
 }
 
@@ -314,6 +401,38 @@ const commitRef = (c: CommitRow): NonNullable<OutOfDate["commit"]> => ({
   date: String(c.commit?.committer?.date ?? c.commit?.author?.date ?? "").slice(0, 10),
   pr: Number(/\(#(\d+)\)/.exec(c.commit?.message ?? "")?.[1]) || null,
 });
+
+/**
+ * FIXED_ON_TRUNK failures: the fix landed after trunk's last failing commit and by its first passing one. Lacking the
+ * last failing commit, the PR lacks the fix (out of date); having the first passing one, it has the fix and still fails
+ * (a REGRESSION for the judge). Anything else, or a cut-off compare, stays unchecked.
+ */
+export async function markFixedOnTrunk({ findings, api, id, baseBranch, log = () => {} }: {
+  findings: Finding[];
+  api: GhApi;
+  id: Pick<CompositeIdentity, "repository" | "commit_sha">;
+  baseBranch: string | null | undefined;
+  log?: (message: string) => void;
+}): Promise<void> {
+  if (!findings.length) return;
+  const cmp = baseBranch ? (await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`)) as CompareResult | null : null;
+  const lacking = new Map((cmp?.commits ?? []).map((c): [string, CommitRow] => [c.sha, c]));
+  const complete = cmp != null && (cmp.ahead_by ?? 0) <= lacking.size;
+  for (const f of findings) {
+    const lastFail = f.trunk_fixed?.last_fail?.commit_sha;
+    const firstPass = f.trunk_fixed?.first_pass?.commit_sha;
+    if (lastFail && lacking.has(lastFail)) {
+      // Named by trunk's first passing commit: the fix is at or before it.
+      const pass = firstPass ? lacking.get(firstPass) : undefined;
+      f.out_of_date = { base: baseBranch!, behind: cmp!.ahead_by ?? null, commit: pass ? commitRef(pass) : null, fixed: true };
+    } else if (firstPass && complete && !lacking.has(firstPass)) {
+      Object.assign(f, { class: "REGRESSION", reason: `${f.reason} This branch has that fix (by ${firstPass.slice(0, 7)}) and still fails the same way.` });
+    } else {
+      log(`whether this PR has ${baseBranch}'s fix for ${f.title} is unknown`);
+      Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} Whether this branch has that fix could not be checked.` });
+    }
+  }
+}
 
 /** What markOutOfDate could not settle: `truncated` when the file list was cut off, and the failures left unchecked. */
 export interface OutOfDateResult {
@@ -355,7 +474,7 @@ export async function markOutOfDate({
   const truncated = files.length >= COMPARE_FILE_CAP;
   const changed = new Set(files.map((x) => x.filename));
   const onBase = new Set((cmp.commits ?? []).map((c) => c.sha));
-  const commits = new Map<string, OutOfDate["commit"]>();
+  const commits = new Map<string, { commit: OutOfDate["commit"]; also: NonNullable<OutOfDate["also"]> }>();
   const rest: Finding[] = [];
   for (const f of findings) {
     const path = f.repo_path;
@@ -365,10 +484,13 @@ export async function markOutOfDate({
     }
     if (!commits.has(path)) {
       const log_ = (await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(path)}&per_page=10`).catch(() => [])) as CommitRow[] | null;
-      const c = (log_ ?? []).find((x) => onBase.has(x.sha)) ?? null;
-      commits.set(path, c && commitRef(c));
+      // Every base commit to the test since the merge base: the newest names the change, the rest show what else changed it.
+      const [c, ...earlier] = (log_ ?? []).filter((x) => onBase.has(x.sha));
+      commits.set(path, { commit: c ? commitRef(c) : null, also: earlier.slice(0, 4).map(commitRef) });
     }
-    f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: commits.get(path) ?? null };
+    const { commit, also } = commits.get(path) ?? { commit: null, also: [] };
+    const diff = files.find((x) => x.filename === path)?.patch;
+    f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit, ...(also.length ? { also } : {}), ...(diff ? { diff: diff.slice(0, 4000) } : {}) };
   }
   if (!truncated) return { truncated: false };
   // The list is cut off: a spec missing from it may still have changed. Its directory's commits since the merge base say.

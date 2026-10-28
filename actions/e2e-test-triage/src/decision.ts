@@ -1,10 +1,11 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import { FAILED_STATUSES } from "../../shared/src/tsio.ts";
 import { errorSignature, exoneratedSet, isInfraError, JUDGED } from "./classify.ts";
 import { DEFAULTS } from "./config.ts";
-import { chainClears, CLEARING, evidenceIds, PACK_IMAGES } from "./pack.ts";
-import { answerKey, cachedAnswer, expectedOutput, maxTokensFor, SYSTEM } from "./judge.ts";
+import { chainClears, CLEARING, evidenceIds, PACK_IMAGES, serverOf } from "./pack.ts";
+import { answerKey, cachedAnswer, expectedOutput, maxTokensFor, systemFor } from "./judge.ts";
 import { costOf, ledgerTotals, newLedger } from "./pricing.ts";
 import type { Answer, BatchResult, Config, Finding, Ledger, Pack } from "./types.ts";
 
@@ -35,11 +36,36 @@ export interface Decision {
   answer: Answer | null;
 }
 
+/**
+ * What a release run's answer may change (see SYSTEM_RELEASE). Sure enough and citing what its cause requires, a test
+ * bug, a server incompatibility or an environment (never for a test that failed everywhere) clears; the history, another
+ * line of code, never carries a clear. An app bug is named and stays red. Anything else stays red unnamed.
+ */
+export function decideRelease(answer: Answer, pack: Pack, cfg: Config = DEFAULTS): Decision {
+  const known = new Set(evidenceIds(pack));
+  const cited = answer.cited_evidence.filter((c) => known.has(c));
+  const a: Answer = { ...answer, cited_evidence: cited };
+  const sure = a.confidence >= cfg.minConfidence;
+  const lanes = pack.same_test_other_platforms_this_run?.results ?? [];
+  const own = pack.release?.server ?? null;
+  const tries = pack.tries_in_this_run;
+  const everywhere = Boolean(tries && tries.ran >= 1 && tries.failed === tries.ran && lanes.length && lanes.every((l) => FAILED_STATUSES.has(l.result)));
+  const clears =
+    a.cause === "test_bug" ? cited.includes("base_change") && Boolean(pack.base_change?.diff)
+    : a.cause === "server_compat" ? cited.includes("other_platforms") && own != null && lanes.some((l) => l.result === "passed" && serverOf(l.platform) != null && serverOf(l.platform) !== own)
+    : a.cause === "flaky_environment" ? !everywhere && (cited.includes("cross_pr") || isInfraError(pack.error))
+    : false;
+  if (sure && clears) return { blocking: false, decision: "adjudicator_unblock", answer: a };
+  if (sure && a.cause === "app_bug") return { blocking: true, decision: "adjudicator_blame", answer: a };
+  return { blocking: true, decision: "engine", answer: a };
+}
+
 /** The decision matrix: what a judge answer may change. Citations must name evidence in the pack. */
 export function decide(cls: string, answer: Answer | null | undefined, pack: Pack, cfg: Config = DEFAULTS, isTrunkRun = false, identityUnresolved = false): Decision {
   const EXON = exoneratedSet(isTrunkRun);
   // A finding whose history can't be tied to it is never cleared by an opinion.
   if (identityUnresolved) return { blocking: true, decision: "evidence_incomplete", answer: answer ?? null };
+  if (pack.release) return answer ? decideRelease(answer, pack, cfg) : { blocking: true, decision: "unavailable", answer: null };
   if (!answer) return { blocking: !EXON.has(cls), decision: "unavailable", answer: null };
   const known = new Set(evidenceIds(pack));
   const cited = answer.cited_evidence.filter((c) => known.has(c));
@@ -77,7 +103,8 @@ export function canChange(cls: string, pack: Pack, isTrunkRun = false): boolean 
 // one that blames the PR without the change that would explain it, which the judge's
 // rules forbid and which would otherwise keep a failure red on no evidence.
 function nearMiss(cls: string, answer: Answer | null | undefined, pack: Pack, cfg: Config, isTrunkRun: boolean): boolean {
-  if (!answer) return false;
+  // A release run's answer is not escalated: the second model's question would be the PR one.
+  if (!answer || pack.release) return false;
   const known = new Set(evidenceIds(pack));
   const cited = answer.cited_evidence.filter((c) => known.has(c));
   const hunk = cited.some((c) => c.startsWith("hunk_"));
@@ -130,8 +157,9 @@ export async function judge(
     const f = findings[i];
     const pack = packs[i];
     // An environment error the rules cleared is not asked; one still blocking is the judge's to clear or blame.
-    if (!pack || f.identity_unresolved || !((JUDGED.has(f.class) && f.blocking) || exoneratedSet(isTrunkRun).has(f.class))) continue;
-    const advisory = !canChange(f.class, pack, isTrunkRun);
+    // A release run asks about every failure still held, whatever the class.
+    if (!pack || f.identity_unresolved || !(pack.release ? f.blocking : (JUDGED.has(f.class) && f.blocking) || exoneratedSet(isTrunkRun).has(f.class))) continue;
+    const advisory = !pack.release && !canChange(f.class, pack, isTrunkRun);
     if (advisory && !(cfg.advise && f.blocking && JUDGED.has(f.class))) {
       ledger.skipped.no_effect++;
       f.ai = { skipped: "nothing the model could change" };
@@ -163,12 +191,14 @@ export async function judge(
         continue;
       }
       const d = decide(m.f.class, answer, m.pack, cfg, isTrunkRun, false);
-      Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
+      // A failure held as failing everywhere may be blamed on the PR, never cleared; decideRelease reads the lanes itself.
+      if (m.f.failed_everywhere && !d.blocking && !m.pack.release) Object.assign(m.f, { decision: "advice", judge: d.answer });
+      else Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
     }
   };
   // One model call, made only when its worst case fits what is left of the budget.
   const call = async (model: string, fresh: Group[], retryMissing: boolean): Promise<void> => {
-    const chars = fresh.reduce((n, g) => n + JSON.stringify(g.lead.pack).length, SYSTEM.length);
+    const chars = fresh.reduce((n, g) => n + JSON.stringify(g.lead.pack).length, systemFor(fresh[0].lead.pack).length);
     const images = fresh.reduce((n, g) => n + (PACK_IMAGES.get(g.lead.pack)?.length ?? 0), 0);
     const worst = costOf({ input_tokens: chars / 3 + images * 1600, output_tokens: expectedOutput(model, fresh.length) }, model, cfg.prices);
     // Fail closed: a call is made only when its cost is bounded (the model is priced), the spend so far
@@ -226,7 +256,7 @@ export async function judge(
   const ask = async (model: string, batch: Group[], retryMissing = true): Promise<void> => {
     const fresh: Group[] = [];
     for (const g of batch) {
-      const cached = cachedAnswer(cfg.answers?.[answerKey(model, g.lead.pack)]);
+      const cached = cachedAnswer(cfg.answers?.[answerKey(model, g.lead.pack)], g.lead.pack);
       if (cached) {
         ledger.skipped.cached++;
         g.answer = cached;

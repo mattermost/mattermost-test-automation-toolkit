@@ -24,7 +24,7 @@ export interface StatusRow {
 }
 
 /** Summarizes the latest status of each lane into the aggregate's state and description. */
-export type LaneSummarizer = (lanes: LaneStatus[]) => LaneSummary;
+export type LaneSummarizer = (lanes: LaneStatus[], untriaged?: LaneStatus[]) => LaneSummary;
 
 export interface StatusPublisher {
   allowed(operation: string): Promise<boolean>;
@@ -137,7 +137,11 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     const rows = await readStatuses(api, id);
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return;
-    await post({ ...summarizeLanes(latest), context: summaryContext }, snapshotOwner());
+    // The other E2E checks under the aggregate's prefix (an upgrade lane, a policy lane): named when red.
+    const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
+    const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
+    const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
+    await post({ ...summarizeLanes(latest, untriaged), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,

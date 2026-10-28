@@ -21,18 +21,23 @@ export const laneName = (context: string): string => String(context).replace(/^e
 interface Named {
   cleared: number;
   caused: number;
+  appBug: number;
+  fixed: number;
   outdated: number;
   check: number;
 }
 
-// The labels are "flaky", "broken on main", "caused by PR", "out of date" and "needs investigation"; "cleared by triage"
+// The labels are "flaky", "broken on main", "test bug", "server compat", "caused by PR", "app bug", "fixed on main",
+// "out of date" and "needs investigation"; "cleared by triage"
 // and "unresolved" are what a status written before them said.
 function namedIn(description: string | null | undefined): Named {
   const d = String(description ?? "");
   const count = (re: RegExp): number => Number(re.exec(d)?.[1] ?? 0);
   return {
-    cleared: count(/(\d+) cleared by triage/) + count(/(\d+) flaky/) + count(/(\d+) broken on main/),
+    cleared: count(/(\d+) cleared by triage/) + count(/(\d+) flaky/) + count(/(\d+) broken on main/) + count(/(\d+) test bug/) + count(/(\d+) server compat/),
     caused: count(/(\d+) caused by PR/),
+    appBug: count(/(\d+) app bug/),
+    fixed: count(/(\d+) fixed on main/),
     outdated: count(/(\d+) out of date/),
     check: count(/(\d+) unresolved/) + count(/(\d+) needs investigation/),
   };
@@ -41,10 +46,12 @@ function namedIn(description: string | null | undefined): Named {
 // Why a lane triage left red is still red, read from the status triage wrote on it.
 export function redReason(description: string | null | undefined = ""): string {
   const d = String(description);
-  const { cleared, caused, outdated, check } = namedIn(d);
+  const { cleared, caused, appBug, fixed, outdated, check } = namedIn(d);
   const parts: string[] = [];
   if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
+  if (appBug) parts.push(`${appBug} app bug`);
+  if (fixed) parts.push(`${fixed} fixed on main`);
   if (outdated) parts.push(`${outdated} out of date`);
   if (check) parts.push(`${check} to check`);
   // Triage asked for the re-run itself, held it for a fix, or a person has to.
@@ -72,13 +79,26 @@ export function redReason(description: string | null | undefined = ""): string {
  * An unavailable or report-only triage must not hide a real failure as pending.
  * Lanes with no status did not run.
  */
-export function laneSummary(lanes: LaneStatus[]): LaneSummary {
+export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = []): LaneSummary {
   const seen = lanes.filter((l): l is { context: string; status: CommitStatus } => Boolean(l.status));
+  // A red check triage does not cover keeps "all lanes green" from being said; its own state still gates the PR.
+  const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
+  const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
+  // The status is cut at 140 characters, so the warning comes last but always fits: by name, else by count, and the
+  // text before it gives way.
+  const withOther = (text: string): string => {
+    if (!otherText) return text;
+    if (`${text} · ${otherText}`.length <= 140) return `${text} · ${otherText}`;
+    const count = `not triaged: ${otherRed.length} red`;
+    const room = 140 - count.length - 3;
+    return `${text.length > room ? `${text.slice(0, room - 1)}…` : text} · ${count}`;
+  };
   const waiting = seen.filter((l) => l.status.state === "pending");
-  if (waiting.length) return { state: "pending", description: `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}` };
+  if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText].filter(Boolean).join(" · ") };
+  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText].filter(Boolean).join(" · ")) };
+  if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" · ")) };
   return { state: "success", description: clearedText ? `${clearedText} · all lanes green` : "All lanes green" };
 }
