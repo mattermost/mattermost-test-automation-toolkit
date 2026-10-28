@@ -25,16 +25,18 @@ function namedIn(description) {
   return {
     cleared: count(/(\d+) cleared by triage/) + count(/(\d+) flaky/) + count(/(\d+) broken on main/),
     caused: count(/(\d+) caused by PR/),
+    fixed: count(/(\d+) fixed on main/),
     outdated: count(/(\d+) out of date/),
     check: count(/(\d+) unresolved/) + count(/(\d+) needs investigation/)
   };
 }
 function redReason(description = "") {
   const d = String(description);
-  const { cleared, caused, outdated, check } = namedIn(d);
+  const { cleared, caused, fixed, outdated, check } = namedIn(d);
   const parts = [];
   if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
+  if (fixed) parts.push(`${fixed} fixed on main`);
   if (outdated) parts.push(`${outdated} out of date`);
   if (check) parts.push(`${check} to check`);
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];

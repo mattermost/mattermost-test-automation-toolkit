@@ -25,16 +25,18 @@ function namedIn(description) {
   return {
     cleared: count2(/(\d+) cleared by triage/) + count2(/(\d+) flaky/) + count2(/(\d+) broken on main/),
     caused: count2(/(\d+) caused by PR/),
+    fixed: count2(/(\d+) fixed on main/),
     outdated: count2(/(\d+) out of date/),
     check: count2(/(\d+) unresolved/) + count2(/(\d+) needs investigation/)
   };
 }
 function redReason(description = "") {
   const d = String(description);
-  const { cleared, caused, outdated, check } = namedIn(d);
+  const { cleared, caused, fixed, outdated, check } = namedIn(d);
   const parts = [];
   if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
+  if (fixed) parts.push(`${fixed} fixed on main`);
   if (outdated) parts.push(`${outdated} out of date`);
   if (check) parts.push(`${check} to check`);
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
@@ -2518,7 +2520,8 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
   const unrelatedBroken = broken.length - blockingBroken;
   const unrelated = unrelatedBroken + flaky.length;
   const outdatedLead = findings.length > 0 && outdated.length * 2 >= findings.length;
-  const staleText = outdated.length ? `${outdated.length} out of date` : "";
+  const fixedCount = outdated.filter((f) => f.out_of_date?.fixed).length;
+  const staleText = [fixedCount && `${fixedCount} fixed on ${md(branch)}`, outdated.length - fixedCount && `${outdated.length - fixedCount} out of date`].filter(Boolean).join(", ");
   const needText = check.length ? `${check.length} need${check.length === 1 ? "s" : ""} a look` : "";
   const head = infra ? "\u26A0\uFE0F needs investigation" : !counts.failed && !missing ? laneRed ? "\u{1F534} red outside the tests" : "\u2705 nothing failed" : outdatedLead ? `\u{1F534} merge ${md(branch)} and re-run: ${staleText}${yours.length ? `, ${yours.length} may be caused by this ${pr ? "PR" : "commit"}` : ""}${needText ? `, ${needText}` : ""}` : yours.length ? `\u{1F534} ${yours.length} may be caused by this ${pr ? "PR" : "commit"}${[staleText, needText].filter(Boolean).map((t) => `, ${t}`).join("")}` : missing ? "\u{1F534} results missing" : check.length || outdated.length ? `${unnamed ? "\u{1F534}" : "\u{1F7E1}"} ${[needText, staleText, unnamed ? "re-run the failed jobs" : ""].filter(Boolean).join(", ")}` : blockingBroken ? `\u{1F534} ${blockingBroken} still failing on ${md(branch)}` : unnamed ? `\u{1F534} ${notRunRerun && !findings.length ? `${count(notRunRerun, "spec")} did not run, ` : ""}${rerun ? RERUNNING : RERUN}` : `\u2705 none caused by this ${pr ? "PR" : "commit"}`;
   const lines = [`## E2E triage${where}: ${head}`, ""];
@@ -2540,7 +2543,8 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
     const kinds = [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
     say = `${count(yours.length + outdated.length + check.length + blockingBroken + unrelated, "failure")}: ` + [
       yours.length && `${yours.length} may be caused by this ${pr ? "PR" : "commit"}`,
-      outdated.length && `${outdated.length} out of date`,
+      fixedCount && `${fixedCount} fixed on ${branch}`,
+      outdated.length - fixedCount && `${outdated.length - fixedCount} out of date`,
       check.length && `${check.length} need${check.length === 1 ? "s" : ""} a look`,
       blockingBroken && `${blockingBroken} still failing on ${branch}`,
       unrelated && `${unrelated} look${unrelated === 1 ? "s" : ""} unrelated (${kinds})`
@@ -2565,7 +2569,7 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
   };
   section(pr ? "Your PR" : "This commit", yours);
   const streakOnly = outdated.length > 0 && outdated.every((f) => f.out_of_date?.streak);
-  section("Out of date", outdated, streakOnly ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}` : `Out of date (${outdated.length}): ${md(branch)} changed these tests, or fixed these failures, after this PR last merged ${md(branch)}`);
+  section("Out of date", outdated, streakOnly ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}` : fixedCount === outdated.length ? `Fixed on ${md(branch)} (${outdated.length}): ${md(branch)} fixed these failures after this PR last merged ${md(branch)}` : `Out of date (${outdated.length}): ${md(branch)} changed these tests, or fixed these failures, after this PR last merged ${md(branch)}`);
   section("Needs a look", check);
   section(`Broken on ${md(branch)}`, broken);
   section("Flaky", flaky);
@@ -2606,10 +2610,10 @@ function otherRunText(lane) {
 function noResultsText(lane, commitSha) {
   return `Not triaged: TSIO has no results for ${md(lane)} at ${sha7(commitSha)} (the tests may not have run).`;
 }
-var STATUS_LABELS = ["flaky", "broken on main", "caused by PR", "out of date", "needs investigation"];
+var STATUS_LABELS = ["flaky", "broken on main", "caused by PR", "fixed on main", "out of date", "needs investigation"];
 function statusLabelOf(f) {
   if (f.blocking) {
-    if (f.out_of_date) return "out of date";
+    if (f.out_of_date) return f.out_of_date.fixed ? "fixed on main" : "out of date";
     if (f.class === "OWNED_BY_PR" || f.judge?.cause === "caused_by_pr" && (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto")) return "caused by PR";
     return "needs investigation";
   }

@@ -4312,7 +4312,7 @@ test("a branch without trunk's fix is out of date; with it, the same failure goe
   const stale = fixedOne();
   await markFixedOnTrunk({ findings: [stale], api: fixCompare(["m1", "f4", "p1", "m2"]), id, baseBranch: "master" });
   assert.deepEqual(stale.out_of_date, { base: "master", behind: 4, commit: { sha: "p1", date: "2026-10-26", pr: 39418 }, fixed: true });
-  assert.equal(statusLabelOf(stale), "out of date");
+  assert.equal(statusLabelOf(stale), "fixed on main");
   assert.match(renderSummary({ findings: [stale], infra: null, runURL: "u", counts: { failed: 1, passed: 9 }, trunkBranch: "master" }), /master fixed this failure \(#39418, 2026-10-26\) after this PR last merged master, so this branch still has it\./);
   const current = fixedOne();
   await markFixedOnTrunk({ findings: [current], api: fixCompare(["m1", "m2"]), id, baseBranch: "master" });
@@ -4328,10 +4328,17 @@ test("a branch without trunk's fix is out of date; with it, the same failure goe
   assert.equal(cutOff.decision, "evidence_incomplete", "a cut-off list can't show the branch has the fix");
 });
 
-test("end to end: the trunk-fixed failure on a stale branch reads out of date, never flaky", async () => {
+test("end to end: the trunk-fixed failure on a stale branch reads fixed on main, never flaky", async () => {
   const run = runOf([{ title: "t1", file: "specs/a.spec.ts", error: stuckTest.error }]);
   const history = new Map([[identityKey(run.failing[0]), fixedOnTrunkHistory()]]);
   const result = await evaluate(run, { history, ask: null, fixedOnTrunk: (fs) => markFixedOnTrunk({ findings: fs, api: fixCompare(["f4", "p1"]), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master" }) });
-  assert.deepEqual(result.findings.map((f) => [f.class, f.blocking, statusLabelOf(f)]), [["FIXED_ON_TRUNK", true, "out of date"]]);
-  assert.match(statusDescription(result.verdict, result.findings, result.infra, result.counts), /^\(1 out of date\)/);
+  assert.deepEqual(result.findings.map((f) => [f.class, f.blocking, statusLabelOf(f)]), [["FIXED_ON_TRUNK", true, "fixed on main"]]);
+  assert.match(statusDescription(result.verdict, result.findings, result.infra, result.counts), /^\(1 fixed on main\)/);
+  const text = summary({ findings: result.findings, counts: { passed: 9, failed: 1 }, runURL: "u", trunkBranch: "master" });
+  assert.match(text, /^## E2E triage: 🔴 merge master and re-run: 1 fixed on master$/m);
+  assert.match(text, /^### Fixed on master \(1\): master fixed these failures after this PR last merged master$/m);
+  assert.match(text, /\*\*Merge master and re-run first\. 1 failure: 1 fixed on master\.\*\*/);
+  const both = summary({ findings: [...result.findings, staleOnMaster("b")], counts: { passed: 9, failed: 2 }, runURL: "u", trunkBranch: "master" });
+  assert.match(both, /^## E2E triage: 🔴 merge master and re-run: 1 fixed on master, 1 out of date$/m);
+  assert.match(both, /^### Out of date \(2\): master changed these tests, or fixed these failures/m);
 });

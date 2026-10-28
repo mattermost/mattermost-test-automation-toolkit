@@ -277,7 +277,9 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
   // Out-of-date failures are counted apart, never as the PR's. When they are at least half the failures, the fix
   // is the merge, so the headline and the say-line lead with it.
   const outdatedLead = findings.length > 0 && outdated.length * 2 >= findings.length;
-  const staleText = outdated.length ? `${outdated.length} out of date` : "";
+  // A failure the base branch fixed is named apart from a test it changed: the same merge fixes both.
+  const fixedCount = outdated.filter((f) => f.out_of_date?.fixed).length;
+  const staleText = [fixedCount && `${fixedCount} fixed on ${md(branch)}`, outdated.length - fixedCount && `${outdated.length - fixedCount} out of date`].filter(Boolean).join(", ");
   const needText = check.length ? `${check.length} need${check.length === 1 ? "s" : ""} a look` : "";
   // The headline must agree with the verdict: blocking failures and missing reports are red, and "none caused"
   // is only said when nothing blocks.
@@ -318,7 +320,8 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
     const kinds = [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
     say = `${count(yours.length + outdated.length + check.length + blockingBroken + unrelated, "failure")}: ` + [
       yours.length && `${yours.length} may be caused by this ${pr ? "PR" : "commit"}`,
-      outdated.length && `${outdated.length} out of date`,
+      fixedCount && `${fixedCount} fixed on ${branch}`,
+      outdated.length - fixedCount && `${outdated.length - fixedCount} out of date`,
       check.length && `${check.length} need${check.length === 1 ? "s" : ""} a look`,
       blockingBroken && `${blockingBroken} still failing on ${branch}`,
       unrelated && `${unrelated} look${unrelated === 1 ? "s" : ""} unrelated (${kinds})`,
@@ -348,7 +351,9 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
   const streakOnly = outdated.length > 0 && outdated.every((f) => f.out_of_date?.streak);
   section("Out of date", outdated, streakOnly
     ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}`
-    : `Out of date (${outdated.length}): ${md(branch)} changed these tests, or fixed these failures, after this PR last merged ${md(branch)}`);
+    : fixedCount === outdated.length
+      ? `Fixed on ${md(branch)} (${outdated.length}): ${md(branch)} fixed these failures after this PR last merged ${md(branch)}`
+      : `Out of date (${outdated.length}): ${md(branch)} changed these tests, or fixed these failures, after this PR last merged ${md(branch)}`);
   section("Needs a look", check);
   section(`Broken on ${md(branch)}`, broken);
   section("Flaky", flaky);
@@ -408,18 +413,19 @@ export function noResultsText(lane: string, commitSha: string): string {
 }
 
 /** The five labels the E2E check's text uses, in the order it lists them. */
-export const STATUS_LABELS = ["flaky", "broken on main", "caused by PR", "out of date", "needs investigation"] as const;
+export const STATUS_LABELS = ["flaky", "broken on main", "caused by PR", "fixed on main", "out of date", "needs investigation"] as const;
 export type StatusLabel = (typeof STATUS_LABELS)[number];
 
 /**
- * The label of one finding. Blocking: out of date (a stale copy, or the branch-state hold), caused by this PR (the PR
+ * The label of one finding. Blocking: fixed on main (the base branch fixed the failure after this PR last merged it),
+ * out of date (a stale copy, or the branch-state hold), caused by this PR (the PR
  * edits the spec, or the judge blames or vetoes it), otherwise needs investigation. Cleared: broken on main (a trunk
  * break, or the judge's bug_on_master), otherwise flaky (trunk or cross-PR flakes, the environment, a test bug, or the
  * same failure as one of those).
  */
 export function statusLabelOf(f: Finding): StatusLabel {
   if (f.blocking) {
-    if (f.out_of_date) return "out of date";
+    if (f.out_of_date) return f.out_of_date.fixed ? "fixed on main" : "out of date";
     if (f.class === "OWNED_BY_PR" || (f.judge?.cause === "caused_by_pr" && (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto"))) return "caused by PR";
     return "needs investigation";
   }

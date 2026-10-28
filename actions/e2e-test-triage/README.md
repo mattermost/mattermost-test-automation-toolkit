@@ -72,7 +72,7 @@ before any data was collected; the 7-week replay found no wrong clear with them.
 
 **Fixed on master:** master failed the test the same way in at least 3 runs in a
 row and has passed since. That is a break master fixed, not a flake: a branch
-without master's first passing commit is held as out of date ("master fixed this
+without master's first passing commit is held as **fixed on main** ("master fixed this
 failure (#PR, date) after this PR last merged master"), and one that has it goes
 to the model as a `REGRESSION`. If the base branch's commit list is cut off, it
 stays unchecked.
@@ -191,7 +191,7 @@ model fails or is unavailable, the rules' outcome stands.
 
 - **E2E check text**, in both modes: `(2 flaky, 2 caused by PR) 99.7% passed (1186
   passed, 4 failed, 164 skipped)`. The labels, each only when non-zero and in this
-  order: flaky, broken on main, caused by PR, out of date, needs investigation. The
+  order: flaky, broken on main, caused by PR, fixed on main, out of date, needs investigation. The
   rate is passed ÷ (passed + failed), as in
   mattermost's own E2E check; it never reads 100% while something failed.
   Shard placeholders add "re-run the failed jobs" after the labels (alone when

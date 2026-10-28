@@ -21,11 +21,12 @@ export const laneName = (context: string): string => String(context).replace(/^e
 interface Named {
   cleared: number;
   caused: number;
+  fixed: number;
   outdated: number;
   check: number;
 }
 
-// The labels are "flaky", "broken on main", "caused by PR", "out of date" and "needs investigation"; "cleared by triage"
+// The labels are "flaky", "broken on main", "caused by PR", "fixed on main", "out of date" and "needs investigation"; "cleared by triage"
 // and "unresolved" are what a status written before them said.
 function namedIn(description: string | null | undefined): Named {
   const d = String(description ?? "");
@@ -33,6 +34,7 @@ function namedIn(description: string | null | undefined): Named {
   return {
     cleared: count(/(\d+) cleared by triage/) + count(/(\d+) flaky/) + count(/(\d+) broken on main/),
     caused: count(/(\d+) caused by PR/),
+    fixed: count(/(\d+) fixed on main/),
     outdated: count(/(\d+) out of date/),
     check: count(/(\d+) unresolved/) + count(/(\d+) needs investigation/),
   };
@@ -41,10 +43,11 @@ function namedIn(description: string | null | undefined): Named {
 // Why a lane triage left red is still red, read from the status triage wrote on it.
 export function redReason(description: string | null | undefined = ""): string {
   const d = String(description);
-  const { cleared, caused, outdated, check } = namedIn(d);
+  const { cleared, caused, fixed, outdated, check } = namedIn(d);
   const parts: string[] = [];
   if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
+  if (fixed) parts.push(`${fixed} fixed on main`);
   if (outdated) parts.push(`${outdated} out of date`);
   if (check) parts.push(`${check} to check`);
   // Triage asked for the re-run itself, held it for a fix, or a person has to.
