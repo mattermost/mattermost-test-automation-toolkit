@@ -92,9 +92,9 @@ failed only in 3 such runs, and each of those counted as that test's flakiness.
 (at least two) and failed on another platform of the same commit (iOS and Android,
 Linux and Windows, or the enterprise and FIPS lanes) is never cleared by the model
 or a same-failure match; the model may still name the PR. A flake rarely does
-that, and a change to shared code does. A rules clear stands only where master or
-3+ other PRs failed it the same way; one that rests on nothing comparable (a bare
-timeout) is held as `REGRESSION`, needs investigation. A break on master, an
+that, and a change to shared code does. A clear by the rules stands only where
+master or 3+ other PRs failed it the same way. One that rests on nothing comparable
+(a bare timeout) is held as `REGRESSION` and needs investigation. A break on master, an
 environment error, and a spec the PR edits keep their own calls. Either condition
 alone changes nothing.
 
