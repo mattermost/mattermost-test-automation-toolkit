@@ -105,7 +105,7 @@ function whyNext(f: Finding, branch: string, pr: boolean): [string, string] {
     }
     case "check":
       if (f.decision === "evidence_incomplete" || f.identity_unresolved) return ["Its history could not be checked.", "Read the error, or re-run if it isn't your change."];
-      if (f.failed_everywhere) return [`Failed every try here and on ${f.failed_everywhere.join(" and ")} on this same commit; a flake rarely does that.`, "Read the error before re-running."];
+      if (f.failed_everywhere) return ["Failed every try here and on another platform of this same commit; a flake rarely does that.", "Read the error before re-running."];
       if (a?.cause === "caused_by_pr") return [`Might be this PR's change (${ai}), but not sure enough to say.`, "Read the error before re-running."];
       if (a) return [`Looks ${LIKELY[a.cause] ?? a.cause} (${ai}), but not sure enough to clear.`, "Read the error before re-running."];
       if (f.class === "INFRA_ERROR") return ["Failed on its environment (see the error), which this change could also have caused.", "Re-run; if it fails the same way again, check your change."];
@@ -341,11 +341,10 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
     lines.push(`### ${heading}`, "", "| Test | Why | Next step |", "| --- | --- | --- |");
     for (const f of list) {
       const [why, next] = whyNext(f, branch, pr);
-      // A row that blames this PR (or a base-branch change to its test) is not steered toward the environment.
-      const blamesPR = bucketOf(f) === "yours" || bucketOf(f) === "outdated";
-      // A failure held for failing everywhere names the platforms in its why already.
-      const also = f.failed_everywhere ? "" : alsoFailed(f, blamesPR ? PLAIN : SHARED_CAUSE);
-      lines.push(`| ${md(f.title)} · \`${mdCode(fileOf(f))}\` | ${md(why + also)} | ${md(next)} |`);
+      // A row that blames this PR (or a base-branch change to its test), or is held for failing everywhere, is not
+      // steered toward the environment.
+      const plain = bucketOf(f) === "yours" || bucketOf(f) === "outdated" || Boolean(f.failed_everywhere);
+      lines.push(`| ${md(f.title)} · \`${mdCode(fileOf(f))}\` | ${md(why + alsoFailed(f, plain ? PLAIN : SHARED_CAUSE))} | ${md(next)} |`);
     }
     lines.push("");
   };

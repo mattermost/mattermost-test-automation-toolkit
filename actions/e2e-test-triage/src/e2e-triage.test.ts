@@ -4372,7 +4372,10 @@ test("failing every try here and on another platform of this commit is never cle
   assert.match(f.reason, /^Failed all 2 tries here and failed on detox-ios on this same commit; a flake rarely does that\. Fails here, passes on trunk/);
   assert.equal(held.verdict, "FAILURE");
   const text = renderSummary({ findings: held.findings, counts: { passed: 9, failed: 1 }, runURL: "u", trunkBranch: "main" });
-  assert.match(text, /\| Failed every try here and on detox-ios on this same commit; a flake rarely does that\. \| Read the error before re-running\. \|/);
+  assert.match(text, /\| Failed every try here and on another platform of this same commit; a flake rarely does that\. Also failed on detox-ios in this run\. \| Read the error before re-running\. \|/);
+  // Out of date as well: its why is the base branch's, and the platforms are still named.
+  const stale = renderSummary({ findings: [{ ...f, out_of_date: { base: "main", behind: 3, commit: null } }], counts: { passed: 9, failed: 1 }, runURL: "u", trunkBranch: "main" });
+  assert.match(stale, /after this PR last merged main, so the PR ran its old copy\. Also failed on detox-ios in this run\. \|/);
   assert.match(text, /99% sure, but a failure on every try and on another platform is not cleared\./);
   assert.equal(sameFailure([f, { ...finding({ title: "t2", file: "specs/a.spec.ts", error, failure_signatures: [errorSignature(error) ?? ""] }), class: "FLAKY_ON_TRUNK", blocking: false }])[0].blocking, true, "a cleared test with the same error doesn't clear it");
   // Each condition alone is not enough: a retry that passed elsewhere, a try that passed here, a single try.
@@ -4451,9 +4454,10 @@ test("a storm's failures are left out of history; a pass, this PR's runs and tru
 
 test("master's own triage keeps a storm-sized break as a streak: a commit that breaks 35 tests is never flaky on the next run", async () => {
   // Run N broke 35 tests on master and is a storm; run N+1 fails the same test. Older runs had one flaky pass.
-  const history = new Map([["k", [obs({ group_id: "n", status: "failed", created_at: "2026-09-20T00:00:00Z" }), ...trunkPasses(6), obs({ group_id: "old", status: "flaky", commit_sha: "o1" })]]]);
+  // A skipped run in between is no trial: it neither starts nor ends the streak.
+  const history = new Map([["k", [obs({ group_id: "skip", status: "skipped", created_at: "2026-09-21T00:00:00Z" }), obs({ group_id: "n", status: "failed", created_at: "2026-09-20T00:00:00Z" }), ...trunkPasses(6), obs({ group_id: "old", status: "flaky", commit_sha: "o1" })]]]);
   await dropStormRuns({ history, fetchImpl: async () => Response.json({ test_stats: { total: 650, failed: 35 } }), base: "http://tsio", minFailures: 30, trunkBranch: "master" });
-  assert.deepEqual(history.get("k")?.map((o) => o.group_id ?? null), ["n", null, null, null, null, null, null, "old"], "the streak is kept; nothing else failed");
+  assert.deepEqual(history.get("k")?.map((o) => o.group_id ?? null), ["skip", "n", null, null, null, null, null, null, "old"], "the streak is kept; nothing else failed");
   const f = classify(failing, history.get("k") ?? [], [], undefined, null, null, { isTrunkRun: true, trunkBranch: "master" });
   assert.deepEqual([f.class, f.blocking], ["BROKEN_ON_TRUNK", true]);
 });

@@ -311,7 +311,8 @@ export async function dropStormRuns({
   const streak = new Set<Observation>();
   for (const rows of history.values()) {
     for (const o of rows) {
-      if (isOwn(o) || !isTrunk(o)) continue;
+      // A skipped run is no trial, as in classify: it neither starts nor ends the streak.
+      if (isOwn(o) || !isTrunk(o) || o.status === "skipped") continue;
       if (!isFailedTry(o.status)) break;
       streak.add(o);
     }
