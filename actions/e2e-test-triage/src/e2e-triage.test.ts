@@ -1441,7 +1441,7 @@ test("a response that is not used is still billed: it is recorded with its cost,
   });
 });
 
-// Escalation is off by default; these tests turn it on to check how it behaves.
+// These tests escalate to Fable 5.1, a model other than the default, to check how escalation behaves.
 const WITH_FABLE: Config = { ...DEFAULTS, escalationModel: "claude-fable-5-1" };
 test("an answer just short of the threshold goes once to the escalation model", async () => {
   const f = classify(failing, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1);
@@ -1503,9 +1503,9 @@ test("prices are looked up by model family and can be overridden", () => {
   assert.equal(priceFor("claude-haiku-4"), null, "a prefix of a different name is not that model");
   assert.equal(costOf({ input_tokens: 1e6, output_tokens: 1e6, cache_read_input_tokens: 1e6, cache_creation_input_tokens: 1e6 }, "claude-opus-5-5"), 4 + 20 + 0.2 + 5);
   assert.equal(costOf({ input_tokens: 10 }, "some-future-model"), null, "an unpriced model has an unknown cost, not zero");
-  const cfg = configFrom({ AI_PRICES: JSON.stringify({ "some-future-model": { input: 3, output: 15, cache_write: 3.75, cache_read: 0.3 } }), ESCALATION_MODEL: "", AI_BUDGET_USD: "0.2" });
+  const cfg = configFrom({ AI_PRICES: JSON.stringify({ "some-future-model": { input: 3, output: 15, cache_write: 3.75, cache_read: 0.3 } }), ESCALATION_MODEL: "off", AI_BUDGET_USD: "0.2" });
   assert.equal(costOf({ input_tokens: 1e6 }, "some-future-model", cfg.prices), 3);
-  assert.equal(cfg.escalationModel, "", "an empty value turns escalation off");
+  assert.equal(cfg.escalationModel, "", "off turns escalation off");
   assert.equal(cfg.budgetUsd, 0.2);
   // An unreadable AI_PRICES warns and leaves every model unpriced: the judge skips the call, and the run goes on.
   const warned: string[] = [];
@@ -2128,20 +2128,24 @@ function fakeModel(served: string | undefined | ((requested: string) => string),
 
 const askOne = (fetchImpl: FetchImpl, model: string) => askModelBatch(fetchImpl, "k", model, [judgePack]);
 
-test("the judge is pinned to a versioned model, and the second opinion is off by default", () => {
+test("the judge and its second opinion are pinned to versioned models, each switchable from the environment", () => {
   // Versioned ids (no dated snapshot exists for these): a family alias could be
   // repointed underneath the thresholds.
   assert.equal(DEFAULTS.model, "claude-sonnet-5-5");
-  assert.equal(DEFAULTS.escalationModel, "", "Sonnet 5.5 only until data shows a second opinion is worth it");
-  assert.equal(configFrom({}).escalationModel, "");
-  for (const m of [DEFAULTS.model, WITH_FABLE.escalationModel]) assert.ok(priceFor(m), `${m} is priced, so the run budget applies to it`);
+  assert.equal(DEFAULTS.escalationModel, "claude-opus-5-5");
+  for (const m of [DEFAULTS.model, DEFAULTS.escalationModel, WITH_FABLE.escalationModel]) assert.ok(priceFor(m), `${m} is priced, so the run budget applies to it`);
+  assert.deepEqual([configFrom({}).model, configFrom({}).escalationModel], [DEFAULTS.model, DEFAULTS.escalationModel]);
+  assert.deepEqual([configFrom({ CLAUDE_MODEL: "", ESCALATION_MODEL: " " }).model, configFrom({ CLAUDE_MODEL: "", ESCALATION_MODEL: " " }).escalationModel], [DEFAULTS.model, DEFAULTS.escalationModel], "an unset repository variable takes the defaults");
+  const set = configFrom({ CLAUDE_MODEL: "claude-haiku-4-5", ESCALATION_MODEL: "claude-fable-5-1" });
+  assert.deepEqual([set.model, set.escalationModel], ["claude-haiku-4-5", "claude-fable-5-1"]);
+  assert.equal(configFrom({ ESCALATION_MODEL: "off" }).escalationModel, "");
 });
-test("with the default settings, an answer just short of the threshold is not asked again", async () => {
+test("with the default settings, an answer just short of the threshold goes once to Opus", async () => {
   const f = classify(failing, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1);
   const asked: string[] = [];
   await judge([f], [buildPack(f, [], prCtx, [])], async (packs, model) => { asked.push(model); return ok({ ...flakyAnswer, confidence: 0.75 })(packs, model); }, DEFAULTS, () => {});
-  assert.deepEqual(asked, [DEFAULTS.model]);
-  assert.equal(f.blocking, true, "below the threshold it stays red for a person");
+  assert.deepEqual(asked, [DEFAULTS.model, "claude-opus-5-5"]);
+  assert.equal(f.blocking, true, "still short after the second opinion, it stays red for a person");
 });
 
 test("an answer from a model other than the one requested is discarded, once", async () => {

@@ -229,8 +229,14 @@ model fails or is unavailable, the rules' outcome stands.
   are asked, 8 to a request: questions that can change the outcome first, then
   those that settle the most tests. A question the response leaves out is asked
   once more. Over 24, the rest keep the rules' outcome.
-- `escalation-model` (off by default) asks a second model once about an answer just
-  short of the threshold, or one that blames the PR without citing a change.
+- `escalation-model` (Opus 5.5 by default) asks a second model once about an answer
+  just short of the threshold, or one that blames the PR without citing a change.
+  `off` turns it off.
+- Neither model is fixed in a workflow: `claude-model` and `escalation-model` (env
+  `CLAUDE_MODEL`, `ESCALATION_MODEL`) take the defaults when empty, so a repository
+  variable can switch them, unset or not:
+  `escalation-model: ${{ vars.E2E_TRIAGE_ESCALATION_MODEL }}`. A model missing from
+  the price table also needs `ai-prices`, or the judge does not call it.
 - A blocking failure the model has nothing to cite for is still asked
   (`ai-advice`), and its read is shown as advice. It never changes the outcome.
 - Spend is priced per call and shown in the summary and the `ai-cost-usd`

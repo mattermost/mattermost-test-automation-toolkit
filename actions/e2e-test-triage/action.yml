@@ -20,9 +20,9 @@ inputs:
     required: false
     default: ""
   claude-model:
-    description: Model for the judge. The confidence thresholds are tuned against the default
+    description: Model for the judge. Empty takes the default (claude-sonnet-5-5), which the confidence thresholds are tuned against. A model missing from the price table also needs ai-prices
     required: false
-    default: claude-sonnet-5-5
+    default: ""
   min-confidence:
     description: Minimum model confidence (0.5-1) to clear a failure history can't explain; a value outside that range is clamped to it, and one that is not a number is replaced by 0.85, both with a warning
     required: false
@@ -76,7 +76,7 @@ inputs:
     required: false
     default: "false"
   escalation-model:
-    description: Stronger model (e.g. claude-fable-5-1) asked once about answers just short of a threshold, or that blame the PR without citing a change. Empty (the default) turns it off
+    description: Stronger model asked once about answers just short of a threshold, or that blame the PR without citing a change. Empty takes the default (claude-opus-5-5); off turns it off
     required: false
     default: ""
   ai-budget-usd:
