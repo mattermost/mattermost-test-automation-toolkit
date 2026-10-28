@@ -89,4 +89,7 @@ test("a red check triage does not cover keeps the aggregate from saying all lane
   const description = laneSummary(slow, [upgrade, { ...upgrade, context: `${upgrade.context}-fips` }]).description;
   assert.equal(description, "Triage is checking: waiting for cypress-full/enterprise, playwright-full/enterprise · not triaged: 2 red", "counted when the names would not fit");
   assert.ok(description.length <= 140);
+  const reds = ["cypress-full/enterprise", "playwright-full/enterprise", "cypress-full/fips"].map((n) => ({ context: `e2e-test/${n}`, status: st("failure", "(3 caused by PR, 2 needs investigation) 99.1% passed") }));
+  const red = laneSummary(reds, [upgrade]).description;
+  assert.ok(red.length <= 140 && red.endsWith(" · not triaged: 1 red"), `the warning survives the cut on a red check too: ${red}`);
 });

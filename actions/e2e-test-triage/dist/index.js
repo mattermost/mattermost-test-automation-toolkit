@@ -60,17 +60,20 @@ function laneSummary(lanes, untriaged = []) {
   const seen = lanes.filter((l) => Boolean(l.status));
   const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
   const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
+  const withOther = (text) => {
+    if (!otherText) return text;
+    if (`${text} \xB7 ${otherText}`.length <= 140) return `${text} \xB7 ${otherText}`;
+    const count2 = `not triaged: ${otherRed.length} red`;
+    const room = 140 - count2.length - 3;
+    return `${text.length > room ? `${text.slice(0, room - 1)}\u2026` : text} \xB7 ${count2}`;
+  };
   const waiting = seen.filter((l) => l.status.state === "pending");
-  if (waiting.length) {
-    const checking = `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`;
-    const other = otherText && `${checking} \xB7 ${otherText}`.length > 140 ? `not triaged: ${otherRed.length} red` : otherText;
-    return { state: "pending", description: [checking, other].filter(Boolean).join(" \xB7 ") };
-  }
+  if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText, otherText].filter(Boolean).join(" \xB7 ") };
-  if (otherText) return { state: "success", description: [clearedText, "triaged lanes green", otherText].filter(Boolean).join(" \xB7 ") };
+  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
+  if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" \xB7 ")) };
   return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
 }
 
