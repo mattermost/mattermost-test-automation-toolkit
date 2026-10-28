@@ -1387,9 +1387,10 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
   };
   const out = (cls, reason, blocking) => ({ ...test, class: cls, reason, blocking, ...stats });
   const otherError = (rows) => {
-    if (ownSignature == null || !rows.length) return null;
-    const sigs = rows.map((o) => errorSignature(o.error_excerpt));
-    return sigs.every(Boolean) && !sigs.includes(ownSignature) ? sigs[0] ?? null : null;
+    const mine2 = errorSignature(maskIds(test.error));
+    if (mine2 == null || !rows.length) return null;
+    const sigs = rows.map((o) => errorSignature(maskIds(o.error_excerpt)));
+    return sigs.every(Boolean) && !sigs.includes(mine2) ? sigs[0] ?? null : null;
   };
   if (own.has(test.repo_path ?? test.file))
     return out("OWNED_BY_PR", isTrunkRun ? `This commit changes ${test.file}; a failure in a spec the commit edits is not noise.` : `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);

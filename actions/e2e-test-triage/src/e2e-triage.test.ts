@@ -190,6 +190,9 @@ test("trunk's instability clears a PR's failure only when trunk failed the same 
   // Broken on trunk: the current streak's error decides.
   assert.equal(classify(pr, [other, ...trunkPasses(6)], []).class, "REGRESSION");
   assert.equal(classify(pr, [same, ...trunkPasses(6)], []).class, "BROKEN_ON_TRUNK");
+  const detached = (postId: string): string => `Error: Element #CENTER_actions_button_${postId} is detached from the DOM after reopening the menu`;
+  const trunkDetached = obs({ status: "failed", commit_sha: "d1", error_excerpt: detached("1xpbzs3wdbf3xb8nzkswcuuqhc") });
+  assert.equal(classify({ ...failing, error: detached("4j9jsuqqytnz8x37pnir3dmeqc") }, [trunkDetached, ...trunkPasses(6)], []).class, "BROKEN_ON_TRUNK", "another run's post in the selector is the same error");
 });
 test("failing every try here does not change the flake verdict: an environment that breaks fails every try too", () => {
   // Replayed on real runs, holding these red added 37 false reds in environment storms and none caught a PR.

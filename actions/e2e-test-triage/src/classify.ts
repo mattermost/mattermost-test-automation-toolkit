@@ -171,11 +171,13 @@ export function classify(
   const out = (cls: string, reason: string, blocking: boolean): Finding => ({ ...test, class: cls, reason, blocking, ...stats });
   // Trunk's instability clears a PR's failure only when it is the same failure. When every
   // trunk failure has an error to compare and none is this one, the PR may have broken the
-  // test in a new way: it goes to the judge instead. Unknown trunk errors prove nothing either way.
+  // test in a new way: it goes to the judge instead. Unknown trunk errors prove nothing either way. Ids are masked, so
+  // another run's post in a selector is not another error.
   const otherError = (rows: Observation[]): string | null => {
-    if (ownSignature == null || !rows.length) return null;
-    const sigs = rows.map((o) => errorSignature(o.error_excerpt));
-    return sigs.every(Boolean) && !sigs.includes(ownSignature) ? (sigs[0] ?? null) : null;
+    const mine = errorSignature(maskIds(test.error));
+    if (mine == null || !rows.length) return null;
+    const sigs = rows.map((o) => errorSignature(maskIds(o.error_excerpt)));
+    return sigs.every(Boolean) && !sigs.includes(mine) ? (sigs[0] ?? null) : null;
   };
   if (own.has(test.repo_path ?? test.file))
     return out("OWNED_BY_PR", isTrunkRun
