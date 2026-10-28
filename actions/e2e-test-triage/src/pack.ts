@@ -144,7 +144,7 @@ export interface ReleaseRef {
 }
 
 // The server version a lane ran against, from its report or group name: "e2e-on-ubuntu-latest-11.11.3", "...-Server_12.0.1".
-export const serverOf = (name: string | null | undefined): string | null => /(\d+\.\d+\.\d+(?:-rc\d+)?)/.exec(String(name ?? ""))?.[1] ?? null;
+export const serverOf = (name: string | null | undefined): string | null => /(\d+\.\d+\.\d+(?:-rc\.?\d+)?)/.exec(String(name ?? ""))?.[1] ?? null;
 
 /**
  * A release branch's pack: the finding's own evidence as buildPack gives it, without a PR, and with the release's facts

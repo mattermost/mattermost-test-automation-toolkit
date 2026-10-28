@@ -1813,7 +1813,7 @@ function buildPack(finding, compareFiles, pr, others, ctx = NO_CHANGE_CONTEXT) {
   if (finding.producer?.images.length) PACK_IMAGES.set(pack, finding.producer.images);
   return pack;
 }
-var serverOf = (name) => /(\d+\.\d+\.\d+(?:-rc\d+)?)/.exec(String(name ?? ""))?.[1] ?? null;
+var serverOf = (name) => /(\d+\.\d+\.\d+(?:-rc\.?\d+)?)/.exec(String(name ?? ""))?.[1] ?? null;
 function releasePack(finding, release, others, ctx = NO_CHANGE_CONTEXT) {
   const pack = buildPack(finding, [], { number: null, repository: release.repository, title: "", lane: release.lane }, others, ctx);
   const ood = finding.out_of_date && !finding.out_of_date.streak && !finding.out_of_date.fixed ? finding.out_of_date : null;

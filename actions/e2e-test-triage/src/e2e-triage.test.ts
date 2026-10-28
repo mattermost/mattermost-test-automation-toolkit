@@ -4610,6 +4610,7 @@ test("a release pack carries the release, the default branch's change to the tes
   const withShot = releasePack(releaseFinding({ producer: { images: [shot], notes: "" } as unknown as Finding["producer"] }), releaseRef, []);
   assert.deepEqual(PACK_IMAGES.get(withShot), [shot], "the run's screenshots still reach the model");
   assert.equal(serverOf("mobile-release-detox-android-Server_12.1.0-rc2"), "12.1.0-rc2");
+  assert.equal(serverOf("mobile-release-detox-android-Server_12.0.1-rc.2"), "12.0.1-rc.2", "a dotted release candidate keeps its suffix");
   assert.equal(releasePack(releaseFinding({ report_name: null }), { ...releaseRef, name: "mobile-release-detox-ios-Server_12.0.1" }, []).release?.server, "12.0.1", "a mobile lane names its server in its group");
 });
 
