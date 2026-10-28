@@ -4553,3 +4553,18 @@ test("master's flakiness never clears a release branch's failure: it is another 
   const unchanged = await triage({ env: releaseEnv("release-6.3"), fetchImpl: fakeFetch(releaseRoutes({ histories: [], master, compare: { ahead_by: 61, files: [], commits: [] } })), log: () => {} });
   assert.deepEqual([unchanged.findings[0].blocking, statusLabelOf(unchanged.findings[0])], [true, "needs investigation"]);
 });
+
+test("an out-of-date test names every base-branch commit to it since the branch last had it, newest first", async () => {
+  // desktop MM-T4054: master's #3957 is the latest change, after the fixes #3960 and #3923 the release branch also lacks.
+  await inTmp(async (dir) => {
+    const commit = (sha: string, pr: number, date: string) => ({ sha, commit: { message: `change (#${pr})`, committer: { date: `${date}T00:00:00Z` } } });
+    const log = [commit("c3", 3957, "2026-08-27"), commit("c2", 3960, "2026-08-26"), commit("old", 3887, "2026-07-08"), commit("c1", 3923, "2026-07-30")];
+    const routes = releaseRoutes({ histories: [], compare: { ahead_by: 61, files: [{ filename: "specs/a.spec.ts" }], commits: [{ sha: "c1" }, { sha: "c2" }, { sha: "c3" }] } })
+      .map(([m, r]): Route => (m.startsWith("/commits?sha=master&path=") ? [m, () => Response.json(log)] : [m, r]));
+    const result = await triage({ env: { ...releaseEnv("release-6.3"), GITHUB_STEP_SUMMARY: join(dir, "s.md") }, fetchImpl: fakeFetch(routes), log: () => {} });
+    assert.deepEqual(result.findings[0].out_of_date?.also?.map((c) => c.pr), [3960, 3923], "only commits the branch lacks; #3887 is before the cut");
+    const text = readFileSync(join(dir, "s.md"), "utf8");
+    assert.match(text, /master changed this test \(#3957, 2026-08-27; also #3960, #3923\) after release-6\.3 branched from it/);
+    assert.match(text, /Yes: c3 \(#3957\) on 2026-08-27, and earlier #3960, #3923\./);
+  });
+});

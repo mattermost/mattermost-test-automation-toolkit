@@ -266,6 +266,8 @@ export interface OutOfDate {
   /** Commits the PR is behind the base; null for the branch-state hold, where no comparison was made. */
   behind: number | null;
   commit: CommitRef | null;
+  /** The base branch's earlier commits to the test since this PR (or branch) last had it, newest first, after `commit` (at most 4). */
+  also?: CommitRef[];
   /** The branch-state hold: this PR failed the same way on its last `streak` commits (this run included), never on the base. */
   streak?: number;
   /** The failure first passed on the base branch at `commit` (see markFixedOnTrunk), after this PR last merged it. */

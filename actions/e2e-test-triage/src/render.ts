@@ -86,6 +86,9 @@ const alsoFailed = (f: Finding, tail: string): string => {
 const SHARED_CAUSE = ": likely environment or a shared cause.";
 const PLAIN = ".";
 
+// A base-branch commit by its PR number, or its short SHA.
+const refOf = (c: { sha: string; pr: number | null }): string => (c.pr ? `#${c.pr}` : sha7(c.sha));
+
 /** One line of why, and the next step, for a failed test. */
 function whyNext(f: Finding, branch: string, pr: boolean, branchRun: string | null = null): [string, string] {
   const t = f.trunk ?? { runs: 0, passes: 0, fails: 0, flaky: 0 };
@@ -99,7 +102,8 @@ function whyNext(f: Finding, branch: string, pr: boolean, branchRun: string | nu
     case "outdated": {
       if (f.out_of_date?.streak) return [`Failed the same way on this PR's last ${f.out_of_date.streak} commits and never on ${branch}: the branch is behind or broken.`, `Merge ${branch} and re-run.`];
       const c = f.out_of_date?.commit;
-      const where = c ? ` (${c.pr ? `#${c.pr}` : sha7(c.sha)}${c.date ? `, ${c.date}` : ""})` : "";
+      const also = f.out_of_date?.also ?? [];
+      const where = c ? ` (${refOf(c)}${c.date ? `, ${c.date}` : ""}${also.length ? `; also ${also.map(refOf).join(", ")}` : ""})` : "";
       if (f.out_of_date?.fixed) return [`The failure first passed on ${branch}${where} after this PR last merged ${branch}, so this branch still has it.`, `Merge ${branch} and re-run.`];
       const base = f.out_of_date?.base ?? branch;
       if (branchRun) return [`${base} changed this test${where} after ${branchRun} branched from it, so this run used ${branchRun}'s old copy.`, `Backport the test change to ${branchRun}, or ignore it for this release.`];
@@ -182,7 +186,8 @@ function factsTable(f: Finding, branch: string, pr: boolean, branchRun: string |
     rows.push([`Failed the same way on this PR's last ${count(f.out_of_date.streak, "commit")}`, `Never on ${branch}; its latest run passed`]);
   } else if (f.out_of_date) {
     const c = f.out_of_date.commit;
-    const which = c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}` : "";
+    const also = f.out_of_date.also ?? [];
+    const which = c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}${also.length ? `, and earlier ${also.map(refOf).join(", ")}` : ""}` : "";
     const base = f.out_of_date.base ?? branch;
     rows.push(branchRun
       ? [`Changed on ${base} since ${branchRun} branched`, `Yes${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test`]

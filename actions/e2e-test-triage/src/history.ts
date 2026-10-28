@@ -479,7 +479,7 @@ export async function markOutOfDate({
   const truncated = files.length >= COMPARE_FILE_CAP;
   const changed = new Set(files.map((x) => x.filename));
   const onBase = new Set((cmp.commits ?? []).map((c) => c.sha));
-  const commits = new Map<string, OutOfDate["commit"]>();
+  const commits = new Map<string, { commit: OutOfDate["commit"]; also: NonNullable<OutOfDate["also"]> }>();
   const rest: Finding[] = [];
   for (const f of findings) {
     const path = f.repo_path;
@@ -489,10 +489,12 @@ export async function markOutOfDate({
     }
     if (!commits.has(path)) {
       const log_ = (await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(path)}&per_page=10`).catch(() => [])) as CommitRow[] | null;
-      const c = (log_ ?? []).find((x) => onBase.has(x.sha)) ?? null;
-      commits.set(path, c && commitRef(c));
+      // Every base commit to the test since the merge base: the newest names the change, the rest show what else changed it.
+      const [c, ...rest] = (log_ ?? []).filter((x) => onBase.has(x.sha));
+      commits.set(path, { commit: c ? commitRef(c) : null, also: rest.slice(0, 4).map(commitRef) });
     }
-    f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: commits.get(path) ?? null };
+    const { commit, also } = commits.get(path) ?? { commit: null, also: [] };
+    f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit, ...(also.length ? { also } : {}) };
   }
   if (!truncated) return { truncated: false };
   // The list is cut off: a spec missing from it may still have changed. Its directory's commits since the merge base say.
