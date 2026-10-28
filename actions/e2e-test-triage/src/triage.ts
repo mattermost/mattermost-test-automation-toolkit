@@ -11,7 +11,7 @@ import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.t
 import { isShardPlaceholder, isSpecNotRun, isSpecStopped } from "./classify.ts";
 import { configFrom, DEFAULTS, historyLane, PR_SPEND_KEY } from "./config.ts";
 import { loadEvidence } from "./evidence.ts";
-import { fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markFixedOnTrunk, markOutOfDate, trunkRunsOn } from "./history.ts";
+import { dropStormRuns, fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markFixedOnTrunk, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { enrichFindings, siblingPlatforms } from "./enrich.ts";
 import { askModelBatch } from "./judge.ts";
 import { evaluateRun } from "./evaluate.ts";
@@ -258,6 +258,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
           history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
         }
       }
+      await dropStormRuns({ history, fetchImpl, base, minFailures: cfg.infraMinFailures, trunkBranch, own: run.group_id, pr: prNumber, log });
     } else if (run.failing.some(isSpecStopped)) {
       // A skipped spec is never cleared while the change edits it (see classifyNotRun).
       diff = await fetchChangedFiles(api, id, prNumber, log);

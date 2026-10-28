@@ -3,7 +3,7 @@
 
 import { identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
-import { BORDERLINE, classify, classifyNotRun, errorSignature, infraVerdict, isShardPlaceholder, isSpecNotRun, isSpecStopped, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
+import { BORDERLINE, classify, classifyNotRun, errorSignature, holdFailedEverywhere, infraVerdict, isShardPlaceholder, isSpecNotRun, isSpecStopped, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, historyLane, repoPath } from "./config.ts";
 import { commonSenseClear } from "./common-sense.ts";
 import { sameTestOnOtherReports } from "./enrich.ts";
@@ -154,8 +154,8 @@ export async function evaluateRun({
       for (const f of result.findings)
         if (f.class !== "OWNED_BY_PR") Object.assign(f, { blocking: true, decision: "evidence_incomplete", reason: `${f.reason} ${blind}, so this could not be confirmed.` });
     }
-    // The same test on the run's other platforms: this run's own reports (no call), then its sibling groups. Evidence
-    // only: the summary and the pack read it, and no class or blocking depends on it.
+    // The same test on the run's other platforms: this run's own reports (no call), then its sibling groups. The summary
+    // and the pack read it, and a failure that failed every try here and on another platform is held.
     sameTestOnOtherReports(result.findings, run);
     // Not on an infrastructure storm: the run is red for its environment, and sibling reads would only add calls.
     if (otherPlatforms && !result.infra) {
@@ -165,6 +165,7 @@ export async function evaluateRun({
         log(`other platforms unavailable: ${String(e).slice(0, 200)}`);
       }
     }
+    holdFailedEverywhere(result.findings);
     // A failure in a test the base branch changed after this PR last merged it ran
     // the PR's old copy: it stays red, with "merge <base>" as the next step, and
     // is not sent to the model.

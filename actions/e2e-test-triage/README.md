@@ -32,7 +32,8 @@ produced no results: a row with no test name; desktop's
 `[<job name>] CI shard failure` in `ci/tsio-shard-failure.ts`
 (`write-tsio-failure-stub.mjs`, after a job died or was cancelled); and mobile's
 `spec did not run` with "<spec> was assigned to a shard but produced no result"
-(`merge-jest-results-for-tsio.js`). They are counted as failed but are not
+(`merge-jest-results-for-tsio.js`) and `CI infrastructure failure` in
+`ci/<job>.stub` (its `write-tsio-failure-stub.mjs`). They are counted as failed but are not
 findings: no test history is read for them, the model is not asked, and they do
 not make the run an `INFRA` run. The lane stays red and the check says "re-run
 the failed jobs", after the labels when the run also has real failures:
@@ -65,10 +66,40 @@ as unchecked evidence (the summary says so), and the model is not asked about it
 passes that needed a retry, plus 1, divided by the runs plus 2, is 0.05 or more,
 and the latest run passed. One failure counts with 38 or fewer runs; two or more
 always count. It clears the PR's failure only when master failed the same way:
-if every master failure has an error to compare and none is the PR's, the
-failure is a `REGRESSION` for the model to judge. The same holds for
-`BROKEN_ON_TRUNK`. **Other PRs:** the last 200 PR runs. These are starting values, set
-before any data was collected; the 7-week replay found no wrong clear with them.
+a failure with an error to compare (a distinctive error, or a timeout's stuck
+step) needs a master failure with that error (Mattermost's 26-character ids
+masked). One master only failed another
+way, or with nothing to compare (a hook timeout, no error), is a `REGRESSION`
+for the model to judge. `BROKEN_ON_TRUNK` needs the same when every failure of
+master's current streak has an error to compare. **Other PRs:** the last 200 PR
+runs. These are starting values, set before any data was collected; the 7-week
+replay found no wrong clear with them.
+
+**Storm runs' failures are left out of history:** a past run where 30 or more
+tests failed, and at least a tenth of its tests (TSIO counts a run over all its
+reports: every OS of a desktop run, and retests), failed on its environment or a
+shared break, and its failures say nothing about one test. Before the rules run,
+each other run with a failed try in the history is read once, newest first (at
+most 100, within 30 seconds); a storm's failed tries are left out, and so are
+those of a run that can't be read in time. Kept: a pass in a storm, this PR's own
+runs, and each test's current failing streak on master, which is a standing break
+whatever its size (master's own triage still calls it broken, and a PR still sees
+it as broken on master). A flaky run keeps the error of its failed try, so
+master retrying past this same error counts as failing the same way. On mobile main, 201 of the 244 tests that
+failed from 15 to 28 October failed only in 3 such runs, and each of those counted
+as that test's flakiness.
+
+**Failed everywhere is not cleared by a guess:** a test that failed every try here
+(at least two) and failed on another platform of the same commit (iOS and Android,
+Linux and Windows, or the enterprise and FIPS lanes) is never cleared by the model
+or a same-failure match; the model may still name the PR. A flake rarely fails
+every try on two platforms, and a change to shared code does. A rules clear stands
+only where master or 3+ other PRs failed it the same way: that is their flake (a
+desktop test master fails on two OSes). One that rests on nothing comparable (a
+bare timeout) is held as `REGRESSION`, needs investigation. A break on master, an
+environment error, and a spec the PR edits keep their own calls. Each condition
+alone changes nothing: a test failing every try on one platform is often its
+environment.
 
 **Fixed on master:** master failed the test the same way in at least 3 runs in a
 row and has passed since. That is a break master fixed, not a flake: a branch
@@ -227,8 +258,9 @@ model fails or is unavailable, the rules' outcome stands.
   failed try counts, even one a retry recovered (TSIO's `flaky`), and the
   wording says which: "Also failed on windows", "Also failed once on windows
   in this run (passed on retry)", or both for a mixed run. A pass does not
-  count. This
-  changes no class or blocking, and needs no model. The other platforms come
+  count. The
+  line and the count need no model; a test that failed every try here and failed
+  on another platform may be held (see "Failed everywhere is not cleared by a guess"). The other platforms come
   from two places, and only for a run with failed tests: a desktop run's other
   OS reports, which sit in the same TSIO group (a report's name names its OS, as
   `e2e-on-ubuntu-latest` is linux), and a mobile run's sibling groups (one TSIO

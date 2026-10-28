@@ -6,10 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { canChange, decide, judge, unblocks } from "./decision.ts";
-import { EXONERATED_ON_TRUNK, classify, classifyNotRun, errorSignature, infraVerdict, isInfraError, isShardPlaceholder, markEarlierFailures, sameFailure } from "./classify.ts";
+import { EXONERATED_ON_TRUNK, classify, classifyNotRun, errorSignature, holdFailedEverywhere, infraVerdict, isInfraError, isShardPlaceholder, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, laneOfReport, repoPath } from "./config.ts";
 import { answerKey, askModelBatch, packKey, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
-import { OUT_OF_DATE_DIR_CAP, fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markFixedOnTrunk, markOutOfDate, trunkRunsOn } from "./history.ts";
+import { OUT_OF_DATE_DIR_CAP, dropStormRuns, fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markFixedOnTrunk, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { commonSenseClear, onlyOnPlatform, platformOf } from "./common-sense.ts";
 import { codeExcerpt, enrichFindings, failingLine, prChangedSince, sameTestOnOtherReports, siblingPlatforms } from "./enrich.ts";
 import { evidenceFor, loadEvidence } from "./evidence.ts";
@@ -176,7 +176,16 @@ test("trunk's instability clears a PR's failure only when trunk failed the same 
   assert.equal(newWay.blocking, true);
   assert.match(newWay.reason, /never with this error; there it failed with "Error: apiCreateChannel failed/);
   assert.equal(classify(pr, [...trunkPasses(8), same, other], []).class, "FLAKY_ON_TRUNK", "it failed this way on trunk too");
-  assert.equal(classify(pr, [...trunkPasses(8), obs({ status: "failed", commit_sha: "u1" }), other], []).class, "FLAKY_ON_TRUNK", "an unknown trunk error can't rule this one out");
+  assert.equal(classify(pr, [...trunkPasses(8), obs({ status: "failed", commit_sha: "u1" }), other], []).class, "REGRESSION", "a trunk failure with no error to compare can't clear it either");
+  const noError = classify(pr, [...trunkPasses(8), obs({ status: "failed", commit_sha: "u1" })], []);
+  assert.equal(noError.class, "REGRESSION");
+  assert.match(noError.reason, /never with this error; there it left no error to compare\.$/);
+  // mobile #10048: trunk's only failure of the test was a hook timeout in a storm run, and the PR broke it another way.
+  const hook = obs({ status: "failed", commit_sha: "h1", error_excerpt: 'Error: thrown: "Exceeded timeout of 300000 ms for a hook.' });
+  assert.match(classify({ ...failing, error: "Test Failed: 'not null' doesn't match the selected view." }, [...trunkPasses(24), hook], []).reason, /never with this error; there it failed with "Error: thrown: "Exceeded timeout of 300000 ms for a hook\./);
+  // A timeout compares by where it got stuck: another duration is the same step.
+  const stuck = (ms: number): string => `Error: locator.click: Timeout ${ms}ms exceeded.\nCall log:\n  - waiting for getByRole('button', { name: 'Save' })`;
+  assert.equal(classify({ ...failing, error: stuck(15000) }, [...trunkPasses(8), obs({ status: "flaky", commit_sha: "f1", error_excerpt: stuck(30000) })], []).class, "FLAKY_ON_TRUNK");
   assert.equal(classify({ ...failing, error: "Error: timeout" }, [...trunkPasses(8), other], []).class, "FLAKY_ON_TRUNK", "a generic error can't be compared");
   // Broken on trunk: the current streak's error decides.
   assert.equal(classify(pr, [other, ...trunkPasses(6)], []).class, "REGRESSION");
@@ -186,7 +195,7 @@ test("failing every try here does not change the flake verdict: an environment t
   // Replayed on real runs, holding these red added 37 false reds in environment storms and none caught a PR.
   const error = 'Error: expect(locator).toHaveText(expected) failed: expected "Channel header" but received "Set a header"';
   const everyTry: TestRef = { ...failing, error, tries: { ran: 2, failed: 2 } };
-  const flakeOnly = obs({ status: "flaky", commit_sha: "z1" });
+  const flakeOnly = obs({ status: "flaky", commit_sha: "z1", error_excerpt: error });
   assert.equal(classify(everyTry, [flakeOnly, ...trunkPasses(8)], []).class, "FLAKY_ON_TRUNK");
   assert.equal(classify(everyTry, [flakeOnly, ...trunkPasses(8)], [], undefined, null, null, { isTrunkRun: true }).class, "FLAKY_ON_TRUNK");
 });
@@ -3728,6 +3737,9 @@ test("shard placeholders are told from tests: no name, the desktop shard stub, a
   assert.ok(isShardPlaceholder({ file: "specs/a.spec.ts", title: "  ", error: "" }), "no test name");
   assert.equal(isShardPlaceholder({ file: "specs/a.spec.ts", title: "[x] CI shard failure", error: "Error: expected visible" }), false, "a real test with an error is a test");
   assert.equal(isShardPlaceholder({ ...MOBILE_STUB, error: "Error: expected visible" }), false, "the title alone is not enough");
+  // Mobile .github/scripts/write-tsio-failure-stub.mjs, for a job that died before its reporter wrote results.
+  assert.ok(isShardPlaceholder({ file: "ci/detox-android-2.stub", title: "CI infrastructure failure", error: "Detox job failed before writing test results" }));
+  assert.equal(isShardPlaceholder({ file: "specs/a.spec.ts", title: "CI infrastructure failure", error: "Error: expected visible" }), false, "a real spec with that title is a test");
   assert.equal(isShardPlaceholder(failing), false);
 });
 
@@ -4342,3 +4354,119 @@ test("end to end: the trunk-fixed failure on a stale branch reads fixed on main,
   assert.match(both, /^## E2E triage: 🔴 merge master and re-run: 1 fixed on master, 1 out of date$/m);
   assert.match(both, /^### Out of date \(2\): master changed these tests, or fixed these failures/m);
 });
+// ---------------------------------------------------------------- failing everywhere, storm runs
+
+test("failing every try here and on another platform of this commit is never cleared by the model", async () => {
+  // Master passes it, and one other PR failed it the same way: evidence the model may clear it by, short of the cross-PR rule.
+  const error = "Test Failed: 'not null' doesn't match the selected view.";
+  const run = runOf([{ title: "t1", file: "specs/a.spec.ts", error }]);
+  run.failing[0].tries = { ran: 2, failed: 2 };
+  const history = new Map([[identityKey(run.failing[0]), [...trunkPasses(8), obs({ gh_pr_number: 7, status: "failed", commit_sha: "p7", error_excerpt: error })]]]);
+  const flaky: Answer = { cause: "flaky_environment", confidence: 0.99, cited_evidence: ["cross_pr"], explanation: "x" };
+  const on = (result: string): Partial<EvaluateParams> => ({ history, ask: answering(() => flaky), otherPlatforms: async (fs) => { for (const f of fs) f.other_lanes = [{ platform: "detox-ios", result }]; } });
+  const passedOnIos = (await evaluate(run, on("passed"))).findings[0];
+  assert.deepEqual([passedOnIos.blocking, passedOnIos.decision], [false, "adjudicator_unblock"], "the model clears it when iOS passed");
+  const held = await evaluate(run, on("failed"));
+  const [f] = held.findings;
+  assert.deepEqual([f.class, f.blocking, f.failed_everywhere, f.decision, statusLabelOf(f)], ["REGRESSION", true, ["detox-ios"], "advice", "needs investigation"]);
+  assert.match(f.reason, /^Failed all 2 tries here and failed on detox-ios on this same commit; a flake rarely does that\. Fails here, passes on trunk/);
+  assert.equal(held.verdict, "FAILURE");
+  const text = renderSummary({ findings: held.findings, counts: { passed: 9, failed: 1 }, runURL: "u", trunkBranch: "main" });
+  assert.match(text, /\| Failed every try here and on detox-ios on this same commit; a flake rarely does that\. \| Read the error before re-running\. \|/);
+  assert.match(text, /99% sure, but a failure on every try and on another platform is not cleared\./);
+  assert.equal(sameFailure([f, { ...finding({ title: "t2", file: "specs/a.spec.ts", error, failure_signatures: [errorSignature(error) ?? ""] }), class: "FLAKY_ON_TRUNK", blocking: false }])[0].blocking, true, "a cleared test with the same error doesn't clear it");
+  // Each condition alone is not enough: a retry that passed elsewhere, a try that passed here, a single try.
+  for (const [why, result, tries] of [
+    ["passed on retry on iOS", "flaky", { ran: 2, failed: 2 }],
+    ["one try passed here", "failed", { ran: 2, failed: 1 }],
+    ["one try only", "failed", { ran: 1, failed: 1 }],
+  ] as const) {
+    run.failing[0].tries = { ...tries };
+    assert.equal((await evaluate(run, on(result))).findings[0].blocking, false, why);
+  }
+});
+
+test("a rules clear of a failure everywhere is undone only where nothing failed the same way", async () => {
+  const bare = 'Error: thrown: "Exceeded timeout of 300000 ms for a hook.';
+  // Desktop #4042: master fails the test the same way on two OSes; its failure everywhere is master's flake.
+  const sameWay = "Error: Timed out waiting for selector \".DesktopAuthToken\" to be visible";
+  const everywhere = (error: string, trunk: Observation[]): Finding => holdFailedEverywhere([{ ...classify({ ...failing, error, tries: { ran: 2, failed: 2 } }, trunk, []), other_lanes: [{ platform: "macos", result: "failed" }] }])[0];
+  const flake = (error: string): Observation[] => [...trunkPasses(8), obs({ status: "failed", commit_sha: "f1", error_excerpt: error })];
+  const held = everywhere(bare, flake(bare));
+  assert.deepEqual([held.class, held.blocking, held.failed_everywhere], ["REGRESSION", true, ["macos"]], "a bare timeout matches nothing");
+  const master = everywhere(sameWay, flake(sameWay));
+  assert.deepEqual([master.class, master.blocking, master.failed_everywhere], ["FLAKY_ON_TRUNK", false, undefined]);
+  // A break on trunk and the PR's own spec keep their calls.
+  assert.equal(everywhere(sameWay, [obs({ status: "failed", error_excerpt: sameWay }), ...trunkPasses(6)]).class, "BROKEN_ON_TRUNK");
+  assert.equal(holdFailedEverywhere([finding({ class: "OWNED_BY_PR", blocking: true, tries: { ran: 2, failed: 2 }, other_lanes: [{ platform: "ios", result: "failed" }] })])[0].failed_everywhere, undefined);
+});
+
+test("a Mattermost id joined to a selector does not make master's failure another one", () => {
+  // mattermost #39376 fips: master failed MM-T1486_3 the same way 23 times, each with its own post id.
+  const at = (id: string): string => `AssertionError: Timed out retrying after 30000ms: Expected to find element: \`#CENTER_actions_button_${id}\`, but never found it.`;
+  // Each failure between two passes: a flake, not a streak trunk fixed.
+  const trunk = Array.from({ length: 4 }, (_, i) => [obs({ commit_sha: `p${i}` }), obs({ status: "failed", commit_sha: `m${i}`, error_excerpt: at(`${"k".repeat(25)}${i}`) })]).flat();
+  assert.equal(classify({ ...failing, error: at("p".repeat(20) + "abc123") }, [...trunk, obs({ commit_sha: "first" })], []).class, "FLAKY_ON_TRUNK");
+});
+
+test("a storm's failures are left out of history; a pass, this PR's runs and trunk's current streak are kept", async () => {
+  const day = (d: number): string => `2026-09-${String(d).padStart(2, "0")}T00:00:00Z`;
+  const rows = [
+    obs({ group_id: "own", status: "failed", created_at: day(21) }),
+    obs({ group_id: "streak", status: "failed", created_at: day(20) }),
+    obs({ group_id: "green", status: "passed", created_at: day(19) }),
+    obs({ group_id: "storm", status: "failed", created_at: day(18) }),
+    obs({ group_id: "calm", status: "failed", created_at: day(17) }),
+    obs({ group_id: "wide", status: "failed", created_at: day(16) }),
+    obs({ group_id: "gone", status: "flaky", created_at: day(15) }),
+    obs({ status: "failed", created_at: day(14) }),
+  ];
+  const history = new Map([["k", rows]]);
+  const asked: string[] = [];
+  // TSIO sums a run over its reports: "wide" is 40 failures of 2000 (every OS and retest), not a storm.
+  const stats: Record<string, { total: number; failed: number }> = { storm: { total: 650, failed: 134 }, calm: { total: 650, failed: 2 }, wide: { total: 2000, failed: 40 } };
+  const fetchImpl: FetchImpl = async (url) => {
+    const id = url.split("/reports/")[1];
+    asked.push(id);
+    return stats[id] ? Response.json({ test_stats: stats[id] }) : new Response("down", { status: 503 });
+  };
+  const logs: string[] = [];
+  const dropped = await dropStormRuns({ history, fetchImpl, base: "http://tsio", minFailures: 30, trunkBranch: "master", own: "own", log: (m) => logs.push(m) });
+  assert.deepEqual(asked, ["storm", "calm", "wide", "gone"], "newest first; never this run, trunk's current streak, or a pass");
+  assert.deepEqual([...dropped].sort(), ["gone", "storm"]);
+  assert.deepEqual(history.get("k")?.map((o) => o.group_id ?? null), ["own", "streak", "green", "calm", "wide", null]);
+  assert.deepEqual(logs, ["history: left out the failures of 1 storm run(s) and of 1 that could not be read"]);
+  // A pass in a storm is kept, and so is every row of this PR's own runs: they never clear its failure.
+  const mixed = new Map([["k", [obs({ group_id: "storm", status: "passed" }), obs({ group_id: "storm", status: "failed", gh_pr_number: "5" }), obs({ group_id: "storm", status: "failed", gh_pr_number: 9 })]]]);
+  await dropStormRuns({ history: mixed, fetchImpl, base: "http://tsio", minFailures: 30, trunkBranch: "master", pr: 5 });
+  assert.deepEqual(mixed.get("k")?.map((o) => [o.status, o.gh_pr_number ?? null]), [["passed", null], ["failed", "5"]]);
+  // Nothing failed, nothing read.
+  const quiet = new Map([["k", [obs({ group_id: "green", status: "passed" })]]]);
+  assert.equal((await dropStormRuns({ history: quiet, fetchImpl: async () => { throw new Error("no read expected"); }, base: "http://tsio", minFailures: 30 })).size, 0);
+  // A read past the deadline is not awaited, and its run is left out as unread.
+  const slow = new Map([["k", [obs({ group_id: "green", status: "passed" }), obs({ group_id: "hung", status: "failed" })]]]);
+  const hung = await dropStormRuns({ history: slow, fetchImpl: () => new Promise<Response>(() => {}), base: "http://tsio", minFailures: 30, trunkBranch: "master", deadlineMs: 20 });
+  assert.deepEqual([...hung], ["hung"]);
+});
+
+test("master's own triage keeps a storm-sized break as a streak: a commit that breaks 35 tests is never flaky on the next run", async () => {
+  // Run N broke 35 tests on master and is a storm; run N+1 fails the same test. Older runs had one flaky pass.
+  const history = new Map([["k", [obs({ group_id: "n", status: "failed", created_at: "2026-09-20T00:00:00Z" }), ...trunkPasses(6), obs({ group_id: "old", status: "flaky", commit_sha: "o1" })]]]);
+  await dropStormRuns({ history, fetchImpl: async () => Response.json({ test_stats: { total: 650, failed: 35 } }), base: "http://tsio", minFailures: 30, trunkBranch: "master" });
+  assert.deepEqual(history.get("k")?.map((o) => o.group_id ?? null), ["n", null, null, null, null, null, null, "old"], "the streak is kept; nothing else failed");
+  const f = classify(failing, history.get("k") ?? [], [], undefined, null, null, { isTrunkRun: true, trunkBranch: "master" });
+  assert.deepEqual([f.class, f.blocking], ["BROKEN_ON_TRUNK", true]);
+});
+
+test("a flaky run in history keeps the error of its failed try, which trunk's comparison reads", async () => {
+  const error = "Error: expect(locator).toHaveText(expected) failed: expected \"Channel header\"";
+  const fetchImpl = fakeFetch([["/reports/history", () => Response.json({ observations: [
+    obs({ group_id: "g1", retry_count: 0, status: "failed", error_excerpt: error }),
+    obs({ group_id: "g1", retry_count: 1, status: "passed", error_excerpt: null }),
+  ], has_more: false })]]);
+  const history = await fetchHistory(fetchImpl, "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, "master");
+  const [row] = history.get(identityKey(failing)) ?? [];
+  assert.deepEqual([row.status, row.error_excerpt], ["flaky", error]);
+  assert.equal(classify({ ...failing, error }, [...trunkPasses(8), row], []).class, "FLAKY_ON_TRUNK", "master retried past this same error");
+});
+

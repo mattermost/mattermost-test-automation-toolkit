@@ -2,7 +2,7 @@
 // See LICENSE.txt for license information.
 
 import type { FetchImpl, GhApi } from "../../shared/src/github.ts";
-import { FAILED_STATUSES, identityKey, outcomeOf, outcomeWithDuplicates } from "../../shared/src/tsio.ts";
+import { FAILED_STATUSES, identityKey, isFailedTry, outcomeOf, outcomeWithDuplicates, tsioJson } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
 import { CHANGED_FILES_MAX_PAGES, COMPARE_FILE_CAP, DEFAULTS, HISTORY_MAX_FILES, HISTORY_MAX_PAGES, HISTORY_PER_PAGE, laneOf } from "./config.ts";
 import type { BrokeBy, ChangedFile, Config, Finding, Observation, OutOfDate, SpecHistory, SpecRun, TestRef } from "./types.ts";
@@ -216,8 +216,10 @@ export async function fetchHistory(
     for (const attempts of runs.values()) {
       attempts.sort((a, b) => a.retry_count - b.retry_count);
       const { status, last } = outcomeOf(attempts);
-      // Every run in `runs` has at least one attempt, so the outcome always has a last one.
-      collapsed.push({ ...last!, status });
+      // Every run in `runs` has at least one attempt, so the outcome always has a last one. A flaky run's last attempt is
+      // its pass: it keeps the error of its last failed try, which is what the rules compare.
+      const failedTry = status === "flaky" ? attempts.filter((a) => FAILED_STATUSES.has(a.status)).at(-1) : undefined;
+      collapsed.push({ ...last!, status, ...(failedTry?.error_excerpt ? { error_excerpt: failedTry.error_excerpt } : {}) });
     }
     byTest.set(key, collapsed);
   }
@@ -265,6 +267,92 @@ export interface ChangedFiles {
  * is complete. An incomplete list looks like "touched nothing", so callers clear
  * nothing unless ok is true.
  */
+/** The most past runs dropStormRuns reads, how many at once, and how long all its reads may take. */
+export const STORM_READS = 100;
+const STORM_READ_BATCH = 10;
+export const STORM_DEADLINE_MS = 30_000;
+
+/**
+ * Leaves out of history the failed tries of past storm runs: at least `minFailures` tests failed, and at least a tenth of
+ * the run's tests (TSIO sums a run over all its reports: every OS of a desktop run, and retests). A storm failed on its
+ * environment or a shared break, and its failures say nothing about one test; counted as trunk's instability or another
+ * PR's same failure, they would clear a PR's real failure. Kept: a pass in a storm, this PR's own runs (`pr`), and each
+ * test's current failing streak on trunk (its latest trunk runs, while each failed a try), which is a standing break
+ * whatever its size. Only other runs with a failed try are read, newest first, once each, the current run's own group
+ * (`own`) aside. A run that can't be read, past STORM_READS or the deadline, is treated as a storm, so an unread storm
+ * clears nothing. Returns the groups whose failures were left out.
+ */
+export async function dropStormRuns({
+  history,
+  fetchImpl,
+  base,
+  minFailures,
+  trunkBranch = null,
+  own = null,
+  pr = null,
+  log = () => {},
+  deadlineMs = STORM_DEADLINE_MS,
+}: {
+  history: Map<string, Observation[]>;
+  fetchImpl: FetchImpl;
+  base: string;
+  minFailures: number;
+  trunkBranch?: string | null;
+  own?: string | number | null;
+  pr?: number | string | null;
+  log?: (message: string) => void;
+  deadlineMs?: number;
+}): Promise<Set<string>> {
+  // Compare PR numbers as numbers: identities built with jq carry them as strings.
+  const prOf = (o: Observation): number | null => (o.gh_pr_number == null || o.gh_pr_number === "" ? null : Number(o.gh_pr_number));
+  const isOwn = (o: Observation): boolean => o.group_id != null && String(o.group_id) === String(own);
+  const isTrunk = (o: Observation): boolean => prOf(o) == null && (trunkBranch == null || o.branch === trunkBranch);
+  // Rows are newest first (see fetchHistory): each test's trunk rows from the latest, while they failed a try.
+  const streak = new Set<Observation>();
+  for (const rows of history.values()) {
+    for (const o of rows) {
+      if (isOwn(o) || !isTrunk(o)) continue;
+      if (!isFailedTry(o.status)) break;
+      streak.add(o);
+    }
+  }
+  const counted = (o: Observation): boolean => o.group_id != null && !isOwn(o) && isFailedTry(o.status) && !streak.has(o) && (pr == null || prOf(o) !== Number(pr));
+  const newest = new Map<string, number>();
+  for (const rows of history.values())
+    for (const o of rows)
+      if (counted(o)) newest.set(String(o.group_id), Math.max(newest.get(String(o.group_id)) ?? 0, Date.parse(o.created_at ?? "") || 0));
+  const list = [...newest.keys()].sort((a, b) => newest.get(b)! - newest.get(a)!);
+  const storms = new Set<string>();
+  const quiet = new Set<string>();
+  const deadline = Date.now() + deadlineMs;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, deadlineMs);
+  });
+  try {
+    for (let i = 0; i < Math.min(list.length, STORM_READS) && Date.now() < deadline; i += STORM_READ_BATCH) {
+      const batch = list.slice(i, Math.min(i + STORM_READ_BATCH, STORM_READS)).map(async (g) => {
+        try {
+          const { test_stats: t } = await tsioJson<{ test_stats?: { total?: number; failed?: number } | null }>(fetchImpl, base, `/reports/${encodeURIComponent(g)}`);
+          const failed = t?.failed ?? 0;
+          (failed >= minFailures && failed * 10 >= (t?.total ?? 0) ? storms : quiet).add(g);
+        } catch {
+          // Unread: left out below with the storms.
+        }
+      });
+      await Promise.race([Promise.all(batch), late]);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+  const dropped = new Set(list.filter((g) => !quiet.has(g)));
+  if (!dropped.size) return dropped;
+  for (const [key, rows] of history) history.set(key, rows.filter((o) => !counted(o) || !dropped.has(String(o.group_id))));
+  const unread = dropped.size - [...dropped].filter((g) => storms.has(g)).length;
+  log(`history: left out the failures of ${dropped.size - unread} storm run(s)${unread ? ` and of ${unread} that could not be read` : ""}`);
+  return dropped;
+}
+
 export async function fetchChangedFiles(api: GhApi, id: CompositeIdentity, prNumber: number | null, log: (message: string) => void = () => {}): Promise<ChangedFiles> {
   try {
     if (prNumber) {

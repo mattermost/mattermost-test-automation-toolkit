@@ -163,7 +163,9 @@ export async function judge(
         continue;
       }
       const d = decide(m.f.class, answer, m.pack, cfg, isTrunkRun, false);
-      Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
+      // A failure held as failing everywhere (see holdFailedEverywhere) may be blamed on the PR, never cleared.
+      if (m.f.failed_everywhere && !d.blocking) Object.assign(m.f, { decision: "advice", judge: d.answer });
+      else Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
     }
   };
   // One model call, made only when its worst case fits what is left of the budget.

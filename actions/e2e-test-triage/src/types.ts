@@ -107,6 +107,8 @@ export interface Finding extends TestRef {
   since_last_pass?: SinceLastPass;
   code_near_failure?: string | null;
   other_lanes?: { platform: string; result: string }[];
+  /** The other platforms of this commit where it also failed, after failing every try here (see holdFailedEverywhere). */
+  failed_everywhere?: string[];
   /** The earliest test of the same spec that failed before this one in this run, with another error (see markEarlierFailures). */
   earlier_failure?: EarlierFailure;
   decision?: string;

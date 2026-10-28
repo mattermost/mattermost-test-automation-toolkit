@@ -563,6 +563,7 @@ function isShardPlaceholder(t) {
   const error = String(t.error ?? "").trim();
   if (!title) return true;
   if (/^\[[^\]]*\] CI shard failure$/.test(title) && (!error || /(?:^|\/)tsio-shard-failure\.ts$/.test(String(t.file ?? "")))) return true;
+  if (title === "CI infrastructure failure" && /^ci\/[^/]+\.stub$/.test(String(t.file ?? ""))) return true;
   return isSpecNotRun(t);
 }
 function isSpecNotRun(t) {
@@ -718,9 +719,11 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
     });
   const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
   if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0 && laplace >= cfg.pMin && latestTrunk?.status !== "failed") {
-    const trunkError = otherError(trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky"));
-    if (trunkError)
-      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; there it failed with "${trunkError.slice(0, 160)}".`, true);
+    const unstable = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
+    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !unstable.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
+      const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
+      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
+    }
     return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the last ${trunk.length} trunk runs.`, false);
   }
   if (failedPRs.length >= cfg.crossPRMinPRs && trunkFails === 0 && trunkPasses > 0)
@@ -771,6 +774,7 @@ function stuckStep(lines) {
   if (!action && !target) return null;
   return [action ? `action ${action}` : null, target].filter(Boolean).join(" ").replace(/\b(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{6,}\b/gi, "<id>").replace(/\b\d{4,}\b/g, "<n>").replace(/\b\d+(?:\.\d+)?\s*sec\b/gi, "<n>sec").replace(/\s+/g, " ").trim();
 }
+var maskIds = (error) => String(error ?? "").replace(/(?<![a-z0-9])[a-z0-9]{26}(?![a-z0-9])/g, "<id>");
 function sameFirstLine(a, b) {
   const ka = failureKey(a);
   const kb = failureKey(b);
@@ -809,7 +813,7 @@ function sameFailure(findings) {
     if (!anchors.has(k)) anchors.set(k, f);
   }
   for (const f of findings) {
-    if (!f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.decision === "evidence_incomplete" || blamed(f)) continue;
+    if (!f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.decision === "evidence_incomplete" || f.failed_everywhere || blamed(f)) continue;
     const k = keyOf(f);
     const anchor = k ? anchors.get(k) : void 0;
     if (!anchor) continue;
@@ -820,6 +824,23 @@ function sameFailure(findings) {
       same_as: anchor.full_title || anchor.title,
       same_as_class: anchor.class,
       reason: `Fails with the same error as "${anchor.title}" in this spec, which history cleared (${anchor.class}): ${anchor.reason}`
+    });
+  }
+  return findings;
+}
+function holdFailedEverywhere(findings) {
+  const flaky = /* @__PURE__ */ new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
+  for (const f of findings) {
+    if (!(BORDERLINE.has(f.class) || flaky.has(f.class)) || f.identity_unresolved || f.out_of_date || !f.tries || f.tries.ran < 2 || f.tries.failed !== f.tries.ran) continue;
+    const kind = failureKey(f.error).kind;
+    if (flaky.has(f.class) && (kind === "distinctive" || kind === "stuck")) continue;
+    const on = [...new Set((f.other_lanes ?? []).filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform))];
+    if (!on.length) continue;
+    Object.assign(f, {
+      ...f.blocking ? {} : { class: "REGRESSION" },
+      blocking: true,
+      failed_everywhere: on,
+      reason: `Failed all ${f.tries.ran} tries here and failed on ${on.join(" and ")} on this same commit; a flake rarely does that. ${f.reason}`
     });
   }
   return findings;
@@ -1127,7 +1148,8 @@ ${o.title}`;
     for (const attempts of runs.values()) {
       attempts.sort((a, b) => a.retry_count - b.retry_count);
       const { status, last } = outcomeOf(attempts);
-      collapsed.push({ ...last, status });
+      const failedTry = status === "flaky" ? attempts.filter((a) => FAILED_STATUSES.has(a.status)).at(-1) : void 0;
+      collapsed.push({ ...last, status, ...failedTry?.error_excerpt ? { error_excerpt: failedTry.error_excerpt } : {} });
     }
     byTest.set(key, collapsed);
   }
@@ -1156,6 +1178,67 @@ function trunkRunsOn(history, branch) {
     most = Math.max(most, runs);
   }
   return most;
+}
+var STORM_READS = 100;
+var STORM_READ_BATCH = 10;
+var STORM_DEADLINE_MS = 3e4;
+async function dropStormRuns({
+  history,
+  fetchImpl,
+  base,
+  minFailures,
+  trunkBranch = null,
+  own = null,
+  pr = null,
+  log = () => {
+  },
+  deadlineMs = STORM_DEADLINE_MS
+}) {
+  const prOf = (o) => o.gh_pr_number == null || o.gh_pr_number === "" ? null : Number(o.gh_pr_number);
+  const isOwn = (o) => o.group_id != null && String(o.group_id) === String(own);
+  const isTrunk = (o) => prOf(o) == null && (trunkBranch == null || o.branch === trunkBranch);
+  const streak = /* @__PURE__ */ new Set();
+  for (const rows of history.values()) {
+    for (const o of rows) {
+      if (isOwn(o) || !isTrunk(o)) continue;
+      if (!isFailedTry(o.status)) break;
+      streak.add(o);
+    }
+  }
+  const counted = (o) => o.group_id != null && !isOwn(o) && isFailedTry(o.status) && !streak.has(o) && (pr == null || prOf(o) !== Number(pr));
+  const newest = /* @__PURE__ */ new Map();
+  for (const rows of history.values())
+    for (const o of rows)
+      if (counted(o)) newest.set(String(o.group_id), Math.max(newest.get(String(o.group_id)) ?? 0, Date.parse(o.created_at ?? "") || 0));
+  const list = [...newest.keys()].sort((a, b) => newest.get(b) - newest.get(a));
+  const storms = /* @__PURE__ */ new Set();
+  const quiet = /* @__PURE__ */ new Set();
+  const deadline = Date.now() + deadlineMs;
+  let timer;
+  const late = new Promise((resolve2) => {
+    timer = setTimeout(resolve2, deadlineMs);
+  });
+  try {
+    for (let i = 0; i < Math.min(list.length, STORM_READS) && Date.now() < deadline; i += STORM_READ_BATCH) {
+      const batch = list.slice(i, Math.min(i + STORM_READ_BATCH, STORM_READS)).map(async (g) => {
+        try {
+          const { test_stats: t } = await tsioJson(fetchImpl, base, `/reports/${encodeURIComponent(g)}`);
+          const failed = t?.failed ?? 0;
+          (failed >= minFailures && failed * 10 >= (t?.total ?? 0) ? storms : quiet).add(g);
+        } catch {
+        }
+      });
+      await Promise.race([Promise.all(batch), late]);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+  const dropped = new Set(list.filter((g) => !quiet.has(g)));
+  if (!dropped.size) return dropped;
+  for (const [key, rows] of history) history.set(key, rows.filter((o) => !counted(o) || !dropped.has(String(o.group_id))));
+  const unread = dropped.size - [...dropped].filter((g) => storms.has(g)).length;
+  log(`history: left out the failures of ${dropped.size - unread} storm run(s)${unread ? ` and of ${unread} that could not be read` : ""}`);
+  return dropped;
 }
 async function fetchChangedFiles(api, id, prNumber, log = () => {
 }) {
@@ -1924,7 +2007,8 @@ async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
         continue;
       }
       const d = decide(m.f.class, answer, m.pack, cfg, isTrunkRun, false);
-      Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
+      if (m.f.failed_everywhere && !d.blocking) Object.assign(m.f, { decision: "advice", judge: d.answer });
+      else Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
     }
   };
   const call = async (model, fresh, retryMissing) => {
@@ -2089,6 +2173,7 @@ async function evaluateRun({
         log(`other platforms unavailable: ${String(e).slice(0, 200)}`);
       }
     }
+    holdFailedEverywhere(result.findings);
     if (!blind && prNumber && outOfDate) {
       const candidates = result.findings.filter((f) => f.blocking && BORDERLINE.has(f.class) && !f.identity_unresolved && f.repo_path);
       const unchecked = (list, because) => {
@@ -2420,6 +2505,7 @@ function whyNext(f, branch, pr) {
     }
     case "check":
       if (f.decision === "evidence_incomplete" || f.identity_unresolved) return ["Its history could not be checked.", "Read the error, or re-run if it isn't your change."];
+      if (f.failed_everywhere) return [`Failed every try here and on ${f.failed_everywhere.join(" and ")} on this same commit; a flake rarely does that.`, "Read the error before re-running."];
       if (a?.cause === "caused_by_pr") return [`Might be this PR's change (${ai}), but not sure enough to say.`, "Read the error before re-running."];
       if (a) return [`Looks ${LIKELY[a.cause] ?? a.cause} (${ai}), but not sure enough to clear.`, "Read the error before re-running."];
       if (f.class === "INFRA_ERROR") return ["Failed on its environment (see the error), which this change could also have caused.", "Re-run; if it fails the same way again, check your change."];
@@ -2492,7 +2578,7 @@ function factsTable(f, branch, pr) {
   if (a) {
     const verdict = a.cause === "caused_by_pr" ? "Caused by this PR" : `Not caused by this PR (${LIKELY[a.cause] ?? a.cause})`;
     const blames = a.cause === "caused_by_pr";
-    const sure = f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame" ? `${pct(a.confidence)} sure, enough to decide` : blames ? `${pct(a.confidence)} sure; naming the PR needs 85% and a change it can point to` : f.decision === "advice" ? `${pct(a.confidence)} sure, but with nothing it could point to, so it can't clear` : `${pct(a.confidence)} sure; clearing needs 85% and evidence`;
+    const sure = f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame" ? `${pct(a.confidence)} sure, enough to decide` : blames ? `${pct(a.confidence)} sure; naming the PR needs 85% and a change it can point to` : f.decision === "advice" ? `${pct(a.confidence)} sure, but ${f.failed_everywhere ? "a failure on every try and on another platform is not cleared" : "with nothing it could point to, so it can't clear"}` : `${pct(a.confidence)} sure; clearing needs 85% and evidence`;
     const model = shortModel(a.provenance?.served_model ?? f.ai?.model);
     rows.push([model ? `AI (${model})` : "AI", `${verdict}, ${sure}. ${a.explanation}`]);
   }
@@ -2563,7 +2649,8 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
     for (const f of list) {
       const [why, next] = whyNext(f, branch, pr);
       const blamesPR = bucketOf(f) === "yours" || bucketOf(f) === "outdated";
-      lines.push(`| ${md(f.title)} \xB7 \`${mdCode(fileOf(f))}\` | ${md(why + alsoFailed(f, blamesPR ? PLAIN : SHARED_CAUSE))} | ${md(next)} |`);
+      const also = f.failed_everywhere ? "" : alsoFailed(f, blamesPR ? PLAIN : SHARED_CAUSE);
+      lines.push(`| ${md(f.title)} \xB7 \`${mdCode(fileOf(f))}\` | ${md(why + also)} | ${md(next)} |`);
     }
     lines.push("");
   };
@@ -2805,6 +2892,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
           history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, reportName, log, historyLane(id, cfg));
         }
       }
+      await dropStormRuns({ history, fetchImpl, base, minFailures: cfg.infraMinFailures, trunkBranch, own: run.group_id, pr: prNumber, log });
     } else if (run.failing.some(isSpecStopped)) {
       diff = await fetchChangedFiles(api, id, prNumber, log);
     }
