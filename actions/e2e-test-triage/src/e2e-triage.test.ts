@@ -3901,6 +3901,10 @@ test("a lane whose only failures are specs a stopped Jest process skipped is gre
   const counts = { total: 634, passed: 615, failed: 1, flaky: 0, skipped: 17 };
   const result = await evaluate({ ...runOf([STOPPED]), counts }, { specHistory: { byFile: new Map([[STOPPED.file, history]]), truncated: false } });
   assert.equal(result.verdict, "SUCCESS");
+  // On a release branch the same spec stays red: that build never ran it, and spec history is not the branch's own.
+  const release = await evaluate({ ...runOf([STOPPED]), counts }, { prNumber: null, branchBase: "main", specHistory: { byFile: new Map([[STOPPED.file, history]]), truncated: false } });
+  assert.deepEqual([release.verdict, release.findings[0].class, release.findings[0].blocking], ["FAILURE", "NOT_RUN", true]);
+  assert.match(release.findings[0].reason, /On a release branch that does not clear it: this build never ran the spec\.$/);
   assert.equal(result.unnamed, undefined, "not a placeholder to re-run");
   assert.equal(result.notRun, 1);
   assert.equal(statusDescription(result.verdict, result.findings, result.infra, result.counts, null, result.unnamed ?? 0, result.notRun ?? 0), "(1 flaky) 615 passed, 0 failed, 1 not run, 17 skipped");

@@ -145,7 +145,8 @@ fewer than 5 earlier runs of its own, history is read from the default branch;
 `history-lane` and `history-report` (a report-name prefix such as
 `e2e-on-ubuntu-latest` for `e2e-on-ubuntu-latest-11.11.3`) make its runs match.
 That history is another line of code: it is evidence, and never clears a failure on
-the release branch by itself.
+the release branch by itself. A spec a stopped Jest process skipped stays `NOT_RUN`
+there: the build never ran it.
 
 **Lanes the base branch rarely runs:** history is read per lane. A lane master
 runs only sometimes (mattermost's subpath suite) has too little history to call

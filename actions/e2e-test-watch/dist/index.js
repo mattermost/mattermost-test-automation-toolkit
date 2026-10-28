@@ -2534,6 +2534,10 @@ async function evaluateRun({
     }
     if (!blind && prNumber) sameFailure(result.findings);
   }
+  if (branchBase) {
+    for (const f of judgedNotRun)
+      if (!f.blocking) Object.assign(f, { class: "NOT_RUN", blocking: true, reason: `${f.reason} On a release branch that does not clear it: this build never ran the spec.` });
+  }
   result.findings.push(...judgedNotRun);
   result.verdict = verdictOf(result.findings, result.infra);
   result.missing = missingReports(run.missing);

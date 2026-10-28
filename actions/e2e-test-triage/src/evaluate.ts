@@ -238,6 +238,11 @@ export async function evaluateRun({
     }
     if (!blind && prNumber) sameFailure(result.findings);
   }
+  // A release branch's spec that never ran is untested in that build: other runs' skips and passes, which are not this
+  // branch's (spec history has no branch), do not clear it.
+  if (branchBase)
+    for (const f of judgedNotRun)
+      if (!f.blocking) Object.assign(f, { class: "NOT_RUN", blocking: true, reason: `${f.reason} On a release branch that does not clear it: this build never ran the spec.` });
   result.findings.push(...judgedNotRun);
   result.verdict = verdictOf(result.findings, result.infra);
   // Specs that never ran can't be vouched for, whatever happened to the rest.
