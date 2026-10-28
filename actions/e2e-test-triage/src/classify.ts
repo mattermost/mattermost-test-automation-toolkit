@@ -253,8 +253,9 @@ export function classify(
     return k.kind === "distinctive" || k.kind === "stuck" ? `${k.kind}:${maskIds(k.key)}` : null;
   };
   const ownBreak = breakKey(test.error);
+  // A stuck step matches only at that step: the signature stops before the step a timeout names.
   const sameBreak = (excerpt: string | null | undefined): boolean =>
-    Boolean(excerpt) && (ownSignature ? errorSignature(excerpt) === ownSignature : ownBreak != null && breakKey(excerpt) === ownBreak);
+    Boolean(excerpt) && ownBreak != null && (ownKey.kind !== "stuck" && ownSignature ? errorSignature(excerpt) === ownSignature : breakKey(excerpt) === ownBreak);
   while (recent + broken < trunk.length && FAILED_STATUSES.has(trunk[recent + broken].status) && sameBreak(trunk[recent + broken].error_excerpt)) broken++;
   if (recent && broken >= FIXED_STREAK)
     return Object.assign(out("FIXED_ON_TRUNK", `${trunkBranch || "Trunk"} failed this test the same way in ${broken} runs in a row, then passed from ${trunk[recent - 1].commit_sha?.slice(0, 7) ?? "unknown"} on: trunk fixed it.`, true), {

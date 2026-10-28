@@ -4325,6 +4325,10 @@ test("a same-error streak on trunk that trunk has passed since is a fix there, n
   assert.equal(classify(ownError, fixedOnTrunkHistory("TypeError: Cannot read properties of undefined (reading 'id')"), [], undefined, 5).class, "FIXED_ON_TRUNK", "the same distinctive error");
   assert.notEqual(classify(ownError, fixedOnTrunkHistory("TypeError: Cannot read properties of null (reading 'name')"), [], undefined, 5).class, "FIXED_ON_TRUNK", "trunk's streak was another failure");
   not([trunkRun("f5", 28, "failed", stuck), ...fixedOnTrunkHistory()], "trunk fails it again now");
+  const click = (locator: string): string => `Error: locator.click: Timeout 15000ms exceeded.\nCall log:\n  - waiting for locator('${locator}')`;
+  const clickTest = { ...failing, error: click("#save") };
+  assert.equal(classify(clickTest, fixedOnTrunkHistory(click("#save")), [], undefined, 5).class, "FIXED_ON_TRUNK", "the same click timeout at the same step");
+  assert.notEqual(classify(clickTest, fixedOnTrunkHistory(click("#cancel")), [], undefined, 5).class, "FIXED_ON_TRUNK", "one timeout at another step");
 });
 
 test("a branch without trunk's fix is out of date; with it, the same failure goes to the judge", async () => {
