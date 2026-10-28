@@ -195,7 +195,6 @@ export const PACK_IMAGES = new WeakMap<Pack, EvidenceImage[]>();
 export const evidenceIds = (pack: Pack): string[] => [
   "test",
   "error",
-  "engine",
   "trunk_history_14d",
   ...(pack.cross_pr_failures_14d?.other_prs_where_this_test_failed?.length ? ["cross_pr"] : []),
   // A release run has no PR: its own facts take the PR's place.

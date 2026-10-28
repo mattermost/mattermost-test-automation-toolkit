@@ -49,7 +49,7 @@ Rules:
 - same_test_other_platforms_this_run (id other_platforms) is the same test in the same run on other platforms. It
   passing elsewhere points to a platform or environment cause rather than shared code, but alone it does not clear.
 - earlier_failure_same_spec (id earlier_failure_same_spec) is an earlier test in the same spec file that failed in this
-  run with a different error: its title, its error's first line and the engine's class for it. An earlier test that
+  run with a different error: its title, its error's first line and its class. An earlier test that
   failed on its environment (class INFRA_ERROR: a server or host it could not reach) explains later failures that depend
   on what it set up. It supports flaky_environment only when that class is INFRA_ERROR and this test passed on another
   platform in this run (other_platforms), never alone: a PR that breaks the server fails every platform. With both, and

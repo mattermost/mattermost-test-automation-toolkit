@@ -362,7 +362,7 @@ test("decision matrix: unblock needs confidence plus a checkable citation; unkno
   assert.equal(decide("REGRESSION", { ...ok, cited_evidence: ["error"] }, pack).blocking, true);
   assert.equal(decide("REGRESSION", { ...ok, cited_evidence: ["hunk_7"] }, pack).blocking, true);
   // "bug_on_master" no longer unblocks on its own; it still needs cross_pr or a hunk.
-  assert.equal(decide("REGRESSION", { ...ok, cause: "bug_on_master", cited_evidence: ["engine"] }, pack).blocking, true);
+  assert.equal(decide("REGRESSION", { ...ok, cause: "bug_on_master", cited_evidence: ["test"] }, pack).blocking, true);
   assert.equal(decide("FLAKY_CROSS_PR", { cause: "caused_by_pr", confidence: 0.95, cited_evidence: ["hunk_0"], explanation: "" }, pack).decision, "adjudicator_veto");
   assert.equal(decide("FLAKY_CROSS_PR", { cause: "caused_by_pr", confidence: 0.95, cited_evidence: ["error"], explanation: "" }, pack).blocking, false);
   assert.equal(decide("OWNED_BY_PR", ok, pack).blocking, true);
@@ -1469,7 +1469,7 @@ test("an answer just short of the threshold goes once to the escalation model", 
 test("an answer that blames the PR without citing a change goes to the escalation model", async () => {
   // mattermost-mobile#10172 replay: Haiku blamed "test setup and environment files" for a
   // Maestro flow the diff does not touch, cited no hunk, and so skipped escalation.
-  const ungrounded: Answer = { cause: "caused_by_pr", confidence: 0.72, cited_evidence: ["error", "engine"], explanation: "x" };
+  const ungrounded: Answer = { cause: "caused_by_pr", confidence: 0.72, cited_evidence: ["error", "test"], explanation: "x" };
   const run = async (second: Answer) => {
     const f = classify(failing, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1);
     const asked: string[] = [];
@@ -3324,7 +3324,7 @@ test("the answer-cache key ignores the other-platform evidence, and is the v6 ke
   // v6 for this pack: SYSTEM no longer says the rules' call is in the pack, so every v5 answer is a miss by design. A
   // cached v6 answer keeps this key, so no call is paid again.
   assert.match(answerKey("claude-sonnet-5-5", pack), /^v6:/);
-  assert.equal(answerKey("claude-sonnet-5-5", pack), "v6:adb245740554ae221807b38223b80148264806803bf2af92501acdda213e6c67");
+  assert.equal(answerKey("claude-sonnet-5-5", pack), "v6:f4004e2a0131d4c94eeb4d205c782200608d6db13657adf0f3b8662ffa7c69e9");
 });
 
 test("a sibling's same leaf title in another describe block is another test: no other-platform line", async () => {
