@@ -1066,7 +1066,7 @@ function statusLabelOf(f) {
     const cause = f.judge?.cause;
     if (cause === "bug_on_master") return "broken on main";
     if (f.release && cause === "test_bug") return "test bug";
-    if (cause === "server_compat") return "server compat";
+    if (f.release && cause === "server_compat") return "server compat";
     return "flaky";
   }
   return f.class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
@@ -1810,11 +1810,10 @@ function releasePack(finding, release, others, ctx = NO_CHANGE_CONTEXT) {
   const pack = buildPack(finding, [], { number: null, repository: release.repository, title: "", lane: release.lane }, others, ctx);
   const ood = finding.out_of_date && !finding.out_of_date.streak && !finding.out_of_date.fixed ? finding.out_of_date : null;
   const ref = (c) => `${c.pr ? `#${c.pr}` : c.sha.slice(0, 7)}${c.date ? ` (${c.date})` : ""}`;
-  return {
-    ...pack,
+  return Object.assign(pack, {
     release: { id: "release", branch: release.branch, base: release.base, history_branch: release.historyBranch, server: serverOf(finding.report_name) ?? serverOf(release.name) },
     ...ood ? { base_change: { id: "base_change", commits: [ood.commit, ...ood.also ?? []].filter((c) => Boolean(c)).map(ref), diff: ood.diff ?? null } } : {}
-  };
+  });
 }
 function thisPrHistory(f) {
   const since = f.since_last_pass;

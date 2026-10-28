@@ -156,11 +156,11 @@ export function releasePack(finding: Finding, release: ReleaseRef, others: Other
   const pack = buildPack(finding, [], { number: null, repository: release.repository, title: "", lane: release.lane }, others, ctx);
   const ood = finding.out_of_date && !finding.out_of_date.streak && !finding.out_of_date.fixed ? finding.out_of_date : null;
   const ref = (c: { sha: string; pr: number | null; date?: string | null }): string => `${c.pr ? `#${c.pr}` : c.sha.slice(0, 7)}${c.date ? ` (${c.date})` : ""}`;
-  return {
-    ...pack,
-    release: { id: "release", branch: release.branch, base: release.base, history_branch: release.historyBranch, server: serverOf(finding.report_name) ?? serverOf(release.name) },
+  // The same object buildPack returned: its screenshots are keyed by it (see PACK_IMAGES).
+  return Object.assign(pack, {
+    release: { id: "release" as const, branch: release.branch, base: release.base, history_branch: release.historyBranch, server: serverOf(finding.report_name) ?? serverOf(release.name) },
     ...(ood ? { base_change: { id: "base_change" as const, commits: [ood.commit, ...(ood.also ?? [])].filter((c): c is NonNullable<typeof c> => Boolean(c)).map(ref), diff: ood.diff ?? null } } : {}),
-  };
+  });
 }
 
 // This PR's earlier runs of the test, and what changed between its last pass and now. Where the PR's own changes are

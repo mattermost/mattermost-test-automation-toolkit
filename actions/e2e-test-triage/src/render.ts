@@ -475,7 +475,7 @@ export function statusLabelOf(f: Finding): StatusLabel {
     const cause = f.judge?.cause;
     if (cause === "bug_on_master") return "broken on main";
     if (f.release && cause === "test_bug") return "test bug";
-    if (cause === "server_compat") return "server compat";
+    if (f.release && cause === "server_compat") return "server compat";
     return "flaky";
   }
   return f.class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";

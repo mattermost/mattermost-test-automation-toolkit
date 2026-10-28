@@ -13,7 +13,7 @@ import { OUT_OF_DATE_DIR_CAP, dropStormRuns, fetchChangedFiles, fetchHistory, fe
 import { commonSenseClear, onlyOnPlatform, platformOf } from "./common-sense.ts";
 import { codeExcerpt, enrichFindings, failingLine, prChangedSince, sameTestOnOtherReports, siblingPlatforms } from "./enrich.ts";
 import { evidenceFor, loadEvidence } from "./evidence.ts";
-import { CLEARING, buildPack, chainClears, changeCategory, changeSummary, compactError, evidenceIds, namesChangedFile, releasePack, serverOf } from "./pack.ts";
+import { CLEARING, PACK_IMAGES, buildPack, chainClears, changeCategory, changeSummary, compactError, evidenceIds, namesChangedFile, releasePack, serverOf } from "./pack.ts";
 import type { OtherFailure } from "./pack.ts";
 import { PRICES, costOf, newLedger, priceFor } from "./pricing.ts";
 import { bucketOf, passLine, passRate, renderSummary, statusDescription, statusLabelOf, statusLabels } from "./render.ts";
@@ -4592,6 +4592,9 @@ test("a release pack carries the release, the default branch's change to the tes
   assert.ok(ids.includes("release") && ids.includes("base_change") && ids.includes("other_platforms"));
   assert.ok(!ids.includes("pr.changed_files"), "there is no PR to cite");
   assert.equal(releasePack(releaseFinding(), releaseRef, []).base_change, undefined, "no change on master: nothing to cite");
+  const shot = { name: "fail.png", media_type: "image/png", data: "AAAA", sha256: "x" };
+  const withShot = releasePack(releaseFinding({ producer: { images: [shot], notes: "" } as unknown as Finding["producer"] }), releaseRef, []);
+  assert.deepEqual(PACK_IMAGES.get(withShot), [shot], "the run's screenshots still reach the model");
   assert.equal(serverOf("mobile-release-detox-android-Server_12.1.0-rc2"), "12.1.0-rc2");
   assert.equal(releasePack(releaseFinding({ report_name: null }), { ...releaseRef, name: "mobile-release-detox-ios-Server_12.0.1" }, []).release?.server, "12.0.1", "a mobile lane names its server in its group");
 });
