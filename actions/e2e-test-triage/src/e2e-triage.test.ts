@@ -4329,6 +4329,8 @@ test("a same-error streak on trunk that trunk has passed since is a fix there, n
   const clickTest = { ...failing, error: click("#save") };
   assert.equal(classify(clickTest, fixedOnTrunkHistory(click("#save")), [], undefined, 5).class, "FIXED_ON_TRUNK", "the same click timeout at the same step");
   assert.notEqual(classify(clickTest, fixedOnTrunkHistory(click("#cancel")), [], undefined, 5).class, "FIXED_ON_TRUNK", "one timeout at another step");
+  const detached = (postId: string): string => `Error: Element #CENTER_actions_button_${postId} is detached from the DOM after reopening the menu`;
+  assert.equal(classify({ ...failing, error: detached("4j9jsuqqytnz8x37pnir3dmeqc") }, fixedOnTrunkHistory(detached("1xpbzs3wdbf3xb8nzkswcuuqhc")), [], undefined, 5).class, "FIXED_ON_TRUNK", "the same distinctive error, whatever post id the selector names");
 });
 
 test("a branch without trunk's fix is out of date; with it, the same failure goes to the judge", async () => {
