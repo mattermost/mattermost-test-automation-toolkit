@@ -9,12 +9,14 @@ import type { Env } from "../../shared/src/github.ts";
 import { isFailedTry } from "../../shared/src/tsio.ts";
 import type { RunResult } from "../../shared/src/tsio.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
+import { statusLabelOf } from "./render.ts";
 import { ledgerTotals, newLedger } from "./pricing.ts";
 import type { TriageIdentity } from "./triage.ts";
 import type { Counts, Finding } from "./types.ts";
 
 /** The schema version. A consumer checks it before it reads any other field. */
-export const FINDINGS_SCHEMA = 1 as const;
+// 2: each row has its check label, and the model's explanation.
+export const FINDINGS_SCHEMA = 2 as const;
 
 /** One failed test: the decision, the facts it rests on, and the model's part when it was asked. */
 export interface FindingRow {
@@ -22,6 +24,8 @@ export interface FindingRow {
   full_title: string | null;
   file: string;
   class: string;
+  /** The label the check counts it under (see statusLabelOf): "flaky", "test bug", "app bug", "out of date"... */
+  label: string;
   blocking: boolean;
   decision: string | null;
   reason: string;
@@ -29,7 +33,7 @@ export interface FindingRow {
   out_of_date: boolean;
   tries: { ran: number; failed: number } | null;
   other_lanes_failed: string[];
-  ai: { cause: string | null; confidence: number | null; cited: string[]; cleared: boolean };
+  ai: { cause: string | null; confidence: number | null; cited: string[]; cleared: boolean; explanation: string | null };
 }
 
 /** The whole file. A run that was not triaged has no verdict or findings, and says why in not_triaged_reason. */
@@ -98,6 +102,7 @@ function rowOf(f: Finding, secrets: string[]): FindingRow {
     full_title: f.full_title ? redact(f.full_title, secrets) : null,
     file: redact(f.repo_path ?? f.file, secrets),
     class: f.class,
+    label: statusLabelOf(f),
     blocking: f.blocking,
     decision: f.decision ?? null,
     reason: clip(redact(f.reason ?? "", secrets), 300),
@@ -105,7 +110,7 @@ function rowOf(f: Finding, secrets: string[]): FindingRow {
     out_of_date: Boolean(f.out_of_date),
     tries: f.tries ? { ran: f.tries.ran, failed: f.tries.failed } : null,
     other_lanes_failed: (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform),
-    ai: { cause: judge?.cause ?? null, confidence: judge?.confidence ?? null, cited: judge?.cited_evidence ?? [], cleared: f.decision === "adjudicator_unblock" },
+    ai: { cause: judge?.cause ?? null, confidence: judge?.confidence ?? null, cited: judge?.cited_evidence ?? [], cleared: f.decision === "adjudicator_unblock", explanation: judge ? clip(redact(judge.explanation, secrets), 200) : null },
   };
 }
 
@@ -162,7 +167,7 @@ export function writeFindings(facts: FindingsFacts, log: (message: string) => vo
 }
 
 const TOP_KEYS = ["schema", "repository", "commit_sha", "pr", "lane", "status_context", "run_id", "run_attempt", "mode", "verdict", "counts", "ai", "triaged", "not_triaged_reason", "findings"];
-const ROW_KEYS = ["title", "full_title", "file", "class", "blocking", "decision", "reason", "error_first_line", "out_of_date", "tries", "other_lanes_failed", "ai"];
+const ROW_KEYS = ["title", "full_title", "file", "class", "label", "blocking", "decision", "reason", "error_first_line", "out_of_date", "tries", "other_lanes_failed", "ai"];
 const COUNT_KEYS = ["total", "passed", "failed", "flaky", "skipped"];
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -186,7 +191,7 @@ export function checkFindingsShape(value: unknown): string[] {
     if (!ok) problems.push(what);
   };
   exactKeys(value, TOP_KEYS, "record", problems);
-  need(value.schema === FINDINGS_SCHEMA, "schema: must be 1");
+  need(value.schema === FINDINGS_SCHEMA, `schema: must be ${FINDINGS_SCHEMA}`);
   for (const k of ["repository", "commit_sha", "lane", "status_context", "run_id", "run_attempt", "verdict", "not_triaged_reason"]) need(orNull(isStr)(value[k]), `${k}: string or null`);
   need(orNull(isNum)(value.pr), "pr: number or null");
   need(value.mode === "enforce" || value.mode === "report-only", "mode: enforce or report-only");
@@ -211,7 +216,7 @@ export function checkFindingsShape(value: unknown): string[] {
       return;
     }
     exactKeys(row, ROW_KEYS, where, problems);
-    need(isStr(row.title) && orNull(isStr)(row.full_title) && isStr(row.file) && isStr(row.class), `${where}: names`);
+    need(isStr(row.title) && orNull(isStr)(row.full_title) && isStr(row.file) && isStr(row.class) && isStr(row.label), `${where}: names`);
     need(isBool(row.blocking) && isBool(row.out_of_date), `${where}: blocking and out_of_date are booleans`);
     need(orNull(isStr)(row.decision) && isStr(row.reason), `${where}: decision and reason`);
     need(isStr(row.error_first_line) && !row.error_first_line.includes("\n") && row.error_first_line.length <= 200, `${where}: error_first_line is one line of at most 200 characters`);
@@ -219,8 +224,8 @@ export function checkFindingsShape(value: unknown): string[] {
     need(isStrs(row.other_lanes_failed), `${where}: other_lanes_failed is a list of platforms`);
     const a = row.ai;
     if (isObj(a)) {
-      exactKeys(a, ["cause", "confidence", "cited", "cleared"], `${where}.ai`, problems);
-      need(orNull(isStr)(a.cause) && orNull(isNum)(a.confidence) && isStrs(a.cited) && isBool(a.cleared), `${where}.ai: cause, confidence, cited, cleared`);
+      exactKeys(a, ["cause", "confidence", "cited", "cleared", "explanation"], `${where}.ai`, problems);
+      need(orNull(isStr)(a.cause) && orNull(isNum)(a.confidence) && isStrs(a.cited) && isBool(a.cleared) && orNull(isStr)(a.explanation), `${where}.ai: cause, confidence, cited, cleared, explanation`);
     } else problems.push(`${where}.ai: not an object`);
   });
   return problems;

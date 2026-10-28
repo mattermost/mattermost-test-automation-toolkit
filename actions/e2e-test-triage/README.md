@@ -427,11 +427,11 @@ the reason.
 every run: judged, superseded, with no results, or broken off. It is for measuring
 how often triage's answers are right, so a consumer can join it to the verdicts
 later. Nothing in it is a secret, and each error is only its first line (200
-characters at most). Fields, in `schema` 1:
+characters at most). Fields, in `schema` 2:
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "repository": "mattermost/mattermost", "commit_sha": "<sha>", "pr": 5,
   "lane": "playwright-full-enterprise", "status_context": "<context>",
   "run_id": "39637355358", "run_attempt": "1",
@@ -443,11 +443,11 @@ characters at most). Fields, in `schema` 1:
   "not_triaged_reason": null,
   "findings": [{
     "title": "", "full_title": "", "file": "specs/a.spec.ts",
-    "class": "REGRESSION", "blocking": true, "decision": "adjudicator_veto | null",
+    "class": "REGRESSION", "label": "caused by PR", "blocking": true, "decision": "adjudicator_veto | null",
     "reason": "", "error_first_line": "", "out_of_date": false,
     "tries": { "ran": 1, "failed": 1 },
     "other_lanes_failed": ["android"],
-    "ai": { "cause": "caused_by_pr | null", "confidence": 0.9, "cited": ["hunk_0"], "cleared": false }
+    "ai": { "cause": "caused_by_pr | null", "confidence": 0.9, "cited": ["hunk_0"], "cleared": false, "explanation": "one or two sentences | null" }
   }]
 }
 ```
@@ -460,7 +460,11 @@ characters at most). Fields, in `schema` 1:
 - `not_triaged_reason` starts with `superseded:`, `no_results:` or `error:`.
 - `ai.cost_usd` is `null` when a call's model is unpriced.
 - `ai.cleared` is `true` when the model cleared the test; `ai.cited` lists the
-  evidence it cited.
+  evidence it cited, and `ai.explanation` what it found (200 characters at most).
+- `label` is what the E2E check counts the test as: flaky, broken on main, test
+  bug, server compat, caused by PR, app bug, fixed on main, out of date, or needs
+  investigation.
+- Schema 2 added `label` and `ai.explanation`.
 
 Consumers check `schema` first. A future change to the shape bumps it.
 

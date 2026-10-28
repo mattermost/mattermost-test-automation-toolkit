@@ -2676,7 +2676,7 @@ async function evaluateRun({
 
 // ../e2e-test-triage/src/findings.ts
 var import_node_fs2 = require("fs");
-var FINDINGS_SCHEMA = 1;
+var FINDINGS_SCHEMA = 2;
 var SECRET_PATTERNS = [/gh[pousr]_[A-Za-z0-9]{20,}/g, /github_pat_[A-Za-z0-9_]{20,}/g, /sk-ant-[A-Za-z0-9_-]{8,}/g, /\bBearer\s+[^\s"']+/gi];
 var ANSI = /\x1b\[[0-9;]*m/g;
 var CREDENTIAL_KV = /([A-Za-z0-9_.-]*(?:token|password|secret|passwd|api[_-]?key|apikey|license|authorization)[A-Za-z0-9_.-]*)(\s*[=:]\s*)((?:Bearer\s+)?[^\s"',;&]+)/gi;
@@ -2703,6 +2703,7 @@ function rowOf(f, secrets) {
     full_title: f.full_title ? redact(f.full_title, secrets) : null,
     file: redact(f.repo_path ?? f.file, secrets),
     class: f.class,
+    label: statusLabelOf(f),
     blocking: f.blocking,
     decision: f.decision ?? null,
     reason: clip(redact(f.reason ?? "", secrets), 300),
@@ -2710,7 +2711,7 @@ function rowOf(f, secrets) {
     out_of_date: Boolean(f.out_of_date),
     tries: f.tries ? { ran: f.tries.ran, failed: f.tries.failed } : null,
     other_lanes_failed: (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform),
-    ai: { cause: judge2?.cause ?? null, confidence: judge2?.confidence ?? null, cited: judge2?.cited_evidence ?? [], cleared: f.decision === "adjudicator_unblock" }
+    ai: { cause: judge2?.cause ?? null, confidence: judge2?.confidence ?? null, cited: judge2?.cited_evidence ?? [], cleared: f.decision === "adjudicator_unblock", explanation: judge2 ? clip(redact(judge2.explanation, secrets), 200) : null }
   };
 }
 function findingLogLine(f, n, of, secrets) {
