@@ -927,7 +927,7 @@ function factsTable(f, branch, pr, branchRun = null) {
     const also = f.out_of_date.also ?? [];
     const which = c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}${also.length ? `, and earlier ${also.map(refOf).join(", ")}` : ""}` : "";
     const base = f.out_of_date.base ?? branch;
-    rows.push(branchRun ? [`Changed on ${base} since ${branchRun} branched`, `Yes${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test`] : [`Changed on ${branch} since this PR last merged it`, `Yes${which}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
+    rows.push(f.out_of_date.fixed ? [`Fixed on ${branch} since this PR last merged it`, `Yes${which}: its first passing run. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it does not have the fix`] : branchRun ? [`Changed on ${base} since ${branchRun} branched`, `Yes${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test`] : [`Changed on ${branch} since this PR last merged it`, `Yes${which}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
   }
   if (f.decision === "evidence_incomplete" || f.identity_unresolved) rows.push(["Why history wasn't used", f.reason]);
   const a = f.judge;

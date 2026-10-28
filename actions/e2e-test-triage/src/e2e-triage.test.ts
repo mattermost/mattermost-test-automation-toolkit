@@ -4334,7 +4334,10 @@ test("a branch without trunk's fix is out of date; with it, the same failure goe
   await markFixedOnTrunk({ findings: [stale], api: fixCompare(["m1", "f4", "p1", "m2"]), id, baseBranch: "master" });
   assert.deepEqual(stale.out_of_date, { base: "master", behind: 4, commit: { sha: "p1", date: "2026-10-26", pr: 39418 }, fixed: true });
   assert.equal(statusLabelOf(stale), "fixed on main");
-  assert.match(renderSummary({ findings: [stale], infra: null, runURL: "u", counts: { failed: 1, passed: 9 }, trunkBranch: "master" }), /The failure first passed on master \(#39418, 2026-10-26\) after this PR last merged master, so this branch still has it\./);
+  const text = renderSummary({ findings: [stale], infra: null, runURL: "u", counts: { failed: 1, passed: 9 }, trunkBranch: "master" });
+  assert.match(text, /The failure first passed on master \(#39418, 2026-10-26\) after this PR last merged master, so this branch still has it\./);
+  assert.match(text, /\| Fixed on master since this PR last merged it \| Yes: \w+ \(#39418\) on 2026-10-26: its first passing run\. This PR is \d+ commits? behind, so it does not have the fix \|/);
+  assert.doesNotMatch(text, /ran its old copy/, "the test did not change; the failure was fixed");
   const current = fixedOne();
   await markFixedOnTrunk({ findings: [current], api: fixCompare(["m1", "m2"]), id, baseBranch: "master" });
   assert.equal(current.class, "REGRESSION", "it has the fix and fails anyway");
