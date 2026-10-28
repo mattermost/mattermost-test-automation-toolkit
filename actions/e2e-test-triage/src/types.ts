@@ -266,7 +266,7 @@ export interface OutOfDate {
   commit: CommitRef | null;
   /** The branch-state hold: this PR failed the same way on its last `streak` commits (this run included), never on the base. */
   streak?: number;
-  /** The base branch fixed this failure at `commit` (see markFixedOnTrunk), after this PR last merged it. */
+  /** The failure first passed on the base branch at `commit` (see markFixedOnTrunk), after this PR last merged it. */
   fixed?: boolean;
 }
 

@@ -72,9 +72,9 @@ before any data was collected; the 7-week replay found no wrong clear with them.
 
 **Fixed on master:** master failed the test the same way in at least 3 runs in a
 row and has passed since. That is a break master fixed, not a flake: a branch
-without master's first passing commit is held as **fixed on main** ("master fixed this
-failure (#PR, date) after this PR last merged master"), and one that has it goes
-to the model as a `REGRESSION`. If the base branch's commit list is cut off, it
+without master's last failing commit is held as **fixed on main** ("The failure
+first passed on master (#PR, date) after this PR last merged master"), and one
+that has master's first passing commit goes to the model as a `REGRESSION`. If the base branch's commit list is cut off, it
 stays unchecked.
 
 **Re-runs:** a re-run uploads its jobs' reports again under the same names; the
