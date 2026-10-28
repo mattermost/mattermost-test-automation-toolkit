@@ -355,6 +355,7 @@ test("a spec whose shard uploaded nothing is an infrastructure failure, not a te
 test("decision matrix: unblock needs confidence plus a checkable citation; unknown citations are dropped", () => {
   const f = classify(failing, [...trunkPasses(8), ...crossPR(11, 12)], [], undefined, 1);
   const pack = buildPack(f, [{ filename: "specs/a.spec.ts", patch: "@@" }], { number: 1, repository: "o/r", title: "", lane: "l" }, []);
+  assert.ok(!JSON.stringify(pack).includes(f.reason), "the judge is not told the rules' call");
   const ok: Answer = { cause: "flaky_environment", confidence: 0.9, cited_evidence: ["cross_pr"], explanation: "recurs" };
   assert.equal(decide("REGRESSION", ok, pack).decision, "adjudicator_unblock");
   assert.equal(decide("REGRESSION", { ...ok, confidence: 0.8 }, pack).blocking, true);
@@ -1284,10 +1285,10 @@ test("the model is asked only when its answer could change the outcome", async (
 
   // With advice on, only the blocked one is asked, and even a confident "flaky" leaves it blocking.
   const again = [classify(failing, [obs({ status: "failed" }), ...trunkPasses(8)], [], undefined, 1), classify(failing, trunkPasses(8), [], undefined, 1)];
-  const asked: string[][] = [];
+  const asked: number[][] = [];
   const advised = newLedger();
-  await judge(again, again.map((f) => buildPack(f, ci, prCtx, [])), async (packs, model) => { asked.push(packs.map((p) => p.engine.class)); return ok({ ...flakyAnswer, confidence: 0.99, cited_evidence: [] })(packs, model); }, DEFAULTS, () => {}, false, advised);
-  assert.deepEqual(asked, [["REGRESSION"]]);
+  await judge(again, again.map((f) => buildPack(f, ci, prCtx, [])), async (packs, model) => { asked.push(packs.map((p) => p.trunk_history_14d.fails)); return ok({ ...flakyAnswer, confidence: 0.99, cited_evidence: [] })(packs, model); }, DEFAULTS, () => {}, false, advised);
+  assert.deepEqual(asked, [[0]], "only the one trunk never failed");
   assert.equal(advised.skipped.no_effect, 1);
   assert.deepEqual(again.map((f) => [f.blocking, f.decision ?? null]), [[false, null], [true, "advice"]]);
   assert.equal(advised.calls.length, 1, "advice is paid for and shown like any other call");
@@ -1957,16 +1958,16 @@ test("a flagged run holds environment errors the rules would clear: without the 
   assert.ok(down.findings.every((f) => f.blocking), "with nothing from elsewhere to cite, and the model down, they stay held");
   assert.equal(down.verdict, "ACTION_REQUIRED");
   // On a run that is not flagged, the rule still clears an environment error, and the model is not asked about it.
-  const classes: string[] = [];
+  const asked: string[] = [];
   const normal = await evaluate(runOf([
     { title: "t0", file: "specs/s0.spec.ts", error: SERVER_DOWN },
     ...[1, 2, 3].map((i) => ({ title: `t${i}`, file: `specs/s${i}.spec.ts`, error: "Error: expected visible" })),
-  ]), { cfg, ask: async (packs) => { classes.push(...packs.map((p) => p.engine.class)); return fixture<BatchResult>({ answers: packs.map(() => envAnswer), usage: { input_tokens: 1, output_tokens: 1 } }); } });
+  ]), { cfg, ask: async (packs) => { asked.push(...packs.map((p) => p.test.title)); return fixture<BatchResult>({ answers: packs.map(() => envAnswer), usage: { input_tokens: 1, output_tokens: 1 } }); } });
   assert.equal(normal.infra, null);
   assert.equal(normal.findings[0].class, "INFRA_ERROR");
   assert.equal(normal.findings[0].blocking, false);
   assert.equal(normal.findings[0].decision, undefined);
-  assert.ok(!classes.includes("INFRA_ERROR"), "a cleared environment error is not sent");
+  assert.ok(!asked.includes("t0"), "a cleared environment error is not sent");
 });
 
 test("a storm of failures is judged: 24 questions in calls of 8, the rest over the per-run limit stay red with the flag", async () => {
@@ -2111,7 +2112,7 @@ test("end to end: green run posts success and no comment", async () => {
 });
 
 // ---- judge provenance, sampling and strict answers ----
-const judgePack = { cross_pr_failures_14d: { other_prs_where_this_test_failed: ["PR 1"] }, diff_hunks_of_files_named_in_error: [], test: {}, error: "", engine: {}, trunk_history_14d: {}, pr: {} } as unknown as Pack;
+const judgePack = { cross_pr_failures_14d: { other_prs_where_this_test_failed: ["PR 1"] }, diff_hunks_of_files_named_in_error: [], test: {}, error: "", trunk_history_14d: {}, pr: {} } as unknown as Pack;
 interface FakeModel extends FetchImpl {
   calls: MessageBody[];
 }
@@ -3316,14 +3317,14 @@ test("a row that blames this PR never says the cause is environmental: the other
   assert.doesNotMatch(row, /environment|shared cause/, "a change to this PR is not steered toward the environment");
 });
 
-test("the answer-cache key ignores the other-platform evidence, and is the v5 key for the same pack", () => {
-  const pack = { test: { title: "t1", full_title: null, suite: null, file: "specs/a.spec.ts", report_scope: null, report_name: null }, error: "Error: expected visible", engine: { class: "REGRESSION", reason: "r" }, trunk_history_14d: { runs: 8, fails: 0, flaky: 0, latest: "passed" }, cross_pr_failures_14d: { id: "cross_pr", other_prs_where_this_test_failed: [], other_pr_runs_where_it_passed: 0 }, pr: { number: 5, repository: "o/r", title: "t", changed_file_count: 1, changed_files: ["app/x.ts"], spec_file_changed_by_pr: false }, diff_hunks_of_files_named_in_error: [], other_failures_in_same_run: [] } as unknown as Pack;
+test("the answer-cache key ignores the other-platform evidence, and is the v6 key for the same pack", () => {
+  const pack = { test: { title: "t1", full_title: null, suite: null, file: "specs/a.spec.ts", report_scope: null, report_name: null }, error: "Error: expected visible", trunk_history_14d: { runs: 8, fails: 0, flaky: 0, latest: "passed" }, cross_pr_failures_14d: { id: "cross_pr", other_prs_where_this_test_failed: [], other_pr_runs_where_it_passed: 0 }, pr: { number: 5, repository: "o/r", title: "t", changed_file_count: 1, changed_files: ["app/x.ts"], spec_file_changed_by_pr: false }, diff_hunks_of_files_named_in_error: [], other_failures_in_same_run: [] } as unknown as Pack;
   const withOthers = { ...pack, same_test_other_platforms_this_run: { id: "other_platforms", results: [{ platform: "windows", result: "failed" }] } } as unknown as Pack;
   assert.equal(answerKey("claude-sonnet-5-5", withOthers), answerKey("claude-sonnet-5-5", pack), "the evidence is not part of the key");
-  // v5 for this pack: SYSTEM gained the earlier_failure_same_spec rule, so every v4 answer is a miss by design. A
-  // cached v5 answer keeps this key, so no call is paid again.
-  assert.match(answerKey("claude-sonnet-5-5", pack), /^v5:/);
-  assert.equal(answerKey("claude-sonnet-5-5", pack), "v5:bcf80891c4782faa31109b2aa041f4d7dcee0d874de8705f6cde091fe0bd8994");
+  // v6 for this pack: SYSTEM no longer says the rules' call is in the pack, so every v5 answer is a miss by design. A
+  // cached v6 answer keeps this key, so no call is paid again.
+  assert.match(answerKey("claude-sonnet-5-5", pack), /^v6:/);
+  assert.equal(answerKey("claude-sonnet-5-5", pack), "v6:adb245740554ae221807b38223b80148264806803bf2af92501acdda213e6c67");
 });
 
 test("a sibling's same leaf title in another describe block is another test: no other-platform line", async () => {

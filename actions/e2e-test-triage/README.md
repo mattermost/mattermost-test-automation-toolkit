@@ -207,7 +207,9 @@ only at `min-confidence` (0.85) or more **and** with a citation a reviewer can
 open: other PRs failing the same way, or an earlier pass on this PR with nothing
 related the PR changed since (for an environment cause, also an error that is
 clearly infrastructural). What the test run recorded (`evidence-dir`) supports a
-clear but never makes one alone, since the PR's own CI wrote it.
+clear but never makes one alone, since the PR's own CI wrote it. The question
+carries the facts, not the rules' call: the model is not told the class or reason
+triage gave the failure, so its answer is its own read of the evidence.
 
 **The first failure in a chain:** a later test in a spec often fails only because
 an earlier one's setup failed. Each question carries the earliest test of the

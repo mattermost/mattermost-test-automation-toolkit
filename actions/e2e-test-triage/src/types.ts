@@ -172,7 +172,6 @@ export interface Pack {
     lane?: string;
   };
   error: string;
-  engine: { class: string; reason: string };
   trunk_history_14d: { runs: number; fails: number; flaky: number; latest: string };
   cross_pr_failures_14d: { id: "cross_pr"; other_prs_where_this_test_failed: string[]; other_pr_runs_where_it_passed: number };
   pr: {
