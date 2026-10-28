@@ -1566,7 +1566,8 @@ function sameTestOnOtherReports(findings, run, everyReport = false) {
   for (const f of findings) {
     const own = f.report_name ?? "";
     if (everyReport) {
-      const others2 = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? []).filter((o) => o.report !== "" && o.report !== own && !o.report.startsWith(`${own}-`) && !own.startsWith(`${o.report}-`));
+      const lane = (report) => report.replace(/-\d+-of-\d+$/, "");
+      const others2 = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? []).filter((o) => o.report !== "" && lane(o.report) !== lane(own));
       for (const o of others2.sort((a, b) => a.report.localeCompare(b.report))) addOtherLane(f, o.report.replace(/^e2e-on-/, ""), o.status);
       continue;
     }

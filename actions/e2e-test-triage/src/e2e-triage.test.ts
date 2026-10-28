@@ -4669,9 +4669,10 @@ test("a release run's lanes are every other report of the run, by OS and server 
     { report: "e2e-on-ubuntu-latest-10.11.25", status: "passed" },
     { report: "e2e-on-macos-26-11.11.3", status: "failed" },
     { report: "e2e-on-ubuntu-latest-11.11.3-2-of-2", status: "failed" },
+    { report: "e2e-on-ubuntu-latest-11.11.3-rc1", status: "passed" },
   ]]]);
   sameTestOnOtherReports([f], { elsewhere } as unknown as RunResult, true);
-  assert.deepEqual(f.other_lanes, [{ platform: "macos-26-11.11.3", result: "failed" }, { platform: "ubuntu-latest-10.11.25", result: "passed" }]);
+  assert.deepEqual(f.other_lanes, [{ platform: "macos-26-11.11.3", result: "failed" }, { platform: "ubuntu-latest-10.11.25", result: "passed" }, { platform: "ubuntu-latest-11.11.3-rc1", result: "passed" }], "a release candidate of the same version is another lane");
 });
 
 test("a row names at most three other lanes, then how many more", () => {

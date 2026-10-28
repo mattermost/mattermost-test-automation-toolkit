@@ -59,10 +59,11 @@ export function sameTestOnOtherReports(findings: Finding[], run: Pick<RunResult,
   for (const f of findings) {
     const own = f.report_name ?? "";
     if (everyReport) {
-      // A release run's lanes are OS x server version, one report each: every other report is another lane, but a shard
-      // of this lane ("<own>-1-of-3") is not.
+      // A release run's lanes are OS x server version: every other report is another lane, but a shard of this lane
+      // ("<own>-1-of-3") is not. "11.11.3-rc1" is another server version, not a shard of "11.11.3".
+      const lane = (report: string): string => report.replace(/-\d+-of-\d+$/, "");
       const others = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? [])
-        .filter((o) => o.report !== "" && o.report !== own && !o.report.startsWith(`${own}-`) && !own.startsWith(`${o.report}-`));
+        .filter((o) => o.report !== "" && lane(o.report) !== lane(own));
       for (const o of others.sort((a, b) => a.report.localeCompare(b.report))) addOtherLane(f, o.report.replace(/^e2e-on-/, ""), o.status);
       continue;
     }
