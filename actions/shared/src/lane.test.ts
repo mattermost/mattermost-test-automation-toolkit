@@ -84,5 +84,9 @@ test("a red check triage does not cover keeps the aggregate from saying all lane
   const many = ["a", "b", "c"].map((n) => ({ context: `e2e-test/upgrade-${n}`, status: st("failure", "x") }));
   assert.equal(laneSummary([green], many).description, "triaged lanes green · not triaged: upgrade-a, upgrade-b +1 red", "two names at most");
   assert.equal(laneSummary([{ ...green, status: st("pending", "running") }], [upgrade]).description,
-    "not triaged: playwright-full/enterprise/upgrade-from-release-11.10 red · Triage is checking: waiting for playwright-full/enterprise", "named while a lane runs too, first");
+    "Triage is checking: waiting for playwright-full/enterprise · not triaged: playwright-full/enterprise/upgrade-from-release-11.10 red", "named while a lane runs too");
+  const slow = ["cypress-full/enterprise", "playwright-full/enterprise"].map((n) => ({ context: `e2e-test/${n}`, status: st("pending", "running") }));
+  const description = laneSummary(slow, [upgrade, { ...upgrade, context: `${upgrade.context}-fips` }]).description;
+  assert.equal(description, "Triage is checking: waiting for cypress-full/enterprise, playwright-full/enterprise · not triaged: 2 red", "counted when the names would not fit");
+  assert.ok(description.length <= 140);
 });
