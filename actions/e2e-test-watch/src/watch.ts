@@ -18,18 +18,27 @@ import { LEDGER_MS, readLedger, writeLedger } from "./ledger.ts";
 import type { LedgerEntry } from "./ledger.ts";
 import { DAY, HOUR, flakes, utcMinute } from "./model.ts";
 import type { Group, GroupTest, Kind } from "./model.ts";
-import { DEFAULT_LABEL, lastActivity, prsChanging, prsTouching, repairPRs, specsInOpenPRs } from "./prs.ts";
+import { DEFAULT_LABEL, lastActivity, openedAt, prsChanging, prsTouching, repairPRs, specsInOpenPRs } from "./prs.ts";
 import type { OpenPR, OpenPRs, RepairPRs } from "./prs.ts";
-import { addGroup, retryRecovered, selectCrossLane, selectRepairs, selectRetryFlakes } from "./select.ts";
+import { addGroup, retryRecovered, selectCrossLane, selectRepairs, selectRetryFlakes, unselected } from "./select.ts";
 import { bundle, specRange, suspects, windowsOverlap } from "./range.ts";
 import type { RangedGroup, WatchId } from "./range.ts";
 
 const MAX_TESTS = 40;
 const MAX_OPEN_PRS_TOUCHING = 10;
+// Failing tests no request covers that the job summary names one by one; the rest are counted.
+const MAX_UNSELECTED_NOTES = 10;
 // How long a requested spec is left to its agent before it can be requested again.
 const HOLD_MS = 24 * HOUR;
 // An agent PR with no activity for longer than this stops blocking the spec it changes.
 const OWN_PR_IDLE_MS = 3 * DAY;
+// An agent PR open longer than this, with its spec still failing on trunk, stops blocking it too:
+// review traffic keeps it active, so idleness alone can hold a red spec back for weeks. The spec is
+// then requested again (no more often than STALE_PR_HOLD_MS), with the PR in open_prs_touching to judge.
+const OWN_PR_MAX_AGE_MS = 2 * DAY;
+// How long a spec whose only agent PRs are past OWN_PR_MAX_AGE_MS is held after a request. Longer than
+// HOLD_MS: a right fix still in review leaves the spec failing too, and each request is an agent run.
+const STALE_PR_HOLD_MS = 3 * DAY;
 const REPORTS_PAGE = 100;
 const REPORTS_MAX_PAGES = 5;
 
@@ -51,6 +60,7 @@ export interface ReportGroup {
   created_at?: string | null;
   last_upload_at?: string | null;
   orchestration?: { durations?: { last_test_at?: string | null } | null } | null;
+  test_stats?: { failed?: number | null } | null;
 }
 
 /** A fix request's body, as the workflow sends it to the agent. */
@@ -110,6 +120,9 @@ export interface WatchOptions {
  * the branch named in its inputs, not the ref it was started from, so branch and commit
  * come from what the run reported rather than from the triggering event. Asked per suite
  * name, newest first, until the run's groups are passed or REPORTS_MAX_PAGES pages are read.
+ *
+ * A re-run attempt re-runs only the failed jobs, so a suite it didn't re-run keeps its report
+ * under the earlier attempt: each suite's newest attempt up to `attempt` is the one this attempt shows.
  */
 export async function runGroups(
   fetchImpl: FetchImpl,
@@ -120,18 +133,67 @@ export async function runGroups(
   names: string[],
 ): Promise<ReportGroup[]> {
   const groups: ReportGroup[] = [];
-  const ofRun = (g: ReportGroup): boolean => String(g.gh_run_id) === String(runId) && String(g.gh_run_attempt) === String(attempt);
+  const ofRun = (g: ReportGroup): boolean => String(g.gh_run_id) === String(runId);
+  const attemptOf = (g: ReportGroup): number => Number(g.gh_run_attempt) || 1;
+  const upTo = Number(attempt) || 1;
   for (const name of names) {
+    const found: ReportGroup[] = [];
     for (let page = 0; page < REPORTS_MAX_PAGES; page++) {
       const query = new URLSearchParams({ repository, name, limit: String(REPORTS_PAGE), offset: String(page * REPORTS_PAGE) });
       const { reports = [] } = await tsioJson<{ reports?: ReportGroup[] }>(fetchImpl, base, `/reports?${query}`);
-      const found = reports.filter((g) => g.name === name && ofRun(g));
-      groups.push(...found);
+      const ofPage = reports.filter((g) => g.name === name && ofRun(g) && attemptOf(g) <= upTo);
+      found.push(...ofPage);
       // Found, and the page goes on to older runs: nothing of this run is further back.
-      if (reports.length < REPORTS_PAGE || (found.length > 0 && !ofRun(reports[reports.length - 1]))) break;
+      if (reports.length < REPORTS_PAGE || (ofPage.length > 0 && !ofRun(reports[reports.length - 1]))) break;
     }
+    const newest = Math.max(0, ...found.map(attemptOf));
+    groups.push(...found.filter((g) => attemptOf(g) === newest));
   }
   return groups;
+}
+
+/**
+ * Suites this run reported failures in that the caller doesn't watch (another framework, a subpath or
+ * upgrade lane): one note each, so a red trunk run with no request says where its failures went.
+ */
+export async function unwatchedFailures(
+  fetchImpl: FetchImpl,
+  base: string,
+  repository: string,
+  commit: string,
+  runId: string | undefined,
+  attempt: string,
+  trunk: string,
+  watched: string[],
+): Promise<string[]> {
+  try {
+    // Every group of the commit: other runs and dispatches of it add theirs, so it can take pages.
+    const reports: ReportGroup[] = [];
+    let complete = false;
+    for (let page = 0; page < REPORTS_MAX_PAGES && !complete; page++) {
+      const query = new URLSearchParams({ repository, commit, limit: String(REPORTS_PAGE), offset: String(page * REPORTS_PAGE) });
+      const { reports: rows = [] } = await tsioJson<{ reports?: ReportGroup[] }>(fetchImpl, base, `/reports?${query}`);
+      reports.push(...rows);
+      complete = rows.length < REPORTS_PAGE;
+    }
+    // Each suite's newest attempt in this run up to the one watched: a re-run's count replaces the one
+    // before it, and a later attempt's is that attempt's to report.
+    const latest = new Map<string, ReportGroup>();
+    for (const g of reports) {
+      if (String(g.gh_run_id) !== String(runId) || g.branch !== trunk || watched.includes(g.name)) continue;
+      if (Number(g.gh_run_attempt) > (Number(attempt) || 1)) continue;
+      const prev = latest.get(g.name);
+      if (!prev || Number(g.gh_run_attempt) > Number(prev.gh_run_attempt)) latest.set(g.name, g);
+    }
+    const notes = [...latest.values()]
+      .filter((g) => Number(g.test_stats?.failed) > 0)
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((g) => `${g.name}: ${g.test_stats?.failed} failed in this run; not watched, so not requested`);
+    if (!complete) notes.push(`suites outside the watched ones checked only in the newest ${REPORTS_MAX_PAGES * REPORTS_PAGE} groups of this commit`);
+    return notes;
+  } catch (e) {
+    return [`suites outside the watched ones not checked for failures (${String(e).slice(0, 160)})`];
+  }
 }
 
 export async function watch({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait }: WatchOptions): Promise<WatchResult> {
@@ -155,12 +217,20 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   // A lane the run did not report (not uploaded, or failed before reporting) can't be read, and its
   // first failures can't count toward a cross-lane break: say so instead of reading it as clean.
   for (const s of wanted) if (!suites.includes(s)) notes.push(`${s.name}: no ${trunk} report for this run; not read`);
+  const groupOf = (name: string): ReportGroup => groupsOfRun.find((g) => g.name === name && g.branch === trunk)!;
+  for (const s of suites) {
+    const read = String(groupOf(s.name).gh_run_attempt);
+    if (read !== String(attempt)) notes.push(`${s.name}: not re-run in attempt ${attempt}; read attempt ${read}`);
+  }
+  notes.push(...(await unwatchedFailures(fetchImpl, base, String(env.REPOSITORY), first.commit, env.GH_RUN_ID, attempt, trunk, wanted.map((s) => s.name))));
   // History for the suspect range ends with this run: later runs (a re-read of an old run, or one that
-  // finished meanwhile) could show a pass newer than this failure.
-  const ranAt = Math.max(
-    ...groupsOfRun.filter((g) => g.branch === trunk).flatMap((g) => [g.created_at, g.last_upload_at, g.orchestration?.durations?.last_test_at].map((t) => Date.parse(t ?? "") || 0)),
-  );
-  const until = new Date(Math.min(now.getTime(), ranAt > 0 ? ranAt + 60e3 : now.getTime())).toISOString();
+  // finished meanwhile) could show a pass newer than this failure. Per suite: one read at an earlier
+  // attempt ends where that attempt did, not where a later attempt's re-run of another suite did.
+  const untilOf = (name: string): string => {
+    const g = groupOf(name);
+    const ranAt = Math.max(...[g.created_at, g.last_upload_at, g.orchestration?.durations?.last_test_at].map((t) => Date.parse(t ?? "") || 0));
+    return new Date(Math.min(now.getTime(), ranAt > 0 ? ranAt + 60e3 : now.getTime())).toISOString();
+  };
   const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
   const maxBrokenPerRun = Number(env.MAX_BROKEN_PER_RUN || 10);
@@ -176,11 +246,12 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     let result: EvaluatedRun;
     try {
       result = await triage({
-        env: { COMPOSITE_IDENTITY: JSON.stringify({ ...id, name: s.name }), MODE: "report-only", TEST_ROOT: s.test_root, REPORT_NAME: s.report_name || "", TSIO_BASE_URL: base, GITHUB_TOKEN: env.GITHUB_TOKEN },
+        // The attempt that holds this suite's report, which an attempt that didn't re-run it leaves earlier.
+        env: { COMPOSITE_IDENTITY: JSON.stringify({ ...id, gh_run_attempt: String(groupOf(s.name).gh_run_attempt), name: s.name }), MODE: "report-only", TEST_ROOT: s.test_root, REPORT_NAME: s.report_name || "", TSIO_BASE_URL: base, GITHUB_TOKEN: env.GITHUB_TOKEN },
         // Classified against the history up to this run: a later trunk run must not decide this one's failures.
         fetchImpl,
         log,
-        now: new Date(until),
+        now: new Date(untilOf(s.name)),
         wait,
       });
     } catch (e) {
@@ -194,10 +265,10 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     bySuite.push({ suite: s.name, findings: result.findings });
     const found = selectRepairs(result, s.name);
     try {
-      const groupId = groupsOfRun.find((g) => g.name === s.name && g.branch === trunk)!.id;
+      const groupId = groupOf(s.name).id;
       const recovered = await retryRecovered(fetchImpl, base, groupId);
       if (recovered.length) {
-        const history = await fetchHistory(fetchImpl, base, id.repository, recovered, until, undefined, trunk, s.report_name || null, log, laneOf(s.name));
+        const history = await fetchHistory(fetchImpl, base, id.repository, recovered, untilOf(s.name), undefined, trunk, s.report_name || null, log, laneOf(s.name));
         found.push(...selectRetryFlakes(recovered, history, { suite: s.name, testRoot: s.test_root, branch: trunk, groupId }));
       }
     } catch (e) {
@@ -206,6 +277,9 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     for (const g of found) addGroup(groups, g);
   }
   for (const g of selectCrossLane(bySuite)) addGroup(groups, g);
+  const left = unselected(bySuite, new Set(groups.keys()));
+  for (const u of left.slice(0, MAX_UNSELECTED_NOTES)) notes.push(`${u.spec} › ${u.title} (${u.suite}): ${u.reason}`);
+  if (left.length > MAX_UNSELECTED_NOTES) notes.push(`${left.length - MAX_UNSELECTED_NOTES} more failing tests wait the same way`);
 
   const decisions: Decision[] = [];
   // What the workflow should send, each with the ledger entry `record` keeps once it is accepted.
@@ -227,12 +301,13 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   const skip = (g: Group, action: string): void => {
     decisions.push({ specs: [g.spec], kind: g.kind, tests: g.tests, action });
   };
-  // When each of the agent's PRs last had activity, from either read of them.
-  const activity = new Map<number, number | null>([
-    ...[...open.prs.values()].map((p): [number, number | null] => [p.number, p.activeAt]),
-    ...own.prs.map((p): [number, number | null] => [p.number, lastActivity(p)]),
+  // Each of the agent's PRs as the payload lists it, with when it was opened and last had activity, from either read of them.
+  const agentPR = new Map<number, OpenPR>([
+    ...own.prs.map((p): [number, OpenPR] => [p.number, { number: p.number, title: p.title ?? "", url: p.url, labels: [label], activeAt: lastActivity(p), openedAt: openedAt(p) }]),
+    ...[...open.prs.values()].map((p): [number, OpenPR] => [p.number, p]),
   ]);
-  const idleNoted = new Set<number>();
+  const daysSince = (at: number): number => Math.floor((now.getTime() - at) / DAY);
+  const staleNoted = new Set<number>();
   const candidates: (Group & { openPRs: OpenPR[] })[] = [];
   for (const g of groups.values()) {
     const prs = prsTouching(open.files, g.spec).flatMap((n) => {
@@ -243,15 +318,28 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     const agentPRs = [...new Set([...prsChanging(open.files, g.spec).filter((n) => open.prs.get(n)?.labels.includes(label)), ...prsChanging(own.files, g.spec)])].sort((a, b) => a - b);
     const ownPRs: number[] = [];
     for (const n of agentPRs) {
-      const at = activity.get(n) ?? null;
-      if (at != null && now.getTime() - at > OWN_PR_IDLE_MS) {
-        if (!idleNoted.has(n)) {
-          idleNoted.add(n);
-          notes.push(`stalled agent PR #${n} (idle ${Math.floor((now.getTime() - at) / DAY)} days): not blocking new requests`);
-        }
-      } else ownPRs.push(n);
+      const p = agentPR.get(n);
+      const opened = p?.openedAt ?? null;
+      const at = p?.activeAt ?? null;
+      const stale =
+        opened != null && now.getTime() - opened > OWN_PR_MAX_AGE_MS
+          ? `open ${daysSince(opened)} days with the spec still failing`
+          : at != null && now.getTime() - at > OWN_PR_IDLE_MS
+            ? `idle ${daysSince(at)} days`
+            : null;
+      if (!stale) {
+        ownPRs.push(n);
+        continue;
+      }
+      if (!staleNoted.has(n)) {
+        staleNoted.add(n);
+        notes.push(`stalled agent PR #${n} (${stale}): not blocking new requests`);
+      }
+      // Listed for the agent even when it has dropped out of the recent open PRs read.
+      if (p && !prs.some((x) => x.number === n)) prs.push(p);
     }
-    const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < HOLD_MS);
+    const holdMs = agentPRs.length && !ownPRs.length ? STALE_PR_HOLD_MS : HOLD_MS;
+    const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < holdMs);
     // Without the agent's own PRs a request may duplicate one it is already fixing: wait for the next run.
     if (ownUnknown) skip(g, "skipped: the agent's own PRs could not be read");
     else if (ownPRs.length) skip(g, `skipped: #${ownPRs.join(", #")} (${label}) already changes it`);
@@ -267,7 +355,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   const flaky = candidates.filter((g) => g.kind === "flaky").sort((a, b) => asked(a) - asked(b) || flakes(b) - flakes(a));
   const ranged: RangedGroup[] = [];
   for (const g of [...candidates.filter((c) => c.kind === "broken"), ...flaky.slice(0, Math.max(0, flakyLeft))]) {
-    const range = await specRange(fetchImpl, base, id, g, until, currentAt, log, reportNameOf);
+    const range = await specRange(fetchImpl, base, id, g, untilOf, currentAt, log, reportNameOf);
     // Without its history a break can't be bundled or held with its cause: wait for the next run.
     if (range.historyError) skip(g, `skipped: history unavailable (${range.historyError})`);
     else ranged.push({ ...g, ...range });

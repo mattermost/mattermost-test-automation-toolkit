@@ -10,13 +10,13 @@ import { test } from "node:test";
 import { identityKey } from "../../shared/src/tsio.ts";
 import type { FetchImpl } from "../../shared/src/github.ts";
 import type { RepairFinding } from "./select.ts";
-import { selectCrossLane, selectRepairs } from "./select.ts";
+import { selectCrossLane, selectRepairs, unselected } from "./select.ts";
 import { breakWindow, bundle, rangeOf, specRange, windowsOverlap } from "./range.ts";
 import type { RangedGroup, WatchId } from "./range.ts";
 import { prsTouching, specsInOpenPRs } from "./prs.ts";
 import type { RepairPR } from "./prs.ts";
 import { readLedger } from "./ledger.ts";
-import { record, runGroups, watch } from "./watch.ts";
+import { record, runGroups, unwatchedFailures, watch } from "./watch.ts";
 import type { FixPayload } from "./watch.ts";
 import type { GroupTest, RangeEnd, RunRow } from "./model.ts";
 
@@ -176,6 +176,12 @@ interface RouteOptions {
   reportName?: string | null;
   forkPRFiles?: string[];
   forkPRLabels?: string[];
+  // The attempt each lane's report is filed under (default "1").
+  attempts?: Record<string, string>;
+  // When each lane's last report arrived (default 2026-10-02T09:50:00Z).
+  uploadedAt?: Record<string, string>;
+  // Other report groups of the same commit: suites the caller doesn't watch, or another run's.
+  others?: { name: string; failed: number; runId?: string; attempt?: string }[];
 }
 
 interface HistoryBody {
@@ -203,6 +209,9 @@ function routes({
   reportName = null,
   forkPRFiles = [],
   forkPRLabels = [],
+  attempts = {},
+  uploadedAt = {},
+  others = [],
 }: RouteOptions): FetchImpl {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
   const retried = recovered ? ["v/e.spec.ts", "u/f.spec.ts"] : [];
@@ -230,13 +239,19 @@ function routes({
         ]
       : []),
   ];
-  const groups = lanes.map((name, n) => ({ id: `g${n + 1}`, repository: "o/r", branch, commit: "abc", name, gh_run_id: "12", gh_run_attempt: "1", status: "completed", created_at: "2026-10-02T09:30:00Z", last_upload_at: "2026-10-02T09:50:00Z" }));
+  const groups = lanes.map((name, n) => ({ id: `g${n + 1}`, repository: "o/r", branch, commit: "abc", name, gh_run_id: "12", gh_run_attempt: attempts[name] ?? "1", status: "completed", created_at: "2026-10-02T09:30:00Z", last_upload_at: uploadedAt[name] ?? "2026-10-02T09:50:00Z" }));
+  const otherGroups = others.map((o, n) => ({ id: `o${n + 1}`, repository: "o/r", branch, commit: "abc", name: o.name, gh_run_id: o.runId ?? "12", gh_run_attempt: o.attempt ?? "1", status: "completed", test_stats: { failed: o.failed } }));
   const laneOfGroup = (url: string): string => groups.find((g) => String(url).includes(`/reports/${g.id}/`))!.name;
   const table: [string, (init: RequestInit, url: string) => Response][] = [
     ["/reports?", (_init, url) => {
-      // Asked by suite name, as the watcher does; triage's own lookup adds the commit.
-      const name = new URL(String(url)).searchParams.get("name");
-      assert.ok(name, "reports are listed per suite name, not as the newest of the whole repository");
+      // Asked by suite name, as the watcher does; triage's own lookup adds the commit; the check for
+      // unwatched suites asks for the run's commit alone.
+      const params = new URL(String(url)).searchParams;
+      const name = params.get("name");
+      if (!name) {
+        assert.ok(params.get("commit"), "reports are listed per suite name or per commit, not as the newest of the whole repository");
+        return Response.json({ reports: [...groups.filter((g) => reported.includes(g.name)), ...otherGroups] });
+      }
       return Response.json({ reports: groups.filter((g) => g.name === name && reported.includes(name)) });
     }],
     ["/suites", () => Response.json({ suites: [...files, ...retried].map((file_path, i) => ({ id: `s${i}`, file_path, ...(reportName ? { report_name: `${reportName}-11.4` } : {}) })) })],
@@ -427,7 +442,7 @@ test("a lane failing first in this run makes this run the suspect range's end", 
   const finding: RepairFinding = { file: "x/a.spec.ts", title: "t1", error: "Error: expected visible", class: "REGRESSION", trunk: trunkOf(0, 0, 8) };
   const [group] = selectCrossLane(lanes.map((suite) => ({ suite, findings: [finding] })));
   const id: WatchId = { repository: "o/r", branch: "master", commit_sha: "c9", gh_run_id: "12", gh_run_attempt: "1" };
-  const { range } = await specRange(fetchImpl, "http://tsio", id, group, "2026-10-03T00:00:00Z", Date.parse("2026-10-02T09:00:00Z"), () => {}, new Map(lanes.map((l): [string, string | null] => [l, null])));
+  const { range } = await specRange(fetchImpl, "http://tsio", id, group, () => "2026-10-03T00:00:00Z", Date.parse("2026-10-02T09:00:00Z"), () => {}, new Map(lanes.map((l): [string, string | null] => [l, null])));
   assert.equal(range?.green.commit_sha, "c7");
   assert.equal(range?.red, null, "enterprise's first failure is this run, later than FIPS's c8");
 });
@@ -441,7 +456,7 @@ test("the suspect range covers every lane's break, ending at the latest lane's f
   const finding: RepairFinding = { file: "x/a.spec.ts", title: "t1", error: "Error: expected visible", class: "REGRESSION", trunk: trunkOf(0, 0, 8) };
   const [group] = selectCrossLane(lanes.map((suite) => ({ suite, findings: [finding] })));
   const id: WatchId = { repository: "o/r", branch: "master", commit_sha: "c9", gh_run_id: "12", gh_run_attempt: "1" };
-  const { range } = await specRange(fetchImpl, "http://tsio", id, group, "2026-10-03T00:00:00Z", Date.parse("2026-10-02T09:00:00Z"), () => {}, new Map(lanes.map((l): [string, string | null] => [l, null])));
+  const { range } = await specRange(fetchImpl, "http://tsio", id, group, () => "2026-10-03T00:00:00Z", Date.parse("2026-10-02T09:00:00Z"), () => {}, new Map(lanes.map((l): [string, string | null] => [l, null])));
   assert.deepEqual([range?.green.commit_sha, range?.red?.commit_sha], ["c6", "c8"], "the oldest green, the latest first failure");
 });
 
@@ -618,6 +633,54 @@ test("an agent PR idle for less than 3 days still blocks", async () => {
   assert.deepEqual(recent.notes, [], "not idle yet: nothing to name");
 });
 
+test("an agent PR open more than 2 days with its spec still failing no longer blocks, however active; the agent gets it to judge", async () => {
+  // Opened four days before the run, with review traffic an hour ago.
+  const stuck = ownPR(9, "specs/z/c.spec.ts", { createdAt: "2026-09-29T00:00:00Z" });
+  const hook: FixPayload[] = [];
+  const { decisions, notes } = await run({ env, fetchImpl: routes({ openPRFiles: [], repairPRs: [stuck] }), hook });
+  assert.deepEqual(decisions.map((d) => [d.specs.slice().sort(), d.action]), [[["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], "to request"]]);
+  assert.deepEqual(notes, ["stalled agent PR #9 (open 4 days with the spec still failing): not blocking new requests"]);
+  assert.deepEqual(asFix(hook[0]).open_prs_touching, [{ number: 9, title: "fix 9", url: "https://github.com/o/r/pull/9" }], "listed, though it is not among the recent open PRs read");
+
+  // Opened a day ago: still the agent's to finish.
+  const young = ownPR(9, "specs/z/c.spec.ts", { createdAt: "2026-10-02T00:00:00Z" });
+  const fresh = await run({ env, fetchImpl: routes({ openPRFiles: [], repairPRs: [young] }), hook: [] });
+  assert.deepEqual(fresh.decisions.map((d) => [d.specs, d.action]), [
+    [["specs/z/c.spec.ts"], "skipped: #9 (e2e-autofix) already changes it"],
+    [["specs/x/a.spec.ts", "specs/y/b.spec.ts"], "to request"],
+  ]);
+});
+
+test("a spec whose old agent PR no longer blocks is asked about every 3 days, not daily: a right fix in review keeps it failing too", async () => {
+  const LEDGER_PATH = ledgerPath();
+  // Only z/c has an agent PR; x/a and y/b keep the daily hold.
+  const stuck = ownPR(9, "specs/z/c.spec.ts", { createdAt: "2026-09-29T00:00:00Z" });
+  const fetchImpl = routes({ openPRFiles: [], repairPRs: [stuck] });
+  const hook: FixPayload[] = [];
+  const at = (h: number): Date => new Date(now.getTime() + h * 3600e3);
+  await run({ env: { ...env, LEDGER_PATH }, fetchImpl, hook });
+  assert.deepEqual(asFix(hook[0]).specs, ["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"]);
+  const nextDay = await run({ env: { ...env, LEDGER_PATH }, fetchImpl, now: at(25), hook });
+  assert.deepEqual(nextDay.decisions.map((d) => [d.specs, d.action]), [
+    [["specs/z/c.spec.ts"], "skipped: requested 2026-10-03 00:00 UTC by https://github.com/o/r/actions/runs/12"],
+    [["specs/x/a.spec.ts", "specs/y/b.spec.ts"], "to request"],
+  ]);
+  await run({ env: { ...env, LEDGER_PATH }, fetchImpl, now: at(73), hook });
+  assert.deepEqual(hook.map((p) => p.specs.includes("specs/z/c.spec.ts")), [true, false, true], "asked again after 3 days");
+});
+
+test("each suite's history ends with its own report: one a re-run left at attempt 1 is not read past it", async () => {
+  const untils: string[] = [];
+  const lanes = ["pw-master", "pw-fips-master"];
+  // Attempt 2 re-ran the enterprise lane hours after attempt 1 reported FIPS.
+  await run({
+    env: { ...env, GH_RUN_ATTEMPT: "2", SUITES: JSON.stringify(lanes.map(suite)) },
+    fetchImpl: routes({ lanes, openPRFiles: [], untils, attempts: { "pw-master": "2" }, uploadedAt: { "pw-master": "2026-10-02T15:00:00Z" } }),
+    hook: [],
+  });
+  assert.deepEqual([...new Set(untils)].sort(), ["2026-10-02T09:51:00.000Z", "2026-10-02T15:01:00.000Z"]);
+});
+
 test("the hold still limits duplicates for a spec whose agent PR is idle", async () => {
   const LEDGER_PATH = ledgerPath();
   writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "r" }] }));
@@ -722,6 +785,87 @@ test("the run's reports are found past the newest page of its suite", async () =
   const found = await runGroups(fetchImpl, "http://tsio", "o/r", "150", "1", ["pw-master"]);
   assert.deepEqual(found.map((g) => g.id), ["g150-0"]);
   assert.deepEqual(offsets, [0, 100], "it stops once the run is behind it");
+});
+
+test("a re-run attempt reads each suite at its newest attempt up to it: one it didn't re-run stays at the earlier one", async () => {
+  const group = (name: string, attempt: string) => ({ id: `${name}-${attempt}`, name, gh_run_id: "150", gh_run_attempt: attempt, branch: "master" });
+  // ent was re-run in attempt 2; fips was not; attempt 3 of ent is newer than the attempt asked for.
+  const reports = [group("ent", "3"), group("ent", "2"), group("ent", "1"), group("fips", "1"), { ...group("ent", "1"), gh_run_id: "149", id: "older" }];
+  const fetchImpl: FetchImpl = async (url) => Response.json({ reports: reports.filter((g) => g.name === new URL(String(url)).searchParams.get("name")) });
+  assert.deepEqual((await runGroups(fetchImpl, "http://tsio", "o/r", "150", "2", ["ent", "fips"])).map((g) => g.id), ["ent-2", "fips-1"]);
+  assert.deepEqual((await runGroups(fetchImpl, "http://tsio", "o/r", "150", "1", ["ent", "fips"])).map((g) => g.id), ["ent-1", "fips-1"]);
+
+  // A whole trunk run whose attempt 2 re-ran other jobs: the Playwright lane is read from attempt 1.
+  const hook: FixPayload[] = [];
+  const { decisions, notes } = await run({ env: { ...env, GH_RUN_ATTEMPT: "2" }, fetchImpl: routes({}), hook });
+  assert.deepEqual(decisions.map((d) => d.action), ["skipped: #41 (e2e-autofix) already changes it", "to request"]);
+  assert.deepEqual(notes, ["pw-master: not re-run in attempt 2; read attempt 1"]);
+});
+
+test("a suite the caller doesn't watch that failed in this run is named, so a red run with no request says why", async () => {
+  const { notes } = await run({
+    env,
+    fetchImpl: routes({
+      others: [
+        { name: "cy-master", failed: 3 },
+        { name: "pw-upgrade-master", failed: 0 },
+        { name: "cy-master-other", failed: 5, runId: "11" }, // another run of the commit
+      ],
+    }),
+    hook: [],
+  });
+  assert.deepEqual(notes, ["cy-master: 3 failed in this run; not watched, so not requested"]);
+
+  // A subpath lane failed in attempt 1 and passed in its re-run, attempt 2: each attempt's watch names its own count.
+  const subpath = [{ name: "pw-subpath-master", failed: 2, attempt: "1" }, { name: "pw-subpath-master", failed: 0, attempt: "2" }];
+  const first = await run({ env, fetchImpl: routes({ others: subpath }), hook: [] });
+  assert.deepEqual(first.notes, ["pw-subpath-master: 2 failed in this run; not watched, so not requested"], "attempt 1's failure, though attempt 2 has passed since");
+  const second = await run({ env: { ...env, GH_RUN_ATTEMPT: "2" }, fetchImpl: routes({ others: subpath }), hook: [] });
+  assert.deepEqual(second.notes, ["pw-master: not re-run in attempt 2; read attempt 1"], "the re-run passed: nothing to name");
+
+  // TSIO down for that read: the run still plans, and says what it couldn't check.
+  const base = routes({});
+  const flaky: FetchImpl = async (url, init) => (String(url).includes("/reports?") && !new URL(String(url)).searchParams.get("name") ? new Response("down", { status: 503 }) : base(url, init));
+  const down = await run({ env, fetchImpl: flaky, hook: [] });
+  assert.equal(down.decisions.at(-1)?.action, "to request");
+  assert.match(down.notes[0], /^suites outside the watched ones not checked for failures/);
+});
+
+test("the check for unwatched suites reads every page of the commit's groups, and says when it stopped short", async () => {
+  const group = (i: number, failed: number) => ({ id: `u${i}`, name: `lane-${i}`, gh_run_id: i === 150 ? "12" : "11", gh_run_attempt: "1", branch: "master", test_stats: { failed } });
+  // The run's failing lane is on the second page; the rest belong to other runs of the commit.
+  const rows = [...Array(230)].map((_, i) => group(i, i === 150 ? 4 : 1));
+  const offsets: number[] = [];
+  const fetchImpl: FetchImpl = async (url) => {
+    const offset = Number(new URL(String(url)).searchParams.get("offset"));
+    offsets.push(offset);
+    return Response.json({ reports: rows.slice(offset, offset + 100) });
+  };
+  assert.deepEqual(await unwatchedFailures(fetchImpl, "http://tsio", "o/r", "abc", "12", "1", "master", []), ["lane-150: 4 failed in this run; not watched, so not requested"]);
+  assert.deepEqual(offsets, [0, 100, 200]);
+
+  const endless: FetchImpl = async () => Response.json({ reports: [...Array(100)].map((_, i) => group(i, 0)) });
+  assert.deepEqual(await unwatchedFailures(endless, "http://tsio", "o/r", "abc", "12", "1", "master", []), ["suites outside the watched ones checked only in the newest 500 groups of this commit"]);
+});
+
+test("failing tests no request covers are named with why they wait", async () => {
+  const lanes = ["pw-master", "pw-fips-master"];
+  const { notes } = await run({
+    env: { ...env, SUITES: JSON.stringify(lanes.map(suite)) },
+    fetchImpl: routes({ lanes, openPRFiles: [], firstFailure: true, failIn: { "x/a.spec.ts": lanes, "y/b.spec.ts": ["pw-master"], "z/c.spec.ts": [] } }),
+    hook: [],
+  });
+  assert.deepEqual(notes, ["specs/y/b.spec.ts › t1 (pw-master): first failure, in pw-master only; requested if it fails again"], "x/a failed in both lanes and is requested: not named");
+
+  const f = (over: Partial<RepairFinding>): RepairFinding => finding({ trunk: trunkOf(0, 0, 8), ...over });
+  const left = unselected(
+    [{ suite: "ent", findings: [f({ title: "same", class: "BROKEN_ON_TRUNK", identity_unresolved: true }), f({ title: "once", class: "FLAKY_ON_TRUNK", file: "b.spec.ts", repo_path: "specs/b.spec.ts" }), f({ title: "infra", class: "INFRA_ERROR", file: "c.spec.ts", repo_path: "specs/c.spec.ts" }), f({ title: "picked", file: "d.spec.ts", repo_path: "specs/d.spec.ts" })] }],
+    new Set(["specs/d.spec.ts"]),
+  );
+  assert.deepEqual(left.map((u) => [u.spec, u.title, u.reason]), [
+    ["specs/a.spec.ts", "same", "shares its name with another test, so its history can't be read"],
+    ["specs/b.spec.ts", "once", "first flake on trunk; requested if it flakes again"],
+  ], "an environment error is the lane's to re-run, and a spec already requested needs no note");
 });
 
 test("a run with no reports says so in the job summary", async () => {

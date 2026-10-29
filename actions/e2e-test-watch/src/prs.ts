@@ -6,13 +6,14 @@ import { HOUR } from "./model.ts";
 
 export const DEFAULT_LABEL = "e2e-autofix";
 
-/** One open PR as the watch reads it: its number, title, URL, labels, and when it last had activity (ms; null when unknown). */
+/** One open PR as the watch reads it: its number, title, URL, labels, and when it was opened and last had activity (ms; null when unknown). */
 export interface OpenPR {
   number: number;
   title: string;
   url: string;
   labels: string[];
   activeAt: number | null;
+  openedAt: number | null;
 }
 
 /** Open PRs into trunk: `files` maps each changed path to PR numbers, `prs` a number to its OpenPR. */
@@ -22,8 +23,9 @@ export interface OpenPRs {
   truncated?: boolean;
 }
 
-/** A PR's activity as GitHub reports it: its last update, and its last commit. */
+/** A PR's activity as GitHub reports it: when it was opened, its last update, and its last commit. */
 export interface PRActivity {
+  createdAt?: string | null;
   updatedAt?: string | null;
   commits?: { nodes?: { commit?: { committedDate?: string | null } | null }[] | null } | null;
 }
@@ -61,6 +63,7 @@ interface OpenPRPage {
         title: string;
         url: string;
         baseRefName: string;
+        createdAt?: string | null;
         updatedAt: string;
         isCrossRepository: boolean;
         commits?: PRActivity["commits"];
@@ -84,11 +87,16 @@ export function lastActivity(p: PRActivity): number | null {
   return Math.max(0, ...times) || null;
 }
 
+/** When a PR was opened, in ms. Null when GitHub didn't say. */
+export function openedAt(p: PRActivity): number | null {
+  return Date.parse(p.createdAt ?? "") || null;
+}
+
 const OPEN_PRS = `query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, first: 50, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { number title url baseRefName updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
+      nodes { number title url baseRefName createdAt updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
     }
   }
 }`;
@@ -122,7 +130,7 @@ export async function specsInOpenPRs(
       if (p.isCrossRepository !== false) continue;
       // A PR into another branch (a release cherry-pick) changes nothing on trunk.
       if (base && p.baseRefName !== base) continue;
-      prs.set(p.number, { number: p.number, title: p.title, url: p.url, labels: (p.labels?.nodes ?? []).map((l) => l.name), activeAt: lastActivity(p) });
+      prs.set(p.number, { number: p.number, title: p.title, url: p.url, labels: (p.labels?.nodes ?? []).map((l) => l.name), activeAt: lastActivity(p), openedAt: openedAt(p) });
       for (const f of p.files.nodes) add(f.path, p.number);
       // Over 100 files: the rest from REST, up to 300 in all.
       for (let filesPage = 2; p.files.pageInfo.hasNextPage && filesPage <= 3; filesPage++) {
@@ -157,7 +165,7 @@ export function prsChanging(touched: Map<string, number[]>, spec: string): numbe
 const REPAIR_PRS = `query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 50, after: $after) {
     pageInfo { hasNextPage endCursor }
-    nodes { ... on PullRequest { number title url baseRefName headRefName headRefOid updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } files(first: 100) { nodes { path } } } }
+    nodes { ... on PullRequest { number title url baseRefName headRefName headRefOid createdAt updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } files(first: 100) { nodes { path } } } }
   }
 }`;
 

@@ -24,13 +24,22 @@ suspect commits overlap a request sent in the last `cause-hold-hours` (4) waits 
 that agent's PR instead of getting a second request.
 
 A spec is not requested within 24 hours of its last request, or while one of the
-agent's own PRs (its `label`) changes that exact file and was active in the last 3
-days; if those PRs can't be read, nothing is requested. Other open PRs that change it
+agent's own PRs (its `label`) changes that exact file, was opened in the last 2 days
+and was active in the last 3; if those PRs can't be read, nothing is requested. An
+older (or idle) agent PR whose spec still fails stops blocking it, however much
+review it gets: the spec is requested again, at most every 3 days, with that PR in
+`open_prs_touching` for the agent to judge. Other open PRs that change it
 go to the agent as `open_prs_touching`; fork PRs are dropped on read. Breaks all go
 out at once (`max-broken-per-run` is only a safety limit); flaky specs share
 `max-flaky-per-day`, those not requested this week first. The agent's PRs that
 later conflict with trunk are left to the PR's own automation (e.g. an
 `AI/ConflictsBabysit` label in `extra-labels`).
+
+A re-run attempt re-runs only the failed jobs, so each suite is read at its newest
+attempt up to `gh-run-attempt`. The job summary also names what no request covers:
+failing tests that wait (a first failure in one lane, a first flake, a name two tests
+share), and suites outside `suites` that failed in the run (another framework, a
+subpath or upgrade lane). Add a suite to `suites` only when the agent can reproduce it.
 
 The action never calls the agent: it writes `requests-file` (`[{"id", "payload"}]`),
 the caller sends each payload with its own credentials, and [`record`](record/action.yml)
