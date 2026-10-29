@@ -121,7 +121,8 @@ export async function specRange(
   base: string,
   id: WatchId,
   group: Group,
-  until: string,
+  // Where each suite's history ends: that suite's run, which a re-run attempt can leave earlier than another's.
+  untilOf: (suite: string) => string,
   currentAt: number,
   log: (message: string) => void,
   reportNameOf: ReadonlyMap<string, string | null> = new Map(),
@@ -138,7 +139,7 @@ export async function specRange(
     }
     const parts: { range: SuspectRange | null; window: BreakWindow | null }[] = [];
     for (const [suite, tests] of bySuite) {
-      const history = await fetchHistory(fetchImpl, base, id.repository, tests, until, undefined, id.branch, reportNameOf.get(suite) ?? null, log, laneOf(suite));
+      const history = await fetchHistory(fetchImpl, base, id.repository, tests, untilOf(suite), undefined, id.branch, reportNameOf.get(suite) ?? null, log, laneOf(suite));
       parts.push({ range: rangeOf(history, tests, id.branch), window: group.kind === "broken" ? breakWindow(history, tests, id.branch, currentAt) : null });
     }
     return { range: combineRanges(parts.map((p) => p.range)), window: combineWindows(parts.map((p) => p.window)) };

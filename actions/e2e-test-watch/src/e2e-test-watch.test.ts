@@ -16,7 +16,7 @@ import type { RangedGroup, WatchId } from "./range.ts";
 import { prsTouching, specsInOpenPRs } from "./prs.ts";
 import type { RepairPR } from "./prs.ts";
 import { readLedger } from "./ledger.ts";
-import { record, runGroups, watch } from "./watch.ts";
+import { record, runGroups, unwatchedFailures, watch } from "./watch.ts";
 import type { FixPayload } from "./watch.ts";
 import type { GroupTest, RangeEnd, RunRow } from "./model.ts";
 
@@ -178,6 +178,8 @@ interface RouteOptions {
   forkPRLabels?: string[];
   // The attempt each lane's report is filed under (default "1").
   attempts?: Record<string, string>;
+  // When each lane's last report arrived (default 2026-10-02T09:50:00Z).
+  uploadedAt?: Record<string, string>;
   // Other report groups of the same commit: suites the caller doesn't watch, or another run's.
   others?: { name: string; failed: number; runId?: string; attempt?: string }[];
 }
@@ -208,6 +210,7 @@ function routes({
   forkPRFiles = [],
   forkPRLabels = [],
   attempts = {},
+  uploadedAt = {},
   others = [],
 }: RouteOptions): FetchImpl {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
@@ -236,7 +239,7 @@ function routes({
         ]
       : []),
   ];
-  const groups = lanes.map((name, n) => ({ id: `g${n + 1}`, repository: "o/r", branch, commit: "abc", name, gh_run_id: "12", gh_run_attempt: attempts[name] ?? "1", status: "completed", created_at: "2026-10-02T09:30:00Z", last_upload_at: "2026-10-02T09:50:00Z" }));
+  const groups = lanes.map((name, n) => ({ id: `g${n + 1}`, repository: "o/r", branch, commit: "abc", name, gh_run_id: "12", gh_run_attempt: attempts[name] ?? "1", status: "completed", created_at: "2026-10-02T09:30:00Z", last_upload_at: uploadedAt[name] ?? "2026-10-02T09:50:00Z" }));
   const otherGroups = others.map((o, n) => ({ id: `o${n + 1}`, repository: "o/r", branch, commit: "abc", name: o.name, gh_run_id: o.runId ?? "12", gh_run_attempt: o.attempt ?? "1", status: "completed", test_stats: { failed: o.failed } }));
   const laneOfGroup = (url: string): string => groups.find((g) => String(url).includes(`/reports/${g.id}/`))!.name;
   const table: [string, (init: RequestInit, url: string) => Response][] = [
@@ -439,7 +442,7 @@ test("a lane failing first in this run makes this run the suspect range's end", 
   const finding: RepairFinding = { file: "x/a.spec.ts", title: "t1", error: "Error: expected visible", class: "REGRESSION", trunk: trunkOf(0, 0, 8) };
   const [group] = selectCrossLane(lanes.map((suite) => ({ suite, findings: [finding] })));
   const id: WatchId = { repository: "o/r", branch: "master", commit_sha: "c9", gh_run_id: "12", gh_run_attempt: "1" };
-  const { range } = await specRange(fetchImpl, "http://tsio", id, group, "2026-10-03T00:00:00Z", Date.parse("2026-10-02T09:00:00Z"), () => {}, new Map(lanes.map((l): [string, string | null] => [l, null])));
+  const { range } = await specRange(fetchImpl, "http://tsio", id, group, () => "2026-10-03T00:00:00Z", Date.parse("2026-10-02T09:00:00Z"), () => {}, new Map(lanes.map((l): [string, string | null] => [l, null])));
   assert.equal(range?.green.commit_sha, "c7");
   assert.equal(range?.red, null, "enterprise's first failure is this run, later than FIPS's c8");
 });
@@ -453,7 +456,7 @@ test("the suspect range covers every lane's break, ending at the latest lane's f
   const finding: RepairFinding = { file: "x/a.spec.ts", title: "t1", error: "Error: expected visible", class: "REGRESSION", trunk: trunkOf(0, 0, 8) };
   const [group] = selectCrossLane(lanes.map((suite) => ({ suite, findings: [finding] })));
   const id: WatchId = { repository: "o/r", branch: "master", commit_sha: "c9", gh_run_id: "12", gh_run_attempt: "1" };
-  const { range } = await specRange(fetchImpl, "http://tsio", id, group, "2026-10-03T00:00:00Z", Date.parse("2026-10-02T09:00:00Z"), () => {}, new Map(lanes.map((l): [string, string | null] => [l, null])));
+  const { range } = await specRange(fetchImpl, "http://tsio", id, group, () => "2026-10-03T00:00:00Z", Date.parse("2026-10-02T09:00:00Z"), () => {}, new Map(lanes.map((l): [string, string | null] => [l, null])));
   assert.deepEqual([range?.green.commit_sha, range?.red?.commit_sha], ["c6", "c8"], "the oldest green, the latest first failure");
 });
 
@@ -648,14 +651,34 @@ test("an agent PR open more than 2 days with its spec still failing no longer bl
   ]);
 });
 
-test("a spec whose old agent PR no longer blocks is still asked about at most once a day", async () => {
+test("a spec whose old agent PR no longer blocks is asked about every 3 days, not daily: a right fix in review keeps it failing too", async () => {
   const LEDGER_PATH = ledgerPath();
+  // Only z/c has an agent PR; x/a and y/b keep the daily hold.
   const stuck = ownPR(9, "specs/z/c.spec.ts", { createdAt: "2026-09-29T00:00:00Z" });
+  const fetchImpl = routes({ openPRFiles: [], repairPRs: [stuck] });
   const hook: FixPayload[] = [];
-  await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], repairPRs: [stuck] }), hook });
-  const later = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], repairPRs: [stuck] }), now: new Date(now.getTime() + 3600e3), hook });
-  assert.equal(hook.length, 1);
-  assert.ok(later.decisions.every((d) => d.action.startsWith("skipped: requested 2026-10-03 00:00 UTC")));
+  const at = (h: number): Date => new Date(now.getTime() + h * 3600e3);
+  await run({ env: { ...env, LEDGER_PATH }, fetchImpl, hook });
+  assert.deepEqual(asFix(hook[0]).specs, ["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"]);
+  const nextDay = await run({ env: { ...env, LEDGER_PATH }, fetchImpl, now: at(25), hook });
+  assert.deepEqual(nextDay.decisions.map((d) => [d.specs, d.action]), [
+    [["specs/z/c.spec.ts"], "skipped: requested 2026-10-03 00:00 UTC by https://github.com/o/r/actions/runs/12"],
+    [["specs/x/a.spec.ts", "specs/y/b.spec.ts"], "to request"],
+  ]);
+  await run({ env: { ...env, LEDGER_PATH }, fetchImpl, now: at(73), hook });
+  assert.deepEqual(hook.map((p) => p.specs.includes("specs/z/c.spec.ts")), [true, false, true], "asked again after 3 days");
+});
+
+test("each suite's history ends with its own report: one a re-run left at attempt 1 is not read past it", async () => {
+  const untils: string[] = [];
+  const lanes = ["pw-master", "pw-fips-master"];
+  // Attempt 2 re-ran the enterprise lane hours after attempt 1 reported FIPS.
+  await run({
+    env: { ...env, GH_RUN_ATTEMPT: "2", SUITES: JSON.stringify(lanes.map(suite)) },
+    fetchImpl: routes({ lanes, openPRFiles: [], untils, attempts: { "pw-master": "2" }, uploadedAt: { "pw-master": "2026-10-02T15:00:00Z" } }),
+    hook: [],
+  });
+  assert.deepEqual([...new Set(untils)].sort(), ["2026-10-02T09:51:00.000Z", "2026-10-02T15:01:00.000Z"]);
 });
 
 test("the hold still limits duplicates for a spec whose agent PR is idle", async () => {
@@ -806,6 +829,23 @@ test("a suite the caller doesn't watch that failed in this run is named, so a re
   const down = await run({ env, fetchImpl: flaky, hook: [] });
   assert.equal(down.decisions.at(-1)?.action, "to request");
   assert.match(down.notes[0], /^suites outside the watched ones not checked for failures/);
+});
+
+test("the check for unwatched suites reads every page of the commit's groups, and says when it stopped short", async () => {
+  const group = (i: number, failed: number) => ({ id: `u${i}`, name: `lane-${i}`, gh_run_id: i === 150 ? "12" : "11", gh_run_attempt: "1", branch: "master", test_stats: { failed } });
+  // The run's failing lane is on the second page; the rest belong to other runs of the commit.
+  const rows = [...Array(230)].map((_, i) => group(i, i === 150 ? 4 : 1));
+  const offsets: number[] = [];
+  const fetchImpl: FetchImpl = async (url) => {
+    const offset = Number(new URL(String(url)).searchParams.get("offset"));
+    offsets.push(offset);
+    return Response.json({ reports: rows.slice(offset, offset + 100) });
+  };
+  assert.deepEqual(await unwatchedFailures(fetchImpl, "http://tsio", "o/r", "abc", "12", "1", "master", []), ["lane-150: 4 failed in this run; not watched, so not requested"]);
+  assert.deepEqual(offsets, [0, 100, 200]);
+
+  const endless: FetchImpl = async () => Response.json({ reports: [...Array(100)].map((_, i) => group(i, 0)) });
+  assert.deepEqual(await unwatchedFailures(endless, "http://tsio", "o/r", "abc", "12", "1", "master", []), ["suites outside the watched ones checked only in the newest 500 groups of this commit"]);
 });
 
 test("failing tests no request covers are named with why they wait", async () => {

@@ -3538,7 +3538,7 @@ function combineWindows(windows) {
   if (!known.length) return null;
   return { from: Math.min(...known.map((w) => w.from)), to: Math.max(...known.map((w) => w.to)) };
 }
-async function specRange(fetchImpl, base, id, group, until, currentAt, log, reportNameOf = /* @__PURE__ */ new Map()) {
+async function specRange(fetchImpl, base, id, group, untilOf, currentAt, log, reportNameOf = /* @__PURE__ */ new Map()) {
   try {
     const bySuite = /* @__PURE__ */ new Map();
     for (const t of group.tests) {
@@ -3551,7 +3551,7 @@ async function specRange(fetchImpl, base, id, group, until, currentAt, log, repo
     }
     const parts = [];
     for (const [suite, tests] of bySuite) {
-      const history = await fetchHistory(fetchImpl, base, id.repository, tests, until, void 0, id.branch, reportNameOf.get(suite) ?? null, log, laneOf(suite));
+      const history = await fetchHistory(fetchImpl, base, id.repository, tests, untilOf(suite), void 0, id.branch, reportNameOf.get(suite) ?? null, log, laneOf(suite));
       parts.push({ range: rangeOf(history, tests, id.branch), window: group.kind === "broken" ? breakWindow(history, tests, id.branch, currentAt) : null });
     }
     return { range: combineRanges(parts.map((p) => p.range)), window: combineWindows(parts.map((p) => p.window)) };
@@ -3636,6 +3636,7 @@ var MAX_UNSELECTED_NOTES = 10;
 var HOLD_MS = 24 * HOUR;
 var OWN_PR_IDLE_MS = 3 * DAY;
 var OWN_PR_MAX_AGE_MS = 2 * DAY;
+var STALE_PR_HOLD_MS = 3 * DAY;
 var REPORTS_PAGE = 100;
 var REPORTS_MAX_PAGES = 5;
 async function runGroups(fetchImpl, base, repository, runId, attempt, names) {
@@ -3659,8 +3660,14 @@ async function runGroups(fetchImpl, base, repository, runId, attempt, names) {
 }
 async function unwatchedFailures(fetchImpl, base, repository, commit, runId, attempt, trunk, watched) {
   try {
-    const query = new URLSearchParams({ repository, commit, limit: String(REPORTS_PAGE) });
-    const { reports = [] } = await tsioJson(fetchImpl, base, `/reports?${query}`);
+    const reports = [];
+    let complete = false;
+    for (let page = 0; page < REPORTS_MAX_PAGES && !complete; page++) {
+      const query = new URLSearchParams({ repository, commit, limit: String(REPORTS_PAGE), offset: String(page * REPORTS_PAGE) });
+      const { reports: rows = [] } = await tsioJson(fetchImpl, base, `/reports?${query}`);
+      reports.push(...rows);
+      complete = rows.length < REPORTS_PAGE;
+    }
     const latest = /* @__PURE__ */ new Map();
     for (const g of reports) {
       if (String(g.gh_run_id) !== String(runId) || g.branch !== trunk || watched.includes(g.name)) continue;
@@ -3668,7 +3675,9 @@ async function unwatchedFailures(fetchImpl, base, repository, commit, runId, att
       const prev = latest.get(g.name);
       if (!prev || Number(g.gh_run_attempt) > Number(prev.gh_run_attempt)) latest.set(g.name, g);
     }
-    return [...latest.values()].filter((g) => Number(g.test_stats?.failed) > 0).sort((a, b) => a.name.localeCompare(b.name)).map((g) => `${g.name}: ${g.test_stats?.failed} failed in this run; not watched, so not requested`);
+    const notes = [...latest.values()].filter((g) => Number(g.test_stats?.failed) > 0).sort((a, b) => a.name.localeCompare(b.name)).map((g) => `${g.name}: ${g.test_stats?.failed} failed in this run; not watched, so not requested`);
+    if (!complete) notes.push(`suites outside the watched ones checked only in the newest ${REPORTS_MAX_PAGES * REPORTS_PAGE} groups of this commit`);
+    return notes;
   } catch (e) {
     return [`suites outside the watched ones not checked for failures (${String(e).slice(0, 160)})`];
   }
@@ -3701,10 +3710,11 @@ ${note}; nothing to watch.
     if (read !== String(attempt)) notes.push(`${s.name}: not re-run in attempt ${attempt}; read attempt ${read}`);
   }
   notes.push(...await unwatchedFailures(fetchImpl, base, String(env.REPOSITORY), first.commit, env.GH_RUN_ID, attempt, trunk, wanted.map((s) => s.name)));
-  const ranAt = Math.max(
-    ...groupsOfRun.filter((g) => g.branch === trunk).flatMap((g) => [g.created_at, g.last_upload_at, g.orchestration?.durations?.last_test_at].map((t) => Date.parse(t ?? "") || 0))
-  );
-  const until = new Date(Math.min(now.getTime(), ranAt > 0 ? ranAt + 6e4 : now.getTime())).toISOString();
+  const untilOf = (name) => {
+    const g = groupOf(name);
+    const ranAt = Math.max(...[g.created_at, g.last_upload_at, g.orchestration?.durations?.last_test_at].map((t) => Date.parse(t ?? "") || 0));
+    return new Date(Math.min(now.getTime(), ranAt > 0 ? ranAt + 6e4 : now.getTime())).toISOString();
+  };
   const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
   const maxBrokenPerRun = Number(env.MAX_BROKEN_PER_RUN || 10);
@@ -3724,7 +3734,7 @@ ${note}; nothing to watch.
         // Classified against the history up to this run: a later trunk run must not decide this one's failures.
         fetchImpl,
         log,
-        now: new Date(until),
+        now: new Date(untilOf(s.name)),
         wait
       });
     } catch (e) {
@@ -3741,7 +3751,7 @@ ${note}; nothing to watch.
       const groupId = groupOf(s.name).id;
       const recovered = await retryRecovered(fetchImpl, base, groupId);
       if (recovered.length) {
-        const history = await fetchHistory(fetchImpl, base, id.repository, recovered, until, void 0, trunk, s.report_name || null, log, laneOf(s.name));
+        const history = await fetchHistory(fetchImpl, base, id.repository, recovered, untilOf(s.name), void 0, trunk, s.report_name || null, log, laneOf(s.name));
         found.push(...selectRetryFlakes(recovered, history, { suite: s.name, testRoot: s.test_root, branch: trunk, groupId }));
       }
     } catch (e) {
@@ -3800,7 +3810,8 @@ ${note}; nothing to watch.
       }
       if (p && !prs.some((x) => x.number === n)) prs.push(p);
     }
-    const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < HOLD_MS);
+    const holdMs = agentPRs.length && !ownPRs.length ? STALE_PR_HOLD_MS : HOLD_MS;
+    const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < holdMs);
     if (ownUnknown) skip(g, "skipped: the agent's own PRs could not be read");
     else if (ownPRs.length) skip(g, `skipped: #${ownPRs.join(", #")} (${label}) already changes it`);
     else if (held) skip(g, `skipped: requested ${utcMinute(held.at)} UTC by ${held.run}`);
@@ -3811,7 +3822,7 @@ ${note}; nothing to watch.
   const flaky = candidates.filter((g) => g.kind === "flaky").sort((a, b) => asked(a) - asked(b) || flakes(b) - flakes(a));
   const ranged = [];
   for (const g of [...candidates.filter((c) => c.kind === "broken"), ...flaky.slice(0, Math.max(0, flakyLeft))]) {
-    const range = await specRange(fetchImpl, base, id, g, until, currentAt, log, reportNameOf);
+    const range = await specRange(fetchImpl, base, id, g, untilOf, currentAt, log, reportNameOf);
     if (range.historyError) skip(g, `skipped: history unavailable (${range.historyError})`);
     else ranged.push({ ...g, ...range });
   }

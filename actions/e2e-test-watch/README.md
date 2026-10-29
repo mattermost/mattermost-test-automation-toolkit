@@ -26,9 +26,9 @@ that agent's PR instead of getting a second request.
 A spec is not requested within 24 hours of its last request, or while one of the
 agent's own PRs (its `label`) changes that exact file, was opened in the last 2 days
 and was active in the last 3; if those PRs can't be read, nothing is requested. An
-older agent PR whose spec still fails stops blocking it, however much review it gets:
-the spec is requested again, with that PR in `open_prs_touching` for the agent to
-judge. Other open PRs that change it
+older (or idle) agent PR whose spec still fails stops blocking it, however much
+review it gets: the spec is requested again, at most every 3 days, with that PR in
+`open_prs_touching` for the agent to judge. Other open PRs that change it
 go to the agent as `open_prs_touching`; fork PRs are dropped on read. Breaks all go
 out at once (`max-broken-per-run` is only a safety limit); flaky specs share
 `max-flaky-per-day`, those not requested this week first. The agent's PRs that
