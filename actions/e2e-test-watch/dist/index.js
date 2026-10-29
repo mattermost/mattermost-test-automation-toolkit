@@ -3266,11 +3266,14 @@ function lastActivity(p) {
   const times = [p.updatedAt, ...(p.commits?.nodes ?? []).map((n) => n.commit?.committedDate)].map((t) => Date.parse(t ?? "") || 0);
   return Math.max(0, ...times) || null;
 }
+function openedAt(p) {
+  return Date.parse(p.createdAt ?? "") || null;
+}
 var OPEN_PRS = `query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, first: 50, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { number title url baseRefName updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
+      nodes { number title url baseRefName createdAt updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
     }
   }
 }`;
@@ -3292,7 +3295,7 @@ async function specsInOpenPRs(api, repository, { days = 14, now = /* @__PURE__ *
       if (Date.parse(p.updatedAt) < since) return result;
       if (p.isCrossRepository !== false) continue;
       if (base && p.baseRefName !== base) continue;
-      prs.set(p.number, { number: p.number, title: p.title, url: p.url, labels: (p.labels?.nodes ?? []).map((l) => l.name), activeAt: lastActivity(p) });
+      prs.set(p.number, { number: p.number, title: p.title, url: p.url, labels: (p.labels?.nodes ?? []).map((l) => l.name), activeAt: lastActivity(p), openedAt: openedAt(p) });
       for (const f of p.files.nodes) add(f.path, p.number);
       for (let filesPage = 2; p.files.pageInfo.hasNextPage && filesPage <= 3; filesPage++) {
         const files = await api("GET", `/repos/${repository}/pulls/${p.number}/files?per_page=100&page=${filesPage}`);
@@ -3321,7 +3324,7 @@ function prsChanging(touched, spec) {
 var REPAIR_PRS = `query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 50, after: $after) {
     pageInfo { hasNextPage endCursor }
-    nodes { ... on PullRequest { number title url baseRefName headRefName headRefOid updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } files(first: 100) { nodes { path } } } }
+    nodes { ... on PullRequest { number title url baseRefName headRefName headRefOid createdAt updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } files(first: 100) { nodes { path } } } }
   }
 }`;
 async function repairPRs(api, repository, label = DEFAULT_LABEL, { base = null, maxPages = 10 } = {}) {
@@ -3437,6 +3440,19 @@ function selectCrossLane(bySuite) {
     }
   }
   return [...bySpec.values()];
+}
+var REPAIRABLE = /* @__PURE__ */ new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", ...FIRST_FAILURE]);
+function unselected(bySuite, selected) {
+  const out = [];
+  for (const { suite, findings } of bySuite) {
+    for (const f of findings) {
+      const spec = specOf(f);
+      if (selected.has(spec) || !REPAIRABLE.has(f.class)) continue;
+      const reason = f.identity_unresolved ? "shares its name with another test, so its history can't be read" : FIRST_FAILURE.has(f.class) ? `first failure, in ${suite} only; requested if it fails again` : f.class === "FLAKY_ON_TRUNK" ? "first flake on trunk; requested if it flakes again" : null;
+      if (reason) out.push({ spec, suite, title: f.full_title || f.title, reason });
+    }
+  }
+  return out;
 }
 function addGroup(groups, g) {
   const prev = groups.get(g.spec);
@@ -3616,23 +3632,46 @@ function bundle(groups) {
 // src/watch.ts
 var MAX_TESTS = 40;
 var MAX_OPEN_PRS_TOUCHING = 10;
+var MAX_UNSELECTED_NOTES = 10;
 var HOLD_MS = 24 * HOUR;
 var OWN_PR_IDLE_MS = 3 * DAY;
+var OWN_PR_MAX_AGE_MS = 2 * DAY;
 var REPORTS_PAGE = 100;
 var REPORTS_MAX_PAGES = 5;
 async function runGroups(fetchImpl, base, repository, runId, attempt, names) {
   const groups = [];
-  const ofRun = (g) => String(g.gh_run_id) === String(runId) && String(g.gh_run_attempt) === String(attempt);
+  const ofRun = (g) => String(g.gh_run_id) === String(runId);
+  const attemptOf = (g) => Number(g.gh_run_attempt) || 1;
+  const upTo = Number(attempt) || 1;
   for (const name of names) {
+    const found = [];
     for (let page = 0; page < REPORTS_MAX_PAGES; page++) {
       const query = new URLSearchParams({ repository, name, limit: String(REPORTS_PAGE), offset: String(page * REPORTS_PAGE) });
       const { reports = [] } = await tsioJson(fetchImpl, base, `/reports?${query}`);
-      const found = reports.filter((g) => g.name === name && ofRun(g));
-      groups.push(...found);
-      if (reports.length < REPORTS_PAGE || found.length > 0 && !ofRun(reports[reports.length - 1])) break;
+      const ofPage = reports.filter((g) => g.name === name && ofRun(g) && attemptOf(g) <= upTo);
+      found.push(...ofPage);
+      if (reports.length < REPORTS_PAGE || ofPage.length > 0 && !ofRun(reports[reports.length - 1])) break;
     }
+    const newest = Math.max(0, ...found.map(attemptOf));
+    groups.push(...found.filter((g) => attemptOf(g) === newest));
   }
   return groups;
+}
+async function unwatchedFailures(fetchImpl, base, repository, commit, runId, attempt, trunk, watched) {
+  try {
+    const query = new URLSearchParams({ repository, commit, limit: String(REPORTS_PAGE) });
+    const { reports = [] } = await tsioJson(fetchImpl, base, `/reports?${query}`);
+    const latest = /* @__PURE__ */ new Map();
+    for (const g of reports) {
+      if (String(g.gh_run_id) !== String(runId) || g.branch !== trunk || watched.includes(g.name)) continue;
+      if (Number(g.gh_run_attempt) > (Number(attempt) || 1)) continue;
+      const prev = latest.get(g.name);
+      if (!prev || Number(g.gh_run_attempt) > Number(prev.gh_run_attempt)) latest.set(g.name, g);
+    }
+    return [...latest.values()].filter((g) => Number(g.test_stats?.failed) > 0).sort((a, b) => a.name.localeCompare(b.name)).map((g) => `${g.name}: ${g.test_stats?.failed} failed in this run; not watched, so not requested`);
+  } catch (e) {
+    return [`suites outside the watched ones not checked for failures (${String(e).slice(0, 160)})`];
+  }
 }
 async function watch({ env, fetchImpl = fetch, log = console.error, now = /* @__PURE__ */ new Date(), wait }) {
   const base = tsioBase(env);
@@ -3656,6 +3695,12 @@ ${note}; nothing to watch.
   const id = { repository: String(env.REPOSITORY), commit_sha: first.commit, gh_run_id: env.GH_RUN_ID, gh_run_attempt: attempt, branch: trunk };
   const notes = [];
   for (const s of wanted) if (!suites.includes(s)) notes.push(`${s.name}: no ${trunk} report for this run; not read`);
+  const groupOf = (name) => groupsOfRun.find((g) => g.name === name && g.branch === trunk);
+  for (const s of suites) {
+    const read = String(groupOf(s.name).gh_run_attempt);
+    if (read !== String(attempt)) notes.push(`${s.name}: not re-run in attempt ${attempt}; read attempt ${read}`);
+  }
+  notes.push(...await unwatchedFailures(fetchImpl, base, String(env.REPOSITORY), first.commit, env.GH_RUN_ID, attempt, trunk, wanted.map((s) => s.name)));
   const ranAt = Math.max(
     ...groupsOfRun.filter((g) => g.branch === trunk).flatMap((g) => [g.created_at, g.last_upload_at, g.orchestration?.durations?.last_test_at].map((t) => Date.parse(t ?? "") || 0))
   );
@@ -3674,7 +3719,8 @@ ${note}; nothing to watch.
     let result;
     try {
       result = await triage({
-        env: { COMPOSITE_IDENTITY: JSON.stringify({ ...id, name: s.name }), MODE: "report-only", TEST_ROOT: s.test_root, REPORT_NAME: s.report_name || "", TSIO_BASE_URL: base, GITHUB_TOKEN: env.GITHUB_TOKEN },
+        // The attempt that holds this suite's report, which an attempt that didn't re-run it leaves earlier.
+        env: { COMPOSITE_IDENTITY: JSON.stringify({ ...id, gh_run_attempt: String(groupOf(s.name).gh_run_attempt), name: s.name }), MODE: "report-only", TEST_ROOT: s.test_root, REPORT_NAME: s.report_name || "", TSIO_BASE_URL: base, GITHUB_TOKEN: env.GITHUB_TOKEN },
         // Classified against the history up to this run: a later trunk run must not decide this one's failures.
         fetchImpl,
         log,
@@ -3692,7 +3738,7 @@ ${note}; nothing to watch.
     bySuite.push({ suite: s.name, findings: result.findings });
     const found = selectRepairs(result, s.name);
     try {
-      const groupId = groupsOfRun.find((g) => g.name === s.name && g.branch === trunk).id;
+      const groupId = groupOf(s.name).id;
       const recovered = await retryRecovered(fetchImpl, base, groupId);
       if (recovered.length) {
         const history = await fetchHistory(fetchImpl, base, id.repository, recovered, until, void 0, trunk, s.report_name || null, log, laneOf(s.name));
@@ -3704,6 +3750,9 @@ ${note}; nothing to watch.
     for (const g of found) addGroup(groups, g);
   }
   for (const g of selectCrossLane(bySuite)) addGroup(groups, g);
+  const left = unselected(bySuite, new Set(groups.keys()));
+  for (const u of left.slice(0, MAX_UNSELECTED_NOTES)) notes.push(`${u.spec} \u203A ${u.title} (${u.suite}): ${u.reason}`);
+  if (left.length > MAX_UNSELECTED_NOTES) notes.push(`${left.length - MAX_UNSELECTED_NOTES} more failing tests wait the same way`);
   const decisions = [];
   const out = [];
   const ledgerPath = String(env.LEDGER_PATH);
@@ -3722,11 +3771,12 @@ ${note}; nothing to watch.
   const skip = (g, action) => {
     decisions.push({ specs: [g.spec], kind: g.kind, tests: g.tests, action });
   };
-  const activity = new Map([
-    ...[...open.prs.values()].map((p) => [p.number, p.activeAt]),
-    ...own.prs.map((p) => [p.number, lastActivity(p)])
+  const agentPR = new Map([
+    ...own.prs.map((p) => [p.number, { number: p.number, title: p.title ?? "", url: p.url, labels: [label], activeAt: lastActivity(p), openedAt: openedAt(p) }]),
+    ...[...open.prs.values()].map((p) => [p.number, p])
   ]);
-  const idleNoted = /* @__PURE__ */ new Set();
+  const daysSince = (at) => Math.floor((now.getTime() - at) / DAY);
+  const staleNoted = /* @__PURE__ */ new Set();
   const candidates = [];
   for (const g of groups.values()) {
     const prs = prsTouching(open.files, g.spec).flatMap((n) => {
@@ -3736,13 +3786,19 @@ ${note}; nothing to watch.
     const agentPRs = [.../* @__PURE__ */ new Set([...prsChanging(open.files, g.spec).filter((n) => open.prs.get(n)?.labels.includes(label)), ...prsChanging(own.files, g.spec)])].sort((a, b) => a - b);
     const ownPRs = [];
     for (const n of agentPRs) {
-      const at = activity.get(n) ?? null;
-      if (at != null && now.getTime() - at > OWN_PR_IDLE_MS) {
-        if (!idleNoted.has(n)) {
-          idleNoted.add(n);
-          notes.push(`stalled agent PR #${n} (idle ${Math.floor((now.getTime() - at) / DAY)} days): not blocking new requests`);
-        }
-      } else ownPRs.push(n);
+      const p = agentPR.get(n);
+      const opened = p?.openedAt ?? null;
+      const at = p?.activeAt ?? null;
+      const stale = opened != null && now.getTime() - opened > OWN_PR_MAX_AGE_MS ? `open ${daysSince(opened)} days with the spec still failing` : at != null && now.getTime() - at > OWN_PR_IDLE_MS ? `idle ${daysSince(at)} days` : null;
+      if (!stale) {
+        ownPRs.push(n);
+        continue;
+      }
+      if (!staleNoted.has(n)) {
+        staleNoted.add(n);
+        notes.push(`stalled agent PR #${n} (${stale}): not blocking new requests`);
+      }
+      if (p && !prs.some((x) => x.number === n)) prs.push(p);
     }
     const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < HOLD_MS);
     if (ownUnknown) skip(g, "skipped: the agent's own PRs could not be read");

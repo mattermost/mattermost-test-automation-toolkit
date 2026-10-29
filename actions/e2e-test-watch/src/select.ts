@@ -139,6 +139,40 @@ export function selectCrossLane(bySuite: { suite: string; findings: readonly Rep
   return [...bySpec.values()];
 }
 
+/** A failing test no request covers, and why it was left for now. */
+export interface Unselected {
+  spec: string;
+  suite: string;
+  title: string;
+  reason: string;
+}
+
+// Triage classes that would be repaired once they repeat or can be told apart.
+const REPAIRABLE = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", ...FIRST_FAILURE]);
+
+/**
+ * The failing tests in specs no group covers, with why each waits: a first failure in one lane, a first
+ * flake, or a name two tests share. Read so a red trunk run with no request says what it saw.
+ */
+export function unselected(bySuite: { suite: string; findings: readonly RepairFinding[] }[], selected: ReadonlySet<string>): Unselected[] {
+  const out: Unselected[] = [];
+  for (const { suite, findings } of bySuite) {
+    for (const f of findings) {
+      const spec = specOf(f);
+      if (selected.has(spec) || !REPAIRABLE.has(f.class)) continue;
+      const reason = f.identity_unresolved
+        ? "shares its name with another test, so its history can't be read"
+        : FIRST_FAILURE.has(f.class)
+          ? `first failure, in ${suite} only; requested if it fails again`
+          : f.class === "FLAKY_ON_TRUNK"
+            ? "first flake on trunk; requested if it flakes again"
+            : null;
+      if (reason) out.push({ spec, suite, title: f.full_title || f.title, reason });
+    }
+  }
+  return out;
+}
+
 /** Adds a spec's group, merging with one already found in another suite: broken wins over flaky. */
 export function addGroup(groups: Map<string, Group>, g: Group): void {
   const prev = groups.get(g.spec);
