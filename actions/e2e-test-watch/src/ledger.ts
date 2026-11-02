@@ -10,9 +10,11 @@ import type { Kind } from "./model.ts";
 export const LEDGER_MS = 7 * DAY;
 
 /**
- * A request sent by an earlier run: { at, specs, kind, window?, run, resent? } (window: a break's run times, `from`
- * null for -Infinity; resent: how many requests before it for these specs left no sign the agent ran them). Entries
- * without specs, from conflict requests before they moved to a label, match no spec.
+ * A request sent by an earlier run: { at, specs, kind, window?, run, resent?, prs? } (window: a break's run times,
+ * `from` null for -Infinity; resent: how many requests before it for these specs left no sign the agent ran them;
+ * prs: the open PRs on its specs it was sent with, where the agent may answer it). Entries without specs, from
+ * conflict requests before they moved to a label, match no spec. Entries without prs, from before it was kept, are
+ * checked by search and the agent's PRs alone.
  */
 export interface LedgerEntry {
   at: string;
@@ -21,6 +23,7 @@ export interface LedgerEntry {
   window?: { from: number | null; to: number };
   run?: string;
   resent?: number;
+  prs?: number[];
 }
 
 /**

@@ -21,8 +21,6 @@ export interface OpenPRs {
   files: Map<string, number[]>;
   prs: Map<number, OpenPR>;
   truncated?: boolean;
-  /** PRs with more changed files than are read (300): one may change a spec past them. */
-  partial?: number[];
 }
 
 /** A PR's activity as GitHub reports it: when it was opened, its last update, and its last commit. */
@@ -70,10 +68,6 @@ interface OpenPRPage {
         isCrossRepository: boolean;
         commits?: PRActivity["commits"];
         labels?: { nodes?: { name: string }[] } | null;
-        /** How many files the PR changes, as GitHub counts them. */
-        changedFiles?: number | null;
-        /** Its head commit when its files were first read. */
-        headRefOid?: string | null;
         files: { pageInfo: { hasNextPage: boolean }; nodes: { path: string }[] };
       }[];
     };
@@ -102,7 +96,7 @@ const OPEN_PRS = `query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, first: 50, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { number title url baseRefName createdAt updatedAt isCrossRepository changedFiles headRefOid commits(last: 1) { nodes { commit { committedDate } } } labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
+      nodes { number title url baseRefName createdAt updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
     }
   }
 }`;
@@ -124,7 +118,7 @@ export async function specsInOpenPRs(
   const add = (path: string, number: number): void => {
     touched.set(path, [...(touched.get(path) ?? []), number]);
   };
-  const result: OpenPRs = { files: touched, prs, truncated: false, partial: [] };
+  const result: OpenPRs = { files: touched, prs, truncated: false };
   let after: string | null = null;
   for (let page = 0; page < maxPages; page++) {
     const res = (await api("POST", "/graphql", { query: OPEN_PRS, variables: { owner, name, after } })) as GraphqlReply<OpenPRPage>;
@@ -138,26 +132,12 @@ export async function specsInOpenPRs(
       if (base && p.baseRefName !== base) continue;
       prs.set(p.number, { number: p.number, title: p.title, url: p.url, labels: (p.labels?.nodes ?? []).map((l) => l.name), activeAt: lastActivity(p), openedAt: openedAt(p) });
       for (const f of p.files.nodes) add(f.path, p.number);
-      // Over 100 files: the rest from REST, up to 300 in all. A PR with more files than were read is named as partial:
-      // by GitHub's count of distinct paths, or, without one, when the last page read was full. So is one whose head
-      // moved while its files were read: its pages may repeat one path and skip another.
-      const paths = new Set(p.files.nodes.map((f) => f.path));
-      let complete = !p.files.pageInfo.hasNextPage;
-      const paged = !complete;
-      for (let filesPage = 2; !complete && filesPage <= 3; filesPage++) {
+      // Over 100 files: the rest from REST, up to 300 in all.
+      for (let filesPage = 2; p.files.pageInfo.hasNextPage && filesPage <= 3; filesPage++) {
         const files = (await api("GET", `/repos/${repository}/pulls/${p.number}/files?per_page=100&page=${filesPage}`)) as { filename: string }[];
-        for (const f of files) {
-          add(f.filename, p.number);
-          paths.add(f.filename);
-        }
-        if (files.length < 100) complete = true;
+        for (const f of files) add(f.filename, p.number);
+        if (files.length < 100) break;
       }
-      let moved = false;
-      if (paged && p.headRefOid) {
-        const after = (await api("GET", `/repos/${repository}/pulls/${p.number}`)) as { head?: { sha?: string | null } | null } | null;
-        moved = after?.head?.sha !== p.headRefOid;
-      }
-      if (moved || (typeof p.changedFiles === "number" ? p.changedFiles > paths.size : !complete)) result.partial!.push(p.number);
     }
     if (!pullRequests.pageInfo.hasNextPage) return result;
     after = pullRequests.pageInfo.endCursor;
@@ -232,9 +212,10 @@ const specName = (spec: string): RegExp => {
  * A check of whether the agent answered a request: some PR or issue holds one text (its body, a comment, a review,
  * or a review comment) that links the request's trunk run and names one of its specs. The agent's new PR, and its
  * comment or review on an existing PR, both do. The spec tells apart requests sent from one trunk run. Read are the
- * PRs and issues search finds citing the run, and `candidates` (the PRs on its specs), so a review that search
- * doesn't index still counts there. Each PR's texts are read once per check. Throws when it can't tell: more PRs
- * and issues cite the run than search returns, or one read with no answer has more texts than its pages hold.
+ * PRs and issues search finds citing the run, and `candidates` (the open PRs the request was sent with, and the
+ * agent's PRs since), so a review that search doesn't index still counts there. No file list is read. Each PR's texts
+ * are read once per check. Throws when it can't tell: more PRs and issues cite the run than search returns, or one
+ * read with no answer has more texts than its pages hold.
  */
 export function answerCheck(api: GhApi, repository: string): (runId: string, specs: string[], candidates: number[]) => Promise<boolean> {
   const [owner, name] = repository.split("/");

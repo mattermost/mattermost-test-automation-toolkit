@@ -26,6 +26,8 @@ import type { RangedGroup, WatchId } from "./range.ts";
 
 const MAX_TESTS = 40;
 const MAX_OPEN_PRS_TOUCHING = 10;
+// PRs read for the agent's answer to one request, besides search's; past it the request holds as sent.
+const MAX_ANSWER_PRS = 20;
 // Failing tests no request covers that the job summary names one by one; the rest are counted.
 const MAX_UNSELECTED_NOTES = 10;
 // How long a requested spec is left to its agent before it can be requested again.
@@ -327,7 +329,9 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   // A webhook can accept a request (HTTP 200) whose agent then never starts. The agent answers each request it runs
   // on GitHub, linking the request's trunk run and naming its spec (a new PR, or a comment or review on an existing
   // one), or opens a PR on its spec. A request old enough to have an answer and with neither stops holding its specs,
-  // MAX_RESENDS times.
+  // MAX_RESENDS times. The answer is looked for where the agent writes it: the open PRs the request was sent with
+  // (kept on its ledger entry), the agent's PRs opened since, and what search finds citing the run. A missed answer
+  // costs one more agent run, which stops early on its own memory of the first.
   const answers = answerCheck(api, id.repository);
   const answeredOf = new Map<LedgerEntry, Promise<boolean>>();
   let answersUnknown: string | null = null;
@@ -338,18 +342,14 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     if ((r.specs ?? []).some((s) => agentPRsChanging(s).some((n) => (agentPR.get(n)?.openedAt ?? 0) >= at))) return false;
     let answered = answeredOf.get(r);
     if (!answered) {
-      // Where the agent answers when it opens no PR: its own PRs on the specs first, then the others it was sent.
       const specs = r.specs ?? [];
-      // A PR whose file list was cut off may change a spec past the files read: its texts are read too.
-      const onSpecs = [...new Set([...specs.flatMap(agentPRsChanging), ...specs.flatMap((s) => prsTouching(open.files, s)), ...(open.partial ?? [])])];
-      // The answer may be on a PR past the ones read: as with an incomplete search, the request holds as sent.
-      if (open.truncated) {
-        notes.push(`${specs.join(", ")}: open PRs past the newest read were not checked for an answer; the request of ${utcMinute(r.at)} UTC (${r.run}) holds as sent`);
+      // The open PRs it was sent with, and the agent's PRs opened since: no file list is read.
+      const sentWith = [...new Set([...(r.prs ?? []), ...[...agentPR.values()].filter((p) => p.labels.includes(label) && (p.openedAt ?? 0) >= at).map((p) => p.number)])];
+      if (sentWith.length > MAX_ANSWER_PRS) {
+        // Too many to read: as with an incomplete search, the request holds as sent.
+        notes.push(`${specs.join(", ")}: ${sentWith.length} PRs to read for an answer, more than ${MAX_ANSWER_PRS}; the request of ${utcMinute(r.at)} UTC (${r.run}) holds as sent`);
         answered = Promise.resolve(true);
-      } else if (onSpecs.length > MAX_OPEN_PRS_TOUCHING) {
-        notes.push(`${specs.join(", ")}: ${onSpecs.length} open PRs change it, more than the ${MAX_OPEN_PRS_TOUCHING} read for an answer; the request of ${utcMinute(r.at)} UTC (${r.run}) holds as sent`);
-        answered = Promise.resolve(true);
-      } else answered = answers(runId, specs, onSpecs);
+      } else answered = answers(runId, specs, sentWith);
       answeredOf.set(r, answered);
     }
     try {
@@ -492,6 +492,8 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
         ...(r.window ? { window: { from: Number.isFinite(r.window.from) ? r.window.from : null, to: r.window.to } } : {}),
         run: runURL,
         ...(resent ? { resent } : {}),
+        // Where the agent may answer it with a review search doesn't index (see unanswered).
+        ...(payload.open_prs_touching.length ? { prs: payload.open_prs_touching.map((p) => p.number) } : {}),
       },
     });
   }

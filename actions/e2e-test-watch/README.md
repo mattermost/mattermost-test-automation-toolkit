@@ -39,18 +39,20 @@ A webhook can accept a request (HTTP 200) whose agent then never starts. The age
 answers each request it runs on GitHub: its PR, or its comment or review on an
 existing PR, links the request's trunk run and names the spec. A request still held
 after `answer-hours` (6) is checked for such an answer: one text (a body, comment,
-review or review comment) that links its run and names one of its specs, on the
-PRs and issues search finds citing the run and on the open PRs on its specs (where
-a review search may not index still counts). With no answer, and no agent PR on its
-specs opened since, it holds nothing (no spec, no break, no flaky budget): its specs
-are requested again, once. The resend then holds as any request does, so a run that
-ends in no change (the agent's no-op leaves no trace either) is not sent a third
-time. Requests hold as sent when the check can't tell: GitHub can't be read, its
-search is incomplete, more than 20 PRs and issues cite the run, the open PRs were
-not all read or more than 10 of them change the request's specs (its answer may be
-on one that was not read), or a PR read without an answer has more comments or
-reviews than the read holds. An open PR with more than 300 changed files is read
-for an answer too, since it may change the spec past the files read.
+review or review comment) that links its run and names one of its specs. The texts
+read are those of the PRs and issues search finds citing the run, the open PRs the
+request was sent with (`open_prs_touching`, kept on its ledger entry, where a review
+search doesn't index still counts), and the agent's PRs opened since. No PR's file
+list is read. With no answer, and no agent PR on its specs opened since, it holds
+nothing (no spec, no break, no flaky budget): its specs are requested again, once.
+The resend then holds as any request does, so a run that ends in no change (the
+agent's no-op leaves no trace either) is not sent a third time. A missed answer
+costs at most that one extra agent run, which stops early on its memory of the
+first. Requests hold as sent when the check can't tell: GitHub can't be read, its
+search is incomplete, more than 20 PRs and issues cite the run, more than 20 PRs are
+to be read besides, or a PR read without an answer has more comments or reviews than
+the read holds. A request sent before its PRs were kept is checked by search and the
+agent's PRs alone.
 
 A re-run attempt re-runs only the failed jobs, so each suite is read at its newest
 attempt up to `gh-run-attempt`. The job summary also names what no request covers:

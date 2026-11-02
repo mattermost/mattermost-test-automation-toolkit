@@ -3339,7 +3339,7 @@ var OPEN_PRS = `query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, first: 50, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { number title url baseRefName createdAt updatedAt isCrossRepository changedFiles headRefOid commits(last: 1) { nodes { commit { committedDate } } } labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
+      nodes { number title url baseRefName createdAt updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
     }
   }
 }`;
@@ -3351,7 +3351,7 @@ async function specsInOpenPRs(api, repository, { days = 14, now = /* @__PURE__ *
   const add = (path, number) => {
     touched.set(path, [...touched.get(path) ?? [], number]);
   };
-  const result = { files: touched, prs, truncated: false, partial: [] };
+  const result = { files: touched, prs, truncated: false };
   let after = null;
   for (let page = 0; page < maxPages; page++) {
     const res = await api("POST", "/graphql", { query: OPEN_PRS, variables: { owner, name, after } });
@@ -3363,23 +3363,11 @@ async function specsInOpenPRs(api, repository, { days = 14, now = /* @__PURE__ *
       if (base && p.baseRefName !== base) continue;
       prs.set(p.number, { number: p.number, title: p.title, url: p.url, labels: (p.labels?.nodes ?? []).map((l) => l.name), activeAt: lastActivity(p), openedAt: openedAt(p) });
       for (const f of p.files.nodes) add(f.path, p.number);
-      const paths = new Set(p.files.nodes.map((f) => f.path));
-      let complete = !p.files.pageInfo.hasNextPage;
-      const paged = !complete;
-      for (let filesPage = 2; !complete && filesPage <= 3; filesPage++) {
+      for (let filesPage = 2; p.files.pageInfo.hasNextPage && filesPage <= 3; filesPage++) {
         const files = await api("GET", `/repos/${repository}/pulls/${p.number}/files?per_page=100&page=${filesPage}`);
-        for (const f of files) {
-          add(f.filename, p.number);
-          paths.add(f.filename);
-        }
-        if (files.length < 100) complete = true;
+        for (const f of files) add(f.filename, p.number);
+        if (files.length < 100) break;
       }
-      let moved = false;
-      if (paged && p.headRefOid) {
-        const after2 = await api("GET", `/repos/${repository}/pulls/${p.number}`);
-        moved = after2?.head?.sha !== p.headRefOid;
-      }
-      if (moved || (typeof p.changedFiles === "number" ? p.changedFiles > paths.size : !complete)) result.partial.push(p.number);
     }
     if (!pullRequests.pageInfo.hasNextPage) return result;
     after = pullRequests.pageInfo.endCursor;
@@ -3765,6 +3753,7 @@ function bundle(groups) {
 // src/watch.ts
 var MAX_TESTS = 40;
 var MAX_OPEN_PRS_TOUCHING = 10;
+var MAX_ANSWER_PRS = 20;
 var MAX_UNSELECTED_NOTES = 10;
 var HOLD_MS = 24 * HOUR;
 var OWN_PR_IDLE_MS = 3 * DAY;
@@ -3941,14 +3930,11 @@ ${note}; nothing to watch.
     let answered = answeredOf.get(r);
     if (!answered) {
       const specs = r.specs ?? [];
-      const onSpecs = [.../* @__PURE__ */ new Set([...specs.flatMap(agentPRsChanging), ...specs.flatMap((s) => prsTouching(open.files, s)), ...open.partial ?? []])];
-      if (open.truncated) {
-        notes.push(`${specs.join(", ")}: open PRs past the newest read were not checked for an answer; the request of ${utcMinute(r.at)} UTC (${r.run}) holds as sent`);
+      const sentWith = [.../* @__PURE__ */ new Set([...r.prs ?? [], ...[...agentPR.values()].filter((p) => p.labels.includes(label) && (p.openedAt ?? 0) >= at).map((p) => p.number)])];
+      if (sentWith.length > MAX_ANSWER_PRS) {
+        notes.push(`${specs.join(", ")}: ${sentWith.length} PRs to read for an answer, more than ${MAX_ANSWER_PRS}; the request of ${utcMinute(r.at)} UTC (${r.run}) holds as sent`);
         answered = Promise.resolve(true);
-      } else if (onSpecs.length > MAX_OPEN_PRS_TOUCHING) {
-        notes.push(`${specs.join(", ")}: ${onSpecs.length} open PRs change it, more than the ${MAX_OPEN_PRS_TOUCHING} read for an answer; the request of ${utcMinute(r.at)} UTC (${r.run}) holds as sent`);
-        answered = Promise.resolve(true);
-      } else answered = answers(runId, specs, onSpecs);
+      } else answered = answers(runId, specs, sentWith);
       answeredOf.set(r, answered);
     }
     try {
@@ -4067,7 +4053,9 @@ ${note}; nothing to watch.
         kind: r.kind,
         ...r.window ? { window: { from: Number.isFinite(r.window.from) ? r.window.from : null, to: r.window.to } } : {},
         run: runURL,
-        ...resent ? { resent } : {}
+        ...resent ? { resent } : {},
+        // Where the agent may answer it with a review search doesn't index (see unanswered).
+        ...payload.open_prs_touching.length ? { prs: payload.open_prs_touching.map((p) => p.number) } : {}
       }
     });
   }

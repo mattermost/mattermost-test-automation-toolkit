@@ -200,12 +200,6 @@ interface RouteOptions {
   searchDown?: boolean;
   // The search timed out: GitHub says its results are incomplete.
   searchIncomplete?: boolean;
-  // Every page of open PRs is recent, so the read stops at its page cap before reaching older ones.
-  openPRsTruncated?: boolean;
-  // An open PR, #44, with 100 files by GraphQL and two full REST pages, none of them a spec, and its changed-file
-  // count as GitHub reports it (null: not reported). `repeat`: the REST pages list the same files (the PR changed
-  // between reads); `headAfter`: its head commit when read after the files (default: unchanged, h44).
-  bigPR?: { changedFiles: number | null; repeat?: boolean; headAfter?: string };
 }
 
 interface HistoryBody {
@@ -240,8 +234,6 @@ function routes({
   searches = [],
   searchDown = false,
   searchIncomplete = false,
-  openPRsTruncated = false,
-  bigPR,
 }: RouteOptions): FetchImpl {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
   const retried = recovered ? ["v/e.spec.ts", "u/f.spec.ts"] : [];
@@ -273,11 +265,6 @@ function routes({
   const otherGroups = others.map((o, n) => ({ id: `o${n + 1}`, repository: "o/r", branch, commit: "abc", name: o.name, gh_run_id: o.runId ?? "12", gh_run_attempt: o.attempt ?? "1", status: "completed", test_stats: { failed: o.failed } }));
   const laneOfGroup = (url: string): string => groups.find((g) => String(url).includes(`/reports/${g.id}/`))!.name;
   const table: [string, (init: RequestInit, url: string) => Response][] = [
-    ["/pulls/44/files", (_init, url) => {
-      const page = bigPR?.repeat ? "2" : new URL(String(url)).searchParams.get("page");
-      return Response.json(Array.from({ length: 100 }, (_, i) => ({ filename: `webapp/p${page}-${i}.ts` })));
-    }],
-    ["/pulls/44", () => Response.json({ number: 44, head: { sha: bigPR?.headAfter ?? "h44" } })],
     ["/reports?", (_init, url) => {
       // Asked by suite name, as the watcher does; triage's own lookup adds the commit; the check for
       // unwatched suites asks for the run's commit alone.
@@ -340,9 +327,6 @@ function routes({
         files: { pageInfo: { hasNextPage: false }, nodes: paths.map((path) => ({ path })) },
       });
       if (!after) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p2" }, nodes: Array.from({ length: 50 }, (_, i) => pr(100 + i, "2026-10-02T12:00:00Z")) } } } });
-      const big = { ...pr(44, "2026-10-02T00:10:00Z"), headRefOid: "h44", changedFiles: bigPR?.changedFiles ?? null, files: { pageInfo: { hasNextPage: true }, nodes: Array.from({ length: 100 }, (_, i) => ({ path: `webapp/f${i}.ts` })) } };
-      if (bigPR) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: false }, nodes: [big, pr(41, "2026-10-02T00:00:00Z", openPRFiles, openPRLabels)] } } } });
-      if (openPRsTruncated) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "pn" }, nodes: [pr(41, "2026-10-02T00:00:00Z", openPRFiles, openPRLabels)] } } } });
       return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p3" }, nodes: [pr(43, "2026-10-02T01:00:00Z", releasePRFiles, [], "release-12.0"), pr(42, "2026-10-02T00:30:00Z", forkPRFiles, forkPRLabels, "master", true), pr(41, "2026-10-02T00:00:00Z", openPRFiles, openPRLabels), pr(7, "2026-09-01T00:00:00Z", ["specs/x/a.spec.ts"])] } } } });
     }],
     ["/compare/", (_init, url) => {
@@ -828,67 +812,47 @@ test("an answer counts for the request whose spec it names, not every request of
   ]);
 });
 
-test("a review search doesn't find still answers a request when it is on a PR on the spec", async () => {
-  // z/c was requested from master run 11, 7 hours ago. #41 (not the agent's) changes it; the agent reviewed it there.
-  const LEDGER_PATH = ledgerPath();
-  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
+test("a review search doesn't find still answers a request on a PR it was sent with", async () => {
+  // z/c was requested from master run 11, 7 hours ago, with #41 (not the agent's) in open_prs_touching; the agent
+  // reviewed it there. No PR's file list is read for this.
+  const sent = { at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" };
   const answers = [{ number: 41, text: "Master run https://github.com/o/r/actions/runs/11: c.spec.ts still fails here.", review: true, indexed: false }];
-  const searches: string[] = [];
-  const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: ["specs/z/c.spec.ts"], openPRLabels: [], answers, searches }), hook: [] });
-  assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [
-    [["specs/z/c.spec.ts"], "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11"],
-    [["specs/x/a.spec.ts", "specs/y/b.spec.ts"], "to request"],
-  ]);
-  assert.deepEqual(searches, ['repo:o/r "11"']);
+  const decide = async (entry: Record<string, unknown>) => {
+    const LEDGER_PATH = ledgerPath();
+    writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [entry] }));
+    const searches: string[] = [];
+    const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], answers, searches }), hook: [] });
+    assert.deepEqual(searches, ['repo:o/r "11"']);
+    return decisions.find((d) => d.specs.includes("specs/z/c.spec.ts"))?.action;
+  };
+  assert.equal(await decide({ ...sent, prs: [41] }), "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11");
+  // An entry from before the PRs were kept is checked by search and the agent's PRs alone: #41's review is missed,
+  // and the request goes once more (the agent stops early on its memory of the first).
+  assert.equal(await decide(sent), "to request");
+});
+
+test("a request keeps the open PRs it was sent with, and more than 20 to read holds it as sent", async () => {
+  // The three specs go together with #41 (someone else's open PR on y/b) in open_prs_touching: the entry keeps it.
+  const LEDGER_PATH = ledgerPath();
+  const hook: FixPayload[] = [];
+  await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRLabels: [] }), hook });
+  assert.deepEqual(hook.flatMap((h) => h.open_prs_touching.map((p) => p.number)), [41]);
+  assert.deepEqual(readLedger(LEDGER_PATH).map((e) => [e.specs, e.prs]), [[["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], [41]]]);
+  const many = ledgerPath();
+  const prs = Array.from({ length: 21 }, (_, i) => 200 + i);
+  writeFileSync(many, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11", prs }] }));
+  const { decisions, notes } = await run({ env: { ...env, LEDGER_PATH: many }, fetchImpl: routes({ openPRFiles: [], answers: [] }), hook: [] });
+  assert.equal(decisions.find((d) => d.specs.includes("specs/z/c.spec.ts"))?.action, "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11");
+  assert.ok(notes.includes("specs/z/c.spec.ts: 21 PRs to read for an answer, more than 20; the request of 2026-10-02 17:00 UTC (https://github.com/o/r/actions/runs/11) holds as sent"));
 });
 
 test("a PR with more comments than read, none of them an answer, keeps the hold: the answer may be in the rest", async () => {
   const LEDGER_PATH = ledgerPath();
-  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
+  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11", prs: [41] }] }));
   const answers = [{ number: 41, text: "Looks good to me.", truncated: true }];
-  const { decisions, notes } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: ["specs/z/c.spec.ts"], openPRLabels: [], answers }), hook: [] });
+  const { decisions, notes } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], answers }), hook: [] });
   assert.deepEqual(decisions[0], { specs: ["specs/z/c.spec.ts"], kind: "broken", tests: decisions[0].tests, action: "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11" });
   assert.ok(notes.includes("requests not checked for a sign the agent ran them (Error: #41: more comments or reviews than read); they hold as sent"));
-});
-
-test("more open PRs on a request's specs than are read for an answer keeps the hold: the answer may be on one not read", async () => {
-  // z/c was requested from master run 11, 7 hours ago. 11 of the agent's PRs change it, all opened before the request;
-  // its only answer is a review on the last, which a read of 10 would miss.
-  const LEDGER_PATH = ledgerPath();
-  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
-  const repairPRs = Array.from({ length: 11 }, (_, i) => ownPR(60 + i, "specs/z/c.spec.ts", { createdAt: "2026-09-30T00:00:00Z" }));
-  const answers = [{ number: 70, text: "Master run https://github.com/o/r/actions/runs/11: c.spec.ts still fails here.", review: true, indexed: false }];
-  const { decisions, notes } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], repairPRs, answers }), hook: [] });
-  assert.deepEqual(decisions.find((d) => d.specs.includes("specs/z/c.spec.ts"))?.action, "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11");
-  assert.ok(notes.includes("specs/z/c.spec.ts: 11 open PRs change it, more than the 10 read for an answer; the request of 2026-10-02 17:00 UTC (https://github.com/o/r/actions/runs/11) holds as sent"));
-});
-
-test("when open PRs past the newest read were not checked, an unanswered request keeps the hold: its answer may be on one of them", async () => {
-  const LEDGER_PATH = ledgerPath();
-  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
-  const { decisions, notes } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], answers: [], openPRsTruncated: true }), hook: [] });
-  assert.deepEqual(decisions.find((d) => d.specs.includes("specs/z/c.spec.ts"))?.action, "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11");
-  assert.ok(notes.includes("specs/z/c.spec.ts: open PRs past the newest read were not checked for an answer; the request of 2026-10-02 17:00 UTC (https://github.com/o/r/actions/runs/11) holds as sent"));
-});
-
-test("an open PR with more files than are read is read for an answer too: it may change the spec past them", async () => {
-  // z/c was requested from master run 11, 7 hours ago. #44 changes over 300 files; the agent reviewed it about c.spec.ts.
-  const LEDGER_PATH = ledgerPath();
-  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
-  const answers = [{ number: 44, text: "Master run https://github.com/o/r/actions/runs/11: c.spec.ts fails on this branch too.", review: true, indexed: false }];
-  const action = async (changedFiles: number | null, more: { repeat?: boolean; headAfter?: string } = {}): Promise<string | undefined> => {
-    writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
-    const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], bigPR: { changedFiles, ...more }, answers }), hook: [] });
-    return decisions.find((d) => d.specs.includes("specs/z/c.spec.ts"))?.action;
-  };
-  const held = "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11";
-  assert.equal(await action(301), held, "301 files: one was not read");
-  assert.equal(await action(null), held, "no count, and the last page read was full: it may have more");
-  // Exactly the 300 read: #44 doesn't change the spec, so it is not read for an answer, and the request goes again.
-  assert.equal(await action(300), "to request");
-  // 300 rows but a path listed twice, or a head that moved while the files were read: some file may be missing.
-  assert.equal(await action(300, { repeat: true }), held, "the REST pages repeat a path");
-  assert.equal(await action(300, { headAfter: "h45" }), held, "the PR changed between the reads");
 });
 
 test("a number input that isn't one takes its default, and the summary says so", async () => {
