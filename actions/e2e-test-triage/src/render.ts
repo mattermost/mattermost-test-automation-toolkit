@@ -362,7 +362,7 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
   } else if (!counts.failed) {
     // Red with no failed test: the jobs to re-run. A missing report says how many arrived; a lane that is red for a job
     // outside the tests says that.
-    say = missing ? `${again}: ${arrived}.` : laneRed ? RED_OUTSIDE : "No test failed.";
+    say = missing ? `${again}: ${arrived}.` : laneRed ? (rerun ? `${again}: no test failed; a job outside the tests failed.` : RED_OUTSIDE) : "No test failed.";
   } else if (findings.length) {
     // A release run's cleared failures are named by what the model found (test bug, server compat, flaky).
     const kinds = branchRun ? statusLabels([...broken.filter((f) => !f.blocking), ...flaky]).join(", ")

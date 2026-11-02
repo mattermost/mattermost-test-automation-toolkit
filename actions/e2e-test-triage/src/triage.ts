@@ -147,17 +147,20 @@ async function noteNoResults({ env, fetchImpl = fetch, log = console.error }: Tr
 /**
  * Why the lane's own status is red, read only where no test failed and every report arrived; null when it is not red.
  * "flaky" where a test passed on a retry and the status says tests failed: its count read that test as failed (a
- * retest in another report), and triage can turn it green. "outside" for any other red status (a job outside the
- * tests, missing reports, no text): the summary says so and nothing is written. An unreadable status is logged, and
- * reads as not red.
+ * retest in another report), and triage can turn it green. "upstream" where e2e-test-status says a job outside the
+ * tests failed (a dead worker whose specs the others ran): nothing is written, and its failed step may get the failed
+ * jobs re-run. "outside" for any other red status (missing reports, no text): the summary says so and nothing is
+ * written. An unreadable status is logged, and reads as not red.
  */
-async function laneRedWhy(api: GhApi, id: TriageIdentity, context: string, flaky: number, log: (message: string) => void): Promise<"flaky" | "outside" | null> {
+async function laneRedWhy(api: GhApi, id: TriageIdentity, context: string, flaky: number, log: (message: string) => void): Promise<"flaky" | "upstream" | "outside" | null> {
   try {
     const own = (await readStatuses(api, id)).find((r) => r.context === context);
     if (own?.state !== "failure" && own?.state !== "error") return null;
     // Only a status that says tests failed: the TSIO summary's "N failed" count, or e2e-test-status's own text. No text,
     // or any other (a job outside the tests, missing reports, an override), is not one triage can turn green.
     const text = String(own.description ?? "");
+    // A job outside the tests failed (a dead worker), and e2e-test-status said so: a re-run may be asked for.
+    if (text.startsWith(UPSTREAM_FAILED)) return "upstream";
     const testsFailed = /\b[1-9]\d* failed\b/.test(text) || text.startsWith(FAILED_TESTS);
     return flaky > 0 && own.state === "failure" && testsFailed && !text.startsWith(UPSTREAM_FAILED) && !text.startsWith(REPORTS_INCOMPLETE) ? "flaky" : "outside";
   } catch (e) {
@@ -362,8 +365,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // read: one the change broke (build, test server) holds the re-run (see decideRerun).
     const attempt = Number(id.gh_run_attempt) || 1;
     const onlyNoResults = (result.unnamed || result.missing) && !result.findings.some((f) => f.blocking);
+    // Every report arrived and no test failed, but a job outside the tests died (a worker whose specs the others ran):
+    // the lane is red only for that job, and its failed step decides the re-run as for a shard that sent nothing.
+    const onlyDeadJobs = redWhy === "upstream" && !run.failing.length && !result.findings.some((f) => f.blocking);
     let rerunCheck: RerunDecision | null = null;
-    if (onlyNoResults && attempt <= cfg.rerunAttempts) {
+    if ((onlyNoResults || onlyDeadJobs) && attempt <= cfg.rerunAttempts) {
       try {
         const dead = await readDeadJobs({ fetchImpl, token: String(env.GITHUB_TOKEN), repository: id.repository, runId: String(id.gh_run_id), attempt: String(id.gh_run_attempt), log });
         rerunCheck = await decideRerun(dead, apiKey && !prSpendUnknown ? askCauseWith(fetchImpl, apiKey, cfg.model, result.ai, cfg.prices) : null, log);
@@ -384,7 +390,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       }
     }
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
-    const laneRed = redWhy === "outside";
+    const laneRed = redWhy === "outside" || redWhy === "upstream";
     if (flakyOnly)
       notes.push(`No test failed: the ${run.counts.flaky === 1 ? "1 test that failed a try" : `${run.counts.flaky} tests that failed a try`} passed on a retry. The lane counted ${run.counts.flaky === 1 ? "it" : "them"} as failed.`);
     const rerun = rerunCheck?.rerun ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;

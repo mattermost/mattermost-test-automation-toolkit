@@ -1033,7 +1033,7 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
   if (unnamed && !findings.length) {
     say = rerunLine;
   } else if (!counts.failed) {
-    say = missing ? `${again}: ${arrived}.` : laneRed ? RED_OUTSIDE : "No test failed.";
+    say = missing ? `${again}: ${arrived}.` : laneRed ? rerun ? `${again}: no test failed; a job outside the tests failed.` : RED_OUTSIDE : "No test failed.";
   } else if (findings.length) {
     const kinds = branchRun ? statusLabels([...broken.filter((f) => !f.blocking), ...flaky]).join(", ") : [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
     say = `${count(yours.length + outdated.length + check.length + blockingBroken + unrelated, "failure")}: ` + [
@@ -2824,7 +2824,7 @@ function writeFindings(facts, log) {
 }
 
 // ../e2e-test-triage/src/rerun-check.ts
-var INFRA_RE2 = /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|socket hang up|network (?:error|aborted|timeout)|Could not resolve host|TLS handshake timeout|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|429 Too Many Requests|rate limit exceeded|The runner has received a shutdown signal|lost communication with the server|hosted runner encountered an error|No space left on device|Unable to download artifact|Failed to download action|<!DOCTYPE html|answered with an HTML page/i;
+var INFRA_RE2 = /Failed to get ID Token|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|socket hang up|network (?:error|aborted|timeout)|Could not resolve host|TLS handshake timeout|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|429 Too Many Requests|rate limit exceeded|The runner has received a shutdown signal|lost communication with the server|hosted runner encountered an error|No space left on device|Unable to download artifact|Failed to download action|<!DOCTYPE html|answered with an HTML page/i;
 var HOLDS = [
   [/\*\* BUILD FAILED \*\*|error TS\d{4}:|Module not found|SyntaxError:|xcodebuild: error|Execution failed for task|Compilation failed|BUILD FAILURE|cannot find symbol/i, "the build failed"],
   [/npm (?:ERR!|error) (?:code )?(?:ERESOLVE|ETARGET)|No matching version found|Could not find a version that satisfies/i, "the dependencies did not install"],
@@ -3023,6 +3023,7 @@ async function laneRedWhy(api, id, context, flaky, log) {
     const own = (await readStatuses(api, id)).find((r) => r.context === context);
     if (own?.state !== "failure" && own?.state !== "error") return null;
     const text = String(own.description ?? "");
+    if (text.startsWith(UPSTREAM_FAILED)) return "upstream";
     const testsFailed = /\b[1-9]\d* failed\b/.test(text) || text.startsWith(FAILED_TESTS);
     return flaky > 0 && own.state === "failure" && testsFailed && !text.startsWith(UPSTREAM_FAILED) && !text.startsWith(REPORTS_INCOMPLETE) ? "flaky" : "outside";
   } catch (e) {
@@ -3201,8 +3202,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     seen.result = result;
     const attempt = Number(id.gh_run_attempt) || 1;
     const onlyNoResults = (result.unnamed || result.missing) && !result.findings.some((f) => f.blocking);
+    const onlyDeadJobs = redWhy === "upstream" && !run.failing.length && !result.findings.some((f) => f.blocking);
     let rerunCheck = null;
-    if (onlyNoResults && attempt <= cfg.rerunAttempts) {
+    if ((onlyNoResults || onlyDeadJobs) && attempt <= cfg.rerunAttempts) {
       try {
         const dead = await readDeadJobs({ fetchImpl, token: String(env.GITHUB_TOKEN), repository: id.repository, runId: String(id.gh_run_id), attempt: String(id.gh_run_attempt), log });
         rerunCheck = await decideRerun(dead, apiKey && !prSpendUnknown ? askCauseWith(fetchImpl, apiKey, cfg.model, result.ai, cfg.prices) : null, log);
@@ -3221,7 +3223,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       }
     }
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
-    const laneRed = redWhy === "outside";
+    const laneRed = redWhy === "outside" || redWhy === "upstream";
     if (flakyOnly)
       notes.push(`No test failed: the ${run.counts.flaky === 1 ? "1 test that failed a try" : `${run.counts.flaky} tests that failed a try`} passed on a retry. The lane counted ${run.counts.flaky === 1 ? "it" : "them"} as failed.`);
     const rerun = rerunCheck?.rerun ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;

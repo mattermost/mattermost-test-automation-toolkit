@@ -417,8 +417,12 @@ with a warning, and the rest of the evidence still loads.
 ## Automatic re-runs
 
 `rerun-attempts` (default `0`, off) lets a lane that is red only because jobs sent no
-results (a shard that reported nothing, reports that never arrived; no test blocks) be
-re-run instead of asking a person to. While the run's attempt is within the allowance,
+results (a shard that reported nothing, reports that never arrived; no test blocks), or
+because a job outside the tests died while every report arrived and no test failed (a
+worker whose specs the others ran; the lane says "E2E upstream execution failed"), be
+re-run instead of asking a person to. A dead job's failed step decides as before: the
+network or the runner (including `Failed to get ID Token`, GitHub's OIDC token service)
+re-runs it, a build or test-server failure holds it. While the run's attempt is within the allowance,
 the check reads "re-running the failed jobs" and triage uploads a marker artifact; the
 `e2e-test-rerun` action, called from a `workflow_run` listener once the run has
 finished, re-runs the failed jobs, and the new attempt is triaged on its own results.
