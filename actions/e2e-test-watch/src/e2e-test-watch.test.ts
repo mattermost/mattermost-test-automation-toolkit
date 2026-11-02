@@ -835,6 +835,18 @@ test("a PR with more comments than read, none of them an answer, keeps the hold:
   assert.ok(notes.includes("requests not checked for a sign the agent ran them (Error: #41: more comments or reviews than read); they hold as sent"));
 });
 
+test("more open PRs on a request's specs than are read for an answer keeps the hold: the answer may be on one not read", async () => {
+  // z/c was requested from master run 11, 7 hours ago. 11 of the agent's PRs change it, all opened before the request;
+  // its only answer is a review on the last, which a read of 10 would miss.
+  const LEDGER_PATH = ledgerPath();
+  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
+  const repairPRs = Array.from({ length: 11 }, (_, i) => ownPR(60 + i, "specs/z/c.spec.ts", { createdAt: "2026-09-30T00:00:00Z" }));
+  const answers = [{ number: 70, text: "Master run https://github.com/o/r/actions/runs/11: c.spec.ts still fails here.", review: true, indexed: false }];
+  const { decisions, notes } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], repairPRs, answers }), hook: [] });
+  assert.deepEqual(decisions.find((d) => d.specs.includes("specs/z/c.spec.ts"))?.action, "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11");
+  assert.ok(notes.includes("specs/z/c.spec.ts: 11 open PRs change it, more than the 10 read for an answer; the request of 2026-10-02 17:00 UTC (https://github.com/o/r/actions/runs/11) holds as sent"));
+});
+
 test("a break that never ran holds no cause: its resend is not held as the same break", async () => {
   // Answers are due after 2 hours here, before the 4-hour cause hold ends. a, b and c went 3 hours ago and never ran.
   const LEDGER_PATH = ledgerPath();

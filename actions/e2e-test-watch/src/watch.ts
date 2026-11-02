@@ -331,7 +331,11 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
       // Where the agent answers when it opens no PR: its own PRs on the specs first, then the others it was sent.
       const specs = r.specs ?? [];
       const onSpecs = [...new Set([...specs.flatMap(agentPRsChanging), ...specs.flatMap((s) => prsTouching(open.files, s))])];
-      answered = answers(runId, specs, onSpecs.slice(0, MAX_OPEN_PRS_TOUCHING));
+      if (onSpecs.length > MAX_OPEN_PRS_TOUCHING) {
+        // The answer may be on a PR past the ones read: as with an incomplete search, the request holds as sent.
+        notes.push(`${specs.join(", ")}: ${onSpecs.length} open PRs change it, more than the ${MAX_OPEN_PRS_TOUCHING} read for an answer; the request of ${utcMinute(r.at)} UTC (${r.run}) holds as sent`);
+        answered = Promise.resolve(true);
+      } else answered = answers(runId, specs, onSpecs);
       answeredOf.set(r, answered);
     }
     try {
