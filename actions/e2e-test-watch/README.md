@@ -35,6 +35,15 @@ out at once (`max-broken-per-run` is only a safety limit); flaky specs share
 later conflict with trunk are left to the PR's own automation (e.g. an
 `AI/ConflictsBabysit` label in `extra-labels`).
 
+A webhook can accept a request (HTTP 200) whose agent then never starts. The agent
+answers each request it runs on GitHub: its PR, or its comment or review on an
+existing PR, links the request's trunk run. A request still held after
+`answer-hours` (6) with no PR, issue, comment or review citing that run, and no
+agent PR on its specs opened since, holds nothing and uses no flaky budget: its
+specs are requested again, once. The resend then holds as any request does, so a
+run that ends in no change (the agent's no-op leaves no trace either) is not sent
+a third time. If GitHub can't be searched, requests hold as sent.
+
 A re-run attempt re-runs only the failed jobs, so each suite is read at its newest
 attempt up to `gh-run-attempt`. The job summary also names what no request covers:
 failing tests that wait (a first failure in one lane, a first flake, a name two tests

@@ -3321,6 +3321,11 @@ function prsTouching(touched, spec) {
 function prsChanging(touched, spec) {
   return [...new Set(touched.get(spec) ?? [])].sort((a, b) => a - b);
 }
+async function citesRun(api, repository, runId) {
+  const q = `repo:${repository} "${runId}"`;
+  const res = await api("GET", `/search/issues?q=${encodeURIComponent(q)}&per_page=1`);
+  return (res.total_count ?? 0) > 0;
+}
 var REPAIR_PRS = `query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 50, after: $after) {
     pageInfo { hasNextPage endCursor }
@@ -3637,6 +3642,7 @@ var HOLD_MS = 24 * HOUR;
 var OWN_PR_IDLE_MS = 3 * DAY;
 var OWN_PR_MAX_AGE_MS = 2 * DAY;
 var STALE_PR_HOLD_MS = 3 * DAY;
+var MAX_RESENDS = 1;
 var REPORTS_PAGE = 100;
 var REPORTS_MAX_PAGES = 5;
 async function runGroups(fetchImpl, base, repository, runId, attempt, names) {
@@ -3720,6 +3726,7 @@ ${note}; nothing to watch.
   const maxBrokenPerRun = Number(env.MAX_BROKEN_PER_RUN || 10);
   const maxFlakyPerDay = Number(env.MAX_FLAKY_PER_DAY || 6);
   const causeHoldMs = Number(env.CAUSE_HOLD_HOURS || 4) * HOUR;
+  const answerHours = Number(env.ANSWER_HOURS || 6);
   const currentAt = Date.parse(first.created_at ?? "") || now.getTime();
   const label = env.LABEL || DEFAULT_LABEL;
   const reportNameOf = new Map(suites.map((s) => [s.name, s.report_name || null]));
@@ -3786,6 +3793,27 @@ ${note}; nothing to watch.
     ...[...open.prs.values()].map((p) => [p.number, p])
   ]);
   const daysSince = (at) => Math.floor((now.getTime() - at) / DAY);
+  const agentPRsChanging = (spec) => [.../* @__PURE__ */ new Set([...prsChanging(open.files, spec).filter((n) => open.prs.get(n)?.labels.includes(label)), ...prsChanging(own.files, spec)])].sort((a, b) => a - b);
+  const citedRuns = /* @__PURE__ */ new Map();
+  let citesUnknown = null;
+  const unanswered = async (r) => {
+    const at = Date.parse(r.at);
+    const runId = /\/actions\/runs\/(\d+)/.exec(r.run ?? "")?.[1];
+    if ((r.resent ?? 0) >= MAX_RESENDS || now.getTime() - at < answerHours * HOUR || !runId) return false;
+    if ((r.specs ?? []).some((s) => agentPRsChanging(s).some((n) => (agentPR.get(n)?.openedAt ?? 0) >= at))) return false;
+    if (!citedRuns.has(runId)) citedRuns.set(runId, citesRun(api, id.repository, runId));
+    try {
+      return !await citedRuns.get(runId);
+    } catch (e) {
+      if (!citesUnknown) {
+        citesUnknown = String(e).slice(0, 160);
+        notes.push(`requests not checked for a sign the agent ran them (${citesUnknown}); they hold as sent`);
+      }
+      return false;
+    }
+  };
+  const unansweredEntries = /* @__PURE__ */ new Set();
+  const resentOf = /* @__PURE__ */ new Map();
   const staleNoted = /* @__PURE__ */ new Set();
   const candidates = [];
   for (const g of groups.values()) {
@@ -3793,7 +3821,7 @@ ${note}; nothing to watch.
       const p = open.prs.get(n);
       return p ? [p] : [];
     });
-    const agentPRs = [.../* @__PURE__ */ new Set([...prsChanging(open.files, g.spec).filter((n) => open.prs.get(n)?.labels.includes(label)), ...prsChanging(own.files, g.spec)])].sort((a, b) => a - b);
+    const agentPRs = agentPRsChanging(g.spec);
     const ownPRs = [];
     for (const n of agentPRs) {
       const p = agentPR.get(n);
@@ -3811,14 +3839,29 @@ ${note}; nothing to watch.
       if (p && !prs.some((x) => x.number === n)) prs.push(p);
     }
     const holdMs = agentPRs.length && !ownPRs.length ? STALE_PR_HOLD_MS : HOLD_MS;
-    const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < holdMs);
+    let held;
+    const dead = [];
+    for (const r of ledger.filter((e) => e.specs?.includes(g.spec) && now.getTime() - Date.parse(e.at) < holdMs)) {
+      if (!ownUnknown && !ownPRs.length && await unanswered(r)) dead.push(r);
+      else {
+        held = r;
+        break;
+      }
+    }
+    if (!held && dead.length) {
+      const last = dead[dead.length - 1];
+      const resent = Math.max(...dead.map((r) => r.resent ?? 0)) + 1;
+      resentOf.set(g.spec, resent);
+      for (const r of dead) unansweredEntries.add(r);
+      notes.push(`${g.spec}: nothing on GitHub answers the request of ${utcMinute(last.at)} UTC (${last.run}) after ${answerHours} hours; it may not have started, so it holds nothing (resend ${resent} of ${MAX_RESENDS})`);
+    }
     if (ownUnknown) skip(g, "skipped: the agent's own PRs could not be read");
     else if (ownPRs.length) skip(g, `skipped: #${ownPRs.join(", #")} (${label}) already changes it`);
     else if (held) skip(g, `skipped: requested ${utcMinute(held.at)} UTC by ${held.run}`);
     else candidates.push({ ...g, openPRs: prs });
   }
   const asked = (g) => ledger.filter((e) => e.specs?.includes(g.spec)).length;
-  const flakyLeft = maxFlakyPerDay - ledger.filter((r) => r.kind === "flaky" && now.getTime() - Date.parse(r.at) < DAY).length;
+  const flakyLeft = maxFlakyPerDay - ledger.filter((r) => r.kind === "flaky" && now.getTime() - Date.parse(r.at) < DAY && !unansweredEntries.has(r)).length;
   const flaky = candidates.filter((g) => g.kind === "flaky").sort((a, b) => asked(a) - asked(b) || flakes(b) - flakes(a));
   const ranged = [];
   for (const g of [...candidates.filter((c) => c.kind === "broken"), ...flaky.slice(0, Math.max(0, flakyLeft))]) {
@@ -3864,6 +3907,7 @@ ${note}; nothing to watch.
       labels: [label, ...env.EXTRA_LABELS ? env.EXTRA_LABELS.split(",").map((l) => l.trim()).filter(Boolean) : []]
     };
     decision.action = "to request";
+    const resent = Math.max(0, ...r.specs.map((s) => resentOf.get(s) ?? 0));
     out.push({
       id: `fix-${out.length + 1}`,
       payload,
@@ -3872,7 +3916,8 @@ ${note}; nothing to watch.
         specs: r.specs,
         kind: r.kind,
         ...r.window ? { window: { from: Number.isFinite(r.window.from) ? r.window.from : null, to: r.window.to } } : {},
-        run: runURL
+        run: runURL,
+        ...resent ? { resent } : {}
       }
     });
   }

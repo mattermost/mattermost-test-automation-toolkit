@@ -162,6 +162,16 @@ export function prsChanging(touched: Map<string, number[]>, spec: string): numbe
   return [...new Set(touched.get(spec) ?? [])].sort((a, b) => a - b);
 }
 
+/**
+ * Whether any PR or issue of the repository cites this trunk run: the agent's PR body, or its comment or review on
+ * an existing PR, links the master run it was sent. Search covers bodies, comments and reviews, open or closed.
+ */
+export async function citesRun(api: GhApi, repository: string, runId: string): Promise<boolean> {
+  const q = `repo:${repository} "${runId}"`;
+  const res = (await api("GET", `/search/issues?q=${encodeURIComponent(q)}&per_page=1`)) as { total_count?: number };
+  return (res.total_count ?? 0) > 0;
+}
+
 const REPAIR_PRS = `query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 50, after: $after) {
     pageInfo { hasNextPage endCursor }

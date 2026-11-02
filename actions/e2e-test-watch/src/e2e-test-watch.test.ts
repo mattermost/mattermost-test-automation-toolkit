@@ -182,6 +182,10 @@ interface RouteOptions {
   uploadedAt?: Record<string, string>;
   // Other report groups of the same commit: suites the caller doesn't watch, or another run's.
   others?: { name: string; failed: number; runId?: string; attempt?: string }[];
+  // Trunk run ids no PR or issue cites (default none: the agent answered every request), and the searches made.
+  uncited?: string[];
+  searches?: string[];
+  searchDown?: boolean;
 }
 
 interface HistoryBody {
@@ -212,6 +216,9 @@ function routes({
   attempts = {},
   uploadedAt = {},
   others = [],
+  uncited = [],
+  searches = [],
+  searchDown = false,
 }: RouteOptions): FetchImpl {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
   const retried = recovered ? ["v/e.spec.ts", "u/f.spec.ts"] : [];
@@ -273,6 +280,13 @@ function routes({
       return Response.json({ observations: history });
     }],
     ["/commits/abc", () => Response.json({ files: [] })],
+    ["/search/issues", (_init, url) => {
+      const q = String(new URL(url).searchParams.get("q"));
+      searches.push(q);
+      if (searchDown) return new Response("rate limited", { status: 403 });
+      const runId = /"(\d+)"/.exec(q)?.[1] ?? "";
+      return Response.json({ total_count: uncited.includes(runId) ? 0 : 1, items: [] });
+    }],
     ["/graphql", (init) => {
       const { query, variables } = JSON.parse(String(init.body)) as { query: string; variables: { q?: string; after?: string | null } };
       if (query.includes("search(")) {
@@ -690,6 +704,75 @@ test("the hold still limits duplicates for a spec whose agent PR is idle", async
     [["specs/z/c.spec.ts"], "skipped: requested 2026-10-02 23:00 UTC by r"],
     [["specs/x/a.spec.ts", "specs/y/b.spec.ts"], "to request"],
   ]);
+});
+
+test("a request accepted but never run, with nothing on GitHub citing its run after 6 hours, is sent once more; then it holds", async () => {
+  const LEDGER_PATH = ledgerPath();
+  const searches: string[] = [];
+  // HTTP 200, and the agent never started: no PR, comment or review cites master run 12.
+  const fetchImpl = routes({ openPRFiles: [], uncited: ["12"], searches });
+  const hook: FixPayload[] = [];
+  const at = (h: number): Date => new Date(now.getTime() + h * 3600e3);
+  await run({ env: { ...env, LEDGER_PATH }, fetchImpl, hook });
+  assert.equal(hook.length, 1);
+
+  // Too soon for an answer: it holds, and GitHub is not searched.
+  const soon = await run({ env: { ...env, LEDGER_PATH }, fetchImpl, now: at(3), hook });
+  assert.deepEqual([...new Set(soon.decisions.map((d) => d.action))], ["skipped: requested 2026-10-03 00:00 UTC by https://github.com/o/r/actions/runs/12"]);
+  assert.deepEqual(searches, []);
+
+  const late = await run({ env: { ...env, LEDGER_PATH }, fetchImpl, now: at(7), hook });
+  assert.deepEqual(late.decisions.map((d) => d.action), ["to request"]);
+  assert.equal(hook.length, 2);
+  assert.deepEqual(searches, ['repo:o/r "12"'], "one search per run, however many specs the request had");
+  assert.ok(late.notes.includes("specs/x/a.spec.ts: nothing on GitHub answers the request of 2026-10-03 00:00 UTC (https://github.com/o/r/actions/runs/12) after 6 hours; it may not have started, so it holds nothing (resend 1 of 1)"));
+  assert.deepEqual(readLedger(LEDGER_PATH).map((e) => e.resent), [undefined, 1]);
+
+  // The resend is silent too (the agent's no-op leaves no trace): it holds as any request does.
+  const after = await run({ env: { ...env, LEDGER_PATH }, fetchImpl, now: at(14), hook });
+  assert.deepEqual([...new Set(after.decisions.map((d) => d.action))], ["skipped: requested 2026-10-03 07:00 UTC by https://github.com/o/r/actions/runs/12"]);
+  assert.equal(hook.length, 2);
+});
+
+test("a request whose run something cites, or whose spec got an agent PR since, holds as sent", async () => {
+  const LEDGER_PATH = ledgerPath();
+  const hook: FixPayload[] = [];
+  await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [] }), hook });
+  // The agent commented on an existing PR with master run 12's link.
+  const cited = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [] }), now: new Date(now.getTime() + 7 * 3600e3), hook });
+  assert.deepEqual([...new Set(cited.decisions.map((d) => d.action))], ["skipped: requested 2026-10-03 00:00 UTC by https://github.com/o/r/actions/runs/12"]);
+
+  // z/c was requested 60 hours ago; its agent PR, now past 2 days open, stopped blocking it (a 3-day hold).
+  const ledgerWithC = (): string => {
+    const path = ledgerPath();
+    writeFileSync(path, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 60 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
+    return path;
+  };
+  const decide = async (createdAt: string) =>
+    (await run({ env: { ...env, LEDGER_PATH: ledgerWithC() }, fetchImpl: routes({ openPRFiles: [], uncited: ["11"], repairPRs: [ownPR(9, "specs/z/c.spec.ts", { createdAt })] }), hook: [] })).decisions.map((d) => [d.specs, d.action]);
+  // Opened an hour after the request, citing no run: the agent ran it.
+  assert.deepEqual(await decide("2026-09-30T13:00:00Z"), [
+    [["specs/z/c.spec.ts"], "skipped: requested 2026-09-30 12:00 UTC by https://github.com/o/r/actions/runs/11"],
+    [["specs/x/a.spec.ts", "specs/y/b.spec.ts"], "to request"],
+  ]);
+  // Opened before it: no answer to that request.
+  assert.deepEqual(await decide("2026-09-29T00:00:00Z"), [[["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], "to request"]]);
+});
+
+test("when GitHub can't be searched, a request holds as sent and the summary says so", async () => {
+  const LEDGER_PATH = ledgerPath();
+  await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [] }), hook: [] });
+  const down = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], uncited: ["12"], searchDown: true }), now: new Date(now.getTime() + 7 * 3600e3), hook: [] });
+  assert.deepEqual([...new Set(down.decisions.map((d) => d.action))], ["skipped: requested 2026-10-03 00:00 UTC by https://github.com/o/r/actions/runs/12"]);
+  assert.ok(down.notes.some((n) => n.startsWith("requests not checked for a sign the agent ran them (Error: GitHub GET /search/issues?") && n.endsWith("; they hold as sent")));
+});
+
+test("a flaky request that never ran does not use the daily budget", async () => {
+  // v/e was requested 7 hours ago and never ran; u/f never was. Room for one a day.
+  const LEDGER_PATH = ledgerPath();
+  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/v/e.spec.ts"], kind: "flaky", run: "https://github.com/o/r/actions/runs/11" }] }));
+  const { decisions } = await run({ env: { ...env, LEDGER_PATH, MAX_FLAKY_PER_DAY: "1" }, fetchImpl: routes({ openPRFiles: [], recovered: true, bothFlaked: true, uncited: ["11"] }), hook: [] });
+  assert.deepEqual(decisions.filter((d) => d.kind === "flaky").map((d) => [d.specs[0], d.action]), [["specs/u/f.spec.ts", "to request"], ["specs/v/e.spec.ts", "skipped: flaky budget of 1 a day used"]]);
 });
 
 test("the flaky budget goes to specs not requested this week before the ones that were", async () => {
