@@ -3922,7 +3922,10 @@ ${note}; nothing to watch.
     if (!answered) {
       const specs = r.specs ?? [];
       const onSpecs = [.../* @__PURE__ */ new Set([...specs.flatMap(agentPRsChanging), ...specs.flatMap((s) => prsTouching(open.files, s))])];
-      if (onSpecs.length > MAX_OPEN_PRS_TOUCHING) {
+      if (open.truncated) {
+        notes.push(`${specs.join(", ")}: open PRs past the newest read were not checked for an answer; the request of ${utcMinute(r.at)} UTC (${r.run}) holds as sent`);
+        answered = Promise.resolve(true);
+      } else if (onSpecs.length > MAX_OPEN_PRS_TOUCHING) {
         notes.push(`${specs.join(", ")}: ${onSpecs.length} open PRs change it, more than the ${MAX_OPEN_PRS_TOUCHING} read for an answer; the request of ${utcMinute(r.at)} UTC (${r.run}) holds as sent`);
         answered = Promise.resolve(true);
       } else answered = answers(runId, specs, onSpecs);

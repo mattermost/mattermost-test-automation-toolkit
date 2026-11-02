@@ -200,6 +200,8 @@ interface RouteOptions {
   searchDown?: boolean;
   // The search timed out: GitHub says its results are incomplete.
   searchIncomplete?: boolean;
+  // Every page of open PRs is recent, so the read stops at its page cap before reaching older ones.
+  openPRsTruncated?: boolean;
 }
 
 interface HistoryBody {
@@ -234,6 +236,7 @@ function routes({
   searches = [],
   searchDown = false,
   searchIncomplete = false,
+  openPRsTruncated = false,
 }: RouteOptions): FetchImpl {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
   const retried = recovered ? ["v/e.spec.ts", "u/f.spec.ts"] : [];
@@ -327,6 +330,7 @@ function routes({
         files: { pageInfo: { hasNextPage: false }, nodes: paths.map((path) => ({ path })) },
       });
       if (!after) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p2" }, nodes: Array.from({ length: 50 }, (_, i) => pr(100 + i, "2026-10-02T12:00:00Z")) } } } });
+      if (openPRsTruncated) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "pn" }, nodes: [pr(41, "2026-10-02T00:00:00Z", openPRFiles, openPRLabels)] } } } });
       return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p3" }, nodes: [pr(43, "2026-10-02T01:00:00Z", releasePRFiles, [], "release-12.0"), pr(42, "2026-10-02T00:30:00Z", forkPRFiles, forkPRLabels, "master", true), pr(41, "2026-10-02T00:00:00Z", openPRFiles, openPRLabels), pr(7, "2026-09-01T00:00:00Z", ["specs/x/a.spec.ts"])] } } } });
     }],
     ["/compare/", (_init, url) => {
@@ -845,6 +849,14 @@ test("more open PRs on a request's specs than are read for an answer keeps the h
   const { decisions, notes } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], repairPRs, answers }), hook: [] });
   assert.deepEqual(decisions.find((d) => d.specs.includes("specs/z/c.spec.ts"))?.action, "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11");
   assert.ok(notes.includes("specs/z/c.spec.ts: 11 open PRs change it, more than the 10 read for an answer; the request of 2026-10-02 17:00 UTC (https://github.com/o/r/actions/runs/11) holds as sent"));
+});
+
+test("when open PRs past the newest read were not checked, an unanswered request keeps the hold: its answer may be on one of them", async () => {
+  const LEDGER_PATH = ledgerPath();
+  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
+  const { decisions, notes } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], answers: [], openPRsTruncated: true }), hook: [] });
+  assert.deepEqual(decisions.find((d) => d.specs.includes("specs/z/c.spec.ts"))?.action, "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11");
+  assert.ok(notes.includes("specs/z/c.spec.ts: open PRs past the newest read were not checked for an answer; the request of 2026-10-02 17:00 UTC (https://github.com/o/r/actions/runs/11) holds as sent"));
 });
 
 test("a break that never ran holds no cause: its resend is not held as the same break", async () => {
