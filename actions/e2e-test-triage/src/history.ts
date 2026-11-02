@@ -217,8 +217,11 @@ export async function fetchHistory(
       attempts.sort((a, b) => a.retry_count - b.retry_count);
       const { status, last } = outcomeOf(attempts);
       // Every run in `runs` has at least one attempt, so the outcome always has a last one. A flaky run's last attempt is
-      // its pass: it keeps the error of its last failed try, which is what the rules compare.
-      const failedTry = status === "flaky" ? attempts.filter((a) => FAILED_STATUSES.has(a.status)).at(-1) : undefined;
+      // its pass: it keeps the error of its last failed try, which is what the rules compare. A retry on the same worker
+      // reaches TSIO as attempts all marked "flaky", the failed one carrying the error.
+      const failedTry = status === "flaky"
+        ? attempts.filter((a) => FAILED_STATUSES.has(a.status) || (a.status === "flaky" && a.error_excerpt)).at(-1)
+        : undefined;
       collapsed.push({ ...last!, status, ...(failedTry?.error_excerpt ? { error_excerpt: failedTry.error_excerpt } : {}) });
     }
     byTest.set(key, collapsed);

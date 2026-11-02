@@ -540,7 +540,7 @@ ${o.title}`;
     for (const attempts of runs.values()) {
       attempts.sort((a, b) => a.retry_count - b.retry_count);
       const { status, last } = outcomeOf(attempts);
-      const failedTry = status === "flaky" ? attempts.filter((a) => FAILED_STATUSES.has(a.status)).at(-1) : void 0;
+      const failedTry = status === "flaky" ? attempts.filter((a) => FAILED_STATUSES.has(a.status) || a.status === "flaky" && a.error_excerpt).at(-1) : void 0;
       collapsed.push({ ...last, status, ...failedTry?.error_excerpt ? { error_excerpt: failedTry.error_excerpt } : {} });
     }
     byTest.set(key, collapsed);
