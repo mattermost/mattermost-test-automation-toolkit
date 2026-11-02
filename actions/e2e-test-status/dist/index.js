@@ -78,6 +78,8 @@ function laneSummary(lanes, untriaged = []) {
 }
 
 // ../shared/src/status.ts
+var UPSTREAM_FAILED = "E2E upstream execution failed; re-run the failed jobs";
+var REPORTS_INCOMPLETE = "E2E reports unavailable or incomplete; re-run the failed jobs";
 var positive = (v) => /^[1-9]\d*$/.test(String(v ?? ""));
 function statusOwner(target, repository) {
   try {
@@ -214,7 +216,8 @@ function tsioBase(env) {
 function outcomeWithDuplicates(attempts, reportOf = () => null) {
   const outcome = outcomeOf(attempts);
   if (outcome.status !== "flaky") return outcome;
-  const duplicateFail = attempts.find((f) => FAILED_STATUSES.has(f.status) && attempts.some((a) => a !== f && a.retry_count === f.retry_count && reportOf(a) === reportOf(f) && !FAILED_STATUSES.has(a.status) && a.status !== "skipped"));
+  const ranAfter = (a, f) => typeof a.ordinal === "number" && typeof f.ordinal === "number" && a.ordinal > f.ordinal;
+  const duplicateFail = attempts.find((f) => FAILED_STATUSES.has(f.status) && attempts.some((a) => a !== f && a.retry_count === f.retry_count && reportOf(a) === reportOf(f) && !FAILED_STATUSES.has(a.status) && a.status !== "skipped" && !ranAfter(a, f)));
   return duplicateFail ? { status: duplicateFail.status, last: duplicateFail } : outcome;
 }
 function outcomeOf(attempts) {
@@ -419,7 +422,7 @@ async function publish({ env, fetchImpl = fetch, log = console.error, wait }) {
       }
       if (!reportsComplete || env.EXECUTION_SUCCESS !== "true") {
         state = "failure";
-        description = !reportsComplete ? "E2E reports unavailable or incomplete; re-run the failed jobs" : "E2E upstream execution failed; re-run the failed jobs";
+        description = !reportsComplete ? REPORTS_INCOMPLETE : UPSTREAM_FAILED;
       }
     }
     written = await publisher.write({ state, description, target_url: env.TARGET_URL }, operation);

@@ -64,6 +64,7 @@ var DEFAULTS = {
   rerunAttempts: 0,
   historyLane: null,
   historyReport: null,
+  supportPaths: [],
   // Re-asks an answer between escalateMin and the threshold, or one that blames the PR
   // without citing a change. Replays of real desktop runs (2026-10-29): Sonnet 5.5 fell just
   // short on 2 of 19 findings (0.8, 0.72) and Opus 5.5 settled both, at about $0.03 each.
@@ -120,6 +121,16 @@ function attemptsFrom(raw, warn) {
   warn(`RERUN_ATTEMPTS ${JSON.stringify(raw)} is not a whole number of 0 or more; using ${DEFAULTS.rerunAttempts}`);
   return DEFAULTS.rerunAttempts;
 }
+function supportPathsFrom(raw, warn) {
+  const out = [];
+  for (const entry of String(raw ?? "").split(/[,\n]/)) {
+    const path = entry.trim().replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+    if (!path) continue;
+    if (path.startsWith("/") || path.split("/").includes("..")) warn(`SUPPORT_PATHS entry ${JSON.stringify(entry.trim())} is not a directory in the repository; ignored`);
+    else out.push(path);
+  }
+  return out;
+}
 var isPlainObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var isPrice = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
 var PRICE_FIELDS = ["input", "output", "cache_write", "cache_read"];
@@ -167,6 +178,7 @@ function configFrom(env, warn = () => {
     rerunAttempts: attemptsFrom(env.RERUN_ATTEMPTS, warn),
     historyLane: (env.HISTORY_LANE || "").trim() || null,
     historyReport: (env.HISTORY_REPORT || "").trim() || null,
+    supportPaths: supportPathsFrom(env.SUPPORT_PATHS, warn),
     prices
   };
 }
@@ -197,7 +209,8 @@ function tsioBase(env) {
 function outcomeWithDuplicates(attempts, reportOf = () => null) {
   const outcome = outcomeOf(attempts);
   if (outcome.status !== "flaky") return outcome;
-  const duplicateFail = attempts.find((f) => FAILED_STATUSES.has(f.status) && attempts.some((a) => a !== f && a.retry_count === f.retry_count && reportOf(a) === reportOf(f) && !FAILED_STATUSES.has(a.status) && a.status !== "skipped"));
+  const ranAfter = (a, f) => typeof a.ordinal === "number" && typeof f.ordinal === "number" && a.ordinal > f.ordinal;
+  const duplicateFail = attempts.find((f) => FAILED_STATUSES.has(f.status) && attempts.some((a) => a !== f && a.retry_count === f.retry_count && reportOf(a) === reportOf(f) && !FAILED_STATUSES.has(a.status) && a.status !== "skipped" && !ranAfter(a, f)));
   return duplicateFail ? { status: duplicateFail.status, last: duplicateFail } : outcome;
 }
 function outcomeOf(attempts) {
@@ -429,7 +442,7 @@ async function fetchSpecRuns(fetchImpl, base, repository, files, until, cfg = DE
   for (const [file, byGroup] of runs) {
     const outcomes = [];
     for (const [group_id, run] of byGroup) {
-      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count), (a) => a.report_name ?? null).status);
+      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0)), (a) => a.report_name ?? null).status);
       const status = run.notRun ? "not_run" : results.some((s) => FAILED_STATUSES.has(s)) ? "failed" : results.every((s) => s === "skipped") ? "skipped" : "passed";
       outcomes.push({ group_id, status });
     }
@@ -538,7 +551,7 @@ ${o.title}`;
       runs.get(run).push(row);
     }
     for (const attempts of runs.values()) {
-      attempts.sort((a, b) => a.retry_count - b.retry_count);
+      attempts.sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0));
       const { status, last } = outcomeOf(attempts);
       const failedTry = status === "flaky" ? attempts.filter((a) => FAILED_STATUSES.has(a.status) && a.error_excerpt).at(-1) ?? attempts.filter((a) => a.status === "flaky" && a.error_excerpt).at(-1) : void 0;
       collapsed.push({ ...last, status, ...failedTry?.error_excerpt ? { error_excerpt: failedTry.error_excerpt } : {} });
@@ -692,7 +705,8 @@ async function markOutOfDate({
   baseBranch,
   until = null,
   log = () => {
-  }
+  },
+  supportPaths = []
 }) {
   if (!findings.length || !baseBranch) return { truncated: false };
   const cmp = await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`);
@@ -718,9 +732,35 @@ async function markOutOfDate({
     const diff = files.find((x) => x.filename === path)?.patch;
     f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit, ...also.length ? { also } : {}, ...diff ? { diff: diff.slice(0, 4e3) } : {} };
   }
-  if (!truncated) return { truncated: false };
   const base = cmp.merge_base_commit;
   const since = base?.commit?.committer?.date ?? base?.commit?.author?.date ?? null;
+  const supportChange = async () => {
+    for (const dir of supportPaths) {
+      if (!truncated) {
+        if (!files.some((x) => x.filename.startsWith(`${dir}/`))) continue;
+        const log_ = await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(dir)}&per_page=10`).catch(() => []);
+        const c2 = (log_ ?? []).find((x) => onBase.has(x.sha));
+        return { dir, commit: c2 ? commitRef(c2) : null };
+      }
+      if (!since) continue;
+      const q = new URLSearchParams({ sha: baseBranch, path: dir, since, ...until ? { until } : {}, per_page: "1" });
+      const raw = await api("GET", `/repos/${id.repository}/commits?${q}`).catch((e) => (log(`${baseBranch} commits in ${dir} unavailable: ${String(e).slice(0, 160)}`), []));
+      const c = (Array.isArray(raw) ? raw : []).find((x) => x.sha !== base?.sha);
+      if (c) return { dir, commit: commitRef(c) };
+    }
+    return null;
+  };
+  let support;
+  const markSupport = async (list) => {
+    const unmarked = list.filter((f) => !f.out_of_date);
+    if (!unmarked.length || !supportPaths.length) return;
+    if (support === void 0) support = await supportChange();
+    if (support) for (const f of unmarked) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by ?? null, commit: support.commit, support: support.dir };
+  };
+  if (!truncated) {
+    await markSupport(findings);
+    return { truncated: false };
+  }
   if (!since) {
     log(`${baseBranch} changed ${files.length}+ files since this PR last merged it, and the merge base has no date; ${rest.length} failure(s) unchecked`);
     return { truncated: true, unchecked: rest };
@@ -750,6 +790,7 @@ async function markOutOfDate({
     if (c === "unchecked") unchecked.push(f);
     else if (c) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: c };
   }
+  await markSupport(findings.filter((f) => !unchecked.includes(f)));
   return { truncated: true, unchecked };
 }
 async function markBrokeBy({ findings, api, id, log = () => {
@@ -853,6 +894,12 @@ function whyNext(f, branch, pr, branchRun = null) {
       const where = c ? ` (${refOf(c)}${c.date ? `, ${c.date}` : ""}${also.length ? `; also ${also.map(refOf).join(", ")}` : ""})` : "";
       if (f.out_of_date?.fixed) return [`The failure first passed on ${branch}${where} after this PR last merged ${branch}, so this branch still has it.`, `Merge ${branch} and re-run.`];
       const base = f.out_of_date?.base ?? branch;
+      const support = f.out_of_date?.support;
+      if (support) {
+        const at = ` (${support}${c ? `; ${refOf(c)}${c.date ? `, ${c.date}` : ""}` : ""})`;
+        if (branchRun) return [`${base} changed the test code it runs through${at} after ${branchRun} branched from it, so this run used ${branchRun}'s old copy.`, `Backport the test change to ${branchRun}, or ignore it for this release.`];
+        return [`${branch} changed the test code it runs through${at} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
+      }
       if (branchRun) return [`${base} changed this test${where} after ${branchRun} branched from it, so this run used ${branchRun}'s old copy.`, `Backport the test change to ${branchRun}, or ignore it for this release.`];
       return [`${branch} changed this test${where} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
     }
@@ -928,7 +975,8 @@ function factsTable(f, branch, pr, branchRun = null) {
     const also = f.out_of_date.also ?? [];
     const which = c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}${also.length ? `, and earlier ${also.map(refOf).join(", ")}` : ""}` : "";
     const base = f.out_of_date.base ?? branch;
-    rows.push(f.out_of_date.fixed ? [`Fixed on ${branch} since this PR last merged it`, `Yes${which}: its first passing run. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it does not have the fix`] : branchRun ? [`Changed on ${base} since ${branchRun} branched`, `Yes${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test`] : [`Changed on ${branch} since this PR last merged it`, `Yes${which}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
+    const support = f.out_of_date.support;
+    rows.push(support ? branchRun ? [`Test code changed on ${base} since ${branchRun} branched`, `Yes, in ${support}${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test code`] : [`Test code changed on ${branch} since this PR last merged it`, `Yes, in ${support}${which}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test code`] : f.out_of_date.fixed ? [`Fixed on ${branch} since this PR last merged it`, `Yes${which}: its first passing run. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it does not have the fix`] : branchRun ? [`Changed on ${base} since ${branchRun} branched`, `Yes${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test`] : [`Changed on ${branch} since this PR last merged it`, `Yes${which}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
   }
   if (f.decision === "evidence_incomplete" || f.identity_unresolved) rows.push(["Why history wasn't used", f.reason]);
   const a = f.judge;
@@ -1176,6 +1224,8 @@ function laneSummary(lanes, untriaged = []) {
 }
 
 // ../shared/src/status.ts
+var UPSTREAM_FAILED = "E2E upstream execution failed; re-run the failed jobs";
+var REPORTS_INCOMPLETE = "E2E reports unavailable or incomplete; re-run the failed jobs";
 var positive = (v) => /^[1-9]\d*$/.test(String(v ?? ""));
 function statusOwner(target, repository) {
   try {
@@ -1460,6 +1510,10 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
     if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !unstable.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
       const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
       return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
+    }
+    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran && !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
+      const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
+      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`, true);
     }
     return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the last ${trunk.length} trunk runs.`, false);
   }
@@ -2960,13 +3014,15 @@ async function noteNoResults({ env, fetchImpl = fetch, log = console.error }, id
     log(`not-triaged note not written on ${context}: ${String(e).slice(0, 200)}`);
   }
 }
-async function laneIsRed(api, id, context, log) {
+async function laneRedWhy(api, id, context, flaky, log) {
   try {
     const own = (await readStatuses(api, id)).find((r) => r.context === context);
-    return own?.state === "failure" || own?.state === "error";
+    if (own?.state !== "failure" && own?.state !== "error") return null;
+    const text = String(own.description ?? "");
+    return flaky > 0 && own.state === "failure" && !text.startsWith(UPSTREAM_FAILED) && !text.startsWith(REPORTS_INCOMPLETE) ? "flaky" : "outside";
   } catch (e) {
     log(`lane status unavailable: ${String(e).slice(0, 160)}`);
-    return false;
+    return null;
   }
 }
 async function defaultBranchOf(api, repository, log) {
@@ -3023,7 +3079,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     notes.push(`Report only on this PR: it has the ${cfg.reportOnlyLabel} label, so triage leaves the E2E check as the tests set it.`);
   }
   seen.enforce = enforce;
-  const announce = enforce && (run.failing.length > 0 || Boolean(run.missing));
+  const redWhy = !run.failing.length && !run.missing && context ? await laneRedWhy(api, id, context, run.counts.flaky, log) : null;
+  const flakyOnly = redWhy === "flaky";
+  const decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly;
+  const announce = enforce && decides;
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
   const settleLaneSummary = async () => {
     try {
@@ -3032,7 +3091,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
     }
   };
-  if (announce) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : `${run.counts.failed} failed \xB7 triage is checking them`);
+  if (announce) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : flakyOnly ? `${run.counts.flaky} flaky \xB7 triage is checking them` : `${run.counts.failed} failed \xB7 triage is checking them`);
   try {
     let history = /* @__PURE__ */ new Map();
     let diff = { files: [], ok: false };
@@ -3129,7 +3188,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       // A release run's matrix (OS x server version) is wider than a PR's platforms.
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log, limit: branchBase ? 20 : 5 }),
-      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log }),
+      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory
@@ -3157,11 +3216,13 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       }
     }
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
-    const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
+    const laneRed = redWhy === "outside";
+    if (flakyOnly)
+      notes.push(`No test failed: the ${run.counts.flaky === 1 ? "1 test that failed a try" : `${run.counts.flaky} tests that failed a try`} passed on a retry. The lane counted ${run.counts.flaky === 1 ? "it" : "them"} as failed.`);
     const rerun = rerunCheck?.rerun ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = rerunCheck?.held ?? null;
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
-    const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
+    const description = flakyOnly ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}` : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
       (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}
@@ -3177,7 +3238,7 @@ ai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}
 ai_input_tokens=${spend.input_tokens}
 ai_output_tokens=${spend.output_tokens}
 `);
-    if (env.GITHUB_STEP_SUMMARY && (run.failing.length > 0 || Boolean(run.missing) || laneRed)) {
+    if (env.GITHUB_STEP_SUMMARY && (decides || laneRed)) {
       (0, import_node_fs3.appendFileSync)(env.GITHUB_STEP_SUMMARY, summary + "\n");
       written.summary = true;
     }
@@ -3185,7 +3246,7 @@ ai_output_tokens=${spend.output_tokens}
     if (mode && mode !== "enforce" && mode !== "report-only")
       log(`unrecognised mode ${JSON.stringify(mode)}; the only value that enforces is "enforce", so this run is report-only`);
     let published = false;
-    if (enforce && context && (run.failing.length > 0 || Boolean(run.missing))) {
+    if (enforce && context && decides) {
       published = await publisher.write({
         state: result.verdict === "SUCCESS" ? "success" : "failure",
         context,
@@ -3193,7 +3254,7 @@ ai_output_tokens=${spend.output_tokens}
         target_url: runURL
       }, "triage");
     }
-    if (!enforce && context && (run.failing.length > 0 || Boolean(run.missing))) {
+    if (!enforce && context && decides) {
       try {
         const current = (await readStatuses(api, id)).find((r) => r.context === context);
         if (current && current.state !== "pending") await publisher.write({ state: current.state, description, target_url: runURL }, "triage");
@@ -3205,7 +3266,7 @@ ai_output_tokens=${spend.output_tokens}
     if (announce && lanes.length) await settleLaneSummary();
     else if (announce) {
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).map((l) => l === RERUN ? again : l).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${again}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", flakyOnly ? `${run.counts.flaky} flaky, passed on retry \xB7 no test failed` : (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).map((l) => l === RERUN ? again : l).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${again}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
 `);
