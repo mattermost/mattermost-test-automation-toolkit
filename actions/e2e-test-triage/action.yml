@@ -64,7 +64,7 @@ inputs:
     description: >-
       Repository directories of the code the specs run through (page objects, support commands, fixtures),
       comma- or newline-separated. A held failure whose spec is unchanged is out of date ("merge the base
-      branch") when the base branch changed one of them after the PR last merged it. Empty turns it off
+      branch") when one base-branch commit since the PR last merged it changed one of them and another spec failing in the run. Empty turns it off
     required: false
     default: ""
   history-report:

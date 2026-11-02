@@ -454,9 +454,10 @@ export interface OutOfDateResult {
  * directories, up to `until`). Any commit marks the failure with it; none leaves it
  * unmarked. A failure no check settled (the cap, an error, no merge base date) is
  * returned in `unchecked`: the caller must treat it as unchecked, not as unchanged.
- * A failure whose spec is unchanged is still out of date where the base branch changed
- * one of `supportPaths` (the code the specs run through): read from the same list, or
- * by directory when it is cut off. A support directory that can't be checked marks nothing.
+ * A failure whose spec is unchanged is still out of date where a base commit that changed
+ * another failing spec of this run also changed one of `supportPaths` (the code the specs
+ * run through): read from the same list, or by directory when it is cut off. A support
+ * directory that can't be checked marks nothing.
  */
 export async function markOutOfDate({
   findings,
@@ -504,20 +505,22 @@ export async function markOutOfDate({
   }
   const base = cmp.merge_base_commit;
   const since = base?.commit?.committer?.date ?? base?.commit?.author?.date ?? null;
-  // The code the specs run through: the first support directory the base branch changed since the merge base, and its
-  // newest commit there. From the list where it is whole, else from the directory's commits up to the run's time.
-  const supportChange = async (): Promise<{ dir: string; commit: OutOfDate["commit"] } | null> => {
+  // The code the specs run through, where one base commit migrated both: a support directory the base branch changed
+  // since the merge base, in a commit that also changed a spec failing in this run (see markSupport). A support change
+  // alone (a new helper, a flag default, other specs' fixtures) says nothing about this run's failures.
+  const supportChange = async (specCommits: Set<string>): Promise<{ dir: string; commit: OutOfDate["commit"] } | null> => {
     for (const dir of supportPaths) {
+      let rows: CommitRow[] = [];
       if (!truncated) {
         if (!files.some((x) => x.filename.startsWith(`${dir}/`))) continue;
-        const log_ = (await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(dir)}&per_page=10`).catch(() => [])) as CommitRow[] | null;
-        const c = (log_ ?? []).find((x) => onBase.has(x.sha));
-        return { dir, commit: c ? commitRef(c) : null };
+        const raw = await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(dir)}&per_page=30`).catch(() => []);
+        rows = (Array.isArray(raw) ? (raw as CommitRow[]) : []).filter((x) => onBase.has(x.sha));
+      } else if (since) {
+        const q = new URLSearchParams({ sha: baseBranch, path: dir, since, ...(until ? { until } : {}), per_page: "30" });
+        const raw = await (api("GET", `/repos/${id.repository}/commits?${q}`) as Promise<unknown>).catch((e: unknown) => (log(`${baseBranch} commits in ${dir} unavailable: ${String(e).slice(0, 160)}`), []));
+        rows = (Array.isArray(raw) ? (raw as CommitRow[]) : []).filter((x) => x.sha !== base?.sha);
       }
-      if (!since) continue;
-      const q = new URLSearchParams({ sha: baseBranch, path: dir, since, ...(until ? { until } : {}), per_page: "1" });
-      const raw = await (api("GET", `/repos/${id.repository}/commits?${q}`) as Promise<unknown>).catch((e: unknown) => (log(`${baseBranch} commits in ${dir} unavailable: ${String(e).slice(0, 160)}`), []));
-      const c = (Array.isArray(raw) ? (raw as CommitRow[]) : []).find((x) => x.sha !== base?.sha);
+      const c = rows.find((x) => specCommits.has(x.sha));
       if (c) return { dir, commit: commitRef(c) };
     }
     return null;
@@ -526,7 +529,10 @@ export async function markOutOfDate({
   const markSupport = async (list: Finding[]): Promise<void> => {
     const unmarked = list.filter((f) => !f.out_of_date);
     if (!unmarked.length || !supportPaths.length) return;
-    if (support === undefined) support = await supportChange();
+    // The base commits that changed this run's failing specs since the merge base.
+    const specCommits = new Set(findings.flatMap((f) => (f.out_of_date && !f.out_of_date.support ? [f.out_of_date.commit, ...(f.out_of_date.also ?? [])] : [])).map((c) => c?.sha).filter((x): x is string => Boolean(x)));
+    if (!specCommits.size) return;
+    if (support === undefined) support = await supportChange(specCommits);
     if (support) for (const f of unmarked) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by ?? null, commit: support.commit, support: support.dir };
   };
   if (!truncated) {

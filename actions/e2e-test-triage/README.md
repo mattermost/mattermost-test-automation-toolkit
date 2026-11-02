@@ -62,11 +62,13 @@ out of date with that commit; none leaves it to the usual rules. A spec no check
 settled (over 20 directories, an error, a merge base with no date) stays blocking
 as unchecked evidence (the summary says so), and the model is not asked about it.
 `support-paths` names the code the specs run through (page objects, support
-commands, fixtures; for example `e2e-tests/playwright/lib`). Where a failure's
-spec is unchanged but the base branch changed one of those directories since the
-merge base (from the same list, or by directory up to the run's time when it is
-cut off), the failure is out of date too, and the summary names the directory and
-commit. Without `support-paths` only the spec counts.
+commands, fixtures; for example `e2e-tests/playwright/lib`). A failure whose spec
+is unchanged is out of date too where one base-branch commit since the merge base
+changed both one of those directories and another spec failing in this run (a
+migration of specs and their page objects, from the same list, or by directory up
+to the run's time when it is cut off). The summary names the directory and the
+commit. A support change alone (a new helper, a flag default) does not count, and
+without `support-paths` only the spec does.
 
 **Flaky on master:** over master's last 50 runs (at least 5), failures plus
 passes that needed a retry, plus 1, divided by the runs plus 2, is 0.05 or more,

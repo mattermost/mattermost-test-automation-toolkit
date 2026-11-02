@@ -2562,49 +2562,62 @@ test("a test the base branch changed after the PR last merged it is out of date:
   });
 });
 
-test("a test whose support code the base branch changed after the PR last merged it is out of date too", async () => {
-  // mattermost#39228 (run 40561804218): master's e190c0f changed the page objects these Playwright specs run through
-  // (e2e-tests/playwright/lib), not the specs; the PR ran its old copy against master's build.
-  const migrate = { sha: "e190c0f", commit: { message: "Migrate product Buttons from shared to compass-ui (#38903)", committer: { date: "2026-10-27T14:39:56Z" } } };
-  const compare = { ahead_by: 8, files: [{ filename: "lib/src/ui/components/channels/delete_post_confirmation_dialog.ts" }, { filename: "webapp/x.tsx" }], commits: [{ sha: "e190c0f" }] };
-  await inTmp(async (dir) => {
-    const asked: number[] = [];
-    const summaryPath = join(dir, "s.md");
-    const routes: Route[] = [["/commits?sha=master&path=lib&per_page=10", () => Response.json([migrate])], ...staleRoutes({ compare, commits: [], asked })];
-    const result = await triage({ env: { ...env, TRIAGE_CONTEXT: "off", SUPPORT_PATHS: "lib/", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl: fakeFetch(routes), log: () => {} });
-    assert.deepEqual(result.findings[0].out_of_date, { base: "master", behind: 8, commit: { sha: "e190c0f", date: "2026-10-27", pr: 38903 }, support: "lib" });
-    assert.equal(result.findings[0].blocking, true);
-    assert.equal(asked.length, 0, "an out-of-date failure is not sent to the model");
-    const text = readFileSync(summaryPath, "utf8");
-    assert.match(text, /\| master changed the test code it runs through \(lib; #38903, 2026-10-27\) after this PR last merged master, so the PR ran its old copy\. \| Merge master and re-run\. \|/);
-    assert.match(text, /Test code changed on master since this PR last merged it \| Yes, in lib: e190c0f \(#38903\) on 2026-10-27\. This PR is 8 commits behind/);
-  });
-  // Without support paths, or when they did not change, the rule is as before.
-  const unset = await triage({ env: { ...env, TRIAGE_CONTEXT: "off" }, fetchImpl: fakeFetch(staleRoutes({ compare, commits: [] })), log: () => {} });
-  assert.equal(unset.findings[0].out_of_date, undefined);
-  const elsewhere = await triage({ env: { ...env, TRIAGE_CONTEXT: "off", SUPPORT_PATHS: "cypress/support" }, fetchImpl: fakeFetch(staleRoutes({ compare, commits: [] })), log: () => {} });
-  assert.equal(elsewhere.findings[0].out_of_date, undefined);
-  // The spec's own change names it first.
-  const both = { ...compare, files: [...compare.files, { filename: "specs/a.spec.ts" }] };
-  const own = await triage({ env: { ...env, TRIAGE_CONTEXT: "off", SUPPORT_PATHS: "lib" }, fetchImpl: fakeFetch(staleRoutes({ compare: both, commits: [migrate] })), log: () => {} });
-  assert.equal(own.findings[0].out_of_date?.support, undefined);
-  assert.equal(own.findings[0].out_of_date?.commit?.sha, "e190c0f");
+// mattermost#39228 (run 40561804218): master's e190c0f migrated both specs and the Playwright page objects they run
+// through (e2e-tests/playwright/lib). The PR ran its old copies against master's build.
+const migrate = { sha: "e190c0f", commit: { message: "Migrate product Buttons from shared to compass-ui (#38903)", committer: { date: "2026-10-27T14:39:56Z" } } };
+const flagDefault = { sha: "7709b2f", commit: { message: "Serve property field permissions (#39080)", committer: { date: "2026-10-27T21:42:06Z" } } };
+const twoSpecs = (): Finding[] => [
+  classify({ ...failing, title: "changed", repo_path: "specs/b.spec.ts" }, trunkPasses(8), []),
+  classify({ ...failing, title: "unchanged", repo_path: "specs/a.spec.ts" }, trunkPasses(8), []),
+];
+const githubOf = (compare: unknown, logs: Record<string, unknown[]>, asked: string[] = []) => async (_m: string, path: string): Promise<unknown> => {
+  asked.push(path);
+  if (path.includes("/compare/")) return compare;
+  for (const [dir, rows] of Object.entries(logs)) if (path.includes(`path=${encodeURIComponent(dir)}&`)) return rows;
+  return [];
+};
+
+test("a failure whose spec is unchanged is out of date when the base commit that changed this run's other failing specs also changed their support code", async () => {
+  const compare = { ahead_by: 8, files: [{ filename: "specs/b.spec.ts" }, { filename: "lib/src/ui/delete_post_confirmation_dialog.ts" }], commits: [{ sha: "e190c0f" }, { sha: "7709b2f" }] };
+  const [changed, unchanged] = twoSpecs();
+  await markOutOfDate({ findings: [changed, unchanged], api: githubOf(compare, { "specs/b.spec.ts": [migrate], lib: [flagDefault, migrate] }), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master", supportPaths: ["lib"] });
+  assert.equal(changed.out_of_date?.commit?.sha, "e190c0f");
+  assert.deepEqual(unchanged.out_of_date, { base: "master", behind: 8, commit: { sha: "e190c0f", date: "2026-10-27", pr: 38903 }, support: "lib" }, "named by the migrating commit, not the newest one in lib");
+  const text = summary({ findings: [unchanged], counts: { passed: 9, failed: 1 }, runURL: "u", trunkBranch: "master" });
+  assert.match(text, /\| master changed the test code it runs through \(lib; #38903, 2026-10-27\) after this PR last merged master, so the PR ran its old copy\. \| Merge master and re-run\. \|/);
+  assert.match(text, /Test code changed on master since this PR last merged it \| Yes, in lib: e190c0f \(#38903\) on 2026-10-27\. This PR is 8 commits behind/);
+});
+
+test("a support-code change alone does not make a failure out of date", async () => {
+  // mattermost#39484 and #39572: master changed a feature-flag default or removed other specs' support code; the
+  // failures were the PR's. No failing spec changed with it, so they stay with the usual rules.
+  const compare = { ahead_by: 8, files: [{ filename: "lib/src/server/default_feature_flags.ts" }], commits: [{ sha: "7709b2f" }] };
+  const [, unchanged] = twoSpecs();
+  await markOutOfDate({ findings: [unchanged], api: githubOf(compare, { lib: [flagDefault] }), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master", supportPaths: ["lib"] });
+  assert.equal(unchanged.out_of_date, undefined);
+  // A failing spec changed by another commit than the support code's: not the same migration either.
+  const other = { ahead_by: 8, files: [{ filename: "specs/b.spec.ts" }, { filename: "lib/src/server/default_feature_flags.ts" }], commits: [{ sha: "e190c0f" }, { sha: "7709b2f" }] };
+  const [changed, alone] = twoSpecs();
+  await markOutOfDate({ findings: [changed, alone], api: githubOf(other, { "specs/b.spec.ts": [migrate], lib: [flagDefault] }), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master", supportPaths: ["lib"] });
+  assert.equal(changed.out_of_date?.commit?.sha, "e190c0f");
+  assert.equal(alone.out_of_date, undefined);
+  // Without support paths the rule is as before.
+  const [c2, u2] = twoSpecs();
+  await markOutOfDate({ findings: [c2, u2], api: githubOf({ ...other, files: [{ filename: "specs/b.spec.ts" }, { filename: "lib/x.ts" }] }, { "specs/b.spec.ts": [migrate], lib: [migrate] }), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master" });
+  assert.equal(u2.out_of_date, undefined);
 });
 
 test("support code is checked by directory when the base branch's file list is cut off", async () => {
-  // e190c0f alone changed 300 files, so GitHub's list stops before the support code.
+  // e190c0f alone changed 300 files, so GitHub's list stops before the specs and the support code.
   const others = Array.from({ length: 300 }, (_, i) => ({ filename: `f${i}.ts` }));
+  const compare = { ahead_by: 8, files: others, commits: [], merge_base_commit: { sha: "base0", commit: { committer: { date: "2026-10-26T16:53:38Z" } } } };
   const asked: string[] = [];
-  const api = async (_m: string, path: string): Promise<unknown> => {
-    asked.push(path);
-    if (path.includes("/compare/")) return { ahead_by: 8, files: others, commits: [], merge_base_commit: { sha: "base0", commit: { committer: { date: "2026-10-26T16:53:38Z" } } } };
-    if (path.includes("path=lib&")) return [{ sha: "e190c0f", commit: { message: "Migrate product Buttons (#38903)", committer: { date: "2026-10-27T14:39:56Z" } } }];
-    return [];
-  };
-  const f = classify({ ...failing, repo_path: "specs/channels/a.spec.ts" }, trunkPasses(8), []);
-  const res = await markOutOfDate({ findings: [f], api, id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master", until: "2026-10-27T19:16:55Z", supportPaths: ["lib"] });
+  const changed = classify({ ...failing, title: "changed", repo_path: "specs/b/x.spec.ts" }, trunkPasses(8), []);
+  const unchanged = classify({ ...failing, title: "unchanged", repo_path: "specs/a/y.spec.ts" }, trunkPasses(8), []);
+  const res = await markOutOfDate({ findings: [changed, unchanged], api: githubOf(compare, { "specs/b": [migrate], lib: [flagDefault, migrate] }, asked), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master", until: "2026-10-27T19:16:55Z", supportPaths: ["lib"] });
   assert.deepEqual(res, { truncated: true, unchecked: [] });
-  assert.deepEqual(f.out_of_date, { base: "master", behind: 8, commit: { sha: "e190c0f", date: "2026-10-27", pr: 38903 }, support: "lib" });
+  assert.equal(changed.out_of_date?.commit?.sha, "e190c0f");
+  assert.deepEqual(unchanged.out_of_date, { base: "master", behind: 8, commit: { sha: "e190c0f", date: "2026-10-27", pr: 38903 }, support: "lib" });
   assert.ok(asked.some((p) => p.includes("path=lib&since=2026-10-26T16%3A53%3A38Z&until=2026-10-27T19%3A16%3A55Z")), "asked since the merge base, up to the run's time");
 });
 

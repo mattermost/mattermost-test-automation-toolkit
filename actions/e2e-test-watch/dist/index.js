@@ -734,18 +734,19 @@ async function markOutOfDate({
   }
   const base = cmp.merge_base_commit;
   const since = base?.commit?.committer?.date ?? base?.commit?.author?.date ?? null;
-  const supportChange = async () => {
+  const supportChange = async (specCommits) => {
     for (const dir of supportPaths) {
+      let rows = [];
       if (!truncated) {
         if (!files.some((x) => x.filename.startsWith(`${dir}/`))) continue;
-        const log_ = await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(dir)}&per_page=10`).catch(() => []);
-        const c2 = (log_ ?? []).find((x) => onBase.has(x.sha));
-        return { dir, commit: c2 ? commitRef(c2) : null };
+        const raw = await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(dir)}&per_page=30`).catch(() => []);
+        rows = (Array.isArray(raw) ? raw : []).filter((x) => onBase.has(x.sha));
+      } else if (since) {
+        const q = new URLSearchParams({ sha: baseBranch, path: dir, since, ...until ? { until } : {}, per_page: "30" });
+        const raw = await api("GET", `/repos/${id.repository}/commits?${q}`).catch((e) => (log(`${baseBranch} commits in ${dir} unavailable: ${String(e).slice(0, 160)}`), []));
+        rows = (Array.isArray(raw) ? raw : []).filter((x) => x.sha !== base?.sha);
       }
-      if (!since) continue;
-      const q = new URLSearchParams({ sha: baseBranch, path: dir, since, ...until ? { until } : {}, per_page: "1" });
-      const raw = await api("GET", `/repos/${id.repository}/commits?${q}`).catch((e) => (log(`${baseBranch} commits in ${dir} unavailable: ${String(e).slice(0, 160)}`), []));
-      const c = (Array.isArray(raw) ? raw : []).find((x) => x.sha !== base?.sha);
+      const c = rows.find((x) => specCommits.has(x.sha));
       if (c) return { dir, commit: commitRef(c) };
     }
     return null;
@@ -754,7 +755,9 @@ async function markOutOfDate({
   const markSupport = async (list) => {
     const unmarked = list.filter((f) => !f.out_of_date);
     if (!unmarked.length || !supportPaths.length) return;
-    if (support === void 0) support = await supportChange();
+    const specCommits = new Set(findings.flatMap((f) => f.out_of_date && !f.out_of_date.support ? [f.out_of_date.commit, ...f.out_of_date.also ?? []] : []).map((c) => c?.sha).filter((x) => Boolean(x)));
+    if (!specCommits.size) return;
+    if (support === void 0) support = await supportChange(specCommits);
     if (support) for (const f of unmarked) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by ?? null, commit: support.commit, support: support.dir };
   };
   if (!truncated) {
