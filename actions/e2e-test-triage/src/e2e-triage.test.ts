@@ -24,7 +24,7 @@ import { NotTriagedError, triage } from "./triage.ts";
 import { FINDINGS_SCHEMA, checkFindingsShape, findingLogLine, redact } from "./findings.ts";
 import type { CommitStatus, Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { laneSummary, redReason } from "../../shared/src/lane.ts";
-import { UPSTREAM_FAILED } from "../../shared/src/status.ts";
+import { FAILED_TESTS, UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
 import { elsewhereKey, fetchRun, identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { RunResult } from "../../shared/src/tsio.ts";
@@ -3231,7 +3231,13 @@ test("a lane red only for a test that passed on a retry goes green in enforce mo
       const summaryPath = join(dir, "s.md");
       const result = await triage({
         env: { ...env, MODE: mode, ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath },
-        fetchImpl: fakeFetch([...runRoutes([spec("t1", "passed", 1), spec("t2", "passed")]), ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })], statusSink(statuses)]),
+        fetchImpl: fakeFetch([
+          ...runRoutes([spec("t1", "passed", 1), spec("t2", "passed")]),
+          ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+          // The lane's status as the TSIO summary wrote it: a spec unit counted failed.
+          ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/playwright", state: "failure", description: "99.7% passed (384/385), 397 specs, 1 failed, (3m 15s setup) + 13m 50s", target_url: "https://github.com/o/r/actions/runs/12" }])],
+          statusSink(statuses),
+        ]),
         log: () => {},
       });
       assert.equal(result.verdict, "SUCCESS", mode);
@@ -3248,7 +3254,7 @@ test("a lane red only for a test that passed on a retry goes green in enforce mo
   }
 });
 
-test("a lane red for a job outside the tests stays red even when a test was flaky", async () => {
+test("a lane red for a job outside the tests, or for no stated test failure, stays red even when a test was flaky", async () => {
   await inTmp(async (dir) => {
     const statuses: StatusBody[] = [];
     const summaryPath = join(dir, "s.md");
@@ -3265,6 +3271,34 @@ test("a lane red for a job outside the tests stays red even when a test was flak
     assert.deepEqual(statuses, [], "upstream execution failed: a flaky test does not make that lane green");
     assert.match(readFileSync(summaryPath, "utf8"), /^## E2E triage · playwright-full: 🔴 red outside the tests$/m);
   });
+  // Only a status that says tests failed is one triage can turn green: no text, or any other, is not.
+  for (const description of [undefined, "", "Overridden by someone", "E2E tests queued or running", "99% passed (99/100), 0 failed"]) {
+    const statuses: StatusBody[] = [];
+    await triage({
+      env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "" },
+      fetchImpl: fakeFetch([
+        ...runRoutes([spec("t1", "passed", 1)]),
+        ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+        ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/playwright", state: "failure", ...(description === undefined ? {} : { description }), target_url: "https://github.com/o/r/actions/runs/12" }])],
+        statusSink(statuses),
+      ]),
+      log: () => {},
+    });
+    assert.deepEqual(statuses, [], JSON.stringify(description));
+  }
+  // e2e-test-status's own text for a run whose reports contain failed tests is one.
+  const statuses: StatusBody[] = [];
+  await triage({
+    env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", TRIAGE_CONTEXT: "off" },
+    fetchImpl: fakeFetch([
+      ...runRoutes([spec("t1", "passed", 1)]),
+      ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+      ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/playwright", state: "failure", description: FAILED_TESTS, target_url: "https://github.com/o/r/actions/runs/12" }])],
+      statusSink(statuses),
+    ]),
+    log: () => {},
+  });
+  assert.deepEqual(statuses.map((s) => s.state), ["success"]);
 });
 
 test("a red lane whose reports never all arrived says how many did, and keeps the missing-reports status", async () => {

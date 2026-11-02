@@ -5,7 +5,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { gh } from "../../shared/src/github.ts";
 import type { Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { laneName, laneSummary } from "../../shared/src/lane.ts";
-import { readStatuses, REPORTS_INCOMPLETE, statusPublisher, UPSTREAM_FAILED } from "../../shared/src/status.ts";
+import { FAILED_TESTS, readStatuses, REPORTS_INCOMPLETE, statusPublisher, UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, SupersededRunError, tsioBase } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.ts";
 import { isShardPlaceholder, isSpecNotRun, isSpecStopped } from "./classify.ts";
@@ -146,16 +146,20 @@ async function noteNoResults({ env, fetchImpl = fetch, log = console.error }: Tr
 
 /**
  * Why the lane's own status is red, read only where no test failed and every report arrived; null when it is not red.
- * "flaky" where a test passed on a retry and the lane's jobs ran: its count read that test as failed (a retest in
- * another report), and triage can turn it green. "outside" where a job outside the tests failed, or the status does
- * not say: the summary says so and nothing is written. An unreadable status is logged, and reads as not red.
+ * "flaky" where a test passed on a retry and the status says tests failed: its count read that test as failed (a
+ * retest in another report), and triage can turn it green. "outside" for any other red status (a job outside the
+ * tests, missing reports, no text): the summary says so and nothing is written. An unreadable status is logged, and
+ * reads as not red.
  */
 async function laneRedWhy(api: GhApi, id: TriageIdentity, context: string, flaky: number, log: (message: string) => void): Promise<"flaky" | "outside" | null> {
   try {
     const own = (await readStatuses(api, id)).find((r) => r.context === context);
     if (own?.state !== "failure" && own?.state !== "error") return null;
+    // Only a status that says tests failed: the TSIO summary's "N failed" count, or e2e-test-status's own text. No text,
+    // or any other (a job outside the tests, missing reports, an override), is not one triage can turn green.
     const text = String(own.description ?? "");
-    return flaky > 0 && own.state === "failure" && !text.startsWith(UPSTREAM_FAILED) && !text.startsWith(REPORTS_INCOMPLETE) ? "flaky" : "outside";
+    const testsFailed = /\b[1-9]\d* failed\b/.test(text) || text.startsWith(FAILED_TESTS);
+    return flaky > 0 && own.state === "failure" && testsFailed && !text.startsWith(UPSTREAM_FAILED) && !text.startsWith(REPORTS_INCOMPLETE) ? "flaky" : "outside";
   } catch (e) {
     log(`lane status unavailable: ${String(e).slice(0, 160)}`);
     return null;

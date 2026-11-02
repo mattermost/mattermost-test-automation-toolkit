@@ -1228,6 +1228,7 @@ function laneSummary(lanes, untriaged = []) {
 
 // ../shared/src/status.ts
 var UPSTREAM_FAILED = "E2E upstream execution failed; re-run the failed jobs";
+var FAILED_TESTS = "E2E reports contain failed tests";
 var REPORTS_INCOMPLETE = "E2E reports unavailable or incomplete; re-run the failed jobs";
 var positive = (v) => /^[1-9]\d*$/.test(String(v ?? ""));
 function statusOwner(target, repository) {
@@ -3022,7 +3023,8 @@ async function laneRedWhy(api, id, context, flaky, log) {
     const own = (await readStatuses(api, id)).find((r) => r.context === context);
     if (own?.state !== "failure" && own?.state !== "error") return null;
     const text = String(own.description ?? "");
-    return flaky > 0 && own.state === "failure" && !text.startsWith(UPSTREAM_FAILED) && !text.startsWith(REPORTS_INCOMPLETE) ? "flaky" : "outside";
+    const testsFailed = /\b[1-9]\d* failed\b/.test(text) || text.startsWith(FAILED_TESTS);
+    return flaky > 0 && own.state === "failure" && testsFailed && !text.startsWith(UPSTREAM_FAILED) && !text.startsWith(REPORTS_INCOMPLETE) ? "flaky" : "outside";
   } catch (e) {
     log(`lane status unavailable: ${String(e).slice(0, 160)}`);
     return null;

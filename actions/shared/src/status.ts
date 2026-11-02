@@ -10,6 +10,8 @@ import type { CompositeIdentity } from "./tsio.ts";
  * e2e-test-status writes it; triage reads it to tell a lane red outside the tests from one red for its tests.
  */
 export const UPSTREAM_FAILED = "E2E upstream execution failed; re-run the failed jobs";
+/** A lane's status text when the summary said it passed but its reports contain failed tests (see UPSTREAM_FAILED). */
+export const FAILED_TESTS = "E2E reports contain failed tests";
 /** A lane's status text when its reports did not all arrive (see UPSTREAM_FAILED). */
 export const REPORTS_INCOMPLETE = "E2E reports unavailable or incomplete; re-run the failed jobs";
 

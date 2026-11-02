@@ -79,6 +79,7 @@ function laneSummary(lanes, untriaged = []) {
 
 // ../shared/src/status.ts
 var UPSTREAM_FAILED = "E2E upstream execution failed; re-run the failed jobs";
+var FAILED_TESTS = "E2E reports contain failed tests";
 var REPORTS_INCOMPLETE = "E2E reports unavailable or incomplete; re-run the failed jobs";
 var positive = (v) => /^[1-9]\d*$/.test(String(v ?? ""));
 function statusOwner(target, repository) {
@@ -415,7 +416,7 @@ async function publish({ env, fetchImpl = fetch, log = console.error, wait }) {
         reportsComplete = !run.missing;
         if (state === "success" && run.counts.failed > 0) {
           state = "failure";
-          description = "E2E reports contain failed tests";
+          description = FAILED_TESTS;
         }
       } catch (e) {
         log(`report completeness could not be verified: ${String(e).slice(0, 300)}`);

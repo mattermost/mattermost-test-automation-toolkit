@@ -280,10 +280,11 @@ model fails or is unavailable, the rules' outcome stands.
   more. Once every failure is cleared, the flag is gone.
   Enforce also sets the state (success only for `SUCCESS`); report-only keeps
   the state the check has, and writes nothing while it is still pending.
-  A lane red where no test failed, every report arrived, and a test passed on a
-  retry (its count read the retried test as failed) reads `(1 flaky, passed on
-  retry) 100% passed (...)`, and enforce sets it green. A lane whose jobs failed
-  outside the tests keeps its state.
+  A lane red where no test failed, every report arrived, a test passed on a retry,
+  and the lane's status says tests failed (its count read the retried test as
+  failed) reads `(1 flaky, passed on retry) 100% passed (...)`, and enforce sets
+  it green. A lane red for anything else (a job outside the tests, missing
+  reports, a status with no failed count) keeps its state.
 - **Job summary**, for a lane where something failed, a report is missing, or
   the lane is red with no failed test, shortest first: a one-line answer, then
   the failed tests in five fixed groups, one line each with why and the next step:
