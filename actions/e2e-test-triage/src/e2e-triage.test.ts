@@ -4518,6 +4518,12 @@ test("a run retried on its own worker keeps the error too: TSIO marks both attem
     obs({ group_id: "g1", retry_count: 1, status: "flaky", error_excerpt: null }),
   ], has_more: false })]]), "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, "master");
   assert.equal(classify({ ...failing, error }, [...trunkPasses(8), ...(other.get(identityKey(failing)) ?? [])], []).class, "REGRESSION", "a trunk flake with another error still clears nothing");
+  const mixed = await fetchHistory(fakeFetch([["/reports/history", () => Response.json({ observations: [
+    obs({ group_id: "g1", retry_count: 0, status: "failed", error_excerpt: error }),
+    obs({ group_id: "g1", retry_count: 1, status: "flaky", error_excerpt: "Error: apiCreateChannel failed with status 500 for the test channel" }),
+    obs({ group_id: "g1", retry_count: 2, status: "passed", error_excerpt: null }),
+  ], has_more: false })]]), "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, "master");
+  assert.equal(mixed.get(identityKey(failing))?.[0].error_excerpt, error, "a failed attempt's error wins over a flaky attempt's");
 });
 
 // ---------------------------------------------------------------- a release branch's run (CMT)
