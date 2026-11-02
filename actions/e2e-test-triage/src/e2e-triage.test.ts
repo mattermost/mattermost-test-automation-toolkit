@@ -161,6 +161,25 @@ test("trunk currently failing the test clears the PR", () => {
   assert.equal(f.class, "BROKEN_ON_TRUNK");
   assert.equal(f.blocking, false);
 });
+test("a failure that failed every try here clears on trunk's flakes only with a trunk failure of its own kind", () => {
+  const hard = { ran: 2, failed: 2 };
+  // mattermost#39408: failed every try, and trunk's flakes failed with the same error: still cleared.
+  const toggle = "Error: locator.check: Clicking the checkbox did not change its state\nCall log:\n  - attempting click action";
+  const trunkToggle = obs({ status: "flaky", commit_sha: "t1", error_excerpt: toggle });
+  assert.equal(classify({ ...failing, error: toggle, tries: hard }, [...trunkPasses(8), trunkToggle], []).class, "FLAKY_ON_TRUNK");
+  // A bare timeout or an error with nothing to compare names no cause: failing every try, it needs trunk to have failed that way.
+  const bare = "Error: Test timeout of 60000ms exceeded.";
+  for (const error of [bare, ""]) {
+    const f = classify({ ...failing, error, tries: hard }, [...trunkPasses(8), trunkToggle], []);
+    assert.deepEqual([f.class, f.blocking], ["REGRESSION", true], JSON.stringify(error));
+    assert.match(f.reason, /failed every try here/, JSON.stringify(error));
+  }
+  assert.equal(classify({ ...failing, error: bare, tries: hard }, [...trunkPasses(8), trunkToggle, obs({ status: "flaky", commit_sha: "t2", error_excerpt: "Error: Test timeout of 30000ms exceeded." })], []).class, "FLAKY_ON_TRUNK", "trunk timed out the same bare way");
+  assert.equal(classify({ ...failing, error: "", tries: hard }, [...trunkPasses(8), obs({ status: "flaky", commit_sha: "t3" })], []).class, "FLAKY_ON_TRUNK", "trunk's flake left no error either");
+  // A failure that passed on a try here, or whose tries are unknown, is unchanged.
+  assert.equal(classify({ ...failing, error: bare, tries: { ran: 2, failed: 1 } }, [...trunkPasses(8), trunkToggle], []).class, "FLAKY_ON_TRUNK");
+  assert.equal(classify({ ...failing, error: bare }, [...trunkPasses(8), trunkToggle], []).class, "FLAKY_ON_TRUNK");
+});
 test("a test that flakes on trunk clears the PR", () => {
   const f = classify(failing, [...trunkPasses(8), obs({ status: "flaky", commit_sha: "zz" })], []);
   assert.equal(f.class, "FLAKY_ON_TRUNK");
