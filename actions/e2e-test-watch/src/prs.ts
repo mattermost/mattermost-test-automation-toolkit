@@ -70,6 +70,8 @@ interface OpenPRPage {
         isCrossRepository: boolean;
         commits?: PRActivity["commits"];
         labels?: { nodes?: { name: string }[] } | null;
+        /** How many files the PR changes, as GitHub counts them. */
+        changedFiles?: number | null;
         files: { pageInfo: { hasNextPage: boolean }; nodes: { path: string }[] };
       }[];
     };
@@ -98,7 +100,7 @@ const OPEN_PRS = `query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, first: 50, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { number title url baseRefName createdAt updatedAt isCrossRepository commits(last: 1) { nodes { commit { committedDate } } } labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
+      nodes { number title url baseRefName createdAt updatedAt isCrossRepository changedFiles commits(last: 1) { nodes { commit { committedDate } } } labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
     }
   }
 }`;
@@ -134,14 +136,17 @@ export async function specsInOpenPRs(
       if (base && p.baseRefName !== base) continue;
       prs.set(p.number, { number: p.number, title: p.title, url: p.url, labels: (p.labels?.nodes ?? []).map((l) => l.name), activeAt: lastActivity(p), openedAt: openedAt(p) });
       for (const f of p.files.nodes) add(f.path, p.number);
-      // Over 100 files: the rest from REST, up to 300 in all. A PR with more is named as partial.
+      // Over 100 files: the rest from REST, up to 300 in all. A PR with more files than were read is named as partial:
+      // by GitHub's count, or, without one, when the last page read was full.
+      let read = p.files.nodes.length;
       let complete = !p.files.pageInfo.hasNextPage;
       for (let filesPage = 2; !complete && filesPage <= 3; filesPage++) {
         const files = (await api("GET", `/repos/${repository}/pulls/${p.number}/files?per_page=100&page=${filesPage}`)) as { filename: string }[];
         for (const f of files) add(f.filename, p.number);
+        read += files.length;
         if (files.length < 100) complete = true;
       }
-      if (!complete) result.partial!.push(p.number);
+      if (typeof p.changedFiles === "number" ? p.changedFiles > read : !complete) result.partial!.push(p.number);
     }
     if (!pullRequests.pageInfo.hasNextPage) return result;
     after = pullRequests.pageInfo.endCursor;
