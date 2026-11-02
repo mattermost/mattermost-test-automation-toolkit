@@ -236,10 +236,20 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   };
   const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
-  const maxBrokenPerRun = Number(env.MAX_BROKEN_PER_RUN || 10);
-  const maxFlakyPerDay = Number(env.MAX_FLAKY_PER_DAY || 6);
-  const causeHoldMs = Number(env.CAUSE_HOLD_HOURS || 4) * HOUR;
-  const answerHours = Number(env.ANSWER_HOURS || 6);
+  // A value that is not a number of 0 or more takes the default, and the summary says so: NaN would turn a limit or
+  // a wait off.
+  const amount = (name: string, fallback: number): number => {
+    const raw = env[name];
+    if (raw == null || String(raw).trim() === "") return fallback;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n;
+    notes.push(`${name} ${JSON.stringify(raw)} is not a number of 0 or more; using ${fallback}`);
+    return fallback;
+  };
+  const maxBrokenPerRun = amount("MAX_BROKEN_PER_RUN", 10);
+  const maxFlakyPerDay = amount("MAX_FLAKY_PER_DAY", 6);
+  const causeHoldMs = amount("CAUSE_HOLD_HOURS", 4) * HOUR;
+  const answerHours = amount("ANSWER_HOURS", 6);
   const currentAt = Date.parse(first.created_at ?? "") || now.getTime();
   const label = env.LABEL || DEFAULT_LABEL;
   const reportNameOf = new Map<string, string | null>(suites.map((s): [string, string | null] => [s.name, s.report_name || null]));

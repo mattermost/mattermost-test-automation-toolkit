@@ -891,6 +891,19 @@ test("an open PR with more files than are read is read for an answer too: it may
   assert.equal(await action(300, { headAfter: "h45" }), held, "the PR changed between the reads");
 });
 
+test("a number input that isn't one takes its default, and the summary says so", async () => {
+  // ANSWER_HOURS "6h" read as NaN made every request old enough to judge: one sent 3 hours ago was sent again.
+  const LEDGER_PATH = ledgerPath();
+  const searches: string[] = [];
+  const fetchImpl = routes({ openPRFiles: [], answers: [], searches });
+  await run({ env: { ...env, LEDGER_PATH }, fetchImpl, hook: [] });
+  const soon = await run({ env: { ...env, LEDGER_PATH, ANSWER_HOURS: "6h", MAX_BROKEN_PER_RUN: "ten" }, fetchImpl, now: new Date(now.getTime() + 3 * 3600e3), hook: [] });
+  assert.deepEqual([...new Set(soon.decisions.map((d) => d.action))], ["skipped: requested 2026-10-03 00:00 UTC by https://github.com/o/r/actions/runs/12"]);
+  assert.deepEqual(searches, [], "too soon to look for an answer");
+  assert.ok(soon.notes.includes('ANSWER_HOURS "6h" is not a number of 0 or more; using 6'));
+  assert.ok(soon.notes.includes('MAX_BROKEN_PER_RUN "ten" is not a number of 0 or more; using 10'));
+});
+
 test("a break that never ran holds no cause: its resend is not held as the same break", async () => {
   // Answers are due after 2 hours here, before the 4-hour cause hold ends. a, b and c went 3 hours ago and never ran.
   const LEDGER_PATH = ledgerPath();

@@ -3851,10 +3851,18 @@ ${note}; nothing to watch.
   };
   const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
-  const maxBrokenPerRun = Number(env.MAX_BROKEN_PER_RUN || 10);
-  const maxFlakyPerDay = Number(env.MAX_FLAKY_PER_DAY || 6);
-  const causeHoldMs = Number(env.CAUSE_HOLD_HOURS || 4) * HOUR;
-  const answerHours = Number(env.ANSWER_HOURS || 6);
+  const amount = (name, fallback) => {
+    const raw = env[name];
+    if (raw == null || String(raw).trim() === "") return fallback;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n;
+    notes.push(`${name} ${JSON.stringify(raw)} is not a number of 0 or more; using ${fallback}`);
+    return fallback;
+  };
+  const maxBrokenPerRun = amount("MAX_BROKEN_PER_RUN", 10);
+  const maxFlakyPerDay = amount("MAX_FLAKY_PER_DAY", 6);
+  const causeHoldMs = amount("CAUSE_HOLD_HOURS", 4) * HOUR;
+  const answerHours = amount("ANSWER_HOURS", 6);
   const currentAt = Date.parse(first.created_at ?? "") || now.getTime();
   const label = env.LABEL || DEFAULT_LABEL;
   const reportNameOf = new Map(suites.map((s) => [s.name, s.report_name || null]));
