@@ -4,7 +4,7 @@ import { appendFileSync } from "node:fs";
 import { gh } from "../../shared/src/github.ts";
 import type { Env, FetchImpl } from "../../shared/src/github.ts";
 import { laneSummary } from "../../shared/src/lane.ts";
-import { statusPublisher } from "../../shared/src/status.ts";
+import { REPORTS_INCOMPLETE, statusPublisher, UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import { compositeIdentityFrom, fetchRun, tsioBase } from "../../shared/src/tsio.ts";
 import type { Wait } from "../../shared/src/tsio.ts";
 
@@ -59,7 +59,7 @@ export async function publish({ env, fetchImpl = fetch, log = console.error, wai
       }
       if (!reportsComplete || env.EXECUTION_SUCCESS !== "true") {
         state = "failure";
-        description = !reportsComplete ? "E2E reports unavailable or incomplete; re-run the failed jobs" : "E2E upstream execution failed; re-run the failed jobs";
+        description = !reportsComplete ? REPORTS_INCOMPLETE : UPSTREAM_FAILED;
       }
     }
     written = await publisher.write({ state, description, target_url: env.TARGET_URL }, operation);

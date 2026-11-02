@@ -5,6 +5,14 @@ import type { CommitStatus, Env, GhApi } from "./github.ts";
 import type { LaneStatus, LaneSummary } from "./lane.ts";
 import type { CompositeIdentity } from "./tsio.ts";
 
+/**
+ * A lane's status text when its jobs failed outside the tests (setup, a worker, the upload) and every report arrived.
+ * e2e-test-status writes it; triage reads it to tell a lane red outside the tests from one red for its tests.
+ */
+export const UPSTREAM_FAILED = "E2E upstream execution failed; re-run the failed jobs";
+/** A lane's status text when its reports did not all arrive (see UPSTREAM_FAILED). */
+export const REPORTS_INCOMPLETE = "E2E reports unavailable or incomplete; re-run the failed jobs";
+
 // GitHub commit statuses have no compare-and-swap API. Every caller MUST hold
 // the same non-cancelling, SHA-scoped job concurrency lock across these reads
 // and writes, including triage and the cross-lane summary. See the action README.

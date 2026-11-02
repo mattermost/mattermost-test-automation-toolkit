@@ -24,6 +24,7 @@ import { NotTriagedError, triage } from "./triage.ts";
 import { FINDINGS_SCHEMA, checkFindingsShape, findingLogLine, redact } from "./findings.ts";
 import type { CommitStatus, Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { laneSummary, redReason } from "../../shared/src/lane.ts";
+import { UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
 import { elsewhereKey, fetchRun, identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { RunResult } from "../../shared/src/tsio.ts";
@@ -3153,6 +3154,50 @@ test("a lane red with no failed test says a job outside the tests failed, and wr
     assert.match(summary, /^## E2E triage · playwright-full: 🔴 red outside the tests$/m);
     assert.match(summary, /^\*\*No test failed\. The lane is red because a job outside the tests failed \(setup, upload or runner\), or results are missing: re-run the failed jobs\.\*\*/m);
     assert.deepEqual(statuses, [], "a verdict for a red lane that no test failed in would be a guess: nothing is written");
+  });
+});
+
+test("a lane red only for a test that passed on a retry goes green in enforce mode, with the reason", async () => {
+  // mattermost#39502: the lane counted one spec failed, but its only failing test passed in the retest report.
+  for (const [mode, state] of [["enforce", "success"], ["report-only", "failure"]]) {
+    await inTmp(async (dir) => {
+      const statuses: StatusBody[] = [];
+      const summaryPath = join(dir, "s.md");
+      const result = await triage({
+        env: { ...env, MODE: mode, ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath },
+        fetchImpl: fakeFetch([...runRoutes([spec("t1", "passed", 1), spec("t2", "passed")]), ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })], statusSink(statuses)]),
+        log: () => {},
+      });
+      assert.equal(result.verdict, "SUCCESS", mode);
+      // Report only keeps the check's state and writes triage's line on it; only enforce posts the triage check.
+      const lane = statuses.filter((s) => s.context === "e2e-test/playwright");
+      assert.deepEqual(lane.map((s) => s.state), [state], mode);
+      assert.match(String(lane[0].description), /^\(1 flaky, passed on retry\) 100% passed \(2 passed, 0 failed, 0 skipped\)$/, mode);
+      const check = statuses.filter((s) => s.context === "e2e-test/playwright/triage").map((s) => [s.state, s.description]);
+      assert.deepEqual(check, mode === "enforce" ? [["pending", "1 flaky · triage is checking them"], ["success", "1 flaky, passed on retry · no test failed"]] : [], mode);
+      const summary = readFileSync(summaryPath, "utf8");
+      assert.match(summary, /^## E2E triage · playwright-full: ✅ nothing failed$/m, mode);
+      assert.match(summary, /No test failed: the 1 test that failed a try passed on a retry\. The lane counted it as failed\./, mode);
+    });
+  }
+});
+
+test("a lane red for a job outside the tests stays red even when a test was flaky", async () => {
+  await inTmp(async (dir) => {
+    const statuses: StatusBody[] = [];
+    const summaryPath = join(dir, "s.md");
+    await triage({
+      env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath },
+      fetchImpl: fakeFetch([
+        ...runRoutes([spec("t1", "passed", 1)]),
+        ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+        ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/playwright", state: "failure", description: UPSTREAM_FAILED, target_url: "https://github.com/o/r/actions/runs/12" }])],
+        statusSink(statuses),
+      ]),
+      log: () => {},
+    });
+    assert.deepEqual(statuses, [], "upstream execution failed: a flaky test does not make that lane green");
+    assert.match(readFileSync(summaryPath, "utf8"), /^## E2E triage · playwright-full: 🔴 red outside the tests$/m);
   });
 });
 

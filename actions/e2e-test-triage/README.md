@@ -69,7 +69,9 @@ always count. It clears the PR's failure only when master failed the same way:
 a distinctive error or a timeout's stuck step needs a master failure with that
 error (Mattermost's 26-character ids masked). One master failed only another
 way, or with nothing to compare (a hook timeout, no error), is a `REGRESSION`
-for the model to judge. `BROKEN_ON_TRUNK` needs the same: a timeout must be stuck
+for the model to judge. A bare timeout or an error with nothing to compare that
+failed every try here needs a master failure of that same kind (the same bare
+timeout, or no error either); master's flakes of another error don't clear it. `BROKEN_ON_TRUNK` needs the same: a timeout must be stuck
 at the step master's latest run is stuck at (a bare timeout never is), and a
 distinctive error must not differ from every error of the streak. **Other PRs:**
 the last 200 PR runs. These are starting values, set before any data was
@@ -85,7 +87,9 @@ tries are left out, and so are those of a run that can't be read in time. Kept:
 a pass in a storm, this PR's own runs, and each test's current failing streak on
 master, a standing break whatever its size. A flaky run keeps the error of its
 failed try, so master retrying past this same error counts as failing the same
-way. On mobile main, 201 of the 244 tests that failed from 15 to 28 October
+way. A test run again later in the same report (Cypress can, at retry 0) is a
+retry when its case ordinals put the pass after the fail; a pass that ran first,
+or with no ordinal, leaves it failed. On mobile main, 201 of the 244 tests that failed from 15 to 28 October
 failed only in 3 such runs, and each of those counted as that test's flakiness.
 
 **Failed everywhere is not cleared by a guess:** a test that failed every try here
@@ -268,6 +272,10 @@ model fails or is unavailable, the rules' outcome stands.
   more. Once every failure is cleared, the flag is gone.
   Enforce also sets the state (success only for `SUCCESS`); report-only keeps
   the state the check has, and writes nothing while it is still pending.
+  A lane red where no test failed, every report arrived, and a test passed on a
+  retry (its count read the retried test as failed) reads `(1 flaky, passed on
+  retry) 100% passed (...)`, and enforce sets it green. A lane whose jobs failed
+  outside the tests keeps its state.
 - **Job summary**, for a lane where something failed, a report is missing, or
   the lane is red with no failed test, shortest first: a one-line answer, then
   the failed tests in five fixed groups, one line each with why and the next step:
