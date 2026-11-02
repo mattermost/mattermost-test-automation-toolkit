@@ -4501,6 +4501,37 @@ test("a flaky run in history keeps the error of its failed try, which trunk's co
   assert.equal(classify({ ...failing, error }, [...trunkPasses(8), row], []).class, "FLAKY_ON_TRUNK", "master retried past this same error");
 });
 
+test("a run retried on its own worker keeps the error too: TSIO marks both attempts flaky", async () => {
+  // quote_selection.spec.ts on master (mattermost#38932): Playwright's retry passed, so TSIO stored the failed try as
+  // "flaky" with the error and the pass as "flaky" without one. Dropping the error made every trunk flake "no error to compare".
+  const error = "Error: expect(locator).toContainText(expected) failed\n\nLocator: getByTestId('postView').last()\nExpected substring: \"What do you mean?\"";
+  const fetchImpl = fakeFetch([["/reports/history", () => Response.json({ observations: [
+    obs({ group_id: "g1", retry_count: 0, status: "flaky", error_excerpt: error }),
+    obs({ group_id: "g1", retry_count: 1, status: "flaky", error_excerpt: null }),
+  ], has_more: false })]]);
+  const history = await fetchHistory(fetchImpl, "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, "master");
+  const [row] = history.get(identityKey(failing)) ?? [];
+  assert.deepEqual([row.status, row.error_excerpt], ["flaky", error]);
+  assert.equal(classify({ ...failing, error }, [...trunkPasses(8), row], []).class, "FLAKY_ON_TRUNK", "master retried past this same error");
+  const other = await fetchHistory(fakeFetch([["/reports/history", () => Response.json({ observations: [
+    obs({ group_id: "g1", retry_count: 0, status: "flaky", error_excerpt: "Error: apiCreateChannel failed with status 500 for the test channel" }),
+    obs({ group_id: "g1", retry_count: 1, status: "flaky", error_excerpt: null }),
+  ], has_more: false })]]), "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, "master");
+  assert.equal(classify({ ...failing, error }, [...trunkPasses(8), ...(other.get(identityKey(failing)) ?? [])], []).class, "REGRESSION", "a trunk flake with another error still clears nothing");
+  const mixed = await fetchHistory(fakeFetch([["/reports/history", () => Response.json({ observations: [
+    obs({ group_id: "g1", retry_count: 0, status: "failed", error_excerpt: error }),
+    obs({ group_id: "g1", retry_count: 1, status: "flaky", error_excerpt: "Error: apiCreateChannel failed with status 500 for the test channel" }),
+    obs({ group_id: "g1", retry_count: 2, status: "passed", error_excerpt: null }),
+  ], has_more: false })]]), "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, "master");
+  assert.equal(mixed.get(identityKey(failing))?.[0].error_excerpt, error, "a failed attempt's error wins over a flaky attempt's");
+  const silent = await fetchHistory(fakeFetch([["/reports/history", () => Response.json({ observations: [
+    obs({ group_id: "g1", retry_count: 0, status: "failed", error_excerpt: null }),
+    obs({ group_id: "g1", retry_count: 1, status: "flaky", error_excerpt: error }),
+    obs({ group_id: "g1", retry_count: 2, status: "passed", error_excerpt: null }),
+  ], has_more: false })]]), "http://tsio", "o/r", [failing], "2026-09-17T00:00:00Z", DEFAULTS, "master");
+  assert.equal(silent.get(identityKey(failing))?.[0].error_excerpt, error, "a failed attempt with no error doesn't hide a flaky attempt's");
+});
+
 // ---------------------------------------------------------------- a release branch's run (CMT)
 
 // desktop CMT on v6.3.2-rc.2: master fixed the failing tests after release-6.3 was cut, and the branch had no history.
