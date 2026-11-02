@@ -279,6 +279,8 @@ export interface OutOfDate {
   streak?: number;
   /** The failure first passed on the base branch at `commit` (see markFixedOnTrunk), after this PR last merged it. */
   fixed?: boolean;
+  /** The support-paths directory the base branch changed at `commit`, where the test itself is unchanged. */
+  support?: string;
 }
 
 export interface BrokeByCommit {
@@ -352,6 +354,8 @@ export interface Config {
   historyLane: string | null;
   /** The report-name prefix history is read under, when the run's own report name is narrower (HISTORY_REPORT). */
   historyReport: string | null;
+  /** Repository directories of the code the specs run through (page objects, support commands, fixtures; SUPPORT_PATHS). */
+  supportPaths: string[];
   escalationModel: string;
   escalateMin: number;
   budgetUsd: number;

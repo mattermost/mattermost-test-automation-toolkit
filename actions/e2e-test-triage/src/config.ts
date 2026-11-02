@@ -38,6 +38,7 @@ export const DEFAULTS: Config = {
   rerunAttempts: 0,
   historyLane: null,
   historyReport: null,
+  supportPaths: [],
   // Re-asks an answer between escalateMin and the threshold, or one that blames the PR
   // without citing a change. Replays of real desktop runs (2026-10-29): Sonnet 5.5 fell just
   // short on 2 of 19 findings (0.8, 0.72) and Opus 5.5 settled both, at about $0.03 each.
@@ -125,6 +126,18 @@ function attemptsFrom(raw: string | undefined, warn: (message: string) => void):
   return DEFAULTS.rerunAttempts;
 }
 
+/** SUPPORT_PATHS: repository directories, comma- or newline-separated, without "./" or a trailing "/". One that is absolute or leaves the repository is dropped with a warning. */
+function supportPathsFrom(raw: string | undefined, warn: (message: string) => void): string[] {
+  const out: string[] = [];
+  for (const entry of String(raw ?? "").split(/[,\n]/)) {
+    const path = entry.trim().replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+    if (!path) continue;
+    if (path.startsWith("/") || path.split("/").includes("..")) warn(`SUPPORT_PATHS entry ${JSON.stringify(entry.trim())} is not a directory in the repository; ignored`);
+    else out.push(path);
+  }
+  return out;
+}
+
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const isPrice = (v: unknown): boolean => typeof v === "number" && Number.isFinite(v) && v >= 0;
 const PRICE_FIELDS = ["input", "output", "cache_write", "cache_read"] as const;
@@ -182,6 +195,7 @@ export function configFrom(env: Env, warn: (message: string) => void = () => {})
     rerunAttempts: attemptsFrom(env.RERUN_ATTEMPTS, warn),
     historyLane: (env.HISTORY_LANE || "").trim() || null,
     historyReport: (env.HISTORY_REPORT || "").trim() || null,
+    supportPaths: supportPathsFrom(env.SUPPORT_PATHS, warn),
     prices,
   };
 }

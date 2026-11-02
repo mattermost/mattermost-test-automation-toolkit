@@ -346,7 +346,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       // A release run's matrix (OS x server version) is wider than a PR's platforms.
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log, limit: branchBase ? 20 : 5 }),
-      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log }),
+      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory,
