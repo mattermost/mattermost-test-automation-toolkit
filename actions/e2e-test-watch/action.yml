@@ -47,7 +47,7 @@ inputs:
     required: false
     default: "4"
   answer-hours:
-    description: Hours after which a request nothing on GitHub answers (no PR, comment or review citing its trunk run, no agent PR on its spec since) counts as never started and is sent once more
+    description: Hours after which a request nothing on GitHub answers (no PR, comment or review that links its trunk run and names its spec, no agent PR on its spec since) counts as never started and is sent once more
     required: false
     default: "6"
   tsio-base-url:

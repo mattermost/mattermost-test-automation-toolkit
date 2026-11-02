@@ -3321,10 +3321,60 @@ function prsTouching(touched, spec) {
 function prsChanging(touched, spec) {
   return [...new Set(touched.get(spec) ?? [])].sort((a, b) => a - b);
 }
-async function citesRun(api, repository, runId) {
-  const q = `repo:${repository} "${runId}"`;
-  const res = await api("GET", `/search/issues?q=${encodeURIComponent(q)}&per_page=1`);
-  return (res.total_count ?? 0) > 0;
+var MAX_ANSWER_READS = 20;
+var TEXTS = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issueOrPullRequest(number: $number) {
+      ... on Issue { body comments(last: 100) { pageInfo { hasPreviousPage } nodes { body } } }
+      ... on PullRequest {
+        body
+        comments(last: 100) { pageInfo { hasPreviousPage } nodes { body } }
+        reviews(last: 100) { pageInfo { hasPreviousPage } nodes { body comments(first: 50) { pageInfo { hasNextPage } nodes { body } } } }
+      }
+    }
+  }
+}`;
+var specName = (spec) => {
+  const file = spec.slice(spec.lastIndexOf("/") + 1).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![\\w.-])${file}(?!\\w)`);
+};
+function answerCheck(api, repository) {
+  const [owner, name] = repository.split("/");
+  const read = /* @__PURE__ */ new Map();
+  const textsOf = (number) => {
+    let texts = read.get(number);
+    if (!texts) {
+      texts = (async () => {
+        const res = await api("POST", "/graphql", { query: TEXTS, variables: { owner, name, number } });
+        if (res.errors?.length) throw new Error(`GitHub GraphQL: ${res.errors[0].message}`);
+        const item = res.data?.repository?.issueOrPullRequest;
+        const bodies = (b) => (b?.nodes ?? []).map((n) => n?.body);
+        const reviews = item?.reviews?.nodes ?? [];
+        return {
+          texts: [item?.body, ...bodies(item?.comments), ...reviews.flatMap((r) => [r?.body, ...bodies(r?.comments)])].filter((t) => Boolean(t)),
+          truncated: Boolean(item?.comments?.pageInfo?.hasPreviousPage || item?.reviews?.pageInfo?.hasPreviousPage || reviews.some((r) => r?.comments?.pageInfo?.hasNextPage))
+        };
+      })();
+      read.set(number, texts);
+    }
+    return texts;
+  };
+  return async (runId, specs, candidates) => {
+    const q = `repo:${repository} "${runId}"`;
+    const found = await api("GET", `/search/issues?q=${encodeURIComponent(q)}&per_page=${MAX_ANSWER_READS}`);
+    if (found.incomplete_results) throw new Error(`search for run ${runId} returned incomplete results`);
+    if ((found.total_count ?? 0) > (found.items ?? []).length) throw new Error(`more than ${MAX_ANSWER_READS} PRs and issues cite run ${runId}`);
+    const link = new RegExp(`/actions/runs/${runId}(?!\\d)`);
+    const names = specs.map(specName);
+    const truncated = [];
+    for (const n of /* @__PURE__ */ new Set([...(found.items ?? []).map((i) => i.number), ...candidates])) {
+      const { texts, truncated: more } = await textsOf(n);
+      if (texts.some((t) => link.test(t) && names.some((s) => s.test(t)))) return true;
+      if (more) truncated.push(n);
+    }
+    if (truncated.length) throw new Error(`#${truncated.join(", #")}: more comments or reviews than read`);
+    return false;
+  };
 }
 var REPAIR_PRS = `query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 50, after: $after) {
@@ -3794,20 +3844,27 @@ ${note}; nothing to watch.
   ]);
   const daysSince = (at) => Math.floor((now.getTime() - at) / DAY);
   const agentPRsChanging = (spec) => [.../* @__PURE__ */ new Set([...prsChanging(open.files, spec).filter((n) => open.prs.get(n)?.labels.includes(label)), ...prsChanging(own.files, spec)])].sort((a, b) => a - b);
-  const citedRuns = /* @__PURE__ */ new Map();
-  let citesUnknown = null;
+  const answers = answerCheck(api, id.repository);
+  const answeredOf = /* @__PURE__ */ new Map();
+  let answersUnknown = null;
   const unanswered = async (r) => {
     const at = Date.parse(r.at);
     const runId = /\/actions\/runs\/(\d+)/.exec(r.run ?? "")?.[1];
     if ((r.resent ?? 0) >= MAX_RESENDS || now.getTime() - at < answerHours * HOUR || !runId) return false;
     if ((r.specs ?? []).some((s) => agentPRsChanging(s).some((n) => (agentPR.get(n)?.openedAt ?? 0) >= at))) return false;
-    if (!citedRuns.has(runId)) citedRuns.set(runId, citesRun(api, id.repository, runId));
+    let answered = answeredOf.get(r);
+    if (!answered) {
+      const specs = r.specs ?? [];
+      const onSpecs = [.../* @__PURE__ */ new Set([...specs.flatMap(agentPRsChanging), ...specs.flatMap((s) => prsTouching(open.files, s))])];
+      answered = answers(runId, specs, onSpecs.slice(0, MAX_OPEN_PRS_TOUCHING));
+      answeredOf.set(r, answered);
+    }
     try {
-      return !await citedRuns.get(runId);
+      return !await answered;
     } catch (e) {
-      if (!citesUnknown) {
-        citesUnknown = String(e).slice(0, 160);
-        notes.push(`requests not checked for a sign the agent ran them (${citesUnknown}); they hold as sent`);
+      if (!answersUnknown) {
+        answersUnknown = String(e).slice(0, 160);
+        notes.push(`requests not checked for a sign the agent ran them (${answersUnknown}); they hold as sent`);
       }
       return false;
     }
@@ -3881,7 +3938,8 @@ ${note}; nothing to watch.
     decisions.push(decision);
     const window = r.window;
     const sameCause = window && ledger.find(
-      (e) => e.window && now.getTime() - Date.parse(e.at) < causeHoldMs && windowsOverlap(window, { from: e.window.from ?? -Infinity, to: e.window.to })
+      // A request that never ran is no cause to wait for.
+      (e) => !unansweredEntries.has(e) && e.window && now.getTime() - Date.parse(e.at) < causeHoldMs && windowsOverlap(window, { from: e.window.from ?? -Infinity, to: e.window.to })
     );
     if (sameCause) {
       decision.action = `skipped: may be the break requested ${utcMinute(sameCause.at)} UTC (overlapping suspect commits)`;

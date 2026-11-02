@@ -18,7 +18,7 @@ import { LEDGER_MS, readLedger, writeLedger } from "./ledger.ts";
 import type { LedgerEntry } from "./ledger.ts";
 import { DAY, HOUR, flakes, utcMinute } from "./model.ts";
 import type { Group, GroupTest, Kind } from "./model.ts";
-import { DEFAULT_LABEL, citesRun, lastActivity, openedAt, prsChanging, prsTouching, repairPRs, specsInOpenPRs } from "./prs.ts";
+import { DEFAULT_LABEL, answerCheck, lastActivity, openedAt, prsChanging, prsTouching, repairPRs, specsInOpenPRs } from "./prs.ts";
 import type { OpenPR, OpenPRs, RepairPRs } from "./prs.ts";
 import { addGroup, retryRecovered, selectCrossLane, selectRepairs, selectRetryFlakes, unselected } from "./select.ts";
 import { bundle, specRange, suspects, windowsOverlap } from "./range.ts";
@@ -315,23 +315,32 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   const agentPRsChanging = (spec: string): number[] =>
     [...new Set([...prsChanging(open.files, spec).filter((n) => open.prs.get(n)?.labels.includes(label)), ...prsChanging(own.files, spec)])].sort((a, b) => a - b);
   // A webhook can accept a request (HTTP 200) whose agent then never starts. The agent answers each request it runs
-  // on GitHub, citing the request's trunk run (a new PR, or a comment or review on an existing one), or opens a PR on
-  // its spec. A request old enough to have an answer and with neither stops holding its specs, MAX_RESENDS times.
-  const citedRuns = new Map<string, Promise<boolean>>();
-  let citesUnknown: string | null = null;
+  // on GitHub, linking the request's trunk run and naming its spec (a new PR, or a comment or review on an existing
+  // one), or opens a PR on its spec. A request old enough to have an answer and with neither stops holding its specs,
+  // MAX_RESENDS times.
+  const answers = answerCheck(api, id.repository);
+  const answeredOf = new Map<LedgerEntry, Promise<boolean>>();
+  let answersUnknown: string | null = null;
   const unanswered = async (r: LedgerEntry): Promise<boolean> => {
     const at = Date.parse(r.at);
     const runId = /\/actions\/runs\/(\d+)/.exec(r.run ?? "")?.[1];
     if ((r.resent ?? 0) >= MAX_RESENDS || now.getTime() - at < answerHours * HOUR || !runId) return false;
     if ((r.specs ?? []).some((s) => agentPRsChanging(s).some((n) => (agentPR.get(n)?.openedAt ?? 0) >= at))) return false;
-    if (!citedRuns.has(runId)) citedRuns.set(runId, citesRun(api, id.repository, runId));
+    let answered = answeredOf.get(r);
+    if (!answered) {
+      // Where the agent answers when it opens no PR: its own PRs on the specs first, then the others it was sent.
+      const specs = r.specs ?? [];
+      const onSpecs = [...new Set([...specs.flatMap(agentPRsChanging), ...specs.flatMap((s) => prsTouching(open.files, s))])];
+      answered = answers(runId, specs, onSpecs.slice(0, MAX_OPEN_PRS_TOUCHING));
+      answeredOf.set(r, answered);
+    }
     try {
-      return !(await citedRuns.get(runId));
+      return !(await answered);
     } catch (e) {
       // Unknown counts as answered: the request holds as sent, as it did before this check.
-      if (!citesUnknown) {
-        citesUnknown = String(e).slice(0, 160);
-        notes.push(`requests not checked for a sign the agent ran them (${citesUnknown}); they hold as sent`);
+      if (!answersUnknown) {
+        answersUnknown = String(e).slice(0, 160);
+        notes.push(`requests not checked for a sign the agent ran them (${answersUnknown}); they hold as sent`);
       }
       return false;
     }
@@ -427,7 +436,8 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     const sameCause =
       window &&
       ledger.find(
-        (e) => e.window && now.getTime() - Date.parse(e.at) < causeHoldMs && windowsOverlap(window, { from: e.window.from ?? -Infinity, to: e.window.to }),
+        // A request that never ran is no cause to wait for.
+        (e) => !unansweredEntries.has(e) && e.window && now.getTime() - Date.parse(e.at) < causeHoldMs && windowsOverlap(window, { from: e.window.from ?? -Infinity, to: e.window.to }),
       );
     if (sameCause) {
       decision.action = `skipped: may be the break requested ${utcMinute(sameCause.at)} UTC (overlapping suspect commits)`;

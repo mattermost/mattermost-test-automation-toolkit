@@ -37,12 +37,17 @@ later conflict with trunk are left to the PR's own automation (e.g. an
 
 A webhook can accept a request (HTTP 200) whose agent then never starts. The agent
 answers each request it runs on GitHub: its PR, or its comment or review on an
-existing PR, links the request's trunk run. A request still held after
-`answer-hours` (6) with no PR, issue, comment or review citing that run, and no
-agent PR on its specs opened since, holds nothing and uses no flaky budget: its
-specs are requested again, once. The resend then holds as any request does, so a
-run that ends in no change (the agent's no-op leaves no trace either) is not sent
-a third time. If GitHub can't be searched, requests hold as sent.
+existing PR, links the request's trunk run and names the spec. A request still held
+after `answer-hours` (6) is checked for such an answer: one text (a body, comment,
+review or review comment) that links its run and names one of its specs, on the
+PRs and issues search finds citing the run and on the open PRs on its specs (where
+a review search may not index still counts). With no answer, and no agent PR on its
+specs opened since, it holds nothing (no spec, no break, no flaky budget): its specs
+are requested again, once. The resend then holds as any request does, so a run that
+ends in no change (the agent's no-op leaves no trace either) is not sent a third
+time. Requests hold as sent when the check can't tell: GitHub can't be read, its
+search is incomplete, more than 20 PRs and issues cite the run, or a PR read without
+an answer has more comments or reviews than the read holds.
 
 A re-run attempt re-runs only the failed jobs, so each suite is read at its newest
 attempt up to `gh-run-attempt`. The job summary also names what no request covers:

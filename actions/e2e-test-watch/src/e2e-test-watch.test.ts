@@ -157,6 +157,17 @@ test("a break window starts after the last run that didn't fail the spec: passed
 // With `recovered`, two more specs fail once and pass on retry: v/e.spec.ts flaked on trunk before, u/f.spec.ts never did.
 // With `lanes`, the run has one report group per lane; `failIn` says which lanes each spec fails in, and
 // `firstFailure` makes every spec pass in all earlier runs, so a failure now is its first.
+interface Answer {
+  number: number;
+  text: string;
+  review?: boolean;
+  indexed?: boolean;
+  // Its PR has more comments than the read's page holds.
+  truncated?: boolean;
+}
+
+const answeredAll: Answer[] = [{ number: 500, text: "Master runs https://github.com/o/r/actions/runs/12 and https://github.com/o/r/actions/runs/11: a.spec.ts, b.spec.ts, c.spec.ts, e.spec.ts and f.spec.ts" }];
+
 interface RouteOptions {
   compared?: string[];
   untils?: string[];
@@ -182,10 +193,13 @@ interface RouteOptions {
   uploadedAt?: Record<string, string>;
   // Other report groups of the same commit: suites the caller doesn't watch, or another run's.
   others?: { name: string; failed: number; runId?: string; attempt?: string }[];
-  // Trunk run ids no PR or issue cites (default none: the agent answered every request), and the searches made.
-  uncited?: string[];
+  // Texts on PRs and issues, as the agent's answers: one per PR or issue, in a review or the body, and whether search
+  // indexes it. The default answers every request of runs 11 and 12. Also the searches made, and a search that fails.
+  answers?: Answer[];
   searches?: string[];
   searchDown?: boolean;
+  // The search timed out: GitHub says its results are incomplete.
+  searchIncomplete?: boolean;
 }
 
 interface HistoryBody {
@@ -216,9 +230,10 @@ function routes({
   attempts = {},
   uploadedAt = {},
   others = [],
-  uncited = [],
+  answers = answeredAll,
   searches = [],
   searchDown = false,
+  searchIncomplete = false,
 }: RouteOptions): FetchImpl {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
   const retried = recovered ? ["v/e.spec.ts", "u/f.spec.ts"] : [];
@@ -284,11 +299,17 @@ function routes({
       const q = String(new URL(url).searchParams.get("q"));
       searches.push(q);
       if (searchDown) return new Response("rate limited", { status: 403 });
-      const runId = /"(\d+)"/.exec(q)?.[1] ?? "";
-      return Response.json({ total_count: uncited.includes(runId) ? 0 : 1, items: [] });
+      const link = new RegExp(`/actions/runs/${/"(\d+)"/.exec(q)?.[1]}(?!\\d)`);
+      const items = [...new Set(answers.filter((a) => a.indexed !== false && link.test(a.text)).map((a) => a.number))].map((number) => ({ number }));
+      return Response.json({ total_count: items.length, incomplete_results: searchIncomplete, items });
     }],
     ["/graphql", (init) => {
-      const { query, variables } = JSON.parse(String(init.body)) as { query: string; variables: { q?: string; after?: string | null } };
+      const { query, variables } = JSON.parse(String(init.body)) as { query: string; variables: { q?: string; after?: string | null; number?: number } };
+      if (query.includes("issueOrPullRequest")) {
+        const on = answers.filter((a) => a.number === variables.number);
+        const item = { body: on.find((a) => !a.review)?.text ?? "", comments: { pageInfo: { hasPreviousPage: on.some((a) => a.truncated) }, nodes: [] }, reviews: { nodes: on.filter((a) => a.review).map((a) => ({ body: a.text, comments: { nodes: [] } })) } };
+        return Response.json({ data: { repository: { issueOrPullRequest: item } } });
+      }
       if (query.includes("search(")) {
         assert.match(String(variables.q), /is:open label:"e2e-autofix"/);
         return Response.json({ data: { search: { nodes: repairPRs } } });
@@ -710,7 +731,7 @@ test("a request accepted but never run, with nothing on GitHub citing its run af
   const LEDGER_PATH = ledgerPath();
   const searches: string[] = [];
   // HTTP 200, and the agent never started: no PR, comment or review cites master run 12.
-  const fetchImpl = routes({ openPRFiles: [], uncited: ["12"], searches });
+  const fetchImpl = routes({ openPRFiles: [], answers: [], searches });
   const hook: FixPayload[] = [];
   const at = (h: number): Date => new Date(now.getTime() + h * 3600e3);
   await run({ env: { ...env, LEDGER_PATH }, fetchImpl, hook });
@@ -724,7 +745,7 @@ test("a request accepted but never run, with nothing on GitHub citing its run af
   const late = await run({ env: { ...env, LEDGER_PATH }, fetchImpl, now: at(7), hook });
   assert.deepEqual(late.decisions.map((d) => d.action), ["to request"]);
   assert.equal(hook.length, 2);
-  assert.deepEqual(searches, ['repo:o/r "12"'], "one search per run, however many specs the request had");
+  assert.deepEqual(searches, ['repo:o/r "12"'], "one search per request, however many specs it had");
   assert.ok(late.notes.includes("specs/x/a.spec.ts: nothing on GitHub answers the request of 2026-10-03 00:00 UTC (https://github.com/o/r/actions/runs/12) after 6 hours; it may not have started, so it holds nothing (resend 1 of 1)"));
   assert.deepEqual(readLedger(LEDGER_PATH).map((e) => e.resent), [undefined, 1]);
 
@@ -738,7 +759,7 @@ test("a request whose run something cites, or whose spec got an agent PR since, 
   const LEDGER_PATH = ledgerPath();
   const hook: FixPayload[] = [];
   await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [] }), hook });
-  // The agent commented on an existing PR with master run 12's link.
+  // The agent answered on an existing PR, with master run 12's link and the spec.
   const cited = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [] }), now: new Date(now.getTime() + 7 * 3600e3), hook });
   assert.deepEqual([...new Set(cited.decisions.map((d) => d.action))], ["skipped: requested 2026-10-03 00:00 UTC by https://github.com/o/r/actions/runs/12"]);
 
@@ -749,7 +770,7 @@ test("a request whose run something cites, or whose spec got an agent PR since, 
     return path;
   };
   const decide = async (createdAt: string) =>
-    (await run({ env: { ...env, LEDGER_PATH: ledgerWithC() }, fetchImpl: routes({ openPRFiles: [], uncited: ["11"], repairPRs: [ownPR(9, "specs/z/c.spec.ts", { createdAt })] }), hook: [] })).decisions.map((d) => [d.specs, d.action]);
+    (await run({ env: { ...env, LEDGER_PATH: ledgerWithC() }, fetchImpl: routes({ openPRFiles: [], answers: [], repairPRs: [ownPR(9, "specs/z/c.spec.ts", { createdAt })] }), hook: [] })).decisions.map((d) => [d.specs, d.action]);
   // Opened an hour after the request, citing no run: the agent ran it.
   assert.deepEqual(await decide("2026-09-30T13:00:00Z"), [
     [["specs/z/c.spec.ts"], "skipped: requested 2026-09-30 12:00 UTC by https://github.com/o/r/actions/runs/11"],
@@ -762,16 +783,72 @@ test("a request whose run something cites, or whose spec got an agent PR since, 
 test("when GitHub can't be searched, a request holds as sent and the summary says so", async () => {
   const LEDGER_PATH = ledgerPath();
   await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [] }), hook: [] });
-  const down = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], uncited: ["12"], searchDown: true }), now: new Date(now.getTime() + 7 * 3600e3), hook: [] });
+  const down = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], answers: [], searchDown: true }), now: new Date(now.getTime() + 7 * 3600e3), hook: [] });
   assert.deepEqual([...new Set(down.decisions.map((d) => d.action))], ["skipped: requested 2026-10-03 00:00 UTC by https://github.com/o/r/actions/runs/12"]);
   assert.ok(down.notes.some((n) => n.startsWith("requests not checked for a sign the agent ran them (Error: GitHub GET /search/issues?") && n.endsWith("; they hold as sent")));
+
+  // A search that timed out returns what it found so far: no answer among it is not no answer.
+  const partial = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], answers: [], searchIncomplete: true }), now: new Date(now.getTime() + 7 * 3600e3), hook: [] });
+  assert.deepEqual([...new Set(partial.decisions.map((d) => d.action))], ["skipped: requested 2026-10-03 00:00 UTC by https://github.com/o/r/actions/runs/12"]);
+  assert.ok(partial.notes.includes("requests not checked for a sign the agent ran them (Error: search for run 12 returned incomplete results); they hold as sent"));
+});
+
+test("an answer counts for the request whose spec it names, not every request of the same run", async () => {
+  // v/e and u/f were each requested from master run 11, 7 hours ago. The agent reviewed #600 about v/e only.
+  const LEDGER_PATH = ledgerPath();
+  const sent = { at: new Date(now.getTime() - 7 * 3600e3).toISOString(), kind: "flaky", run: "https://github.com/o/r/actions/runs/11" };
+  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ ...sent, specs: ["specs/v/e.spec.ts"] }, { ...sent, specs: ["specs/u/f.spec.ts"] }] }));
+  const answers = [
+    { number: 600, text: "Master run [11](https://github.com/o/r/actions/runs/11) failed `v/e.spec.ts`; this PR fixes it.", review: true },
+    // Another run's link, whose number starts with 11, names u/f: not an answer to run 11.
+    { number: 601, text: "https://github.com/o/r/actions/runs/110 failed f.spec.ts" },
+    // Run 11's link with another spec whose name ends in f.spec.ts: not an answer about u/f.
+    { number: 602, text: "https://github.com/o/r/actions/runs/11 failed specs/u/self.spec.ts too" },
+  ];
+  const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], recovered: true, bothFlaked: true, answers }), hook: [] });
+  assert.deepEqual(decisions.filter((d) => d.kind === "flaky").map((d) => [d.specs[0], d.action]), [
+    ["specs/v/e.spec.ts", "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11"],
+    ["specs/u/f.spec.ts", "to request"],
+  ]);
+});
+
+test("a review search doesn't find still answers a request when it is on a PR on the spec", async () => {
+  // z/c was requested from master run 11, 7 hours ago. #41 (not the agent's) changes it; the agent reviewed it there.
+  const LEDGER_PATH = ledgerPath();
+  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
+  const answers = [{ number: 41, text: "Master run https://github.com/o/r/actions/runs/11: c.spec.ts still fails here.", review: true, indexed: false }];
+  const searches: string[] = [];
+  const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: ["specs/z/c.spec.ts"], openPRLabels: [], answers, searches }), hook: [] });
+  assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [
+    [["specs/z/c.spec.ts"], "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11"],
+    [["specs/x/a.spec.ts", "specs/y/b.spec.ts"], "to request"],
+  ]);
+  assert.deepEqual(searches, ['repo:o/r "11"']);
+});
+
+test("a PR with more comments than read, none of them an answer, keeps the hold: the answer may be in the rest", async () => {
+  const LEDGER_PATH = ledgerPath();
+  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
+  const answers = [{ number: 41, text: "Looks good to me.", truncated: true }];
+  const { decisions, notes } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: ["specs/z/c.spec.ts"], openPRLabels: [], answers }), hook: [] });
+  assert.deepEqual(decisions[0], { specs: ["specs/z/c.spec.ts"], kind: "broken", tests: decisions[0].tests, action: "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11" });
+  assert.ok(notes.includes("requests not checked for a sign the agent ran them (Error: #41: more comments or reviews than read); they hold as sent"));
+});
+
+test("a break that never ran holds no cause: its resend is not held as the same break", async () => {
+  // Answers are due after 2 hours here, before the 4-hour cause hold ends. a, b and c went 3 hours ago and never ran.
+  const LEDGER_PATH = ledgerPath();
+  const window = { from: Date.parse("2026-10-02T07:00:00Z"), to: Date.parse("2026-10-02T08:00:00Z") };
+  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 3 * 3600e3).toISOString(), specs: ["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], kind: "broken", window, run: "https://github.com/o/r/actions/runs/11" }] }));
+  const { decisions } = await run({ env: { ...env, LEDGER_PATH, ANSWER_HOURS: "2" }, fetchImpl: routes({ openPRFiles: [], answers: [] }), hook: [] });
+  assert.deepEqual(decisions.map((d) => [d.specs, d.action]), [[["specs/x/a.spec.ts", "specs/y/b.spec.ts", "specs/z/c.spec.ts"], "to request"]]);
 });
 
 test("a flaky request that never ran does not use the daily budget", async () => {
   // v/e was requested 7 hours ago and never ran; u/f never was. Room for one a day.
   const LEDGER_PATH = ledgerPath();
   writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/v/e.spec.ts"], kind: "flaky", run: "https://github.com/o/r/actions/runs/11" }] }));
-  const { decisions } = await run({ env: { ...env, LEDGER_PATH, MAX_FLAKY_PER_DAY: "1" }, fetchImpl: routes({ openPRFiles: [], recovered: true, bothFlaked: true, uncited: ["11"] }), hook: [] });
+  const { decisions } = await run({ env: { ...env, LEDGER_PATH, MAX_FLAKY_PER_DAY: "1" }, fetchImpl: routes({ openPRFiles: [], recovered: true, bothFlaked: true, answers: [] }), hook: [] });
   assert.deepEqual(decisions.filter((d) => d.kind === "flaky").map((d) => [d.specs[0], d.action]), [["specs/u/f.spec.ts", "to request"], ["specs/v/e.spec.ts", "skipped: flaky budget of 1 a day used"]]);
 });
 
