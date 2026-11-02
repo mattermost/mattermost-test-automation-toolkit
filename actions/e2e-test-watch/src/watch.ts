@@ -330,7 +330,8 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     if (!answered) {
       // Where the agent answers when it opens no PR: its own PRs on the specs first, then the others it was sent.
       const specs = r.specs ?? [];
-      const onSpecs = [...new Set([...specs.flatMap(agentPRsChanging), ...specs.flatMap((s) => prsTouching(open.files, s))])];
+      // A PR whose file list was cut off may change a spec past the files read: its texts are read too.
+      const onSpecs = [...new Set([...specs.flatMap(agentPRsChanging), ...specs.flatMap((s) => prsTouching(open.files, s)), ...(open.partial ?? [])])];
       // The answer may be on a PR past the ones read: as with an incomplete search, the request holds as sent.
       if (open.truncated) {
         notes.push(`${specs.join(", ")}: open PRs past the newest read were not checked for an answer; the request of ${utcMinute(r.at)} UTC (${r.run}) holds as sent`);

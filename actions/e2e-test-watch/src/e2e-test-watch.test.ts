@@ -202,6 +202,8 @@ interface RouteOptions {
   searchIncomplete?: boolean;
   // Every page of open PRs is recent, so the read stops at its page cap before reaching older ones.
   openPRsTruncated?: boolean;
+  // An open PR, #44, with more files than are read: 100 by GraphQL and two full REST pages, none of them a spec.
+  bigPR?: boolean;
 }
 
 interface HistoryBody {
@@ -237,6 +239,7 @@ function routes({
   searchDown = false,
   searchIncomplete = false,
   openPRsTruncated = false,
+  bigPR = false,
 }: RouteOptions): FetchImpl {
   const files = ["x/a.spec.ts", "y/b.spec.ts", "z/c.spec.ts"];
   const retried = recovered ? ["v/e.spec.ts", "u/f.spec.ts"] : [];
@@ -268,6 +271,7 @@ function routes({
   const otherGroups = others.map((o, n) => ({ id: `o${n + 1}`, repository: "o/r", branch, commit: "abc", name: o.name, gh_run_id: o.runId ?? "12", gh_run_attempt: o.attempt ?? "1", status: "completed", test_stats: { failed: o.failed } }));
   const laneOfGroup = (url: string): string => groups.find((g) => String(url).includes(`/reports/${g.id}/`))!.name;
   const table: [string, (init: RequestInit, url: string) => Response][] = [
+    ["/pulls/44/files", () => Response.json(Array.from({ length: 100 }, (_, i) => ({ filename: `webapp/g${i}.ts` })))],
     ["/reports?", (_init, url) => {
       // Asked by suite name, as the watcher does; triage's own lookup adds the commit; the check for
       // unwatched suites asks for the run's commit alone.
@@ -330,6 +334,8 @@ function routes({
         files: { pageInfo: { hasNextPage: false }, nodes: paths.map((path) => ({ path })) },
       });
       if (!after) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p2" }, nodes: Array.from({ length: 50 }, (_, i) => pr(100 + i, "2026-10-02T12:00:00Z")) } } } });
+      const big = { ...pr(44, "2026-10-02T00:10:00Z", Array.from({ length: 100 }, (_, i) => `webapp/f${i}.ts`)), files: { pageInfo: { hasNextPage: true }, nodes: Array.from({ length: 100 }, (_, i) => ({ path: `webapp/f${i}.ts` })) } };
+      if (bigPR) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: false }, nodes: [big, pr(41, "2026-10-02T00:00:00Z", openPRFiles, openPRLabels)] } } } });
       if (openPRsTruncated) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "pn" }, nodes: [pr(41, "2026-10-02T00:00:00Z", openPRFiles, openPRLabels)] } } } });
       return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p3" }, nodes: [pr(43, "2026-10-02T01:00:00Z", releasePRFiles, [], "release-12.0"), pr(42, "2026-10-02T00:30:00Z", forkPRFiles, forkPRLabels, "master", true), pr(41, "2026-10-02T00:00:00Z", openPRFiles, openPRLabels), pr(7, "2026-09-01T00:00:00Z", ["specs/x/a.spec.ts"])] } } } });
     }],
@@ -857,6 +863,15 @@ test("when open PRs past the newest read were not checked, an unanswered request
   const { decisions, notes } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], answers: [], openPRsTruncated: true }), hook: [] });
   assert.deepEqual(decisions.find((d) => d.specs.includes("specs/z/c.spec.ts"))?.action, "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11");
   assert.ok(notes.includes("specs/z/c.spec.ts: open PRs past the newest read were not checked for an answer; the request of 2026-10-02 17:00 UTC (https://github.com/o/r/actions/runs/11) holds as sent"));
+});
+
+test("an open PR with more files than are read is read for an answer too: it may change the spec past them", async () => {
+  // z/c was requested from master run 11, 7 hours ago. #44 changes over 300 files; the agent reviewed it about c.spec.ts.
+  const LEDGER_PATH = ledgerPath();
+  writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
+  const answers = [{ number: 44, text: "Master run https://github.com/o/r/actions/runs/11: c.spec.ts fails on this branch too.", review: true, indexed: false }];
+  const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], bigPR: true, answers }), hook: [] });
+  assert.deepEqual(decisions.find((d) => d.specs.includes("specs/z/c.spec.ts"))?.action, "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11");
 });
 
 test("a break that never ran holds no cause: its resend is not held as the same break", async () => {

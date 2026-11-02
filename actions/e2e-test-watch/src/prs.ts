@@ -21,6 +21,8 @@ export interface OpenPRs {
   files: Map<string, number[]>;
   prs: Map<number, OpenPR>;
   truncated?: boolean;
+  /** PRs with more changed files than are read (300): one may change a spec past them. */
+  partial?: number[];
 }
 
 /** A PR's activity as GitHub reports it: when it was opened, its last update, and its last commit. */
@@ -118,7 +120,7 @@ export async function specsInOpenPRs(
   const add = (path: string, number: number): void => {
     touched.set(path, [...(touched.get(path) ?? []), number]);
   };
-  const result: OpenPRs = { files: touched, prs, truncated: false };
+  const result: OpenPRs = { files: touched, prs, truncated: false, partial: [] };
   let after: string | null = null;
   for (let page = 0; page < maxPages; page++) {
     const res = (await api("POST", "/graphql", { query: OPEN_PRS, variables: { owner, name, after } })) as GraphqlReply<OpenPRPage>;
@@ -132,12 +134,14 @@ export async function specsInOpenPRs(
       if (base && p.baseRefName !== base) continue;
       prs.set(p.number, { number: p.number, title: p.title, url: p.url, labels: (p.labels?.nodes ?? []).map((l) => l.name), activeAt: lastActivity(p), openedAt: openedAt(p) });
       for (const f of p.files.nodes) add(f.path, p.number);
-      // Over 100 files: the rest from REST, up to 300 in all.
-      for (let filesPage = 2; p.files.pageInfo.hasNextPage && filesPage <= 3; filesPage++) {
+      // Over 100 files: the rest from REST, up to 300 in all. A PR with more is named as partial.
+      let complete = !p.files.pageInfo.hasNextPage;
+      for (let filesPage = 2; !complete && filesPage <= 3; filesPage++) {
         const files = (await api("GET", `/repos/${repository}/pulls/${p.number}/files?per_page=100&page=${filesPage}`)) as { filename: string }[];
         for (const f of files) add(f.filename, p.number);
-        if (files.length < 100) break;
+        if (files.length < 100) complete = true;
       }
+      if (!complete) result.partial!.push(p.number);
     }
     if (!pullRequests.pageInfo.hasNextPage) return result;
     after = pullRequests.pageInfo.endCursor;

@@ -48,8 +48,9 @@ ends in no change (the agent's no-op leaves no trace either) is not sent a third
 time. Requests hold as sent when the check can't tell: GitHub can't be read, its
 search is incomplete, more than 20 PRs and issues cite the run, the open PRs were
 not all read or more than 10 of them change the request's specs (its answer may be
-on one not read), or a PR read without an answer has more comments or reviews than
-the read holds.
+on one that was not read), or a PR read without an answer has more comments or
+reviews than the read holds. An open PR with more than 300 changed files is read
+for an answer too, since it may change the spec past the files read.
 
 A re-run attempt re-runs only the failed jobs, so each suite is read at its newest
 attempt up to `gh-run-attempt`. The job summary also names what no request covers:
