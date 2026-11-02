@@ -3339,7 +3339,7 @@ var OPEN_PRS = `query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, first: 50, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { number title url baseRefName createdAt updatedAt isCrossRepository changedFiles commits(last: 1) { nodes { commit { committedDate } } } labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
+      nodes { number title url baseRefName createdAt updatedAt isCrossRepository changedFiles headRefOid commits(last: 1) { nodes { commit { committedDate } } } labels(first: 20) { nodes { name } } files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
     }
   }
 }`;
@@ -3363,15 +3363,23 @@ async function specsInOpenPRs(api, repository, { days = 14, now = /* @__PURE__ *
       if (base && p.baseRefName !== base) continue;
       prs.set(p.number, { number: p.number, title: p.title, url: p.url, labels: (p.labels?.nodes ?? []).map((l) => l.name), activeAt: lastActivity(p), openedAt: openedAt(p) });
       for (const f of p.files.nodes) add(f.path, p.number);
-      let read = p.files.nodes.length;
+      const paths = new Set(p.files.nodes.map((f) => f.path));
       let complete = !p.files.pageInfo.hasNextPage;
+      const paged = !complete;
       for (let filesPage = 2; !complete && filesPage <= 3; filesPage++) {
         const files = await api("GET", `/repos/${repository}/pulls/${p.number}/files?per_page=100&page=${filesPage}`);
-        for (const f of files) add(f.filename, p.number);
-        read += files.length;
+        for (const f of files) {
+          add(f.filename, p.number);
+          paths.add(f.filename);
+        }
         if (files.length < 100) complete = true;
       }
-      if (typeof p.changedFiles === "number" ? p.changedFiles > read : !complete) result.partial.push(p.number);
+      let moved = false;
+      if (paged && p.headRefOid) {
+        const after2 = await api("GET", `/repos/${repository}/pulls/${p.number}`);
+        moved = after2?.head?.sha !== p.headRefOid;
+      }
+      if (moved || (typeof p.changedFiles === "number" ? p.changedFiles > paths.size : !complete)) result.partial.push(p.number);
     }
     if (!pullRequests.pageInfo.hasNextPage) return result;
     after = pullRequests.pageInfo.endCursor;

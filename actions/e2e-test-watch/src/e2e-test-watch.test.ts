@@ -203,8 +203,9 @@ interface RouteOptions {
   // Every page of open PRs is recent, so the read stops at its page cap before reaching older ones.
   openPRsTruncated?: boolean;
   // An open PR, #44, with 100 files by GraphQL and two full REST pages, none of them a spec, and its changed-file
-  // count as GitHub reports it (null: not reported).
-  bigPR?: { changedFiles: number | null };
+  // count as GitHub reports it (null: not reported). `repeat`: the REST pages list the same files (the PR changed
+  // between reads); `headAfter`: its head commit when read after the files (default: unchanged, h44).
+  bigPR?: { changedFiles: number | null; repeat?: boolean; headAfter?: string };
 }
 
 interface HistoryBody {
@@ -272,7 +273,11 @@ function routes({
   const otherGroups = others.map((o, n) => ({ id: `o${n + 1}`, repository: "o/r", branch, commit: "abc", name: o.name, gh_run_id: o.runId ?? "12", gh_run_attempt: o.attempt ?? "1", status: "completed", test_stats: { failed: o.failed } }));
   const laneOfGroup = (url: string): string => groups.find((g) => String(url).includes(`/reports/${g.id}/`))!.name;
   const table: [string, (init: RequestInit, url: string) => Response][] = [
-    ["/pulls/44/files", () => Response.json(Array.from({ length: 100 }, (_, i) => ({ filename: `webapp/g${i}.ts` })))],
+    ["/pulls/44/files", (_init, url) => {
+      const page = bigPR?.repeat ? "2" : new URL(String(url)).searchParams.get("page");
+      return Response.json(Array.from({ length: 100 }, (_, i) => ({ filename: `webapp/p${page}-${i}.ts` })));
+    }],
+    ["/pulls/44", () => Response.json({ number: 44, head: { sha: bigPR?.headAfter ?? "h44" } })],
     ["/reports?", (_init, url) => {
       // Asked by suite name, as the watcher does; triage's own lookup adds the commit; the check for
       // unwatched suites asks for the run's commit alone.
@@ -335,7 +340,7 @@ function routes({
         files: { pageInfo: { hasNextPage: false }, nodes: paths.map((path) => ({ path })) },
       });
       if (!after) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p2" }, nodes: Array.from({ length: 50 }, (_, i) => pr(100 + i, "2026-10-02T12:00:00Z")) } } } });
-      const big = { ...pr(44, "2026-10-02T00:10:00Z"), changedFiles: bigPR?.changedFiles ?? null, files: { pageInfo: { hasNextPage: true }, nodes: Array.from({ length: 100 }, (_, i) => ({ path: `webapp/f${i}.ts` })) } };
+      const big = { ...pr(44, "2026-10-02T00:10:00Z"), headRefOid: "h44", changedFiles: bigPR?.changedFiles ?? null, files: { pageInfo: { hasNextPage: true }, nodes: Array.from({ length: 100 }, (_, i) => ({ path: `webapp/f${i}.ts` })) } };
       if (bigPR) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: false }, nodes: [big, pr(41, "2026-10-02T00:00:00Z", openPRFiles, openPRLabels)] } } } });
       if (openPRsTruncated) return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "pn" }, nodes: [pr(41, "2026-10-02T00:00:00Z", openPRFiles, openPRLabels)] } } } });
       return Response.json({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: "p3" }, nodes: [pr(43, "2026-10-02T01:00:00Z", releasePRFiles, [], "release-12.0"), pr(42, "2026-10-02T00:30:00Z", forkPRFiles, forkPRLabels, "master", true), pr(41, "2026-10-02T00:00:00Z", openPRFiles, openPRLabels), pr(7, "2026-09-01T00:00:00Z", ["specs/x/a.spec.ts"])] } } } });
@@ -871,9 +876,9 @@ test("an open PR with more files than are read is read for an answer too: it may
   const LEDGER_PATH = ledgerPath();
   writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
   const answers = [{ number: 44, text: "Master run https://github.com/o/r/actions/runs/11: c.spec.ts fails on this branch too.", review: true, indexed: false }];
-  const action = async (changedFiles: number | null): Promise<string | undefined> => {
+  const action = async (changedFiles: number | null, more: { repeat?: boolean; headAfter?: string } = {}): Promise<string | undefined> => {
     writeFileSync(LEDGER_PATH, JSON.stringify({ requests: [{ at: new Date(now.getTime() - 7 * 3600e3).toISOString(), specs: ["specs/z/c.spec.ts"], kind: "broken", run: "https://github.com/o/r/actions/runs/11" }] }));
-    const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], bigPR: { changedFiles }, answers }), hook: [] });
+    const { decisions } = await run({ env: { ...env, LEDGER_PATH }, fetchImpl: routes({ openPRFiles: [], bigPR: { changedFiles, ...more }, answers }), hook: [] });
     return decisions.find((d) => d.specs.includes("specs/z/c.spec.ts"))?.action;
   };
   const held = "skipped: requested 2026-10-02 17:00 UTC by https://github.com/o/r/actions/runs/11";
@@ -881,6 +886,9 @@ test("an open PR with more files than are read is read for an answer too: it may
   assert.equal(await action(null), held, "no count, and the last page read was full: it may have more");
   // Exactly the 300 read: #44 doesn't change the spec, so it is not read for an answer, and the request goes again.
   assert.equal(await action(300), "to request");
+  // 300 rows but a path listed twice, or a head that moved while the files were read: some file may be missing.
+  assert.equal(await action(300, { repeat: true }), held, "the REST pages repeat a path");
+  assert.equal(await action(300, { headAfter: "h45" }), held, "the PR changed between the reads");
 });
 
 test("a break that never ran holds no cause: its resend is not held as the same break", async () => {
