@@ -86,7 +86,7 @@ export async function fetchSpecRuns(
     const outcomes: SpecRun[] = [];
     for (const [group_id, run] of byGroup) {
       // As the run reader does: a pass beside a fail at the same retry level of one report does not excuse the fail.
-      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count), (a) => a.report_name ?? null).status);
+      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0)), (a) => a.report_name ?? null).status);
       // A run where every test was skipped is no pass (see classifyNotRun).
       const status = run.notRun ? "not_run" : results.some((s) => FAILED_STATUSES.has(s)) ? "failed" : results.every((s) => s === "skipped") ? "skipped" : "passed";
       outcomes.push({ group_id, status });
@@ -214,7 +214,7 @@ export async function fetchHistory(
       runs.get(run)!.push(row);
     }
     for (const attempts of runs.values()) {
-      attempts.sort((a, b) => a.retry_count - b.retry_count);
+      attempts.sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0));
       const { status, last } = outcomeOf(attempts);
       // Every run in `runs` has at least one attempt, so the outcome always has a last one. A flaky run's last attempt is
       // its pass: it keeps the error of its last failed try, which is what the rules compare. A retry on the same worker
