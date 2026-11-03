@@ -271,6 +271,14 @@ export function classify(
       const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
       return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
     }
+    // A bare timeout or an error with nothing to compare names no cause. One that failed every try here is cleared only
+    // where trunk failed the same kind of way (the same bare timeout, or no error either): trunk's flakes of another
+    // error say nothing about it. Unknown tries are left as before.
+    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran &&
+      !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
+      const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
+      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`, true);
+    }
     return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the last ${trunk.length} trunk runs.`, false);
   }
   // Require real trunk passes: trunkFails === 0 is also true with no trunk runs.

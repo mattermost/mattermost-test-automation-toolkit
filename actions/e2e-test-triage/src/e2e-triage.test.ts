@@ -24,6 +24,7 @@ import { NotTriagedError, triage } from "./triage.ts";
 import { FINDINGS_SCHEMA, checkFindingsShape, findingLogLine, redact } from "./findings.ts";
 import type { CommitStatus, Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { laneSummary, redReason } from "../../shared/src/lane.ts";
+import { FAILED_TESTS, UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
 import { elsewhereKey, fetchRun, identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { RunResult } from "../../shared/src/tsio.ts";
@@ -160,6 +161,25 @@ test("trunk currently failing the test clears the PR", () => {
   const f = classify(failing, [obs({ status: "failed" }), ...trunkPasses(6)], []);
   assert.equal(f.class, "BROKEN_ON_TRUNK");
   assert.equal(f.blocking, false);
+});
+test("a failure that failed every try here clears on trunk's flakes only with a trunk failure of its own kind", () => {
+  const hard = { ran: 2, failed: 2 };
+  // mattermost#39408: failed every try, and trunk's flakes failed with the same error: still cleared.
+  const toggle = "Error: locator.check: Clicking the checkbox did not change its state\nCall log:\n  - attempting click action";
+  const trunkToggle = obs({ status: "flaky", commit_sha: "t1", error_excerpt: toggle });
+  assert.equal(classify({ ...failing, error: toggle, tries: hard }, [...trunkPasses(8), trunkToggle], []).class, "FLAKY_ON_TRUNK");
+  // A bare timeout or an error with nothing to compare names no cause: failing every try, it needs trunk to have failed that way.
+  const bare = "Error: Test timeout of 60000ms exceeded.";
+  for (const error of [bare, ""]) {
+    const f = classify({ ...failing, error, tries: hard }, [...trunkPasses(8), trunkToggle], []);
+    assert.deepEqual([f.class, f.blocking], ["REGRESSION", true], JSON.stringify(error));
+    assert.match(f.reason, /failed every try here/, JSON.stringify(error));
+  }
+  assert.equal(classify({ ...failing, error: bare, tries: hard }, [...trunkPasses(8), trunkToggle, obs({ status: "flaky", commit_sha: "t2", error_excerpt: "Error: Test timeout of 30000ms exceeded." })], []).class, "FLAKY_ON_TRUNK", "trunk timed out the same bare way");
+  assert.equal(classify({ ...failing, error: "", tries: hard }, [...trunkPasses(8), obs({ status: "flaky", commit_sha: "t3" })], []).class, "FLAKY_ON_TRUNK", "trunk's flake left no error either");
+  // A failure that passed on a try here, or whose tries are unknown, is unchanged.
+  assert.equal(classify({ ...failing, error: bare, tries: { ran: 2, failed: 1 } }, [...trunkPasses(8), trunkToggle], []).class, "FLAKY_ON_TRUNK");
+  assert.equal(classify({ ...failing, error: bare }, [...trunkPasses(8), trunkToggle], []).class, "FLAKY_ON_TRUNK");
 });
 test("a test that flakes on trunk clears the PR", () => {
   const f = classify(failing, [...trunkPasses(8), obs({ status: "flaky", commit_sha: "zz" })], []);
@@ -2542,6 +2562,72 @@ test("a test the base branch changed after the PR last merged it is out of date:
   });
 });
 
+// mattermost#39228 (run 40561804218): master's e190c0f migrated both specs and the Playwright page objects they run
+// through (e2e-tests/playwright/lib). The PR ran its old copies against master's build.
+const migrate = { sha: "e190c0f", commit: { message: "Migrate product Buttons from shared to compass-ui (#38903)", committer: { date: "2026-10-27T14:39:56Z" } } };
+const flagDefault = { sha: "7709b2f", commit: { message: "Serve property field permissions (#39080)", committer: { date: "2026-10-27T21:42:06Z" } } };
+const twoSpecs = (): Finding[] => [
+  classify({ ...failing, title: "changed", repo_path: "specs/b.spec.ts" }, trunkPasses(8), []),
+  classify({ ...failing, title: "unchanged", repo_path: "specs/a.spec.ts" }, trunkPasses(8), []),
+];
+const githubOf = (compare: unknown, logs: Record<string, unknown[]>, asked: string[] = []) => async (_m: string, path: string): Promise<unknown> => {
+  asked.push(path);
+  if (path.includes("/compare/")) return compare;
+  for (const [dir, rows] of Object.entries(logs)) if (path.includes(`path=${encodeURIComponent(dir)}&`)) return rows;
+  return [];
+};
+
+test("a failure whose spec is unchanged is out of date when the base commit that changed this run's other failing specs also changed their support code", async () => {
+  const compare = { ahead_by: 8, files: [{ filename: "specs/b.spec.ts" }, { filename: "lib/src/ui/delete_post_confirmation_dialog.ts" }], commits: [{ sha: "e190c0f" }, { sha: "7709b2f" }] };
+  const [changed, unchanged] = twoSpecs();
+  await markOutOfDate({ findings: [changed, unchanged], api: githubOf(compare, { "specs/b.spec.ts": [migrate], lib: [flagDefault, migrate] }), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master", supportPaths: ["lib"] });
+  assert.equal(changed.out_of_date?.commit?.sha, "e190c0f");
+  assert.deepEqual(unchanged.out_of_date, { base: "master", behind: 8, commit: { sha: "e190c0f", date: "2026-10-27", pr: 38903 }, support: "lib" }, "named by the migrating commit, not the newest one in lib");
+  const text = summary({ findings: [unchanged], counts: { passed: 9, failed: 1 }, runURL: "u", trunkBranch: "master" });
+  assert.match(text, /\| master changed the test code it runs through \(lib; #38903, 2026-10-27\) after this PR last merged master, so the PR ran its old copy\. \| Merge master and re-run\. \|/);
+  assert.match(text, /Test code changed on master since this PR last merged it \| Yes, in lib: e190c0f \(#38903\) on 2026-10-27\. This PR is 8 commits behind/);
+});
+
+test("a support-code change alone does not make a failure out of date", async () => {
+  // mattermost#39484 and #39572: master changed a feature-flag default or removed other specs' support code; the
+  // failures were the PR's. No failing spec changed with it, so they stay with the usual rules.
+  const compare = { ahead_by: 8, files: [{ filename: "lib/src/server/default_feature_flags.ts" }], commits: [{ sha: "7709b2f" }] };
+  const [, unchanged] = twoSpecs();
+  await markOutOfDate({ findings: [unchanged], api: githubOf(compare, { lib: [flagDefault] }), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master", supportPaths: ["lib"] });
+  assert.equal(unchanged.out_of_date, undefined);
+  // A failing spec changed by another commit than the support code's: not the same migration either.
+  const other = { ahead_by: 8, files: [{ filename: "specs/b.spec.ts" }, { filename: "lib/src/server/default_feature_flags.ts" }], commits: [{ sha: "e190c0f" }, { sha: "7709b2f" }] };
+  const [changed, alone] = twoSpecs();
+  await markOutOfDate({ findings: [changed, alone], api: githubOf(other, { "specs/b.spec.ts": [migrate], lib: [flagDefault] }), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master", supportPaths: ["lib"] });
+  assert.equal(changed.out_of_date?.commit?.sha, "e190c0f");
+  assert.equal(alone.out_of_date, undefined);
+  // Without support paths the rule is as before.
+  const [c2, u2] = twoSpecs();
+  await markOutOfDate({ findings: [c2, u2], api: githubOf({ ...other, files: [{ filename: "specs/b.spec.ts" }, { filename: "lib/x.ts" }] }, { "specs/b.spec.ts": [migrate], lib: [migrate] }), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master" });
+  assert.equal(u2.out_of_date, undefined);
+});
+
+test("support code is checked by directory when the base branch's file list is cut off", async () => {
+  // e190c0f alone changed 300 files, so GitHub's list stops before the specs and the support code.
+  const others = Array.from({ length: 300 }, (_, i) => ({ filename: `f${i}.ts` }));
+  const compare = { ahead_by: 8, files: others, commits: [], merge_base_commit: { sha: "base0", commit: { committer: { date: "2026-10-26T16:53:38Z" } } } };
+  const asked: string[] = [];
+  const changed = classify({ ...failing, title: "changed", repo_path: "specs/b/x.spec.ts" }, trunkPasses(8), []);
+  const unchanged = classify({ ...failing, title: "unchanged", repo_path: "specs/a/y.spec.ts" }, trunkPasses(8), []);
+  const res = await markOutOfDate({ findings: [changed, unchanged], api: githubOf(compare, { "specs/b": [migrate], lib: [flagDefault, migrate] }, asked), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master", until: "2026-10-27T19:16:55Z", supportPaths: ["lib"] });
+  assert.deepEqual(res, { truncated: true, unchecked: [] });
+  assert.equal(changed.out_of_date?.commit?.sha, "e190c0f");
+  assert.deepEqual(unchanged.out_of_date, { base: "master", behind: 8, commit: { sha: "e190c0f", date: "2026-10-27", pr: 38903 }, support: "lib" });
+  assert.ok(asked.some((p) => p.includes("path=lib&since=2026-10-26T16%3A53%3A38Z&until=2026-10-27T19%3A16%3A55Z")), "asked since the merge base, up to the run's time");
+});
+
+test("support-paths is read as a list of repository directories; one leaving the repository is dropped", () => {
+  const warnings: string[] = [];
+  assert.deepEqual(configFrom({ SUPPORT_PATHS: " e2e-tests/playwright/lib/ , ./e2e-tests/cypress/tests/support\n../x, /etc" }, (m) => warnings.push(m)).supportPaths, ["e2e-tests/playwright/lib", "e2e-tests/cypress/tests/support"]);
+  assert.equal(warnings.length, 2);
+  assert.deepEqual(configFrom({}).supportPaths, []);
+});
+
 test("the out-of-date rule stays out of the way when it can't be sure", async () => {
   // master changed other files only: the usual path, and the model is asked.
   const asked: number[] = [];
@@ -3135,6 +3221,84 @@ test("a lane red with no failed test says a job outside the tests failed, and wr
     assert.match(summary, /^\*\*No test failed\. The lane is red because a job outside the tests failed \(setup, upload or runner\), or results are missing: re-run the failed jobs\.\*\*/m);
     assert.deepEqual(statuses, [], "a verdict for a red lane that no test failed in would be a guess: nothing is written");
   });
+});
+
+test("a lane red only for a test that passed on a retry goes green in enforce mode, with the reason", async () => {
+  // mattermost#39502: the lane counted one spec failed, but its only failing test passed in the retest report.
+  for (const [mode, state] of [["enforce", "success"], ["report-only", "failure"]]) {
+    await inTmp(async (dir) => {
+      const statuses: StatusBody[] = [];
+      const summaryPath = join(dir, "s.md");
+      const result = await triage({
+        env: { ...env, MODE: mode, ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath },
+        fetchImpl: fakeFetch([
+          ...runRoutes([spec("t1", "passed", 1), spec("t2", "passed")]),
+          ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+          // The lane's status as the TSIO summary wrote it: a spec unit counted failed.
+          ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/playwright", state: "failure", description: "99.7% passed (384/385), 397 specs, 1 failed, (3m 15s setup) + 13m 50s", target_url: "https://github.com/o/r/actions/runs/12" }])],
+          statusSink(statuses),
+        ]),
+        log: () => {},
+      });
+      assert.equal(result.verdict, "SUCCESS", mode);
+      // Report only keeps the check's state and writes triage's line on it; only enforce posts the triage check.
+      const lane = statuses.filter((s) => s.context === "e2e-test/playwright");
+      assert.deepEqual(lane.map((s) => s.state), [state], mode);
+      assert.match(String(lane[0].description), /^\(1 flaky, passed on retry\) 100% passed \(2 passed, 0 failed, 0 skipped\)$/, mode);
+      const check = statuses.filter((s) => s.context === "e2e-test/playwright/triage").map((s) => [s.state, s.description]);
+      assert.deepEqual(check, mode === "enforce" ? [["pending", "1 flaky · triage is checking them"], ["success", "1 flaky, passed on retry · no test failed"]] : [], mode);
+      const summary = readFileSync(summaryPath, "utf8");
+      assert.match(summary, /^## E2E triage · playwright-full: ✅ nothing failed$/m, mode);
+      assert.match(summary, /No test failed: the 1 test that failed a try passed on a retry\. The lane counted it as failed\./, mode);
+    });
+  }
+});
+
+test("a lane red for a job outside the tests, or for no stated test failure, stays red even when a test was flaky", async () => {
+  await inTmp(async (dir) => {
+    const statuses: StatusBody[] = [];
+    const summaryPath = join(dir, "s.md");
+    await triage({
+      env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath },
+      fetchImpl: fakeFetch([
+        ...runRoutes([spec("t1", "passed", 1)]),
+        ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+        ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/playwright", state: "failure", description: UPSTREAM_FAILED, target_url: "https://github.com/o/r/actions/runs/12" }])],
+        statusSink(statuses),
+      ]),
+      log: () => {},
+    });
+    assert.deepEqual(statuses, [], "upstream execution failed: a flaky test does not make that lane green");
+    assert.match(readFileSync(summaryPath, "utf8"), /^## E2E triage · playwright-full: 🔴 red outside the tests$/m);
+  });
+  // Only a status that says tests failed is one triage can turn green: no text, or any other, is not.
+  for (const description of [undefined, "", "Overridden by someone", "E2E tests queued or running", "99% passed (99/100), 0 failed"]) {
+    const statuses: StatusBody[] = [];
+    await triage({
+      env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "" },
+      fetchImpl: fakeFetch([
+        ...runRoutes([spec("t1", "passed", 1)]),
+        ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+        ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/playwright", state: "failure", ...(description === undefined ? {} : { description }), target_url: "https://github.com/o/r/actions/runs/12" }])],
+        statusSink(statuses),
+      ]),
+      log: () => {},
+    });
+    assert.deepEqual(statuses, [], JSON.stringify(description));
+  }
+  // e2e-test-status's own text for a run whose reports contain failed tests is one.
+  const statuses: StatusBody[] = [];
+  await triage({
+    env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", TRIAGE_CONTEXT: "off" },
+    fetchImpl: fakeFetch([
+      ...runRoutes([spec("t1", "passed", 1)]),
+      ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+      ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/playwright", state: "failure", description: FAILED_TESTS, target_url: "https://github.com/o/r/actions/runs/12" }])],
+      statusSink(statuses),
+    ]),
+    log: () => {},
+  });
+  assert.deepEqual(statuses.map((s) => s.state), ["success"]);
 });
 
 test("a red lane whose reports never all arrived says how many did, and keeps the missing-reports status", async () => {
@@ -3903,10 +4067,12 @@ test("a spec's runs are read from the whole file: not run where its placeholder 
     row("g6", "a", "skipped"), row("g6", "b", "skipped"),
     // One spec reported twice in one run at the same retry: the pass beside the fail cannot excuse it, as in the run reader.
     row("g7", "a", "failed"), row("g7", "a", "passed"),
+    // The same, with ordinals that put the pass after the fail (mattermost#39481): a retry, so the run passed.
+    { ...row("g8", "a", "passed"), ordinal: 30 }, { ...row("g8", "a", "failed"), ordinal: 21 },
   ];
   const history = await fetchSpecRuns(fakeFetch([["/reports/history", () => Response.json({ observations: rows })]]), "http://tsio", "o/r", [MOBILE_STUB.file], "2026-10-26T00:00:00Z", DEFAULTS, laneOf("mobile-pr-detox-ios"));
   assert.equal(history.truncated, false);
-  assert.deepEqual(history.byFile.get(MOBILE_STUB.file)!.map((r) => [r.group_id, r.status]), [["g1", "not_run"], ["g2", "passed"], ["g3", "failed"], ["g4", "passed"], ["g6", "skipped"], ["g7", "failed"]], "another lane's run is not this lane's history, and a run where every test was skipped is no pass");
+  assert.deepEqual(history.byFile.get(MOBILE_STUB.file)!.map((r) => [r.group_id, r.status]), [["g1", "not_run"], ["g2", "passed"], ["g3", "failed"], ["g4", "passed"], ["g6", "skipped"], ["g7", "failed"], ["g8", "passed"]], "another lane's run is not this lane's history, and a run where every test was skipped is no pass");
 });
 
 test("a lane whose only failures are specs a stopped Jest process skipped is green when they are flaky that way; a silent shard is re-run", async () => {

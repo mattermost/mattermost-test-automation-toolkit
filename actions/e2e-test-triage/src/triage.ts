@@ -5,7 +5,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { gh } from "../../shared/src/github.ts";
 import type { Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { laneName, laneSummary } from "../../shared/src/lane.ts";
-import { readStatuses, statusPublisher } from "../../shared/src/status.ts";
+import { FAILED_TESTS, readStatuses, REPORTS_INCOMPLETE, statusPublisher, UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, SupersededRunError, tsioBase } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.ts";
 import { isShardPlaceholder, isSpecNotRun, isSpecStopped } from "./classify.ts";
@@ -145,16 +145,27 @@ async function noteNoResults({ env, fetchImpl = fetch, log = console.error }: Tr
 }
 
 /**
- * Whether the lane's own status is red. Read only where no test failed: a red lane then has a job outside the tests
- * that failed, which the summary says. Nothing is written for it. An unreadable status is logged, and reads as not red.
+ * Why the lane's own status is red, read only where no test failed and every report arrived; null when it is not red.
+ * "flaky" where a test passed on a retry and the status says tests failed: its count read that test as failed (a
+ * retest in another report), and triage can turn it green. "upstream" where e2e-test-status says a job outside the
+ * tests failed (a dead worker whose specs the others ran): nothing is written, and its failed step may get the failed
+ * jobs re-run. "outside" for any other red status (missing reports, no text): the summary says so and nothing is
+ * written. An unreadable status is logged, and reads as not red.
  */
-async function laneIsRed(api: GhApi, id: TriageIdentity, context: string, log: (message: string) => void): Promise<boolean> {
+async function laneRedWhy(api: GhApi, id: TriageIdentity, context: string, flaky: number, log: (message: string) => void): Promise<"flaky" | "upstream" | "outside" | null> {
   try {
     const own = (await readStatuses(api, id)).find((r) => r.context === context);
-    return own?.state === "failure" || own?.state === "error";
+    if (own?.state !== "failure" && own?.state !== "error") return null;
+    // Only a status that says tests failed: the TSIO summary's "N failed" count, or e2e-test-status's own text. No text,
+    // or any other (a job outside the tests, missing reports, an override), is not one triage can turn green.
+    const text = String(own.description ?? "");
+    // A job outside the tests failed (a dead worker), and e2e-test-status said so: a re-run may be asked for.
+    if (text.startsWith(UPSTREAM_FAILED)) return "upstream";
+    const testsFailed = /\b[1-9]\d* failed\b/.test(text) || text.startsWith(FAILED_TESTS);
+    return flaky > 0 && own.state === "failure" && testsFailed && !text.startsWith(UPSTREAM_FAILED) && !text.startsWith(REPORTS_INCOMPLETE) ? "flaky" : "outside";
   } catch (e) {
     log(`lane status unavailable: ${String(e).slice(0, 160)}`);
-    return false;
+    return null;
   }
 }
 
@@ -221,8 +232,13 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     notes.push(`Report only on this PR: it has the ${cfg.reportOnlyLabel} label, so triage leaves the E2E check as the tests set it.`);
   }
   seen.enforce = enforce;
+  // Nothing failed and every report arrived, yet the lane is red: for a test that passed on a retry, or a job outside the tests.
+  const redWhy = !run.failing.length && !run.missing && context ? await laneRedWhy(api, id, context, run.counts.flaky, log) : null;
+  const flakyOnly = redWhy === "flaky";
+  // What triage decides: failures, missing reports, or a lane red only for tests that passed on a retry.
+  const decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly;
   // Like the required status, only an enforcing run writes to the PR.
-  const announce = enforce && (run.failing.length > 0 || Boolean(run.missing));
+  const announce = enforce && decides;
   // TRIAGE_LANES lists every lane's required context: then the triage check is one
   // for the whole PR, summarising all lanes, rather than one per lane.
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
@@ -235,7 +251,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
     }
   };
-  if (announce) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : `${run.counts.failed} failed · triage is checking them`);
+  if (announce) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : flakyOnly ? `${run.counts.flaky} flaky · triage is checking them` : `${run.counts.failed} failed · triage is checking them`);
   try {
     let history: HistoryLike = new Map();
     let diff: Diff = { files: [], ok: false };
@@ -337,7 +353,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       // A release run's matrix (OS x server version) is wider than a PR's platforms.
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log, limit: branchBase ? 20 : 5 }),
-      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log }),
+      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory,
@@ -349,8 +365,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // read: one the change broke (build, test server) holds the re-run (see decideRerun).
     const attempt = Number(id.gh_run_attempt) || 1;
     const onlyNoResults = (result.unnamed || result.missing) && !result.findings.some((f) => f.blocking);
+    // Every report arrived and no test failed, but a job outside the tests died (a worker whose specs the others ran):
+    // the lane is red only for that job, and its failed step decides the re-run as for a shard that sent nothing.
+    const onlyDeadJobs = redWhy === "upstream" && !run.failing.length && !result.findings.some((f) => f.blocking);
     let rerunCheck: RerunDecision | null = null;
-    if (onlyNoResults && attempt <= cfg.rerunAttempts) {
+    if ((onlyNoResults || onlyDeadJobs) && attempt <= cfg.rerunAttempts) {
       try {
         const dead = await readDeadJobs({ fetchImpl, token: String(env.GITHUB_TOKEN), repository: id.repository, runId: String(id.gh_run_id), attempt: String(id.gh_run_attempt), log });
         rerunCheck = await decideRerun(dead, apiKey && !prSpendUnknown ? askCauseWith(fetchImpl, apiKey, cfg.model, result.ai, cfg.prices) : null, log);
@@ -371,12 +390,15 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       }
     }
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
-    // Nothing failed and every report arrived, yet the lane is red: a job outside the tests failed. Its own status says so.
-    const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
+    const laneRed = redWhy === "outside" || redWhy === "upstream";
+    if (flakyOnly)
+      notes.push(`No test failed: the ${run.counts.flaky === 1 ? "1 test that failed a try" : `${run.counts.flaky} tests that failed a try`} passed on a retry. The lane counted ${run.counts.flaky === 1 ? "it" : "them"} as failed.`);
     const rerun = rerunCheck?.rerun ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = rerunCheck?.held ?? null;
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
-    const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
+    const description = flakyOnly
+      ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}`
+      : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
@@ -384,7 +406,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         `ai_calls=${spend.calls}\nai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}\nai_input_tokens=${spend.input_tokens}\nai_output_tokens=${spend.output_tokens}\n`);
     // A lane with nothing failed or missing has nothing to report, so it writes no job
     // summary: the run page then shows only the lanes someone needs to read.
-    if (env.GITHUB_STEP_SUMMARY && (run.failing.length > 0 || Boolean(run.missing) || laneRed)) {
+    if (env.GITHUB_STEP_SUMMARY && (decides || laneRed)) {
       appendFileSync(env.GITHUB_STEP_SUMMARY, summary + "\n");
       written.summary = true;
     }
@@ -396,7 +418,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // is nothing triage decided, and overwriting it could turn a lane that went red
     // outside its tests green.
     let published = false;
-    if (enforce && context && (run.failing.length > 0 || Boolean(run.missing))) {
+    if (enforce && context && decides) {
       published = await publisher.write({
         state: result.verdict === "SUCCESS" ? "success" : "failure",
         context,
@@ -407,7 +429,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // Report only: triage's line goes on the E2E check, but the check keeps the state it
     // has now. Red stays red, and a check a waiver label turned green stays green. Its link
     // moves to this run, whose summary explains each failure.
-    if (!enforce && context && (run.failing.length > 0 || Boolean(run.missing))) {
+    if (!enforce && context && decides) {
       try {
         const current = (await readStatuses(api, id)).find((r) => r.context === context);
         // The publisher also refuses a check another run or attempt owns.
@@ -421,7 +443,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     else if (announce) {
       // The same labels as the E2E check's text (see statusDescription), and its re-run wording.
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (flag && !result.findings.length
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", flakyOnly ? `${run.counts.flaky} flaky, passed on retry · no test failed` : (flag && !result.findings.length
         ? `${run.counts.failed} failed · not triaged, ${runFlag(flag)}`
         : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }

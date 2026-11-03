@@ -61,6 +61,14 @@ base branch's newest commit in each failing spec's directory since the merge bas
 out of date with that commit; none leaves it to the usual rules. A spec no check
 settled (over 20 directories, an error, a merge base with no date) stays blocking
 as unchecked evidence (the summary says so), and the model is not asked about it.
+`support-paths` names the code the specs run through (page objects, support
+commands, fixtures; for example `e2e-tests/playwright/lib`). A failure whose spec
+is unchanged is out of date too where one base-branch commit since the merge base
+changed both one of those directories and another spec failing in this run (a
+migration of specs and their page objects, from the same list, or by directory up
+to the run's time when it is cut off). The summary names the directory and the
+commit. A support change alone (a new helper, a flag default) does not count, and
+without `support-paths` only the spec does.
 
 **Flaky on master:** over master's last 50 runs (at least 5), failures plus
 passes that needed a retry, plus 1, divided by the runs plus 2, is 0.05 or more,
@@ -69,7 +77,9 @@ always count. It clears the PR's failure only when master failed the same way:
 a distinctive error or a timeout's stuck step needs a master failure with that
 error (Mattermost's 26-character ids masked). One master failed only another
 way, or with nothing to compare (a hook timeout, no error), is a `REGRESSION`
-for the model to judge. `BROKEN_ON_TRUNK` needs the same: a timeout must be stuck
+for the model to judge. A bare timeout or an error with nothing to compare that
+failed every try here needs a master failure of that same kind (the same bare
+timeout, or no error either); master's flakes of another error don't clear it. `BROKEN_ON_TRUNK` needs the same: a timeout must be stuck
 at the step master's latest run is stuck at (a bare timeout never is), and a
 distinctive error must not differ from every error of the streak. **Other PRs:**
 the last 200 PR runs. These are starting values, set before any data was
@@ -85,7 +95,9 @@ tries are left out, and so are those of a run that can't be read in time. Kept:
 a pass in a storm, this PR's own runs, and each test's current failing streak on
 master, a standing break whatever its size. A flaky run keeps the error of its
 failed try, so master retrying past this same error counts as failing the same
-way. On mobile main, 201 of the 244 tests that failed from 15 to 28 October
+way. A test run again later in the same report (Cypress can, at retry 0) is a
+retry when its case ordinals put the pass after the fail; a pass that ran first,
+or with no ordinal, leaves it failed. On mobile main, 201 of the 244 tests that failed from 15 to 28 October
 failed only in 3 such runs, and each of those counted as that test's flakiness.
 
 **Failed everywhere is not cleared by a guess:** a test that failed every try here
@@ -268,6 +280,11 @@ model fails or is unavailable, the rules' outcome stands.
   more. Once every failure is cleared, the flag is gone.
   Enforce also sets the state (success only for `SUCCESS`); report-only keeps
   the state the check has, and writes nothing while it is still pending.
+  A lane red where no test failed, every report arrived, a test passed on a retry,
+  and the lane's status says tests failed (its count read the retried test as
+  failed) reads `(1 flaky, passed on retry) 100% passed (...)`, and enforce sets
+  it green. A lane red for anything else (a job outside the tests, missing
+  reports, a status with no failed count) keeps its state.
 - **Job summary**, for a lane where something failed, a report is missing, or
   the lane is red with no failed test, shortest first: a one-line answer, then
   the failed tests in five fixed groups, one line each with why and the next step:
@@ -400,8 +417,12 @@ with a warning, and the rest of the evidence still loads.
 ## Automatic re-runs
 
 `rerun-attempts` (default `0`, off) lets a lane that is red only because jobs sent no
-results (a shard that reported nothing, reports that never arrived; no test blocks) be
-re-run instead of asking a person to. While the run's attempt is within the allowance,
+results (a shard that reported nothing, reports that never arrived; no test blocks), or
+because a job outside the tests died while every report arrived and no test failed (a
+worker whose specs the others ran; the lane says "E2E upstream execution failed"), be
+re-run instead of asking a person to. A dead job's failed step decides as before: the
+network or the runner (including `Failed to get ID Token`, GitHub's OIDC token service)
+re-runs it, a build or test-server failure holds it. While the run's attempt is within the allowance,
 the check reads "re-running the failed jobs" and triage uploads a marker artifact; the
 `e2e-test-rerun` action, called from a `workflow_run` listener once the run has
 finished, re-runs the failed jobs, and the new attempt is triaged on its own results.

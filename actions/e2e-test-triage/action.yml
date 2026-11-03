@@ -60,6 +60,13 @@ inputs:
       (e.g. playwright-full-enterprise for a subpath suite); empty for the run's own lane
     required: false
     default: ""
+  support-paths:
+    description: >-
+      Repository directories of the code the specs run through (page objects, support commands, fixtures),
+      comma- or newline-separated. A held failure whose spec is unchanged is out of date ("merge the base
+      branch") when one base-branch commit since the PR last merged it changed one of them and another spec failing in the run. Empty turns it off
+    required: false
+    default: ""
   history-report:
     description: >-
       Report-name prefix the history is read under, when the run's own report name carries what
@@ -121,7 +128,8 @@ inputs:
     default: ""
   rerun-attempts:
     description: >-
-      How many times a lane red only for jobs that sent no results (a shard that reported nothing, missing reports) may have its
+      How many times a lane red only for jobs that sent no results (a shard that reported nothing, missing reports), or only for
+      a job outside the tests that died while every report arrived and no test failed, may have its
       failed jobs re-run automatically before a person is asked to. Triage uploads a marker artifact for the
       e2e-test-rerun action, which a workflow_run listener in the repo calls. Before asking, the dead jobs' failed steps
       and logs are read: a build or test-server failure holds the re-run (needs actions: read). 0 (the default) turns it off
@@ -182,6 +190,7 @@ runs:
         AI_ADVICE: ${{ inputs.ai-advice }}
         HISTORY_LANE: ${{ inputs.history-lane }}
         HISTORY_REPORT: ${{ inputs.history-report }}
+        SUPPORT_PATHS: ${{ inputs.support-paths }}
         INFRA_CLEARS: ${{ inputs.infra-clears }}
         TRIAGE_CONTEXT: ${{ inputs.triage-status-context }}
         TRIAGE_LANES: ${{ inputs.triage-lanes }}

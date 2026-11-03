@@ -46,6 +46,10 @@ inputs:
     description: Hours a break whose suspect commits overlap one already requested waits for that agent to open its PR
     required: false
     default: "4"
+  answer-hours:
+    description: Hours after which a request nothing on GitHub answers (no PR, comment or review that links its trunk run and names its spec, no agent PR on its spec since) counts as never started and is sent once more
+    required: false
+    default: "6"
   tsio-base-url:
     description: Test System IO base URL; empty for the shared instance
     required: false
@@ -84,6 +88,7 @@ runs:
         MAX_BROKEN_PER_RUN: ${{ inputs.max-broken-per-run }}
         MAX_FLAKY_PER_DAY: ${{ inputs.max-flaky-per-day }}
         CAUSE_HOLD_HOURS: ${{ inputs.cause-hold-hours }}
+        ANSWER_HOURS: ${{ inputs.answer-hours }}
         LEDGER_PATH: ${{ github.workspace }}/.e2e-master-watch/ledger.json
         PENDING_PATH: ${{ github.workspace }}/.e2e-master-watch/pending.json
         REQUESTS_PATH: ${{ github.workspace }}/.e2e-master-watch/requests.json

@@ -64,6 +64,7 @@ var DEFAULTS = {
   rerunAttempts: 0,
   historyLane: null,
   historyReport: null,
+  supportPaths: [],
   // Re-asks an answer between escalateMin and the threshold, or one that blames the PR
   // without citing a change. Replays of real desktop runs (2026-10-29): Sonnet 5.5 fell just
   // short on 2 of 19 findings (0.8, 0.72) and Opus 5.5 settled both, at about $0.03 each.
@@ -120,6 +121,16 @@ function attemptsFrom(raw, warn) {
   warn(`RERUN_ATTEMPTS ${JSON.stringify(raw)} is not a whole number of 0 or more; using ${DEFAULTS.rerunAttempts}`);
   return DEFAULTS.rerunAttempts;
 }
+function supportPathsFrom(raw, warn) {
+  const out = [];
+  for (const entry of String(raw ?? "").split(/[,\n]/)) {
+    const path = entry.trim().replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+    if (!path) continue;
+    if (path.startsWith("/") || path.split("/").includes("..")) warn(`SUPPORT_PATHS entry ${JSON.stringify(entry.trim())} is not a directory in the repository; ignored`);
+    else out.push(path);
+  }
+  return out;
+}
 var isPlainObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var isPrice = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
 var PRICE_FIELDS = ["input", "output", "cache_write", "cache_read"];
@@ -167,6 +178,7 @@ function configFrom(env, warn = () => {
     rerunAttempts: attemptsFrom(env.RERUN_ATTEMPTS, warn),
     historyLane: (env.HISTORY_LANE || "").trim() || null,
     historyReport: (env.HISTORY_REPORT || "").trim() || null,
+    supportPaths: supportPathsFrom(env.SUPPORT_PATHS, warn),
     prices
   };
 }
@@ -197,7 +209,8 @@ function tsioBase(env) {
 function outcomeWithDuplicates(attempts, reportOf = () => null) {
   const outcome = outcomeOf(attempts);
   if (outcome.status !== "flaky") return outcome;
-  const duplicateFail = attempts.find((f) => FAILED_STATUSES.has(f.status) && attempts.some((a) => a !== f && a.retry_count === f.retry_count && reportOf(a) === reportOf(f) && !FAILED_STATUSES.has(a.status) && a.status !== "skipped"));
+  const ranAfter = (a, f) => typeof a.ordinal === "number" && typeof f.ordinal === "number" && a.ordinal > f.ordinal;
+  const duplicateFail = attempts.find((f) => FAILED_STATUSES.has(f.status) && attempts.some((a) => a !== f && a.retry_count === f.retry_count && reportOf(a) === reportOf(f) && !FAILED_STATUSES.has(a.status) && a.status !== "skipped" && !ranAfter(a, f)));
   return duplicateFail ? { status: duplicateFail.status, last: duplicateFail } : outcome;
 }
 function outcomeOf(attempts) {
@@ -429,7 +442,7 @@ async function fetchSpecRuns(fetchImpl, base, repository, files, until, cfg = DE
   for (const [file, byGroup] of runs) {
     const outcomes = [];
     for (const [group_id, run] of byGroup) {
-      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count), (a) => a.report_name ?? null).status);
+      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0)), (a) => a.report_name ?? null).status);
       const status = run.notRun ? "not_run" : results.some((s) => FAILED_STATUSES.has(s)) ? "failed" : results.every((s) => s === "skipped") ? "skipped" : "passed";
       outcomes.push({ group_id, status });
     }
@@ -538,7 +551,7 @@ ${o.title}`;
       runs.get(run).push(row);
     }
     for (const attempts of runs.values()) {
-      attempts.sort((a, b) => a.retry_count - b.retry_count);
+      attempts.sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0));
       const { status, last } = outcomeOf(attempts);
       const failedTry = status === "flaky" ? attempts.filter((a) => FAILED_STATUSES.has(a.status) && a.error_excerpt).at(-1) ?? attempts.filter((a) => a.status === "flaky" && a.error_excerpt).at(-1) : void 0;
       collapsed.push({ ...last, status, ...failedTry?.error_excerpt ? { error_excerpt: failedTry.error_excerpt } : {} });
@@ -692,7 +705,8 @@ async function markOutOfDate({
   baseBranch,
   until = null,
   log = () => {
-  }
+  },
+  supportPaths = []
 }) {
   if (!findings.length || !baseBranch) return { truncated: false };
   const cmp = await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`);
@@ -718,9 +732,38 @@ async function markOutOfDate({
     const diff = files.find((x) => x.filename === path)?.patch;
     f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit, ...also.length ? { also } : {}, ...diff ? { diff: diff.slice(0, 4e3) } : {} };
   }
-  if (!truncated) return { truncated: false };
   const base = cmp.merge_base_commit;
   const since = base?.commit?.committer?.date ?? base?.commit?.author?.date ?? null;
+  const supportChange = async (specCommits) => {
+    for (const dir of supportPaths) {
+      let rows = [];
+      if (!truncated) {
+        if (!files.some((x) => x.filename.startsWith(`${dir}/`))) continue;
+        const raw = await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(dir)}&per_page=30`).catch(() => []);
+        rows = (Array.isArray(raw) ? raw : []).filter((x) => onBase.has(x.sha));
+      } else if (since) {
+        const q = new URLSearchParams({ sha: baseBranch, path: dir, since, ...until ? { until } : {}, per_page: "30" });
+        const raw = await api("GET", `/repos/${id.repository}/commits?${q}`).catch((e) => (log(`${baseBranch} commits in ${dir} unavailable: ${String(e).slice(0, 160)}`), []));
+        rows = (Array.isArray(raw) ? raw : []).filter((x) => x.sha !== base?.sha);
+      }
+      const c = rows.find((x) => specCommits.has(x.sha));
+      if (c) return { dir, commit: commitRef(c) };
+    }
+    return null;
+  };
+  let support;
+  const markSupport = async (list) => {
+    const unmarked = list.filter((f) => !f.out_of_date);
+    if (!unmarked.length || !supportPaths.length) return;
+    const specCommits = new Set(findings.flatMap((f) => f.out_of_date && !f.out_of_date.support ? [f.out_of_date.commit, ...f.out_of_date.also ?? []] : []).map((c) => c?.sha).filter((x) => Boolean(x)));
+    if (!specCommits.size) return;
+    if (support === void 0) support = await supportChange(specCommits);
+    if (support) for (const f of unmarked) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by ?? null, commit: support.commit, support: support.dir };
+  };
+  if (!truncated) {
+    await markSupport(findings);
+    return { truncated: false };
+  }
   if (!since) {
     log(`${baseBranch} changed ${files.length}+ files since this PR last merged it, and the merge base has no date; ${rest.length} failure(s) unchecked`);
     return { truncated: true, unchecked: rest };
@@ -750,6 +793,7 @@ async function markOutOfDate({
     if (c === "unchecked") unchecked.push(f);
     else if (c) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: c };
   }
+  await markSupport(findings.filter((f) => !unchecked.includes(f)));
   return { truncated: true, unchecked };
 }
 async function markBrokeBy({ findings, api, id, log = () => {
@@ -853,6 +897,12 @@ function whyNext(f, branch, pr, branchRun = null) {
       const where = c ? ` (${refOf(c)}${c.date ? `, ${c.date}` : ""}${also.length ? `; also ${also.map(refOf).join(", ")}` : ""})` : "";
       if (f.out_of_date?.fixed) return [`The failure first passed on ${branch}${where} after this PR last merged ${branch}, so this branch still has it.`, `Merge ${branch} and re-run.`];
       const base = f.out_of_date?.base ?? branch;
+      const support = f.out_of_date?.support;
+      if (support) {
+        const at = ` (${support}${c ? `; ${refOf(c)}${c.date ? `, ${c.date}` : ""}` : ""})`;
+        if (branchRun) return [`${base} changed the test code it runs through${at} after ${branchRun} branched from it, so this run used ${branchRun}'s old copy.`, `Backport the test change to ${branchRun}, or ignore it for this release.`];
+        return [`${branch} changed the test code it runs through${at} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
+      }
       if (branchRun) return [`${base} changed this test${where} after ${branchRun} branched from it, so this run used ${branchRun}'s old copy.`, `Backport the test change to ${branchRun}, or ignore it for this release.`];
       return [`${branch} changed this test${where} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
     }
@@ -928,7 +978,8 @@ function factsTable(f, branch, pr, branchRun = null) {
     const also = f.out_of_date.also ?? [];
     const which = c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}${also.length ? `, and earlier ${also.map(refOf).join(", ")}` : ""}` : "";
     const base = f.out_of_date.base ?? branch;
-    rows.push(f.out_of_date.fixed ? [`Fixed on ${branch} since this PR last merged it`, `Yes${which}: its first passing run. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it does not have the fix`] : branchRun ? [`Changed on ${base} since ${branchRun} branched`, `Yes${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test`] : [`Changed on ${branch} since this PR last merged it`, `Yes${which}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
+    const support = f.out_of_date.support;
+    rows.push(support ? branchRun ? [`Test code changed on ${base} since ${branchRun} branched`, `Yes, in ${support}${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test code`] : [`Test code changed on ${branch} since this PR last merged it`, `Yes, in ${support}${which}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test code`] : f.out_of_date.fixed ? [`Fixed on ${branch} since this PR last merged it`, `Yes${which}: its first passing run. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it does not have the fix`] : branchRun ? [`Changed on ${base} since ${branchRun} branched`, `Yes${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test`] : [`Changed on ${branch} since this PR last merged it`, `Yes${which}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test`]);
   }
   if (f.decision === "evidence_incomplete" || f.identity_unresolved) rows.push(["Why history wasn't used", f.reason]);
   const a = f.judge;
@@ -982,7 +1033,7 @@ function renderSummary({ findings, infra: runInfra = null, runURL, counts, mode 
   if (unnamed && !findings.length) {
     say = rerunLine;
   } else if (!counts.failed) {
-    say = missing ? `${again}: ${arrived}.` : laneRed ? RED_OUTSIDE : "No test failed.";
+    say = missing ? `${again}: ${arrived}.` : laneRed ? rerun ? `${again}: no test failed; a job outside the tests failed.` : RED_OUTSIDE : "No test failed.";
   } else if (findings.length) {
     const kinds = branchRun ? statusLabels([...broken.filter((f) => !f.blocking), ...flaky]).join(", ") : [unrelatedBroken && `${unrelatedBroken} broken on ${branch}`, flaky.length && `${flaky.length} flaky`].filter(Boolean).join(", ");
     say = `${count(yours.length + outdated.length + check.length + blockingBroken + unrelated, "failure")}: ` + [
@@ -1176,6 +1227,9 @@ function laneSummary(lanes, untriaged = []) {
 }
 
 // ../shared/src/status.ts
+var UPSTREAM_FAILED = "E2E upstream execution failed; re-run the failed jobs";
+var FAILED_TESTS = "E2E reports contain failed tests";
+var REPORTS_INCOMPLETE = "E2E reports unavailable or incomplete; re-run the failed jobs";
 var positive = (v) => /^[1-9]\d*$/.test(String(v ?? ""));
 function statusOwner(target, repository) {
   try {
@@ -1460,6 +1514,10 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
     if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !unstable.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
       const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
       return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
+    }
+    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran && !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
+      const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
+      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`, true);
     }
     return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the last ${trunk.length} trunk runs.`, false);
   }
@@ -2766,7 +2824,7 @@ function writeFindings(facts, log) {
 }
 
 // ../e2e-test-triage/src/rerun-check.ts
-var INFRA_RE2 = /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|socket hang up|network (?:error|aborted|timeout)|Could not resolve host|TLS handshake timeout|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|429 Too Many Requests|rate limit exceeded|The runner has received a shutdown signal|lost communication with the server|hosted runner encountered an error|No space left on device|Unable to download artifact|Failed to download action|<!DOCTYPE html|answered with an HTML page/i;
+var INFRA_RE2 = /Failed to get ID Token|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|socket hang up|network (?:error|aborted|timeout)|Could not resolve host|TLS handshake timeout|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|429 Too Many Requests|rate limit exceeded|The runner has received a shutdown signal|lost communication with the server|hosted runner encountered an error|No space left on device|Unable to download artifact|Failed to download action|<!DOCTYPE html|answered with an HTML page/i;
 var HOLDS = [
   [/\*\* BUILD FAILED \*\*|error TS\d{4}:|Module not found|SyntaxError:|xcodebuild: error|Execution failed for task|Compilation failed|BUILD FAILURE|cannot find symbol/i, "the build failed"],
   [/npm (?:ERR!|error) (?:code )?(?:ERESOLVE|ETARGET)|No matching version found|Could not find a version that satisfies/i, "the dependencies did not install"],
@@ -2960,13 +3018,17 @@ async function noteNoResults({ env, fetchImpl = fetch, log = console.error }, id
     log(`not-triaged note not written on ${context}: ${String(e).slice(0, 200)}`);
   }
 }
-async function laneIsRed(api, id, context, log) {
+async function laneRedWhy(api, id, context, flaky, log) {
   try {
     const own = (await readStatuses(api, id)).find((r) => r.context === context);
-    return own?.state === "failure" || own?.state === "error";
+    if (own?.state !== "failure" && own?.state !== "error") return null;
+    const text = String(own.description ?? "");
+    if (text.startsWith(UPSTREAM_FAILED)) return "upstream";
+    const testsFailed = /\b[1-9]\d* failed\b/.test(text) || text.startsWith(FAILED_TESTS);
+    return flaky > 0 && own.state === "failure" && testsFailed && !text.startsWith(UPSTREAM_FAILED) && !text.startsWith(REPORTS_INCOMPLETE) ? "flaky" : "outside";
   } catch (e) {
     log(`lane status unavailable: ${String(e).slice(0, 160)}`);
-    return false;
+    return null;
   }
 }
 async function defaultBranchOf(api, repository, log) {
@@ -3023,7 +3085,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     notes.push(`Report only on this PR: it has the ${cfg.reportOnlyLabel} label, so triage leaves the E2E check as the tests set it.`);
   }
   seen.enforce = enforce;
-  const announce = enforce && (run.failing.length > 0 || Boolean(run.missing));
+  const redWhy = !run.failing.length && !run.missing && context ? await laneRedWhy(api, id, context, run.counts.flaky, log) : null;
+  const flakyOnly = redWhy === "flaky";
+  const decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly;
+  const announce = enforce && decides;
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
   const settleLaneSummary = async () => {
     try {
@@ -3032,7 +3097,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
     }
   };
-  if (announce) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : `${run.counts.failed} failed \xB7 triage is checking them`);
+  if (announce) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : flakyOnly ? `${run.counts.flaky} flaky \xB7 triage is checking them` : `${run.counts.failed} failed \xB7 triage is checking them`);
   try {
     let history = /* @__PURE__ */ new Map();
     let diff = { files: [], ok: false };
@@ -3129,7 +3194,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       // A release run's matrix (OS x server version) is wider than a PR's platforms.
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log, limit: branchBase ? 20 : 5 }),
-      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log }),
+      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory
@@ -3137,8 +3202,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     seen.result = result;
     const attempt = Number(id.gh_run_attempt) || 1;
     const onlyNoResults = (result.unnamed || result.missing) && !result.findings.some((f) => f.blocking);
+    const onlyDeadJobs = redWhy === "upstream" && !run.failing.length && !result.findings.some((f) => f.blocking);
     let rerunCheck = null;
-    if (onlyNoResults && attempt <= cfg.rerunAttempts) {
+    if ((onlyNoResults || onlyDeadJobs) && attempt <= cfg.rerunAttempts) {
       try {
         const dead = await readDeadJobs({ fetchImpl, token: String(env.GITHUB_TOKEN), repository: id.repository, runId: String(id.gh_run_id), attempt: String(id.gh_run_attempt), log });
         rerunCheck = await decideRerun(dead, apiKey && !prSpendUnknown ? askCauseWith(fetchImpl, apiKey, cfg.model, result.ai, cfg.prices) : null, log);
@@ -3157,11 +3223,13 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       }
     }
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
-    const laneRed = !run.failing.length && !run.missing && context ? await laneIsRed(api, id, context, log) : false;
+    const laneRed = redWhy === "outside" || redWhy === "upstream";
+    if (flakyOnly)
+      notes.push(`No test failed: the ${run.counts.flaky === 1 ? "1 test that failed a try" : `${run.counts.flaky} tests that failed a try`} passed on a retry. The lane counted ${run.counts.flaky === 1 ? "it" : "them"} as failed.`);
     const rerun = rerunCheck?.rerun ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = rerunCheck?.held ?? null;
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
-    const description = statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
+    const description = flakyOnly ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}` : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
       (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}
@@ -3177,7 +3245,7 @@ ai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}
 ai_input_tokens=${spend.input_tokens}
 ai_output_tokens=${spend.output_tokens}
 `);
-    if (env.GITHUB_STEP_SUMMARY && (run.failing.length > 0 || Boolean(run.missing) || laneRed)) {
+    if (env.GITHUB_STEP_SUMMARY && (decides || laneRed)) {
       (0, import_node_fs3.appendFileSync)(env.GITHUB_STEP_SUMMARY, summary + "\n");
       written.summary = true;
     }
@@ -3185,7 +3253,7 @@ ai_output_tokens=${spend.output_tokens}
     if (mode && mode !== "enforce" && mode !== "report-only")
       log(`unrecognised mode ${JSON.stringify(mode)}; the only value that enforces is "enforce", so this run is report-only`);
     let published = false;
-    if (enforce && context && (run.failing.length > 0 || Boolean(run.missing))) {
+    if (enforce && context && decides) {
       published = await publisher.write({
         state: result.verdict === "SUCCESS" ? "success" : "failure",
         context,
@@ -3193,7 +3261,7 @@ ai_output_tokens=${spend.output_tokens}
         target_url: runURL
       }, "triage");
     }
-    if (!enforce && context && (run.failing.length > 0 || Boolean(run.missing))) {
+    if (!enforce && context && decides) {
       try {
         const current = (await readStatuses(api, id)).find((r) => r.context === context);
         if (current && current.state !== "pending") await publisher.write({ state: current.state, description, target_url: runURL }, "triage");
@@ -3205,7 +3273,7 @@ ai_output_tokens=${spend.output_tokens}
     if (announce && lanes.length) await settleLaneSummary();
     else if (announce) {
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).map((l) => l === RERUN ? again : l).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${again}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", flakyOnly ? `${run.counts.flaky} flaky, passed on retry \xB7 no test failed` : (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).map((l) => l === RERUN ? again : l).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${again}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
 `);
@@ -3320,6 +3388,61 @@ function prsTouching(touched, spec) {
 }
 function prsChanging(touched, spec) {
   return [...new Set(touched.get(spec) ?? [])].sort((a, b) => a - b);
+}
+var MAX_ANSWER_READS = 20;
+var TEXTS = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issueOrPullRequest(number: $number) {
+      ... on Issue { body comments(last: 100) { pageInfo { hasPreviousPage } nodes { body } } }
+      ... on PullRequest {
+        body
+        comments(last: 100) { pageInfo { hasPreviousPage } nodes { body } }
+        reviews(last: 100) { pageInfo { hasPreviousPage } nodes { body comments(first: 50) { pageInfo { hasNextPage } nodes { body } } } }
+      }
+    }
+  }
+}`;
+var specName = (spec) => {
+  const file = spec.slice(spec.lastIndexOf("/") + 1).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![\\w.-])${file}(?!\\w)`);
+};
+function answerCheck(api, repository) {
+  const [owner, name] = repository.split("/");
+  const read = /* @__PURE__ */ new Map();
+  const textsOf = (number) => {
+    let texts = read.get(number);
+    if (!texts) {
+      texts = (async () => {
+        const res = await api("POST", "/graphql", { query: TEXTS, variables: { owner, name, number } });
+        if (res.errors?.length) throw new Error(`GitHub GraphQL: ${res.errors[0].message}`);
+        const item = res.data?.repository?.issueOrPullRequest;
+        const bodies = (b) => (b?.nodes ?? []).map((n) => n?.body);
+        const reviews = item?.reviews?.nodes ?? [];
+        return {
+          texts: [item?.body, ...bodies(item?.comments), ...reviews.flatMap((r) => [r?.body, ...bodies(r?.comments)])].filter((t) => Boolean(t)),
+          truncated: Boolean(item?.comments?.pageInfo?.hasPreviousPage || item?.reviews?.pageInfo?.hasPreviousPage || reviews.some((r) => r?.comments?.pageInfo?.hasNextPage))
+        };
+      })();
+      read.set(number, texts);
+    }
+    return texts;
+  };
+  return async (runId, specs, candidates) => {
+    const q = `repo:${repository} "${runId}"`;
+    const found = await api("GET", `/search/issues?q=${encodeURIComponent(q)}&per_page=${MAX_ANSWER_READS}`);
+    if (found.incomplete_results) throw new Error(`search for run ${runId} returned incomplete results`);
+    if ((found.total_count ?? 0) > (found.items ?? []).length) throw new Error(`more than ${MAX_ANSWER_READS} PRs and issues cite run ${runId}`);
+    const link = new RegExp(`/actions/runs/${runId}(?!\\d)`);
+    const names = specs.map(specName);
+    const truncated = [];
+    for (const n of /* @__PURE__ */ new Set([...(found.items ?? []).map((i) => i.number), ...candidates])) {
+      const { texts, truncated: more } = await textsOf(n);
+      if (texts.some((t) => link.test(t) && names.some((s) => s.test(t)))) return true;
+      if (more) truncated.push(n);
+    }
+    if (truncated.length) throw new Error(`#${truncated.join(", #")}: more comments or reviews than read`);
+    return false;
+  };
 }
 var REPAIR_PRS = `query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 50, after: $after) {
@@ -3632,11 +3755,13 @@ function bundle(groups) {
 // src/watch.ts
 var MAX_TESTS = 40;
 var MAX_OPEN_PRS_TOUCHING = 10;
+var MAX_ANSWER_PRS = 20;
 var MAX_UNSELECTED_NOTES = 10;
 var HOLD_MS = 24 * HOUR;
 var OWN_PR_IDLE_MS = 3 * DAY;
 var OWN_PR_MAX_AGE_MS = 2 * DAY;
 var STALE_PR_HOLD_MS = 3 * DAY;
+var MAX_RESENDS = 1;
 var REPORTS_PAGE = 100;
 var REPORTS_MAX_PAGES = 5;
 async function runGroups(fetchImpl, base, repository, runId, attempt, names) {
@@ -3717,9 +3842,18 @@ ${note}; nothing to watch.
   };
   const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
-  const maxBrokenPerRun = Number(env.MAX_BROKEN_PER_RUN || 10);
-  const maxFlakyPerDay = Number(env.MAX_FLAKY_PER_DAY || 6);
-  const causeHoldMs = Number(env.CAUSE_HOLD_HOURS || 4) * HOUR;
+  const amount = (name, fallback) => {
+    const raw = env[name];
+    if (raw == null || String(raw).trim() === "") return fallback;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n;
+    notes.push(`${name} ${JSON.stringify(raw)} is not a number of 0 or more; using ${fallback}`);
+    return fallback;
+  };
+  const maxBrokenPerRun = amount("MAX_BROKEN_PER_RUN", 10);
+  const maxFlakyPerDay = amount("MAX_FLAKY_PER_DAY", 6);
+  const causeHoldMs = amount("CAUSE_HOLD_HOURS", 4) * HOUR;
+  const answerHours = amount("ANSWER_HOURS", 6);
   const currentAt = Date.parse(first.created_at ?? "") || now.getTime();
   const label = env.LABEL || DEFAULT_LABEL;
   const reportNameOf = new Map(suites.map((s) => [s.name, s.report_name || null]));
@@ -3786,6 +3920,37 @@ ${note}; nothing to watch.
     ...[...open.prs.values()].map((p) => [p.number, p])
   ]);
   const daysSince = (at) => Math.floor((now.getTime() - at) / DAY);
+  const agentPRsChanging = (spec) => [.../* @__PURE__ */ new Set([...prsChanging(open.files, spec).filter((n) => open.prs.get(n)?.labels.includes(label)), ...prsChanging(own.files, spec)])].sort((a, b) => a - b);
+  const answers = answerCheck(api, id.repository);
+  const answeredOf = /* @__PURE__ */ new Map();
+  let answersUnknown = null;
+  const unanswered = async (r) => {
+    const at = Date.parse(r.at);
+    const runId = /\/actions\/runs\/(\d+)/.exec(r.run ?? "")?.[1];
+    if ((r.resent ?? 0) >= MAX_RESENDS || now.getTime() - at < answerHours * HOUR || !runId) return false;
+    if ((r.specs ?? []).some((s) => agentPRsChanging(s).some((n) => (agentPR.get(n)?.openedAt ?? 0) >= at))) return false;
+    let answered = answeredOf.get(r);
+    if (!answered) {
+      const specs = r.specs ?? [];
+      const sentWith = [.../* @__PURE__ */ new Set([...r.prs ?? [], ...[...agentPR.values()].filter((p) => p.labels.includes(label) && (p.openedAt ?? 0) >= at).map((p) => p.number)])];
+      if (sentWith.length > MAX_ANSWER_PRS) {
+        notes.push(`${specs.join(", ")}: ${sentWith.length} PRs to read for an answer, more than ${MAX_ANSWER_PRS}; the request of ${utcMinute(r.at)} UTC (${r.run}) holds as sent`);
+        answered = Promise.resolve(true);
+      } else answered = answers(runId, specs, sentWith);
+      answeredOf.set(r, answered);
+    }
+    try {
+      return !await answered;
+    } catch (e) {
+      if (!answersUnknown) {
+        answersUnknown = String(e).slice(0, 160);
+        notes.push(`requests not checked for a sign the agent ran them (${answersUnknown}); they hold as sent`);
+      }
+      return false;
+    }
+  };
+  const unansweredEntries = /* @__PURE__ */ new Set();
+  const resentOf = /* @__PURE__ */ new Map();
   const staleNoted = /* @__PURE__ */ new Set();
   const candidates = [];
   for (const g of groups.values()) {
@@ -3793,7 +3958,7 @@ ${note}; nothing to watch.
       const p = open.prs.get(n);
       return p ? [p] : [];
     });
-    const agentPRs = [.../* @__PURE__ */ new Set([...prsChanging(open.files, g.spec).filter((n) => open.prs.get(n)?.labels.includes(label)), ...prsChanging(own.files, g.spec)])].sort((a, b) => a - b);
+    const agentPRs = agentPRsChanging(g.spec);
     const ownPRs = [];
     for (const n of agentPRs) {
       const p = agentPR.get(n);
@@ -3811,14 +3976,29 @@ ${note}; nothing to watch.
       if (p && !prs.some((x) => x.number === n)) prs.push(p);
     }
     const holdMs = agentPRs.length && !ownPRs.length ? STALE_PR_HOLD_MS : HOLD_MS;
-    const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < holdMs);
+    let held;
+    const dead = [];
+    for (const r of ledger.filter((e) => e.specs?.includes(g.spec) && now.getTime() - Date.parse(e.at) < holdMs)) {
+      if (!ownUnknown && !ownPRs.length && await unanswered(r)) dead.push(r);
+      else {
+        held = r;
+        break;
+      }
+    }
+    if (!held && dead.length) {
+      const last = dead[dead.length - 1];
+      const resent = Math.max(...dead.map((r) => r.resent ?? 0)) + 1;
+      resentOf.set(g.spec, resent);
+      for (const r of dead) unansweredEntries.add(r);
+      notes.push(`${g.spec}: nothing on GitHub answers the request of ${utcMinute(last.at)} UTC (${last.run}) after ${answerHours} hours; it may not have started, so it holds nothing (resend ${resent} of ${MAX_RESENDS})`);
+    }
     if (ownUnknown) skip(g, "skipped: the agent's own PRs could not be read");
     else if (ownPRs.length) skip(g, `skipped: #${ownPRs.join(", #")} (${label}) already changes it`);
     else if (held) skip(g, `skipped: requested ${utcMinute(held.at)} UTC by ${held.run}`);
     else candidates.push({ ...g, openPRs: prs });
   }
   const asked = (g) => ledger.filter((e) => e.specs?.includes(g.spec)).length;
-  const flakyLeft = maxFlakyPerDay - ledger.filter((r) => r.kind === "flaky" && now.getTime() - Date.parse(r.at) < DAY).length;
+  const flakyLeft = maxFlakyPerDay - ledger.filter((r) => r.kind === "flaky" && now.getTime() - Date.parse(r.at) < DAY && !unansweredEntries.has(r)).length;
   const flaky = candidates.filter((g) => g.kind === "flaky").sort((a, b) => asked(a) - asked(b) || flakes(b) - flakes(a));
   const ranged = [];
   for (const g of [...candidates.filter((c) => c.kind === "broken"), ...flaky.slice(0, Math.max(0, flakyLeft))]) {
@@ -3838,7 +4018,8 @@ ${note}; nothing to watch.
     decisions.push(decision);
     const window = r.window;
     const sameCause = window && ledger.find(
-      (e) => e.window && now.getTime() - Date.parse(e.at) < causeHoldMs && windowsOverlap(window, { from: e.window.from ?? -Infinity, to: e.window.to })
+      // A request that never ran is no cause to wait for.
+      (e) => !unansweredEntries.has(e) && e.window && now.getTime() - Date.parse(e.at) < causeHoldMs && windowsOverlap(window, { from: e.window.from ?? -Infinity, to: e.window.to })
     );
     if (sameCause) {
       decision.action = `skipped: may be the break requested ${utcMinute(sameCause.at)} UTC (overlapping suspect commits)`;
@@ -3864,6 +4045,7 @@ ${note}; nothing to watch.
       labels: [label, ...env.EXTRA_LABELS ? env.EXTRA_LABELS.split(",").map((l) => l.trim()).filter(Boolean) : []]
     };
     decision.action = "to request";
+    const resent = Math.max(0, ...r.specs.map((s) => resentOf.get(s) ?? 0));
     out.push({
       id: `fix-${out.length + 1}`,
       payload,
@@ -3872,7 +4054,10 @@ ${note}; nothing to watch.
         specs: r.specs,
         kind: r.kind,
         ...r.window ? { window: { from: Number.isFinite(r.window.from) ? r.window.from : null, to: r.window.to } } : {},
-        run: runURL
+        run: runURL,
+        ...resent ? { resent } : {},
+        // Where the agent may answer it with a review search doesn't index (see unanswered).
+        ...payload.open_prs_touching.length ? { prs: payload.open_prs_touching.map((p) => p.number) } : {}
       }
     });
   }

@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { FetchImpl } from "./github.ts";
-import { DEFAULT_TSIO_BASE_URL, NoResultsError, STAGING_TSIO_BASE_URL, SupersededRunError, compositeIdentityFrom, fetchRun, missingReports, missingArrived, tsioBase } from "./tsio.ts";
+import { DEFAULT_TSIO_BASE_URL, NoResultsError, STAGING_TSIO_BASE_URL, SupersededRunError, compositeIdentityFrom, fetchRun, missingReports, missingArrived, outcomeWithDuplicates, tsioBase } from "./tsio.ts";
 
 test("use-staging unset, false or empty keeps the shared instance or the given base URL", () => {
   assert.equal(tsioBase({}), DEFAULT_TSIO_BASE_URL);
@@ -135,4 +135,30 @@ test("a re-run's report replaces the earlier attempt's of the same name: its stu
   const run = await fetchRun(fetchImpl, "http://tsio", ours, null, { attempts: 1, ms: 0 });
   assert.deepEqual(run.failing, []);
   assert.deepEqual(run.counts, { total: 2, passed: 2, failed: 0, flaky: 0, skipped: 0 });
+});
+
+test("a pass after a fail in one report at one retry level is a retry, by ordinal; a pass before it, or with no ordinal, is not", () => {
+  const at = (status: string, ordinal?: number) => ({ status, retry_count: 0, report: "r1", ...(ordinal === undefined ? {} : { ordinal }) });
+  const report = (a: { report: string }) => a.report;
+  // mattermost#39481: Cypress ran email_login_activity_spec.ts twice in one report; the test failed at ordinal 21, passed at 30.
+  assert.equal(outcomeWithDuplicates([at("failed", 21), at("passed", 30)], report).status, "flaky");
+  assert.equal(outcomeWithDuplicates([at("passed", 30), at("failed", 21)], report).status, "flaky", "the ordinals decide, not the order given");
+  assert.equal(outcomeWithDuplicates([at("passed", 21), at("failed", 30)], report).status, "failed", "a pass before the fail does not excuse it");
+  assert.equal(outcomeWithDuplicates([at("failed", 21), at("passed")], report).status, "failed", "without both ordinals the pass cannot be placed after the fail");
+  assert.equal(outcomeWithDuplicates([at("failed", 21), { ...at("passed", 30), report: "r2" }], report).status, "flaky", "a retest in another report is unchanged");
+});
+
+test("the run reader counts a test that failed and then passed later in its own report as flaky, not failed", async () => {
+  const fetchImpl = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/suites")) return Response.json({ suites: [{ id: "s1", file_path: "tests/a_spec.ts", report_name: "dispatch-run-cypress--9", report_id: "01a182aa-0f89-777c-a5be-c8d73982368c" }] });
+    if (u.includes("/cases")) return Response.json([
+      { suite_id: "s1", title: "MM-T1", full_title: "A > MM-T1", status: "failed", retry_count: 0, ordinal: 21, error_message: "AssertionError: expected undefined to be one of [ 200, 201 ]" },
+      { suite_id: "s1", title: "MM-T1", full_title: "A > MM-T1", status: "passed", retry_count: 0, ordinal: 30 },
+    ]);
+    return Response.json({ reports: [group(ours.gh_run_id)], total: 1 });
+  }) as FetchImpl;
+  const run = await fetchRun(fetchImpl, "http://tsio", ours, null, { attempts: 1, ms: 0 });
+  assert.deepEqual(run.failing, []);
+  assert.deepEqual(run.counts, { total: 1, passed: 1, failed: 0, flaky: 1, skipped: 0 });
 });

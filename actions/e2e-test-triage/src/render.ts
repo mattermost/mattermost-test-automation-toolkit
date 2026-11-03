@@ -119,6 +119,13 @@ function whyNext(f: Finding, branch: string, pr: boolean, branchRun: string | nu
       const where = c ? ` (${refOf(c)}${c.date ? `, ${c.date}` : ""}${also.length ? `; also ${also.map(refOf).join(", ")}` : ""})` : "";
       if (f.out_of_date?.fixed) return [`The failure first passed on ${branch}${where} after this PR last merged ${branch}, so this branch still has it.`, `Merge ${branch} and re-run.`];
       const base = f.out_of_date?.base ?? branch;
+      // The test is unchanged; the code it runs through (a support-paths directory) is not.
+      const support = f.out_of_date?.support;
+      if (support) {
+        const at = ` (${support}${c ? `; ${refOf(c)}${c.date ? `, ${c.date}` : ""}` : ""})`;
+        if (branchRun) return [`${base} changed the test code it runs through${at} after ${branchRun} branched from it, so this run used ${branchRun}'s old copy.`, `Backport the test change to ${branchRun}, or ignore it for this release.`];
+        return [`${branch} changed the test code it runs through${at} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
+      }
       if (branchRun) return [`${base} changed this test${where} after ${branchRun} branched from it, so this run used ${branchRun}'s old copy.`, `Backport the test change to ${branchRun}, or ignore it for this release.`];
       return [`${branch} changed this test${where} after this PR last merged ${branch}, so the PR ran its old copy.`, `Merge ${branch} and re-run.`];
     }
@@ -203,7 +210,12 @@ function factsTable(f: Finding, branch: string, pr: boolean, branchRun: string |
     const also = f.out_of_date.also ?? [];
     const which = c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}${also.length ? `, and earlier ${also.map(refOf).join(", ")}` : ""}` : "";
     const base = f.out_of_date.base ?? branch;
-    rows.push(f.out_of_date.fixed
+    const support = f.out_of_date.support;
+    rows.push(support
+      ? (branchRun
+        ? [`Test code changed on ${base} since ${branchRun} branched`, `Yes, in ${support}${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test code`]
+        : [`Test code changed on ${branch} since this PR last merged it`, `Yes, in ${support}${which}. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it ran its old copy of the test code`])
+      : f.out_of_date.fixed
       ? [`Fixed on ${branch} since this PR last merged it`, `Yes${which}: its first passing run. This PR is ${count(f.out_of_date.behind ?? 0, "commit")} behind, so it does not have the fix`]
       : branchRun
       ? [`Changed on ${base} since ${branchRun} branched`, `Yes${which}. ${branchRun} is ${count(f.out_of_date.behind ?? 0, "commit")} behind ${base}, so it ran its old copy of the test`]
@@ -350,7 +362,7 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
   } else if (!counts.failed) {
     // Red with no failed test: the jobs to re-run. A missing report says how many arrived; a lane that is red for a job
     // outside the tests says that.
-    say = missing ? `${again}: ${arrived}.` : laneRed ? RED_OUTSIDE : "No test failed.";
+    say = missing ? `${again}: ${arrived}.` : laneRed ? (rerun ? `${again}: no test failed; a job outside the tests failed.` : RED_OUTSIDE) : "No test failed.";
   } else if (findings.length) {
     // A release run's cleared failures are named by what the model found (test bug, server compat, flaky).
     const kinds = branchRun ? statusLabels([...broken.filter((f) => !f.blocking), ...flaky]).join(", ")

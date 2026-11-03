@@ -56,14 +56,16 @@ export interface Outcome<T> {
 }
 
 /**
- * outcomeOf, except that two executions of one report at the same retry level are not a retry: a pass
- * beside a fail there (one spec reported twice in one group) cannot excuse the fail, so it is a fail.
+ * outcomeOf, except that two executions of one report at the same retry level are not a retry unless their case
+ * ordinals say the pass ran after the fail (a spec run again later in the same report, as Cypress can). A pass beside a
+ * fail there that ran first, or that cannot be placed (an ordinal missing), cannot excuse the fail, so it is a fail.
  * A retest on another worker is a different report, so it stays a retest.
  */
-export function outcomeWithDuplicates<T extends { status: string; retry_count: number }>(attempts: readonly T[], reportOf: (a: T) => string | null = () => null): Outcome<T> {
+export function outcomeWithDuplicates<T extends { status: string; retry_count: number; ordinal?: number | null }>(attempts: readonly T[], reportOf: (a: T) => string | null = () => null): Outcome<T> {
   const outcome = outcomeOf(attempts);
   if (outcome.status !== "flaky") return outcome;
-  const duplicateFail = attempts.find((f) => FAILED_STATUSES.has(f.status) && attempts.some((a) => a !== f && a.retry_count === f.retry_count && reportOf(a) === reportOf(f) && !FAILED_STATUSES.has(a.status) && a.status !== "skipped"));
+  const ranAfter = (a: T, f: T): boolean => typeof a.ordinal === "number" && typeof f.ordinal === "number" && a.ordinal > f.ordinal;
+  const duplicateFail = attempts.find((f) => FAILED_STATUSES.has(f.status) && attempts.some((a) => a !== f && a.retry_count === f.retry_count && reportOf(a) === reportOf(f) && !FAILED_STATUSES.has(a.status) && a.status !== "skipped" && !ranAfter(a, f)));
   return duplicateFail ? { status: duplicateFail.status, last: duplicateFail } : outcome;
 }
 

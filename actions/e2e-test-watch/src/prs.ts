@@ -162,6 +162,103 @@ export function prsChanging(touched: Map<string, number[]>, spec: string): numbe
   return [...new Set(touched.get(spec) ?? [])].sort((a, b) => a - b);
 }
 
+// PRs and issues that search may return for one trunk run; past it a request can't be ruled unanswered.
+const MAX_ANSWER_READS = 20;
+
+const TEXTS = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issueOrPullRequest(number: $number) {
+      ... on Issue { body comments(last: 100) { pageInfo { hasPreviousPage } nodes { body } } }
+      ... on PullRequest {
+        body
+        comments(last: 100) { pageInfo { hasPreviousPage } nodes { body } }
+        reviews(last: 100) { pageInfo { hasPreviousPage } nodes { body comments(first: 50) { pageInfo { hasNextPage } nodes { body } } } }
+      }
+    }
+  }
+}`;
+
+interface Bodies {
+  pageInfo?: { hasPreviousPage?: boolean; hasNextPage?: boolean } | null;
+  nodes?: ({ body?: string | null } | null)[] | null;
+}
+
+interface Texts {
+  repository: {
+    issueOrPullRequest: {
+      body?: string | null;
+      comments?: Bodies | null;
+      reviews?: { pageInfo?: Bodies["pageInfo"]; nodes?: ({ body?: string | null; comments?: Bodies | null } | null)[] | null } | null;
+    } | null;
+  } | null;
+}
+
+/** A PR's or issue's texts as read, and whether some were past the pages read. */
+interface ReadTexts {
+  texts: string[];
+  truncated: boolean;
+}
+
+/**
+ * A spec as the agent names it in its answers: its file name, e.g. `channel_classification.spec.ts`, alone or at the
+ * end of a path. Not as the end of another name: `post.spec.ts` is not named by `edit_post.spec.ts`.
+ */
+const specName = (spec: string): RegExp => {
+  const file = spec.slice(spec.lastIndexOf("/") + 1).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![\\w.-])${file}(?!\\w)`);
+};
+
+/**
+ * A check of whether the agent answered a request: some PR or issue holds one text (its body, a comment, a review,
+ * or a review comment) that links the request's trunk run and names one of its specs. The agent's new PR, and its
+ * comment or review on an existing PR, both do. The spec tells apart requests sent from one trunk run. Read are the
+ * PRs and issues search finds citing the run, and `candidates` (the open PRs the request was sent with, and the
+ * agent's PRs since), so a review that search doesn't index still counts there. No file list is read. Each PR's texts
+ * are read once per check. Throws when it can't tell: more PRs and issues cite the run than search returns, or one
+ * read with no answer has more texts than its pages hold.
+ */
+export function answerCheck(api: GhApi, repository: string): (runId: string, specs: string[], candidates: number[]) => Promise<boolean> {
+  const [owner, name] = repository.split("/");
+  const read = new Map<number, Promise<ReadTexts>>();
+  const textsOf = (number: number): Promise<ReadTexts> => {
+    let texts = read.get(number);
+    if (!texts) {
+      texts = (async () => {
+        const res = (await api("POST", "/graphql", { query: TEXTS, variables: { owner, name, number } })) as GraphqlReply<Texts>;
+        if (res.errors?.length) throw new Error(`GitHub GraphQL: ${res.errors[0].message}`);
+        const item = res.data?.repository?.issueOrPullRequest;
+        const bodies = (b?: Bodies | null): (string | null | undefined)[] => (b?.nodes ?? []).map((n) => n?.body);
+        const reviews = item?.reviews?.nodes ?? [];
+        return {
+          texts: [item?.body, ...bodies(item?.comments), ...reviews.flatMap((r) => [r?.body, ...bodies(r?.comments)])].filter((t): t is string => Boolean(t)),
+          truncated: Boolean(item?.comments?.pageInfo?.hasPreviousPage || item?.reviews?.pageInfo?.hasPreviousPage || reviews.some((r) => r?.comments?.pageInfo?.hasNextPage)),
+        };
+      })();
+      read.set(number, texts);
+    }
+    return texts;
+  };
+  return async (runId, specs, candidates) => {
+    const q = `repo:${repository} "${runId}"`;
+    const found = (await api("GET", `/search/issues?q=${encodeURIComponent(q)}&per_page=${MAX_ANSWER_READS}`)) as { total_count?: number; incomplete_results?: boolean; items?: { number: number }[] };
+    // A search that timed out may have missed the answer.
+    if (found.incomplete_results) throw new Error(`search for run ${runId} returned incomplete results`);
+    if ((found.total_count ?? 0) > (found.items ?? []).length) throw new Error(`more than ${MAX_ANSWER_READS} PRs and issues cite run ${runId}`);
+    // The run's link, not a number that happens to contain it.
+    const link = new RegExp(`/actions/runs/${runId}(?!\\d)`);
+    const names = specs.map(specName);
+    const truncated: number[] = [];
+    for (const n of new Set([...(found.items ?? []).map((i) => i.number), ...candidates])) {
+      const { texts, truncated: more } = await textsOf(n);
+      if (texts.some((t) => link.test(t) && names.some((s) => s.test(t)))) return true;
+      if (more) truncated.push(n);
+    }
+    // The answer may be among the texts not read.
+    if (truncated.length) throw new Error(`#${truncated.join(", #")}: more comments or reviews than read`);
+    return false;
+  };
+}
+
 const REPAIR_PRS = `query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 50, after: $after) {
     pageInfo { hasNextPage endCursor }

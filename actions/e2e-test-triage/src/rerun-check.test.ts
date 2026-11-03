@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { FetchImpl } from "../../shared/src/github.ts";
+import { UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import { askCauseWith, classifyDeadJob, decideRerun, lastLines, readDeadJobs } from "./rerun-check.ts";
 import { newLedger } from "./pricing.ts";
 import type { AskCause, DeadJob } from "./rerun-check.ts";
@@ -161,6 +162,53 @@ test("end to end: a shard that died on npm ci is re-run; one whose build failed 
   assert.match(build.output, /^rerun=false$/m);
   assert.match(build.output, /^rerun_held=the build failed$/m);
   assert.match(build.description, /^\(not re-run: the build failed\) 0 passed, 0 failed, 1 not run, 0 skipped$/);
+});
+
+test("a worker that died getting its OIDC token failed on the runner, and is re-run", () => {
+  // mattermost run 41428729555, job 125228012401: one Cypress dispatch-run worker crashed before it ran a spec.
+  const call = classifyDeadJob(job({ step: "Run dispatch-run", tail: "##[error]dispatch-run action crashed: Error: Error message: Failed to get ID Token." }));
+  assert.equal(call.verdict, "rerun");
+  assert.match(call.reason, /Failed to get ID Token/);
+});
+
+test("end to end: a lane red only because a worker died, with every report in and no test failed, is re-run unless the change broke it", async () => {
+  // mattermost run 41428729555: the other workers ran the dead one's specs, so the reports are complete and nothing
+  // failed; the lane is red only with e2e-test-status's upstream-failure text.
+  const run = async ({ step, tail, testStatus = "passed" }: { step: string; tail: string; testStatus?: string }) => {
+    const dir = mkdtempSync(join(tmpdir(), "rerun-check-"));
+    const fetchImpl = (async (url: string, init: RequestInit = {}) => {
+      const u = String(url);
+      if (u.includes("/reports?")) return Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "cypress-full", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 });
+      if (u.includes("/reports/g1/suites")) return Response.json({ suites: [{ id: "s1", file_path: "tests/a_spec.js" }] });
+      if (u.includes("/reports/g1/cases")) return Response.json([{ suite_id: "s1", title: "t1", status: testStatus, retry_count: 0, ordinal: 0, error_message: testStatus === "passed" ? null : "AssertionError: expected true", error_stack: null }]);
+      if (u.includes("/reports/history")) return Response.json({ observations: [] });
+      if (u.includes("/pulls/5/files")) return Response.json([]);
+      if (u.includes("/pulls/5")) return Response.json({ title: "t", base: { ref: "master" }, labels: [] });
+      if (u.includes("/actions/runs/12/attempts/1/jobs")) return Response.json({ total_count: 1, jobs: [{ id: 7, name: "e2e-cypress / cypress-full / dispatch-run-cypress--3", status: "completed", conclusion: "failure", steps: [{ name: step, conclusion: "failure", started_at: "2026-11-02T13:00:00Z", completed_at: "2026-11-02T13:01:00Z" }] }] });
+      if (u.includes("/actions/jobs/7/logs")) return new Response(`2026-11-02T13:00:30.0000000Z ${tail}`);
+      if (u.includes("/commits/abc/statuses") && (init.method ?? "GET") === "GET") return Response.json([{ context: "e2e-test/cypress-full", state: "failure", description: UPSTREAM_FAILED, target_url: "https://github.com/o/r/actions/runs/12" }]);
+      if (u.includes("/statuses/abc")) return Response.json({});
+      throw new Error(`unexpected ${u}`);
+    }) as FetchImpl;
+    try {
+      const output = join(dir, "o.txt");
+      const env = { COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "cypress-full", branch: "pr-5", gh_pr_number: 5 }), STATUS_CONTEXT: "e2e-test/cypress-full", TEST_ROOT: ".", MODE: "enforce", GITHUB_TOKEN: "GH", TSIO_BASE_URL: "http://tsio", RERUN_ATTEMPTS: "1", TRIAGE_CONTEXT: "off", GITHUB_OUTPUT: output };
+      await triage({ env, fetchImpl, log: () => {}, wait: { attempts: 1, ms: 0 } });
+      return readFileSync(output, "utf8");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const died = await run({ step: "Run dispatch-run", tail: "##[error]dispatch-run action crashed: Error: Error message: Failed to get ID Token." });
+  assert.match(died, /^rerun=true$/m);
+  assert.match(died, /^rerun_of=2$/m);
+  const build = await run({ step: "Build webapp", tail: "error TS2304: Cannot find name 'x'." });
+  assert.match(build, /^rerun=false$/m);
+  assert.match(build, /^rerun_held=the build failed$/m);
+  // A failed test is triage's to judge, never a reason to re-run.
+  const failed = await run({ step: "Run dispatch-run", tail: "##[error]dispatch-run action crashed: Error: Error message: Failed to get ID Token.", testStatus: "failed" });
+  assert.match(failed, /^rerun=false$/m);
+  assert.match(failed, /^rerun_held=$/m);
 });
 
 test("the model is asked with the re-run prompt, its cost is counted, and an answer for a job it was not asked about is dropped", async () => {

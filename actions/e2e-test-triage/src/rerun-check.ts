@@ -31,9 +31,10 @@ export interface RerunDecision {
 /** The model's read of the jobs the rules could not settle, one answer per job id. */
 export type AskCause = (jobs: DeadJob[]) => Promise<{ id: number; cause: "infrastructure" | "change" | "unclear"; reason: string }[]>;
 
-// The runner, the network, the host or an outside service failed: nothing the change wrote.
+// The runner, the network, the host or an outside service failed: nothing the change wrote. "Failed to get ID Token" is
+// GitHub's OIDC token service failing a job's request (a dispatch-run worker that crashed before running a spec).
 const INFRA_RE =
-  /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|socket hang up|network (?:error|aborted|timeout)|Could not resolve host|TLS handshake timeout|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|429 Too Many Requests|rate limit exceeded|The runner has received a shutdown signal|lost communication with the server|hosted runner encountered an error|No space left on device|Unable to download artifact|Failed to download action|<!DOCTYPE html|answered with an HTML page/i;
+  /Failed to get ID Token|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|socket hang up|network (?:error|aborted|timeout)|Could not resolve host|TLS handshake timeout|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|429 Too Many Requests|rate limit exceeded|The runner has received a shutdown signal|lost communication with the server|hosted runner encountered an error|No space left on device|Unable to download artifact|Failed to download action|<!DOCTYPE html|answered with an HTML page/i;
 // What the change can break before a test runs, with the words the check uses for it.
 const HOLDS: [RegExp, string][] = [
   [/\*\* BUILD FAILED \*\*|error TS\d{4}:|Module not found|SyntaxError:|xcodebuild: error|Execution failed for task|Compilation failed|BUILD FAILURE|cannot find symbol/i, "the build failed"],

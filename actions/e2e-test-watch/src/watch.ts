@@ -18,7 +18,7 @@ import { LEDGER_MS, readLedger, writeLedger } from "./ledger.ts";
 import type { LedgerEntry } from "./ledger.ts";
 import { DAY, HOUR, flakes, utcMinute } from "./model.ts";
 import type { Group, GroupTest, Kind } from "./model.ts";
-import { DEFAULT_LABEL, lastActivity, openedAt, prsChanging, prsTouching, repairPRs, specsInOpenPRs } from "./prs.ts";
+import { DEFAULT_LABEL, answerCheck, lastActivity, openedAt, prsChanging, prsTouching, repairPRs, specsInOpenPRs } from "./prs.ts";
 import type { OpenPR, OpenPRs, RepairPRs } from "./prs.ts";
 import { addGroup, retryRecovered, selectCrossLane, selectRepairs, selectRetryFlakes, unselected } from "./select.ts";
 import { bundle, specRange, suspects, windowsOverlap } from "./range.ts";
@@ -26,6 +26,8 @@ import type { RangedGroup, WatchId } from "./range.ts";
 
 const MAX_TESTS = 40;
 const MAX_OPEN_PRS_TOUCHING = 10;
+// PRs read for the agent's answer to one request, besides search's; past it the request holds as sent.
+const MAX_ANSWER_PRS = 20;
 // Failing tests no request covers that the job summary names one by one; the rest are counted.
 const MAX_UNSELECTED_NOTES = 10;
 // How long a requested spec is left to its agent before it can be requested again.
@@ -39,6 +41,9 @@ const OWN_PR_MAX_AGE_MS = 2 * DAY;
 // How long a spec whose only agent PRs are past OWN_PR_MAX_AGE_MS is held after a request. Longer than
 // HOLD_MS: a right fix still in review leaves the spec failing too, and each request is an agent run.
 const STALE_PR_HOLD_MS = 3 * DAY;
+// How many times a request with no sign the agent ran it is sent again before its hold applies as usual. The
+// agent's no-op outcome leaves no GitHub trace either; it stops early on a recent memory, so one more is cheap.
+const MAX_RESENDS = 1;
 const REPORTS_PAGE = 100;
 const REPORTS_MAX_PAGES = 5;
 
@@ -233,9 +238,20 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   };
   const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
-  const maxBrokenPerRun = Number(env.MAX_BROKEN_PER_RUN || 10);
-  const maxFlakyPerDay = Number(env.MAX_FLAKY_PER_DAY || 6);
-  const causeHoldMs = Number(env.CAUSE_HOLD_HOURS || 4) * HOUR;
+  // A value that is not a number of 0 or more takes the default, and the summary says so: NaN would turn a limit or
+  // a wait off.
+  const amount = (name: string, fallback: number): number => {
+    const raw = env[name];
+    if (raw == null || String(raw).trim() === "") return fallback;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n;
+    notes.push(`${name} ${JSON.stringify(raw)} is not a number of 0 or more; using ${fallback}`);
+    return fallback;
+  };
+  const maxBrokenPerRun = amount("MAX_BROKEN_PER_RUN", 10);
+  const maxFlakyPerDay = amount("MAX_FLAKY_PER_DAY", 6);
+  const causeHoldMs = amount("CAUSE_HOLD_HOURS", 4) * HOUR;
+  const answerHours = amount("ANSWER_HOURS", 6);
   const currentAt = Date.parse(first.created_at ?? "") || now.getTime();
   const label = env.LABEL || DEFAULT_LABEL;
   const reportNameOf = new Map<string, string | null>(suites.map((s): [string, string | null] => [s.name, s.report_name || null]));
@@ -307,6 +323,49 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     ...[...open.prs.values()].map((p): [number, OpenPR] => [p.number, p]),
   ]);
   const daysSince = (at: number): number => Math.floor((now.getTime() - at) / DAY);
+  // The agent's PRs that change this exact spec: a sibling in its directory is not a reason to wait.
+  const agentPRsChanging = (spec: string): number[] =>
+    [...new Set([...prsChanging(open.files, spec).filter((n) => open.prs.get(n)?.labels.includes(label)), ...prsChanging(own.files, spec)])].sort((a, b) => a - b);
+  // A webhook can accept a request (HTTP 200) whose agent then never starts. The agent answers each request it runs
+  // on GitHub, linking the request's trunk run and naming its spec (a new PR, or a comment or review on an existing
+  // one), or opens a PR on its spec. A request old enough to have an answer and with neither stops holding its specs,
+  // MAX_RESENDS times. The answer is looked for where the agent writes it: the open PRs the request was sent with
+  // (kept on its ledger entry), the agent's PRs opened since, and what search finds citing the run. A missed answer
+  // costs one more agent run, which stops early on its own memory of the first.
+  const answers = answerCheck(api, id.repository);
+  const answeredOf = new Map<LedgerEntry, Promise<boolean>>();
+  let answersUnknown: string | null = null;
+  const unanswered = async (r: LedgerEntry): Promise<boolean> => {
+    const at = Date.parse(r.at);
+    const runId = /\/actions\/runs\/(\d+)/.exec(r.run ?? "")?.[1];
+    if ((r.resent ?? 0) >= MAX_RESENDS || now.getTime() - at < answerHours * HOUR || !runId) return false;
+    if ((r.specs ?? []).some((s) => agentPRsChanging(s).some((n) => (agentPR.get(n)?.openedAt ?? 0) >= at))) return false;
+    let answered = answeredOf.get(r);
+    if (!answered) {
+      const specs = r.specs ?? [];
+      // The open PRs it was sent with, and the agent's PRs opened since: no file list is read.
+      const sentWith = [...new Set([...(r.prs ?? []), ...[...agentPR.values()].filter((p) => p.labels.includes(label) && (p.openedAt ?? 0) >= at).map((p) => p.number)])];
+      if (sentWith.length > MAX_ANSWER_PRS) {
+        // Too many to read: as with an incomplete search, the request holds as sent.
+        notes.push(`${specs.join(", ")}: ${sentWith.length} PRs to read for an answer, more than ${MAX_ANSWER_PRS}; the request of ${utcMinute(r.at)} UTC (${r.run}) holds as sent`);
+        answered = Promise.resolve(true);
+      } else answered = answers(runId, specs, sentWith);
+      answeredOf.set(r, answered);
+    }
+    try {
+      return !(await answered);
+    } catch (e) {
+      // Unknown counts as answered: the request holds as sent, as it did before this check.
+      if (!answersUnknown) {
+        answersUnknown = String(e).slice(0, 160);
+        notes.push(`requests not checked for a sign the agent ran them (${answersUnknown}); they hold as sent`);
+      }
+      return false;
+    }
+  };
+  // Requests found unanswered, which hold nothing and use no flaky budget; per spec, the resend count its next request carries.
+  const unansweredEntries = new Set<LedgerEntry>();
+  const resentOf = new Map<string, number>();
   const staleNoted = new Set<number>();
   const candidates: (Group & { openPRs: OpenPR[] })[] = [];
   for (const g of groups.values()) {
@@ -314,8 +373,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
       const p = open.prs.get(n);
       return p ? [p] : [];
     });
-    // The agent's PRs that change this exact spec: a sibling in its directory is not a reason to wait.
-    const agentPRs = [...new Set([...prsChanging(open.files, g.spec).filter((n) => open.prs.get(n)?.labels.includes(label)), ...prsChanging(own.files, g.spec)])].sort((a, b) => a - b);
+    const agentPRs = agentPRsChanging(g.spec);
     const ownPRs: number[] = [];
     for (const n of agentPRs) {
       const p = agentPR.get(n);
@@ -339,7 +397,23 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
       if (p && !prs.some((x) => x.number === n)) prs.push(p);
     }
     const holdMs = agentPRs.length && !ownPRs.length ? STALE_PR_HOLD_MS : HOLD_MS;
-    const held = ledger.find((r) => r.specs?.includes(g.spec) && now.getTime() - Date.parse(r.at) < holdMs);
+    let held: LedgerEntry | undefined;
+    const dead: LedgerEntry[] = [];
+    for (const r of ledger.filter((e) => e.specs?.includes(g.spec) && now.getTime() - Date.parse(e.at) < holdMs)) {
+      // Checked only where the hold decides: an unread or blocking agent PR skips the spec anyway.
+      if (!ownUnknown && !ownPRs.length && (await unanswered(r))) dead.push(r);
+      else {
+        held = r;
+        break;
+      }
+    }
+    if (!held && dead.length) {
+      const last = dead[dead.length - 1];
+      const resent = Math.max(...dead.map((r) => r.resent ?? 0)) + 1;
+      resentOf.set(g.spec, resent);
+      for (const r of dead) unansweredEntries.add(r);
+      notes.push(`${g.spec}: nothing on GitHub answers the request of ${utcMinute(last.at)} UTC (${last.run}) after ${answerHours} hours; it may not have started, so it holds nothing (resend ${resent} of ${MAX_RESENDS})`);
+    }
     // Without the agent's own PRs a request may duplicate one it is already fixing: wait for the next run.
     if (ownUnknown) skip(g, "skipped: the agent's own PRs could not be read");
     else if (ownPRs.length) skip(g, `skipped: #${ownPRs.join(", #")} (${label}) already changes it`);
@@ -351,7 +425,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
   // chosen before any history is read: those not requested in the last week first (so the budget
   // rotates), then the most flaky.
   const asked = (g: Group): number => ledger.filter((e) => e.specs?.includes(g.spec)).length;
-  const flakyLeft = maxFlakyPerDay - ledger.filter((r) => r.kind === "flaky" && now.getTime() - Date.parse(r.at) < DAY).length;
+  const flakyLeft = maxFlakyPerDay - ledger.filter((r) => r.kind === "flaky" && now.getTime() - Date.parse(r.at) < DAY && !unansweredEntries.has(r)).length;
   const flaky = candidates.filter((g) => g.kind === "flaky").sort((a, b) => asked(a) - asked(b) || flakes(b) - flakes(a));
   const ranged: RangedGroup[] = [];
   for (const g of [...candidates.filter((c) => c.kind === "broken"), ...flaky.slice(0, Math.max(0, flakyLeft))]) {
@@ -380,7 +454,8 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     const sameCause =
       window &&
       ledger.find(
-        (e) => e.window && now.getTime() - Date.parse(e.at) < causeHoldMs && windowsOverlap(window, { from: e.window.from ?? -Infinity, to: e.window.to }),
+        // A request that never ran is no cause to wait for.
+        (e) => !unansweredEntries.has(e) && e.window && now.getTime() - Date.parse(e.at) < causeHoldMs && windowsOverlap(window, { from: e.window.from ?? -Infinity, to: e.window.to }),
       );
     if (sameCause) {
       decision.action = `skipped: may be the break requested ${utcMinute(sameCause.at)} UTC (overlapping suspect commits)`;
@@ -406,6 +481,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
       labels: [label, ...(env.EXTRA_LABELS ? env.EXTRA_LABELS.split(",").map((l) => l.trim()).filter(Boolean) : [])],
     };
     decision.action = "to request";
+    const resent = Math.max(0, ...r.specs.map((s) => resentOf.get(s) ?? 0));
     out.push({
       id: `fix-${out.length + 1}`,
       payload,
@@ -415,6 +491,9 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
         kind: r.kind,
         ...(r.window ? { window: { from: Number.isFinite(r.window.from) ? r.window.from : null, to: r.window.to } } : {}),
         run: runURL,
+        ...(resent ? { resent } : {}),
+        // Where the agent may answer it with a review search doesn't index (see unanswered).
+        ...(payload.open_prs_touching.length ? { prs: payload.open_prs_touching.map((p) => p.number) } : {}),
       },
     });
   }

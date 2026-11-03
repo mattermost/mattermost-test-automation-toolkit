@@ -86,7 +86,7 @@ export async function fetchSpecRuns(
     const outcomes: SpecRun[] = [];
     for (const [group_id, run] of byGroup) {
       // As the run reader does: a pass beside a fail at the same retry level of one report does not excuse the fail.
-      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count), (a) => a.report_name ?? null).status);
+      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0)), (a) => a.report_name ?? null).status);
       // A run where every test was skipped is no pass (see classifyNotRun).
       const status = run.notRun ? "not_run" : results.some((s) => FAILED_STATUSES.has(s)) ? "failed" : results.every((s) => s === "skipped") ? "skipped" : "passed";
       outcomes.push({ group_id, status });
@@ -214,7 +214,7 @@ export async function fetchHistory(
       runs.get(run)!.push(row);
     }
     for (const attempts of runs.values()) {
-      attempts.sort((a, b) => a.retry_count - b.retry_count);
+      attempts.sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0));
       const { status, last } = outcomeOf(attempts);
       // Every run in `runs` has at least one attempt, so the outcome always has a last one. A flaky run's last attempt is
       // its pass: it keeps the error of its last failed try, which is what the rules compare. A retry on the same worker
@@ -454,6 +454,10 @@ export interface OutOfDateResult {
  * directories, up to `until`). Any commit marks the failure with it; none leaves it
  * unmarked. A failure no check settled (the cap, an error, no merge base date) is
  * returned in `unchecked`: the caller must treat it as unchecked, not as unchanged.
+ * A failure whose spec is unchanged is still out of date where a base commit that changed
+ * another failing spec of this run also changed one of `supportPaths` (the code the specs
+ * run through): read from the same list, or by directory when it is cut off. A support
+ * directory that can't be checked marks nothing.
  */
 export async function markOutOfDate({
   findings,
@@ -462,6 +466,7 @@ export async function markOutOfDate({
   baseBranch,
   until = null,
   log = () => {},
+  supportPaths = [],
 }: {
   findings: Finding[];
   api: GhApi;
@@ -470,6 +475,8 @@ export async function markOutOfDate({
   /** The run's time: commits after it are not counted, so a replay reads what the run could have. */
   until?: string | null;
   log?: (message: string) => void;
+  /** Repository directories of the code the specs run through (see Config.supportPaths). */
+  supportPaths?: string[];
 }): Promise<OutOfDateResult> {
   if (!findings.length || !baseBranch) return { truncated: false };
   const cmp = (await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`)) as CompareResult | null;
@@ -496,10 +503,43 @@ export async function markOutOfDate({
     const diff = files.find((x) => x.filename === path)?.patch;
     f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit, ...(also.length ? { also } : {}), ...(diff ? { diff: diff.slice(0, 4000) } : {}) };
   }
-  if (!truncated) return { truncated: false };
-  // The list is cut off: a spec missing from it may still have changed. Its directory's commits since the merge base say.
   const base = cmp.merge_base_commit;
   const since = base?.commit?.committer?.date ?? base?.commit?.author?.date ?? null;
+  // The code the specs run through, where one base commit migrated both: a support directory the base branch changed
+  // since the merge base, in a commit that also changed a spec failing in this run (see markSupport). A support change
+  // alone (a new helper, a flag default, other specs' fixtures) says nothing about this run's failures.
+  const supportChange = async (specCommits: Set<string>): Promise<{ dir: string; commit: OutOfDate["commit"] } | null> => {
+    for (const dir of supportPaths) {
+      let rows: CommitRow[] = [];
+      if (!truncated) {
+        if (!files.some((x) => x.filename.startsWith(`${dir}/`))) continue;
+        const raw = await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(dir)}&per_page=30`).catch(() => []);
+        rows = (Array.isArray(raw) ? (raw as CommitRow[]) : []).filter((x) => onBase.has(x.sha));
+      } else if (since) {
+        const q = new URLSearchParams({ sha: baseBranch, path: dir, since, ...(until ? { until } : {}), per_page: "30" });
+        const raw = await (api("GET", `/repos/${id.repository}/commits?${q}`) as Promise<unknown>).catch((e: unknown) => (log(`${baseBranch} commits in ${dir} unavailable: ${String(e).slice(0, 160)}`), []));
+        rows = (Array.isArray(raw) ? (raw as CommitRow[]) : []).filter((x) => x.sha !== base?.sha);
+      }
+      const c = rows.find((x) => specCommits.has(x.sha));
+      if (c) return { dir, commit: commitRef(c) };
+    }
+    return null;
+  };
+  let support: { dir: string; commit: OutOfDate["commit"] } | null | undefined;
+  const markSupport = async (list: Finding[]): Promise<void> => {
+    const unmarked = list.filter((f) => !f.out_of_date);
+    if (!unmarked.length || !supportPaths.length) return;
+    // The base commits that changed this run's failing specs since the merge base.
+    const specCommits = new Set(findings.flatMap((f) => (f.out_of_date && !f.out_of_date.support ? [f.out_of_date.commit, ...(f.out_of_date.also ?? [])] : [])).map((c) => c?.sha).filter((x): x is string => Boolean(x)));
+    if (!specCommits.size) return;
+    if (support === undefined) support = await supportChange(specCommits);
+    if (support) for (const f of unmarked) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by ?? null, commit: support.commit, support: support.dir };
+  };
+  if (!truncated) {
+    await markSupport(findings);
+    return { truncated: false };
+  }
+  // The list is cut off: a spec missing from it may still have changed. Its directory's commits since the merge base say.
   if (!since) {
     log(`${baseBranch} changed ${files.length}+ files since this PR last merged it, and the merge base has no date; ${rest.length} failure(s) unchecked`);
     return { truncated: true, unchecked: rest };
@@ -532,6 +572,8 @@ export async function markOutOfDate({
     if (c === "unchecked") unchecked.push(f);
     else if (c) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: c };
   }
+  // A spec settled as unchanged may still run through support code the base branch changed.
+  await markSupport(findings.filter((f) => !unchecked.includes(f)));
   return { truncated: true, unchecked };
 }
 
