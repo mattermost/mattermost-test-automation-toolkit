@@ -179,22 +179,20 @@ anything flaky; `history-lane` makes it read a lane with the same tests, such as
 a break specific to that lane still goes to the model.
 
 **Failed on one platform only (common sense, with or without the model):** a
-regression or a test with too little history is cleared as flaky when the same
-commit shows the PR is not its cause. The same test passed on another platform of
-the same commit (iOS against Android, Linux against macOS and Windows) and failed
-on none, and **either**
+regression or a test with too little history is cleared as flaky when this PR's
+own code both passed and failed it on that platform. The same test passed on
+another platform of the same commit (iOS against Android, Linux against macOS and
+Windows) and failed on none, **and** it passed on this platform earlier on this
+PR, and the PR itself changed nothing related since (a file merged in from the
+base branch, or one whose own patch is the same as at that pass, is the base
+branch's change, allowed while trunk's latest run of the test passed).
 
-- it passed on this platform earlier on this PR, and the PR itself changed
-  nothing related since (a file merged in from the base branch, or one whose own
-  patch is the same as at that pass, is the base branch's change, allowed while
-  trunk's latest run of the test passed), **or**
-- it passes on trunk (a regression), and the PR changes nothing it uses: not the
-  spec, no file its error names.
-
-A PR that breaks shared code fails every platform, so the pass elsewhere is what
-rules the PR out. It never applies when the PR changes a file that reaches the
-failing platform only (`ios/`, `Podfile.lock`, `android/`, `*.gradle`, a path
-naming linux, windows or macos), to an environment error, or where no other
+A pass on the other platforms alone is not enough: shared code can branch on the
+platform, so a PR can break one platform without touching a file named for it. A
+one-platform failure of a test trunk always passes stays a regression for the
+model to judge. It never applies when the PR changed, since that pass, a file that
+reaches the failing platform only (`ios/`, `Podfile.lock`, `android/`, `*.gradle`,
+a path naming linux, windows or macos), to an environment error, or where no other
 platform ran the test (mattermost's lanes are workers of one platform).
 
 If the evidence is incomplete (changed files, test root, base branch, truncated

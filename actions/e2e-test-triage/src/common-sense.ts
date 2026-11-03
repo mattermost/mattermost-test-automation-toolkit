@@ -30,11 +30,12 @@ export const onlyOnPlatform = (platform: string, file: string): boolean => Boole
 
 /**
  * Why the same commit shows the PR is not a blocking borderline failure's cause, or null. It must have passed on another
- * platform of this commit and failed on none, with no change it rests on reaching the failing platform alone, and either
- * passed here earlier on this PR with nothing related the PR changed since (this_pr), or be stable on trunk (REGRESSION)
- * with the PR changing nothing it uses. A PR that breaks shared code fails every platform, so a pass on one rules it out.
+ * platform of this commit and failed on none, with no change it rests on reaching the failing platform alone, and have
+ * passed here earlier on this PR with nothing related the PR changed since (this_pr): the same code passed and failed on
+ * this platform, which is a flake. A pass on the other platforms alone is no such evidence: shared code can branch on the
+ * platform, so a PR can break one platform without touching a file named for it, and that failure goes to the judge.
  */
-export function commonSenseClear(f: Finding, pack: Pack | null | undefined, prFiles: string[]): string | null {
+export function commonSenseClear(f: Finding, pack: Pack | null | undefined): string | null {
   if (!pack || !f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete") return null;
   const platform = platformOf(f.report_name);
   const lanes = f.other_lanes ?? [];
@@ -47,7 +48,5 @@ export function commonSenseClear(f: Finding, pack: Pack | null | undefined, prFi
     const at = f.this_pr.last_pass?.commit_sha?.slice(0, 7);
     return `Failed only on ${platform}: it ${elsewhere}, and passed on ${platform} earlier on this PR${at ? ` (${at})` : ""} with nothing related this PR changed since.`;
   }
-  if (f.class === "REGRESSION" && f.untouched === true && !pack.diff_hunks_of_files_named_in_error.length && !pack.pr.spec_file_changed_by_pr && !prFiles.some((x) => onlyOnPlatform(platform, x)))
-    return `Failed only on ${platform}: it ${elsewhere}, passes on trunk (${f.trunk.passes} of ${f.trunk.runs} runs), and this PR changes nothing it uses.`;
   return null;
 }

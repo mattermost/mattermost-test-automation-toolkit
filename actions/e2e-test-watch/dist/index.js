@@ -2361,7 +2361,7 @@ var PLATFORM_FILES = {
   macos: /(^|[/_.-])(mac|macos|darwin|osx|dmg|mas)([/_.-]|$)|\.(entitlements|plist)$/i
 };
 var onlyOnPlatform = (platform, file) => Boolean(PLATFORM_FILES[platform]?.test(file));
-function commonSenseClear(f, pack, prFiles) {
+function commonSenseClear(f, pack) {
   if (!pack || !f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete") return null;
   const platform = platformOf(f.report_name);
   const lanes = f.other_lanes ?? [];
@@ -2373,8 +2373,6 @@ function commonSenseClear(f, pack, prFiles) {
     const at = f.this_pr.last_pass?.commit_sha?.slice(0, 7);
     return `Failed only on ${platform}: it ${elsewhere}, and passed on ${platform} earlier on this PR${at ? ` (${at})` : ""} with nothing related this PR changed since.`;
   }
-  if (f.class === "REGRESSION" && f.untouched === true && !pack.diff_hunks_of_files_named_in_error.length && !pack.pr.spec_file_changed_by_pr && !prFiles.some((x) => onlyOnPlatform(platform, x)))
-    return `Failed only on ${platform}: it ${elsewhere}, passes on trunk (${f.trunk.passes} of ${f.trunk.runs} runs), and this PR changes nothing it uses.`;
   return null;
 }
 
@@ -2706,7 +2704,7 @@ async function evaluateRun({
       const pr = { number: prNumber, repository: id.repository, title: prTitle, lane };
       const packs = result.findings.map((f) => f.class === "OWNED_BY_PR" || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete" ? null : buildPack(f, files, pr, others, changeContext));
       for (const [i, f] of result.findings.entries()) {
-        const why = commonSenseClear(f, packs[i], changed);
+        const why = commonSenseClear(f, packs[i]);
         if (why) Object.assign(f, { blocking: false, decision: "rules_unblock", reason: why });
       }
       if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);

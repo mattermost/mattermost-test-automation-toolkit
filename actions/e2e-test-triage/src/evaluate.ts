@@ -233,7 +233,7 @@ export async function evaluateRun({
       const packs = result.findings.map((f) => (f.class === "OWNED_BY_PR" || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete" ? null : buildPack(f, files, pr, others, changeContext)));
       // Common sense before the model, with or without it: a failure the same commit shows is not the PR's is cleared.
       for (const [i, f] of result.findings.entries()) {
-        const why = commonSenseClear(f, packs[i], changed);
+        const why = commonSenseClear(f, packs[i]);
         if (why) Object.assign(f, { blocking: false, decision: "rules_unblock", reason: why });
       }
       if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
