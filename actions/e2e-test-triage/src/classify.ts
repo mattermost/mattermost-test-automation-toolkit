@@ -227,9 +227,10 @@ export function classify(
       const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
       return `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`;
     }
-    // A bare timeout or an error with nothing to compare names no cause. One that failed every try here is cleared only
-    // where trunk failed the same kind of way (the same bare timeout, or no error either): trunk's flakes of another
-    // error say nothing about it. Unknown tries are left as before.
+    // A bare timeout or an error with nothing to compare names no cause. Only one that failed every try here is held to
+    // trunk, and then it clears only where trunk failed the same kind (failureKey's kind: a bare timeout, or no usable
+    // error, whatever its text): trunk's flakes of a distinctive error say nothing about it. A test that passed a try
+    // here, or whose tries are unknown, clears on trunk's flake of any error.
     if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran &&
       !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
       const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
@@ -462,18 +463,20 @@ export function sameFailure(findings: Finding[]): Finding[] {
  * A failure that failed every try here and on another platform of this commit is not flakiness: a flake rarely does
  * that, a change to shared code does. Neither the model nor sameFailure may clear it. A rules clear is undone too, even
  * one that trunk's flakes with the same error support: a flake of one platform's error on trunk says nothing about the
- * same test failing on two platforms of this commit. A break on trunk, an environment error, and a failure this change
- * owns or that is out of date keep their own calls.
+ * same test failing on two platforms of this commit. A held flaky clear becomes REGRESSION; a blocking REGRESSION or
+ * INSUFFICIENT_DATA keeps its class. A break on trunk, an environment error and a failure this change owns are not in
+ * the set checked here, so they keep their calls. Out-of-date is not checked here: markOutOfDate runs after this, so an
+ * out-of-date failure is held too and then gets its out-of-date mark as usual.
  */
 export function holdFailedEverywhere(findings: Finding[]): Finding[] {
   const flaky = new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
   for (const f of findings) {
-    if (!(BORDERLINE.has(f.class) || flaky.has(f.class)) || f.identity_unresolved || f.out_of_date || !f.tries || f.tries.ran < 2 || f.tries.failed !== f.tries.ran) continue;
+    if (!(BORDERLINE.has(f.class) || flaky.has(f.class)) || f.identity_unresolved || !f.tries || f.tries.ran < 2 || f.tries.failed !== f.tries.ran) continue;
     const on = [...new Set((f.other_lanes ?? []).filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform))];
     if (!on.length) continue;
     const why = `Failed all ${f.tries.ran} tries here and failed on ${on.join(" and ")} on this same commit; a flake rarely does that.`;
     Object.assign(f, {
-      ...(f.blocking ? {} : { class: "REGRESSION" }),
+      ...(flaky.has(f.class) || !f.blocking ? { class: "REGRESSION" } : {}),
       blocking: true,
       failed_everywhere: on,
       reason: `${why} ${flaky.has(f.class) ? `Its clear does not stand: ${f.reason}` : f.reason}`,

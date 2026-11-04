@@ -1634,12 +1634,12 @@ function sameFailure(findings) {
 function holdFailedEverywhere(findings) {
   const flaky = /* @__PURE__ */ new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
   for (const f of findings) {
-    if (!(BORDERLINE.has(f.class) || flaky.has(f.class)) || f.identity_unresolved || f.out_of_date || !f.tries || f.tries.ran < 2 || f.tries.failed !== f.tries.ran) continue;
+    if (!(BORDERLINE.has(f.class) || flaky.has(f.class)) || f.identity_unresolved || !f.tries || f.tries.ran < 2 || f.tries.failed !== f.tries.ran) continue;
     const on = [...new Set((f.other_lanes ?? []).filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform))];
     if (!on.length) continue;
     const why = `Failed all ${f.tries.ran} tries here and failed on ${on.join(" and ")} on this same commit; a flake rarely does that.`;
     Object.assign(f, {
-      ...f.blocking ? {} : { class: "REGRESSION" },
+      ...flaky.has(f.class) || !f.blocking ? { class: "REGRESSION" } : {},
       blocking: true,
       failed_everywhere: on,
       reason: `${why} ${flaky.has(f.class) ? `Its clear does not stand: ${f.reason}` : f.reason}`

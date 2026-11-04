@@ -100,16 +100,19 @@ retry when its case ordinals put the pass after the fail; a pass that ran first,
 or with no ordinal, leaves it failed. On mobile main, 201 of the 244 tests that failed from 15 to 28 October
 failed only in 3 such runs, and each of those counted as that test's flakiness.
 
-**Failed everywhere is not cleared by a guess:** a test that failed every try here
-(at least two) and failed on another platform of the same commit (iOS and Android,
-Linux and Windows, or the enterprise and FIPS lanes) is never cleared by the model
-or a same-failure match; the model may still name the PR. A flake rarely does
-that, and a change to shared code does. A clear by the rules is undone too, even
-one that master's flakes of the same error would support: those flakes say
-nothing about the same test failing on two platforms of this commit. Such a
-failure is held as `REGRESSION` and needs investigation. A break on master, an
-environment error, and a spec the PR edits keep their own calls. Either condition
-alone changes nothing.
+**Failed everywhere is not cleared by a guess:** on a PR run, a test that failed
+every try here (at least two) and failed on another platform of the same commit
+(iOS and Android, Linux and Windows, or the enterprise and FIPS lanes) is never
+cleared by the model or a same-failure match; the model may still name the PR. A
+flake rarely does that, and a change to shared code does. A clear by the rules is
+undone too, even one that master's flakes of the same error would support: those
+flakes say nothing about the same test failing on two platforms of this commit.
+Such a failure is held: a flaky clear becomes `REGRESSION` and needs
+investigation, and a blocking `REGRESSION` or `INSUFFICIENT_DATA` keeps its class.
+A break on master, an environment error, and a spec the PR edits keep their own
+calls. Either condition alone changes nothing. On a release branch the hold is
+not final: the model may still unblock a test bug or a server compat problem (see
+the release section below).
 
 **Fixed on master:** master failed the test the same way in at least 3 runs in a
 row and has passed since. That is a break master fixed, not a flake: a branch
@@ -499,11 +502,18 @@ Without a PR number, the run is a trunk run. A failure that was already there in
 the previous run is a streak and stays blocking; only intermittency clears. The
 model is not asked.
 
-A flake clears only where the previous runs failed it the same way, as on a PR
-(the same error, a timeout's stuck step, or for a bare timeout or no error, the
-same kind). A failure with another error is `REGRESSION`, blocking. There is no
-rate threshold here: a real break that matches an old flake fails again in the
-next run and is then a streak.
+A flake clears only where the previous runs failed it the same way, as on a PR:
+the same error, or a timeout's stuck step. A bare timeout or an error with nothing
+to compare is held to that only when it failed every try here (at least two, all
+failed). Then it clears only where trunk failed the same kind: a bare timeout, or
+no usable error, whatever its text. A test that passed a try here clears on
+trunk's flake of any error. A failure with another error is `REGRESSION`,
+blocking. There is no rate threshold here: a real break that matches an old flake
+fails again in the next run and is then a streak.
+
+A failure that failed every try here and on another platform of the same commit
+is held there too, as on a PR: it is `REGRESSION`, blocking (see "Failed
+everywhere" above).
 
 ## Tests
 

@@ -255,7 +255,7 @@ test("on trunk, a flake clears only where trunk failed the same way", () => {
   const error = 'Error: expect(locator).toHaveText(expected) failed: expected "Channel header" but received "Set a header"';
   const ref: TestRef = { ...failing, error };
   // A PR's flake needs trunk's failure with the same error: trunk's flakes of another error say nothing about this one.
-  const other = obs({ status: "flaky", commit_sha: "o1", error_excerpt: "Error: apiCreateChannel failed: No response from server" });
+  const other = obs({ status: "flaky", commit_sha: "o1", error_excerpt: "Error: apiCreateChannel failed: channel name already taken" });
   const newWay = classify(ref, [...trunkPasses(8), other], [], undefined, null, null, trunkRun);
   assert.deepEqual([newWay.class, newWay.blocking], ["REGRESSION", true]);
   assert.match(newWay.reason, /never with this error; there it failed with "Error: apiCreateChannel failed/);
@@ -268,6 +268,9 @@ test("on trunk, a flake clears only where trunk failed the same way", () => {
   const hard = classify({ ...failing, error: bare, tries: { ran: 2, failed: 2 } }, [...trunkPasses(8), same], [], undefined, null, null, trunkRun);
   assert.deepEqual([hard.class, hard.blocking], ["REGRESSION", true]);
   assert.match(hard.reason, /failed every try here/);
+  // A bare timeout that passed a try here is not held to trunk's error: trunk's flake of another error clears it.
+  const oneTry = classify({ ...failing, error: bare, tries: { ran: 2, failed: 1 } }, [...trunkPasses(8), other], [], undefined, null, null, trunkRun);
+  assert.equal(oneTry.class, "FLAKY_ON_TRUNK", "one try passed here: trunk's flake of any error clears it");
 });
 test("on trunk, a pass on retry does not end a streak; a test that keeps failing and passing is a flake", () => {
   // mattermost release-12.1 run 40292449090: passed every run to 10-21 14:43, then failed every try in each run but one,
@@ -4630,6 +4633,8 @@ test("a failure that failed every try here and on another platform is held even 
     other_lanes: [{ platform: "android", result }],
   }])[0];
   for (const error of [toggle, stuck]) {
+    const before = classify({ ...failing, error, tries: { ran: 2, failed: 2 } }, [...trunkPasses(8), obs({ status: "failed", commit_sha: "f1", error_excerpt: error })], []);
+    assert.equal(before.class, "FLAKY_ON_TRUNK", `trunk's flake clears it before the hold: ${JSON.stringify(error)}`);
     const f = onAndroid(error);
     assert.deepEqual([f.class, f.blocking, f.failed_everywhere], ["REGRESSION", true, ["android"]], JSON.stringify(error));
     assert.match(f.reason, /^Failed all 2 tries here and failed on android on this same commit; a flake rarely does that\./, JSON.stringify(error));
@@ -4638,6 +4643,29 @@ test("a failure that failed every try here and on another platform is held even 
   assert.equal(onAndroid(toggle, { ran: 2, failed: 1 }).class, "FLAKY_ON_TRUNK", "one try passed here");
   assert.equal(onAndroid(toggle, { ran: 1, failed: 1 }).class, "FLAKY_ON_TRUNK", "one try only");
   assert.equal(onAndroid(toggle, { ran: 2, failed: 2 }, "passed").class, "FLAKY_ON_TRUNK", "passed on the other platform, as before");
+});
+
+test("a blocking flake held as failing everywhere is REGRESSION; a blocking REGRESSION or INSUFFICIENT_DATA keeps its class", () => {
+  // A blind run leaves a flake blocking without changing its class: the hold must still make it a REGRESSION.
+  const lanes = [{ platform: "android", result: "failed" }];
+  const flaky = holdFailedEverywhere([finding({ class: "FLAKY_ON_TRUNK", blocking: true, tries: { ran: 2, failed: 2 }, other_lanes: lanes })])[0];
+  assert.deepEqual([flaky.class, flaky.blocking, flaky.failed_everywhere], ["REGRESSION", true, ["android"]]);
+  const borderline = holdFailedEverywhere([finding({ class: "INSUFFICIENT_DATA", blocking: true, tries: { ran: 2, failed: 2 }, other_lanes: lanes })])[0];
+  assert.deepEqual([borderline.class, borderline.blocking], ["INSUFFICIENT_DATA", true], "a blocking call keeps its class");
+});
+
+test("a trunk flake that failed every try here and on another platform of the commit is held too", async () => {
+  // Sibling platforms are read on trunk as on a PR, so the hold applies with no PR number.
+  const error = "Error: expected visible";
+  const run = runOf([{ title: "t1", file: "specs/a.spec.ts", error }]);
+  run.failing[0].tries = { ran: 2, failed: 2 };
+  const history = new Map([[identityKey(run.failing[0]), [...trunkPasses(8), obs({ status: "failed", commit_sha: "f1", error_excerpt: error })]]]);
+  const on = (result: string): Partial<EvaluateParams> => ({ prNumber: null, history, otherPlatforms: async (fs) => { for (const f of fs) f.other_lanes = [{ platform: "macos", result }]; } });
+  const passed = (await evaluate(run, on("passed"))).findings[0];
+  assert.deepEqual([passed.class, passed.blocking], ["FLAKY_ON_TRUNK", false], "trunk's flake clears it when the other platform passed");
+  const [held] = (await evaluate(run, on("failed"))).findings;
+  assert.deepEqual([held.class, held.blocking, held.failed_everywhere], ["REGRESSION", true, ["macos"]]);
+  assert.match(held.reason, /^Failed all 2 tries here and failed on macos on this same commit; a flake rarely does that\./);
 });
 
 test("a Mattermost id joined to a selector does not make master's failure another one", () => {
