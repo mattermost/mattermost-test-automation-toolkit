@@ -250,28 +250,6 @@ test("on trunk, an intermittent failure whose last run passed is a flake and cle
   assert.equal(f.class, "FLAKY_ON_TRUNK");
   assert.equal(f.blocking, false);
 });
-test("on trunk, a flake clears only where trunk failed the same way", () => {
-  const trunkRun = { isTrunkRun: true };
-  const error = 'Error: expect(locator).toHaveText(expected) failed: expected "Channel header" but received "Set a header"';
-  const ref: TestRef = { ...failing, error };
-  // A PR's flake needs trunk's failure with the same error: trunk's flakes of another error say nothing about this one.
-  const other = obs({ status: "flaky", commit_sha: "o1", error_excerpt: "Error: apiCreateChannel failed: channel name already taken" });
-  const newWay = classify(ref, [...trunkPasses(8), other], [], undefined, null, null, trunkRun);
-  assert.deepEqual([newWay.class, newWay.blocking], ["REGRESSION", true]);
-  assert.match(newWay.reason, /never with this error; there it failed with "Error: apiCreateChannel failed/);
-  const same = obs({ status: "failed", commit_sha: "s1", error_excerpt: error });
-  assert.equal(classify(ref, [...trunkPasses(8), same], [], undefined, null, null, trunkRun).class, "FLAKY_ON_TRUNK");
-  // No rate floor on trunk: one same failure in 50 runs still clears (a real break is a streak on the next run).
-  assert.equal(classify(ref, [...trunkPasses(49), same], [], undefined, null, null, trunkRun).class, "FLAKY_ON_TRUNK");
-  // A bare timeout that failed every try here needs trunk to have failed that way, as on a PR.
-  const bare = "Error: Test timeout of 60000ms exceeded.";
-  const hard = classify({ ...failing, error: bare, tries: { ran: 2, failed: 2 } }, [...trunkPasses(8), same], [], undefined, null, null, trunkRun);
-  assert.deepEqual([hard.class, hard.blocking], ["REGRESSION", true]);
-  assert.match(hard.reason, /failed every try here/);
-  // A bare timeout that passed a try here is not held to trunk's error: trunk's flake of another error clears it.
-  const oneTry = classify({ ...failing, error: bare, tries: { ran: 2, failed: 1 } }, [...trunkPasses(8), other], [], undefined, null, null, trunkRun);
-  assert.equal(oneTry.class, "FLAKY_ON_TRUNK", "one try passed here: trunk's flake of any error clears it");
-});
 test("on trunk, a pass on retry does not end a streak; a test that keeps failing and passing is a flake", () => {
   // mattermost release-12.1 run 40292449090: passed every run to 10-21 14:43, then failed every try in each run but one,
   // which passed on its retest (flaky). Every try failed here too.

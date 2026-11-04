@@ -217,27 +217,6 @@ export function classify(
       `The available suite/report identity does not uniquely identify "${test.title}" in ${test.file}; history cannot clear it.`,
       true,
     );
-  // Trunk's instability clears this failure only where trunk failed it the same way. Returns the reason it stays blocking,
-  // or null when it may clear. Both the PR path and trunk runs use it.
-  const unexplainedByTrunk = (): string | null => {
-    const unstable = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
-    // A failure with an error to compare is cleared only where trunk failed the same way: a trunk failure with another
-    // error, or with none to compare (a hook timeout, an empty excerpt), says nothing about this one.
-    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !unstable.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
-      const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
-      return `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`;
-    }
-    // A bare timeout or an error with nothing to compare names no cause. Only one that failed every try here is held to
-    // trunk, and then it clears only where trunk failed the same kind (failureKey's kind: a bare timeout, or no usable
-    // error, whatever its text): trunk's flakes of a distinctive error say nothing about it. A test that passed a try
-    // here, or whose tries are unknown, clears on trunk's flake of any error.
-    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran &&
-      !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
-      const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
-      return `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`;
-    }
-    return null;
-  };
   // On trunk, a failure already there last time is a streak and stays red.
   if (isTrunkRun) {
     if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status))
@@ -248,13 +227,8 @@ export function classify(
     while (rough < trunk.length && (FAILED_STATUSES.has(trunk[rough].status) || trunk[rough].status === "flaky")) rough++;
     if (rough >= 2 && trunk.slice(0, rough).some((o) => FAILED_STATUSES.has(o.status)))
       return out("BROKEN_ON_TRUNK", `Still failing: failed or passed only on retry in each of the previous ${rough} ${lane ?? "trunk"} runs. A pass on retry is not a fix.`, true);
-    if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0) {
-      // Only the same failure clears, as on a PR. No rate floor here: a rare flake would page every trunk run it hit,
-      // while a real break that matches an old flake fails again next run and is a streak (BROKEN_ON_TRUNK) then.
-      const why = unexplainedByTrunk();
-      if (why) return out("REGRESSION", why, true);
+    if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0)
       return out("FLAKY_ON_TRUNK", `Intermittent on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the previous ${trunk.length} runs, and the last one passed${latestTrunk?.status === "flaky" ? " on retry" : ""}.`, false);
-    }
     if (trunk.length < cfg.minTrunkRuns)
       return out("INSUFFICIENT_DATA", `Only ${trunk.length} earlier trunk runs (need ${cfg.minTrunkRuns}); cannot tell a flake from a new break.`, true);
     return out("REGRESSION", `New on trunk: passed in all ${trunk.length} previous runs.`, true);
@@ -290,8 +264,21 @@ export function classify(
     });
   const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
   if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0 && laplace >= cfg.pMin && latestTrunk?.status !== "failed") {
-    const why = unexplainedByTrunk();
-    if (why) return out("REGRESSION", why, true);
+    const unstable = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
+    // A failure with an error to compare is cleared only where trunk failed the same way: a trunk failure with another
+    // error, or with none to compare (a hook timeout, an empty excerpt), says nothing about this one.
+    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !unstable.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
+      const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
+      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
+    }
+    // A bare timeout or an error with nothing to compare names no cause. One that failed every try here is cleared only
+    // where trunk failed the same kind of way (the same bare timeout, or no error either): trunk's flakes of another
+    // error say nothing about it. Unknown tries are left as before.
+    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran &&
+      !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
+      const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
+      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`, true);
+    }
     return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the last ${trunk.length} trunk runs.`, false);
   }
   // Require real trunk passes: trunkFails === 0 is also true with no trunk runs.

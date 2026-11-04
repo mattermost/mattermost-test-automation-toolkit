@@ -502,15 +502,6 @@ Without a PR number, the run is a trunk run. A failure that was already there in
 the previous run is a streak and stays blocking; only intermittency clears. The
 model is not asked.
 
-A flake clears only where the previous runs failed it the same way, as on a PR:
-the same error, or a timeout's stuck step. A bare timeout or an error with nothing
-to compare is held to that only when it failed every try here (at least two, all
-failed). Then it clears only where trunk failed the same kind: a bare timeout, or
-no usable error, whatever its text. A test that passed a try here clears on
-trunk's flake of any error. A failure with another error is `REGRESSION`,
-blocking. There is no rate threshold here: a real break that matches an old flake
-fails again in the next run and is then a streak.
-
 A failure that failed every try here and on another platform of the same commit
 is held there too, as on a PR: it is `REGRESSION`, blocking (see "Failed
 everywhere" above).
