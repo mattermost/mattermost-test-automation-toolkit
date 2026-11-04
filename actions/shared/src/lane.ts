@@ -51,8 +51,9 @@ export function redReason(description: string | null | undefined = ""): string {
   if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
-  if (fixed) parts.push(`${fixed} fixed on main`);
-  if (outdated) parts.push(`${outdated} out of date`);
+  // A PR's failures the base branch explains, named by what to do; a status written before says "fixed on main" or
+  // "out of date". A release run's check keeps those labels, and it is not summarised here.
+  if (fixed || outdated || /pull main changes/.test(d)) parts.push("pull main changes");
   if (check) parts.push(`${check} to check`);
   // Triage asked for the re-run itself, held it for a fix, or a person has to.
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];

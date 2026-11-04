@@ -2693,7 +2693,7 @@ test("an out-of-date failure is its own group: merge and re-run, never the PR's 
   assert.match(text, /\| master changed this test \(#39127, 2026-10-13\) after this PR last merged master, so the PR ran its old copy\. \| Merge master and re-run\. \|/);
   assert.match(text, /\*\*Merge master and re-run first\. 1 failure: 1 out of date\.\*\*/);
   assert.doesNotMatch(text, /may be caused by this PR|Your PR/);
-  assert.match(statusDescription("FAILURE", [stale], null, { passed: 9, failed: 1 }), /^\(1 out of date\)/, "the check names it as out of date");
+  assert.match(statusDescription("FAILURE", [stale], null, { passed: 9, failed: 1 }), /^\(pull main changes\) /, "the check says what to do about it");
 });
 
 test("out-of-date failures are counted apart from the PR's own, and lead the headline once they are half the failures", () => {
@@ -3761,7 +3761,7 @@ test("branch state, end to end: the check is red as out of date, the summary say
     const result = await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "AK", TRIAGE_CONTEXT: "off", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl, log: () => {} });
     assert.equal(result.findings[0].class, "BRANCH_STATE");
     assert.equal(fetchImpl.calls.filter((c) => c.url.includes("api.anthropic.com")).length, 0, "held before the judge, so the model is not asked");
-    assert.deepEqual(statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => [s.state, s.description]), [["failure", "(1 out of date) 0% passed (0 passed, 1 failed, 0 skipped)"]]);
+    assert.deepEqual(statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => [s.state, s.description]), [["failure", "(pull main changes) 0% passed (0 passed, 1 failed, 0 skipped)"]]);
     const text = readFileSync(summaryPath, "utf8");
     assert.match(text, /^## E2E triage · playwright-full: 🔴 merge master and re-run: 1 out of date$/m);
     assert.match(text, /^### Out of date \(1\): this PR fails the same way on its last commits and never on master$/m);
@@ -3908,7 +3908,7 @@ test("the status text names each finding by its label, in the owner's order, and
     blocked({ class: "REGRESSION", out_of_date: { base: "master", behind: 3, commit: null } }),
     blocked({ class: "REGRESSION" }),
   ];
-  assert.equal(statusDescription("FAILURE", mixed, null, { passed: 10, failed: 6, skipped: 0 }), "(1 flaky, 2 broken on main, 1 caused by PR, 1 out of date, 1 needs investigation) 62.5% passed (10 passed, 6 failed, 0 skipped)");
+  assert.equal(statusDescription("FAILURE", mixed, null, { passed: 10, failed: 6, skipped: 0 }), "(1 flaky, 2 broken on main, 1 caused by PR, pull main changes, 1 needs investigation) 62.5% passed (10 passed, 6 failed, 0 skipped)");
   assert.equal(statusDescription("SUCCESS", [cleared({ class: "FLAKY_ON_TRUNK" }), cleared({ class: "FLAKY_ON_TRUNK" })], null, { passed: 1186, failed: 2, skipped: 164 }), "(2 flaky) 99.8% passed (1186 passed, 2 failed, 164 skipped)");
   assert.equal(statusDescription("SUCCESS", [], null, { passed: 9, failed: 0 }), "100% passed (9 passed, 0 failed, 0 skipped)", "no labels, no brackets");
   assert.equal(statusDescription("SUCCESS", [cleared({ class: "SAME_FAILURE_AS_CLEARED", same_as_class: "BROKEN_ON_TRUNK" })], null, { passed: 9, failed: 1 }), "(1 broken on main) 90.0% passed (9 passed, 1 failed, 0 skipped)", "takes its anchor's label");
@@ -4436,6 +4436,14 @@ test("common sense clears only a flake on this PR, never what the PR could have 
   const since = (pr_changed: string[]): Partial<Finding> => ({ since_last_pass: fixture<SinceLastPass>({ files: pr_changed, related: [], complete: true, pr_changed }) });
   assert.equal(clears(passedHereBefore(since(["src/main/linux/tray.ts"]))), null, "a linux-only change since the pass, for a linux failure");
   assert.ok(clears(passedHereBefore(since(["ios/Podfile.lock"]))), "an iOS-only change since the pass cannot break linux");
+  assert.ok(clears(passedHereBefore(since(["ios/Podfile.lock", "scripts/win32/installer.nsh"]))), "nor can changes only other platforms build");
+  // Shared code can branch on the platform: a change the error does not name can still break linux alone, so the judge reads it.
+  assert.equal(clears(passedHereBefore(since(["src/main/views/webContentEvents.ts"]))), null, "a shared change since the pass, named by no error");
+  assert.equal(clears(passedHereBefore(since(["ios/Podfile.lock", "src/common/config.ts"]))), null, "one shared change among platform-only ones");
+  // The PR's own changes unknown: every change since the pass counts, the base branch's too.
+  const unknownOwn = { since_last_pass: fixture<SinceLastPass>({ files: ["src/main/menus/app.ts"], related: [], complete: true }) };
+  assert.equal(clears(passedHereBefore(unknownOwn)), null, "which changes are the PR's is unknown, and one is shared");
+  assert.ok(clears(passedHereBefore({ since_last_pass: fixture<SinceLastPass>({ files: [], related: [], complete: true }) })), "a re-run of the commit that passed");
   assert.equal(clears(passedHereBefore({ report_name: "worker-3" })), null, "a report that names no platform");
   for (const over of [{ blocking: false }, { identity_unresolved: true }, { out_of_date: { base: "master", behind: 1, commit: null } }, { decision: "evidence_incomplete" }] as Partial<Finding>[])
     assert.equal(clears(passedHereBefore(over)), null, JSON.stringify(over));
@@ -4569,7 +4577,7 @@ test("end to end: the trunk-fixed failure on a stale branch reads fixed on main,
   const history = new Map([[identityKey(run.failing[0]), fixedOnTrunkHistory()]]);
   const result = await evaluate(run, { history, ask: null, fixedOnTrunk: (fs) => markFixedOnTrunk({ findings: fs, api: fixCompare(["f4", "p1"]), id: { repository: "o/r", commit_sha: "abc" }, baseBranch: "master" }) });
   assert.deepEqual(result.findings.map((f) => [f.class, f.blocking, statusLabelOf(f)]), [["FIXED_ON_TRUNK", true, "fixed on main"]]);
-  assert.match(statusDescription(result.verdict, result.findings, result.infra, result.counts), /^\(1 fixed on main\)/);
+  assert.match(statusDescription(result.verdict, result.findings, result.infra, result.counts), /^\(pull main changes\) /);
   const text = summary({ findings: result.findings, counts: { passed: 9, failed: 1 }, runURL: "u", trunkBranch: "master" });
   assert.match(text, /^## E2E triage: 🔴 merge master and re-run: 1 fixed on master$/m);
   assert.match(text, /^### Fixed on master \(1\): master fixed these failures after this PR last merged master$/m);
@@ -5026,4 +5034,16 @@ test("a release run whose only failure is a spec Jest never reached still knows 
   const result = await triage({ env: releaseEnv("release-6.3"), fetchImpl: fakeFetch(routes), log: () => {} });
   assert.ok(asked.includes("repo"), "the default branch is read before the placeholder-only exit");
   assert.deepEqual(result.findings.map((f) => [f.class, f.blocking]), [["NOT_RUN", true]]);
+});
+
+test("a PR check names failures main explains by what to do, once: pull main changes, not a count of out of date", () => {
+  const fixed = finding({ title: "fixed", class: "FIXED_ON_TRUNK", blocking: true, out_of_date: { base: "master", behind: 2, commit: null, fixed: true } });
+  const stale = finding({ title: "stale", class: "REGRESSION", blocking: true, out_of_date: { base: "master", behind: 2, commit: null } });
+  const mine = finding({ title: "mine", class: "OWNED_BY_PR", blocking: true });
+  assert.equal(statusDescription("FAILURE", [fixed, stale], null, { passed: 8, failed: 2 }), "(pull main changes) 80.0% passed (8 passed, 2 failed, 0 skipped)");
+  assert.equal(statusDescription("FAILURE", [mine, stale], null, { passed: 8, failed: 2 }), "(1 caused by PR, pull main changes) 80.0% passed (8 passed, 2 failed, 0 skipped)");
+  // A release run is not fixed by pulling main: it keeps its labels.
+  assert.equal(statusDescription("FAILURE", [{ ...fixed, release: true }, { ...stale, release: true }], null, { passed: 8, failed: 2 }), "(1 fixed on main, 1 out of date) 80.0% passed (8 passed, 2 failed, 0 skipped)");
+  // The per-test label, which the findings file and the desktop alert read, is unchanged.
+  assert.deepEqual([statusLabelOf(fixed), statusLabelOf(stale)], ["fixed on main", "out of date"]);
 });

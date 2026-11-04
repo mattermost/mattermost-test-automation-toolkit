@@ -61,8 +61,7 @@ function redReason(description = "") {
   if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
-  if (fixed) parts.push(`${fixed} fixed on main`);
-  if (outdated) parts.push(`${outdated} out of date`);
+  if (fixed || outdated || /pull main changes/.test(d)) parts.push("pull main changes");
   if (check) parts.push(`${check} to check`);
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";

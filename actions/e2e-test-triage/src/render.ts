@@ -499,17 +499,30 @@ export const RERUN = "re-run the failed jobs";
 export const RERUNNING = "re-running the failed jobs";
 
 /**
+ * What the check says for a PR's failures the base branch's changes explain (fixed on main, or out of date): the one thing
+ * to do about them, without a count. The pass line already counts the failures.
+ */
+export const PULL_MAIN = "pull main changes";
+
+/**
  * The status labels for a run, each with its count, in the fixed order and only where non-zero ("2 flaky, 2 caused by PR").
- * A run with failures and no findings (every failure is a shard placeholder) is red for a re-run, and says so.
+ * A PR's fixed-on-main and out-of-date failures are named once, by what to do: PULL_MAIN, where "fixed on main" would be.
+ * A release run keeps their labels: its fix is a backport, not a merge of main. A run with failures and no findings
+ * (every failure is a shard placeholder) is red for a re-run, and says so.
  */
 export function statusLabels(findings: Finding[], failed = findings.length): string[] {
   if (!findings.length) return failed ? [RERUN] : [];
   const counts = new Map<StatusLabel, number>();
+  let pull = false;
   for (const f of findings) {
     const label = statusLabelOf(f);
-    counts.set(label, (counts.get(label) ?? 0) + 1);
+    if (!f.release && (label === "fixed on main" || label === "out of date")) pull = true;
+    else counts.set(label, (counts.get(label) ?? 0) + 1);
   }
-  return STATUS_LABELS.filter((l) => counts.has(l)).map((l) => `${counts.get(l)} ${l}`);
+  return STATUS_LABELS.flatMap((l) => [
+    ...(pull && l === "fixed on main" ? [PULL_MAIN] : []),
+    ...(counts.has(l) ? [`${counts.get(l)} ${l}`] : []),
+  ]);
 }
 
 const STATUS_MAX = 140;

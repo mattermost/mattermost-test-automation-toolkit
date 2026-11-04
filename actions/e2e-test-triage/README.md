@@ -189,17 +189,22 @@ regression or a test with too little history is cleared as flaky when this PR's
 own code both passed and failed it on that platform. The same test passed on
 another platform of the same commit (iOS against Android, Linux against macOS and
 Windows) and failed on none, **and** it passed on this platform earlier on this
-PR, and the PR itself changed nothing related since (a file merged in from the
-base branch, or one whose own patch is the same as at that pass, is the base
-branch's change, allowed while trunk's latest run of the test passed).
+PR, and since that pass the PR itself changed nothing related and nothing the
+failing platform builds: no file at all, or only files other platforms build
+(`ios/` for a Linux failure). A file merged in from the base branch, or one whose
+own patch is the same as at that pass, is the base branch's change, allowed while
+trunk's latest run of the test passed; where the PR's own changes cannot be told
+from the base branch's, every change since the pass counts.
 
 A pass on the other platforms alone is not enough: shared code can branch on the
 platform, so a PR can break one platform without touching a file named for it. A
 one-platform failure of a test trunk always passes stays a regression for the
-model to judge. It never applies when the PR changed, since that pass, a file that
-reaches the failing platform only (`ios/`, `Podfile.lock`, `android/`, `*.gradle`,
-a path naming linux, windows or macos), to an environment error, or where no other
-platform ran the test (mattermost's lanes are workers of one platform).
+model to judge, and so does one where the PR changed a shared file since the pass,
+even one the error does not name: the model reads those changes. It never applies
+when the PR changed, since that pass, a file that reaches the failing platform
+only (`ios/`, `Podfile.lock`, `android/`, `*.gradle`, a path naming linux, windows
+or macos), to an environment error, or where no other platform ran the test
+(mattermost's lanes are workers of one platform).
 
 If the evidence is incomplete (changed files, test root, base branch, truncated
 history, report scope, or a test whose identity is ambiguous), nothing is
@@ -274,7 +279,11 @@ model fails or is unavailable, the rules' outcome stands.
   passed, 4 failed, 164 skipped)`. The labels, each only when non-zero and in this
   order: flaky, broken on main, test bug, server compat, caused by PR, app bug,
   fixed on main, out of date, needs investigation (test bug, server compat and
-  app bug only on a release branch). The
+  app bug only on a release branch). On a PR, fixed on main and out of date are
+  named once, by what to do, with no count: `(1 caused by PR, pull main changes)`.
+  A release branch keeps them as labels: its fix is a backport, not a merge. The
+  PR-wide triage check reads the same way (`playwright-full/enterprise: pull main
+  changes`). The
   rate is passed ÷ (passed + failed), as in
   mattermost's own E2E check; it never reads 100% while something failed.
   Shard placeholders add "re-run the failed jobs" after the labels (alone when

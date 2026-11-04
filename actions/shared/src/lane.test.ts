@@ -16,8 +16,10 @@ test("a lane's name in the PR-wide check drops the shared prefix", () => {
 test("the red reason reads the labels a status now carries", () => {
   assert.equal(redReason("(2 flaky, 2 caused by PR) 99.7% passed (1186 passed, 4 failed, 164 skipped)"), "2 not caused by PR, 2 caused by PR");
   assert.equal(redReason("(1 broken on main, 4 needs investigation) 90.0% passed (9 passed, 5 failed, 0 skipped)"), "1 not caused by PR, 4 to check");
-  assert.equal(redReason("(1 out of date, 1 caused by PR) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, 1 out of date");
-  assert.equal(redReason("(1 caused by PR, 2 fixed on main) 25.0% passed (1 passed, 3 failed, 0 skipped)"), "1 caused by PR, 2 fixed on main");
+  assert.equal(redReason("(1 out of date, 1 caused by PR) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, pull main changes");
+  assert.equal(redReason("(1 caused by PR, 2 fixed on main) 25.0% passed (1 passed, 3 failed, 0 skipped)"), "1 caused by PR, pull main changes");
+  assert.equal(redReason("(1 caused by PR, pull main changes) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, pull main changes", "the label the check now carries");
+  assert.equal(redReason("(pull main changes) 50.0% passed (1 passed, 1 failed, 0 skipped)"), "pull main changes");
   assert.equal(redReason("(3 flaky, 1 needs investigation; many failures in one run) 80.0% passed (4 passed, 1 failed, 0 skipped)"), "3 not caused by PR, 1 to check, many failures in one run");
   assert.equal(redReason("(17 flaky, 2 needs investigation; mostly environment errors, re-run) 96.9% passed (587 passed, 19 failed, 42 skipped)"), "17 not caused by PR, 2 to check, environment errors, re-run");
   assert.equal(redReason("(not triaged, mostly environment errors, re-run) 99.2% passed (240 passed, 2 failed, 3 skipped)"), "environment errors, re-run");
@@ -55,7 +57,7 @@ test("a lane summary reads red lanes by their labels and old wording alike, and 
   assert.deepEqual(lanes({
     "e2e-test/playwright-full/enterprise": st("failure", "(1 out of date, 2 caused by PR) 50% passed (4 passed, 4 failed, 0 skipped)"),
     "e2e/linux": st("success", "235 passed, 0 failed"),
-  }), { state: "failure", description: "playwright-full/enterprise: 2 caused by PR, 1 out of date" });
+  }), { state: "failure", description: "playwright-full/enterprise: 2 caused by PR, pull main changes" });
   assert.deepEqual(lanes({ "e2e-test/detox-ios": st("success", "(0 flaky) 597 passed, 0 failed") }), { state: "success", description: "All lanes green" });
 });
 

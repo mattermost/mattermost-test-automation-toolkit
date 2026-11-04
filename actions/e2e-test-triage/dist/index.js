@@ -61,8 +61,7 @@ function redReason(description = "") {
   if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
-  if (fixed) parts.push(`${fixed} fixed on main`);
-  if (outdated) parts.push(`${outdated} out of date`);
+  if (fixed || outdated || /pull main changes/.test(d)) parts.push("pull main changes");
   if (check) parts.push(`${check} to check`);
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";
@@ -2065,6 +2064,7 @@ var PLATFORM_FILES = {
   macos: /(^|[/_.-])(mac|macos|darwin|osx|dmg|mas)([/_.-]|$)|\.(entitlements|plist)$/i
 };
 var onlyOnPlatform = (platform, file) => Boolean(PLATFORM_FILES[platform]?.test(file));
+var onlyElsewhere = (platform, file) => !onlyOnPlatform(platform, file) && Object.keys(PLATFORM_FILES).some((p) => p !== platform && onlyOnPlatform(p, file));
 function commonSenseClear(f, pack) {
   if (!pack || !f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete") return null;
   const platform = platformOf(f.report_name);
@@ -2073,7 +2073,7 @@ function commonSenseClear(f, pack) {
   if (!platform || !PLATFORM_FILES[platform] || !passedOn.length || lanes.some((l) => FAILED_STATUSES.has(l.result) || l.result === "flaky")) return null;
   const elsewhere = `passed on ${passedOn.join(" and ")} on this same commit`;
   const since = f.since_last_pass;
-  if (since && evidenceIds(pack).includes("this_pr") && !(since.pr_changed ?? since.files).some((x) => onlyOnPlatform(platform, x))) {
+  if (since && evidenceIds(pack).includes("this_pr") && (since.pr_changed ?? since.files).every((x) => onlyElsewhere(platform, x))) {
     const at = f.this_pr.last_pass?.commit_sha?.slice(0, 7);
     return `Failed only on ${platform}: it ${elsewhere}, and passed on ${platform} earlier on this PR${at ? ` (${at})` : ""} with nothing related this PR changed since.`;
   }
@@ -2747,14 +2747,20 @@ function statusLabelOf(f) {
 }
 var RERUN = "re-run the failed jobs";
 var RERUNNING = "re-running the failed jobs";
+var PULL_MAIN = "pull main changes";
 function statusLabels(findings, failed = findings.length) {
   if (!findings.length) return failed ? [RERUN] : [];
   const counts = /* @__PURE__ */ new Map();
+  let pull = false;
   for (const f of findings) {
     const label = statusLabelOf(f);
-    counts.set(label, (counts.get(label) ?? 0) + 1);
+    if (!f.release && (label === "fixed on main" || label === "out of date")) pull = true;
+    else counts.set(label, (counts.get(label) ?? 0) + 1);
   }
-  return STATUS_LABELS.filter((l) => counts.has(l)).map((l) => `${counts.get(l)} ${l}`);
+  return STATUS_LABELS.flatMap((l) => [
+    ...pull && l === "fixed on main" ? [PULL_MAIN] : [],
+    ...counts.has(l) ? [`${counts.get(l)} ${l}`] : []
+  ]);
 }
 var STATUS_MAX = 140;
 var runFlag = (infra) => /infrastructure errors/.test(infra) ? "mostly environment errors, re-run" : "many failures in one run";
