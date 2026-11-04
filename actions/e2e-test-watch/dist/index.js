@@ -1153,16 +1153,39 @@ function statusDescription(verdict, findings, runInfra, counts, missing = null, 
 var import_node_fs3 = require("fs");
 
 // ../shared/src/github.ts
-function gh(fetchImpl, token) {
+var sleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
+var STATUS_POST = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/?]+$/;
+var RETRY_DELAYS_MS = Object.freeze([1e3, 3e3]);
+var retryable = (status) => status >= 500 || status === 429;
+var networkError = (e) => e instanceof TypeError || e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError");
+function gh(fetchImpl, token, wait = sleep) {
   return async (method, path, body) => {
-    const res = await fetchImpl(`https://api.github.com${path}`, {
-      method,
-      headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json", "user-agent": "mattermost-e2e-triage" },
-      body: body ? JSON.stringify(body) : void 0,
-      signal: AbortSignal.timeout(6e4)
-    });
-    if (!res.ok) throw new Error(`GitHub ${method} ${path}: ${res.status} ${(await res.text()).slice(0, 200)}`);
-    return res.status === 204 ? null : res.json();
+    const delays = method === "POST" && STATUS_POST.test(path) ? RETRY_DELAYS_MS : [];
+    const payload = body ? JSON.stringify(body) : void 0;
+    for (let attempt = 0; ; attempt++) {
+      let res;
+      try {
+        res = await fetchImpl(`https://api.github.com${path}`, {
+          method,
+          headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json", "user-agent": "mattermost-e2e-triage" },
+          body: payload,
+          signal: AbortSignal.timeout(6e4)
+        });
+      } catch (e) {
+        if (networkError(e) && attempt < delays.length) {
+          await wait(delays[attempt]);
+          continue;
+        }
+        throw e;
+      }
+      if (res.ok) return res.status === 204 ? null : res.json();
+      const text = (await res.text().catch(() => "")).slice(0, 200);
+      if (retryable(res.status) && attempt < delays.length) {
+        await wait(delays[attempt]);
+        continue;
+      }
+      throw new Error(`GitHub ${method} ${path}: ${res.status} ${text}`);
+    }
   };
 }
 
@@ -2846,6 +2869,7 @@ var MAX_JOBS = 10;
 var TAIL_LINES = 60;
 var lastLines = (text, n) => text.split("\n").slice(-n).join("\n");
 function classifyDeadJob(job) {
+  if (job.conclusion === NEVER_STARTED) return { verdict: "rerun", short: null, reason: `${job.name}: never got a runner, so it ran no test` };
   const step = job.step ?? "an unnamed step";
   const how = job.conclusion === "cancelled" ? "hung" : "failed";
   const infra = INFRA_RE2.exec(job.tail);
@@ -2861,9 +2885,11 @@ function classifyDeadJob(job) {
   if (SETUP_STEP.test(step)) return { verdict: "rerun", short: null, reason: `${job.name}: setup step "${step}" ${how}` };
   return { verdict: "unclear", short: null, reason: `${job.name}: step "${step}" ${how}` };
 }
+var NEVER_STARTED_MS = 30 * 60 * 1e3;
+var NEVER_STARTED = "never_started";
 var STAMP = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,3})\d*)?Z (.*)$/;
 var toMs = (iso) => iso ? Date.parse(iso) : null;
-async function readDeadJobs({ fetchImpl, token, repository, runId, attempt, log }) {
+async function readDeadJobs({ fetchImpl, token, repository, runId, attempt, log, now = Date.now() }) {
   const get = async (path) => {
     const res = await fetchImpl(`https://api.github.com${path}`, { headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "mattermost-e2e-triage" }, signal: AbortSignal.timeout(6e4) });
     if (!res.ok) throw new Error(`GitHub GET ${path}: ${res.status}`);
@@ -2877,7 +2903,12 @@ async function readDeadJobs({ fetchImpl, token, repository, runId, attempt, log 
   }
   const failedStep = (j) => j.steps?.find((s) => s.conclusion === "failure") ?? j.steps?.find((s) => s.conclusion === "cancelled") ?? null;
   const dead = jobs.filter((j) => j.status === "completed" && (j.conclusion === "failure" || j.conclusion === "cancelled" || j.conclusion === "timed_out")).filter((j) => !AGGREGATE_JOB.test(j.name) && !AGGREGATE_STEP.test(failedStep(j)?.name ?? "")).slice(0, MAX_JOBS);
-  const out = [];
+  const neverStarted = jobs.filter((j) => j.status === "queued" && !j.runner_name && !AGGREGATE_JOB.test(j.name)).filter((j) => {
+    const created = toMs(j.created_at);
+    return created != null && now - created >= NEVER_STARTED_MS;
+  }).slice(0, Math.max(0, MAX_JOBS - dead.length));
+  const out = neverStarted.map((j) => ({ id: j.id, name: j.name, conclusion: NEVER_STARTED, step: null, tail: "" }));
+  if (neverStarted.length) log(`${neverStarted.length} job(s) never got a runner: ${neverStarted.map((j) => j.name).join(", ").slice(0, 300)}`);
   for (const j of dead) {
     const step = failedStep(j);
     let tail = "";
@@ -3012,11 +3043,11 @@ async function triage(options) {
     throw e;
   }
 }
-async function noteNoResults({ env, fetchImpl = fetch, log = console.error }, id) {
+async function noteNoResults({ env, fetchImpl = fetch, log = console.error, retryWait }, id) {
   const context = env.STATUS_CONTEXT;
   if (!context || !env.GITHUB_TOKEN) return;
   try {
-    const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
+    const api = gh(fetchImpl, String(env.GITHUB_TOKEN), retryWait);
     const own = (await readStatuses(api, id)).find((r) => r.context === context);
     if (!own || own.state === "pending") return;
     const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
@@ -3047,13 +3078,13 @@ async function defaultBranchOf(api, repository, log) {
     return null;
   }
 }
-async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /* @__PURE__ */ new Date(), wait }, written, seen) {
+async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /* @__PURE__ */ new Date(), wait, retryWait }, written, seen) {
   const cfg = configFrom(env, log);
   const id = compositeIdentityFrom(env.COMPOSITE_IDENTITY);
   const prNumber = Number(id.gh_pr_number || 0) || null;
   const isTrunkRun = prNumber == null;
   const base = tsioBase(env);
-  const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
+  const api = gh(fetchImpl, String(env.GITHUB_TOKEN), retryWait);
   const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
   const reportName = env.REPORT_NAME || null;
   const historyReport = cfg.historyReport || reportName;

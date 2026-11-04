@@ -23,6 +23,7 @@ import type { EvaluatedRun, EvaluateParams } from "./evaluate.ts";
 import { NotTriagedError, triage } from "./triage.ts";
 import { FINDINGS_SCHEMA, checkFindingsShape, findingLogLine, redact } from "./findings.ts";
 import type { CommitStatus, Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
+import { RETRY_DELAYS_MS } from "../../shared/src/github.ts";
 import { laneSummary, redReason } from "../../shared/src/lane.ts";
 import { FAILED_TESTS, UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
@@ -2478,9 +2479,14 @@ test("triage reports publication only after an owned required-status write succe
       : kind === "superseded"
         ? [["/commits/abc/statuses", () => Response.json([{ context: env.STATUS_CONTEXT, state: "failure", target_url: "https://github.com/o/r/actions/runs/99" }])]]
         : [];
-    const work = triage({ env: { ...env, GITHUB_OUTPUT: join(dir, "output") }, fetchImpl: fakeFetch([...overrides, ...judgedRoutes()]), log: () => {} });
-    if (kind === "write-error") await assert.rejects(work, /503/);
-    else await work;
+    const fetchImpl = fakeFetch([...overrides, ...judgedRoutes()]);
+    const work = triage({ env: { ...env, GITHUB_OUTPUT: join(dir, "output") }, fetchImpl, log: () => {}, retryWait: async () => {} });
+    if (kind === "write-error") {
+      await assert.rejects(work, /503/);
+      // A GitHub 5xx on the status write is tried again before triage gives up on it.
+      const writes = fetchImpl.calls.filter((c) => c.url.endsWith("/statuses/abc") && c.init.method === "POST" && parsed<StatusBody>(bodyText(c.init)).context === env.STATUS_CONTEXT);
+      assert.equal(writes.length, RETRY_DELAYS_MS.length + 1);
+    } else await work;
     const output = readFileSync(join(dir, "output"), "utf8");
     assert.match(output, /verdict=SUCCESS\n/, "a diagnostic verdict alone does not establish publication");
     if (kind === "current") assert.match(output, /published=true\n/);

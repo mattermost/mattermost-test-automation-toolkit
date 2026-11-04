@@ -439,6 +439,8 @@ re-run. A build failure, a test server that did not start, or dependencies that
 did not install hold the re-run: the check reads `(not re-run: the build failed)`
 and the summary quotes the line. A job neither settles (a test run that hung) is
 asked of the model once per run; without an answer a person decides, as before.
+A shard still queued with no runner 30 minutes after it was created never got one
+(GitHub ends its lane "abandoned"): it ran no test and has no log, so it is re-run.
 The log is the job's own output and is never taken as an instruction. The triage
 job needs `actions: read` to read the jobs; without it nothing is re-run
 automatically.

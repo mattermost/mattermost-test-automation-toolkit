@@ -55,6 +55,7 @@ export const lastLines = (text: string, n: number): string => text.split("\n").s
 
 /** What one dead job's failed step says: the network or the runner (re-run), the change (hold), or neither. */
 export function classifyDeadJob(job: DeadJob): JobCall {
+  if (job.conclusion === NEVER_STARTED) return { verdict: "rerun", short: null, reason: `${job.name}: never got a runner, so it ran no test` };
   const step = job.step ?? "an unnamed step";
   const how = job.conclusion === "cancelled" ? "hung" : "failed";
   const infra = INFRA_RE.exec(job.tail);
@@ -76,8 +77,18 @@ interface GhJob {
   name: string;
   status: string;
   conclusion: string | null;
+  created_at?: string | null;
+  runner_name?: string | null;
   steps?: { name: string; conclusion: string | null; started_at?: string | null; completed_at?: string | null }[];
 }
+
+// A heuristic: a shard still queued with no runner this long after it was created most likely never gets one. GitHub
+// ended such a lane "abandoned" in mattermost-mobile run 41818921294 (5 Android shards on ubuntu-latest-8-cores): its
+// reports never arrived and no step failed to read. A job blocked on `needs:` is not created until it can start, so the
+// other jobs queued now are this run's later jobs, created minutes ago. A shard of another lane can still be waiting on a
+// busy runner pool this long; then the run's re-run (once, after it ends) repeats work it did not need, never a verdict.
+export const NEVER_STARTED_MS = 30 * 60 * 1000;
+export const NEVER_STARTED = "never_started";
 
 // Log lines start with an ISO time with 7 fractional digits; Date.parse reads 3.
 const STAMP = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,3})\d*)?Z (.*)$/;
@@ -88,7 +99,7 @@ const toMs = (iso: string | null | undefined): number | null => (iso ? Date.pars
  * own last log lines (by the step's start and end times). Needs `actions: read`. A log that can't be read leaves the tail
  * empty: the step's name still decides.
  */
-export async function readDeadJobs({ fetchImpl, token, repository, runId, attempt, log }: { fetchImpl: FetchImpl; token: string; repository: string; runId: string; attempt: string; log: (message: string) => void }): Promise<DeadJob[]> {
+export async function readDeadJobs({ fetchImpl, token, repository, runId, attempt, log, now = Date.now() }: { fetchImpl: FetchImpl; token: string; repository: string; runId: string; attempt: string; log: (message: string) => void; now?: number }): Promise<DeadJob[]> {
   const get = async (path: string): Promise<Response> => {
     const res = await fetchImpl(`https://api.github.com${path}`, { headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "mattermost-e2e-triage" }, signal: AbortSignal.timeout(60000) });
     if (!res.ok) throw new Error(`GitHub GET ${path}: ${res.status}`);
@@ -105,7 +116,15 @@ export async function readDeadJobs({ fetchImpl, token, repository, runId, attemp
     .filter((j) => j.status === "completed" && (j.conclusion === "failure" || j.conclusion === "cancelled" || j.conclusion === "timed_out"))
     .filter((j) => !AGGREGATE_JOB.test(j.name) && !AGGREGATE_STEP.test(failedStep(j)?.name ?? ""))
     .slice(0, MAX_JOBS);
-  const out: DeadJob[] = [];
+  const neverStarted = jobs
+    .filter((j) => j.status === "queued" && !j.runner_name && !AGGREGATE_JOB.test(j.name))
+    .filter((j) => {
+      const created = toMs(j.created_at);
+      return created != null && now - created >= NEVER_STARTED_MS;
+    })
+    .slice(0, Math.max(0, MAX_JOBS - dead.length));
+  const out: DeadJob[] = neverStarted.map((j) => ({ id: j.id, name: j.name, conclusion: NEVER_STARTED, step: null, tail: "" }));
+  if (neverStarted.length) log(`${neverStarted.length} job(s) never got a runner: ${neverStarted.map((j) => j.name).join(", ").slice(0, 300)}`);
   for (const j of dead) {
     const step = failedStep(j);
     let tail = "";

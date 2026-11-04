@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { FetchImpl } from "../../shared/src/github.ts";
 import { UPSTREAM_FAILED } from "../../shared/src/status.ts";
-import { askCauseWith, classifyDeadJob, decideRerun, lastLines, readDeadJobs } from "./rerun-check.ts";
+import { askCauseWith, classifyDeadJob, decideRerun, lastLines, NEVER_STARTED_MS, readDeadJobs } from "./rerun-check.ts";
 import { newLedger } from "./pricing.ts";
 import type { AskCause, DeadJob } from "./rerun-check.ts";
 import { renderSummary, statusDescription } from "./render.ts";
@@ -89,6 +89,33 @@ test("a job that failed only reporting the others (a status or results step) is 
     ] })) as FetchImpl;
   const jobs = await readDeadJobs({ fetchImpl, token: "GH", repository: "o/r", runId: "12", attempt: "1", log: () => {} });
   assert.deepEqual(jobs.map((j) => j.id), [7]);
+});
+
+test("a shard that never got a runner is a dead job to re-run; one still waiting its turn, or a summary, is not", async () => {
+  // mattermost-mobile run 41818921294: 5 Android shards stayed queued on ubuntu-latest-8-cores and the lane ended abandoned.
+  const now = Date.parse("2026-11-04T12:40:00Z");
+  const ago = (ms: number) => new Date(now - ms).toISOString();
+  const jobs = [
+    { id: 1, name: "Detox Android E2E / Android / machine-24-api-35", status: "queued", conclusion: null, runner_name: null, created_at: ago(NEVER_STARTED_MS + 60_000) },
+    { id: 2, name: "Triage E2E failures (detox-ios)", status: "queued", conclusion: null, runner_name: null, created_at: ago(2 * 60_000) },
+    { id: 3, name: "Detox Android E2E / Android / machine-3-api-35", status: "queued", conclusion: null, runner_name: null, created_at: ago(NEVER_STARTED_MS - 60_000) },
+    { id: 4, name: "Detox Android E2E / Android / detox-android summary", status: "queued", conclusion: null, runner_name: null, created_at: ago(NEVER_STARTED_MS * 2) },
+    { id: 5, name: "Detox Android E2E / Android / machine-5-api-35", status: "completed", conclusion: "success", runner_name: "r", created_at: ago(NEVER_STARTED_MS * 2) },
+  ];
+  const fetched: string[] = [];
+  const fetchImpl = (async (url: string) => {
+    fetched.push(String(url));
+    return Response.json({ total_count: jobs.length, jobs });
+  }) as FetchImpl;
+  const logs: string[] = [];
+  const dead = await readDeadJobs({ fetchImpl, token: "GH", repository: "o/r", runId: "41818921294", attempt: "1", log: (m) => logs.push(m), now });
+  assert.deepEqual(dead.map((d) => d.id), [1]);
+  assert.ok(!fetched.some((u) => u.includes("/logs")), "a job that never ran has no log to read");
+  assert.match(logs.join("\n"), /1 job\(s\) never got a runner: Detox Android E2E \/ Android \/ machine-24-api-35/);
+  const call = classifyDeadJob(dead[0]);
+  assert.deepEqual([call.verdict, call.short], ["rerun", null]);
+  assert.match(call.reason, /never got a runner/);
+  assert.deepEqual(await decideRerun(dead, null), { rerun: true, held: null, reason: call.reason });
 });
 
 test("an API call the test server answers with an HTML page is its environment, not the change", () => {

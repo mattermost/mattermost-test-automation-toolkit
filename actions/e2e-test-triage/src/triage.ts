@@ -3,7 +3,7 @@
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { gh } from "../../shared/src/github.ts";
-import type { Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
+import type { Env, FetchImpl, GhApi, Sleep } from "../../shared/src/github.ts";
 import { laneName, laneSummary } from "../../shared/src/lane.ts";
 import { FAILED_TESTS, readStatuses, REPORTS_INCOMPLETE, statusPublisher, UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, SupersededRunError, tsioBase } from "../../shared/src/tsio.ts";
@@ -53,6 +53,8 @@ export interface TriageOptions {
   log?: (message: string) => void;
   now?: Date;
   wait?: Wait;
+  /** Waits between attempts of a retried status write (shared gh); a test passes one that does not sleep. */
+  retryWait?: Sleep;
 }
 
 /** What triage got as far as it went, for the findings file and the not-triaged paths. */
@@ -130,11 +132,11 @@ export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
  * The lane's status when TSIO has no results: the note goes on the state it already has, so the lane stays as it
  * was, and only where this run owns the status (the publisher checks that). A failed note is logged, not raised.
  */
-async function noteNoResults({ env, fetchImpl = fetch, log = console.error }: TriageOptions, id: TriageIdentity): Promise<void> {
+async function noteNoResults({ env, fetchImpl = fetch, log = console.error, retryWait }: TriageOptions, id: TriageIdentity): Promise<void> {
   const context = env.STATUS_CONTEXT;
   if (!context || !env.GITHUB_TOKEN) return;
   try {
-    const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
+    const api = gh(fetchImpl, String(env.GITHUB_TOKEN), retryWait);
     const own = (await readStatuses(api, id)).find((r) => r.context === context);
     if (!own || own.state === "pending") return;
     const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
@@ -180,14 +182,14 @@ async function defaultBranchOf(api: GhApi, repository: string, log: (message: st
   }
 }
 
-async function decideRun({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait }: TriageOptions, written: { summary: boolean }, seen: Seen): Promise<EvaluatedRun> {
+async function decideRun({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait, retryWait }: TriageOptions, written: { summary: boolean }, seen: Seen): Promise<EvaluatedRun> {
   const cfg: Config = configFrom(env, log);
   const id = compositeIdentityFrom<TriageIdentity>(env.COMPOSITE_IDENTITY);
   const prNumber = Number(id.gh_pr_number || 0) || null;
   // No PR number: a trunk run (see EXONERATED_ON_TRUNK).
   const isTrunkRun = prNumber == null;
   const base = tsioBase(env);
-  const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
+  const api = gh(fetchImpl, String(env.GITHUB_TOKEN), retryWait);
   // Not guessed: a wrong root makes every spec look untouched.
   const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
   const reportName = env.REPORT_NAME || null;

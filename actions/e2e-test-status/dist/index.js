@@ -4,16 +4,39 @@
 var import_node_fs = require("fs");
 
 // ../shared/src/github.ts
-function gh(fetchImpl, token) {
+var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var STATUS_POST = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/?]+$/;
+var RETRY_DELAYS_MS = Object.freeze([1e3, 3e3]);
+var retryable = (status) => status >= 500 || status === 429;
+var networkError = (e) => e instanceof TypeError || e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError");
+function gh(fetchImpl, token, wait = sleep) {
   return async (method, path, body) => {
-    const res = await fetchImpl(`https://api.github.com${path}`, {
-      method,
-      headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json", "user-agent": "mattermost-e2e-triage" },
-      body: body ? JSON.stringify(body) : void 0,
-      signal: AbortSignal.timeout(6e4)
-    });
-    if (!res.ok) throw new Error(`GitHub ${method} ${path}: ${res.status} ${(await res.text()).slice(0, 200)}`);
-    return res.status === 204 ? null : res.json();
+    const delays = method === "POST" && STATUS_POST.test(path) ? RETRY_DELAYS_MS : [];
+    const payload = body ? JSON.stringify(body) : void 0;
+    for (let attempt = 0; ; attempt++) {
+      let res;
+      try {
+        res = await fetchImpl(`https://api.github.com${path}`, {
+          method,
+          headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json", "user-agent": "mattermost-e2e-triage" },
+          body: payload,
+          signal: AbortSignal.timeout(6e4)
+        });
+      } catch (e) {
+        if (networkError(e) && attempt < delays.length) {
+          await wait(delays[attempt]);
+          continue;
+        }
+        throw e;
+      }
+      if (res.ok) return res.status === 204 ? null : res.json();
+      const text = (await res.text().catch(() => "")).slice(0, 200);
+      if (retryable(res.status) && attempt < delays.length) {
+        await wait(delays[attempt]);
+        continue;
+      }
+      throw new Error(`GitHub ${method} ${path}: ${res.status} ${text}`);
+    }
   };
 }
 
