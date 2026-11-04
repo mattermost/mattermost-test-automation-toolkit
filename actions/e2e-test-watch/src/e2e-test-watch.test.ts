@@ -1052,12 +1052,14 @@ test("failing tests no request covers are named with why they wait", async () =>
 
   const f = (over: Partial<RepairFinding>): RepairFinding => finding({ trunk: trunkOf(0, 0, 8), ...over });
   const left = unselected(
-    [{ suite: "ent", findings: [f({ title: "same", class: "BROKEN_ON_TRUNK", identity_unresolved: true }), f({ title: "once", class: "FLAKY_ON_TRUNK", file: "b.spec.ts", repo_path: "specs/b.spec.ts" }), f({ title: "infra", class: "INFRA_ERROR", file: "c.spec.ts", repo_path: "specs/c.spec.ts" }), f({ title: "picked", file: "d.spec.ts", repo_path: "specs/d.spec.ts" })] }],
+    [{ suite: "ent", findings: [f({ title: "same", class: "BROKEN_ON_TRUNK", identity_unresolved: true }), f({ title: "once", class: "FLAKY_ON_TRUNK", file: "b.spec.ts", repo_path: "specs/b.spec.ts" }), f({ title: "infra", class: "INFRA_ERROR", file: "c.spec.ts", repo_path: "specs/c.spec.ts" }), f({ title: "picked", file: "d.spec.ts", repo_path: "specs/d.spec.ts" }), f({ title: "rare", class: "REGRESSION", file: "e.spec.ts", repo_path: "specs/e.spec.ts", trunk: trunkOf(0, 1, 7) })] }],
     new Set(["specs/d.spec.ts"]),
   );
   assert.deepEqual(left.map((u) => [u.spec, u.title, u.reason]), [
     ["specs/a.spec.ts", "same", "shares its name with another test, so its history can't be read"],
     ["specs/b.spec.ts", "once", "first flake on trunk; requested if it flakes again"],
+    // Triage keeps a failure blocking when trunk flaked it too rarely to call it a flake: not its first.
+    ["specs/e.spec.ts", "rare", "rare on trunk (1 of 8 runs before), in ent only; requested if it fails again"],
   ], "an environment error is the lane's to re-run, and a spec already requested needs no note");
 });
 

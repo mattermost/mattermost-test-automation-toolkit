@@ -250,6 +250,30 @@ test("on trunk, an intermittent failure whose last run passed is a flake and cle
   assert.equal(f.class, "FLAKY_ON_TRUNK");
   assert.equal(f.blocking, false);
 });
+test("on trunk, a failure clears on trunk's instability only as a PR's would: often enough, and the same failure", () => {
+  // desktop master run 41462716210: MM-T5611 failed every try on Windows after the Electron 45.2.1 upgrade, and was
+  // cleared on one flaky pass with the same error (61c577d, 2026-10-02) among 48 trunk runs.
+  const error = 'Error: Timed out waiting for selector "[data-testid="linkInput"]" to be visible\n    at ..\\helpers\\serverView.ts:659';
+  const hard = { ...failing, title: "MM-T5611 Open a bookmark URL/link (External and Internal links)", error, tries: { ran: 2, failed: 2 } };
+  const flake = obs({ commit_sha: "61c577d", status: "flaky", error_excerpt: error });
+  const opts = { isTrunkRun: true };
+  const once = classify(hard, [...trunkPasses(20), flake, ...trunkPasses(27)], [], undefined, null, null, opts);
+  assert.deepEqual([once.class, once.blocking], ["REGRESSION", true]);
+  assert.equal(once.reason, "Rarely unstable on trunk: 0 failures and 1 flaky passes in the previous 48 runs, too few to call this failure a flake.");
+  // A genuinely flaky test, at pMin or above with the same error, still clears on trunk, every try failed or not.
+  const twice = [...trunkPasses(20), flake, obs({ commit_sha: "f2", status: "failed", error_excerpt: error }), ...trunkPasses(26)];
+  assert.deepEqual([classify(hard, twice, [], undefined, null, null, opts).class, classify(hard, twice, [], undefined, null, null, opts).blocking], ["FLAKY_ON_TRUNK", false]);
+  assert.equal(classify(hard, twice, []).class, "FLAKY_ON_TRUNK", "as a PR's failure clears on the same history");
+  // Unstable often enough, but never with this error: trunk's flake says nothing about it.
+  const other = obs({ commit_sha: "o1", status: "flaky", error_excerpt: "Error: Bookmarks Bar menu item not found in channel header menu" });
+  const otherError = classify(hard, [...trunkPasses(8), other], [], undefined, null, null, opts);
+  assert.deepEqual([otherError.class, otherError.blocking], ["REGRESSION", true]);
+  assert.match(otherError.reason, /never with this error/);
+  // A bare timeout that failed every try needs trunk to have timed out that way too.
+  const bare = { ...failing, error: "Error: Test timeout of 60000ms exceeded.", tries: { ran: 2, failed: 2 } };
+  assert.equal(classify(bare, [...trunkPasses(8), other], [], undefined, null, null, opts).class, "REGRESSION");
+  assert.equal(classify(bare, [...trunkPasses(8), obs({ commit_sha: "t1", status: "flaky", error_excerpt: "Error: Test timeout of 30000ms exceeded." })], [], undefined, null, null, opts).class, "FLAKY_ON_TRUNK");
+});
 test("on trunk, a pass on retry does not end a streak; a test that keeps failing and passing is a flake", () => {
   // mattermost release-12.1 run 40292449090: passed every run to 10-21 14:43, then failed every try in each run but one,
   // which passed on its retest (flaky). Every try failed here too.

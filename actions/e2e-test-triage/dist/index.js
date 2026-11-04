@@ -713,6 +713,19 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
       `The available suite/report identity does not uniquely identify "${test.title}" in ${test.file}; history cannot clear it.`,
       true
     );
+  const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
+  const notTrunksFlake = () => {
+    const unstable = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
+    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !unstable.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
+      const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
+      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
+    }
+    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran && !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
+      const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
+      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`, true);
+    }
+    return null;
+  };
   if (isTrunkRun) {
     if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status))
       return out("BROKEN_ON_TRUNK", `Still failing: the previous ${lane ?? "trunk"} run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}) failed this test too. That is a streak, not a flake.`, true);
@@ -720,8 +733,13 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
     while (rough < trunk.length && (FAILED_STATUSES.has(trunk[rough].status) || trunk[rough].status === "flaky")) rough++;
     if (rough >= 2 && trunk.slice(0, rough).some((o) => FAILED_STATUSES.has(o.status)))
       return out("BROKEN_ON_TRUNK", `Still failing: failed or passed only on retry in each of the previous ${rough} ${lane ?? "trunk"} runs. A pass on retry is not a fix.`, true);
-    if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0)
+    if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0) {
+      if (laplace < cfg.pMin)
+        return out("REGRESSION", `Rarely unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the previous ${trunk.length} runs, too few to call this failure a flake.`, true);
+      const unlike = notTrunksFlake();
+      if (unlike) return unlike;
       return out("FLAKY_ON_TRUNK", `Intermittent on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the previous ${trunk.length} runs, and the last one passed${latestTrunk?.status === "flaky" ? " on retry" : ""}.`, false);
+    }
     if (trunk.length < cfg.minTrunkRuns)
       return out("INSUFFICIENT_DATA", `Only ${trunk.length} earlier trunk runs (need ${cfg.minTrunkRuns}); cannot tell a flake from a new break.`, true);
     return out("REGRESSION", `New on trunk: passed in all ${trunk.length} previous runs.`, true);
@@ -750,17 +768,9 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
     return Object.assign(out("FIXED_ON_TRUNK", `${trunkBranch || "Trunk"} failed this test the same way in ${broken} runs in a row, then passed from ${trunk[recent - 1].commit_sha?.slice(0, 7) ?? "unknown"} on: trunk fixed it.`, true), {
       trunk_fixed: { last_fail: at(trunk[recent]), first_pass: at(trunk[recent - 1]) }
     });
-  const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
   if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0 && laplace >= cfg.pMin && latestTrunk?.status !== "failed") {
-    const unstable = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
-    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !unstable.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
-      const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
-      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
-    }
-    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran && !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
-      const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
-      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`, true);
-    }
+    const unlike = notTrunksFlake();
+    if (unlike) return unlike;
     return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the last ${trunk.length} trunk runs.`, false);
   }
   if (failedPRs.length >= cfg.crossPRMinPRs && trunkFails === 0 && trunkPasses > 0)

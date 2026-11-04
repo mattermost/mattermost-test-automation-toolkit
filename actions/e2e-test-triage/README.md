@@ -496,7 +496,12 @@ Consumers check `schema` first. A future change to the shape bumps it.
 
 Without a PR number, the run is a trunk run. A failure that was already there in
 the previous run is a streak and stays blocking; only intermittency clears. The
-model is not asked.
+model is not asked. Intermittent is held to the bar a PR's failure meets to clear on
+trunk's instability: trunk failed or flaked the test often enough (`pMin`, about 1 in
+20 of its recent runs; one flake in 48 runs is too rare), and the same way (the same
+error, or for a bare timeout or empty error that failed every try, the same kind).
+Otherwise the failure stays blocking as a `REGRESSION`; failing again in the next
+run makes it `BROKEN_ON_TRUNK`.
 
 ## Tests
 

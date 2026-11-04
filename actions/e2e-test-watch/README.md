@@ -7,7 +7,8 @@ fix only for what repeats:
 | Failure | Action |
 | --- | --- |
 | Failed in this run and the previous one (`BROKEN_ON_TRUNK`) | fix |
-| Intermittent on trunk: failed in this run and at least once before (`FLAKY_ON_TRUNK`) | fix |
+| Intermittent on trunk: failed in this run, and the same way in about 1 in 20 runs before (`FLAKY_ON_TRUNK`) | fix |
+| Failed in this run, and trunk failed it more rarely or another way (`REGRESSION`) | as a first failure: wait for the next run |
 | Failed and then passed on retry in this run, and failed or flaked on trunk at least once before | fix (flaky) |
 | Failed for the first time in two or more lanes (suites) of the same run, e.g. enterprise and FIPS | fix (broken) |
 | Failed for the first time, in one lane | wait for the next run |
