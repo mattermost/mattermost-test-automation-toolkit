@@ -3579,7 +3579,7 @@ function unselected(bySuite, selected) {
     for (const f of findings) {
       const spec = specOf(f);
       if (selected.has(spec) || !REPAIRABLE.has(f.class)) continue;
-      const reason = f.identity_unresolved ? "shares its name with another test, so its history can't be read" : FIRST_FAILURE.has(f.class) ? f.trunk.fails + f.trunk.flaky > 0 ? `rare on trunk (${f.trunk.fails + f.trunk.flaky} of ${f.trunk.runs} runs before), in ${suite} only; requested if it fails again` : `first failure, in ${suite} only; requested if it fails again` : f.class === "FLAKY_ON_TRUNK" ? "first flake on trunk; requested if it flakes again" : null;
+      const reason = f.identity_unresolved ? "shares its name with another test, so its history can't be read" : FIRST_FAILURE.has(f.class) ? f.trunk.fails + f.trunk.flaky > 0 ? `failed or flaked in ${f.trunk.fails + f.trunk.flaky} of ${f.trunk.runs} trunk runs before, too rarely or another way to call a flake; in ${suite} only; requested if it fails again` : `first failure, in ${suite} only; requested if it fails again` : f.class === "FLAKY_ON_TRUNK" ? "first flake on trunk; requested if it flakes again" : null;
       if (reason) out.push({ spec, suite, title: f.full_title || f.title, reason });
     }
   }

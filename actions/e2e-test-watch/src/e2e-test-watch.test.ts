@@ -1058,8 +1058,9 @@ test("failing tests no request covers are named with why they wait", async () =>
   assert.deepEqual(left.map((u) => [u.spec, u.title, u.reason]), [
     ["specs/a.spec.ts", "same", "shares its name with another test, so its history can't be read"],
     ["specs/b.spec.ts", "once", "first flake on trunk; requested if it flakes again"],
-    // Triage keeps a failure blocking when trunk flaked it too rarely to call it a flake: not its first.
-    ["specs/e.spec.ts", "rare", "rare on trunk (1 of 8 runs before), in ent only; requested if it fails again"],
+    // Triage keeps a failure blocking when trunk flaked it too rarely, or with another error, to call it a flake: not
+    // its first, and not called rare, since trunk may have failed it often with another error.
+    ["specs/e.spec.ts", "rare", "failed or flaked in 1 of 8 trunk runs before, too rarely or another way to call a flake; in ent only; requested if it fails again"],
   ], "an environment error is the lane's to re-run, and a spec already requested needs no note");
 });
 

@@ -151,8 +151,9 @@ export interface Unselected {
 const REPAIRABLE = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", ...FIRST_FAILURE]);
 
 /**
- * The failing tests in specs no group covers, with why each waits: a first (or rare) failure in one lane, a first
- * flake, or a name two tests share. Read so a red trunk run with no request says what it saw.
+ * The failing tests in specs no group covers, with why each waits: a first failure in one lane (or one trunk's history
+ * does not call a flake), a first flake, or a name two tests share. Read so a red trunk run with no request says what
+ * it saw.
  */
 export function unselected(bySuite: { suite: string; findings: readonly RepairFinding[] }[], selected: ReadonlySet<string>): Unselected[] {
   const out: Unselected[] = [];
@@ -164,7 +165,7 @@ export function unselected(bySuite: { suite: string; findings: readonly RepairFi
         ? "shares its name with another test, so its history can't be read"
         : FIRST_FAILURE.has(f.class)
           ? f.trunk.fails + f.trunk.flaky > 0
-            ? `rare on trunk (${f.trunk.fails + f.trunk.flaky} of ${f.trunk.runs} runs before), in ${suite} only; requested if it fails again`
+            ? `failed or flaked in ${f.trunk.fails + f.trunk.flaky} of ${f.trunk.runs} trunk runs before, too rarely or another way to call a flake; in ${suite} only; requested if it fails again`
             : `first failure, in ${suite} only; requested if it fails again`
           : f.class === "FLAKY_ON_TRUNK"
             ? "first flake on trunk; requested if it flakes again"
