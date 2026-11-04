@@ -32,12 +32,13 @@ export const RETRY_DELAYS_MS: readonly number[] = Object.freeze([1000, 3000]);
 // A 429's Retry-After is not read: these short waits cover a brief burst, and a longer limit fails as before.
 const retryable = (status: number): boolean => status >= 500 || status === 429;
 
-// fetch (undici) rejects a dropped connection with a TypeError "fetch failed" whose cause says why, and an expired or
-// aborted signal with a DOMException (TimeoutError, AbortError). Any other TypeError is not the network's doing (an
-// invalid header value, for one). A timed-out write is retried too: with the 60 s signal a status POST that keeps
-// hanging gives up after about 3 minutes.
+// fetch (undici) rejects a dropped connection with a TypeError ("fetch failed" before headers, "terminated" while
+// reading the body) whose cause says why, and an expired or aborted signal with a DOMException (TimeoutError,
+// AbortError). Any other TypeError is not the network's doing (an invalid header value, for one), and a SyntaxError
+// from res.json() is a bad response body, not a dropped connection. A timed-out write is retried too: with the 60 s
+// signal a status POST that keeps hanging gives up after about 3 minutes.
 const networkError = (e: unknown): boolean =>
-  (e instanceof TypeError && e.message === "fetch failed") ||
+  (e instanceof TypeError && (e.message === "fetch failed" || e.message === "terminated")) ||
   (e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError"));
 
 export function gh(fetchImpl: FetchImpl, token: string, wait: Sleep = sleep): GhApi {
@@ -55,6 +56,7 @@ export function gh(fetchImpl: FetchImpl, token: string, wait: Sleep = sleep): Gh
           body: payload,
           signal: AbortSignal.timeout(60000),
         });
+        if (res.ok) return res.status === 204 ? null : await res.json();
       } catch (e) {
         if (networkError(e) && attempt < delays.length) {
           await wait(delays[attempt]);
@@ -62,7 +64,6 @@ export function gh(fetchImpl: FetchImpl, token: string, wait: Sleep = sleep): Gh
         }
         throw e;
       }
-      if (res.ok) return res.status === 204 ? null : res.json();
       // The body only names the error: one that cannot be read must not stop a retry.
       const text = (await res.text().catch(() => "")).slice(0, 200);
       if (retryable(res.status) && attempt < delays.length) {

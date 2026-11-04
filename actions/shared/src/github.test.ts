@@ -66,6 +66,22 @@ test("a 5xx whose body cannot be read is still tried again", async () => {
   assert.equal(calls.length, 2);
 });
 
+test("a 2xx commit status response whose body drops mid-read is tried again, while unparseable JSON fails at once", async () => {
+  for (const err of [new TypeError("terminated"), new TypeError("fetch failed"), new DOMException("timed out", "TimeoutError")]) {
+    const dropped = new Response(new ReadableStream({ pull: (c) => c.error(err) }), { status: 201 });
+    const waits: number[] = [];
+    const { calls, fetchImpl } = scripted(dropped, 201);
+    assert.deepEqual(await gh(fetchImpl, "t", async (ms) => { waits.push(ms); })("POST", STATUS, {}), { step: 201 }, String(err));
+    assert.equal(calls.length, 2, String(err));
+    assert.deepEqual(waits, [RETRY_DELAYS_MS[0]], String(err));
+  }
+
+  const malformed = new Response("not json", { status: 201, headers: { "content-type": "application/json" } });
+  const { calls, fetchImpl } = scripted(malformed, 201);
+  await assert.rejects(gh(fetchImpl, "t", async () => {})("POST", STATUS, {}), SyntaxError);
+  assert.equal(calls.length, 1);
+});
+
 test("a 429 is tried again on the same short waits, whatever its Retry-After says", async () => {
   const limited = new Response(null, { status: 429, headers: { "retry-after": "60" } });
   const waits: number[] = [];
