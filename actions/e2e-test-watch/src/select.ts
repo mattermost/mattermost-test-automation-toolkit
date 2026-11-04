@@ -16,7 +16,7 @@ const ERROR_CHARS = 600;
 const MIN_FLAKY = 1;
 
 /** The parts of a triage finding that selecting repairs reads. */
-export type RepairFinding = Pick<Finding, "class" | "title" | "full_title" | "file" | "repo_path" | "error" | "identity_unresolved" | "trunk">;
+export type RepairFinding = Pick<Finding, "class" | "title" | "full_title" | "file" | "repo_path" | "error" | "identity_unresolved" | "trunk" | "failed_everywhere">;
 
 /** A test that failed and then passed on retry in one run, as retryRecovered finds it. */
 export interface RecoveredTest {
@@ -163,10 +163,14 @@ export function unselected(bySuite: { suite: string; findings: readonly RepairFi
       if (selected.has(spec) || !REPAIRABLE.has(f.class)) continue;
       const reason = f.identity_unresolved
         ? "shares its name with another test, so its history can't be read"
-        : FIRST_FAILURE.has(f.class)
-          ? f.trunk.fails + f.trunk.flaky > 0
-            ? `failed or flaked in ${f.trunk.fails + f.trunk.flaky} of ${f.trunk.runs} trunk runs before, too rarely or another way to call a flake; in ${suite} only; requested if it fails again`
-            : `first failure, in ${suite} only; requested if it fails again`
+        : f.class === "INSUFFICIENT_DATA"
+          ? `only ${f.trunk.runs} trunk runs before, too few to call a flake; in ${suite} only; requested if it fails again`
+          : FIRST_FAILURE.has(f.class)
+            ? f.failed_everywhere?.length
+              ? `failed every try and on ${f.failed_everywhere.join(" and ")} on this commit; in ${suite} only; requested if it fails again`
+              : f.trunk.fails + f.trunk.flaky > 0
+                ? `failed or flaked in ${f.trunk.fails + f.trunk.flaky} of ${f.trunk.runs} trunk runs before, too rarely or another way to call a flake; in ${suite} only; requested if it fails again`
+                : `first failure, in ${suite} only; requested if it fails again`
           : f.class === "FLAKY_ON_TRUNK"
             ? "first flake on trunk; requested if it flakes again"
             : null;

@@ -439,8 +439,6 @@ re-run. A build failure, a test server that did not start, or dependencies that
 did not install hold the re-run: the check reads `(not re-run: the build failed)`
 and the summary quotes the line. A job neither settles (a test run that hung) is
 asked of the model once per run; without an answer a person decides, as before.
-A shard still queued with no runner 30 minutes after it was created never got one
-(GitHub ends its lane "abandoned"): it ran no test and has no log, so it is re-run.
 The log is the job's own output and is never taken as an instruction. The triage
 job needs `actions: read` to read the jobs; without it nothing is re-run
 automatically.
@@ -503,9 +501,10 @@ Consumers check `schema` first. A future change to the shape bumps it.
 Without a PR number, the run is a trunk run. A failure that was already there in
 the previous run is a streak and stays blocking; only intermittency clears. The
 model is not asked. Intermittent is held to the bar a PR's failure meets to clear on
-trunk's instability. Trunk must have failed or flaked the test often enough: `pMin`,
-about 1 in 20 of its recent runs, counting failures and flaky passes of any error (one
-flake in 48 runs is too rare). Whether trunk must also have failed the same way depends
+trunk's instability. Trunk must have failed or flaked the test often enough: the
+smoothed rate (failures + flaky passes + 1) / (runs + 2) must reach `pMin` (0.05),
+counting failures and flaky passes of any error (one flake in 48 runs is 2/50 = 0.04,
+too rare). Whether trunk must also have failed the same way depends
 on the error:
 
 - A distinctive or stuck error: trunk failed with the same error.
@@ -518,8 +517,9 @@ Otherwise the failure stays blocking as a `REGRESSION`. Failing again in the nex
 makes it `BROKEN_ON_TRUNK`.
 
 A failure that failed every try here and on another platform of the same commit
-is held there too, as on a PR: it is `REGRESSION`, blocking (see "Failed
-everywhere" above).
+is held there too, as on a PR: a flaky clear becomes `REGRESSION`, blocking, and a
+failure that is already blocking (`BROKEN_ON_TRUNK`, `INSUFFICIENT_DATA`) keeps its
+class (see "Failed everywhere" above).
 
 ## Tests
 

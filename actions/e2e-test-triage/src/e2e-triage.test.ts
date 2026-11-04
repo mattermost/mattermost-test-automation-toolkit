@@ -4676,6 +4676,18 @@ test("a trunk flake that failed every try here and on another platform of the co
   assert.match(held.reason, /^Failed all 2 tries here and failed on macos on this same commit; a flake rarely does that\./);
 });
 
+test("a flaky clear the hold turns into a REGRESSION says whether the PR touches a file its error names", async () => {
+  const error = "Error: expected visible at helpers/login.ts:12";
+  const run = runOf([{ title: "t1", file: "specs/a.spec.ts", error }]);
+  run.failing[0].tries = { ran: 2, failed: 2 };
+  const history = new Map([[identityKey(run.failing[0]), [...trunkPasses(8), obs({ status: "failed", commit_sha: "f1", error_excerpt: error })]]]);
+  const otherPlatforms = async (fs: Finding[]) => { for (const f of fs) f.other_lanes = [{ platform: "android", result: "failed" }]; };
+  const touched = (await evaluate(run, { history, otherPlatforms, diff: { files: [{ filename: "helpers/login.ts", patch: "@@" }], ok: true } })).findings[0];
+  assert.deepEqual([touched.class, touched.blocking, touched.untouched], ["REGRESSION", true, false]);
+  const untouched = (await evaluate(run, { history, otherPlatforms, diff: { files: [{ filename: "docs/readme.md", patch: "@@" }], ok: true } })).findings[0];
+  assert.deepEqual([untouched.class, untouched.untouched], ["REGRESSION", true]);
+});
+
 test("a Mattermost id joined to a selector does not make master's failure another one", () => {
   // mattermost #39376 fips: master failed MM-T1486_3 the same way 23 times, each with its own post id.
   const at = (id: string): string => `AssertionError: Timed out retrying after 30000ms: Expected to find element: \`#CENTER_actions_button_${id}\`, but never found it.`;

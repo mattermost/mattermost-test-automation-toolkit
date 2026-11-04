@@ -34,6 +34,8 @@ const retryable = (status: number): boolean => status >= 500 || status === 429;
 
 // fetch rejects a dropped connection with a TypeError ("fetch failed"), and an expired or aborted
 // signal with a DOMException (TimeoutError, AbortError). Anything else is not the network's doing.
+// A timed-out write is retried too: with the 60 s signal a status POST that keeps hanging gives up
+// after about 3 minutes, inside every caller's job timeout.
 const networkError = (e: unknown): boolean => e instanceof TypeError || (e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError"));
 
 export function gh(fetchImpl: FetchImpl, token: string, wait: Sleep = sleep): GhApi {

@@ -2687,6 +2687,8 @@ async function evaluateRun({
       }
     }
     holdFailedEverywhere(result.findings);
+    for (const f of result.findings)
+      if (prNumber && diff.ok && f.class === "REGRESSION" && f.untouched === void 0) f.untouched = !changed.some((name) => namesChangedFile(f, name));
     if (branchBase && trunkBranch === branchBase) {
       for (const f of result.findings)
         if (!f.blocking && f.class !== "INFRA_ERROR")
@@ -2869,7 +2871,6 @@ var MAX_JOBS = 10;
 var TAIL_LINES = 60;
 var lastLines = (text, n) => text.split("\n").slice(-n).join("\n");
 function classifyDeadJob(job) {
-  if (job.conclusion === NEVER_STARTED) return { verdict: "rerun", short: null, reason: `${job.name}: never got a runner, so it ran no test` };
   const step = job.step ?? "an unnamed step";
   const how = job.conclusion === "cancelled" ? "hung" : "failed";
   const infra = INFRA_RE2.exec(job.tail);
@@ -2885,11 +2886,9 @@ function classifyDeadJob(job) {
   if (SETUP_STEP.test(step)) return { verdict: "rerun", short: null, reason: `${job.name}: setup step "${step}" ${how}` };
   return { verdict: "unclear", short: null, reason: `${job.name}: step "${step}" ${how}` };
 }
-var NEVER_STARTED_MS = 30 * 60 * 1e3;
-var NEVER_STARTED = "never_started";
 var STAMP = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,3})\d*)?Z (.*)$/;
 var toMs = (iso) => iso ? Date.parse(iso) : null;
-async function readDeadJobs({ fetchImpl, token, repository, runId, attempt, log, now = Date.now() }) {
+async function readDeadJobs({ fetchImpl, token, repository, runId, attempt, log }) {
   const get = async (path) => {
     const res = await fetchImpl(`https://api.github.com${path}`, { headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "mattermost-e2e-triage" }, signal: AbortSignal.timeout(6e4) });
     if (!res.ok) throw new Error(`GitHub GET ${path}: ${res.status}`);
@@ -2903,12 +2902,7 @@ async function readDeadJobs({ fetchImpl, token, repository, runId, attempt, log,
   }
   const failedStep = (j) => j.steps?.find((s) => s.conclusion === "failure") ?? j.steps?.find((s) => s.conclusion === "cancelled") ?? null;
   const dead = jobs.filter((j) => j.status === "completed" && (j.conclusion === "failure" || j.conclusion === "cancelled" || j.conclusion === "timed_out")).filter((j) => !AGGREGATE_JOB.test(j.name) && !AGGREGATE_STEP.test(failedStep(j)?.name ?? "")).slice(0, MAX_JOBS);
-  const neverStarted = jobs.filter((j) => j.status === "queued" && !j.runner_name && !AGGREGATE_JOB.test(j.name)).filter((j) => {
-    const created = toMs(j.created_at);
-    return created != null && now - created >= NEVER_STARTED_MS;
-  }).slice(0, Math.max(0, MAX_JOBS - dead.length));
-  const out = neverStarted.map((j) => ({ id: j.id, name: j.name, conclusion: NEVER_STARTED, step: null, tail: "" }));
-  if (neverStarted.length) log(`${neverStarted.length} job(s) never got a runner: ${neverStarted.map((j) => j.name).join(", ").slice(0, 300)}`);
+  const out = [];
   for (const j of dead) {
     const step = failedStep(j);
     let tail = "";
@@ -3609,7 +3603,7 @@ function unselected(bySuite, selected) {
     for (const f of findings) {
       const spec = specOf(f);
       if (selected.has(spec) || !REPAIRABLE.has(f.class)) continue;
-      const reason = f.identity_unresolved ? "shares its name with another test, so its history can't be read" : FIRST_FAILURE.has(f.class) ? f.trunk.fails + f.trunk.flaky > 0 ? `failed or flaked in ${f.trunk.fails + f.trunk.flaky} of ${f.trunk.runs} trunk runs before, too rarely or another way to call a flake; in ${suite} only; requested if it fails again` : `first failure, in ${suite} only; requested if it fails again` : f.class === "FLAKY_ON_TRUNK" ? "first flake on trunk; requested if it flakes again" : null;
+      const reason = f.identity_unresolved ? "shares its name with another test, so its history can't be read" : f.class === "INSUFFICIENT_DATA" ? `only ${f.trunk.runs} trunk runs before, too few to call a flake; in ${suite} only; requested if it fails again` : FIRST_FAILURE.has(f.class) ? f.failed_everywhere?.length ? `failed every try and on ${f.failed_everywhere.join(" and ")} on this commit; in ${suite} only; requested if it fails again` : f.trunk.fails + f.trunk.flaky > 0 ? `failed or flaked in ${f.trunk.fails + f.trunk.flaky} of ${f.trunk.runs} trunk runs before, too rarely or another way to call a flake; in ${suite} only; requested if it fails again` : `first failure, in ${suite} only; requested if it fails again` : f.class === "FLAKY_ON_TRUNK" ? "first flake on trunk; requested if it flakes again" : null;
       if (reason) out.push({ spec, suite, title: f.full_title || f.title, reason });
     }
   }
