@@ -250,6 +250,25 @@ test("on trunk, an intermittent failure whose last run passed is a flake and cle
   assert.equal(f.class, "FLAKY_ON_TRUNK");
   assert.equal(f.blocking, false);
 });
+test("on trunk, a flake clears only where trunk failed the same way", () => {
+  const trunkRun = { isTrunkRun: true };
+  const error = 'Error: expect(locator).toHaveText(expected) failed: expected "Channel header" but received "Set a header"';
+  const ref: TestRef = { ...failing, error };
+  // A PR's flake needs trunk's failure with the same error: trunk's flakes of another error say nothing about this one.
+  const other = obs({ status: "flaky", commit_sha: "o1", error_excerpt: "Error: apiCreateChannel failed: No response from server" });
+  const newWay = classify(ref, [...trunkPasses(8), other], [], undefined, null, null, trunkRun);
+  assert.deepEqual([newWay.class, newWay.blocking], ["REGRESSION", true]);
+  assert.match(newWay.reason, /never with this error; there it failed with "Error: apiCreateChannel failed/);
+  const same = obs({ status: "failed", commit_sha: "s1", error_excerpt: error });
+  assert.equal(classify(ref, [...trunkPasses(8), same], [], undefined, null, null, trunkRun).class, "FLAKY_ON_TRUNK");
+  // No rate floor on trunk: one same failure in 50 runs still clears (a real break is a streak on the next run).
+  assert.equal(classify(ref, [...trunkPasses(49), same], [], undefined, null, null, trunkRun).class, "FLAKY_ON_TRUNK");
+  // A bare timeout that failed every try here needs trunk to have failed that way, as on a PR.
+  const bare = "Error: Test timeout of 60000ms exceeded.";
+  const hard = classify({ ...failing, error: bare, tries: { ran: 2, failed: 2 } }, [...trunkPasses(8), same], [], undefined, null, null, trunkRun);
+  assert.deepEqual([hard.class, hard.blocking], ["REGRESSION", true]);
+  assert.match(hard.reason, /failed every try here/);
+});
 test("on trunk, a pass on retry does not end a streak; a test that keeps failing and passing is a flake", () => {
   // mattermost release-12.1 run 40292449090: passed every run to 10-21 14:43, then failed every try in each run but one,
   // which passed on its retest (flaky). Every try failed here too.
@@ -4584,19 +4603,41 @@ test("failing every try here and on another platform of this commit is never cle
   }
 });
 
-test("a rules clear of a failure everywhere is undone only where nothing failed the same way", async () => {
+test("a rules clear of a failure everywhere is undone, whatever trunk failed", async () => {
   const bare = 'Error: thrown: "Exceeded timeout of 300000 ms for a hook.';
-  // Desktop #4042: master fails the test the same way on two OSes; its failure everywhere is master's flake.
+  // Desktop #4042: master failed the test the same way once, and this failure on another OS is held too: a flake of
+  // master's error is no evidence against the same test failing on two platforms of one commit.
   const sameWay = "Error: Timed out waiting for selector \".DesktopAuthToken\" to be visible";
   const everywhere = (error: string, trunk: Observation[]): Finding => holdFailedEverywhere([{ ...classify({ ...failing, error, tries: { ran: 2, failed: 2 } }, trunk, []), other_lanes: [{ platform: "macos", result: "failed" }] }])[0];
   const flake = (error: string): Observation[] => [...trunkPasses(8), obs({ status: "failed", commit_sha: "f1", error_excerpt: error })];
   const held = everywhere(bare, flake(bare));
   assert.deepEqual([held.class, held.blocking, held.failed_everywhere], ["REGRESSION", true, ["macos"]], "a bare timeout matches nothing");
   const master = everywhere(sameWay, flake(sameWay));
-  assert.deepEqual([master.class, master.blocking, master.failed_everywhere], ["FLAKY_ON_TRUNK", false, undefined]);
+  assert.deepEqual([master.class, master.blocking, master.failed_everywhere], ["REGRESSION", true, ["macos"]], "trunk's flake of the same error does not clear it");
+  assert.match(master.reason, /^Failed all 2 tries here and failed on macos on this same commit; a flake rarely does that\. Its clear does not stand: Unstable on trunk/);
   // A break on trunk and the PR's own spec keep their calls.
   assert.equal(everywhere(sameWay, [obs({ status: "failed", error_excerpt: sameWay }), ...trunkPasses(6)]).class, "BROKEN_ON_TRUNK");
   assert.equal(holdFailedEverywhere([finding({ class: "OWNED_BY_PR", blocking: true, tries: { ran: 2, failed: 2 }, other_lanes: [{ platform: "ios", result: "failed" }] })])[0].failed_everywhere, undefined);
+});
+
+test("a failure that failed every try here and on another platform is held even where trunk failed it the same way", () => {
+  // mobile #10048, run 40585344391: the dialog test failed every try on iOS and on Android, and trunk had failed it once with
+  // this error. Trunk's flake does not make a failure on two platforms of one commit a flake.
+  const toggle = "Error: locator.check: Clicking the checkbox did not change its state\nCall log:\n  - attempting click action";
+  const stuck = "Error: locator.click: Timeout 15000ms exceeded.\nCall log:\n  - waiting for getByRole('button', { name: 'Save' })";
+  const onAndroid = (error: string, tries: { ran: number; failed: number } = { ran: 2, failed: 2 }, result = "failed"): Finding => holdFailedEverywhere([{
+    ...classify({ ...failing, error, tries }, [...trunkPasses(8), obs({ status: "failed", commit_sha: "f1", error_excerpt: error })], []),
+    other_lanes: [{ platform: "android", result }],
+  }])[0];
+  for (const error of [toggle, stuck]) {
+    const f = onAndroid(error);
+    assert.deepEqual([f.class, f.blocking, f.failed_everywhere], ["REGRESSION", true, ["android"]], JSON.stringify(error));
+    assert.match(f.reason, /^Failed all 2 tries here and failed on android on this same commit; a flake rarely does that\./, JSON.stringify(error));
+  }
+  // Each condition alone still clears: a try passed here, one try only, or the other platform passed it.
+  assert.equal(onAndroid(toggle, { ran: 2, failed: 1 }).class, "FLAKY_ON_TRUNK", "one try passed here");
+  assert.equal(onAndroid(toggle, { ran: 1, failed: 1 }).class, "FLAKY_ON_TRUNK", "one try only");
+  assert.equal(onAndroid(toggle, { ran: 2, failed: 2 }, "passed").class, "FLAKY_ON_TRUNK", "passed on the other platform, as before");
 });
 
 test("a Mattermost id joined to a selector does not make master's failure another one", () => {

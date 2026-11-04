@@ -104,9 +104,10 @@ failed only in 3 such runs, and each of those counted as that test's flakiness.
 (at least two) and failed on another platform of the same commit (iOS and Android,
 Linux and Windows, or the enterprise and FIPS lanes) is never cleared by the model
 or a same-failure match; the model may still name the PR. A flake rarely does
-that, and a change to shared code does. A clear by the rules stands only where
-master or 3+ other PRs failed it the same way. One that rests on nothing comparable
-(a bare timeout) is held as `REGRESSION` and needs investigation. A break on master, an
+that, and a change to shared code does. A clear by the rules is undone too, even
+one that master's flakes of the same error would support: those flakes say
+nothing about the same test failing on two platforms of this commit. Such a
+failure is held as `REGRESSION` and needs investigation. A break on master, an
 environment error, and a spec the PR edits keep their own calls. Either condition
 alone changes nothing.
 
@@ -497,6 +498,12 @@ Consumers check `schema` first. A future change to the shape bumps it.
 Without a PR number, the run is a trunk run. A failure that was already there in
 the previous run is a streak and stays blocking; only intermittency clears. The
 model is not asked.
+
+A flake clears only where the previous runs failed it the same way, as on a PR
+(the same error, a timeout's stuck step, or for a bare timeout or no error, the
+same kind). A failure with another error is `REGRESSION`, blocking. There is no
+rate threshold here: a real break that matches an old flake fails again in the
+next run and is then a streak.
 
 ## Tests
 
