@@ -7,7 +7,8 @@ fix only for what repeats:
 | Failure | Action |
 | --- | --- |
 | Failed in this run and the previous one (`BROKEN_ON_TRUNK`) | fix |
-| Intermittent on trunk: failed in this run and at least once before (`FLAKY_ON_TRUNK`) | fix |
+| Intermittent on trunk: failed in this run; trunk failed or flaked it in about 1 in 20 runs before, with the same error where the error names its cause (`FLAKY_ON_TRUNK`; see [trunk runs](../e2e-test-triage/README.md#trunk-runs)) | fix |
+| Failed in this run, and trunk failed or flaked it too rarely, or with another error (`REGRESSION`); or failed every try here and on another platform of this commit, held (`failed_everywhere`); or trunk has too little history to say (`INSUFFICIENT_DATA`) | as a first failure: wait for the next run |
 | Failed and then passed on retry in this run, and failed or flaked on trunk at least once before | fix (flaky) |
 | Failed for the first time in two or more lanes (suites) of the same run, e.g. enterprise and FIPS | fix (broken) |
 | Failed for the first time, in one lane | wait for the next run |

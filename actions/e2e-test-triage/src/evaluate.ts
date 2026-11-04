@@ -172,6 +172,10 @@ export async function evaluateRun({
       }
     }
     holdFailedEverywhere(result.findings);
+    // A finding the hold just turned into a REGRESSION gets the same check as one classified so: does the PR touch the
+    // test or a file its error names? (Set above only for findings that were already REGRESSION.)
+    for (const f of result.findings)
+      if (prNumber && diff.ok && f.class === "REGRESSION" && f.untouched === undefined) f.untouched = !changed.some((name) => namesChangedFile(f, name));
     // A release branch judged on its default branch's history: another line of code, so nothing clears on it.
     if (branchBase && trunkBranch === branchBase)
       for (const f of result.findings)

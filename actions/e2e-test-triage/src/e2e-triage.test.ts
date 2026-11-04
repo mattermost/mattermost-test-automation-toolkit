@@ -23,6 +23,7 @@ import type { EvaluatedRun, EvaluateParams } from "./evaluate.ts";
 import { NotTriagedError, triage } from "./triage.ts";
 import { FINDINGS_SCHEMA, checkFindingsShape, findingLogLine, redact } from "./findings.ts";
 import type { CommitStatus, Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
+import { RETRY_DELAYS_MS } from "../../shared/src/github.ts";
 import { laneSummary, redReason } from "../../shared/src/lane.ts";
 import { FAILED_TESTS, UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
@@ -249,6 +250,30 @@ test("on trunk, an intermittent failure whose last run passed is a flake and cle
   const f = classify(failing, history, [], undefined, null, null, { isTrunkRun: true });
   assert.equal(f.class, "FLAKY_ON_TRUNK");
   assert.equal(f.blocking, false);
+});
+test("on trunk, a failure clears on trunk's instability only as a PR's would: often enough, and the same failure", () => {
+  // desktop master run 41462716210: MM-T5611 failed every try on Windows after the Electron 45.2.1 upgrade, and was
+  // cleared on one flaky pass with the same error (61c577d, 2026-10-02) among 48 trunk runs.
+  const error = 'Error: Timed out waiting for selector "[data-testid="linkInput"]" to be visible\n    at ..\\helpers\\serverView.ts:659';
+  const hard = { ...failing, title: "MM-T5611 Open a bookmark URL/link (External and Internal links)", error, tries: { ran: 2, failed: 2 } };
+  const flake = obs({ commit_sha: "61c577d", status: "flaky", error_excerpt: error });
+  const opts = { isTrunkRun: true };
+  const once = classify(hard, [...trunkPasses(20), flake, ...trunkPasses(27)], [], undefined, null, null, opts);
+  assert.deepEqual([once.class, once.blocking], ["REGRESSION", true]);
+  assert.equal(once.reason, "Rarely unstable on trunk: 0 failures and 1 flaky passes in the previous 48 runs, too few to call this failure a flake.");
+  // A genuinely flaky test, at pMin or above with the same error, still clears on trunk, every try failed or not.
+  const twice = [...trunkPasses(20), flake, obs({ commit_sha: "f2", status: "failed", error_excerpt: error }), ...trunkPasses(26)];
+  assert.deepEqual([classify(hard, twice, [], undefined, null, null, opts).class, classify(hard, twice, [], undefined, null, null, opts).blocking], ["FLAKY_ON_TRUNK", false]);
+  assert.equal(classify(hard, twice, []).class, "FLAKY_ON_TRUNK", "as a PR's failure clears on the same history");
+  // Unstable often enough, but never with this error: trunk's flake says nothing about it.
+  const other = obs({ commit_sha: "o1", status: "flaky", error_excerpt: "Error: Bookmarks Bar menu item not found in channel header menu" });
+  const otherError = classify(hard, [...trunkPasses(8), other], [], undefined, null, null, opts);
+  assert.deepEqual([otherError.class, otherError.blocking], ["REGRESSION", true]);
+  assert.match(otherError.reason, /never with this error/);
+  // A bare timeout that failed every try needs trunk to have timed out that way too.
+  const bare = { ...failing, error: "Error: Test timeout of 60000ms exceeded.", tries: { ran: 2, failed: 2 } };
+  assert.equal(classify(bare, [...trunkPasses(8), other], [], undefined, null, null, opts).class, "REGRESSION");
+  assert.equal(classify(bare, [...trunkPasses(8), obs({ commit_sha: "t1", status: "flaky", error_excerpt: "Error: Test timeout of 30000ms exceeded." })], [], undefined, null, null, opts).class, "FLAKY_ON_TRUNK");
 });
 test("on trunk, a pass on retry does not end a streak; a test that keeps failing and passing is a flake", () => {
   // mattermost release-12.1 run 40292449090: passed every run to 10-21 14:43, then failed every try in each run but one,
@@ -2454,9 +2479,14 @@ test("triage reports publication only after an owned required-status write succe
       : kind === "superseded"
         ? [["/commits/abc/statuses", () => Response.json([{ context: env.STATUS_CONTEXT, state: "failure", target_url: "https://github.com/o/r/actions/runs/99" }])]]
         : [];
-    const work = triage({ env: { ...env, GITHUB_OUTPUT: join(dir, "output") }, fetchImpl: fakeFetch([...overrides, ...judgedRoutes()]), log: () => {} });
-    if (kind === "write-error") await assert.rejects(work, /503/);
-    else await work;
+    const fetchImpl = fakeFetch([...overrides, ...judgedRoutes()]);
+    const work = triage({ env: { ...env, GITHUB_OUTPUT: join(dir, "output") }, fetchImpl, log: () => {}, retryWait: async () => {} });
+    if (kind === "write-error") {
+      await assert.rejects(work, /503/);
+      // A GitHub 5xx on the status write is tried again before triage gives up on it.
+      const writes = fetchImpl.calls.filter((c) => c.url.endsWith("/statuses/abc") && c.init.method === "POST" && parsed<StatusBody>(bodyText(c.init)).context === env.STATUS_CONTEXT);
+      assert.equal(writes.length, RETRY_DELAYS_MS.length + 1);
+    } else await work;
     const output = readFileSync(join(dir, "output"), "utf8");
     assert.match(output, /verdict=SUCCESS\n/, "a diagnostic verdict alone does not establish publication");
     if (kind === "current") assert.match(output, /published=true\n/);
@@ -4584,19 +4614,78 @@ test("failing every try here and on another platform of this commit is never cle
   }
 });
 
-test("a rules clear of a failure everywhere is undone only where nothing failed the same way", async () => {
+test("a rules clear of a failure everywhere is undone, whatever trunk failed", async () => {
   const bare = 'Error: thrown: "Exceeded timeout of 300000 ms for a hook.';
-  // Desktop #4042: master fails the test the same way on two OSes; its failure everywhere is master's flake.
+  // Desktop #4042: master failed the test the same way once, and this failure on another OS is held too: a flake of
+  // master's error is no evidence against the same test failing on two platforms of one commit.
   const sameWay = "Error: Timed out waiting for selector \".DesktopAuthToken\" to be visible";
   const everywhere = (error: string, trunk: Observation[]): Finding => holdFailedEverywhere([{ ...classify({ ...failing, error, tries: { ran: 2, failed: 2 } }, trunk, []), other_lanes: [{ platform: "macos", result: "failed" }] }])[0];
   const flake = (error: string): Observation[] => [...trunkPasses(8), obs({ status: "failed", commit_sha: "f1", error_excerpt: error })];
   const held = everywhere(bare, flake(bare));
   assert.deepEqual([held.class, held.blocking, held.failed_everywhere], ["REGRESSION", true, ["macos"]], "a bare timeout matches nothing");
   const master = everywhere(sameWay, flake(sameWay));
-  assert.deepEqual([master.class, master.blocking, master.failed_everywhere], ["FLAKY_ON_TRUNK", false, undefined]);
+  assert.deepEqual([master.class, master.blocking, master.failed_everywhere], ["REGRESSION", true, ["macos"]], "trunk's flake of the same error does not clear it");
+  assert.match(master.reason, /^Failed all 2 tries here and failed on macos on this same commit; a flake rarely does that\. Its clear does not stand: Unstable on trunk/);
   // A break on trunk and the PR's own spec keep their calls.
   assert.equal(everywhere(sameWay, [obs({ status: "failed", error_excerpt: sameWay }), ...trunkPasses(6)]).class, "BROKEN_ON_TRUNK");
   assert.equal(holdFailedEverywhere([finding({ class: "OWNED_BY_PR", blocking: true, tries: { ran: 2, failed: 2 }, other_lanes: [{ platform: "ios", result: "failed" }] })])[0].failed_everywhere, undefined);
+});
+
+test("a failure that failed every try here and on another platform is held even where trunk failed it the same way", () => {
+  // mobile #10048, run 40585344391: the dialog test failed every try on iOS and on Android, and trunk had failed it once with
+  // this error. Trunk's flake does not make a failure on two platforms of one commit a flake.
+  const toggle = "Error: locator.check: Clicking the checkbox did not change its state\nCall log:\n  - attempting click action";
+  const stuck = "Error: locator.click: Timeout 15000ms exceeded.\nCall log:\n  - waiting for getByRole('button', { name: 'Save' })";
+  const onAndroid = (error: string, tries: { ran: number; failed: number } = { ran: 2, failed: 2 }, result = "failed"): Finding => holdFailedEverywhere([{
+    ...classify({ ...failing, error, tries }, [...trunkPasses(8), obs({ status: "failed", commit_sha: "f1", error_excerpt: error })], []),
+    other_lanes: [{ platform: "android", result }],
+  }])[0];
+  for (const error of [toggle, stuck]) {
+    const before = classify({ ...failing, error, tries: { ran: 2, failed: 2 } }, [...trunkPasses(8), obs({ status: "failed", commit_sha: "f1", error_excerpt: error })], []);
+    assert.equal(before.class, "FLAKY_ON_TRUNK", `trunk's flake clears it before the hold: ${JSON.stringify(error)}`);
+    const f = onAndroid(error);
+    assert.deepEqual([f.class, f.blocking, f.failed_everywhere], ["REGRESSION", true, ["android"]], JSON.stringify(error));
+    assert.match(f.reason, /^Failed all 2 tries here and failed on android on this same commit; a flake rarely does that\./, JSON.stringify(error));
+  }
+  // Each condition alone still clears: a try passed here, one try only, or the other platform passed it.
+  assert.equal(onAndroid(toggle, { ran: 2, failed: 1 }).class, "FLAKY_ON_TRUNK", "one try passed here");
+  assert.equal(onAndroid(toggle, { ran: 1, failed: 1 }).class, "FLAKY_ON_TRUNK", "one try only");
+  assert.equal(onAndroid(toggle, { ran: 2, failed: 2 }, "passed").class, "FLAKY_ON_TRUNK", "passed on the other platform, as before");
+});
+
+test("a blocking flake held as failing everywhere is REGRESSION; a blocking REGRESSION or INSUFFICIENT_DATA keeps its class", () => {
+  // A blind run leaves a flake blocking without changing its class: the hold must still make it a REGRESSION.
+  const lanes = [{ platform: "android", result: "failed" }];
+  const flaky = holdFailedEverywhere([finding({ class: "FLAKY_ON_TRUNK", blocking: true, tries: { ran: 2, failed: 2 }, other_lanes: lanes })])[0];
+  assert.deepEqual([flaky.class, flaky.blocking, flaky.failed_everywhere], ["REGRESSION", true, ["android"]]);
+  const borderline = holdFailedEverywhere([finding({ class: "INSUFFICIENT_DATA", blocking: true, tries: { ran: 2, failed: 2 }, other_lanes: lanes })])[0];
+  assert.deepEqual([borderline.class, borderline.blocking], ["INSUFFICIENT_DATA", true], "a blocking call keeps its class");
+});
+
+test("a trunk flake that failed every try here and on another platform of the commit is held too", async () => {
+  // Sibling platforms are read on trunk as on a PR, so the hold applies with no PR number.
+  const error = "Error: expected visible";
+  const run = runOf([{ title: "t1", file: "specs/a.spec.ts", error }]);
+  run.failing[0].tries = { ran: 2, failed: 2 };
+  const history = new Map([[identityKey(run.failing[0]), [...trunkPasses(8), obs({ status: "failed", commit_sha: "f1", error_excerpt: error })]]]);
+  const on = (result: string): Partial<EvaluateParams> => ({ prNumber: null, history, otherPlatforms: async (fs) => { for (const f of fs) f.other_lanes = [{ platform: "macos", result }]; } });
+  const passed = (await evaluate(run, on("passed"))).findings[0];
+  assert.deepEqual([passed.class, passed.blocking], ["FLAKY_ON_TRUNK", false], "trunk's flake clears it when the other platform passed");
+  const [held] = (await evaluate(run, on("failed"))).findings;
+  assert.deepEqual([held.class, held.blocking, held.failed_everywhere], ["REGRESSION", true, ["macos"]]);
+  assert.match(held.reason, /^Failed all 2 tries here and failed on macos on this same commit; a flake rarely does that\./);
+});
+
+test("a flaky clear the hold turns into a REGRESSION says whether the PR touches a file its error names", async () => {
+  const error = "Error: expected visible at helpers/login.ts:12";
+  const run = runOf([{ title: "t1", file: "specs/a.spec.ts", error }]);
+  run.failing[0].tries = { ran: 2, failed: 2 };
+  const history = new Map([[identityKey(run.failing[0]), [...trunkPasses(8), obs({ status: "failed", commit_sha: "f1", error_excerpt: error })]]]);
+  const otherPlatforms = async (fs: Finding[]) => { for (const f of fs) f.other_lanes = [{ platform: "android", result: "failed" }]; };
+  const touched = (await evaluate(run, { history, otherPlatforms, diff: { files: [{ filename: "helpers/login.ts", patch: "@@" }], ok: true } })).findings[0];
+  assert.deepEqual([touched.class, touched.blocking, touched.untouched], ["REGRESSION", true, false]);
+  const untouched = (await evaluate(run, { history, otherPlatforms, diff: { files: [{ filename: "docs/readme.md", patch: "@@" }], ok: true } })).findings[0];
+  assert.deepEqual([untouched.class, untouched.untouched], ["REGRESSION", true]);
 });
 
 test("a Mattermost id joined to a selector does not make master's failure another one", () => {

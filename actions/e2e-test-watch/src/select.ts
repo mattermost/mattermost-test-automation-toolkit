@@ -16,7 +16,7 @@ const ERROR_CHARS = 600;
 const MIN_FLAKY = 1;
 
 /** The parts of a triage finding that selecting repairs reads. */
-export type RepairFinding = Pick<Finding, "class" | "title" | "full_title" | "file" | "repo_path" | "error" | "identity_unresolved" | "trunk">;
+export type RepairFinding = Pick<Finding, "class" | "title" | "full_title" | "file" | "repo_path" | "error" | "identity_unresolved" | "trunk" | "failed_everywhere">;
 
 /** A test that failed and then passed on retry in one run, as retryRecovered finds it. */
 export interface RecoveredTest {
@@ -151,8 +151,9 @@ export interface Unselected {
 const REPAIRABLE = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", ...FIRST_FAILURE]);
 
 /**
- * The failing tests in specs no group covers, with why each waits: a first failure in one lane, a first
- * flake, or a name two tests share. Read so a red trunk run with no request says what it saw.
+ * The failing tests in specs no group covers, with why each waits: a first failure in one lane (or one trunk's history
+ * does not call a flake), a first flake, or a name two tests share. Read so a red trunk run with no request says what
+ * it saw.
  */
 export function unselected(bySuite: { suite: string; findings: readonly RepairFinding[] }[], selected: ReadonlySet<string>): Unselected[] {
   const out: Unselected[] = [];
@@ -160,10 +161,19 @@ export function unselected(bySuite: { suite: string; findings: readonly RepairFi
     for (const f of findings) {
       const spec = specOf(f);
       if (selected.has(spec) || !REPAIRABLE.has(f.class)) continue;
+      // A cross-platform failure leads even where history is too short to call a flake: it is the stronger fact.
       const reason = f.identity_unresolved
         ? "shares its name with another test, so its history can't be read"
-        : FIRST_FAILURE.has(f.class)
-          ? `first failure, in ${suite} only; requested if it fails again`
+        : f.class === "INSUFFICIENT_DATA"
+          ? f.failed_everywhere?.length
+            ? `failed every try and on ${f.failed_everywhere.join(" and ")} on this commit; only ${f.trunk.runs} trunk runs before; in ${suite} only; requested if it fails again`
+            : `only ${f.trunk.runs} trunk runs before, too few to call a flake; in ${suite} only; requested if it fails again`
+          : FIRST_FAILURE.has(f.class)
+            ? f.failed_everywhere?.length
+              ? `failed every try and on ${f.failed_everywhere.join(" and ")} on this commit; in ${suite} only; requested if it fails again`
+              : f.trunk.fails + f.trunk.flaky > 0
+                ? `failed or flaked in ${f.trunk.fails + f.trunk.flaky} of ${f.trunk.runs} trunk runs before, too rarely or another way to call a flake; in ${suite} only; requested if it fails again`
+                : `first failure, in ${suite} only; requested if it fails again`
           : f.class === "FLAKY_ON_TRUNK"
             ? "first flake on trunk; requested if it flakes again"
             : null;

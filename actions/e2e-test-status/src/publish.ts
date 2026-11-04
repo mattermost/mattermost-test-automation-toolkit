@@ -2,7 +2,7 @@
 // See LICENSE.txt for license information.
 import { appendFileSync } from "node:fs";
 import { gh } from "../../shared/src/github.ts";
-import type { Env, FetchImpl } from "../../shared/src/github.ts";
+import type { Env, FetchImpl, Sleep } from "../../shared/src/github.ts";
 import { laneSummary } from "../../shared/src/lane.ts";
 import { FAILED_TESTS, REPORTS_INCOMPLETE, statusPublisher, UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import { compositeIdentityFrom, fetchRun, tsioBase } from "../../shared/src/tsio.ts";
@@ -24,9 +24,11 @@ export interface PublishOptions {
   fetchImpl?: FetchImpl;
   log?: (message: string) => void;
   wait?: Wait;
+  /** Waits between a status write's retries; a test passes one that does not sleep. */
+  retryWait?: Sleep;
 }
 
-export async function publish({ env, fetchImpl = fetch, log = console.error, wait }: PublishOptions): Promise<boolean> {
+export async function publish({ env, fetchImpl = fetch, log = console.error, wait, retryWait }: PublishOptions): Promise<boolean> {
   if (env.CANCELLED === "true") return false;
   // The identity is trusted as written by the caller, as before: no shape check.
   const id = compositeIdentityFrom(env.COMPOSITE_IDENTITY);
@@ -36,7 +38,7 @@ export async function publish({ env, fetchImpl = fetch, log = console.error, wai
   // before any GitHub or TSIO call. claim, refresh and summarize read no TSIO and still publish.
   if (operation === "finish") tsioBase(env);
   if (!env.STATUS_CONTEXT || !env.GITHUB_TOKEN) throw new Error("Status context and GitHub token are required");
-  const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN), id, context: env.STATUS_CONTEXT, env, log });
+  const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN, retryWait), id, context: env.STATUS_CONTEXT, env, log });
   let written = false;
   let state: string = env.STATUS_STATE ?? "";
   let reportsComplete = false;

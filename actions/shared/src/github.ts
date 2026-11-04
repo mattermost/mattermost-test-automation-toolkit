@@ -18,15 +18,59 @@ export interface CommitStatus {
   target_url?: string | null;
 }
 
-export function gh(fetchImpl: FetchImpl, token: string): GhApi {
+/** Waits between attempts of a retried call; a test passes one that does not sleep. */
+export type Sleep = (ms: number) => Promise<void>;
+
+const sleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// A commit status POST only sets that context's latest state: posting it again posts the same
+// row, so a GitHub 5xx, a 429 or a dropped connection is tried again. Left failed, the lane
+// stays at the pending its claim posted, and nothing after it writes the context.
+const STATUS_POST = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/?]+$/;
+export const RETRY_DELAYS_MS: readonly number[] = Object.freeze([1000, 3000]);
+
+// A 429's Retry-After is not read: these short waits cover a brief burst, and a longer limit fails as before.
+const retryable = (status: number): boolean => status >= 500 || status === 429;
+
+// fetch (undici) rejects a dropped connection with a TypeError ("fetch failed" before headers, "terminated" while
+// reading the body) whose cause says why, and an expired or aborted signal with a DOMException (TimeoutError,
+// AbortError). Any other TypeError is not the network's doing (an invalid header value, for one), and a SyntaxError
+// from res.json() is a bad response body, not a dropped connection. A timed-out write is retried too: with the 60 s
+// signal a status POST that keeps hanging gives up after about 3 minutes.
+const networkError = (e: unknown): boolean =>
+  (e instanceof TypeError && (e.message === "fetch failed" || e.message === "terminated")) ||
+  (e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError"));
+
+export function gh(fetchImpl: FetchImpl, token: string, wait: Sleep = sleep): GhApi {
   return async (method, path, body) => {
-    const res = await fetchImpl(`https://api.github.com${path}`, {
-      method,
-      headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json", "user-agent": "mattermost-e2e-triage" },
-      body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(60000),
-    });
-    if (!res.ok) throw new Error(`GitHub ${method} ${path}: ${res.status} ${(await res.text()).slice(0, 200)}`);
-    return res.status === 204 ? null : res.json();
+    // Only a status write is safe to repeat; other writes (a re-run request) are not.
+    const delays = method === "POST" && STATUS_POST.test(path) ? RETRY_DELAYS_MS : [];
+    // Outside the retry: a body that cannot be serialized is the caller's error, not the network's.
+    const payload = body ? JSON.stringify(body) : undefined;
+    for (let attempt = 0; ; attempt++) {
+      let res: Response;
+      try {
+        res = await fetchImpl(`https://api.github.com${path}`, {
+          method,
+          headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json", "user-agent": "mattermost-e2e-triage" },
+          body: payload,
+          signal: AbortSignal.timeout(60000),
+        });
+        if (res.ok) return res.status === 204 ? null : await res.json();
+      } catch (e) {
+        if (networkError(e) && attempt < delays.length) {
+          await wait(delays[attempt]);
+          continue;
+        }
+        throw e;
+      }
+      // The body only names the error: one that cannot be read must not stop a retry.
+      const text = (await res.text().catch(() => "")).slice(0, 200);
+      if (retryable(res.status) && attempt < delays.length) {
+        await wait(delays[attempt]);
+        continue;
+      }
+      throw new Error(`GitHub ${method} ${path}: ${res.status} ${text}`);
+    }
   };
 }
