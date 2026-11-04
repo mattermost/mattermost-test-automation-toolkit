@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { RETRY_DELAYS_MS } from "../../shared/src/github.ts";
 import type { CommitStatus, Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { laneSummary } from "../../shared/src/lane.ts";
 import { mayPublish, ownedURL, publishingOwner, readStatuses, statusOwner, statusPublisher } from "../../shared/src/status.ts";
@@ -115,6 +116,23 @@ test("new pending, clean result and raw failure replace an existing all-green ag
 });
 test("cancelled publication preserves statuses and does not even read GitHub", async () => {
   assert.equal(await publish({ env: { CANCELLED: "true" }, fetchImpl: () => { throw new Error("should not fetch"); } }), false);
+});
+test("a status write answered 503 is tried again, and publish's retryWait is used for the wait", async () => {
+  const f = fixture();
+  let posts = 0;
+  const fetchImpl: FetchImpl = async (url, init) => {
+    if (init?.method === "POST" && ++posts === 1) return new Response("unavailable", { status: 503 });
+    return f.fetchImpl(url, init);
+  };
+  const waits: number[] = [];
+  const written = await publish({
+    env: { COMPOSITE_IDENTITY: JSON.stringify(id), GITHUB_TOKEN: "fake", STATUS_CONTEXT: lane, OPERATION: "claim", STATUS_STATE: "pending", GITHUB_RUN_ID: "20", GITHUB_RUN_ATTEMPT: "1" },
+    fetchImpl,
+    retryWait: async (ms) => { waits.push(ms); },
+  });
+  assert.equal(written, true);
+  assert.deepEqual([posts, waits], [2, [RETRY_DELAYS_MS[0]]]);
+  assert.equal(f.rows.find((r) => r.context === lane)?.state, "pending");
 });
 test("finishing a summary verifies execution and exact-run reports before allowing green", async (t) => {
   const cases = [

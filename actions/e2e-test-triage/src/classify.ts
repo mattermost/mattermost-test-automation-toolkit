@@ -462,7 +462,8 @@ export function sameFailure(findings: Finding[]): Finding[] {
 
 /**
  * A failure that failed every try here and on another platform of this commit is not flakiness: a flake rarely does
- * that, a change to shared code does. Neither the model nor sameFailure may clear it. A rules clear is undone too, even
+ * that, a change to shared code does. Neither the model nor sameFailure may clear it, except on a release branch, where the
+ * model may still unblock it (decideRelease). A rules clear is undone too, even
  * one that trunk's flakes with the same error support: a flake of one platform's error on trunk says nothing about the
  * same test failing on two platforms of this commit. A held flaky clear becomes REGRESSION; a blocking REGRESSION or
  * INSUFFICIENT_DATA keeps its class. A break on trunk, an environment error and a failure this change owns are not in

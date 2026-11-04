@@ -112,7 +112,9 @@ investigation, and a blocking `REGRESSION` or `INSUFFICIENT_DATA` keeps its clas
 A break on master, an environment error, and a spec the PR edits keep their own
 calls. Either condition alone changes nothing. On a release branch the hold is
 not final: the model may still unblock a test bug or a server compat problem (see
-the release section below).
+the release section below). A held failure that is also out of date shows in the
+out-of-date bucket ("merge and re-run"), because the out-of-date mark is set after
+the hold.
 
 **Fixed on master:** master failed the test the same way in at least 3 runs in a
 row and has passed since. That is a break master fixed, not a flake: a branch
@@ -507,9 +509,9 @@ counting failures and flaky passes of any error (one flake in 48 runs is 2/50 = 
 too rare). Whether trunk must also have failed the same way depends
 on the error:
 
-- A distinctive or stuck error: trunk failed with the same error.
+- A distinctive or stuck error: trunk failed or flaked with the same error.
 - A bare timeout or an unusable (e.g. empty) error that failed every try: trunk failed
-  with the same kind.
+  or flaked with the same kind.
 - A bare or unusable error that passed on some try, or whose tries are unknown: the
   rate alone.
 
@@ -517,9 +519,12 @@ Otherwise the failure stays blocking as a `REGRESSION`. Failing again in the nex
 makes it `BROKEN_ON_TRUNK`.
 
 A failure that failed every try here and on another platform of the same commit
-is held there too, as on a PR: a flaky clear becomes `REGRESSION`, blocking, and a
-failure that is already blocking (`BROKEN_ON_TRUNK`, `INSUFFICIENT_DATA`) keeps its
-class (see "Failed everywhere" above).
+is held there too, as on a PR, and only the held classes are: `REGRESSION`,
+`INSUFFICIENT_DATA` and the flaky classes (`FLAKY_ON_TRUNK`, `FLAKY_CROSS_PR`). A
+flaky clear becomes `REGRESSION`, blocking. A blocking `REGRESSION` or
+`INSUFFICIENT_DATA` keeps its class and gets the `failed_everywhere` mark. A break
+already blocking on trunk (`BROKEN_ON_TRUNK`, `FIXED_ON_TRUNK`) is not held and gets
+no mark (see "Failed everywhere" above).
 
 ## Tests
 

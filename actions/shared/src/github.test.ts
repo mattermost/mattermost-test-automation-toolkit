@@ -9,20 +9,21 @@ import type { FetchImpl } from "./github.ts";
 
 const STATUS = "/repos/mattermost/mattermost/statuses/abc123";
 
-// Answers each call with the next step: a status code, or an Error to throw (a dropped connection).
-const scripted = (...steps: (number | Error)[]) => {
+// Answers each call with the next step: a status code, a Response as given, or an Error to throw (a dropped connection).
+const scripted = (...steps: (number | Error | Response)[]) => {
   const calls: { url: string; method: string }[] = [];
   const fetchImpl: FetchImpl = async (url, init) => {
     calls.push({ url: String(url), method: String(init?.method) });
     const step = steps[calls.length - 1];
     if (step instanceof Error) throw step;
+    if (step instanceof Response) return step;
     return step === 204 ? new Response(null, { status: 204 }) : Response.json({ step }, { status: step });
   };
   return { calls, fetchImpl };
 };
 
-test("a commit status POST is tried again after a GitHub 5xx, a 429 or a dropped connection", async () => {
-  for (const first of [500, 502, 503, 429, new TypeError("fetch failed"), new DOMException("timed out", "TimeoutError")]) {
+test("a commit status POST is tried again after a GitHub 5xx, a 429, a dropped connection or an aborted call", async () => {
+  for (const first of [500, 502, 503, 429, new TypeError("fetch failed"), new DOMException("timed out", "TimeoutError"), new DOMException("aborted", "AbortError")]) {
     const waits: number[] = [];
     const { calls, fetchImpl } = scripted(first, 201);
     const body = await gh(fetchImpl, "t", async (ms) => {
@@ -44,6 +45,34 @@ test("an error that is not the network's is thrown at once", async () => {
   const { calls, fetchImpl } = scripted(new Error("bug in the caller"), 201);
   await assert.rejects(gh(fetchImpl, "t", async () => {})("POST", STATUS, {}), /bug in the caller/);
   assert.equal(calls.length, 1);
+});
+
+test("a TypeError the network did not cause, such as an invalid header value, is thrown at once", async () => {
+  const { calls, fetchImpl } = scripted(new TypeError('Headers.append: "Bearer a\\nb" is an invalid header value.'), 201);
+  await assert.rejects(gh(fetchImpl, "t", async () => {})("POST", STATUS, {}), /invalid header value/);
+  assert.equal(calls.length, 1);
+});
+
+test("a TypeError with a cause but not undici's \"fetch failed\" is thrown at once", async () => {
+  const { calls, fetchImpl } = scripted(new TypeError("Invalid URL", { cause: new Error("bad input") }), 201);
+  await assert.rejects(gh(fetchImpl, "t", async () => {})("POST", STATUS, {}), /Invalid URL/);
+  assert.equal(calls.length, 1);
+});
+
+test("a 5xx whose body cannot be read is still tried again", async () => {
+  const unreadable = new Response(new ReadableStream({ pull: (c) => c.error(new Error("connection reset")) }), { status: 503 });
+  const { calls, fetchImpl } = scripted(unreadable, 201);
+  assert.deepEqual(await gh(fetchImpl, "t", async () => {})("POST", STATUS, {}), { step: 201 });
+  assert.equal(calls.length, 2);
+});
+
+test("a 429 is tried again on the same short waits, whatever its Retry-After says", async () => {
+  const limited = new Response(null, { status: 429, headers: { "retry-after": "60" } });
+  const waits: number[] = [];
+  const { calls, fetchImpl } = scripted(limited, 201);
+  assert.deepEqual(await gh(fetchImpl, "t", async (ms) => { waits.push(ms); })("POST", STATUS, {}), { step: 201 });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(waits, [RETRY_DELAYS_MS[0]]);
 });
 
 test("a 4xx fails at once: the request is wrong, not GitHub", async () => {

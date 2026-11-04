@@ -1052,7 +1052,7 @@ test("failing tests no request covers are named with why they wait", async () =>
 
   const f = (over: Partial<RepairFinding>): RepairFinding => finding({ trunk: trunkOf(0, 0, 8), ...over });
   const left = unselected(
-    [{ suite: "ent", findings: [f({ title: "same", class: "BROKEN_ON_TRUNK", identity_unresolved: true }), f({ title: "once", class: "FLAKY_ON_TRUNK", file: "b.spec.ts", repo_path: "specs/b.spec.ts" }), f({ title: "infra", class: "INFRA_ERROR", file: "c.spec.ts", repo_path: "specs/c.spec.ts" }), f({ title: "picked", file: "d.spec.ts", repo_path: "specs/d.spec.ts" }), f({ title: "rare", class: "REGRESSION", file: "e.spec.ts", repo_path: "specs/e.spec.ts", trunk: trunkOf(0, 1, 7) }), f({ title: "young", class: "INSUFFICIENT_DATA", file: "g.spec.ts", repo_path: "specs/g.spec.ts", trunk: { ...trunkOf(1, 0, 2), runs: 3 } }), f({ title: "both", class: "REGRESSION", file: "h.spec.ts", repo_path: "specs/h.spec.ts", trunk: trunkOf(0, 1, 7), failed_everywhere: ["windows"] })] }],
+    [{ suite: "ent", findings: [f({ title: "same", class: "BROKEN_ON_TRUNK", identity_unresolved: true }), f({ title: "once", class: "FLAKY_ON_TRUNK", file: "b.spec.ts", repo_path: "specs/b.spec.ts" }), f({ title: "infra", class: "INFRA_ERROR", file: "c.spec.ts", repo_path: "specs/c.spec.ts" }), f({ title: "picked", file: "d.spec.ts", repo_path: "specs/d.spec.ts" }), f({ title: "rare", class: "REGRESSION", file: "e.spec.ts", repo_path: "specs/e.spec.ts", trunk: trunkOf(0, 1, 7) }), f({ title: "young", class: "INSUFFICIENT_DATA", file: "g.spec.ts", repo_path: "specs/g.spec.ts", trunk: { ...trunkOf(1, 0, 2), runs: 3 } }), f({ title: "both", class: "REGRESSION", file: "h.spec.ts", repo_path: "specs/h.spec.ts", trunk: trunkOf(0, 1, 7), failed_everywhere: ["windows"] }), f({ title: "youngboth", class: "INSUFFICIENT_DATA", file: "i.spec.ts", repo_path: "specs/i.spec.ts", trunk: { ...trunkOf(1, 0, 2), runs: 3 }, failed_everywhere: ["windows"] })] }],
     new Set(["specs/d.spec.ts"]),
   );
   assert.deepEqual(left.map((u) => [u.spec, u.title, u.reason]), [
@@ -1065,6 +1065,8 @@ test("failing tests no request covers are named with why they wait", async () =>
     ["specs/g.spec.ts", "young", "only 3 trunk runs before, too few to call a flake; in ent only; requested if it fails again"],
     // A flake triage held for failing on another platform of the commit too says so, whatever trunk's rate.
     ["specs/h.spec.ts", "both", "failed every try and on windows on this commit; in ent only; requested if it fails again"],
+    // Too little history with a cross-platform failure: the failure leads, and the history count stays.
+    ["specs/i.spec.ts", "youngboth", "failed every try and on windows on this commit; only 3 trunk runs before; in ent only; requested if it fails again"],
   ], "an environment error is the lane's to re-run, and a spec already requested needs no note");
 });
 

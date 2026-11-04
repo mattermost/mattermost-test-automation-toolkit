@@ -8,7 +8,7 @@ var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var STATUS_POST = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/?]+$/;
 var RETRY_DELAYS_MS = Object.freeze([1e3, 3e3]);
 var retryable = (status) => status >= 500 || status === 429;
-var networkError = (e) => e instanceof TypeError || e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError");
+var networkError = (e) => e instanceof TypeError && e.message === "fetch failed" || e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError");
 function gh(fetchImpl, token, wait = sleep) {
   return async (method, path, body) => {
     const delays = method === "POST" && STATUS_POST.test(path) ? RETRY_DELAYS_MS : [];
@@ -418,14 +418,14 @@ function reportWait(env) {
   const ms = 2e4;
   return { attempts: Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds * 1e3 / ms) : 0, ms };
 }
-async function publish({ env, fetchImpl = fetch, log = console.error, wait }) {
+async function publish({ env, fetchImpl = fetch, log = console.error, wait, retryWait }) {
   if (env.CANCELLED === "true") return false;
   const id = compositeIdentityFrom(env.COMPOSITE_IDENTITY);
   const operation = env.OPERATION || "finish";
   if (!["claim", "finish", "refresh", "summarize"].includes(operation)) throw new Error("Invalid status operation");
   if (operation === "finish") tsioBase(env);
   if (!env.STATUS_CONTEXT || !env.GITHUB_TOKEN) throw new Error("Status context and GitHub token are required");
-  const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN), id, context: env.STATUS_CONTEXT, env, log });
+  const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN, retryWait), id, context: env.STATUS_CONTEXT, env, log });
   let written = false;
   let state = env.STATUS_STATE ?? "";
   let reportsComplete = false;

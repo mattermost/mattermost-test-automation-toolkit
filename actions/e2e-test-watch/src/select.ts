@@ -161,10 +161,13 @@ export function unselected(bySuite: { suite: string; findings: readonly RepairFi
     for (const f of findings) {
       const spec = specOf(f);
       if (selected.has(spec) || !REPAIRABLE.has(f.class)) continue;
+      // A cross-platform failure leads even where history is too short to call a flake: it is the stronger fact.
       const reason = f.identity_unresolved
         ? "shares its name with another test, so its history can't be read"
         : f.class === "INSUFFICIENT_DATA"
-          ? `only ${f.trunk.runs} trunk runs before, too few to call a flake; in ${suite} only; requested if it fails again`
+          ? f.failed_everywhere?.length
+            ? `failed every try and on ${f.failed_everywhere.join(" and ")} on this commit; only ${f.trunk.runs} trunk runs before; in ${suite} only; requested if it fails again`
+            : `only ${f.trunk.runs} trunk runs before, too few to call a flake; in ${suite} only; requested if it fails again`
           : FIRST_FAILURE.has(f.class)
             ? f.failed_everywhere?.length
               ? `failed every try and on ${f.failed_everywhere.join(" and ")} on this commit; in ${suite} only; requested if it fails again`

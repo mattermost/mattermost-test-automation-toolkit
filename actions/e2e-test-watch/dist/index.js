@@ -1157,7 +1157,7 @@ var sleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
 var STATUS_POST = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/?]+$/;
 var RETRY_DELAYS_MS = Object.freeze([1e3, 3e3]);
 var retryable = (status) => status >= 500 || status === 429;
-var networkError = (e) => e instanceof TypeError || e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError");
+var networkError = (e) => e instanceof TypeError && e.message === "fetch failed" || e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError");
 function gh(fetchImpl, token, wait = sleep) {
   return async (method, path, body) => {
     const delays = method === "POST" && STATUS_POST.test(path) ? RETRY_DELAYS_MS : [];
@@ -3603,7 +3603,7 @@ function unselected(bySuite, selected) {
     for (const f of findings) {
       const spec = specOf(f);
       if (selected.has(spec) || !REPAIRABLE.has(f.class)) continue;
-      const reason = f.identity_unresolved ? "shares its name with another test, so its history can't be read" : f.class === "INSUFFICIENT_DATA" ? `only ${f.trunk.runs} trunk runs before, too few to call a flake; in ${suite} only; requested if it fails again` : FIRST_FAILURE.has(f.class) ? f.failed_everywhere?.length ? `failed every try and on ${f.failed_everywhere.join(" and ")} on this commit; in ${suite} only; requested if it fails again` : f.trunk.fails + f.trunk.flaky > 0 ? `failed or flaked in ${f.trunk.fails + f.trunk.flaky} of ${f.trunk.runs} trunk runs before, too rarely or another way to call a flake; in ${suite} only; requested if it fails again` : `first failure, in ${suite} only; requested if it fails again` : f.class === "FLAKY_ON_TRUNK" ? "first flake on trunk; requested if it flakes again" : null;
+      const reason = f.identity_unresolved ? "shares its name with another test, so its history can't be read" : f.class === "INSUFFICIENT_DATA" ? f.failed_everywhere?.length ? `failed every try and on ${f.failed_everywhere.join(" and ")} on this commit; only ${f.trunk.runs} trunk runs before; in ${suite} only; requested if it fails again` : `only ${f.trunk.runs} trunk runs before, too few to call a flake; in ${suite} only; requested if it fails again` : FIRST_FAILURE.has(f.class) ? f.failed_everywhere?.length ? `failed every try and on ${f.failed_everywhere.join(" and ")} on this commit; in ${suite} only; requested if it fails again` : f.trunk.fails + f.trunk.flaky > 0 ? `failed or flaked in ${f.trunk.fails + f.trunk.flaky} of ${f.trunk.runs} trunk runs before, too rarely or another way to call a flake; in ${suite} only; requested if it fails again` : `first failure, in ${suite} only; requested if it fails again` : f.class === "FLAKY_ON_TRUNK" ? "first flake on trunk; requested if it flakes again" : null;
       if (reason) out.push({ spec, suite, title: f.full_title || f.title, reason });
     }
   }

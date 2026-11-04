@@ -8,7 +8,7 @@ var sleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
 var STATUS_POST = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/?]+$/;
 var RETRY_DELAYS_MS = Object.freeze([1e3, 3e3]);
 var retryable = (status) => status >= 500 || status === 429;
-var networkError = (e) => e instanceof TypeError || e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError");
+var networkError = (e) => e instanceof TypeError && e.message === "fetch failed" || e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError");
 function gh(fetchImpl, token, wait = sleep) {
   return async (method, path, body) => {
     const delays = method === "POST" && STATUS_POST.test(path) ? RETRY_DELAYS_MS : [];
