@@ -5043,9 +5043,11 @@ test("a PR check names failures main explains by what to do, once: pull main cha
   const mine = finding({ title: "mine", class: "OWNED_BY_PR", blocking: true });
   assert.equal(statusDescription("FAILURE", [fixed, stale], null, { passed: 8, failed: 2 }), "(pull main changes) 80.0% passed (8 passed, 2 failed, 0 skipped)");
   assert.equal(statusDescription("FAILURE", [mine, stale], null, { passed: 8, failed: 2 }), "(1 caused by PR, pull main changes) 80.0% passed (8 passed, 2 failed, 0 skipped)");
-  // A PR targeting a non-default base branch names that branch in the label.
+  // A PR targeting a non-default base branch names that branch in the label, and each finding's out_of_date.base wins over the fallback.
   const staleOnRelease = finding({ title: "stale-rel", class: "REGRESSION", blocking: true, out_of_date: { base: "release-10.5", behind: 2, commit: null } });
   assert.equal(statusDescription("FAILURE", [mine, staleOnRelease], null, { passed: 8, failed: 2 }), "(1 caused by PR, pull release-10.5 changes) 80.0% passed (8 passed, 2 failed, 0 skipped)");
+  assert.equal(statusDescription("FAILURE", [mine, stale], null, { passed: 8, failed: 2 }, null, 0, 0, null, null, "stacked-branch"), "(1 caused by PR, pull main changes) 80.0% passed (8 passed, 2 failed, 0 skipped)", "finding's out_of_date.base (master) wins when prBase fell back to default branch");
+  assert.equal(statusDescription("FAILURE", [mine, { ...stale, out_of_date: { base: "", behind: 2, commit: null } }], null, { passed: 8, failed: 2 }, null, 0, 0, null, null, "release-10.5"), "(1 caused by PR, pull release-10.5 changes) 80.0% passed (8 passed, 2 failed, 0 skipped)", "falls back to baseBranch when finding has no base");
   // A release run is not fixed by pulling main: it keeps its labels.
   assert.equal(statusDescription("FAILURE", [{ ...fixed, release: true }, { ...stale, release: true }], null, { passed: 8, failed: 2 }), "(1 fixed on main, 1 out of date) 80.0% passed (8 passed, 2 failed, 0 skipped)");
   // The per-test label, which the findings file and the desktop alert read, is unchanged.

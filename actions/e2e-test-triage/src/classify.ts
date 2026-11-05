@@ -219,7 +219,7 @@ export function classify(
     );
   // How often trunk failed or flaked this test, smoothed: trunk's instability clears a failure only at pMin or above.
   const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
-  // Why trunk's instability says nothing about this failure, or null when it may be the same flake.
+  /** Why trunk's instability says nothing about this failure, or null when it may be the same flake. */
   const notTrunksFlake = (): Finding | null => {
     const unstable = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
     // A failure with an error to compare is cleared only where trunk failed the same way: a trunk failure with another

@@ -43,7 +43,7 @@ function namedIn(description: string | null | undefined): Named {
   };
 }
 
-// Why a lane triage left red is still red, read from the status triage wrote on it.
+/** Why a lane triage left red is still red, read from the status triage wrote on it. */
 export function redReason(description: string | null | undefined = "", release = false): string {
   const d = String(description);
   const { cleared, caused, appBug, fixed, outdated, check } = namedIn(d);

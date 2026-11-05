@@ -169,7 +169,7 @@ function mayPublish(rows, id, context, owner, operation) {
   }
   return current.run === owner.run && compareOwners(owner, current) >= 0 && (operation !== "triage" || lane[0].state !== "pending");
 }
-function statusPublisher({ api, id, context, env = {}, log = console.error }) {
+function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease = false }) {
   let validated;
   const owner = () => validated ??= publishingOwner(id, env);
   const snapshotOwner = () => {
@@ -188,7 +188,7 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
     description: row.description.slice(0, 140),
     target_url: ownedURL(row.target_url, by, id.repository)
   });
-  const summarize = async (lanes, summaryContext, summarizeLanes) => {
+  const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease) => {
     if (!summaryContext || !lanes.length) return;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
     const rows = await readStatuses(api, id);
@@ -197,7 +197,7 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
-    await post({ ...summarizeLanes(latest, untriaged), context: summaryContext }, snapshotOwner());
+    await post({ ...summarizeLanes(latest, untriaged, release), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,
@@ -215,9 +215,9 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
       await post(row);
       return true;
     },
-    async refresh(lanes, summaryContext, summarizeLanes) {
+    async refresh(lanes, summaryContext, summarizeLanes, release = defaultRelease) {
       if (!summaryContext || !lanes.includes(context) || !await allowed("finish")) return;
-      await summarize(lanes, summaryContext, summarizeLanes);
+      await summarize(lanes, summaryContext, summarizeLanes, release);
     }
   };
 }
@@ -432,7 +432,8 @@ async function publish({ env, fetchImpl = fetch, log = console.error, wait, retr
   if (!["claim", "finish", "refresh", "summarize"].includes(operation)) throw new Error("Invalid status operation");
   if (operation === "finish") tsioBase(env);
   if (!env.STATUS_CONTEXT || !env.GITHUB_TOKEN) throw new Error("Status context and GitHub token are required");
-  const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN, retryWait), id, context: env.STATUS_CONTEXT, env, log });
+  const release = env.RELEASE === "true";
+  const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN, retryWait), id, context: env.STATUS_CONTEXT, env, log, release });
   let written = false;
   let state = env.STATUS_STATE ?? "";
   let reportsComplete = false;
@@ -459,8 +460,8 @@ async function publish({ env, fetchImpl = fetch, log = console.error, wait, retr
     written = await publisher.write({ state, description, target_url: env.TARGET_URL }, operation);
   }
   const lanes = String(env.TRIAGE_LANES || "").split(",").map((s) => s.trim()).filter(Boolean);
-  if (operation === "summarize") await publisher.summarize(lanes, env.TRIAGE_CONTEXT, laneSummary);
-  if (written || operation === "refresh") await publisher.refresh(lanes, env.TRIAGE_CONTEXT, laneSummary);
+  if (operation === "summarize") await publisher.summarize(lanes, env.TRIAGE_CONTEXT, laneSummary, release);
+  if (written || operation === "refresh") await publisher.refresh(lanes, env.TRIAGE_CONTEXT, laneSummary, release);
   if (env.GITHUB_OUTPUT) (0, import_node_fs.appendFileSync)(env.GITHUB_OUTPUT, `published=${written}
 state=${state || ""}
 reports_complete=${reportsComplete}

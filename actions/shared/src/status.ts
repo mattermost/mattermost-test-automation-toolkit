@@ -34,14 +34,14 @@ export interface StatusRow {
 }
 
 /** Summarizes the latest status of each lane into the aggregate's state and description. */
-export type LaneSummarizer = (lanes: LaneStatus[], untriaged?: LaneStatus[]) => LaneSummary;
+export type LaneSummarizer = (lanes: LaneStatus[], untriaged?: LaneStatus[], release?: boolean) => LaneSummary;
 
 export interface StatusPublisher {
   allowed(operation: string): Promise<boolean>;
-  summarize(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer): Promise<void>;
+  summarize(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean): Promise<void>;
   write(row: StatusRow, operation?: string): Promise<boolean>;
   info(row: StatusRow): Promise<boolean>;
-  refresh(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer): Promise<void>;
+  refresh(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean): Promise<void>;
 }
 
 const positive = (v: unknown): boolean => /^[1-9]\d*$/.test(String(v ?? ""));
@@ -116,12 +116,14 @@ export function mayPublish(rows: CommitStatus[], id: CompositeIdentity, context:
     (operation !== "triage" || lane[0].state !== "pending");
 }
 
-export function statusPublisher({ api, id, context, env = {}, log = console.error }: {
+/** Builds the status publisher for one lane and its cross-lane aggregate. */
+export function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease = false }: {
   api: GhApi;
   id: CompositeIdentity;
   context: string;
   env?: Env;
   log?: (message: string) => void;
+  release?: boolean;
 }): StatusPublisher {
   // Validated when a lane is written, not when the publisher is built: a verification run only summarizes.
   let validated: Owner | undefined;
@@ -141,7 +143,7 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
   const post = (row: StatusRow, by: Owner = owner()): Promise<unknown> => api("POST", `/repos/${id.repository}/statuses/${id.commit_sha}`, {
     ...row, description: row.description.slice(0, 140), target_url: ownedURL(row.target_url, by, id.repository),
   });
-  const summarize = async (lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer): Promise<void> => {
+  const summarize = async (lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release = defaultRelease): Promise<void> => {
     if (!summaryContext || !lanes.length) return;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
     const rows = await readStatuses(api, id);
@@ -151,7 +153,7 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
-    await post({ ...summarizeLanes(latest, untriaged), context: summaryContext }, snapshotOwner());
+    await post({ ...summarizeLanes(latest, untriaged, release), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,
@@ -169,9 +171,9 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
       await post(row);
       return true;
     },
-    async refresh(lanes, summaryContext, summarizeLanes) {
+    async refresh(lanes, summaryContext, summarizeLanes, release = defaultRelease) {
       if (!summaryContext || !lanes.includes(context) || !await allowed("finish")) return;
-      await summarize(lanes, summaryContext, summarizeLanes);
+      await summarize(lanes, summaryContext, summarizeLanes, release);
     },
   };
 }

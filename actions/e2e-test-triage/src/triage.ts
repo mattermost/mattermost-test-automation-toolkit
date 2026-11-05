@@ -182,6 +182,7 @@ async function defaultBranchOf(api: GhApi, repository: string, log: (message: st
   }
 }
 
+/** Fetches the run, its history and diff, evaluates the findings, and writes the summary and commit statuses. */
 async function decideRun({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait, retryWait }: TriageOptions, written: { summary: boolean }, seen: Seen): Promise<EvaluatedRun> {
   const cfg: Config = configFrom(env, log);
   const id = compositeIdentityFrom<TriageIdentity>(env.COMPOSITE_IDENTITY);
@@ -246,10 +247,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
   // All required-status writers and this snapshot hold one SHA-scoped job
   // concurrency lock. A delayed second snapshot cannot substitute for that lock.
-  let summarizeLanes = laneSummary;
+  let branchBase: string | null = null;
   const settleLaneSummary = async (): Promise<void> => {
     try {
-      await publisher.refresh(lanes, triageContext ?? undefined, summarizeLanes);
+      await publisher.refresh(lanes, triageContext ?? undefined, laneSummary, Boolean(branchBase));
     } catch (e) {
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
     }
@@ -264,13 +265,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     let trunkBranch: string | null | undefined = isTrunkRun ? id.branch : prBase;
     // A run with no PR on a branch other than the default (a release candidate's CMT) runs that branch's own copies of
     // the tests, which the default branch may have changed since: the default branch is its base.
-    let branchBase: string | null = null;
     if (isTrunkRun && id.branch && run.failing.length) {
       const defaultBranch = await defaultBranchOf(api, id.repository, log);
-      if (defaultBranch && defaultBranch !== id.branch) {
-        branchBase = defaultBranch;
-        summarizeLanes = (ls, u) => laneSummary(ls, u, true);
-      }
+      if (defaultBranch && defaultBranch !== id.branch) branchBase = defaultBranch;
     }
     // A run of shard placeholders only needs no history. Otherwise placeholders' files are asked for too: TSIO counts its
     // run window over the files asked for, so dropping one would change which past runs the real tests are judged on.
@@ -402,9 +399,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const rerun = rerunCheck?.rerun ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = rerunCheck?.held ?? null;
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
+    const pullBase = result.findings.find((f) => f.out_of_date?.base)?.out_of_date?.base ?? trunkBranch ?? prBase;
     const description = flakyOnly
       ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}`
-      : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held, prBase ?? trunkBranch);
+      : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held, pullBase);
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
@@ -451,7 +449,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
       await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", flakyOnly ? `${run.counts.flaky} flaky, passed on retry · no test failed` : (flag && !result.findings.length
         ? `${run.counts.failed} failed · not triaged, ${runFlag(flag)}`
-        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed, prBase ?? trunkBranch).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
+        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed, pullBase).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));

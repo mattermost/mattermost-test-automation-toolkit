@@ -29,17 +29,18 @@ const sleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const STATUS_POST = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/?]+$/;
 export const RETRY_DELAYS_MS: readonly number[] = Object.freeze([1000, 3000]);
 
-// A 429's Retry-After is not read: these short waits cover a brief burst, and a longer limit fails as before.
+/** Whether an HTTP status is transient (5xx or 429); 429's Retry-After is not read beyond the short burst waits. */
 const retryable = (status: number): boolean => status >= 500 || status === 429;
 
-// fetch (undici) rejects a dropped connection with a TypeError ("fetch failed" before headers, "terminated" while
-// reading the body) whose cause says why, and an expired or aborted signal with a DOMException (TimeoutError,
-// AbortError). Any other TypeError is not the network's doing (an invalid header value, for one). A timed-out write is
-// retried too: with the 60 s signal a status POST that keeps hanging gives up after about 3 minutes.
+/**
+ * Whether a fetch error is a dropped connection (undici TypeError "fetch failed" or "terminated") or an expired/aborted
+ * signal (DOMException TimeoutError or AbortError). Any other TypeError (e.g. an invalid header value) is not retried.
+ */
 const networkError = (e: unknown): boolean =>
   (e instanceof TypeError && (e.message === "fetch failed" || e.message === "terminated")) ||
   (e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError"));
 
+/** Returns a GitHub REST client that retries commit-status POST requests on transient HTTP or network failures. */
 export function gh(fetchImpl: FetchImpl, token: string, wait: Sleep = sleep): GhApi {
   return async (method, path, body) => {
     // Only a status write is safe to repeat; other writes (a re-run request) are not.

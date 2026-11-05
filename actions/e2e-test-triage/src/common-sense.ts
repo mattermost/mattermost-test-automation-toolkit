@@ -27,9 +27,10 @@ const PLATFORM_FILES: Record<string, RegExp> = {
   macos: /(^|[/_.-])(mac|macos|darwin|osx|dmg|mas)([/_.-]|$)|\.(entitlements|plist)$/i,
 };
 
+/** Whether a file path matches the platform-specific patterns for `platform`. */
 export const onlyOnPlatform = (platform: string, file: string): boolean => Boolean(PLATFORM_FILES[platform]?.test(file));
 
-// A file only other platforms build, so a change to it cannot reach this one.
+/** A file only other platforms build, so a change to it cannot reach this one. */
 const onlyElsewhere = (platform: string, file: string): boolean =>
   !onlyOnPlatform(platform, file) && Object.keys(PLATFORM_FILES).some((p) => p !== platform && onlyOnPlatform(p, file));
 

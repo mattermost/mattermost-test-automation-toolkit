@@ -504,6 +504,7 @@ export const RERUNNING = "re-running the failed jobs";
  */
 export const PULL_MAIN = "pull main changes";
 const DEFAULT_BASE_BRANCHES = new Set(["main", "master", "the default branch"]);
+/** The check label for failures the base branch explains: "pull main changes", or "pull <base> changes" on another base. */
 export const pullBaseLabel = (baseBranch?: string | null): string => {
   const b = (baseBranch ?? "").replace(/[,;()]/g, "").trim();
   return `pull ${!b || DEFAULT_BASE_BRANCHES.has(b) ? "main" : b} changes`;
@@ -521,7 +522,7 @@ export function statusLabels(findings: Finding[], failed = findings.length, base
   let pull: string | null = null;
   for (const f of findings) {
     const label = statusLabelOf(f);
-    if (!f.release && (label === "fixed on main" || label === "out of date")) pull ??= baseBranch ?? f.out_of_date?.base ?? null;
+    if (!f.release && (label === "fixed on main" || label === "out of date")) pull ??= f.out_of_date?.base || baseBranch || null;
     else counts.set(label, (counts.get(label) ?? 0) + 1);
   }
   return STATUS_LABELS.flatMap((l) => [

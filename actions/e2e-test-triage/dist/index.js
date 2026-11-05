@@ -169,7 +169,7 @@ function mayPublish(rows, id, context, owner, operation) {
   }
   return current.run === owner.run && compareOwners(owner, current) >= 0 && (operation !== "triage" || lane[0].state !== "pending");
 }
-function statusPublisher({ api, id, context, env = {}, log = console.error }) {
+function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease = false }) {
   let validated;
   const owner = () => validated ??= publishingOwner(id, env);
   const snapshotOwner = () => {
@@ -188,7 +188,7 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
     description: row.description.slice(0, 140),
     target_url: ownedURL(row.target_url, by, id.repository)
   });
-  const summarize = async (lanes, summaryContext, summarizeLanes) => {
+  const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease) => {
     if (!summaryContext || !lanes.length) return;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
     const rows = await readStatuses(api, id);
@@ -197,7 +197,7 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
-    await post({ ...summarizeLanes(latest, untriaged), context: summaryContext }, snapshotOwner());
+    await post({ ...summarizeLanes(latest, untriaged, release), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,
@@ -215,9 +215,9 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
       await post(row);
       return true;
     },
-    async refresh(lanes, summaryContext, summarizeLanes) {
+    async refresh(lanes, summaryContext, summarizeLanes, release = defaultRelease) {
       if (!summaryContext || !lanes.includes(context) || !await allowed("finish")) return;
-      await summarize(lanes, summaryContext, summarizeLanes);
+      await summarize(lanes, summaryContext, summarizeLanes, release);
     }
   };
 }
@@ -2767,7 +2767,7 @@ function statusLabels(findings, failed = findings.length, baseBranch) {
   let pull = null;
   for (const f of findings) {
     const label = statusLabelOf(f);
-    if (!f.release && (label === "fixed on main" || label === "out of date")) pull ??= baseBranch ?? f.out_of_date?.base ?? null;
+    if (!f.release && (label === "fixed on main" || label === "out of date")) pull ??= f.out_of_date?.base || baseBranch || null;
     else counts.set(label, (counts.get(label) ?? 0) + 1);
   }
   return STATUS_LABELS.flatMap((l) => [
@@ -3139,10 +3139,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
   const decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly;
   const announce = enforce && decides;
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
-  let summarizeLanes = laneSummary;
+  let branchBase = null;
   const settleLaneSummary = async () => {
     try {
-      await publisher.refresh(lanes, triageContext ?? void 0, summarizeLanes);
+      await publisher.refresh(lanes, triageContext ?? void 0, laneSummary, Boolean(branchBase));
     } catch (e) {
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
     }
@@ -3153,13 +3153,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     let diff = { files: [], ok: false };
     const prBase = isTrunkRun ? null : pull.base?.ref ?? null;
     let trunkBranch = isTrunkRun ? id.branch : prBase;
-    let branchBase = null;
     if (isTrunkRun && id.branch && run.failing.length) {
       const defaultBranch = await defaultBranchOf(api, id.repository, log);
-      if (defaultBranch && defaultBranch !== id.branch) {
-        branchBase = defaultBranch;
-        summarizeLanes = (ls, u) => laneSummary(ls, u, true);
-      }
+      if (defaultBranch && defaultBranch !== id.branch) branchBase = defaultBranch;
     }
     if (run.failing.some((t) => !isShardPlaceholder(t))) {
       [history, diff] = await Promise.all([
@@ -3282,7 +3278,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const rerun = rerunCheck?.rerun ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = rerunCheck?.held ?? null;
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
-    const description = flakyOnly ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}` : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held, prBase ?? trunkBranch);
+    const pullBase = result.findings.find((f) => f.out_of_date?.base)?.out_of_date?.base ?? trunkBranch ?? prBase;
+    const description = flakyOnly ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}` : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held, pullBase);
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
       (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}
@@ -3326,7 +3323,7 @@ ai_output_tokens=${spend.output_tokens}
     if (announce && lanes.length) await settleLaneSummary();
     else if (announce) {
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", flakyOnly ? `${run.counts.flaky} flaky, passed on retry \xB7 no test failed` : (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed, prBase ?? trunkBranch).map((l) => l === RERUN ? again : l).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${again}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", flakyOnly ? `${run.counts.flaky} flaky, passed on retry \xB7 no test failed` : (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed, pullBase).map((l) => l === RERUN ? again : l).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${again}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
 `);
