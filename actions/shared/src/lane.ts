@@ -46,6 +46,21 @@ function namedIn(description: string | null | undefined): Named {
 /** A PR's "pull <base> changes" guidance in a status; only a PR run writes it. */
 export const PULL_GUIDANCE = /\bpull [^\s,;)][^\n,;)]*? changes\b/;
 
+/**
+ * Whether statuses triage wrote come from a release run, read from their text alone; undefined when nothing says.
+ * Pull guidance and "caused by PR" are written only on a PR run. "test bug" and "server compat" only on a release run.
+ * "out of date" and "fixed on main" are a release run's labels now, and a PR's only in statuses written before pull
+ * guidance, so they count after the PR-only labels. "app bug" says nothing: both runs write it.
+ */
+export function releaseFromDescriptions(descriptions: readonly (string | null | undefined)[]): boolean | undefined {
+  const ds = descriptions.map((d) => String(d ?? ""));
+  if (ds.some((d) => PULL_GUIDANCE.test(d))) return false;
+  if (ds.some((d) => /\b\d+ (?:test bug|server compat)\b/.test(d))) return true;
+  if (ds.some((d) => /\b\d+ caused by PR\b/.test(d))) return false;
+  if (ds.some((d) => /\b\d+ (?:out of date|fixed on main)\b/.test(d))) return true;
+  return undefined;
+}
+
 /** Why a lane triage left red is still red, read from the status triage wrote on it. */
 export function redReason(description: string | null | undefined = "", release = false): string {
   const d = String(description);
@@ -106,14 +121,8 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], r
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
-  // Unset release is read from the lanes. Pull guidance comes first: only a PR run writes it, so a lane that names it
-  // keeps it, whatever release labels another lane carries. Without it, a release-only label, or old "out of date" /
-  // "fixed on main" wording with nothing PR-only beside it, marks a release run.
-  const descriptions = seen.map((l) => String(l.status.description ?? ""));
-  const isRelease = release ?? (!descriptions.some((d) => PULL_GUIDANCE.test(d)) && (
-    descriptions.some((d) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(d)) ||
-    (descriptions.some((d) => /\b\d+ (?:out of date|fixed on main)\b/.test(d)) && !descriptions.some((d) => /\b\d+ caused by PR\b/.test(d)))
-  ));
+  // Unset release is read from the lanes' text (see releaseFromDescriptions); nothing saying so is a PR's wording.
+  const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
   if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" · ")) };

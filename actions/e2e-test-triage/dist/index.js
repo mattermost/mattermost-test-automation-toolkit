@@ -56,6 +56,14 @@ function namedIn(description) {
   };
 }
 var PULL_GUIDANCE = /\bpull [^\s,;)][^\n,;)]*? changes\b/;
+function releaseFromDescriptions(descriptions) {
+  const ds = descriptions.map((d) => String(d ?? ""));
+  if (ds.some((d) => PULL_GUIDANCE.test(d))) return false;
+  if (ds.some((d) => /\b\d+ (?:test bug|server compat)\b/.test(d))) return true;
+  if (ds.some((d) => /\b\d+ caused by PR\b/.test(d))) return false;
+  if (ds.some((d) => /\b\d+ (?:out of date|fixed on main)\b/.test(d))) return true;
+  return void 0;
+}
 function redReason(description = "", release = false) {
   const d = String(description);
   const { cleared, caused, appBug, fixed, outdated, check } = namedIn(d);
@@ -100,8 +108,7 @@ function laneSummary(lanes, untriaged = [], release) {
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
-  const descriptions = seen.map((l) => String(l.status.description ?? ""));
-  const isRelease = release ?? (!descriptions.some((d) => PULL_GUIDANCE.test(d)) && (descriptions.some((d) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(d)) || descriptions.some((d) => /\b\d+ (?:out of date|fixed on main)\b/.test(d)) && !descriptions.some((d) => /\b\d+ caused by PR\b/.test(d))));
+  const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
   if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
@@ -180,11 +187,7 @@ function inferRelease(id, env = {}, rows = [], summaryContext) {
   if (branch) return branch !== "main" && branch !== "master";
   const ref = String(env.GITHUB_REF_NAME || String(env.GITHUB_REF ?? "").replace(/^refs\/heads\//, "")).trim();
   if (/^release([/_.-]|$)/i.test(ref)) return true;
-  if (summaryContext) {
-    const prev = rows.find((r) => r.context === summaryContext)?.description ?? "";
-    if (PULL_GUIDANCE.test(prev)) return false;
-    if (/\b\d+ (?:out of date|fixed on main|test bug|server compat|app bug)\b/.test(prev)) return true;
-  }
+  if (summaryContext) return releaseFromDescriptions([rows.find((r) => r.context === summaryContext)?.description]);
   return void 0;
 }
 function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease }) {
@@ -2783,14 +2786,17 @@ var pullBaseLabel = (baseBranch) => {
 function statusLabels(findings, failed = findings.length, baseBranch) {
   if (!findings.length) return failed ? [RERUN] : [];
   const counts = /* @__PURE__ */ new Map();
-  let pull = null;
+  let pull = false;
+  let pullBase = null;
   for (const f of findings) {
     const label = statusLabelOf(f);
-    if (!f.release && (label === "fixed on main" || label === "out of date")) pull ??= f.out_of_date?.base || baseBranch || null;
-    else counts.set(label, (counts.get(label) ?? 0) + 1);
+    if (!f.release && (label === "fixed on main" || label === "out of date")) {
+      pull = true;
+      pullBase ??= f.out_of_date?.base || baseBranch || null;
+    } else counts.set(label, (counts.get(label) ?? 0) + 1);
   }
   return STATUS_LABELS.flatMap((l) => [
-    ...pull !== null && l === "fixed on main" ? [pullBaseLabel(pull)] : [],
+    ...pull && l === "fixed on main" ? [pullBaseLabel(pullBase)] : [],
     ...counts.has(l) ? [`${counts.get(l)} ${l}`] : []
   ]);
 }
@@ -3159,9 +3165,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
   const announce = enforce && decides;
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
   let branchBase = null;
+  let releaseRun = isTrunkRun ? void 0 : false;
   const settleLaneSummary = async () => {
     try {
-      await publisher.refresh(lanes, triageContext ?? void 0, laneSummary, Boolean(branchBase));
+      await publisher.refresh(lanes, triageContext ?? void 0, laneSummary, releaseRun);
     } catch (e) {
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
     }
@@ -3174,7 +3181,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     let trunkBranch = isTrunkRun ? id.branch : prBase;
     if (isTrunkRun && id.branch && run.failing.length) {
       const defaultBranch = await defaultBranchOf(api, id.repository, log);
-      if (defaultBranch && defaultBranch !== id.branch) branchBase = defaultBranch;
+      if (defaultBranch) {
+        releaseRun = defaultBranch !== id.branch;
+        if (releaseRun) branchBase = defaultBranch;
+      }
     }
     if (run.failing.some((t) => !isShardPlaceholder(t))) {
       [history, diff] = await Promise.all([

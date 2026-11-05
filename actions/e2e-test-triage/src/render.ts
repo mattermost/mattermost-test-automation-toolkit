@@ -519,14 +519,18 @@ export const pullBaseLabel = (baseBranch?: string | null): string => {
 export function statusLabels(findings: Finding[], failed = findings.length, baseBranch?: string | null): string[] {
   if (!findings.length) return failed ? [RERUN] : [];
   const counts = new Map<StatusLabel, number>();
-  let pull: string | null = null;
+  // Whether to say "pull ... changes" is kept apart from which base it names: an unknown base still says "pull main changes".
+  let pull = false;
+  let pullBase: string | null = null;
   for (const f of findings) {
     const label = statusLabelOf(f);
-    if (!f.release && (label === "fixed on main" || label === "out of date")) pull ??= f.out_of_date?.base || baseBranch || null;
-    else counts.set(label, (counts.get(label) ?? 0) + 1);
+    if (!f.release && (label === "fixed on main" || label === "out of date")) {
+      pull = true;
+      pullBase ??= f.out_of_date?.base || baseBranch || null;
+    } else counts.set(label, (counts.get(label) ?? 0) + 1);
   }
   return STATUS_LABELS.flatMap((l) => [
-    ...(pull !== null && l === "fixed on main" ? [pullBaseLabel(pull)] : []),
+    ...(pull && l === "fixed on main" ? [pullBaseLabel(pullBase)] : []),
     ...(counts.has(l) ? [`${counts.get(l)} ${l}`] : []),
   ]);
 }

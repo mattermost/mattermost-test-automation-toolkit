@@ -56,6 +56,14 @@ function namedIn(description) {
   };
 }
 var PULL_GUIDANCE = /\bpull [^\s,;)][^\n,;)]*? changes\b/;
+function releaseFromDescriptions(descriptions) {
+  const ds = descriptions.map((d) => String(d ?? ""));
+  if (ds.some((d) => PULL_GUIDANCE.test(d))) return false;
+  if (ds.some((d) => /\b\d+ (?:test bug|server compat)\b/.test(d))) return true;
+  if (ds.some((d) => /\b\d+ caused by PR\b/.test(d))) return false;
+  if (ds.some((d) => /\b\d+ (?:out of date|fixed on main)\b/.test(d))) return true;
+  return void 0;
+}
 function redReason(description = "", release = false) {
   const d = String(description);
   const { cleared, caused, appBug, fixed, outdated, check } = namedIn(d);
@@ -100,8 +108,7 @@ function laneSummary(lanes, untriaged = [], release) {
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
-  const descriptions = seen.map((l) => String(l.status.description ?? ""));
-  const isRelease = release ?? (!descriptions.some((d) => PULL_GUIDANCE.test(d)) && (descriptions.some((d) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(d)) || descriptions.some((d) => /\b\d+ (?:out of date|fixed on main)\b/.test(d)) && !descriptions.some((d) => /\b\d+ caused by PR\b/.test(d))));
+  const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
   if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
@@ -180,11 +187,7 @@ function inferRelease(id, env = {}, rows = [], summaryContext) {
   if (branch) return branch !== "main" && branch !== "master";
   const ref = String(env.GITHUB_REF_NAME || String(env.GITHUB_REF ?? "").replace(/^refs\/heads\//, "")).trim();
   if (/^release([/_.-]|$)/i.test(ref)) return true;
-  if (summaryContext) {
-    const prev = rows.find((r) => r.context === summaryContext)?.description ?? "";
-    if (PULL_GUIDANCE.test(prev)) return false;
-    if (/\b\d+ (?:out of date|fixed on main|test bug|server compat|app bug)\b/.test(prev)) return true;
-  }
+  if (summaryContext) return releaseFromDescriptions([rows.find((r) => r.context === summaryContext)?.description]);
   return void 0;
 }
 function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease }) {

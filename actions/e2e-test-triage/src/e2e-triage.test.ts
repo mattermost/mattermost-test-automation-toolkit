@@ -5053,3 +5053,43 @@ test("a PR check names failures main explains by what to do, once: pull main cha
   // The per-test label, which the findings file and the desktop alert read, is unchanged.
   assert.deepEqual([statusLabelOf(fixed), statusLabelOf(stale)], ["fixed on main", "out of date"]);
 });
+
+test("a PR's failure main explains still says pull main changes when no base branch is known", () => {
+  const fixed = finding({ title: "fixed", class: "FIXED_ON_TRUNK", blocking: true, out_of_date: { base: "", behind: 2, commit: null, fixed: true } });
+  const mine = finding({ title: "mine", class: "OWNED_BY_PR", blocking: true });
+  assert.equal(statusLabelOf(fixed), "fixed on main");
+  assert.deepEqual(statusLabels([mine, fixed], 2), ["1 caused by PR", "pull main changes"]);
+  const stale = finding({ title: "stale", class: "REGRESSION", blocking: true, out_of_date: { base: "release-10.5", behind: 2, commit: null } });
+  assert.deepEqual(statusLabels([fixed, stale], 2), ["pull release-10.5 changes"], "the first known base is named, even after a finding with none");
+});
+
+test("a release branch's run whose default-branch lookup fails leaves release to the tested identity, so the PR-wide check keeps release labels", async () => {
+  const written: StatusBody[] = [];
+  const lane = "e2e-test/playwright";
+  const other = { context: "e2e-test/other", state: "failure", description: "(1 out of date) 50.0% passed (1 passed, 1 failed, 0 skipped)" };
+  const routes: Route[] = [
+    ...runRoutes([spec("t1", "failed")], "cmt-desktop"),
+    ["/reports/history", () => Response.json({ observations: trunkFailsAll(8) })],
+    ["/commits/abc/statuses", () => Response.json([...[...written].reverse(), { context: lane, state: "failure", target_url: "https://github.com/o/r/actions/runs/12" }, other])],
+    ["/statuses/abc", (i) => { written.push(parsed<StatusBody>(bodyText(i))); return Response.json({}); }],
+    ["/commits/abc", () => Response.json({ files: [] })],
+  ];
+  const fake = fakeFetch(routes);
+  let lookedUp = false;
+  const fetchImpl = async (url: string, init: RequestInit = {}): Promise<Response> => {
+    if (/\/repos\/o\/r$/.test(String(url))) {
+      lookedUp = true;
+      return new Response("unavailable", { status: 503 });
+    }
+    return fake(url, init);
+  };
+  const identity = { repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "cmt-desktop", branch: "release-6.3" };
+  await triage({
+    env: { ...env, COMPOSITE_IDENTITY: JSON.stringify(identity), MODE: "enforce", ANTHROPIC_API_KEY: "", STATUS_CONTEXT: lane, TRIAGE_CONTEXT: "e2e-test/triage", TRIAGE_LANES: `${lane}, e2e-test/other`, TRIAGE_SETTLE_MS: "0" },
+    fetchImpl, log: () => {}, retryWait: async () => {},
+  });
+  assert.ok(lookedUp, "the default branch was asked for");
+  const aggregate = written.filter((s) => s.context === "e2e-test/triage").at(-1);
+  assert.match(aggregate?.description ?? "", /other: 1 out of date/);
+  assert.doesNotMatch(aggregate?.description ?? "", /pull main changes/);
+});

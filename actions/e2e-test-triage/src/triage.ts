@@ -248,9 +248,13 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   // All required-status writers and this snapshot hold one SHA-scoped job
   // concurrency lock. A delayed second snapshot cannot substitute for that lock.
   let branchBase: string | null = null;
+  // Whether this is a release run, for the aggregate's labels. A PR run never is; a trunk run is when its branch is not
+  // the repository's default branch. Until GitHub names that branch (the lookup failed, or never ran because nothing
+  // failed) it stays undefined, and the publisher infers it from the tested identity and the statuses.
+  let releaseRun: boolean | undefined = isTrunkRun ? undefined : false;
   const settleLaneSummary = async (): Promise<void> => {
     try {
-      await publisher.refresh(lanes, triageContext ?? undefined, laneSummary, Boolean(branchBase));
+      await publisher.refresh(lanes, triageContext ?? undefined, laneSummary, releaseRun);
     } catch (e) {
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
     }
@@ -267,7 +271,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // the tests, which the default branch may have changed since: the default branch is its base.
     if (isTrunkRun && id.branch && run.failing.length) {
       const defaultBranch = await defaultBranchOf(api, id.repository, log);
-      if (defaultBranch && defaultBranch !== id.branch) branchBase = defaultBranch;
+      if (defaultBranch) {
+        releaseRun = defaultBranch !== id.branch;
+        if (releaseRun) branchBase = defaultBranch;
+      }
     }
     // A run of shard placeholders only needs no history. Otherwise placeholders' files are asked for too: TSIO counts its
     // run window over the files asked for, so dropping one would change which past runs the real tests are judged on.
