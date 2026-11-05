@@ -100,15 +100,24 @@ retry when its case ordinals put the pass after the fail; a pass that ran first,
 or with no ordinal, leaves it failed. On mobile main, 201 of the 244 tests that failed from 15 to 28 October
 failed only in 3 such runs, and each of those counted as that test's flakiness.
 
-**Failed everywhere is not cleared by a guess:** a test that failed every try here
-(at least two) and failed on another platform of the same commit (iOS and Android,
-Linux and Windows, or the enterprise and FIPS lanes) is never cleared by the model
-or a same-failure match; the model may still name the PR. A flake rarely does
-that, and a change to shared code does. A clear by the rules stands only where
-master or 3+ other PRs failed it the same way. One that rests on nothing comparable
-(a bare timeout) is held as `REGRESSION` and needs investigation. A break on master, an
-environment error, and a spec the PR edits keep their own calls. Either condition
-alone changes nothing.
+**Failed everywhere is not cleared by a guess:** on a PR run, a test that failed
+every try here (at least two) and failed on another platform of the same commit
+(iOS and Android, Linux and Windows, or the enterprise and FIPS lanes) is never
+cleared by the model or a same-failure match; the model may still name the PR. A
+flake rarely does that, and a change to shared code does. A clear by the rules is
+undone too, even one that master's flakes of the same error would support: those
+flakes say nothing about the same test failing on two platforms of this commit.
+Such a failure is held: a flaky clear becomes `REGRESSION` and needs
+investigation, and a blocking `REGRESSION` or `INSUFFICIENT_DATA` keeps its class.
+A break on master, an environment error, and a spec the PR edits keep their own
+calls. Either condition alone changes nothing. The hold is not
+final on a release branch: the model may still unblock a test bug or a server
+compat problem (see the release section below). On a run flagged as a whole
+(`INFRA`), sibling TSIO groups are not read (other reports in the same group
+still are), so the hold applies only where another platform's result is in the
+same group. A held failure that is also out of date shows in the
+out-of-date bucket ("merge and re-run") because the out-of-date mark is set after
+the hold.
 
 **Fixed on master:** master failed the test the same way in at least 3 runs in a
 row and has passed since. That is a break master fixed, not a flake: a branch
@@ -183,17 +192,22 @@ regression or a test with too little history is cleared as flaky when this PR's
 own code both passed and failed it on that platform. The same test passed on
 another platform of the same commit (iOS against Android, Linux against macOS and
 Windows) and failed on none, **and** it passed on this platform earlier on this
-PR, and the PR itself changed nothing related since (a file merged in from the
-base branch, or one whose own patch is the same as at that pass, is the base
-branch's change, allowed while trunk's latest run of the test passed).
+PR, and since that pass the PR itself changed nothing related and nothing the
+failing platform builds: no file at all, or only files other platforms build
+(`ios/` for a Linux failure). A file merged in from the base branch, or one whose
+own patch is the same as at that pass, is the base branch's change, allowed while
+trunk's latest run of the test passed; where the PR's own changes cannot be told
+from the base branch's, every change since the pass counts.
 
 A pass on the other platforms alone is not enough: shared code can branch on the
 platform, so a PR can break one platform without touching a file named for it. A
 one-platform failure of a test trunk always passes stays a regression for the
-model to judge. It never applies when the PR changed, since that pass, a file that
-reaches the failing platform only (`ios/`, `Podfile.lock`, `android/`, `*.gradle`,
-a path naming linux, windows or macos), to an environment error, or where no other
-platform ran the test (mattermost's lanes are workers of one platform).
+model to judge, and so does one where the PR changed a shared file since the pass,
+even one the error does not name: the model reads those changes. It never applies
+when the PR changed, since that pass, a file that reaches the failing platform
+only (`ios/`, `Podfile.lock`, `android/`, `*.gradle`, a path naming linux, windows
+or macos), to an environment error, or where no other platform ran the test
+(mattermost's lanes are workers of one platform).
 
 If the evidence is incomplete (changed files, test root, base branch, truncated
 history, report scope, or a test whose identity is ambiguous), nothing is
@@ -268,7 +282,12 @@ model fails or is unavailable, the rules' outcome stands.
   passed, 4 failed, 164 skipped)`. The labels, each only when non-zero and in this
   order: flaky, broken on main, test bug, server compat, caused by PR, app bug,
   fixed on main, out of date, needs investigation (test bug, server compat and
-  app bug only on a release branch). The
+  app bug only on a release branch). On a PR, fixed on main and out of date are
+  named once, by what to do, with no count: `(1 caused by PR, pull main changes)`
+  (or `pull <base> changes` when the PR targets another branch).
+  A release branch keeps them as labels: its fix is a backport, not a merge. The
+  PR-wide triage check reads the same way (`playwright-full/enterprise: pull main
+  changes`). The
   rate is passed ÷ (passed + failed), as in
   mattermost's own E2E check; it never reads 100% while something failed.
   Shard placeholders add "re-run the failed jobs" after the labels (alone when
@@ -496,7 +515,30 @@ Consumers check `schema` first. A future change to the shape bumps it.
 
 Without a PR number, the run is a trunk run. A failure that was already there in
 the previous run is a streak and stays blocking; only intermittency clears. The
-model is not asked.
+model is not asked. Intermittent is held to the bar a PR's failure meets to clear on
+trunk's instability. Trunk must have failed or flaked the test often enough: the
+smoothed rate (failures + flaky passes + 1) / (runs + 2) must reach `pMin` (0.05),
+counting failures and flaky passes of any error (one flake in 48 runs is 2/50 = 0.04,
+too rare). Whether trunk must also have failed the same way depends
+on the error:
+
+- A distinctive or stuck error: trunk failed or flaked with the same error.
+- A bare timeout or an unusable (e.g. empty) error that failed every try: trunk failed
+  or flaked with the same kind.
+- A bare or unusable error that passed on some try, or whose tries are unknown: the
+  rate alone.
+
+Otherwise the failure stays blocking as a `REGRESSION`. Failing again in the next run
+makes it `BROKEN_ON_TRUNK`.
+
+A failure that failed every try here and on another platform of the same commit
+is held there too, as on a PR (when the run is not flagged as `INFRA`, or the
+other platform is in the same TSIO group), and only the held classes are: `REGRESSION`,
+`INSUFFICIENT_DATA` and the flaky classes (`FLAKY_ON_TRUNK`, `FLAKY_CROSS_PR`). A
+flaky clear becomes `REGRESSION`, blocking. A blocking `REGRESSION` or
+`INSUFFICIENT_DATA` keeps its class and gets the `failed_everywhere` mark. A break
+already blocking on trunk (`BROKEN_ON_TRUNK`, `FIXED_ON_TRUNK`) is not held and gets
+no mark (see "Failed everywhere" above).
 
 ## Tests
 

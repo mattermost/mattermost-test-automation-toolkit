@@ -2,6 +2,7 @@
 // See LICENSE.txt for license information.
 
 import type { CommitStatus, Env, GhApi } from "./github.ts";
+import { releaseFromDescriptions } from "./lane.ts";
 import type { LaneStatus, LaneSummary } from "./lane.ts";
 import type { CompositeIdentity } from "./tsio.ts";
 
@@ -34,14 +35,14 @@ export interface StatusRow {
 }
 
 /** Summarizes the latest status of each lane into the aggregate's state and description. */
-export type LaneSummarizer = (lanes: LaneStatus[], untriaged?: LaneStatus[]) => LaneSummary;
+export type LaneSummarizer = (lanes: LaneStatus[], untriaged?: LaneStatus[], release?: boolean) => LaneSummary;
 
 export interface StatusPublisher {
   allowed(operation: string): Promise<boolean>;
-  summarize(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer): Promise<void>;
+  summarize(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean): Promise<void>;
   write(row: StatusRow, operation?: string): Promise<boolean>;
   info(row: StatusRow): Promise<boolean>;
-  refresh(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer): Promise<void>;
+  refresh(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean): Promise<void>;
 }
 
 const positive = (v: unknown): boolean => /^[1-9]\d*$/.test(String(v ?? ""));
@@ -116,12 +117,35 @@ export function mayPublish(rows: CommitStatus[], id: CompositeIdentity, context:
     (operation !== "triage" || lane[0].state !== "pending");
 }
 
-export function statusPublisher({ api, id, context, env = {}, log = console.error }: {
+/**
+ * Infers whether a run is a release-branch run when the caller did not pass an explicit boolean:
+ * checks `env.RELEASE` ("true" / "false"), then the tested identity (a PR number is never a release run; an
+ * `id.branch` other than `main` or `master` is), then a `release*` workflow ref, and finally the existing aggregate
+ * status's text (releaseFromDescriptions). The workflow's own event is not read: a PR-triggered workflow can test a
+ * release branch's commit. Triage passes an explicit value once GitHub names the default branch, so a repository
+ * whose default branch has another name relies on that, not on this guess.
+ */
+export function inferRelease(id: CompositeIdentity, env: Env = {}, rows: CommitStatus[] = [], summaryContext?: string): boolean | undefined {
+  const configured = (env.RELEASE ?? "").trim().toLowerCase();
+  if (configured === "true") return true;
+  if (configured === "false") return false;
+  if (Number(id.gh_pr_number || 0) > 0) return false;
+  const branch = String(id.branch ?? "").trim();
+  if (branch) return branch !== "main" && branch !== "master";
+  const ref = String(env.GITHUB_REF_NAME || String(env.GITHUB_REF ?? "").replace(/^refs\/heads\//, "")).trim();
+  if (/^release([/_.-]|$)/i.test(ref)) return true;
+  if (summaryContext) return releaseFromDescriptions([rows.find((r) => r.context === summaryContext)?.description]);
+  return undefined;
+}
+
+/** Builds the status publisher for one lane and its cross-lane aggregate. */
+export function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease }: {
   api: GhApi;
   id: CompositeIdentity;
   context: string;
   env?: Env;
   log?: (message: string) => void;
+  release?: boolean;
 }): StatusPublisher {
   // Validated when a lane is written, not when the publisher is built: a verification run only summarizes.
   let validated: Owner | undefined;
@@ -141,7 +165,7 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
   const post = (row: StatusRow, by: Owner = owner()): Promise<unknown> => api("POST", `/repos/${id.repository}/statuses/${id.commit_sha}`, {
     ...row, description: row.description.slice(0, 140), target_url: ownedURL(row.target_url, by, id.repository),
   });
-  const summarize = async (lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer): Promise<void> => {
+  const summarize = async (lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release = defaultRelease): Promise<void> => {
     if (!summaryContext || !lanes.length) return;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
     const rows = await readStatuses(api, id);
@@ -151,7 +175,8 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
-    await post({ ...summarizeLanes(latest, untriaged), context: summaryContext }, snapshotOwner());
+    const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
+    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,
@@ -169,9 +194,9 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
       await post(row);
       return true;
     },
-    async refresh(lanes, summaryContext, summarizeLanes) {
+    async refresh(lanes, summaryContext, summarizeLanes, release = defaultRelease) {
       if (!summaryContext || !lanes.includes(context) || !await allowed("finish")) return;
-      await summarize(lanes, summaryContext, summarizeLanes);
+      await summarize(lanes, summaryContext, summarizeLanes, release);
     },
   };
 }

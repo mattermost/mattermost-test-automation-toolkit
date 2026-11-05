@@ -3,7 +3,7 @@
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { gh } from "../../shared/src/github.ts";
-import type { Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
+import type { Env, FetchImpl, GhApi, Sleep } from "../../shared/src/github.ts";
 import { laneName, laneSummary } from "../../shared/src/lane.ts";
 import { FAILED_TESTS, readStatuses, REPORTS_INCOMPLETE, statusPublisher, UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, SupersededRunError, tsioBase } from "../../shared/src/tsio.ts";
@@ -53,6 +53,8 @@ export interface TriageOptions {
   log?: (message: string) => void;
   now?: Date;
   wait?: Wait;
+  /** Waits between attempts of a retried status write (shared gh); a test passes one that does not sleep. */
+  retryWait?: Sleep;
 }
 
 /** What triage got as far as it went, for the findings file and the not-triaged paths. */
@@ -130,11 +132,11 @@ export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
  * The lane's status when TSIO has no results: the note goes on the state it already has, so the lane stays as it
  * was, and only where this run owns the status (the publisher checks that). A failed note is logged, not raised.
  */
-async function noteNoResults({ env, fetchImpl = fetch, log = console.error }: TriageOptions, id: TriageIdentity): Promise<void> {
+async function noteNoResults({ env, fetchImpl = fetch, log = console.error, retryWait }: TriageOptions, id: TriageIdentity): Promise<void> {
   const context = env.STATUS_CONTEXT;
   if (!context || !env.GITHUB_TOKEN) return;
   try {
-    const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
+    const api = gh(fetchImpl, String(env.GITHUB_TOKEN), retryWait);
     const own = (await readStatuses(api, id)).find((r) => r.context === context);
     if (!own || own.state === "pending") return;
     const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
@@ -180,14 +182,15 @@ async function defaultBranchOf(api: GhApi, repository: string, log: (message: st
   }
 }
 
-async function decideRun({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait }: TriageOptions, written: { summary: boolean }, seen: Seen): Promise<EvaluatedRun> {
+/** Fetches the run, its history and diff, evaluates the findings, and writes the summary and commit statuses. */
+async function decideRun({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait, retryWait }: TriageOptions, written: { summary: boolean }, seen: Seen): Promise<EvaluatedRun> {
   const cfg: Config = configFrom(env, log);
   const id = compositeIdentityFrom<TriageIdentity>(env.COMPOSITE_IDENTITY);
   const prNumber = Number(id.gh_pr_number || 0) || null;
   // No PR number: a trunk run (see EXONERATED_ON_TRUNK).
   const isTrunkRun = prNumber == null;
   const base = tsioBase(env);
-  const api = gh(fetchImpl, String(env.GITHUB_TOKEN));
+  const api = gh(fetchImpl, String(env.GITHUB_TOKEN), retryWait);
   // Not guessed: a wrong root makes every spec look untouched.
   const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
   const reportName = env.REPORT_NAME || null;
@@ -244,9 +247,14 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
   // All required-status writers and this snapshot hold one SHA-scoped job
   // concurrency lock. A delayed second snapshot cannot substitute for that lock.
+  let branchBase: string | null = null;
+  // Whether this is a release run, for the aggregate's labels. A PR run never is; a trunk run is when its branch is not
+  // the repository's default branch. Until GitHub names that branch (the lookup failed, or never ran because nothing
+  // failed) it stays undefined, and the publisher infers it from the tested identity and the statuses.
+  let releaseRun: boolean | undefined = isTrunkRun ? undefined : false;
   const settleLaneSummary = async (): Promise<void> => {
     try {
-      await publisher.refresh(lanes, triageContext ?? undefined, laneSummary);
+      await publisher.refresh(lanes, triageContext ?? undefined, laneSummary, releaseRun);
     } catch (e) {
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
     }
@@ -261,10 +269,12 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     let trunkBranch: string | null | undefined = isTrunkRun ? id.branch : prBase;
     // A run with no PR on a branch other than the default (a release candidate's CMT) runs that branch's own copies of
     // the tests, which the default branch may have changed since: the default branch is its base.
-    let branchBase: string | null = null;
     if (isTrunkRun && id.branch && run.failing.length) {
       const defaultBranch = await defaultBranchOf(api, id.repository, log);
-      if (defaultBranch && defaultBranch !== id.branch) branchBase = defaultBranch;
+      if (defaultBranch) {
+        releaseRun = defaultBranch !== id.branch;
+        if (releaseRun) branchBase = defaultBranch;
+      }
     }
     // A run of shard placeholders only needs no history. Otherwise placeholders' files are asked for too: TSIO counts its
     // run window over the files asked for, so dropping one would change which past runs the real tests are judged on.
@@ -396,9 +406,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const rerun = rerunCheck?.rerun ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = rerunCheck?.held ?? null;
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
+    const pullBase = result.findings.find((f) => f.out_of_date?.base)?.out_of_date?.base ?? trunkBranch ?? prBase;
     const description = flakyOnly
       ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}`
-      : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
+      : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held, pullBase);
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
@@ -445,7 +456,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
       await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", flakyOnly ? `${run.counts.flaky} flaky, passed on retry · no test failed` : (flag && !result.findings.length
         ? `${run.counts.failed} failed · not triaged, ${runFlag(flag)}`
-        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
+        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed, pullBase).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));

@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { RETRY_DELAYS_MS } from "../../shared/src/github.ts";
 import type { CommitStatus, Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { laneSummary } from "../../shared/src/lane.ts";
 import { mayPublish, ownedURL, publishingOwner, readStatuses, statusOwner, statusPublisher } from "../../shared/src/status.ts";
@@ -115,6 +116,23 @@ test("new pending, clean result and raw failure replace an existing all-green ag
 });
 test("cancelled publication preserves statuses and does not even read GitHub", async () => {
   assert.equal(await publish({ env: { CANCELLED: "true" }, fetchImpl: () => { throw new Error("should not fetch"); } }), false);
+});
+test("a status write answered 503 is tried again, and publish's retryWait is used for the wait", async () => {
+  const f = fixture();
+  let posts = 0;
+  const fetchImpl: FetchImpl = async (url, init) => {
+    if (init?.method === "POST" && ++posts === 1) return new Response("unavailable", { status: 503 });
+    return f.fetchImpl(url, init);
+  };
+  const waits: number[] = [];
+  const written = await publish({
+    env: { COMPOSITE_IDENTITY: JSON.stringify(id), GITHUB_TOKEN: "fake", STATUS_CONTEXT: lane, OPERATION: "claim", STATUS_STATE: "pending", GITHUB_RUN_ID: "20", GITHUB_RUN_ATTEMPT: "1" },
+    fetchImpl,
+    retryWait: async (ms) => { waits.push(ms); },
+  });
+  assert.equal(written, true);
+  assert.deepEqual([posts, waits], [2, [RETRY_DELAYS_MS[0]]]);
+  assert.equal(f.rows.find((r) => r.context === lane)?.state, "pending");
 });
 test("finishing a summary verifies execution and exact-run reports before allowing green", async (t) => {
   const cases = [
@@ -274,4 +292,26 @@ test("the aggregate names a red E2E check under its own prefix that triage does 
   const f = fixture([status("20", "1", "success"), status("20", "1", "success", other), status("20", "1", "failure", upgrade), status("20", "1", "failure", "ci/build")]);
   await f.writer().summarize(lanes, "e2e-test/triage", laneSummary);
   assert.equal((f.posts.at(-1) as CommitStatus).description, "triaged lanes green · not triaged: playwright-full/enterprise/upgrade-from-release-11.10 red");
+});
+
+test("release workflows preserve out of date and fixed on main labels across refresh and summarize, including for legacy callers", async () => {
+  const f = fixture([{ ...status("20", "1", "failure"), description: "(1 out of date, 1 fixed on main) 50.0% passed (2 passed, 2 failed, 0 skipped)" }]);
+  const baseEnv = {
+    COMPOSITE_IDENTITY: JSON.stringify(id), GITHUB_TOKEN: "fake", STATUS_CONTEXT: lane,
+    TRIAGE_CONTEXT: "e2e-test/triage", TRIAGE_LANES: lanes.join(","),
+    GITHUB_RUN_ID: "20", GITHUB_RUN_ATTEMPT: "1",
+  };
+  // Legacy caller (no RELEASE input, default ""): derived from release lane status or composite-identity branch.
+  await publish({ env: { ...baseEnv, OPERATION: "refresh" }, fetchImpl: f.fetchImpl });
+  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 1 fixed on main, 1 out of date");
+  await publish({ env: { ...baseEnv, OPERATION: "summarize" }, fetchImpl: f.fetchImpl });
+  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 1 fixed on main, 1 out of date");
+  await publish({
+    env: { ...baseEnv, COMPOSITE_IDENTITY: JSON.stringify({ ...id, branch: "release-11.7" }), OPERATION: "refresh" },
+    fetchImpl: f.fetchImpl,
+  });
+  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 1 fixed on main, 1 out of date");
+  // Explicit RELEASE: "false" overrides inference for non-release callers.
+  await publish({ env: { ...baseEnv, RELEASE: "false", OPERATION: "refresh" }, fetchImpl: f.fetchImpl });
+  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: pull main changes");
 });

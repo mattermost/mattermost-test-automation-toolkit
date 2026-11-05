@@ -217,6 +217,27 @@ export function classify(
       `The available suite/report identity does not uniquely identify "${test.title}" in ${test.file}; history cannot clear it.`,
       true,
     );
+  // How often trunk failed or flaked this test, smoothed: trunk's instability clears a failure only at pMin or above.
+  const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
+  /** Why trunk's instability says nothing about this failure, or null when it may be the same flake. */
+  const notTrunksFlake = (): Finding | null => {
+    const unstable = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
+    // A failure with an error to compare is cleared only where trunk failed the same way: a trunk failure with another
+    // error, or with none to compare (a hook timeout, an empty excerpt), says nothing about this one.
+    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !unstable.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
+      const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
+      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
+    }
+    // A bare timeout or an error with nothing to compare names no cause. One that failed every try here is cleared only
+    // where trunk failed the same kind of way (the same bare timeout, or no error either): trunk's flakes of another
+    // error say nothing about it. Unknown tries are left as before.
+    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran &&
+      !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
+      const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
+      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`, true);
+    }
+    return null;
+  };
   // On trunk, a failure already there last time is a streak and stays red.
   if (isTrunkRun) {
     if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status))
@@ -227,8 +248,15 @@ export function classify(
     while (rough < trunk.length && (FAILED_STATUSES.has(trunk[rough].status) || trunk[rough].status === "flaky")) rough++;
     if (rough >= 2 && trunk.slice(0, rough).some((o) => FAILED_STATUSES.has(o.status)))
       return out("BROKEN_ON_TRUNK", `Still failing: failed or passed only on retry in each of the previous ${rough} ${lane ?? "trunk"} runs. A pass on retry is not a fix.`, true);
-    if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0)
+    // Intermittent clears only as a PR's failure would: often enough (pMin; one flake in 48 runs says little about a
+    // failure now) and the same failure (its error, or for one that failed every try, the same kind of failure).
+    if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0) {
+      if (laplace < cfg.pMin)
+        return out("REGRESSION", `Rarely unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the previous ${trunk.length} runs, too few to call this failure a flake.`, true);
+      const unlike = notTrunksFlake();
+      if (unlike) return unlike;
       return out("FLAKY_ON_TRUNK", `Intermittent on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the previous ${trunk.length} runs, and the last one passed${latestTrunk?.status === "flaky" ? " on retry" : ""}.`, false);
+    }
     if (trunk.length < cfg.minTrunkRuns)
       return out("INSUFFICIENT_DATA", `Only ${trunk.length} earlier trunk runs (need ${cfg.minTrunkRuns}); cannot tell a flake from a new break.`, true);
     return out("REGRESSION", `New on trunk: passed in all ${trunk.length} previous runs.`, true);
@@ -262,23 +290,9 @@ export function classify(
     return Object.assign(out("FIXED_ON_TRUNK", `${trunkBranch || "Trunk"} failed this test the same way in ${broken} runs in a row, then passed from ${trunk[recent - 1].commit_sha?.slice(0, 7) ?? "unknown"} on: trunk fixed it.`, true), {
       trunk_fixed: { last_fail: at(trunk[recent]), first_pass: at(trunk[recent - 1]) },
     });
-  const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
   if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0 && laplace >= cfg.pMin && latestTrunk?.status !== "failed") {
-    const unstable = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
-    // A failure with an error to compare is cleared only where trunk failed the same way: a trunk failure with another
-    // error, or with none to compare (a hook timeout, an empty excerpt), says nothing about this one.
-    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !unstable.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
-      const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
-      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
-    }
-    // A bare timeout or an error with nothing to compare names no cause. One that failed every try here is cleared only
-    // where trunk failed the same kind of way (the same bare timeout, or no error either): trunk's flakes of another
-    // error say nothing about it. Unknown tries are left as before.
-    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran &&
-      !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
-      const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
-      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`, true);
-    }
+    const unlike = notTrunksFlake();
+    if (unlike) return unlike;
     return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the last ${trunk.length} trunk runs.`, false);
   }
   // Require real trunk passes: trunkFails === 0 is also true with no trunk runs.
@@ -448,23 +462,26 @@ export function sameFailure(findings: Finding[]): Finding[] {
 
 /**
  * A failure that failed every try here and on another platform of this commit is not flakiness: a flake rarely does
- * that, a change to shared code does. Neither the model nor sameFailure may clear it. A rules clear is undone only where
- * it rests on no failure seen the same way (a bare timeout, an error too short to compare). A break on trunk, an
- * environment error, and a failure this change owns or that is out of date keep their own calls.
+ * that, a change to shared code does. Neither the model nor sameFailure may clear it, except on a release branch, where the
+ * model may still unblock it (decideRelease). A rules clear is undone too, even
+ * one that trunk's flakes with the same error support: a flake of one platform's error on trunk says nothing about the
+ * same test failing on two platforms of this commit. A held flaky clear becomes REGRESSION; a blocking REGRESSION or
+ * INSUFFICIENT_DATA keeps its class. A break on trunk, an environment error and a failure this change owns are not in
+ * the set checked here, so they keep their calls. Out-of-date is not checked here: markOutOfDate runs after this, so an
+ * out-of-date failure is held too and then gets its out-of-date mark as usual.
  */
 export function holdFailedEverywhere(findings: Finding[]): Finding[] {
   const flaky = new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
   for (const f of findings) {
-    if (!(BORDERLINE.has(f.class) || flaky.has(f.class)) || f.identity_unresolved || f.out_of_date || !f.tries || f.tries.ran < 2 || f.tries.failed !== f.tries.ran) continue;
-    const kind = failureKey(f.error).kind;
-    if (flaky.has(f.class) && (kind === "distinctive" || kind === "stuck")) continue;
+    if (!(BORDERLINE.has(f.class) || flaky.has(f.class)) || f.identity_unresolved || !f.tries || f.tries.ran < 2 || f.tries.failed !== f.tries.ran) continue;
     const on = [...new Set((f.other_lanes ?? []).filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform))];
     if (!on.length) continue;
+    const why = `Failed all ${f.tries.ran} tries here and failed on ${on.join(" and ")} on this same commit; a flake rarely does that.`;
     Object.assign(f, {
-      ...(f.blocking ? {} : { class: "REGRESSION" }),
+      ...(flaky.has(f.class) || !f.blocking ? { class: "REGRESSION" } : {}),
       blocking: true,
       failed_everywhere: on,
-      reason: `Failed all ${f.tries.ran} tries here and failed on ${on.join(" and ")} on this same commit; a flake rarely does that. ${f.reason}`,
+      reason: `${why} ${flaky.has(f.class) ? `Its clear does not stand: ${f.reason}` : f.reason}`,
     });
   }
   return findings;

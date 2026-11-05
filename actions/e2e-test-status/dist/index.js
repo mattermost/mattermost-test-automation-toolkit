@@ -4,16 +4,40 @@
 var import_node_fs = require("fs");
 
 // ../shared/src/github.ts
-function gh(fetchImpl, token) {
+var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var STATUS_POST = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/?]+$/;
+var RETRY_DELAYS_MS = Object.freeze([1e3, 3e3]);
+var retryable = (status) => status >= 500 || status === 429;
+var networkError = (e) => e instanceof TypeError && (e.message === "fetch failed" || e.message === "terminated") || e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError");
+function gh(fetchImpl, token, wait = sleep) {
   return async (method, path, body) => {
-    const res = await fetchImpl(`https://api.github.com${path}`, {
-      method,
-      headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json", "user-agent": "mattermost-e2e-triage" },
-      body: body ? JSON.stringify(body) : void 0,
-      signal: AbortSignal.timeout(6e4)
-    });
-    if (!res.ok) throw new Error(`GitHub ${method} ${path}: ${res.status} ${(await res.text()).slice(0, 200)}`);
-    return res.status === 204 ? null : res.json();
+    const isStatusPost = method === "POST" && STATUS_POST.test(path);
+    const delays = isStatusPost ? RETRY_DELAYS_MS : [];
+    const payload = body ? JSON.stringify(body) : void 0;
+    for (let attempt = 0; ; attempt++) {
+      let res;
+      try {
+        res = await fetchImpl(`https://api.github.com${path}`, {
+          method,
+          headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json", "user-agent": "mattermost-e2e-triage" },
+          body: payload,
+          signal: AbortSignal.timeout(6e4)
+        });
+      } catch (e) {
+        if (networkError(e) && attempt < delays.length) {
+          await wait(delays[attempt]);
+          continue;
+        }
+        throw e;
+      }
+      if (res.ok) return res.status === 204 ? null : isStatusPost ? res.json().catch(() => null) : await res.json();
+      const text = (await res.text().catch(() => "")).slice(0, 200);
+      if (retryable(res.status) && attempt < delays.length) {
+        await wait(delays[attempt]);
+        continue;
+      }
+      throw new Error(`GitHub ${method} ${path}: ${res.status} ${text}`);
+    }
   };
 }
 
@@ -31,15 +55,29 @@ function namedIn(description) {
     check: count(/(\d+) unresolved/) + count(/(\d+) needs investigation/)
   };
 }
-function redReason(description = "") {
+var PULL_GUIDANCE = /\bpull [^\s,;)][^\n,;)]*? changes\b/;
+function releaseFromDescriptions(descriptions) {
+  const ds = descriptions.map((d) => String(d ?? ""));
+  if (ds.some((d) => PULL_GUIDANCE.test(d))) return false;
+  if (ds.some((d) => /\b\d+ (?:test bug|server compat)\b/.test(d))) return true;
+  if (ds.some((d) => /\b\d+ caused by PR\b/.test(d))) return false;
+  if (ds.some((d) => /\b\d+ (?:out of date|fixed on main)\b/.test(d))) return true;
+  return void 0;
+}
+function redReason(description = "", release = false) {
   const d = String(description);
   const { cleared, caused, appBug, fixed, outdated, check } = namedIn(d);
   const parts = [];
   if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
-  if (fixed) parts.push(`${fixed} fixed on main`);
-  if (outdated) parts.push(`${outdated} out of date`);
+  const pull = PULL_GUIDANCE.exec(d)?.[0];
+  if (release) {
+    if (fixed) parts.push(`${fixed} fixed on main`);
+    if (outdated) parts.push(`${outdated} out of date`);
+  } else if (pull || fixed || outdated) {
+    parts.push(pull ?? "pull main changes");
+  }
   if (check) parts.push(`${check} to check`);
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";
@@ -56,7 +94,7 @@ function redReason(description = "") {
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
   return parts.length ? parts.join(", ") : "still red";
 }
-function laneSummary(lanes, untriaged = []) {
+function laneSummary(lanes, untriaged = [], release) {
   const seen = lanes.filter((l) => Boolean(l.status));
   const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
   const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
@@ -70,9 +108,10 @@ function laneSummary(lanes, untriaged = []) {
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
+  const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
+  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
   if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" \xB7 ")) };
   return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
 }
@@ -139,7 +178,19 @@ function mayPublish(rows, id, context, owner, operation) {
   }
   return current.run === owner.run && compareOwners(owner, current) >= 0 && (operation !== "triage" || lane[0].state !== "pending");
 }
-function statusPublisher({ api, id, context, env = {}, log = console.error }) {
+function inferRelease(id, env = {}, rows = [], summaryContext) {
+  const configured = (env.RELEASE ?? "").trim().toLowerCase();
+  if (configured === "true") return true;
+  if (configured === "false") return false;
+  if (Number(id.gh_pr_number || 0) > 0) return false;
+  const branch = String(id.branch ?? "").trim();
+  if (branch) return branch !== "main" && branch !== "master";
+  const ref = String(env.GITHUB_REF_NAME || String(env.GITHUB_REF ?? "").replace(/^refs\/heads\//, "")).trim();
+  if (/^release([/_.-]|$)/i.test(ref)) return true;
+  if (summaryContext) return releaseFromDescriptions([rows.find((r) => r.context === summaryContext)?.description]);
+  return void 0;
+}
+function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease }) {
   let validated;
   const owner = () => validated ??= publishingOwner(id, env);
   const snapshotOwner = () => {
@@ -158,7 +209,7 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
     description: row.description.slice(0, 140),
     target_url: ownedURL(row.target_url, by, id.repository)
   });
-  const summarize = async (lanes, summaryContext, summarizeLanes) => {
+  const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease) => {
     if (!summaryContext || !lanes.length) return;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
     const rows = await readStatuses(api, id);
@@ -167,7 +218,8 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
-    await post({ ...summarizeLanes(latest, untriaged), context: summaryContext }, snapshotOwner());
+    const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
+    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,
@@ -185,9 +237,9 @@ function statusPublisher({ api, id, context, env = {}, log = console.error }) {
       await post(row);
       return true;
     },
-    async refresh(lanes, summaryContext, summarizeLanes) {
+    async refresh(lanes, summaryContext, summarizeLanes, release = defaultRelease) {
       if (!summaryContext || !lanes.includes(context) || !await allowed("finish")) return;
-      await summarize(lanes, summaryContext, summarizeLanes);
+      await summarize(lanes, summaryContext, summarizeLanes, release);
     }
   };
 }
@@ -395,14 +447,16 @@ function reportWait(env) {
   const ms = 2e4;
   return { attempts: Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds * 1e3 / ms) : 0, ms };
 }
-async function publish({ env, fetchImpl = fetch, log = console.error, wait }) {
+async function publish({ env, fetchImpl = fetch, log = console.error, wait, retryWait }) {
   if (env.CANCELLED === "true") return false;
   const id = compositeIdentityFrom(env.COMPOSITE_IDENTITY);
   const operation = env.OPERATION || "finish";
   if (!["claim", "finish", "refresh", "summarize"].includes(operation)) throw new Error("Invalid status operation");
   if (operation === "finish") tsioBase(env);
   if (!env.STATUS_CONTEXT || !env.GITHUB_TOKEN) throw new Error("Status context and GitHub token are required");
-  const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN), id, context: env.STATUS_CONTEXT, env, log });
+  const rawRelease = (env.RELEASE ?? "").trim().toLowerCase();
+  const release = rawRelease === "true" ? true : rawRelease === "false" ? false : void 0;
+  const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN, retryWait), id, context: env.STATUS_CONTEXT, env, log, release });
   let written = false;
   let state = env.STATUS_STATE ?? "";
   let reportsComplete = false;
@@ -429,8 +483,8 @@ async function publish({ env, fetchImpl = fetch, log = console.error, wait }) {
     written = await publisher.write({ state, description, target_url: env.TARGET_URL }, operation);
   }
   const lanes = String(env.TRIAGE_LANES || "").split(",").map((s) => s.trim()).filter(Boolean);
-  if (operation === "summarize") await publisher.summarize(lanes, env.TRIAGE_CONTEXT, laneSummary);
-  if (written || operation === "refresh") await publisher.refresh(lanes, env.TRIAGE_CONTEXT, laneSummary);
+  if (operation === "summarize") await publisher.summarize(lanes, env.TRIAGE_CONTEXT, laneSummary, release);
+  if (written || operation === "refresh") await publisher.refresh(lanes, env.TRIAGE_CONTEXT, laneSummary, release);
   if (env.GITHUB_OUTPUT) (0, import_node_fs.appendFileSync)(env.GITHUB_OUTPUT, `published=${written}
 state=${state || ""}
 reports_complete=${reportsComplete}

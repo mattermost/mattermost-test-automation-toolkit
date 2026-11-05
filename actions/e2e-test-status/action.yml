@@ -54,6 +54,12 @@ inputs:
   triage-lanes:
     description: Comma-separated required status contexts included in the cross-lane summary
     default: ""
+  release:
+    description: >-
+      Whether this is a release-branch run ("true" or "false"), so the cross-lane
+      summary preserves release labels. Leave empty to infer from composite-identity
+      and existing lane/aggregate statuses.
+    default: ""
 outputs:
   state:
     description: Raw result after execution and report validation (publication still requires ownership)
@@ -86,4 +92,5 @@ runs:
         USE_STAGING: ${{ inputs.use-staging }}
         TRIAGE_CONTEXT: ${{ inputs.triage-status-context }}
         TRIAGE_LANES: ${{ inputs.triage-lanes }}
+        RELEASE: ${{ inputs.release }}
       run: node "${{ github.action_path }}/dist/index.js"

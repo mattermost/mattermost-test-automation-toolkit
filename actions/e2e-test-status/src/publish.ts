@@ -2,7 +2,7 @@
 // See LICENSE.txt for license information.
 import { appendFileSync } from "node:fs";
 import { gh } from "../../shared/src/github.ts";
-import type { Env, FetchImpl } from "../../shared/src/github.ts";
+import type { Env, FetchImpl, Sleep } from "../../shared/src/github.ts";
 import { laneSummary } from "../../shared/src/lane.ts";
 import { FAILED_TESTS, REPORTS_INCOMPLETE, statusPublisher, UPSTREAM_FAILED } from "../../shared/src/status.ts";
 import { compositeIdentityFrom, fetchRun, tsioBase } from "../../shared/src/tsio.ts";
@@ -24,9 +24,12 @@ export interface PublishOptions {
   fetchImpl?: FetchImpl;
   log?: (message: string) => void;
   wait?: Wait;
+  /** Waits between a status write's retries; a test passes one that does not sleep. */
+  retryWait?: Sleep;
 }
 
-export async function publish({ env, fetchImpl = fetch, log = console.error, wait }: PublishOptions): Promise<boolean> {
+/** Publishes a run-owned E2E lane status and refreshes or summarizes the cross-lane aggregate. */
+export async function publish({ env, fetchImpl = fetch, log = console.error, wait, retryWait }: PublishOptions): Promise<boolean> {
   if (env.CANCELLED === "true") return false;
   // The identity is trusted as written by the caller, as before: no shape check.
   const id = compositeIdentityFrom(env.COMPOSITE_IDENTITY);
@@ -36,7 +39,9 @@ export async function publish({ env, fetchImpl = fetch, log = console.error, wai
   // before any GitHub or TSIO call. claim, refresh and summarize read no TSIO and still publish.
   if (operation === "finish") tsioBase(env);
   if (!env.STATUS_CONTEXT || !env.GITHUB_TOKEN) throw new Error("Status context and GitHub token are required");
-  const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN), id, context: env.STATUS_CONTEXT, env, log });
+  const rawRelease = (env.RELEASE ?? "").trim().toLowerCase();
+  const release = rawRelease === "true" ? true : rawRelease === "false" ? false : undefined;
+  const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN, retryWait), id, context: env.STATUS_CONTEXT, env, log, release });
   let written = false;
   let state: string = env.STATUS_STATE ?? "";
   let reportsComplete = false;
@@ -67,8 +72,8 @@ export async function publish({ env, fetchImpl = fetch, log = console.error, wai
   const lanes = String(env.TRIAGE_LANES || "").split(",").map((s) => s.trim()).filter(Boolean);
   // This is a factual projection of required statuses, also in report-only
   // mode. Only triage itself can clear failures, and still respects its label.
-  if (operation === "summarize") await publisher.summarize(lanes, env.TRIAGE_CONTEXT, laneSummary);
-  if (written || operation === "refresh") await publisher.refresh(lanes, env.TRIAGE_CONTEXT, laneSummary);
+  if (operation === "summarize") await publisher.summarize(lanes, env.TRIAGE_CONTEXT, laneSummary, release);
+  if (written || operation === "refresh") await publisher.refresh(lanes, env.TRIAGE_CONTEXT, laneSummary, release);
   if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${written}\nstate=${state || ""}\nreports_complete=${reportsComplete}\n`);
   return written;
 }

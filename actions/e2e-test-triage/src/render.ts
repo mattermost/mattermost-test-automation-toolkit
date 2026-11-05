@@ -499,17 +499,40 @@ export const RERUN = "re-run the failed jobs";
 export const RERUNNING = "re-running the failed jobs";
 
 /**
+ * What the check says for a PR's failures the base branch's changes explain (fixed on main, or out of date): the one thing
+ * to do about them, without a count. The pass line already counts the failures.
+ */
+export const PULL_MAIN = "pull main changes";
+const DEFAULT_BASE_BRANCHES = new Set(["main", "master", "the default branch"]);
+/** The check label for failures the base branch explains: "pull main changes", or "pull <base> changes" on another base. */
+export const pullBaseLabel = (baseBranch?: string | null): string => {
+  const b = (baseBranch ?? "").replace(/[,;()]/g, "").trim();
+  return `pull ${!b || DEFAULT_BASE_BRANCHES.has(b) ? "main" : b} changes`;
+};
+
+/**
  * The status labels for a run, each with its count, in the fixed order and only where non-zero ("2 flaky, 2 caused by PR").
+ * A PR's fixed-on-main and out-of-date failures are named once, by what to do: pullBaseLabel(baseBranch), where
+ * "fixed on main" would be. A release run keeps their labels: its fix is a backport, not a merge of the base branch.
  * A run with failures and no findings (every failure is a shard placeholder) is red for a re-run, and says so.
  */
-export function statusLabels(findings: Finding[], failed = findings.length): string[] {
+export function statusLabels(findings: Finding[], failed = findings.length, baseBranch?: string | null): string[] {
   if (!findings.length) return failed ? [RERUN] : [];
   const counts = new Map<StatusLabel, number>();
+  // Whether to say "pull ... changes" is kept apart from which base it names: an unknown base still says "pull main changes".
+  let pull = false;
+  let pullBase: string | null = null;
   for (const f of findings) {
     const label = statusLabelOf(f);
-    counts.set(label, (counts.get(label) ?? 0) + 1);
+    if (!f.release && (label === "fixed on main" || label === "out of date")) {
+      pull = true;
+      pullBase ??= f.out_of_date?.base || baseBranch || null;
+    } else counts.set(label, (counts.get(label) ?? 0) + 1);
   }
-  return STATUS_LABELS.filter((l) => counts.has(l)).map((l) => `${counts.get(l)} ${l}`);
+  return STATUS_LABELS.flatMap((l) => [
+    ...(pull && l === "fixed on main" ? [pullBaseLabel(pullBase)] : []),
+    ...(counts.has(l) ? [`${counts.get(l)} ${l}`] : []),
+  ]);
 }
 
 const STATUS_MAX = 140;
@@ -526,13 +549,13 @@ export const activeFlag = (infra: string | null | undefined, findings: Finding[]
  * left out. Shard placeholders beside findings add "re-run the failed jobs" after the labels ("(1 flaky; re-run the
  * failed jobs) ..."). The pass line counts specs that never ran apart from the failed. It is never shortened; past 140 characters the labels are, as the last resort.
  */
-export function statusDescription(verdict: string, findings: Finding[], runInfra: string | null | undefined, counts: Partial<Counts>, missing: SummaryMissing | null = null, unnamed = 0, notRun = 0, rerun: Rerun | null = null, held: string | null = null): string {
+export function statusDescription(verdict: string, findings: Finding[], runInfra: string | null | undefined, counts: Partial<Counts>, missing: SummaryMissing | null = null, unnamed = 0, notRun = 0, rerun: Rerun | null = null, held: string | null = null, baseBranch: string | null = null): string {
   const pass = passLine(counts, notRun);
   // A held re-run says why on the check; an automatic one says it is on its way.
   const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
   // A run with many failures says what triage made of each one, and its flag only while one still blocks.
   const infra = activeFlag(runInfra, findings);
-  const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0).map((l) => (l === RERUN ? again : l)).join(", ");
+  const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0, baseBranch).map((l) => (l === RERUN ? again : l)).join(", ");
   const rest = [infra && findings.length ? runFlag(infra) : "", unnamed && findings.length ? again : "", missing?.short ?? ""].filter(Boolean).join("; ");
   const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);
   const shown = head.length <= room ? head : room > 1 ? `${head.slice(0, room - 1).trimEnd()}…` : "";
