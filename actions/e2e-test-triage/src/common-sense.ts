@@ -22,7 +22,8 @@ const PLATFORM_FILES: Record<string, RegExp> = {
   ios: /(^|\/)ios\/|(^|\/)Podfile(\.lock)?$|\.(swift|m|mm|h|pbxproj|xcconfig|entitlements|plist|storyboard|xib)$|\.xc(odeproj|workspace)\//i,
   android: /(^|\/)android\/|\.(gradle|kts|kt|java)$|(^|\/)gradle\.properties$|AndroidManifest\.xml$/i,
   linux: /(^|[/_.-])(linux|ubuntu|debian|deb|rpm|snap|flatpak|appimage)([/_.-]|$)/i,
-  windows: /(^|[/_.-])(win|win32|win64|windows|msi|msix|appx|nsis)([/_.-]|$)|\.(ps1|bat|cmd)$/i,
+  // "windows" in a directory name is often UI window code (e.g. src/app/windows/baseWindow.ts), not Microsoft Windows.
+  windows: /(^|[/_.-])(win|win32|win64|msi|msix|appx|nsis)([/_.-]|$)|[/_.-]windows(?=\.[^/]+$)|\.(ps1|bat|cmd)$/i,
   macos: /(^|[/_.-])(mac|macos|darwin|osx|dmg|mas)([/_.-]|$)|\.(entitlements|plist)$/i,
 };
 

@@ -34,9 +34,8 @@ const retryable = (status: number): boolean => status >= 500 || status === 429;
 
 // fetch (undici) rejects a dropped connection with a TypeError ("fetch failed" before headers, "terminated" while
 // reading the body) whose cause says why, and an expired or aborted signal with a DOMException (TimeoutError,
-// AbortError). Any other TypeError is not the network's doing (an invalid header value, for one), and a SyntaxError
-// from res.json() is a bad response body, not a dropped connection. A timed-out write is retried too: with the 60 s
-// signal a status POST that keeps hanging gives up after about 3 minutes.
+// AbortError). Any other TypeError is not the network's doing (an invalid header value, for one). A timed-out write is
+// retried too: with the 60 s signal a status POST that keeps hanging gives up after about 3 minutes.
 const networkError = (e: unknown): boolean =>
   (e instanceof TypeError && (e.message === "fetch failed" || e.message === "terminated")) ||
   (e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError"));
@@ -44,7 +43,8 @@ const networkError = (e: unknown): boolean =>
 export function gh(fetchImpl: FetchImpl, token: string, wait: Sleep = sleep): GhApi {
   return async (method, path, body) => {
     // Only a status write is safe to repeat; other writes (a re-run request) are not.
-    const delays = method === "POST" && STATUS_POST.test(path) ? RETRY_DELAYS_MS : [];
+    const isStatusPost = method === "POST" && STATUS_POST.test(path);
+    const delays = isStatusPost ? RETRY_DELAYS_MS : [];
     // Outside the retry: a body that cannot be serialized is the caller's error, not the network's.
     const payload = body ? JSON.stringify(body) : undefined;
     for (let attempt = 0; ; attempt++) {
@@ -56,7 +56,6 @@ export function gh(fetchImpl: FetchImpl, token: string, wait: Sleep = sleep): Gh
           body: payload,
           signal: AbortSignal.timeout(60000),
         });
-        if (res.ok) return res.status === 204 ? null : await res.json();
       } catch (e) {
         if (networkError(e) && attempt < delays.length) {
           await wait(delays[attempt]);
@@ -64,6 +63,9 @@ export function gh(fetchImpl: FetchImpl, token: string, wait: Sleep = sleep): Gh
         }
         throw e;
       }
+      // Once GitHub returns 2xx for a status POST, the status is already created and callers do not read its body:
+      // a body-read failure must neither retry the POST nor fail the write (which would skip the aggregate refresh).
+      if (res.ok) return res.status === 204 ? null : isStatusPost ? res.json().catch(() => null) : await res.json();
       // The body only names the error: one that cannot be read must not stop a retry.
       const text = (await res.text().catch(() => "")).slice(0, 200);
       if (retryable(res.status) && attempt < delays.length) {

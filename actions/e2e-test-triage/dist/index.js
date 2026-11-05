@@ -11,7 +11,8 @@ var retryable = (status) => status >= 500 || status === 429;
 var networkError = (e) => e instanceof TypeError && (e.message === "fetch failed" || e.message === "terminated") || e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError");
 function gh(fetchImpl, token, wait = sleep) {
   return async (method, path, body) => {
-    const delays = method === "POST" && STATUS_POST.test(path) ? RETRY_DELAYS_MS : [];
+    const isStatusPost = method === "POST" && STATUS_POST.test(path);
+    const delays = isStatusPost ? RETRY_DELAYS_MS : [];
     const payload = body ? JSON.stringify(body) : void 0;
     for (let attempt = 0; ; attempt++) {
       let res;
@@ -22,7 +23,6 @@ function gh(fetchImpl, token, wait = sleep) {
           body: payload,
           signal: AbortSignal.timeout(6e4)
         });
-        if (res.ok) return res.status === 204 ? null : await res.json();
       } catch (e) {
         if (networkError(e) && attempt < delays.length) {
           await wait(delays[attempt]);
@@ -30,6 +30,7 @@ function gh(fetchImpl, token, wait = sleep) {
         }
         throw e;
       }
+      if (res.ok) return res.status === 204 ? null : isStatusPost ? res.json().catch(() => null) : await res.json();
       const text = (await res.text().catch(() => "")).slice(0, 200);
       if (retryable(res.status) && attempt < delays.length) {
         await wait(delays[attempt]);
@@ -54,14 +55,20 @@ function namedIn(description) {
     check: count2(/(\d+) unresolved/) + count2(/(\d+) needs investigation/)
   };
 }
-function redReason(description = "") {
+function redReason(description = "", release = false) {
   const d = String(description);
   const { cleared, caused, appBug, fixed, outdated, check } = namedIn(d);
   const parts = [];
   if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
-  if (fixed || outdated || /pull main changes/.test(d)) parts.push("pull main changes");
+  const pull = /\bpull [^\s,;)][^\n,;)]*? changes\b/.exec(d)?.[0];
+  if (release) {
+    if (fixed) parts.push(`${fixed} fixed on main`);
+    if (outdated) parts.push(`${outdated} out of date`);
+  } else if (pull || fixed || outdated) {
+    parts.push(pull ?? "pull main changes");
+  }
   if (check) parts.push(`${check} to check`);
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";
@@ -78,7 +85,7 @@ function redReason(description = "") {
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
   return parts.length ? parts.join(", ") : "still red";
 }
-function laneSummary(lanes, untriaged = []) {
+function laneSummary(lanes, untriaged = [], release = false) {
   const seen = lanes.filter((l) => Boolean(l.status));
   const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
   const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
@@ -92,9 +99,10 @@ function laneSummary(lanes, untriaged = []) {
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
+  const isRelease = release || seen.some((l) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(String(l.status.description ?? "")));
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
+  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
   if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" \xB7 ")) };
   return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
 }
@@ -2060,7 +2068,8 @@ var PLATFORM_FILES = {
   ios: /(^|\/)ios\/|(^|\/)Podfile(\.lock)?$|\.(swift|m|mm|h|pbxproj|xcconfig|entitlements|plist|storyboard|xib)$|\.xc(odeproj|workspace)\//i,
   android: /(^|\/)android\/|\.(gradle|kts|kt|java)$|(^|\/)gradle\.properties$|AndroidManifest\.xml$/i,
   linux: /(^|[/_.-])(linux|ubuntu|debian|deb|rpm|snap|flatpak|appimage)([/_.-]|$)/i,
-  windows: /(^|[/_.-])(win|win32|win64|windows|msi|msix|appx|nsis)([/_.-]|$)|\.(ps1|bat|cmd)$/i,
+  // "windows" in a directory name is often UI window code (e.g. src/app/windows/baseWindow.ts), not Microsoft Windows.
+  windows: /(^|[/_.-])(win|win32|win64|msi|msix|appx|nsis)([/_.-]|$)|[/_.-]windows(?=\.[^/]+$)|\.(ps1|bat|cmd)$/i,
   macos: /(^|[/_.-])(mac|macos|darwin|osx|dmg|mas)([/_.-]|$)|\.(entitlements|plist)$/i
 };
 var onlyOnPlatform = (platform, file) => Boolean(PLATFORM_FILES[platform]?.test(file));
@@ -2747,29 +2756,33 @@ function statusLabelOf(f) {
 }
 var RERUN = "re-run the failed jobs";
 var RERUNNING = "re-running the failed jobs";
-var PULL_MAIN = "pull main changes";
-function statusLabels(findings, failed = findings.length) {
+var DEFAULT_BASE_BRANCHES = /* @__PURE__ */ new Set(["main", "master", "the default branch"]);
+var pullBaseLabel = (baseBranch) => {
+  const b = (baseBranch ?? "").replace(/[,;()]/g, "").trim();
+  return `pull ${!b || DEFAULT_BASE_BRANCHES.has(b) ? "main" : b} changes`;
+};
+function statusLabels(findings, failed = findings.length, baseBranch) {
   if (!findings.length) return failed ? [RERUN] : [];
   const counts = /* @__PURE__ */ new Map();
-  let pull = false;
+  let pull = null;
   for (const f of findings) {
     const label = statusLabelOf(f);
-    if (!f.release && (label === "fixed on main" || label === "out of date")) pull = true;
+    if (!f.release && (label === "fixed on main" || label === "out of date")) pull ??= baseBranch ?? f.out_of_date?.base ?? null;
     else counts.set(label, (counts.get(label) ?? 0) + 1);
   }
   return STATUS_LABELS.flatMap((l) => [
-    ...pull && l === "fixed on main" ? [PULL_MAIN] : [],
+    ...pull !== null && l === "fixed on main" ? [pullBaseLabel(pull)] : [],
     ...counts.has(l) ? [`${counts.get(l)} ${l}`] : []
   ]);
 }
 var STATUS_MAX = 140;
 var runFlag = (infra) => /infrastructure errors/.test(infra) ? "mostly environment errors, re-run" : "many failures in one run";
 var activeFlag = (infra, findings) => infra && (!findings.length || findings.some((f) => f.blocking)) ? infra : null;
-function statusDescription(verdict, findings, runInfra, counts, missing = null, unnamed = 0, notRun = 0, rerun = null, held = null) {
+function statusDescription(verdict, findings, runInfra, counts, missing = null, unnamed = 0, notRun = 0, rerun = null, held = null, baseBranch = null) {
   const pass = passLine(counts, notRun);
   const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
   const infra = activeFlag(runInfra, findings);
-  const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0).map((l) => l === RERUN ? again : l).join(", ");
+  const head = infra && !findings.length ? `not triaged, ${runFlag(infra)}` : statusLabels(findings, counts.failed ?? 0, baseBranch).map((l) => l === RERUN ? again : l).join(", ");
   const rest = [infra && findings.length ? runFlag(infra) : "", unnamed && findings.length ? again : "", missing?.short ?? ""].filter(Boolean).join("; ");
   const room = STATUS_MAX - pass.length - 3 - (rest ? rest.length + 2 : 0);
   const shown = head.length <= room ? head : room > 1 ? `${head.slice(0, room - 1).trimEnd()}\u2026` : "";
@@ -3126,9 +3139,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
   const decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly;
   const announce = enforce && decides;
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
+  let summarizeLanes = laneSummary;
   const settleLaneSummary = async () => {
     try {
-      await publisher.refresh(lanes, triageContext ?? void 0, laneSummary);
+      await publisher.refresh(lanes, triageContext ?? void 0, summarizeLanes);
     } catch (e) {
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
     }
@@ -3142,7 +3156,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     let branchBase = null;
     if (isTrunkRun && id.branch && run.failing.length) {
       const defaultBranch = await defaultBranchOf(api, id.repository, log);
-      if (defaultBranch && defaultBranch !== id.branch) branchBase = defaultBranch;
+      if (defaultBranch && defaultBranch !== id.branch) {
+        branchBase = defaultBranch;
+        summarizeLanes = (ls, u) => laneSummary(ls, u, true);
+      }
     }
     if (run.failing.some((t) => !isShardPlaceholder(t))) {
       [history, diff] = await Promise.all([
@@ -3265,7 +3282,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const rerun = rerunCheck?.rerun ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = rerunCheck?.held ?? null;
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
-    const description = flakyOnly ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}` : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
+    const description = flakyOnly ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}` : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held, prBase ?? trunkBranch);
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
       (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}
@@ -3309,7 +3326,7 @@ ai_output_tokens=${spend.output_tokens}
     if (announce && lanes.length) await settleLaneSummary();
     else if (announce) {
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", flakyOnly ? `${run.counts.flaky} flaky, passed on retry \xB7 no test failed` : (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).map((l) => l === RERUN ? again : l).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${again}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", flakyOnly ? `${run.counts.flaky} flaky, passed on retry \xB7 no test failed` : (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed, prBase ?? trunkBranch).map((l) => l === RERUN ? again : l).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${again}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
 `);

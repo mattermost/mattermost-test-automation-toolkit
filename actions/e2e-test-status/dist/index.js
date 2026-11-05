@@ -11,7 +11,8 @@ var retryable = (status) => status >= 500 || status === 429;
 var networkError = (e) => e instanceof TypeError && (e.message === "fetch failed" || e.message === "terminated") || e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError");
 function gh(fetchImpl, token, wait = sleep) {
   return async (method, path, body) => {
-    const delays = method === "POST" && STATUS_POST.test(path) ? RETRY_DELAYS_MS : [];
+    const isStatusPost = method === "POST" && STATUS_POST.test(path);
+    const delays = isStatusPost ? RETRY_DELAYS_MS : [];
     const payload = body ? JSON.stringify(body) : void 0;
     for (let attempt = 0; ; attempt++) {
       let res;
@@ -22,7 +23,6 @@ function gh(fetchImpl, token, wait = sleep) {
           body: payload,
           signal: AbortSignal.timeout(6e4)
         });
-        if (res.ok) return res.status === 204 ? null : await res.json();
       } catch (e) {
         if (networkError(e) && attempt < delays.length) {
           await wait(delays[attempt]);
@@ -30,6 +30,7 @@ function gh(fetchImpl, token, wait = sleep) {
         }
         throw e;
       }
+      if (res.ok) return res.status === 204 ? null : isStatusPost ? res.json().catch(() => null) : await res.json();
       const text = (await res.text().catch(() => "")).slice(0, 200);
       if (retryable(res.status) && attempt < delays.length) {
         await wait(delays[attempt]);
@@ -54,14 +55,20 @@ function namedIn(description) {
     check: count(/(\d+) unresolved/) + count(/(\d+) needs investigation/)
   };
 }
-function redReason(description = "") {
+function redReason(description = "", release = false) {
   const d = String(description);
   const { cleared, caused, appBug, fixed, outdated, check } = namedIn(d);
   const parts = [];
   if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
-  if (fixed || outdated || /pull main changes/.test(d)) parts.push("pull main changes");
+  const pull = /\bpull [^\s,;)][^\n,;)]*? changes\b/.exec(d)?.[0];
+  if (release) {
+    if (fixed) parts.push(`${fixed} fixed on main`);
+    if (outdated) parts.push(`${outdated} out of date`);
+  } else if (pull || fixed || outdated) {
+    parts.push(pull ?? "pull main changes");
+  }
   if (check) parts.push(`${check} to check`);
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";
@@ -78,7 +85,7 @@ function redReason(description = "") {
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
   return parts.length ? parts.join(", ") : "still red";
 }
-function laneSummary(lanes, untriaged = []) {
+function laneSummary(lanes, untriaged = [], release = false) {
   const seen = lanes.filter((l) => Boolean(l.status));
   const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
   const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
@@ -92,9 +99,10 @@ function laneSummary(lanes, untriaged = []) {
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
+  const isRelease = release || seen.some((l) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(String(l.status.description ?? "")));
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
+  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
   if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" \xB7 ")) };
   return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
 }

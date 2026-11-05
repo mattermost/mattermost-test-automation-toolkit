@@ -110,9 +110,12 @@ flakes say nothing about the same test failing on two platforms of this commit.
 Such a failure is held: a flaky clear becomes `REGRESSION` and needs
 investigation, and a blocking `REGRESSION` or `INSUFFICIENT_DATA` keeps its class.
 A break on master, an environment error, and a spec the PR edits keep their own
-calls. Either condition alone changes nothing. On a release branch the hold is
-not final: the model may still unblock a test bug or a server compat problem (see
-the release section below). A held failure that is also out of date shows in the
+calls. Either condition alone changes nothing. The hold is not
+final on a release branch: the model may still unblock a test bug or a server
+compat problem (see the release section below). On a run flagged as a whole
+(`INFRA`), sibling TSIO groups are not read (other reports in the same group
+still are), so the hold applies only where another platform's result is in the
+same group. A held failure that is also out of date shows in the
 out-of-date bucket ("merge and re-run") because the out-of-date mark is set after
 the hold.
 
@@ -280,7 +283,8 @@ model fails or is unavailable, the rules' outcome stands.
   order: flaky, broken on main, test bug, server compat, caused by PR, app bug,
   fixed on main, out of date, needs investigation (test bug, server compat and
   app bug only on a release branch). On a PR, fixed on main and out of date are
-  named once, by what to do, with no count: `(1 caused by PR, pull main changes)`.
+  named once, by what to do, with no count: `(1 caused by PR, pull main changes)`
+  (or `pull <base> changes` when the PR targets another branch).
   A release branch keeps them as labels: its fix is a backport, not a merge. The
   PR-wide triage check reads the same way (`playwright-full/enterprise: pull main
   changes`). The
@@ -528,7 +532,8 @@ Otherwise the failure stays blocking as a `REGRESSION`. Failing again in the nex
 makes it `BROKEN_ON_TRUNK`.
 
 A failure that failed every try here and on another platform of the same commit
-is held there too, as on a PR, and only the held classes are: `REGRESSION`,
+is held there too, as on a PR (when the run is not flagged as `INFRA`, or the
+other platform is in the same TSIO group), and only the held classes are: `REGRESSION`,
 `INSUFFICIENT_DATA` and the flaky classes (`FLAKY_ON_TRUNK`, `FLAKY_CROSS_PR`). A
 flaky clear becomes `REGRESSION`, blocking. A blocking `REGRESSION` or
 `INSUFFICIENT_DATA` keeps its class and gets the `failed_everywhere` mark. A break

@@ -246,9 +246,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
   // All required-status writers and this snapshot hold one SHA-scoped job
   // concurrency lock. A delayed second snapshot cannot substitute for that lock.
+  let summarizeLanes = laneSummary;
   const settleLaneSummary = async (): Promise<void> => {
     try {
-      await publisher.refresh(lanes, triageContext ?? undefined, laneSummary);
+      await publisher.refresh(lanes, triageContext ?? undefined, summarizeLanes);
     } catch (e) {
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
     }
@@ -266,7 +267,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     let branchBase: string | null = null;
     if (isTrunkRun && id.branch && run.failing.length) {
       const defaultBranch = await defaultBranchOf(api, id.repository, log);
-      if (defaultBranch && defaultBranch !== id.branch) branchBase = defaultBranch;
+      if (defaultBranch && defaultBranch !== id.branch) {
+        branchBase = defaultBranch;
+        summarizeLanes = (ls, u) => laneSummary(ls, u, true);
+      }
     }
     // A run of shard placeholders only needs no history. Otherwise placeholders' files are asked for too: TSIO counts its
     // run window over the files asked for, so dropping one would change which past runs the real tests are judged on.
@@ -400,7 +404,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
     const description = flakyOnly
       ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}`
-      : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
+      : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held, prBase ?? trunkBranch);
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
@@ -447,7 +451,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
       await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", flakyOnly ? `${run.counts.flaky} flaky, passed on retry · no test failed` : (flag && !result.findings.length
         ? `${run.counts.failed} failed · not triaged, ${runFlag(flag)}`
-        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
+        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed, prBase ?? trunkBranch).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));

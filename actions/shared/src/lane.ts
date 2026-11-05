@@ -44,7 +44,7 @@ function namedIn(description: string | null | undefined): Named {
 }
 
 // Why a lane triage left red is still red, read from the status triage wrote on it.
-export function redReason(description: string | null | undefined = ""): string {
+export function redReason(description: string | null | undefined = "", release = false): string {
   const d = String(description);
   const { cleared, caused, appBug, fixed, outdated, check } = namedIn(d);
   const parts: string[] = [];
@@ -52,8 +52,14 @@ export function redReason(description: string | null | undefined = ""): string {
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
   // A PR's failures the base branch explains, named by what to do; a status written before says "fixed on main" or
-  // "out of date". A release run's check keeps those labels, and it is not summarised here.
-  if (fixed || outdated || /pull main changes/.test(d)) parts.push("pull main changes");
+  // "out of date". A release run's check keeps those labels: its fix is a backport, not a merge.
+  const pull = /\bpull [^\s,;)][^\n,;)]*? changes\b/.exec(d)?.[0];
+  if (release) {
+    if (fixed) parts.push(`${fixed} fixed on main`);
+    if (outdated) parts.push(`${outdated} out of date`);
+  } else if (pull || fixed || outdated) {
+    parts.push(pull ?? "pull main changes");
+  }
   if (check) parts.push(`${check} to check`);
   // Triage asked for the re-run itself, held it for a fix, or a person has to.
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
@@ -80,7 +86,7 @@ export function redReason(description: string | null | undefined = ""): string {
  * An unavailable or report-only triage must not hide a real failure as pending.
  * Lanes with no status did not run.
  */
-export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = []): LaneSummary {
+export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], release = false): LaneSummary {
   const seen = lanes.filter((l): l is { context: string; status: CommitStatus } => Boolean(l.status));
   // A red check triage does not cover keeps "all lanes green" from being said; its own state still gates the PR.
   const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
@@ -97,9 +103,10 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = []): 
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
+  const isRelease = release || seen.some((l) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(String(l.status.description ?? "")));
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description)}`), clearedText].filter(Boolean).join(" · ")) };
+  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" · ")) };
   if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" · ")) };
   return { state: "success", description: clearedText ? `${clearedText} · all lanes green` : "All lanes green" };
 }

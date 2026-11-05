@@ -4409,8 +4409,8 @@ const packOfFinding = (f: Finding, diff: { filename: string; patch?: string }[] 
 test("platforms: a report names its platform, and a file reaches one platform only by its path", () => {
   assert.deepEqual(["e2e-on-ubuntu-latest-6.0", "e2e-on-windows-2022", "e2e-on-macos-26", "detox-ios", "detox-android", "e2e-cypress / dispatch-run--21", null].map(platformOf), ["linux", "windows", "macos", "ios", "android", null, null]);
   assert.ok(onlyOnPlatform("ios", "ios/Podfile.lock") && onlyOnPlatform("ios", "ios/Mattermost/AppDelegate.swift"));
-  assert.ok(onlyOnPlatform("android", "android/app/build.gradle") && onlyOnPlatform("linux", "src/main/linux/tray.ts") && onlyOnPlatform("windows", "scripts/win32/installer.nsh"));
-  assert.ok(!onlyOnPlatform("ios", "package.json") && !onlyOnPlatform("windows", "src/renderer/window.ts") && !onlyOnPlatform("linux", "src/debug.ts") && !onlyOnPlatform("macos", "src/machine.ts"));
+  assert.ok(onlyOnPlatform("android", "android/app/build.gradle") && onlyOnPlatform("linux", "src/main/linux/tray.ts") && onlyOnPlatform("windows", "scripts/win32/installer.nsh") && onlyOnPlatform("windows", "src/main/tray.windows.ts"));
+  assert.ok(!onlyOnPlatform("ios", "package.json") && !onlyOnPlatform("windows", "src/renderer/window.ts") && !onlyOnPlatform("windows", "src/app/windows/baseWindow.ts") && !onlyOnPlatform("linux", "src/debug.ts") && !onlyOnPlatform("macos", "src/machine.ts"));
 });
 
 test("common sense does not clear a one-platform failure of a test trunk always passes: the PR can break one platform through shared code (desktop #4033, #4082)", () => {
@@ -4439,6 +4439,7 @@ test("common sense clears only a flake on this PR, never what the PR could have 
   assert.ok(clears(passedHereBefore(since(["ios/Podfile.lock", "scripts/win32/installer.nsh"]))), "nor can changes only other platforms build");
   // Shared code can branch on the platform: a change the error does not name can still break linux alone, so the judge reads it.
   assert.equal(clears(passedHereBefore(since(["src/main/views/webContentEvents.ts"]))), null, "a shared change since the pass, named by no error");
+  assert.equal(clears(passedHereBefore(since(["src/app/windows/baseWindow.ts"]))), null, "a shared window file is not Windows-exclusive");
   assert.equal(clears(passedHereBefore(since(["ios/Podfile.lock", "src/common/config.ts"]))), null, "one shared change among platform-only ones");
   // The PR's own changes unknown: every change since the pass counts, the base branch's too.
   const unknownOwn = { since_last_pass: fixture<SinceLastPass>({ files: ["src/main/menus/app.ts"], related: [], complete: true }) };
@@ -5042,6 +5043,9 @@ test("a PR check names failures main explains by what to do, once: pull main cha
   const mine = finding({ title: "mine", class: "OWNED_BY_PR", blocking: true });
   assert.equal(statusDescription("FAILURE", [fixed, stale], null, { passed: 8, failed: 2 }), "(pull main changes) 80.0% passed (8 passed, 2 failed, 0 skipped)");
   assert.equal(statusDescription("FAILURE", [mine, stale], null, { passed: 8, failed: 2 }), "(1 caused by PR, pull main changes) 80.0% passed (8 passed, 2 failed, 0 skipped)");
+  // A PR targeting a non-default base branch names that branch in the label.
+  const staleOnRelease = finding({ title: "stale-rel", class: "REGRESSION", blocking: true, out_of_date: { base: "release-10.5", behind: 2, commit: null } });
+  assert.equal(statusDescription("FAILURE", [mine, staleOnRelease], null, { passed: 8, failed: 2 }), "(1 caused by PR, pull release-10.5 changes) 80.0% passed (8 passed, 2 failed, 0 skipped)");
   // A release run is not fixed by pulling main: it keeps its labels.
   assert.equal(statusDescription("FAILURE", [{ ...fixed, release: true }, { ...stale, release: true }], null, { passed: 8, failed: 2 }), "(1 fixed on main, 1 out of date) 80.0% passed (8 passed, 2 failed, 0 skipped)");
   // The per-test label, which the findings file and the desktop alert read, is unchanged.
