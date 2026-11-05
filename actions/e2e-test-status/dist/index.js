@@ -85,7 +85,7 @@ function redReason(description = "", release = false) {
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
   return parts.length ? parts.join(", ") : "still red";
 }
-function laneSummary(lanes, untriaged = [], release = false) {
+function laneSummary(lanes, untriaged = [], release) {
   const seen = lanes.filter((l) => Boolean(l.status));
   const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
   const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
@@ -99,7 +99,7 @@ function laneSummary(lanes, untriaged = [], release = false) {
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
-  const isRelease = release || seen.some((l) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(String(l.status.description ?? "")));
+  const isRelease = release ?? (seen.some((l) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(String(l.status.description ?? ""))) || seen.some((l) => /\b\d+ (?:out of date|fixed on main)\b/.test(String(l.status.description ?? ""))) && !seen.some((l) => /\b\d+ caused by PR\b|\bpull [^\s,;)][^\n,;)]*? changes\b/.test(String(l.status.description ?? ""))));
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
   if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
@@ -169,7 +169,24 @@ function mayPublish(rows, id, context, owner, operation) {
   }
   return current.run === owner.run && compareOwners(owner, current) >= 0 && (operation !== "triage" || lane[0].state !== "pending");
 }
-function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease = false }) {
+function inferRelease(id, env = {}, rows = [], summaryContext) {
+  const configured = (env.RELEASE ?? "").trim().toLowerCase();
+  if (configured === "true") return true;
+  if (configured === "false") return false;
+  if (Number(id.gh_pr_number || 0) > 0 || env.GITHUB_EVENT_NAME === "pull_request" || env.GITHUB_EVENT_NAME === "pull_request_target" || String(env.GITHUB_REF ?? "").startsWith("refs/pull/"))
+    return false;
+  const branch = String(id.branch ?? "").trim();
+  if (branch) return branch !== "main" && branch !== "master";
+  const ref = String(env.GITHUB_REF_NAME || String(env.GITHUB_REF ?? "").replace(/^refs\/heads\//, "")).trim();
+  if (/^release([/_.-]|$)/i.test(ref)) return true;
+  if (summaryContext) {
+    const prev = rows.find((r) => r.context === summaryContext)?.description ?? "";
+    if (/\b\d+ (?:out of date|fixed on main|test bug|server compat|app bug)\b/.test(prev)) return true;
+    if (/\bpull [^\s,;)][^\n,;)]*? changes\b/.test(prev)) return false;
+  }
+  return void 0;
+}
+function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease }) {
   let validated;
   const owner = () => validated ??= publishingOwner(id, env);
   const snapshotOwner = () => {
@@ -197,7 +214,8 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
-    await post({ ...summarizeLanes(latest, untriaged, release), context: summaryContext }, snapshotOwner());
+    const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
+    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,
@@ -432,7 +450,8 @@ async function publish({ env, fetchImpl = fetch, log = console.error, wait, retr
   if (!["claim", "finish", "refresh", "summarize"].includes(operation)) throw new Error("Invalid status operation");
   if (operation === "finish") tsioBase(env);
   if (!env.STATUS_CONTEXT || !env.GITHUB_TOKEN) throw new Error("Status context and GitHub token are required");
-  const release = env.RELEASE === "true";
+  const rawRelease = (env.RELEASE ?? "").trim().toLowerCase();
+  const release = rawRelease === "true" ? true : rawRelease === "false" ? false : void 0;
   const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN, retryWait), id, context: env.STATUS_CONTEXT, env, log, release });
   let written = false;
   let state = env.STATUS_STATE ?? "";

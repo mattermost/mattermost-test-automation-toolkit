@@ -63,7 +63,7 @@ test("a lane summary reads red lanes by their labels and old wording alike, and 
   }), { state: "failure", description: "playwright-full/enterprise: 2 caused by PR, pull main changes" });
   assert.deepEqual(laneSummary([
     { context: "e2e-test/ubuntu-11.11", status: st("failure", "(1 out of date) 50% passed (1 passed, 1 failed, 0 skipped)") },
-  ], [], true), { state: "failure", description: "ubuntu-11.11: 1 out of date" }, "a release run keeps its labels in the lane summary");
+  ]), { state: "failure", description: "ubuntu-11.11: 1 out of date" }, "a release run keeps its labels in the lane summary even without explicit release flag");
   assert.deepEqual(lanes({ "e2e-test/detox-ios": st("success", "(0 flaky) 597 passed, 0 failed") }), { state: "success", description: "All lanes green" });
 });
 

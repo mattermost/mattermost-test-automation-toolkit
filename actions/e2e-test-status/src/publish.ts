@@ -39,7 +39,8 @@ export async function publish({ env, fetchImpl = fetch, log = console.error, wai
   // before any GitHub or TSIO call. claim, refresh and summarize read no TSIO and still publish.
   if (operation === "finish") tsioBase(env);
   if (!env.STATUS_CONTEXT || !env.GITHUB_TOKEN) throw new Error("Status context and GitHub token are required");
-  const release = env.RELEASE === "true";
+  const rawRelease = (env.RELEASE ?? "").trim().toLowerCase();
+  const release = rawRelease === "true" ? true : rawRelease === "false" ? false : undefined;
   const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN, retryWait), id, context: env.STATUS_CONTEXT, env, log, release });
   let written = false;
   let state: string = env.STATUS_STATE ?? "";

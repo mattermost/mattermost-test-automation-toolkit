@@ -55,8 +55,11 @@ inputs:
     description: Comma-separated required status contexts included in the cross-lane summary
     default: ""
   release:
-    description: Whether this is a release-branch run, so the cross-lane summary preserves release labels
-    default: "false"
+    description: >-
+      Whether this is a release-branch run ("true" or "false"), so the cross-lane
+      summary preserves release labels. Leave empty to infer from composite-identity
+      and existing lane/aggregate statuses.
+    default: ""
 outputs:
   state:
     description: Raw result after execution and report validation (publication still requires ownership)

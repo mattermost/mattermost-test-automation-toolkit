@@ -94,6 +94,8 @@ export interface CompositeIdentity {
   name?: string;
   gh_run_id?: string | number | null;
   gh_run_attempt?: string | number | null;
+  branch?: string | null;
+  gh_pr_number?: number | string | null;
 }
 
 /**

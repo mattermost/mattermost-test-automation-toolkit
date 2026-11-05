@@ -86,7 +86,7 @@ export function redReason(description: string | null | undefined = "", release =
  * An unavailable or report-only triage must not hide a real failure as pending.
  * Lanes with no status did not run.
  */
-export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], release = false): LaneSummary {
+export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], release?: boolean): LaneSummary {
   const seen = lanes.filter((l): l is { context: string; status: CommitStatus } => Boolean(l.status));
   // A red check triage does not cover keeps "all lanes green" from being said; its own state still gates the PR.
   const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
@@ -103,7 +103,11 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], r
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
-  const isRelease = release || seen.some((l) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(String(l.status.description ?? "")));
+  const isRelease = release ?? (
+    seen.some((l) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(String(l.status.description ?? ""))) ||
+    (seen.some((l) => /\b\d+ (?:out of date|fixed on main)\b/.test(String(l.status.description ?? ""))) &&
+      !seen.some((l) => /\b\d+ caused by PR\b|\bpull [^\s,;)][^\n,;)]*? changes\b/.test(String(l.status.description ?? ""))))
+  );
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
   if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" · ")) };

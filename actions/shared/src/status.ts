@@ -116,8 +116,31 @@ export function mayPublish(rows: CommitStatus[], id: CompositeIdentity, context:
     (operation !== "triage" || lane[0].state !== "pending");
 }
 
+/**
+ * Infers whether a run is a release-branch run when the caller did not pass an explicit boolean:
+ * checks `env.RELEASE` ("true" / "false"), then `id.gh_pr_number` and PR event/ref vars, then a non-default
+ * `id.branch` or `release*` workflow ref, and finally the existing aggregate status description.
+ */
+export function inferRelease(id: CompositeIdentity, env: Env = {}, rows: CommitStatus[] = [], summaryContext?: string): boolean | undefined {
+  const configured = (env.RELEASE ?? "").trim().toLowerCase();
+  if (configured === "true") return true;
+  if (configured === "false") return false;
+  if (Number(id.gh_pr_number || 0) > 0 || env.GITHUB_EVENT_NAME === "pull_request" || env.GITHUB_EVENT_NAME === "pull_request_target" || String(env.GITHUB_REF ?? "").startsWith("refs/pull/"))
+    return false;
+  const branch = String(id.branch ?? "").trim();
+  if (branch) return branch !== "main" && branch !== "master";
+  const ref = String(env.GITHUB_REF_NAME || String(env.GITHUB_REF ?? "").replace(/^refs\/heads\//, "")).trim();
+  if (/^release([/_.-]|$)/i.test(ref)) return true;
+  if (summaryContext) {
+    const prev = rows.find((r) => r.context === summaryContext)?.description ?? "";
+    if (/\b\d+ (?:out of date|fixed on main|test bug|server compat|app bug)\b/.test(prev)) return true;
+    if (/\bpull [^\s,;)][^\n,;)]*? changes\b/.test(prev)) return false;
+  }
+  return undefined;
+}
+
 /** Builds the status publisher for one lane and its cross-lane aggregate. */
-export function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease = false }: {
+export function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease }: {
   api: GhApi;
   id: CompositeIdentity;
   context: string;
@@ -153,7 +176,8 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
-    await post({ ...summarizeLanes(latest, untriaged, release), context: summaryContext }, snapshotOwner());
+    const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
+    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,

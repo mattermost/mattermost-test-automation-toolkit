@@ -86,7 +86,10 @@ by a PR label: it never clears a failure. The triage action itself still writes
 nothing in report-only mode or with `E2E/Triage-report-only`. Only listed lanes
 may refresh the shared summary; other suites/editions cannot change it. Terminal
 failures remain red even if triage is unavailable. No delayed 15-second snapshot
-is needed.
+is needed. On release-branch runs, `release: "true"` (or automatic inference from
+`composite-identity` and existing release statuses when `release` is omitted)
+preserves `out of date` and `fixed on main` in the cross-lane summary instead of
+converting them to `pull main changes`.
 
 ## Rollout
 
