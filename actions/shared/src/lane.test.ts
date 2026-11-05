@@ -67,6 +67,18 @@ test("a lane summary reads red lanes by their labels and old wording alike, and 
   assert.deepEqual(lanes({ "e2e-test/detox-ios": st("success", "(0 flaky) 597 passed, 0 failed") }), { state: "success", description: "All lanes green" });
 });
 
+test("pull guidance in a lane is kept even beside a label only a release run writes", () => {
+  assert.deepEqual(lanes({ "e2e-test/playwright-full/enterprise": st("failure", "(1 app bug, pull main changes) 50.0% passed (1 passed, 2 failed, 0 skipped)") }),
+    { state: "failure", description: "playwright-full/enterprise: 1 app bug, pull main changes" });
+  const across = lanes({
+    "e2e-test/detox-ios": st("failure", "(1 test bug) 50.0% passed (1 passed, 1 failed, 0 skipped)"),
+    "e2e-test/detox-android": st("failure", "(1 out of date) 50.0% passed (1 passed, 1 failed, 0 skipped)"),
+    "e2e-test/maestro-ios": st("failure", "(pull main changes) 50.0% passed (1 passed, 1 failed, 0 skipped)"),
+  }).description;
+  assert.match(across, /detox-android: pull main changes/, "an old out-of-date lane takes the PR wording");
+  assert.match(across, /maestro-ios: pull main changes/);
+});
+
 test("a flagged run reads the same way: its flag while a failure blocks, none once all are cleared", () => {
   // Every failure cleared: no flag, green, and named as cleared by triage.
   assert.deepEqual(lanes({ "e2e-test/playwright": st("success", "(4 flaky) 0% passed (0 passed, 4 failed, 0 skipped)") }),

@@ -43,6 +43,9 @@ function namedIn(description: string | null | undefined): Named {
   };
 }
 
+/** A PR's "pull <base> changes" guidance in a status; only a PR run writes it. */
+export const PULL_GUIDANCE = /\bpull [^\s,;)][^\n,;)]*? changes\b/;
+
 /** Why a lane triage left red is still red, read from the status triage wrote on it. */
 export function redReason(description: string | null | undefined = "", release = false): string {
   const d = String(description);
@@ -53,7 +56,7 @@ export function redReason(description: string | null | undefined = "", release =
   if (appBug) parts.push(`${appBug} app bug`);
   // A PR's failures the base branch explains, named by what to do; a status written before says "fixed on main" or
   // "out of date". A release run's check keeps those labels: its fix is a backport, not a merge.
-  const pull = /\bpull [^\s,;)][^\n,;)]*? changes\b/.exec(d)?.[0];
+  const pull = PULL_GUIDANCE.exec(d)?.[0];
   if (release) {
     if (fixed) parts.push(`${fixed} fixed on main`);
     if (outdated) parts.push(`${outdated} out of date`);
@@ -103,11 +106,14 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], r
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
-  const isRelease = release ?? (
-    seen.some((l) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(String(l.status.description ?? ""))) ||
-    (seen.some((l) => /\b\d+ (?:out of date|fixed on main)\b/.test(String(l.status.description ?? ""))) &&
-      !seen.some((l) => /\b\d+ caused by PR\b|\bpull [^\s,;)][^\n,;)]*? changes\b/.test(String(l.status.description ?? ""))))
-  );
+  // Unset release is read from the lanes. Pull guidance comes first: only a PR run writes it, so a lane that names it
+  // keeps it, whatever release labels another lane carries. Without it, a release-only label, or old "out of date" /
+  // "fixed on main" wording with nothing PR-only beside it, marks a release run.
+  const descriptions = seen.map((l) => String(l.status.description ?? ""));
+  const isRelease = release ?? (!descriptions.some((d) => PULL_GUIDANCE.test(d)) && (
+    descriptions.some((d) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(d)) ||
+    (descriptions.some((d) => /\b\d+ (?:out of date|fixed on main)\b/.test(d)) && !descriptions.some((d) => /\b\d+ caused by PR\b/.test(d)))
+  ));
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
   if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" · ")) };

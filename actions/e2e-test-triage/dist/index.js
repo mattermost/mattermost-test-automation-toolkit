@@ -55,6 +55,7 @@ function namedIn(description) {
     check: count2(/(\d+) unresolved/) + count2(/(\d+) needs investigation/)
   };
 }
+var PULL_GUIDANCE = /\bpull [^\s,;)][^\n,;)]*? changes\b/;
 function redReason(description = "", release = false) {
   const d = String(description);
   const { cleared, caused, appBug, fixed, outdated, check } = namedIn(d);
@@ -62,7 +63,7 @@ function redReason(description = "", release = false) {
   if (cleared) parts.push(`${cleared} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
-  const pull = /\bpull [^\s,;)][^\n,;)]*? changes\b/.exec(d)?.[0];
+  const pull = PULL_GUIDANCE.exec(d)?.[0];
   if (release) {
     if (fixed) parts.push(`${fixed} fixed on main`);
     if (outdated) parts.push(`${outdated} out of date`);
@@ -99,7 +100,8 @@ function laneSummary(lanes, untriaged = [], release) {
   const waiting = seen.filter((l) => l.status.state === "pending");
   if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
-  const isRelease = release ?? (seen.some((l) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(String(l.status.description ?? ""))) || seen.some((l) => /\b\d+ (?:out of date|fixed on main)\b/.test(String(l.status.description ?? ""))) && !seen.some((l) => /\b\d+ caused by PR\b|\bpull [^\s,;)][^\n,;)]*? changes\b/.test(String(l.status.description ?? ""))));
+  const descriptions = seen.map((l) => String(l.status.description ?? ""));
+  const isRelease = release ?? (!descriptions.some((d) => PULL_GUIDANCE.test(d)) && (descriptions.some((d) => /\b\d+ (?:test bug|server compat|app bug)\b/.test(d)) || descriptions.some((d) => /\b\d+ (?:out of date|fixed on main)\b/.test(d)) && !descriptions.some((d) => /\b\d+ caused by PR\b/.test(d))));
   const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
   if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
@@ -173,16 +175,15 @@ function inferRelease(id, env = {}, rows = [], summaryContext) {
   const configured = (env.RELEASE ?? "").trim().toLowerCase();
   if (configured === "true") return true;
   if (configured === "false") return false;
-  if (Number(id.gh_pr_number || 0) > 0 || env.GITHUB_EVENT_NAME === "pull_request" || env.GITHUB_EVENT_NAME === "pull_request_target" || String(env.GITHUB_REF ?? "").startsWith("refs/pull/"))
-    return false;
+  if (Number(id.gh_pr_number || 0) > 0) return false;
   const branch = String(id.branch ?? "").trim();
   if (branch) return branch !== "main" && branch !== "master";
   const ref = String(env.GITHUB_REF_NAME || String(env.GITHUB_REF ?? "").replace(/^refs\/heads\//, "")).trim();
   if (/^release([/_.-]|$)/i.test(ref)) return true;
   if (summaryContext) {
     const prev = rows.find((r) => r.context === summaryContext)?.description ?? "";
+    if (PULL_GUIDANCE.test(prev)) return false;
     if (/\b\d+ (?:out of date|fixed on main|test bug|server compat|app bug)\b/.test(prev)) return true;
-    if (/\bpull [^\s,;)][^\n,;)]*? changes\b/.test(prev)) return false;
   }
   return void 0;
 }

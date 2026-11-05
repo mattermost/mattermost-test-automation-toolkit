@@ -2,6 +2,7 @@
 // See LICENSE.txt for license information.
 
 import type { CommitStatus, Env, GhApi } from "./github.ts";
+import { PULL_GUIDANCE } from "./lane.ts";
 import type { LaneStatus, LaneSummary } from "./lane.ts";
 import type { CompositeIdentity } from "./tsio.ts";
 
@@ -118,23 +119,24 @@ export function mayPublish(rows: CommitStatus[], id: CompositeIdentity, context:
 
 /**
  * Infers whether a run is a release-branch run when the caller did not pass an explicit boolean:
- * checks `env.RELEASE` ("true" / "false"), then `id.gh_pr_number` and PR event/ref vars, then a non-default
- * `id.branch` or `release*` workflow ref, and finally the existing aggregate status description.
+ * checks `env.RELEASE` ("true" / "false"), then the tested identity (`id.gh_pr_number`, then a non-default
+ * `id.branch`), then a `release*` workflow ref, and finally the existing aggregate status description.
+ * The workflow's own event is not read: a PR-triggered workflow can test a release branch's commit.
  */
 export function inferRelease(id: CompositeIdentity, env: Env = {}, rows: CommitStatus[] = [], summaryContext?: string): boolean | undefined {
   const configured = (env.RELEASE ?? "").trim().toLowerCase();
   if (configured === "true") return true;
   if (configured === "false") return false;
-  if (Number(id.gh_pr_number || 0) > 0 || env.GITHUB_EVENT_NAME === "pull_request" || env.GITHUB_EVENT_NAME === "pull_request_target" || String(env.GITHUB_REF ?? "").startsWith("refs/pull/"))
-    return false;
+  if (Number(id.gh_pr_number || 0) > 0) return false;
   const branch = String(id.branch ?? "").trim();
   if (branch) return branch !== "main" && branch !== "master";
   const ref = String(env.GITHUB_REF_NAME || String(env.GITHUB_REF ?? "").replace(/^refs\/heads\//, "")).trim();
   if (/^release([/_.-]|$)/i.test(ref)) return true;
   if (summaryContext) {
     const prev = rows.find((r) => r.context === summaryContext)?.description ?? "";
+    // Pull guidance first: only a PR run writes it, even beside a label a release run also writes.
+    if (PULL_GUIDANCE.test(prev)) return false;
     if (/\b\d+ (?:out of date|fixed on main|test bug|server compat|app bug)\b/.test(prev)) return true;
-    if (/\bpull [^\s,;)][^\n,;)]*? changes\b/.test(prev)) return false;
   }
   return undefined;
 }
