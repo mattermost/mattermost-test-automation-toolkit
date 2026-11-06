@@ -3576,11 +3576,19 @@ async function retryRecovered(fetchImpl, base, groupId, reportName = null) {
     tsioJson(fetchImpl, base, `/reports/${groupId}/cases`)
   ]);
   const fileOf2 = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
-  const scoped = reportName ? new Set(suites.filter((s) => String(s.report_name ?? "").startsWith(reportName)).map((s) => s.id)) : null;
+  const reportOf = new Map(suites.map((s) => [s.id, String(s.report_name ?? "")]));
+  let scoped = null;
+  if (reportName) {
+    const matching = suites.filter((s) => String(s.report_name ?? "").startsWith(reportName));
+    const newest = /* @__PURE__ */ new Map();
+    for (const s of matching) if (s.report_id && (newest.get(String(s.report_name)) ?? "") < s.report_id) newest.set(String(s.report_name), s.report_id);
+    scoped = new Set(matching.filter((s) => s.report_id ? newest.get(String(s.report_name)) === s.report_id : !newest.has(String(s.report_name))).map((s) => s.id));
+  }
+  const reportKey = (c) => scoped ? reportOf.get(c.suite_id) ?? "" : "";
   const byTest = /* @__PURE__ */ new Map();
   for (const c of cases) {
     if (scoped && !scoped.has(c.suite_id)) continue;
-    const k = c.full_title ? JSON.stringify([fileOf2.get(c.suite_id) ?? "", c.full_title]) : JSON.stringify([c.suite_id, c.title]);
+    const k = c.full_title ? JSON.stringify(scoped ? [reportKey(c), fileOf2.get(c.suite_id) ?? "", c.full_title] : [fileOf2.get(c.suite_id) ?? "", c.full_title]) : JSON.stringify([c.suite_id, c.title]);
     let attempts = byTest.get(k);
     if (!attempts) {
       attempts = [];
@@ -3588,12 +3596,14 @@ async function retryRecovered(fetchImpl, base, groupId, reportName = null) {
     }
     attempts.push(c);
   }
+  const identityOf = (c) => identityKey({ file: fileOf2.get(c.suite_id) ?? "", title: c.title, full_title: c.full_title });
   const perIdentity = /* @__PURE__ */ new Map();
   for (const attempts of byTest.values()) {
-    const key = identityKey({ file: fileOf2.get(attempts[0].suite_id) ?? "", title: attempts[0].title, full_title: attempts[0].full_title });
+    const key = JSON.stringify([reportKey(attempts[0]), identityOf(attempts[0])]);
     perIdentity.set(key, (perIdentity.get(key) ?? 0) + 1);
   }
   const out = [];
+  const sent = /* @__PURE__ */ new Set();
   for (const attempts of byTest.values()) {
     attempts.sort((a, b) => a.retry_count - b.retry_count || a.ordinal - b.ordinal);
     if (outcomeOf(attempts).status !== "flaky") continue;
@@ -3605,7 +3615,9 @@ async function retryRecovered(fetchImpl, base, groupId, reportName = null) {
       full_title: failed.full_title ?? null,
       error: [failed.error_message, failed.error_stack].filter(Boolean).join("\n")
     };
-    if (file && perIdentity.get(identityKey(test)) === 1) out.push(test);
+    if (!file || perIdentity.get(JSON.stringify([reportKey(failed), identityOf(failed)])) !== 1 || sent.has(identityKey(test))) continue;
+    sent.add(identityKey(test));
+    out.push(test);
   }
   return out;
 }

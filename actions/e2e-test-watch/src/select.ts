@@ -53,8 +53,10 @@ export function selectRepairs(result: { findings: readonly RepairFinding[] }, su
 /**
  * Tests that failed and then passed on retry in one run. The triage engine counts them as
  * passed, so a test that flakes on trunk but always recovers would otherwise never be seen.
- * `reportName` (a prefix, as triage reads it) keeps only those reports' cases: otherwise a test that
- * failed and recovered only in another report (another OS) would read as flaky in this one.
+ * `reportName` (a prefix, as triage reads it) scopes the run as `runFromGroups` does: only the
+ * newest upload of each matching report name (a re-run replaces the earlier attempt's), each report
+ * read on its own. Otherwise a failure in another report (another OS, another shard, or a
+ * superseded upload) plus a pass here would read as a recovered retry.
  */
 export async function retryRecovered(fetchImpl: FetchImpl, base: string, groupId: TsioId, reportName: string | null = null): Promise<RecoveredTest[]> {
   const [{ suites = [] }, cases] = await Promise.all([
@@ -62,11 +64,23 @@ export async function retryRecovered(fetchImpl: FetchImpl, base: string, groupId
     tsioJson<TsioCase[]>(fetchImpl, base, `/reports/${groupId}/cases`),
   ]);
   const fileOf = new Map<TsioId, string>(suites.map((s): [TsioId, string] => [s.id, s.file_path ?? s.file ?? ""]));
-  const scoped = reportName ? new Set<TsioId>(suites.filter((s) => String(s.report_name ?? "").startsWith(reportName)).map((s) => s.id)) : null;
+  const reportOf = new Map<TsioId, string>(suites.map((s): [TsioId, string] => [s.id, String(s.report_name ?? "")]));
+  let scoped: Set<TsioId> | null = null;
+  if (reportName) {
+    const matching = suites.filter((s) => String(s.report_name ?? "").startsWith(reportName));
+    // Report ids are UUIDv7, so the greatest of a name is its newest upload.
+    const newest = new Map<string, string>();
+    for (const s of matching) if (s.report_id && (newest.get(String(s.report_name)) ?? "") < s.report_id) newest.set(String(s.report_name), s.report_id);
+    scoped = new Set<TsioId>(matching.filter((s) => (s.report_id ? newest.get(String(s.report_name)) === s.report_id : !newest.has(String(s.report_name)))).map((s) => s.id));
+  }
+  // Scoped, the report is part of the key, so two reports' attempts never merge into one test's.
+  const reportKey = (c: TsioCase): string => (scoped ? reportOf.get(c.suite_id) ?? "" : "");
   const byTest = new Map<string, TsioCase[]>();
   for (const c of cases) {
     if (scoped && !scoped.has(c.suite_id)) continue;
-    const k = c.full_title ? JSON.stringify([fileOf.get(c.suite_id) ?? "", c.full_title]) : JSON.stringify([c.suite_id, c.title]);
+    const k = c.full_title
+      ? JSON.stringify(scoped ? [reportKey(c), fileOf.get(c.suite_id) ?? "", c.full_title] : [fileOf.get(c.suite_id) ?? "", c.full_title])
+      : JSON.stringify([c.suite_id, c.title]);
     let attempts = byTest.get(k);
     if (!attempts) {
       attempts = [];
@@ -74,13 +88,15 @@ export async function retryRecovered(fetchImpl: FetchImpl, base: string, groupId
     }
     attempts.push(c);
   }
-  // A name two tests share can't be matched to its own history.
+  // A name two tests share can't be matched to its own history. The same test in two reports is still one test.
+  const identityOf = (c: TsioCase): string => identityKey({ file: fileOf.get(c.suite_id) ?? "", title: c.title, full_title: c.full_title });
   const perIdentity = new Map<string, number>();
   for (const attempts of byTest.values()) {
-    const key = identityKey({ file: fileOf.get(attempts[0].suite_id) ?? "", title: attempts[0].title, full_title: attempts[0].full_title });
+    const key = JSON.stringify([reportKey(attempts[0]), identityOf(attempts[0])]);
     perIdentity.set(key, (perIdentity.get(key) ?? 0) + 1);
   }
   const out: RecoveredTest[] = [];
+  const sent = new Set<string>();
   for (const attempts of byTest.values()) {
     attempts.sort((a, b) => a.retry_count - b.retry_count || a.ordinal - b.ordinal);
     if (outcomeOf(attempts).status !== "flaky") continue;
@@ -92,7 +108,10 @@ export async function retryRecovered(fetchImpl: FetchImpl, base: string, groupId
       full_title: failed.full_title ?? null,
       error: [failed.error_message, failed.error_stack].filter(Boolean).join("\n"),
     };
-    if (file && perIdentity.get(identityKey(test)) === 1) out.push(test);
+    // Recovered in two matching reports: one test, requested once.
+    if (!file || perIdentity.get(JSON.stringify([reportKey(failed), identityOf(failed)])) !== 1 || sent.has(identityKey(test))) continue;
+    sent.add(identityKey(test));
+    out.push(test);
   }
   return out;
 }

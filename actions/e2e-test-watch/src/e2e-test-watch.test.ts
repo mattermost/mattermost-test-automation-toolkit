@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { identityKey } from "../../shared/src/tsio.ts";
 import type { FetchImpl } from "../../shared/src/github.ts";
 import type { RepairFinding } from "./select.ts";
-import { selectCrossLane, selectRepairs, unselected } from "./select.ts";
+import { retryRecovered, selectCrossLane, selectRepairs, unselected } from "./select.ts";
 import { breakWindow, bundle, rangeOf, specRange, windowsOverlap } from "./range.ts";
 import type { RangedGroup, WatchId } from "./range.ts";
 import { prsTouching, specsInOpenPRs } from "./prs.ts";
@@ -1117,6 +1117,49 @@ test("a test that recovered on retry only in another report is not flaky in the 
   };
   assert.deepEqual(await flakySpecs(null), [["specs/v/e.spec.ts"]], "recovered in the suite's own report: requested");
   assert.deepEqual(await flakySpecs("mac-11.4"), [], "recovered only on another OS, passed here at once: nothing to repair here");
+});
+
+// One run's group for retryRecovered: suites (id, report name, report id) and each suite's attempts of test t1 in a.spec.ts.
+function recoveredRun(reports: { id: string; report: string; reportId: string; attempts: string[] }[]): FetchImpl {
+  return async (url) => {
+    if (url.includes("/suites")) return Response.json({ suites: reports.map((r) => ({ id: r.id, file_path: "a.spec.ts", report_name: r.report, report_id: r.reportId })) });
+    if (url.includes("/cases"))
+      return Response.json(reports.flatMap((r, n) => r.attempts.map((status, retry) => ({ suite_id: r.id, title: "t1", full_title: "a > t1", status, retry_count: retry, ordinal: n * 10 + retry, error_message: status === "failed" ? `Error in ${r.report}` : null }))));
+    throw new Error(`unexpected fetch ${url}`);
+  };
+}
+const recoveredIn = async (fetchImpl: FetchImpl, reportName: string | null): Promise<string[]> =>
+  (await retryRecovered(fetchImpl, "http://tsio", "g1", reportName)).map((t) => t.error);
+
+test("scoped retry recovery reads each matching report on its own", async () => {
+  // Failed in one Linux shard's report, passed at once in another's: neither recovered on retry.
+  const twoReports = recoveredRun([
+    { id: "s1", report: "linux-1-of-2", reportId: "01a", attempts: ["failed"] },
+    { id: "s2", report: "linux-2-of-2", reportId: "01b", attempts: ["passed"] },
+  ]);
+  assert.deepEqual(await recoveredIn(twoReports, "linux"), []);
+  assert.deepEqual(await recoveredIn(twoReports, null), ["Error in linux-1-of-2"], "unscoped reads the run as one, as before");
+  // Recovered in two matching reports: one test, found once.
+  const both = recoveredRun([
+    { id: "s1", report: "linux-1-of-2", reportId: "01a", attempts: ["failed", "passed"] },
+    { id: "s2", report: "linux-2-of-2", reportId: "01b", attempts: ["failed", "passed"] },
+  ]);
+  assert.deepEqual(await recoveredIn(both, "linux"), ["Error in linux-1-of-2"]);
+});
+
+test("scoped retry recovery reads only the newest upload of a report name", async () => {
+  // The first attempt's upload failed; the re-run's upload of the same report passed at once.
+  const rerun = recoveredRun([
+    { id: "s1", report: "linux-1-of-1", reportId: "01a", attempts: ["failed"] },
+    { id: "s2", report: "linux-1-of-1", reportId: "01b", attempts: ["passed"] },
+  ]);
+  assert.deepEqual(await recoveredIn(rerun, "linux"), []);
+  // The re-run's upload is the one that recovered on retry.
+  const recoveredOnRerun = recoveredRun([
+    { id: "s1", report: "linux-1-of-1", reportId: "01a", attempts: ["passed"] },
+    { id: "s2", report: "linux-1-of-1", reportId: "01b", attempts: ["failed", "passed"] },
+  ]);
+  assert.deepEqual(await recoveredIn(recoveredOnRerun, "linux"), ["Error in linux-1-of-1"]);
 });
 
 test("the requests go to a file for the workflow to send", async () => {
