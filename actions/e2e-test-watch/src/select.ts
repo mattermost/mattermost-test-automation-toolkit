@@ -53,15 +53,19 @@ export function selectRepairs(result: { findings: readonly RepairFinding[] }, su
 /**
  * Tests that failed and then passed on retry in one run. The triage engine counts them as
  * passed, so a test that flakes on trunk but always recovers would otherwise never be seen.
+ * `reportName` (a prefix, as triage reads it) keeps only those reports' cases: otherwise a test that
+ * failed and recovered only in another report (another OS) would read as flaky in this one.
  */
-export async function retryRecovered(fetchImpl: FetchImpl, base: string, groupId: TsioId): Promise<RecoveredTest[]> {
+export async function retryRecovered(fetchImpl: FetchImpl, base: string, groupId: TsioId, reportName: string | null = null): Promise<RecoveredTest[]> {
   const [{ suites = [] }, cases] = await Promise.all([
     tsioJson<{ suites?: TsioSuite[] }>(fetchImpl, base, `/reports/${groupId}/suites`),
     tsioJson<TsioCase[]>(fetchImpl, base, `/reports/${groupId}/cases`),
   ]);
   const fileOf = new Map<TsioId, string>(suites.map((s): [TsioId, string] => [s.id, s.file_path ?? s.file ?? ""]));
+  const scoped = reportName ? new Set<TsioId>(suites.filter((s) => String(s.report_name ?? "").startsWith(reportName)).map((s) => s.id)) : null;
   const byTest = new Map<string, TsioCase[]>();
   for (const c of cases) {
+    if (scoped && !scoped.has(c.suite_id)) continue;
     const k = c.full_title ? JSON.stringify([fileOf.get(c.suite_id) ?? "", c.full_title]) : JSON.stringify([c.suite_id, c.title]);
     let attempts = byTest.get(k);
     if (!attempts) {

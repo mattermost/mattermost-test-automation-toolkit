@@ -185,6 +185,9 @@ interface RouteOptions {
   bothFlaked?: boolean;
   historyBodies?: HistoryBody[];
   reportName?: string | null;
+  // With `recovered` and `reportName`: the retried specs failed and recovered only in this other report (another OS),
+  // and passed at once in the suite's own report.
+  retriedReport?: string | null;
   forkPRFiles?: string[];
   forkPRLabels?: string[];
   // The attempt each lane's report is filed under (default "1").
@@ -225,6 +228,7 @@ function routes({
   bothFlaked = false,
   historyBodies = [],
   reportName = null,
+  retriedReport = null,
   forkPRFiles = [],
   forkPRLabels = [],
   attempts = {},
@@ -261,6 +265,9 @@ function routes({
         ]
       : []),
   ];
+  // With `retriedReport`, the retried specs' trunk history is the suite's own report's, under their full titles.
+  if (retriedReport)
+    for (const o of history) if (retried.includes(o.file)) Object.assign(o, { full_title: `${o.file} > t1`, report_name: `${reportName}-11.4` });
   const groups = lanes.map((name, n) => ({ id: `g${n + 1}`, repository: "o/r", branch, commit: "abc", name, gh_run_id: "12", gh_run_attempt: attempts[name] ?? "1", status: "completed", created_at: "2026-10-02T09:30:00Z", last_upload_at: uploadedAt[name] ?? "2026-10-02T09:50:00Z" }));
   const otherGroups = others.map((o, n) => ({ id: `o${n + 1}`, repository: "o/r", branch, commit: "abc", name: o.name, gh_run_id: o.runId ?? "12", gh_run_attempt: o.attempt ?? "1", status: "completed", test_stats: { failed: o.failed } }));
   const laneOfGroup = (url: string): string => groups.find((g) => String(url).includes(`/reports/${g.id}/`))!.name;
@@ -276,15 +283,25 @@ function routes({
       }
       return Response.json({ reports: groups.filter((g) => g.name === name && reported.includes(name)) });
     }],
-    ["/suites", () => Response.json({ suites: [...files, ...retried].map((file_path, i) => ({ id: `s${i}`, file_path, ...(reportName ? { report_name: `${reportName}-11.4` } : {}) })) })],
+    ["/suites", () => Response.json({
+      suites: [
+        ...[...files, ...retried].map((file_path, i) => ({ id: `s${i}`, file_path, ...(reportName ? { report_name: i >= files.length && retriedReport ? retriedReport : `${reportName}-11.4` } : {}) })),
+        ...(retriedReport ? retried.map((file_path, j) => ({ id: `own${j}`, file_path, report_name: `${reportName}-11.4` })) : []),
+      ],
+    })],
     ["/cases", (_init, url) => {
       const lane = laneOfGroup(url);
       return Response.json([
         ...files.map((file, i) => ({ suite_id: `s${i}`, title: "t1", status: fails(file, lane) ? "failed" : "passed", retry_count: 0, ordinal: i, error_message: fails(file, lane) ? "Error: expected visible" : null })),
-        ...retried.flatMap((_, j) => [
-          { suite_id: `s${files.length + j}`, title: "t1", status: "failed", retry_count: 0, ordinal: files.length + j, error_message: "Error: toast not visible" },
-          { suite_id: `s${files.length + j}`, title: "t1", status: "passed", retry_count: 1, ordinal: files.length + j },
-        ]),
+        // With `retriedReport`, full titles as TSIO sends them: the same test in two reports shares one.
+        ...retried.flatMap((file, j) => {
+          const full = retriedReport ? { full_title: `${file} > t1` } : {};
+          return [
+            { suite_id: `s${files.length + j}`, title: "t1", ...full, status: "failed", retry_count: 0, ordinal: files.length + j, error_message: "Error: toast not visible" },
+            { suite_id: `s${files.length + j}`, title: "t1", ...full, status: "passed", retry_count: 1, ordinal: files.length + j },
+          ];
+        }),
+        ...(retriedReport ? retried.map((file, j) => ({ suite_id: `own${j}`, title: "t1", full_title: `${file} > t1`, status: "passed", retry_count: 0, ordinal: 100 + j })) : []),
       ]);
     }],
     ["/reports/history", (init) => {
@@ -1090,6 +1107,16 @@ test("a suite's report name scopes every history read, the suspect range's too",
   await run({ env: { ...env, SUITES: JSON.stringify([{ ...suite("pw-master"), report_name: "pw" }]) }, fetchImpl: routes({ openPRFiles: [], historyBodies, reportName: "pw" }), hook: [] });
   assert.ok(historyBodies.some((b) => b.files.length === 1), "the suspect range read history");
   assert.ok(historyBodies.every((b) => b.report === "pw"));
+});
+
+test("a test that recovered on retry only in another report is not flaky in the suite's own", async () => {
+  const scopedEnv = { ...env, SUITES: JSON.stringify([{ ...suite("pw-master"), report_name: "pw" }]) };
+  const flakySpecs = async (retriedReport: string | null): Promise<string[][]> => {
+    const { decisions } = await run({ env: scopedEnv, fetchImpl: routes({ openPRFiles: [], recovered: true, reportName: "pw", retriedReport }), hook: [] });
+    return decisions.filter((d) => d.kind === "flaky").map((d) => d.specs);
+  };
+  assert.deepEqual(await flakySpecs(null), [["specs/v/e.spec.ts"]], "recovered in the suite's own report: requested");
+  assert.deepEqual(await flakySpecs("mac-11.4"), [], "recovered only on another OS, passed here at once: nothing to repair here");
 });
 
 test("the requests go to a file for the workflow to send", async () => {

@@ -3570,14 +3570,16 @@ function selectRepairs(result, suite) {
   }
   return [...bySpec.values()];
 }
-async function retryRecovered(fetchImpl, base, groupId) {
+async function retryRecovered(fetchImpl, base, groupId, reportName = null) {
   const [{ suites = [] }, cases] = await Promise.all([
     tsioJson(fetchImpl, base, `/reports/${groupId}/suites`),
     tsioJson(fetchImpl, base, `/reports/${groupId}/cases`)
   ]);
   const fileOf2 = new Map(suites.map((s) => [s.id, s.file_path ?? s.file ?? ""]));
+  const scoped = reportName ? new Set(suites.filter((s) => String(s.report_name ?? "").startsWith(reportName)).map((s) => s.id)) : null;
   const byTest = /* @__PURE__ */ new Map();
   for (const c of cases) {
+    if (scoped && !scoped.has(c.suite_id)) continue;
     const k = c.full_title ? JSON.stringify([fileOf2.get(c.suite_id) ?? "", c.full_title]) : JSON.stringify([c.suite_id, c.title]);
     let attempts = byTest.get(k);
     if (!attempts) {
@@ -3964,7 +3966,7 @@ ${note}; nothing to watch.
     const found = selectRepairs(result, s.name);
     try {
       const groupId = groupOf(s.name).id;
-      const recovered = await retryRecovered(fetchImpl, base, groupId);
+      const recovered = await retryRecovered(fetchImpl, base, groupId, s.report_name || null);
       if (recovered.length) {
         const history = await fetchHistory(fetchImpl, base, id.repository, recovered, untilOf(s.name), void 0, trunk, s.report_name || null, log, laneOf(s.name));
         found.push(...selectRetryFlakes(recovered, history, { suite: s.name, testRoot: s.test_root, branch: trunk, groupId }));
