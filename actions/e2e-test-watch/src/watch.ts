@@ -282,7 +282,7 @@ export async function watch({ env, fetchImpl = fetch, log = console.error, now =
     const found = selectRepairs(result, s.name);
     try {
       const groupId = groupOf(s.name).id;
-      const recovered = await retryRecovered(fetchImpl, base, groupId);
+      const recovered = await retryRecovered(fetchImpl, base, groupId, s.report_name || null);
       if (recovered.length) {
         const history = await fetchHistory(fetchImpl, base, id.repository, recovered, untilOf(s.name), undefined, trunk, s.report_name || null, log, laneOf(s.name));
         found.push(...selectRetryFlakes(recovered, history, { suite: s.name, testRoot: s.test_root, branch: trunk, groupId }));
