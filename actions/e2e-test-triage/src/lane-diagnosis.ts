@@ -118,6 +118,10 @@ const quote = (line: string): string => clip(line.replace(/^##\[error\]/, "").re
 const sameSpec = (spec: string, files: readonly string[]): boolean => files.some((f) => f === spec || f.endsWith(`/${spec}`) || spec.endsWith(`/${f}`));
 const changedByPR = (spec: string, prFiles: string[] | null): boolean => sameSpec(spec, prFiles ?? []);
 
+/** The failed test a dead job's log names (Playwright's "✘ … › test", an error line), else its cause's line. */
+const hiddenLine = (c: { job: LaneJob; cause: JobCause }): string =>
+  [c.job.tail, ...c.job.errors].join("\n").split("\n").map((l) => l.trim()).find((l) => /✘|failed|Error/.test(l) && !TESTS_FAILED.test(l)) ?? c.cause.line;
+
 /** The base branch's verdict on a lane-wide failure: whose fault, and what to do. */
 function baselineCall(facts: LaneFacts, setup: boolean, setupShort: string | null = null): { label: LaneLabel; fault: Fault; action: string; evidence: string } {
   const b = facts.baseline;
@@ -197,8 +201,7 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
   // lane-wide failure, judged below.
   if (hidden.length && hidden.length < workers.length) {
     const h = hidden[0];
-    const line = [h.job.tail, ...h.job.errors].join("\n").split("\n").map((l) => l.trim()).find((l) => /✘|failed|Error/.test(l) && !TESTS_FAILED.test(l)) ?? h.cause.line;
-    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(hidden.length, "worker")} and passed on the others: ${quote(line)}`, rerun: rerunKind, evidence: [`${hidden.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; the other ${plural(workers.length - hidden.length, "worker")} passed it`, ...evidence] };
+    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(hidden.length, "worker")} and passed on the others: ${quote(hiddenLine(h))}`, rerun: rerunKind, evidence: [`${hidden.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; the other ${plural(workers.length - hidden.length, "worker")} passed it`, ...evidence] };
   }
 
   // 2. A lane-wide failure: most specs failed, or the setup broke on every worker that started.
@@ -210,7 +213,9 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
   const allWorkersSetup = workers.length > 0 && deadWorkers.length === workers.length && finished === 0 && readDead.length > 0 &&
     readDead.every((c) => c.cause.kind === "code") && new Set(deadWorkers.map((c) => c.job.step)).size === 1;
   const setupJob = codeDead.find((c) => !c.job.worker);
-  if (massTests || allWorkersSetup || (setupJob && finished === 0)) {
+  // Harness tests that failed on every worker: the same code failed them everywhere, a lane-wide test failure.
+  const hiddenAll = hidden.length > 0 && hidden.length === workers.length;
+  if (massTests || allWorkersSetup || hiddenAll || (setupJob && finished === 0)) {
     const call = baselineCall(facts, !massTests, (setupJob ?? codeDead[0])?.cause.short ?? null);
     // The error the failed specs share, as the dead workers' logs give it: an assertion or error line, the most repeated first.
     const errs = deadWorkers.flatMap((c) => c.job.errors).filter((l) => !INFRA_RE.test(l));
@@ -219,7 +224,9 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
       ? `${o!.failed.length} of ${finished} specs failed${top ? `: ${quote(top)}` : ""}`
       : setupJob
         ? `${setupJob.job.short} ${setupJob.job.step ?? ""} failed: ${quote(setupJob.cause.line)}`
-        : `${codeDead[0].job.step ?? "setup"} failed on ${deadWorkers.length} of ${workers.length} workers: ${quote(codeDead[0].cause.line)}`;
+        : hiddenAll && !codeDead.length
+          ? `${hidden[0].job.step} tests failed on every worker: ${quote(hiddenLine(hidden[0]))}`
+          : `${codeDead[0].job.step ?? "setup"} failed on ${deadWorkers.length} of ${workers.length} workers: ${quote(codeDead[0].cause.line)}`;
     // A PR's specs that ran and failed as the base branch does are not the PR's: green, as each test would be (see
     // settlePR). A setup that broke ran no spec, so nothing vouches for the PR: red until the base branch is fixed.
     const notYours = !facts.trunkRun && massTests && (call.label === "broken on main" || call.label === "fixed on main");

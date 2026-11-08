@@ -3477,6 +3477,7 @@ var clip2 = (s, n) => s.length <= n ? s : `${s.slice(0, n - 1).trimEnd()}\u2026`
 var quote = (line) => clip2(line.replace(/^##\[error\]/, "").replace(/\s+/g, " ").trim(), 110);
 var sameSpec = (spec, files) => files.some((f) => f === spec || f.endsWith(`/${spec}`) || spec.endsWith(`/${f}`));
 var changedByPR = (spec, prFiles) => sameSpec(spec, prFiles ?? []);
+var hiddenLine = (c) => [c.job.tail, ...c.job.errors].join("\n").split("\n").map((l) => l.trim()).find((l) => /✘|failed|Error/.test(l) && !TESTS_FAILED.test(l)) ?? c.cause.line;
 function baselineCall(facts, setup, setupShort = null) {
   const b = facts.baseline;
   const at = b?.atBase ?? null;
@@ -3530,8 +3531,7 @@ function diagnoseLane(facts) {
   }
   if (hidden.length && hidden.length < workers.length) {
     const h = hidden[0];
-    const line = [h.job.tail, ...h.job.errors].join("\n").split("\n").map((l) => l.trim()).find((l) => /✘|failed|Error/.test(l) && !TESTS_FAILED.test(l)) ?? h.cause.line;
-    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(hidden.length, "worker")} and passed on the others: ${quote(line)}`, rerun: rerunKind, evidence: [`${hidden.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; the other ${plural(workers.length - hidden.length, "worker")} passed it`, ...evidence] };
+    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(hidden.length, "worker")} and passed on the others: ${quote(hiddenLine(h))}`, rerun: rerunKind, evidence: [`${hidden.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; the other ${plural(workers.length - hidden.length, "worker")} passed it`, ...evidence] };
   }
   const finished2 = o ? o.units.length - o.unfinished.length : 0;
   const massTests = Boolean(o && o.failed.length >= 20 && o.failed.length * 4 >= finished2);
@@ -3539,11 +3539,12 @@ function diagnoseLane(facts) {
   const readDead = deadWorkers.filter((c) => c.job.tail || c.job.errors.length);
   const allWorkersSetup = workers.length > 0 && deadWorkers.length === workers.length && finished2 === 0 && readDead.length > 0 && readDead.every((c) => c.cause.kind === "code") && new Set(deadWorkers.map((c) => c.job.step)).size === 1;
   const setupJob = codeDead.find((c) => !c.job.worker);
-  if (massTests || allWorkersSetup || setupJob && finished2 === 0) {
+  const hiddenAll = hidden.length > 0 && hidden.length === workers.length;
+  if (massTests || allWorkersSetup || hiddenAll || setupJob && finished2 === 0) {
     const call = baselineCall(facts, !massTests, (setupJob ?? codeDead[0])?.cause.short ?? null);
     const errs = deadWorkers.flatMap((c) => c.job.errors).filter((l) => !INFRA_RE3.test(l));
     const top = massTests ? errs.find((l) => /AssertionError|Error:|Expected|Timed out|toBe|not found/.test(l)) ?? errs[0] ?? null : null;
-    const what = massTests ? `${o.failed.length} of ${finished2} specs failed${top ? `: ${quote(top)}` : ""}` : setupJob ? `${setupJob.job.short} ${setupJob.job.step ?? ""} failed: ${quote(setupJob.cause.line)}` : `${codeDead[0].job.step ?? "setup"} failed on ${deadWorkers.length} of ${workers.length} workers: ${quote(codeDead[0].cause.line)}`;
+    const what = massTests ? `${o.failed.length} of ${finished2} specs failed${top ? `: ${quote(top)}` : ""}` : setupJob ? `${setupJob.job.short} ${setupJob.job.step ?? ""} failed: ${quote(setupJob.cause.line)}` : hiddenAll && !codeDead.length ? `${hidden[0].job.step} tests failed on every worker: ${quote(hiddenLine(hidden[0]))}` : `${codeDead[0].job.step ?? "setup"} failed on ${deadWorkers.length} of ${workers.length} workers: ${quote(codeDead[0].cause.line)}`;
     const notYours = !facts.trunkRun && massTests && (call.label === "broken on main" || call.label === "fixed on main");
     return { label: call.label, state: notYours ? "success" : "failure", fault: call.fault, action: call.action, what, rerun: "none", evidence: [call.evidence, ...evidence] };
   }
