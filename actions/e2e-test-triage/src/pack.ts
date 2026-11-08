@@ -1,7 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-import { errorSignature } from "./classify.ts";
+import { errorSignature, isProductChange } from "./classify.ts";
 import type { ChangeSummary, EvidenceImage, Finding, Pack, PrRef, ThisPRHistory } from "./types.ts";
 
 /** The message and the first few app stack frames, without framework noise. */
@@ -106,11 +106,13 @@ export function buildPack(finding: Finding, compareFiles: { filename: string; pa
   const ownPath = finding.repo_path ?? finding.file;
   const changes = changeSummary(names, { ...ctx, failingSpecs: [...ctx.failingSpecs, ownPath] });
   const hunks: Pack["diff_hunks_of_files_named_in_error"] = [];
-  for (const [index, f] of compareFiles.entries()) {
-    // Only hunks related to the failure are sent: nothing else may be cited.
-    if (namesChangedFile(finding, f.filename) && f.patch) hunks.push({ id: `hunk_${index}`, file: f.filename, related: true, patch: f.patch.slice(0, 4000) });
-    if (hunks.length >= 8) break;
-  }
+  // Only hunks related to the failure are sent: nothing else may be cited. A file whose change holds what the test
+  // looked for (changed_by_pr) is related even where the error does not name it. For a PR streak the PR's diff is the
+  // cause, so its product changes are related too, after those: the judge is asked which of them it is.
+  const related = (f: { filename: string }): boolean => namesChangedFile(finding, f.filename) || f.filename === finding.changed_by_pr?.file;
+  const ranked = [...compareFiles.entries()].filter(([, f]) => f.patch && (related(f) || (finding.pr_streak && f.filename !== ownPath && isProductChange(f.filename))));
+  ranked.sort(([, a], [, b]) => Number(related(b)) - Number(related(a)));
+  for (const [index, f] of ranked.slice(0, 8)) hunks.push({ id: `hunk_${index}`, file: f.filename, related: true, patch: patchExcerpt(f.patch ?? "", f.filename === finding.changed_by_pr?.file ? finding.changed_by_pr.line : null) });
   const signature = errorSignature(finding.error);
   const neighbours = others.filter((o) => o.title !== finding.title && (o.file === finding.file || (signature && o.signature === signature)));
   const pack: Pack = {
@@ -127,9 +129,30 @@ export function buildPack(finding: Finding, compareFiles: { filename: string; pa
     ...(finding.earlier_failure ? { earlier_failure_same_spec: { id: "earlier_failure_same_spec" as const, title: finding.earlier_failure.title, error: finding.earlier_failure.error, class: finding.earlier_failure.class } } : {}),
     ...(finding.tries?.ran ? { tries_in_this_run: finding.tries } : {}),
     ...(finding.code_near_failure ? { test_code_near_failure: finding.code_near_failure } : {}),
+    ...(finding.pr_streak ? { pr_streak: { id: "pr_streak" as const, failed_commits: finding.pr_streak, trunk_runs: finding.trunk.runs } } : {}),
   };
   if (finding.producer?.images.length) PACK_IMAGES.set(pack, finding.producer.images);
   return pack;
+}
+
+/** The most of a patch a pack carries. */
+export const PATCH_MAX = 4000;
+
+/**
+ * A patch cut to PATCH_MAX characters: its start, or, where the line that holds what the test looked for (`focus`) is
+ * past that, a window of whole lines around it, so the judge reads the change that matters. A cut is marked.
+ */
+export function patchExcerpt(patch: string, focus: string | null = null): string {
+  if (patch.length <= PATCH_MAX) return patch;
+  const at = focus ? patch.indexOf(focus) : -1;
+  if (at < 0 || at + focus!.length <= PATCH_MAX) return patch.slice(0, PATCH_MAX);
+  const marker = "[... earlier lines of this patch left out ...]\n";
+  let start = patch.lastIndexOf("\n", Math.max(0, at - Math.floor(PATCH_MAX / 2))) + 1;
+  // Start at the hunk header that holds the line when the excerpt still reaches the line from there: the header gives
+  // the line numbers, and the rest of the window shows what follows the change.
+  const header = patch.lastIndexOf("\n@@", at);
+  if (header >= 0 && at - header < PATCH_MAX - marker.length - 200) start = header + 1;
+  return marker + patch.slice(start, start + PATCH_MAX - marker.length);
 }
 
 /** What a release branch's run is, for its packs (see releasePack). */
@@ -153,7 +176,7 @@ export const serverOf = (name: string | null | undefined): string | null => /(\d
  */
 export function releasePack(finding: Finding, release: ReleaseRef, others: OtherFailure[], ctx: ChangeContext = NO_CHANGE_CONTEXT): Pack {
   const pack = buildPack(finding, [], { number: null, repository: release.repository, title: "", lane: release.lane }, others, ctx);
-  const ood = finding.out_of_date && !finding.out_of_date.streak && !finding.out_of_date.fixed ? finding.out_of_date : null;
+  const ood = finding.out_of_date && !finding.out_of_date.fixed ? finding.out_of_date : null;
   const ref = (c: { sha: string; pr: number | null; date?: string | null }): string => `${c.pr ? `#${c.pr}` : c.sha.slice(0, 7)}${c.date ? ` (${c.date})` : ""}`;
   // The same object buildPack returned: its screenshots are keyed by it (see PACK_IMAGES).
   return Object.assign(pack, {
@@ -207,6 +230,7 @@ export const evidenceIds = (pack: Pack): string[] => [
   ...(thisPrCitable(pack) ? ["this_pr"] : []),
   ...(pack.same_test_other_platforms_this_run ? ["other_platforms"] : []),
   ...(pack.earlier_failure_same_spec ? ["earlier_failure_same_spec"] : []),
+  ...(pack.pr_streak ? ["pr_streak"] : []),
 ];
 
 // Evidence that can change a blocked finding's outcome: a related hunk (a blame or a veto), other PRs failing the

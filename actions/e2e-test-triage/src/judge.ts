@@ -58,6 +58,11 @@ Rules:
   failed consistently in this run, not that the PR caused it.
 - test_code_near_failure is the test's code around the failing line. Use it to say what the test was doing, for
   example waiting on an outside website or service the test does not control.
+- pr_streak (id pr_streak), when present, means the test failed the same way on this PR's last failed_commits commits,
+  passed in all trunk_runs recent trunk runs, and trunk has not changed the test since this PR last merged trunk. The
+  PR's diff is then the difference: answer caused_by_pr, find the hunk that explains the error (the hunks given are the
+  PR's product changes), and cite it with pr_streak. Only an error that is clearly infrastructural AND recurs on other
+  PRs (cross_pr) may be answered otherwise.
 - confidence: 0.9 or higher when the cited evidence meets the requirement above for the cause you give and no part of
   the diff plausibly touches the failing test, its flow or screen, or the request it depends on; 0.6 to 0.85 when it
   meets the requirement but some part of the diff could plausibly be involved. A pass on an earlier commit of this PR
@@ -65,7 +70,11 @@ Rules:
   can still be involved. If you read those changes and none could affect the test, answer 0.9 or higher. If the evidence is genuinely
   insufficient, answer with confidence below 0.6 rather than guessing.
 - explanation: one or two plain sentences, at most 200 characters, written for the PR author: what most likely
-  happened. No evidence ids, no percentages and no history numbers; those are shown next to your answer.`;
+  happened. No evidence ids, no percentages and no history numbers; those are shown next to your answer.
+- fix: for caused_by_pr, one or two plain sentences, at most 240 characters, telling the author what to change: name the
+  changed file and the change to undo or adjust, or the test file and what to update in it when the PR's new behavior
+  is intended (for example "keep the 'Only the latest entries' notice in log_list.tsx, or remove the spec's assertion
+  of it"). Only what the hunks show; no evidence ids. For any other cause, an empty string.`;
 
 // The schema for one answer. Its property order is part of the request body.
 export const SCHEMA = {
@@ -75,8 +84,9 @@ export const SCHEMA = {
     confidence: { type: "number", description: "0 to 1" },
     cited_evidence: { type: "array", items: { type: "string" }, description: "up to 6 evidence ids from the pack" },
     explanation: { type: "string", description: "one or two plain sentences, at most 200 characters, for the PR author" },
+    fix: { type: "string", description: "for caused_by_pr: what to change, naming the file, at most 240 characters; otherwise empty" },
   },
-  required: ["cause", "confidence", "cited_evidence", "explanation"],
+  required: ["cause", "confidence", "cited_evidence", "explanation", "fix"],
   additionalProperties: false,
 };
 
@@ -129,7 +139,8 @@ Rules:
 - confidence: 0.9 or higher when the cited evidence meets the requirement above and nothing points to another cause;
   0.6 to 0.85 when it meets it but another cause is plausible; below 0.6 when the evidence is genuinely insufficient.
 - explanation: one or two plain sentences, at most 200 characters, written for the release owner: what most likely
-  happened. No evidence ids and no percentages.`;
+  happened. No evidence ids and no percentages.
+- fix: always an empty string.`;
 
 const RELEASE_CAUSES: readonly Cause[] = ["app_bug", "test_bug", "flaky_environment", "server_compat"];
 export const systemFor = (pack: Pack): string => (pack.release ? SYSTEM_RELEASE : SYSTEM);
@@ -352,7 +363,7 @@ export function cachedAnswer(entry: unknown, pack: Pack): Answer | null {
 /** A judge answer as validated; the fields are checked before use, and the cause is narrowed after its check. */
 export function parseAnswer(text: string, causes: readonly Cause[] = CAUSES): Omit<Answer, "provenance"> {
   // The parsed value is read as the old code read it: a null or non-object throws the same TypeError.
-  const a = JSON.parse(text) as { cause: unknown; confidence: unknown; cited_evidence: unknown; explanation: unknown };
+  const a = JSON.parse(text) as { cause: unknown; confidence: unknown; cited_evidence: unknown; explanation: unknown; fix?: unknown };
   if (!(causes as readonly unknown[]).includes(a.cause)) throw new Error("answer failed validation: unknown cause");
   // Out of [0, 1] is malformed, not emphatic: reject rather than clamp.
   if (typeof a.confidence !== "number" || !Number.isFinite(a.confidence) || a.confidence < 0 || a.confidence > 1)
@@ -360,11 +371,14 @@ export function parseAnswer(text: string, causes: readonly Cause[] = CAUSES): Om
   if (!Array.isArray(a.cited_evidence) || !a.cited_evidence.every((c): c is string => typeof c === "string"))
     throw new Error("answer failed validation: cited_evidence must be a list of evidence ids");
   if (typeof a.explanation !== "string") throw new Error("answer failed validation: explanation must be a string");
-  return { cause: a.cause as Cause, confidence: a.confidence, cited_evidence: a.cited_evidence.slice(0, 6), explanation: a.explanation.slice(0, 280) };
+  // A fix is kept only for a blame: it is advice to the PR author, and an answer cached before it existed has none.
+  const fix = a.cause === "caused_by_pr" && typeof a.fix === "string" && a.fix.trim() ? { fix: a.fix.trim().slice(0, 320) } : {};
+  return { cause: a.cause as Cause, confidence: a.confidence, cited_evidence: a.cited_evidence.slice(0, 6), explanation: a.explanation.slice(0, 280), ...fix };
 }
 
 // v4: the pack gained pr.change_summary and this_pr_history.latest, and this_pr is citable only after a latest pass.
 // v6: the pack no longer carries the rules' class and reason, so the model reads the evidence unanchored. Every v5
 // answer is a miss.
+// v7: answers carry a fix, and a PR streak's pack its pr_streak and product hunks. Every v6 answer is a miss.
 // A release pack is keyed with its own question, so a PR answer is never reused for it.
-export const answerKey = (model: string, pack: Pack): string => `v6:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + systemFor(pack), pack)}`;
+export const answerKey = (model: string, pack: Pack): string => `v7:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + systemFor(pack), pack)}`;

@@ -2,6 +2,7 @@
 // See LICENSE.txt for license information.
 
 import { FAILED_STATUSES, isFailedTry } from "../../shared/src/tsio.ts";
+import { describeChange, errorFirstLine } from "./classify.ts";
 import { COMPARE_FILE_CAP } from "./config.ts";
 import { ledgerTotals, newLedger } from "./pricing.ts";
 import type { Counts, Finding, Ledger } from "./types.ts";
@@ -53,6 +54,8 @@ export function bucketOf(f: Finding): Bucket {
     if (f.judge?.cause === "app_bug" && f.decision === "adjudicator_blame") return "yours";
     // A stale copy of the test is not the PR's change: it is merged, not explained.
     if (f.out_of_date && f.class !== "OWNED_BY_PR") return "outdated";
+    // A PR streak the base branch does not explain is this PR's (see prStreak).
+    if (provenStreak(f)) return "yours";
     const yours = f.class === "OWNED_BY_PR" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame"
       || (f.class === "REGRESSION" && f.untouched === false);
     // A judge's veto or blame names this PR even where base-branch history also fails the test.
@@ -64,6 +67,33 @@ export function bucketOf(f: Finding): Bucket {
   if (f.release) return "flaky";
   const cause = f.decision === "adjudicator_unblock" ? f.judge?.cause : null;
   return cause === "bug_on_master" || cause === "test_bug" ? "broken" : "flaky";
+}
+
+/**
+ * A PR streak the base branch does not explain (it did not change the test; see markOutOfDate) and whose check ran: the
+ * PR's change is the cause. One the check could not run for keeps its "needs a look" call.
+ */
+const provenStreak = (f: Finding): boolean => Boolean(f.pr_streak) && f.blocking && !f.out_of_date && f.decision !== "evidence_incomplete";
+
+/** The judge's confidence from which its explanation and fix for a PR streak are shown (its "meets the requirement" bar). */
+const JUDGE_SURE = 0.6;
+
+/** The cause, and the fix, for a PR streak (see provenStreak): the judge's when it gave one, else the rules'. */
+function streakWhyNext(f: Finding, branch: string): [string, string] {
+  const runs = f.trunk?.runs ?? 0;
+  const cause = `Failed the same way on this PR's last ${f.pr_streak} commits, passed in all ${runs} recent runs on ${branch}, and ${branch} has not changed this test since this PR last merged it: this PR's change causes it.`;
+  const spec = f.file.split("/").pop() ?? f.file;
+  // The judge's answer counts where it met its own bar for naming a cause (0.6, see SYSTEM); below it, it found no
+  // change that explains the failure, and the summary says so instead of passing on a guess.
+  const a = f.judge?.cause === "caused_by_pr" && f.judge.confidence >= JUDGE_SURE ? f.judge : null;
+  const unsure = Boolean(f.judge) && !a ? " The AI found no change in this PR's diff that explains it." : "";
+  if (a?.fix) return [`${cause} ${a.explanation}`, `Suggested fix (AI): ${a.fix}`];
+  const c = f.changed_by_pr;
+  if (c?.removed) return [`${cause} ${c.file} removes ${describeChange(c)}, which the test expects.`, `Keep ${describeChange(c)} in ${c.file}; if removing it is intended, update ${spec} to the new behavior.`];
+  if (c) return [`${cause} ${c.file} changes the line with ${describeChange(c)} that the test looks for: "${c.line}".`, `Make that line give the test what it expects again, or update ${spec} to match the change.`];
+  if (a) return [`${cause} ${a.explanation}`, "Check the change named in the evidence."];
+  const at = errorFirstLine(f.error);
+  return [`${cause}${at ? ` It fails at: "${at.slice(0, 160)}".` : ""}${unsure}`, f.suspects?.length ? `Look first at this PR's changes to ${f.suspects.join(", ")}.` : "Check what this PR changes that the test uses."];
 }
 
 /** Who to look at for a test broken on the base branch: the PR(s) merged between its last pass and first failure. */
@@ -107,6 +137,7 @@ function whyNext(f: Finding, branch: string, pr: boolean, branchRun: string | nu
   const t = f.trunk ?? { runs: 0, passes: 0, fails: 0, flaky: 0 };
   const a = f.judge;
   const ai = a ? `AI, ${PERCENT(a.confidence)} sure` : "";
+  if (provenStreak(f)) return streakWhyNext(f, branch);
   switch (bucketOf(f)) {
     case "yours":
       if (f.class === "OWNED_BY_PR") return [`This ${pr ? "PR" : "commit"} edits the test.`, "Check your change to the test."];
@@ -114,7 +145,6 @@ function whyNext(f: Finding, branch: string, pr: boolean, branchRun: string | nu
       if (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto") return [`Points to this PR's change (${ai}).`, "Check the change named in the evidence."];
       return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and this PR changes a file its error names.`, "Check your change to that file."];
     case "outdated": {
-      if (f.out_of_date?.streak) return [`Failed the same way on this PR's last ${f.out_of_date.streak} commits and never on ${branch}: the branch is behind or broken.`, `Merge ${branch} and re-run.`];
       const c = f.out_of_date?.commit;
       const also = f.out_of_date?.also ?? [];
       const where = c ? ` (${refOf(c)}${c.date ? `, ${c.date}` : ""}${also.length ? `; also ${also.map(refOf).join(", ")}` : ""})` : "";
@@ -175,6 +205,8 @@ function factsTable(f: Finding, branch: string, pr: boolean, branchRun: string |
   const rows: [string, string][] = [];
   const edits = f.class === "OWNED_BY_PR";
   rows.push([`Does this ${pr ? "PR" : "commit"} change the test?`, edits ? "Yes" : "No"]);
+  if (f.changed_by_pr) rows.push(["Does this PR change what the test looks for?", `Yes, ${f.changed_by_pr.removed ? "removes it" : "changes it"} in ${f.changed_by_pr.file}: "${f.changed_by_pr.line}"`]);
+  if (f.pr_streak) rows.push([`Failed the same way on this PR's last commits`, `${count(f.pr_streak, "commit")}, never on ${branch}`]);
   if (!edits && f.untouched != null) rows.push(["Does this PR change a file its error names?", f.untouched ? "No" : "Yes"]);
   if (t) rows.push(t.runs ? [`${branch}, last ${count(t.runs, "run")}`, `Passed ${t.passes}, failed ${t.fails}${t.flaky ? `, passed on retry ${t.flaky}` : ""}${t.latest ? `. Latest: ${t.latest}` : ""}`] : [`${branch}`, "No runs on record"]);
   if (f.broke_by) {
@@ -204,9 +236,7 @@ function factsTable(f: Finding, branch: string, pr: boolean, branchRun: string |
   if (f.tries?.ran) rows.push(["Tries in this run", f.tries.ran === 1 ? "Failed its only try" : f.tries.failed === f.tries.ran ? `Failed all ${f.tries.ran}` : `Failed ${f.tries.failed} of ${f.tries.ran}`]);
   if (f.producer) rows.push(["Recorded by the run", [f.producer.images.length && count(f.producer.images.length, "screenshot"), f.producer.notes && `notes: ${f.producer.notes.slice(0, 200)}`].filter(Boolean).join("; ")]);
   if (f.same_as) rows.push(["Same failure as", f.same_as]);
-  if (f.out_of_date?.streak) {
-    rows.push([`Failed the same way on this PR's last ${count(f.out_of_date.streak, "commit")}`, `Never on ${branch}; its latest run passed`]);
-  } else if (f.out_of_date) {
+  if (f.out_of_date) {
     const c = f.out_of_date.commit;
     const also = f.out_of_date.also ?? [];
     const which = c ? `: ${sha7(c.sha)}${c.pr ? ` (#${c.pr})` : ""}${c.date ? ` on ${c.date}` : ""}${also.length ? `, and earlier ${also.map(refOf).join(", ")}` : ""}` : "";
@@ -398,12 +428,8 @@ export function renderSummary({ findings, infra: runInfra = null, runURL, counts
     lines.push("");
   };
   section(pr ? "Your PR" : "This commit", yours);
-  // A branch-state hold changed nothing on the base: its heading says what it is.
-  const streakOnly = outdated.length > 0 && outdated.every((f) => f.out_of_date?.streak);
   section("Out of date", outdated, branchRun
     ? `Out of date (${outdated.length}): ${md(staleBase)} changed these tests after ${md(branchRun)} branched from it`
-    : streakOnly
-    ? `Out of date (${outdated.length}): this PR fails the same way on its last commits and never on ${md(branch)}`
     : fixedCount === outdated.length
       ? `Fixed on ${md(branch)} (${outdated.length}): ${md(branch)} fixed these failures after this PR last merged ${md(branch)}`
       : `Out of date (${outdated.length}): ${md(branch)} changed these tests, or fixed these failures, after this PR last merged ${md(branch)}`);
@@ -502,7 +528,7 @@ export type StatusLabel = (typeof STATUS_LABELS)[number];
 
 /**
  * The label of one finding. Blocking: app bug (a release run's judge names one), fixed on main (the base branch fixed the
- * failure after this PR last merged it), out of date (a stale copy, or the branch-state hold), caused by this PR (the PR
+ * failure after this PR last merged it), out of date (a stale copy), caused by this PR (the PR
  * edits the spec, or the judge blames or vetoes it), otherwise needs investigation. Cleared: broken on main (a trunk
  * break, or the judge's bug_on_master), test bug or server compat (the judge's, on a release run), otherwise flaky
  * (trunk or cross-PR flakes, the environment, a PR run's test bug, or the same failure as one of those).
@@ -511,6 +537,7 @@ export function statusLabelOf(f: Finding): StatusLabel {
   if (f.blocking) {
     if (f.judge?.cause === "app_bug" && f.decision === "adjudicator_blame") return "app bug";
     if (f.out_of_date) return f.out_of_date.fixed ? "fixed on main" : "out of date";
+    if (provenStreak(f)) return "caused by PR";
     if (f.class === "OWNED_BY_PR" || (f.judge?.cause === "caused_by_pr" && (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto"))) return "caused by PR";
     return "needs investigation";
   }

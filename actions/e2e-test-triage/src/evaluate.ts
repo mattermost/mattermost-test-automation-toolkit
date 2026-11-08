@@ -3,7 +3,7 @@
 
 import { identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
-import { BORDERLINE, classify, classifyNotRun, errorSignature, holdFailedEverywhere, infraVerdict, isShardPlaceholder, isSpecNotRun, isSpecStopped, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
+import { BORDERLINE, classify, classifyNotRun, errorSignature, holdFailedEverywhere, infraVerdict, isShardPlaceholder, isSpecNotRun, isSpecStopped, isProductChange, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, historyLane, repoPath } from "./config.ts";
 import { commonSenseClear } from "./common-sense.ts";
 import { sameTestOnOtherReports } from "./enrich.ts";
@@ -130,6 +130,8 @@ export async function evaluateRun({
         groupId: run.group_id,
         trunkBranch,
         commitSha: id.commit_sha,
+        // A cut-off list could hide the change: only a complete one may name the PR's line.
+        patches: diff.ok ? files : null,
       });
     });
     // A PR that breaks its own server fails every test on the environment, so on a flagged run only the judge clears
@@ -144,7 +146,15 @@ export async function evaluateRun({
       const producer = evidenceFor(f, evidence);
       if (producer) f.producer = producer;
       // "Likely regression" only if the PR touches the test or a file its error names.
-      if (prNumber && diff.ok && f.class === "REGRESSION") f.untouched = !changed.some((name) => namesChangedFile(f, name));
+      // A change that holds what the test looked for (changed_by_pr) touches it too.
+      if (prNumber && diff.ok && f.class === "REGRESSION") f.untouched = !f.changed_by_pr && !changed.some((name) => namesChangedFile(f, name));
+      // A PR streak's likely files, for the summary when no judge names one: the change that holds what the test looked
+      // for, then files its error names, then the PR's other product changes.
+      if (f.pr_streak && diff.ok) {
+        const own = f.repo_path ?? f.file;
+        const rank = (name: string): number => (name === f.changed_by_pr?.file ? 0 : namesChangedFile(f, name) ? 1 : 2);
+        f.suspects = changed.filter((name) => name !== own && isProductChange(name)).sort((a, b) => rank(a) - rank(b)).slice(0, 3);
+      }
     }
     // Incomplete evidence makes the rules unsound: nothing clears, and the model isn't asked.
     const blind =

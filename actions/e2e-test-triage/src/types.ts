@@ -101,6 +101,15 @@ export interface Finding extends TestRef {
   trunk_fixed?: { last_fail: At | null; first_pass: At | null };
   this_pr: ThisPRStats;
   untouched?: boolean;
+  /** The PR's changed line that holds what the failing test looked for (see changeTouchesFailure). */
+  changed_by_pr?: ChangedByPR;
+  /**
+   * A PR streak (see prStreak): how many of this PR's last commits failed the same way, never on trunk. Unless the base
+   * branch changed the test since (markOutOfDate), the PR's change is the cause: held, never cleared, and labelled so.
+   */
+  pr_streak?: number;
+  /** For a PR streak: the PR's changed product files most likely behind it (at most 3), for the summary to name. */
+  suspects?: string[];
   producer?: Evidence;
   out_of_date?: OutOfDate;
   broke_by?: BrokeBy;
@@ -151,6 +160,8 @@ export interface Answer {
   confidence: number;
   cited_evidence: string[];
   explanation: string;
+  /** With caused_by_pr: what to change, naming the file (the judge's suggestion). Absent otherwise. */
+  fix?: string;
   provenance?: Provenance;
 }
 
@@ -191,6 +202,12 @@ export interface Pack {
   earlier_failure_same_spec?: { id: "earlier_failure_same_spec" } & EarlierFailure;
   tries_in_this_run?: { ran: number; failed: number };
   test_code_near_failure?: string;
+  /**
+   * A PR streak (see prStreak): the test failed the same way on this PR's last `failed_commits` commits, passed in all
+   * `trunk_runs` recent trunk runs, and trunk did not change it since this PR last merged trunk. The judge is asked
+   * which change in the hunks causes it, and the fix.
+   */
+  pr_streak?: { id: "pr_streak"; failed_commits: number; trunk_runs: number };
   /** A release branch's run (see releasePack): what the run is, instead of a PR. */
   release?: { id: "release"; branch: string; base: string; history_branch: string; server: string | null };
   /** The default branch changed the test's file after the release branch was cut: its commits, and the file's diff since. */
@@ -268,15 +285,13 @@ export interface CommitRef {
 
 export interface OutOfDate {
   base: string;
-  /** Commits the PR is behind the base; null for the branch-state hold, where no comparison was made. */
+  /** Commits the PR is behind the base; null where no comparison was made. */
   behind: number | null;
   commit: CommitRef | null;
   /** The base branch's earlier commits to the test since this PR (or branch) last had it, newest first, after `commit` (at most 4). */
   also?: CommitRef[];
   /** The test file's diff on the base branch since the merge base, as GitHub's compare gave it (cut to 4000 characters). */
   diff?: string;
-  /** The branch-state hold: this PR failed the same way on its last `streak` commits (this run included), never on the base. */
-  streak?: number;
   /** The failure first passed on the base branch at `commit` (see markFixedOnTrunk), after this PR last merged it. */
   fixed?: boolean;
   /** The support-paths directory the base branch changed at `commit`, where the test itself is unchanged. */
@@ -379,6 +394,17 @@ export interface PrRef {
 export interface ChangedFile {
   filename: string;
   patch?: string;
+}
+
+/** A changed line of the PR that holds what a failing test looked for: a selector, a test id, or the expected text. */
+export interface ChangedByPR {
+  file: string;
+  anchor: string;
+  kind: "selector" | "test id" | "text";
+  /** The changed line, trimmed (at most 200 characters). */
+  line: string;
+  /** The PR removes it: it is on a removed line and on no added line of that file. */
+  removed: boolean;
 }
 
 /** The changed files of a PR (or commit), and whether that list is complete. */
