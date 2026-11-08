@@ -192,6 +192,15 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
     return { label: "all specs ran", state: "success", fault: "nobody", action: "nothing", what: lost ? `${plural(lost, "worker")} lost after the other workers ran every spec` : "a job outside the tests failed after every spec ran", rerun: "none", evidence: ev };
   }
 
+  // 1b. Tests that failed outside dispatch (an upgrade harness) on some workers, while the others ran them clean: the
+  // same code passed there, so it is re-run, and the summary names the test step that failed. On every worker it is a
+  // lane-wide failure, judged below.
+  if (hidden.length && hidden.length < workers.length) {
+    const h = hidden[0];
+    const line = [h.job.tail, ...h.job.errors].join("\n").split("\n").map((l) => l.trim()).find((l) => /✘|failed|Error/.test(l) && !TESTS_FAILED.test(l)) ?? h.cause.line;
+    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(hidden.length, "worker")} and passed on the others: ${quote(line)}`, rerun: rerunKind, evidence: [`${hidden.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; the other ${plural(workers.length - hidden.length, "worker")} passed it`, ...evidence] };
+  }
+
   // 2. A lane-wide failure: most specs failed, or the setup broke on every worker that started.
   const finished = o ? o.units.length - o.unfinished.length : 0;
   const massTests = Boolean(o && o.failed.length >= 20 && o.failed.length * 4 >= finished);

@@ -3386,7 +3386,7 @@ test("a red lane whose reports never all arrived says how many did, and keeps th
       statusSink(statuses),
     ];
     await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl: fakeFetch(routes), log: () => {}, wait: { attempts: 1, ms: 0 } });
-    assert.match(readFileSync(summaryPath, "utf8"), /^\*\*Re-run the failed jobs: 1 of 2 reports arrived; 1 of 2 reports never uploaded, so the specs on those workers never ran\.\*\*/m);
+    assert.match(readFileSync(summaryPath, "utf8"), /^\*\*Re-run the failed jobs: 1 of 2 reports arrived; 1 of 2 reports never uploaded, so the specs on those workers never ran\.(?: Not re-run automatically: [^*]+\.)?\*\*/m);
     assert.deepEqual(statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => [s.state, s.description]), [["failure", "(1 report(s) missing) 100% passed (1 passed, 0 failed, 0 skipped)"]]);
   });
 });
@@ -3679,7 +3679,7 @@ test("zero failures with missing reports says both how many arrived and what nev
       statusSink(statuses),
     ];
     await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl: fakeFetch(routes), log: () => {}, wait: { attempts: 1, ms: 0 } });
-    assert.match(readFileSync(summaryPath, "utf8"), /\*\*Re-run the failed jobs: 1 of 2 reports arrived; 1 of 2 reports never uploaded, so the specs on those workers never ran\.\*\*/m);
+    assert.match(readFileSync(summaryPath, "utf8"), /\*\*Re-run the failed jobs: 1 of 2 reports arrived; 1 of 2 reports never uploaded, so the specs on those workers never ran\.(?: Not re-run automatically: [^*]+\.)?\*\*/m);
   });
 });
 
@@ -3753,12 +3753,13 @@ test("PR streak: failing the same way on this PR's last commits, and never on tr
   assert.equal(statusLabelOf(f), "caused by PR", "out of date only where the base branch changed the test (markOutOfDate)");
 });
 
-test("an infrastructure error repeated on this PR's commits is a streak only where the PR can break its environment", () => {
+test("an infrastructure error repeated on this PR's commits is never a PR streak", () => {
   const infra = 'Error: server at "http://localhost:8065" is not healthy after 30 seconds of retries';
   const runs = [prRun("c2", "failed", infra), prRun("c1", "failed", infra), ...trunkPasses(8)];
-  // A server PR (infraClears off) can hang its own server: the repeat is held as the PR's.
+  // Never a streak: a test-server outage across two pushes is the environment's. With infraClears off it stays held for
+  // the rules after it (settlePR), never as the PR's streak.
   const held = classify({ ...branchTest, error: infra }, runs, [], { ...DEFAULTS, infraClears: false }, 5);
-  assert.deepEqual([held.class, held.blocking, held.pr_streak], ["REGRESSION", true, 3]);
+  assert.deepEqual([held.class, held.blocking, held.pr_streak], ["INFRA_ERROR", true, undefined]);
   // An app against a separate test server (infraClears on) cannot: the repeat is still the environment's, cleared.
   const cfg = { ...DEFAULTS, infraClears: true };
   const env = classify({ ...branchTest, error: infra }, runs, [], cfg, 5);
@@ -4155,7 +4156,7 @@ test("a lane whose every failure names no test is red for a re-run: no history i
     assert.equal(result.findings.length, 0, "nothing is classified");
     assert.equal(fetchImpl.calls.filter((c) => c.url.includes("api.anthropic.com")).length, 0, "no model call");
     assert.equal(fetchImpl.calls.filter((c) => c.url.includes("/reports/history")).length, 0, "no history read");
-    assert.match(readFileSync(summaryPath, "utf8"), /^\*\*Re-run the failed jobs: 2 of 3 reports arrived; 1 of 3 reports never uploaded, so the specs on those workers never ran\.\*\*/m);
+    assert.match(readFileSync(summaryPath, "utf8"), /^\*\*Re-run the failed jobs: 2 of 3 reports arrived; 1 of 3 reports never uploaded, so the specs on those workers never ran\.(?: Not re-run automatically: [^*]+\.)?\*\*/m);
     assert.deepEqual(statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => [s.state, s.description]), [["failure", "(re-run the failed jobs; 1 report(s) missing) 0% passed (0 passed, 1 failed, 0 skipped)"]]);
   });
 });
@@ -4169,7 +4170,7 @@ test("a run whose only failures name no test, with every report in, says so: a r
     const result = await triage({ env: { ...env, MODE: "report-only", ANTHROPIC_API_KEY: "AK", TRIAGE_CONTEXT: "off", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl, log: () => {} });
     assert.equal(result.verdict, "FAILURE");
     assert.equal(fetchImpl.calls.filter((c) => c.url.includes("api.anthropic.com")).length, 0);
-    assert.match(readFileSync(summaryPath, "utf8"), /^\*\*Re-run the failed jobs: 1 failed result with no test name\.\*\*/m);
+    assert.match(readFileSync(summaryPath, "utf8"), /^\*\*Re-run the failed jobs: 1 failed result with no test name\.(?: Not re-run automatically: [^*]+\.)?\*\*/m);
   });
 });
 

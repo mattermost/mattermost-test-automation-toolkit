@@ -1019,7 +1019,7 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
   };
   if (own.has(test.repo_path ?? test.file))
     return out("OWNED_BY_PR", isTrunkRun ? `This commit changes ${test.file}; a failure in a spec the commit edits is not noise.` : `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
-  if (!isTrunkRun && currentPR != null && !test.identity_unresolved && !failedPRs.length && !(cfg.infraClears && isInfraError(test.error))) {
+  if (!isTrunkRun && currentPR != null && !test.identity_unresolved && !failedPRs.length && !isInfraError(test.error)) {
     const earlier = /* @__PURE__ */ new Set();
     for (const o of mine) {
       if (!FAILED_STATUSES.has(o.status) || !sameFirstLine(o.error_excerpt, test.error)) break;
@@ -3528,6 +3528,11 @@ function diagnoseLane(facts) {
     for (const u of slow.slice(0, 2)) ev.push(`${u.spec} ran ${Math.round(longestRun(u) / 6e4)} min, past its lease: split it or it can outlast a worker`);
     return { label: "all specs ran", state: "success", fault: "nobody", action: "nothing", what: lost ? `${plural(lost, "worker")} lost after the other workers ran every spec` : "a job outside the tests failed after every spec ran", rerun: "none", evidence: ev };
   }
+  if (hidden.length && hidden.length < workers.length) {
+    const h = hidden[0];
+    const line = [h.job.tail, ...h.job.errors].join("\n").split("\n").map((l) => l.trim()).find((l) => /✘|failed|Error/.test(l) && !TESTS_FAILED.test(l)) ?? h.cause.line;
+    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(hidden.length, "worker")} and passed on the others: ${quote(line)}`, rerun: rerunKind, evidence: [`${hidden.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; the other ${plural(workers.length - hidden.length, "worker")} passed it`, ...evidence] };
+  }
   const finished2 = o ? o.units.length - o.unfinished.length : 0;
   const massTests = Boolean(o && o.failed.length >= 20 && o.failed.length * 4 >= finished2);
   const codeDead = causes.filter((c) => c.cause.kind === "code");
@@ -4046,13 +4051,15 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const onlyNoResults = (result.unnamed || result.missing || result.findings.some((f) => f.class === "NOT_RUN")) && !result.findings.some((f) => f.blocking && f.class !== "NOT_RUN");
     const onlyDeadJobs = redWhy === "upstream" && !run.failing.length && !result.findings.some((f) => f.blocking);
     let rerunCheck = null;
-    if (!lane && (onlyNoResults || onlyDeadJobs) && attempt <= cfg.rerunAttempts) {
+    if (!lane && (onlyNoResults || onlyDeadJobs)) {
       try {
-        const dead = await readDeadJobs({ fetchImpl, token: String(env.GITHUB_TOKEN), repository: id.repository, runId: String(id.gh_run_id), attempt: String(id.gh_run_attempt), log });
+        const dead = await readDeadJobs({ fetchImpl, token: String(env.GITHUB_TOKEN), repository: id.repository, runId: String(id.gh_run_id), attempt: String(attempt), log });
         rerunCheck = await decideRerun(dead, apiKey && !prSpendUnknown ? askCauseWith(fetchImpl, apiKey, cfg.model, result.ai, cfg.prices) : null, log);
       } catch (e) {
         rerunCheck = { rerun: false, held: null, reason: `the run's jobs could not be read (${String(e).slice(0, 120)}; the action needs actions: read)` };
       }
+      if (rerunCheck.rerun && attempt > cfg.rerunAttempts)
+        rerunCheck = { rerun: false, held: null, reason: `${rerunCheck.reason}; attempt ${attempt} was the last automatic one, so a person re-runs it` };
       log(`e2e-test-triage: re-run check: ${rerunCheck.rerun ? "re-run" : rerunCheck.held ? `held, ${rerunCheck.held}` : "left to a person"}: ${rerunCheck.reason}`);
     }
     const spend = ledgerTotals(result.ai);

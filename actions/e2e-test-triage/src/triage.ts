@@ -451,13 +451,17 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // the lane is red only for that job, and its failed step decides the re-run as for a shard that sent nothing.
     const onlyDeadJobs = redWhy === "upstream" && !run.failing.length && !result.findings.some((f) => f.blocking);
     let rerunCheck: RerunDecision | null = null;
-    if (!lane && (onlyNoResults || onlyDeadJobs) && attempt <= cfg.rerunAttempts) {
+    // The dead jobs are read on every attempt, the last too, so the summary says why the lane is red; the repo's allowance
+    // decides only whether triage re-runs it. This attempt's jobs, not the identity's first attempt.
+    if (!lane && (onlyNoResults || onlyDeadJobs)) {
       try {
-        const dead = await readDeadJobs({ fetchImpl, token: String(env.GITHUB_TOKEN), repository: id.repository, runId: String(id.gh_run_id), attempt: String(id.gh_run_attempt), log });
+        const dead = await readDeadJobs({ fetchImpl, token: String(env.GITHUB_TOKEN), repository: id.repository, runId: String(id.gh_run_id), attempt: String(attempt), log });
         rerunCheck = await decideRerun(dead, apiKey && !prSpendUnknown ? askCauseWith(fetchImpl, apiKey, cfg.model, result.ai, cfg.prices) : null, log);
       } catch (e) {
         rerunCheck = { rerun: false, held: null, reason: `the run's jobs could not be read (${String(e).slice(0, 120)}; the action needs actions: read)` };
       }
+      if (rerunCheck.rerun && attempt > cfg.rerunAttempts)
+        rerunCheck = { rerun: false, held: null, reason: `${rerunCheck.reason}; attempt ${attempt} was the last automatic one, so a person re-runs it` };
       log(`e2e-test-triage: re-run check: ${rerunCheck.rerun ? "re-run" : rerunCheck.held ? `held, ${rerunCheck.held}` : "left to a person"}: ${rerunCheck.reason}`);
     }
     const spend = ledgerTotals(result.ai);

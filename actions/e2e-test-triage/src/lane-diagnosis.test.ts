@@ -114,8 +114,8 @@ test("every spec ran and passed: green, whatever worker or report was lost (fix 
   // A rolling-upgrade worker whose harness failed (ci/upgrade-to) before dispatch: its tests ran where the orchestration
   // never sees them, so the other workers' clean run does not vouch for the lane.
   const harness = diagnoseLane(facts({ orchestration: orch(passing(421)), jobs: workers(40, { 13: { conclusion: "failure", step: "ci/upgrade-to", tail: "  ✘  1 [upgrade-to] › upgrade_to.ts:12 › baseline survives the upgrade\n  1 failed\n  4 passed (2.1m)" } }) }));
-  assert.notEqual(harness.label, "all specs ran");
-  assert.equal(harness.state, "failure");
+  assert.deepEqual([harness.label, harness.state, harness.rerun], ["machine failure", "failure", "lane"], "passed on the other workers: re-run");
+  assert.match(harness.what, /^ci\/upgrade-to tests failed on 1 worker and passed on the others: ✘ 1 \[upgrade-to\] › upgrade_to\.ts:12 › baseline survives the upgrade/);
   // run 41940673353: the abandoned spec's late report passed; the slow spec is named in the evidence.
   const slow = diagnoseLane(facts({ orchestration: orch([...passing(409), unit("specs/functional/system_console/abac/teams/team_advanced_rules.spec.ts", "abandoned", [{ status: "passed", actual_duration_ms: 874041, expired: true }, { status: null, expired: true }])], "timed_out"), jobs: workers(30, { 8: { conclusion: "failure", step: "ci/dispatch-run", tail: "##[error]The action 'ci/dispatch-run' has timed out after 25 minutes." } }) }));
   assert.equal(slow.state, "success");
