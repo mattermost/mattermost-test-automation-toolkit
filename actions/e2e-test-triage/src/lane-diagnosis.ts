@@ -276,6 +276,16 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
   };
 }
 
+/**
+ * Whether a lane verdict may turn the run green. A lane red outside its tests (a report missing, a job dead, no results)
+ * turns green only on the orchestration: every dispatched spec ran and passed ("all specs ran"). That is the line the
+ * lane-result gate holds (basis "orchestration"), so success is never written for a lane that gate would keep red. A
+ * PR's lane the base branch explains ("broken on main", "fixed on main") is green only when its results are complete.
+ */
+export function laneTurnsGreen(v: Pick<LaneVerdict, "state" | "label">, outsideTests: boolean): boolean {
+  return v.state === "success" && (v.label === "all specs ran" || !outsideTests);
+}
+
 /** The lane's status text: "(label, action) what", cut to GitHub's 140 characters. */
 export function laneDescription(v: LaneVerdict, rerunning: boolean, base = "main"): string {
   const head =

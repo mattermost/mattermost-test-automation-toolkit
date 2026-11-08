@@ -5427,3 +5427,24 @@ test("a PR's failure is red only with evidence the PR caused it; nothing else is
   assert.deepEqual([unread.blocking, statusLabelOf(unread)], [true, "machine failure"]);
   for (const l of STATUS_LABELS) assert.doesNotMatch(l, /needs investigation|out of date|pull .* changes/);
 });
+
+test("a lane whose tests all clear while a job outside them died is never written green: the lane-result gate's line", async () => {
+  const run = async (description: string): Promise<{ verdict: string; written: StatusBody[] }> => {
+    const written: StatusBody[] = [];
+    const result = await triage({ env: { ...env, ANTHROPIC_API_KEY: "", TRIAGE_CONTEXT: "off" }, fetchImpl: fakeFetch([
+      ...runRoutes([spec("t1", "failed")]),
+      ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
+      // Nothing in the PR touches t1: cleared as a first failure (see settlePR).
+      ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+      ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
+      ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/playwright", state: "failure", description, target_url: "https://github.com/o/r/actions/runs/12" }])],
+      ["/statuses/abc", (init) => { written.push(parsed<StatusBody>(bodyText(init))); return Response.json({}); }],
+    ]), log: () => {} });
+    return { verdict: result.verdict, written };
+  };
+  const dead = await run(UPSTREAM_FAILED);
+  assert.equal(dead.verdict, "FAILURE", "a dead job outside the tests: only the orchestration may vouch for the lane");
+  assert.ok(dead.written.every((s) => s.state !== "success"), JSON.stringify(dead.written));
+  const plain = await run("99.9% passed (1383 passed, 1 failed, 63 skipped)");
+  assert.equal(plain.verdict, "SUCCESS", "tests alone red: the cleared failure turns it green");
+});

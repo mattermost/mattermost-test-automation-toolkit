@@ -12,7 +12,7 @@ import { REPORTS_INCOMPLETE, UPSTREAM_FAILED } from "../../shared/src/status.ts"
 import { redReason } from "../../shared/src/lane.ts";
 import { trunkBroken } from "./baseline.ts";
 import type { Baseline, TrunkRun } from "./baseline.ts";
-import { diagnoseLane, jobCause, laneDescription } from "./lane-diagnosis.ts";
+import { diagnoseLane, jobCause, laneDescription, laneTurnsGreen } from "./lane-diagnosis.ts";
 import type { LaneFacts } from "./lane-diagnosis.ts";
 import { errorLines, lanePrefixOf, stepLines } from "./lane-jobs.ts";
 import type { LaneJob } from "./lane-jobs.ts";
@@ -254,6 +254,15 @@ test("a lane red for no reason shown is re-run as a machine failure, or the PR's
   assert.deepEqual([mine.label, mine.fault, mine.rerun], ["caused by PR", "PR", "none"]);
   // No label is ever "needs investigation" or "out of date".
   for (const v of [machine, mine]) assert.doesNotMatch(laneDescription(v, false, "master"), /needs investigation|out of date/);
+});
+
+test("a lane the base branch explains turns the run green only with complete results; all specs ran always may", () => {
+  assert.equal(laneTurnsGreen({ state: "success", label: "all specs ran" }, true), true, "the orchestration vouches for every spec");
+  assert.equal(laneTurnsGreen({ state: "success", label: "broken on main" }, false), true, "results complete");
+  // A report missing or a job dead: the lane-result gate accepts only an orchestration basis, so no success is written.
+  assert.equal(laneTurnsGreen({ state: "success", label: "broken on main" }, true), false);
+  assert.equal(laneTurnsGreen({ state: "success", label: "fixed on main" }, true), false);
+  assert.equal(laneTurnsGreen({ state: "failure", label: "machine failure" }, false), false);
 });
 
 test("a trunk run counts as broken only when most of its specs failed or none ran", () => {

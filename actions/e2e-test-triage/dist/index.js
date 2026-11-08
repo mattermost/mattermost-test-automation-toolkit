@@ -3585,6 +3585,9 @@ function diagnoseLane(facts) {
     evidence: [...facts.orchestrationError ? [`TSIO orchestration unreadable: ${facts.orchestrationError}`] : [], ...evidence]
   };
 }
+function laneTurnsGreen(v, outsideTests) {
+  return v.state === "success" && (v.label === "all specs ran" || !outsideTests);
+}
 function laneDescription(v, rerunning, base = "main") {
   const head = v.label === "machine failure" ? `machine failure, ${rerunning ? v.rerun === "lane" ? "re-running the lane" : "re-running the failed jobs" : v.action}` : v.label === "broken on main" ? v.action.startsWith("fix the base branch") ? "broken on main" : "broken on main, not your change" : v.label === "fixed on main" ? v.state === "success" ? "fixed on main, not your change" : `fixed on main, merge ${base}` : v.label;
   return clip2(`(${head}) ${v.what}`, 140);
@@ -3797,6 +3800,16 @@ async function noteNoResults({ env, fetchImpl = fetch, log = console.error, retr
     await statusPublisher({ api, id, context, env, log }).write({ state: own.state, description: "(not triaged: no results)", target_url: runURL }, "triage");
   } catch (e) {
     log(`not-triaged note not written on ${context}: ${String(e).slice(0, 200)}`);
+  }
+}
+async function redOutsideTests(api, id, context, log) {
+  try {
+    const own = (await readStatuses(api, id)).find((r) => r.context === context);
+    const text = String(own?.description ?? "");
+    return isUpstreamFailed(text) || isReportsIncomplete(text);
+  } catch (e) {
+    log(`lane status unavailable: ${String(e).slice(0, 160)}`);
+    return false;
   }
 }
 async function laneRedWhy(api, id, context, flaky, log) {
@@ -4051,8 +4064,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const laneRerun = lane && lane.verdict.rerun !== "none" && attempt <= cfg.rerunAttempts && Number(env.GITHUB_RUN_ATTEMPT || attempt) <= cfg.rerunAttempts ? lane.verdict.rerun : null;
     const rerun = (lane ? laneRerun : rerunCheck?.rerun) ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = lane ? null : rerunCheck?.held ?? null;
-    if (lane?.verdict.state === "success" && !result.findings.some((f) => f.blocking)) result.verdict = "SUCCESS";
+    if (lane && laneTurnsGreen(lane.verdict, outsideTests) && !result.findings.some((f) => f.blocking)) result.verdict = "SUCCESS";
     else if (lane) result.verdict = "FAILURE";
+    if (decides && result.verdict === "SUCCESS" && lane?.verdict.label !== "all specs ran" && context && (outsideTests || run.failing.length > 0 && await redOutsideTests(api, id, context, log)))
+      result.verdict = "FAILURE";
     const laneSection = lane ? renderLane({ verdict: lane.verdict, rerunning: Boolean(rerun), lane: env.LANE || id.name, runURL, base: lane.baseline?.base ?? prBase ?? trunkBranch ?? null }) : "";
     const testsSummary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
     const summary = lane && !result.findings.length ? laneSection : [laneSection, testsSummary].filter(Boolean).join("\n");

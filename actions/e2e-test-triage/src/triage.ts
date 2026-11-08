@@ -19,6 +19,7 @@ import type { EvaluatedRun } from "./evaluate.ts";
 import { findingLogLine, redact, secretsOf, writeFindings } from "./findings.ts";
 import { askCauseWith, decideRerun, readDeadJobs } from "./rerun-check.ts";
 import { laneDescription } from "./lane-diagnosis.ts";
+import { laneTurnsGreen } from "./lane-diagnosis.ts";
 import { judgeLane, lanePathsOf } from "./lane-verdict.ts";
 import type { JudgedLane } from "./lane-verdict.ts";
 import type { RerunDecision } from "./rerun-check.ts";
@@ -171,6 +172,18 @@ async function noteNoResults({ env, fetchImpl = fetch, log = console.error, retr
  * jobs re-run. "outside" for any other red status (missing reports, no text): the summary says so and nothing is
  * written. An unreadable status is logged, and reads as not red.
  */
+/** Whether the lane's own status says a job outside its tests failed or its reports are incomplete; false when unread. */
+async function redOutsideTests(api: GhApi, id: TriageIdentity, context: string, log: (message: string) => void): Promise<boolean> {
+  try {
+    const own = (await readStatuses(api, id)).find((r) => r.context === context);
+    const text = String(own?.description ?? "");
+    return isUpstreamFailed(text) || isReportsIncomplete(text);
+  } catch (e) {
+    log(`lane status unavailable: ${String(e).slice(0, 160)}`);
+    return false;
+  }
+}
+
 async function laneRedWhy(api: GhApi, id: TriageIdentity, context: string, flaky: number, log: (message: string) => void): Promise<"flaky" | "upstream" | "outside" | null> {
   try {
     const own = (await readStatuses(api, id)).find((r) => r.context === context);
@@ -463,8 +476,14 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const laneRerun = lane && lane.verdict.rerun !== "none" && attempt <= cfg.rerunAttempts && Number(env.GITHUB_RUN_ATTEMPT || attempt) <= cfg.rerunAttempts ? lane.verdict.rerun : null;
     const rerun = (lane ? laneRerun : rerunCheck?.rerun) ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = lane ? null : rerunCheck?.held ?? null;
-    if (lane?.verdict.state === "success" && !result.findings.some((f) => f.blocking)) result.verdict = "SUCCESS";
+    if (lane && laneTurnsGreen(lane.verdict, outsideTests) && !result.findings.some((f) => f.blocking)) result.verdict = "SUCCESS";
     else if (lane) result.verdict = "FAILURE";
+    // The lane-result gate's line, held before the status is written: a lane red outside its tests (a job outside them
+    // died, a report is missing) turns green only on the orchestration ("all specs ran"). Tests that all cleared beside a
+    // dead job leave it red, so success is never written for a lane that gate would keep red. A run that writes nothing
+    // (decides is false) is left to the gate.
+    if (decides && result.verdict === "SUCCESS" && lane?.verdict.label !== "all specs ran" && context && (outsideTests || (run.failing.length > 0 && (await redOutsideTests(api, id, context, log)))))
+      result.verdict = "FAILURE";
     const laneSection = lane ? renderLane({ verdict: lane.verdict, rerunning: Boolean(rerun), lane: env.LANE || id.name, runURL, base: lane.baseline?.base ?? prBase ?? trunkBranch ?? null }) : "";
     const testsSummary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
     const summary = lane && !result.findings.length ? laneSection : [laneSection, testsSummary].filter(Boolean).join("\n");

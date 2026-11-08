@@ -498,8 +498,10 @@ your change) 300 of 320 specs failed: Error: expect(locator).toBeVisible() faile
 the job summary adds whose fault it is and the evidence. Only `all specs ran` gives the
 `basis` output `orchestration`: a caller's gate may accept a green verdict on a lane whose
 jobs failed or reports are missing only on that basis. A PR's `broken on main` or `fixed
-on main` lane whose specs ran is green with `basis` `lane`, so such a gate still keeps it
-red while results are missing. A lane without an
+on main` lane whose specs ran is green only when its results are complete (`basis` `lane`).
+Triage holds that line itself before it writes the status: a lane red outside its tests (a
+report missing, a job outside the tests dead) is never written green unless every spec ran
+and passed, even when each of its test failures was cleared. A lane without an
 orchestration (one that does not lease its specs) keeps the judgement it had before.
 
 A machine failure after the lane's TSIO run began is re-run from the lane's first job
