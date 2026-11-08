@@ -4299,7 +4299,9 @@ test("with re-runs allowed, a lane red only for jobs that sent no results asks f
   const text = renderSummary({ findings: [], runURL: "u", counts, trunkBranch: "master", unnamed: 2, notRun: 2, notRunRerun: 2, rerun: { attempt: 2, of: 2 } });
   assert.match(text, /^## E2E triage: 🔴 2 specs did not run, re-running the failed jobs$/m);
   assert.match(text, /^\*\*Re-running the failed jobs automatically \(attempt 2 of 2\), then triaging the new results: 2 specs did not run, no result from their CI job\.\*\*/m);
-  for (const [attempt, expected] of [["1", "true"], ["2", "false"]]) {
+  // [the identity's attempt, the run's own attempt, whether a re-run is asked]. A re-run of failed jobs keeps the first
+  // attempt's TSIO identity (desktop run 42252914935): the run's own attempt decides, so no re-run is promised past it.
+  for (const [attempt, runAttempt, expected] of [["1", "1", "true"], ["2", "2", "false"], ["1", "2", "false"]]) {
     await inTmp(async (dir) => {
       const statuses: StatusBody[] = [];
       const outputPath = join(dir, "o.txt");
@@ -4312,8 +4314,8 @@ test("with re-runs allowed, a lane red only for jobs that sent no results asks f
         statusSink(statuses),
       ]);
       const id = { ...parsed<CompositeIdentity>(env.COMPOSITE_IDENTITY), name: "mobile-pr-detox-ios", gh_run_attempt: attempt };
-      await triage({ env: { ...env, COMPOSITE_IDENTITY: JSON.stringify(id), MODE: "enforce", RERUN_ATTEMPTS: "1", TRIAGE_CONTEXT: "off", GITHUB_OUTPUT: outputPath }, fetchImpl, log: () => {} });
-      assert.match(readFileSync(outputPath, "utf8"), new RegExp(`^rerun=${expected}$`, "m"), `attempt ${attempt}`);
+      await triage({ env: { ...env, COMPOSITE_IDENTITY: JSON.stringify(id), MODE: "enforce", RERUN_ATTEMPTS: "1", TRIAGE_CONTEXT: "off", GITHUB_OUTPUT: outputPath, GITHUB_RUN_ATTEMPT: runAttempt }, fetchImpl, log: () => {} });
+      assert.match(readFileSync(outputPath, "utf8"), new RegExp(`^rerun=${expected}$`, "m"), `attempt ${attempt}, run attempt ${runAttempt}`);
       if (expected === "true") assert.match(readFileSync(outputPath, "utf8"), /^rerun_of=2$/m, "the marker carries the lane's limit to the listener");
       const description = statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => s.description)[0];
       assert.match(String(description), expected === "true" ? /^\(re-running the failed jobs\) / : /^\(re-run the failed jobs\) /, `attempt ${attempt}`);

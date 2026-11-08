@@ -441,7 +441,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // are re-run, and the new attempt is triaged again (see e2e-test-rerun); the last attempt asks a person. A lane a test
     // already blocks is not re-run: the re-run would not turn it green. Before asking, the dead jobs' failed steps are
     // read: one the change broke (build, test server) holds the re-run (see decideRerun).
-    const attempt = Number(id.gh_run_attempt) || 1;
+    // The later of the run's own attempt and the identity's: a re-run of failed jobs keeps the first attempt's TSIO
+    // identity (gh_run_attempt 1), so the identity alone would promise a re-run the listener will not make.
+    const attempt = Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1);
     const onlyNoResults = (result.unnamed || result.missing) && !result.findings.some((f) => f.blocking);
     // Every report arrived and no test failed, but a job outside the tests died (a worker whose specs the others ran):
     // the lane is red only for that job, and its failed step decides the re-run as for a shard that sent nothing.

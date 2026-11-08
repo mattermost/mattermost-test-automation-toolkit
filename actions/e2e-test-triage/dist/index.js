@@ -4039,7 +4039,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       if (lane) decides = true;
       log(`e2e-test-triage: lane ${lane ? "verdict" : "read (tests decide)"}: ${judged.verdict.label} (${judged.verdict.fault}): ${judged.verdict.what}`);
     }
-    const attempt = Number(id.gh_run_attempt) || 1;
+    const attempt = Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1);
     const onlyNoResults = (result.unnamed || result.missing) && !result.findings.some((f) => f.blocking);
     const onlyDeadJobs = redWhy === "upstream" && !run.failing.length && !result.findings.some((f) => f.blocking);
     let rerunCheck = null;
