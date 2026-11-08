@@ -113,3 +113,12 @@ test("a red check triage does not cover keeps the aggregate from saying all lane
   const red = laneSummary(reds, [upgrade]).description;
   assert.ok(red.length <= 140 && red.endsWith(" · not triaged: 1 red"), `the warning survives the cut on a red check too: ${red}`);
 });
+
+test("an upgrade check its own triage judged is named with its verdict, not as untriaged", () => {
+  const green = { context: "e2e-test/playwright-full/enterprise", status: st("success", "100% passed (1315)") };
+  const judged = { context: "e2e-test/playwright-full/enterprise/upgrade-from-release-11.11", status: st("failure", "(1 broken on main) 99.9% passed (1385 passed, 1 failed)") };
+  assert.deepEqual(laneSummary([green], [judged]), { state: "success", description: "triaged lanes green · playwright-full/enterprise/upgrade-from-release-11.11: 1 not caused by PR" });
+  const machine = { context: "e2e-test/fips/upgrade-11.10", status: st("failure", "(machine failure, re-running the lane) worker 3: Failed to get ID Token.") };
+  assert.equal(laneSummary([green], [machine, { context: "e2e-test/upgrade-x", status: st("failure", "x") }]).description,
+    "triaged lanes green · fips/upgrade-11.10: machine failure, re-running the lane · not triaged: upgrade-x red");
+});

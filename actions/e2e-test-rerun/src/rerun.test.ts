@@ -16,7 +16,7 @@ const github = (artifacts: { name: string; expired?: boolean }[], pages = 1) => 
   const fetchImpl = (async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     calls.push({ method, url });
-    if (method === "POST" && url.endsWith("/actions/runs/40301634711/rerun-failed-jobs")) return new Response(null, { status: 201 });
+    if (method === "POST" && (url.endsWith("/actions/runs/40301634711/rerun-failed-jobs") || url.endsWith("/actions/runs/40301634711/rerun") || /\/actions\/jobs\/\d+\/rerun$/.test(url))) return new Response(null, { status: 201 });
     const page = Number(new URL(url).searchParams.get("page") ?? 1);
     if (method === "GET" && url.includes("/actions/runs/40301634711/artifacts")) {
       const rows = page <= pages ? artifacts.filter((_, i) => i % pages === page - 1) : [];
@@ -93,4 +93,33 @@ test("the marker e2e-test-triage's action uploads is one this action acts on: na
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a lane whose TSIO run began is re-run whole from its first job, so its workers find a new run instead of a closed one", async () => {
+  // mattermost run 41940673353: a worker timed out holding a spec; re-running only the failed jobs found the run closed.
+  const gh = github([{ name: "e2e-triage-rerun-attempt-1-of-2-job-126961998001-e2e-test-playwright-full-enterprise" }]);
+  const result = await requestRerun({ env: env("1"), fetchImpl: gh.fetchImpl, log: () => {} });
+  assert.deepEqual(result, { rerun: true, reason: "re-running the whole lane e2e-test-playwright-full-enterprise from its first job (attempt 2 of 2)" });
+  assert.deepEqual(gh.calls.filter((c) => c.method === "POST").map((c) => new URL(c.url).pathname), ["/repos/mattermost/mattermost-mobile/actions/jobs/126961998001/rerun"]);
+});
+
+test("two lanes that need a fresh start, or a lane whose first job was not found, re-run every job of the run", async () => {
+  for (const artifacts of [
+    [{ name: "e2e-triage-rerun-attempt-1-of-2-job-11-e2e-test-cypress-full-enterprise" }, { name: "e2e-triage-rerun-attempt-1-of-2-job-12-e2e-test-playwright-full-enterprise" }],
+    [{ name: "e2e-triage-rerun-attempt-1-of-2-job-11-e2e-test-cypress-full-enterprise" }, { name: "e2e-triage-rerun-attempt-1-of-2-e2e-test-playwright-full-enterprise" }],
+    [{ name: "e2e-triage-rerun-attempt-1-of-2-job-0-e2e-test-cypress-full-enterprise" }],
+  ]) {
+    const gh = github(artifacts);
+    const result = await requestRerun({ env: env("1"), fetchImpl: gh.fetchImpl, log: () => {} });
+    assert.equal(result.rerun, true);
+    assert.match(result.reason, /^re-running every job of the run for /);
+    assert.deepEqual(gh.calls.filter((c) => c.method === "POST").map((c) => new URL(c.url).pathname), ["/repos/mattermost/mattermost-mobile/actions/runs/40301634711/rerun"], JSON.stringify(artifacts));
+  }
+});
+
+test("a fresh-start request on the last allowed attempt asks a person, like any other", async () => {
+  const gh = github([{ name: "e2e-triage-rerun-attempt-2-of-2-job-11-e2e-test-cypress-full-enterprise" }]);
+  const result = await requestRerun({ env: env("2"), fetchImpl: gh.fetchImpl, log: () => {} });
+  assert.deepEqual(result, { rerun: false, reason: "attempt 2 is the last of 2; a person re-runs it" });
+  assert.equal(posts(gh.calls), 0);
 });

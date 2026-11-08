@@ -12,7 +12,7 @@ var networkError = (e) => e instanceof TypeError && (e.message === "fetch failed
 function gh(fetchImpl, token, wait = sleep) {
   return async (method, path, body) => {
     const isStatusPost = method === "POST" && STATUS_POST.test(path);
-    const delays = isStatusPost ? RETRY_DELAYS_MS : [];
+    const delays = isStatusPost || method === "GET" ? RETRY_DELAYS_MS : [];
     const payload = body ? JSON.stringify(body) : void 0;
     for (let attempt = 0; ; attempt++) {
       let res;
@@ -66,6 +66,9 @@ function releaseFromDescriptions(descriptions) {
 }
 function redReason(description = "", release = false) {
   const d = String(description);
+  const lane = /^\((machine failure, [^)]+|broken on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
+  if (lane) return lane;
+  if (/triage is checking why/.test(d)) return "triage is checking why";
   const { cleared, caused, appBug, fixed, outdated, check } = namedIn(d);
   const parts = [];
   if (cleared) parts.push(`${cleared} not caused by PR`);
@@ -96,12 +99,19 @@ function redReason(description = "", release = false) {
 }
 function laneSummary(lanes, untriaged = [], release) {
   const seen = lanes.filter((l) => Boolean(l.status));
-  const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
-  const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
+  const redOthers = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending");
+  const judgedOther = (l) => /^\([^)]+\) /.test(String(l.status?.description ?? ""));
+  const otherRed = redOthers.filter((l) => !judgedOther(l)).map((l) => laneName(l.context));
+  const otherJudged = redOthers.filter(judgedOther).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false)}`);
+  const otherText = [
+    ...otherJudged.slice(0, 2),
+    otherJudged.length > 2 ? `+${otherJudged.length - 2} triaged red` : "",
+    otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : ""
+  ].filter(Boolean).join(" \xB7 ");
   const withOther = (text) => {
     if (!otherText) return text;
     if (`${text} \xB7 ${otherText}`.length <= 140) return `${text} \xB7 ${otherText}`;
-    const count = `not triaged: ${otherRed.length} red`;
+    const count = otherJudged.length ? `${otherJudged.length + otherRed.length} other E2E check(s) red` : `not triaged: ${otherRed.length} red`;
     const room = 140 - count.length - 3;
     return `${text.length > room ? `${text.slice(0, room - 1)}\u2026` : text} \xB7 ${count}`;
   };
@@ -117,9 +127,9 @@ function laneSummary(lanes, untriaged = [], release) {
 }
 
 // ../shared/src/status.ts
-var UPSTREAM_FAILED = "E2E upstream execution failed; re-run the failed jobs";
+var UPSTREAM_FAILED = "E2E jobs failed outside the tests; triage is checking why";
 var FAILED_TESTS = "E2E reports contain failed tests";
-var REPORTS_INCOMPLETE = "E2E reports unavailable or incomplete; re-run the failed jobs";
+var REPORTS_INCOMPLETE = "E2E reports unavailable or incomplete; triage is checking why";
 var positive = (v) => /^[1-9]\d*$/.test(String(v ?? ""));
 function statusOwner(target, repository) {
   try {

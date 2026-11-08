@@ -5,6 +5,7 @@ import { FAILED_STATUSES, isFailedTry } from "../../shared/src/tsio.ts";
 import { COMPARE_FILE_CAP } from "./config.ts";
 import { ledgerTotals, newLedger } from "./pricing.ts";
 import type { Counts, Finding, Ledger } from "./types.ts";
+import type { LaneVerdict } from "./lane-diagnosis.ts";
 
 const CODE_ESCAPES: Record<string, string> = { "|": "&#124;", "<": "&lt;", ">": "&gt;", "`": "&#96;" };
 
@@ -447,6 +448,37 @@ export function renderUnfinished({ reason, lane = null }: { reason: string; lane
 export function renderNotTriaged({ text, lane = null }: { text: string; lane?: string | null }): string {
   const where = lane ? ` · ${md(lane)}` : "";
   return [`## E2E triage${where}: ⚠️ not triaged`, "", `**${text}**`, ""].join("\n");
+}
+
+const FAULT_TEXT: Record<string, string> = {
+  nobody: "nobody's: every spec ran and passed",
+  "base branch": "the base branch's, not this change's",
+  PR: "this change's",
+  infrastructure: "the CI machines' or an outside service's, not this change's",
+  unknown: "not shown by the logs",
+};
+
+/**
+ * The job summary of a lane triage judged as a whole (see diagnoseLane): what happened, whose fault it is, what to do,
+ * and the lines it rests on.
+ */
+export function renderLane({ verdict, rerunning, lane = null, runURL, base = null }: { verdict: LaneVerdict; rerunning: boolean; lane?: string | null; runURL: string; base?: string | null }): string {
+  const where = lane ? ` · ${md(lane)}` : "";
+  const icon = verdict.state === "success" ? "✅" : verdict.label === "machine failure" ? "🔁" : "❌";
+  const action = verdict.label === "machine failure" && rerunning ? (verdict.rerun === "lane" ? "nothing: triage is re-running the whole lane" : "nothing: triage is re-running the failed jobs") : verdict.action;
+  const lines = [
+    `## E2E triage${where}: ${icon} ${md(verdict.label)}`,
+    "",
+    `**What happened:** ${md(verdict.what)}`,
+    "",
+    `**Whose fault:** ${md(FAULT_TEXT[verdict.fault] ?? verdict.fault)}`,
+    "",
+    `**What to do:** ${md(action)}${base && /merge (?:main|the base)/.test(action) ? ` (base branch: ${md(base)})` : ""}`,
+    "",
+  ];
+  if (verdict.evidence.length) lines.push("<details><summary>Evidence</summary>", "", ...verdict.evidence.map((e) => `- ${md(e)}`), "", "</details>", "");
+  lines.push(`[Run](${runURL})`, "");
+  return lines.join("\n");
 }
 
 /** The run a newer dispatch replaced: its number is the link to that run's own triage. */

@@ -4,7 +4,7 @@
 var import_node_fs = require("fs");
 
 // src/rerun.ts
-var MARKER = /^e2e-triage-rerun-attempt-(\d+)-of-(\d+)-(.+)$/;
+var MARKER = /^e2e-triage-rerun-attempt-(\d+)-of-(\d+)-(?:job-(\d+)-)?(.+)$/;
 var refuse = (message) => {
   throw new Error(`e2e-test-rerun: ${message}`);
 };
@@ -33,14 +33,21 @@ async function requestRerun({ env, fetchImpl = fetch, log = console.log }) {
     if (!rows.length || artifacts.length >= total) break;
   }
   const asks = artifacts.filter((a) => !a.expired).map((a) => MARKER.exec(a.name)).filter((m) => m != null && Number(m[1]) === attempt);
-  const lanes = asks.map((m) => m[3]).sort();
+  const lanes = asks.map((m) => m[4]).sort();
+  const fresh = asks.filter((m) => m[3] !== void 0).map((m) => Number(m[3]));
   const limit = Math.min(max, ...asks.map((m) => Number(m[2])));
   let result;
   if (!lanes.length) result = { rerun: false, reason: `no lane asked for a re-run on attempt ${attempt}` };
   else if (attempt >= limit) result = { rerun: false, reason: `attempt ${attempt} is the last of ${limit}; a person re-runs it` };
-  else {
+  else if (!fresh.length) {
     await call("POST", `/repos/${repo}/actions/runs/${runId}/rerun-failed-jobs`);
     result = { rerun: true, reason: `re-running the failed jobs for ${lanes.join(", ")} (attempt ${attempt + 1} of ${limit})` };
+  } else if (asks.length === 1 && fresh[0] > 0) {
+    await call("POST", `/repos/${repo}/actions/jobs/${fresh[0]}/rerun`);
+    result = { rerun: true, reason: `re-running the whole lane ${lanes[0]} from its first job (attempt ${attempt + 1} of ${limit})` };
+  } else {
+    await call("POST", `/repos/${repo}/actions/runs/${runId}/rerun`);
+    result = { rerun: true, reason: `re-running every job of the run for ${lanes.join(", ")} (attempt ${attempt + 1} of ${limit})` };
   }
   log(`e2e-test-rerun: ${result.reason}`);
   return result;

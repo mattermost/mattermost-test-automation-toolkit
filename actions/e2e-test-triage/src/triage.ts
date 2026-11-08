@@ -5,7 +5,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { gh } from "../../shared/src/github.ts";
 import type { Env, FetchImpl, GhApi, Sleep } from "../../shared/src/github.ts";
 import { laneName, laneSummary } from "../../shared/src/lane.ts";
-import { FAILED_TESTS, readStatuses, REPORTS_INCOMPLETE, statusPublisher, UPSTREAM_FAILED } from "../../shared/src/status.ts";
+import { FAILED_TESTS, isReportsIncomplete, isUpstreamFailed, readStatuses, statusPublisher } from "../../shared/src/status.ts";
 import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, SupersededRunError, tsioBase } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.ts";
 import { isShardPlaceholder, isSpecNotRun, isSpecStopped } from "./classify.ts";
@@ -18,9 +18,12 @@ import { evaluateRun } from "./evaluate.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
 import { findingLogLine, redact, secretsOf, writeFindings } from "./findings.ts";
 import { askCauseWith, decideRerun, readDeadJobs } from "./rerun-check.ts";
+import { laneDescription } from "./lane-diagnosis.ts";
+import { judgeLane, lanePathsOf } from "./lane-verdict.ts";
+import type { JudgedLane } from "./lane-verdict.ts";
 import type { RerunDecision } from "./rerun-check.ts";
 import { ledgerTotals } from "./pricing.ts";
-import { activeFlag, noResultsText, otherRunText, passLine, renderNotTriaged, renderSummary, renderUnfinished, RERUN, RERUNNING, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
+import { activeFlag, noResultsText, otherRunText, passLine, renderLane, renderNotTriaged, renderSummary, renderUnfinished, RERUN, RERUNNING, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
 import type { AskFn, Config, Diff, HistoryLike, SpecHistory } from "./types.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
@@ -162,9 +165,9 @@ async function laneRedWhy(api: GhApi, id: TriageIdentity, context: string, flaky
     // or any other (a job outside the tests, missing reports, an override), is not one triage can turn green.
     const text = String(own.description ?? "");
     // A job outside the tests failed (a dead worker), and e2e-test-status said so: a re-run may be asked for.
-    if (text.startsWith(UPSTREAM_FAILED)) return "upstream";
+    if (isUpstreamFailed(text)) return "upstream";
     const testsFailed = /\b[1-9]\d* failed\b/.test(text) || text.startsWith(FAILED_TESTS);
-    return flaky > 0 && own.state === "failure" && testsFailed && !text.startsWith(UPSTREAM_FAILED) && !text.startsWith(REPORTS_INCOMPLETE) ? "flaky" : "outside";
+    return flaky > 0 && own.state === "failure" && testsFailed && !isUpstreamFailed(text) && !isReportsIncomplete(text) ? "flaky" : "outside";
   } catch (e) {
     log(`lane status unavailable: ${String(e).slice(0, 160)}`);
     return null;
@@ -195,8 +198,19 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
   const reportName = env.REPORT_NAME || null;
   const historyReport = cfg.historyReport || reportName;
-  const run = await fetchRun(fetchImpl, base, id, reportName, wait);
-  seen.run = run;
+  // No results to judge test by test (no TSIO group, or a group with no test cases: every worker died before it
+  // reported): the lane is judged from its orchestration and its jobs alone (see judgeLane).
+  let laneOnly: string | null = null;
+  let run: RunResult;
+  try {
+    run = await fetchRun(fetchImpl, base, id, reportName, wait);
+  } catch (e) {
+    if (!(e instanceof NoResultsError) && !/reported no test cases/.test(String(e))) throw e;
+    laneOnly = String(e instanceof Error ? e.message : e).slice(0, 200);
+    log(`no test results to triage (${laneOnly}); judging the lane from its orchestration and jobs`);
+    run = { group_id: "", failing: [], missing: { expected: null, received: 0, status: "no results" }, outcomes: new Map(), elsewhere: new Map(), counts: { total: 0, passed: 0, failed: 0, flaky: 0, skipped: 0 } };
+  }
+  seen.run = laneOnly ? null : run;
   const context = env.STATUS_CONTEXT;
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
   // The lane's context is set in the environment (STATUS_CONTEXT); an unset one is passed through as undefined,
@@ -238,8 +252,13 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   // Nothing failed and every report arrived, yet the lane is red: for a test that passed on a retry, or a job outside the tests.
   const redWhy = !run.failing.length && !run.missing && context ? await laneRedWhy(api, id, context, run.counts.flaky, log) : null;
   const flakyOnly = redWhy === "flaky";
-  // What triage decides: failures, missing reports, or a lane red only for tests that passed on a retry.
-  const decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly;
+  // A lane red outside its test results: no results, missing reports, or a job outside the tests died. Triage gives
+  // it a verdict of its own (see judgeLane): every red lane gets one.
+  const outsideTests = Boolean(laneOnly) || Boolean(run.missing) || redWhy === "upstream" || redWhy === "outside";
+  // What triage decides from the tests: failures, missing reports, or a lane red only for tests that passed on a retry.
+  // A lane red outside its tests is decided too, but only once its verdict rests on what TSIO's orchestration says
+  // (see grounded below): a job that died is not, by itself, a reason to write anything.
+  let decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly;
   // Like the required status, only an enforcing run writes to the PR.
   const announce = enforce && decides;
   // TRIAGE_LANES lists every lane's required context: then the triage check is one
@@ -369,6 +388,28 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       specHistory,
     });
     seen.result = result;
+    // A lane red outside its tests, or one with so many failures that triage flagged the run instead of judging them:
+    // what the lane comes down to (see diagnoseLane). Its verdict stands where no test of the arrived reports blocks,
+    // and replaces a flag (a mass failure is the base branch's or the PR's, not "many failures").
+    const flagged = activeFlag(result.infra, result.findings);
+    let lane: JudgedLane | null = null;
+    if ((outsideTests || flagged) && context) {
+      if (!diff.ok && prNumber) diff = await fetchChangedFiles(api, id, prNumber, log);
+      const laneBase = isTrunkRun ? id.branch ?? null : prBase;
+      const judged = await judgeLane({
+        env, fetchImpl, api, tsio: base, id, context, base: laneBase, trunkRun: isTrunkRun,
+        prFiles: diff.ok ? diff.files.map((f) => f.filename) : null, lanePaths: lanePathsOf(testRoot, cfg.supportPaths),
+        judgedSpecs: run.failing.map((t) => t.file), noResults: Boolean(laneOnly), log,
+      });
+      const mass = ["broken on main", "fixed on main", "caused by PR", "out of date"].includes(judged.verdict.label);
+      const testsBlock = result.findings.some((f) => f.blocking);
+      // A lane without an orchestration (one that does not lease its specs) keeps the judgement it had: its jobs alone
+      // cannot show that every spec ran. A lane with no results at all is judged on whatever could be read.
+      const grounded = Boolean(judged.orchestration) || Boolean(laneOnly);
+      if (grounded && (outsideTests ? !testsBlock || (flagged && mass) : mass)) lane = judged;
+      if (lane) decides = true;
+      log(`e2e-test-triage: lane ${lane ? "verdict" : "read (tests decide)"}: ${judged.verdict.label} (${judged.verdict.fault}): ${judged.verdict.what}`);
+    }
     // A lane red only for placeholders and missing reports, no test's result. Within the repo's allowance the failed jobs
     // are re-run, and the new attempt is triaged again (see e2e-test-rerun); the last attempt asks a person. A lane a test
     // already blocks is not re-run: the re-run would not turn it green. Before asking, the dead jobs' failed steps are
@@ -379,7 +420,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // the lane is red only for that job, and its failed step decides the re-run as for a shard that sent nothing.
     const onlyDeadJobs = redWhy === "upstream" && !run.failing.length && !result.findings.some((f) => f.blocking);
     let rerunCheck: RerunDecision | null = null;
-    if ((onlyNoResults || onlyDeadJobs) && attempt <= cfg.rerunAttempts) {
+    if (!lane && (onlyNoResults || onlyDeadJobs) && attempt <= cfg.rerunAttempts) {
       try {
         const dead = await readDeadJobs({ fetchImpl, token: String(env.GITHUB_TOKEN), repository: id.repository, runId: String(id.gh_run_id), attempt: String(id.gh_run_attempt), log });
         rerunCheck = await decideRerun(dead, apiKey && !prSpendUnknown ? askCauseWith(fetchImpl, apiKey, cfg.model, result.ai, cfg.prices) : null, log);
@@ -403,21 +444,31 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const laneRed = redWhy === "outside" || redWhy === "upstream";
     if (flakyOnly)
       notes.push(`No test failed: the ${run.counts.flaky === 1 ? "1 test that failed a try" : `${run.counts.flaky} tests that failed a try`} passed on a retry. The lane counted ${run.counts.flaky === 1 ? "it" : "them"} as failed.`);
-    const rerun = rerunCheck?.rerun ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
-    const held = rerunCheck?.held ?? null;
-    const summary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
+    // The lane's own re-run: only for a machine failure, and only within the repo's allowance. A lane whose orchestration
+    // began is re-run whole, from its first job: re-running its failed jobs alone finds that run closed.
+    const laneRerun = lane && lane.verdict.rerun !== "none" && attempt <= cfg.rerunAttempts && Number(env.GITHUB_RUN_ATTEMPT || attempt) <= cfg.rerunAttempts ? lane.verdict.rerun : null;
+    const rerun = (lane ? laneRerun : rerunCheck?.rerun) ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
+    const held = lane ? null : rerunCheck?.held ?? null;
+    if (lane?.verdict.state === "success" && !result.findings.some((f) => f.blocking)) result.verdict = "SUCCESS";
+    else if (lane) result.verdict = "FAILURE";
+    const laneSection = lane ? renderLane({ verdict: lane.verdict, rerunning: Boolean(rerun), lane: env.LANE || id.name, runURL, base: lane.baseline?.base ?? prBase ?? trunkBranch ?? null }) : "";
+    const testsSummary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
+    const summary = lane && !result.findings.length ? laneSection : [laneSection, testsSummary].filter(Boolean).join("\n");
     const pullBase = result.findings.find((f) => f.out_of_date?.base)?.out_of_date?.base ?? trunkBranch ?? prBase;
-    const description = flakyOnly
+    const description = lane
+      ? laneDescription(lane.verdict, Boolean(rerun), lane.baseline?.base ?? prBase ?? "main")
+      : flakyOnly
       ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}`
       : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held, pullBase);
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
       appendFileSync(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}\nverdict=${result.verdict}\nblocking=${flag ? run.counts.failed : result.findings.filter((f) => f.blocking).length + (result.unnamed ?? 0)}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\nrerun=${Boolean(rerun)}\nrerun_of=${rerun?.of ?? ""}\nrerun_held=${held ?? ""}\n` +
+        `rerun_job=${rerun && laneRerun === "lane" ? String(lane?.startJobId ?? 0) : ""}\nlane_label=${lane?.verdict.label ?? ""}\nlane_fault=${lane?.verdict.fault ?? ""}\nbasis=${lane ? (lane.verdict.state === "success" ? "orchestration" : "lane") : "tests"}\n` +
         `ai_calls=${spend.calls}\nai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}\nai_input_tokens=${spend.input_tokens}\nai_output_tokens=${spend.output_tokens}\n`);
     // A lane with nothing failed or missing has nothing to report, so it writes no job
     // summary: the run page then shows only the lanes someone needs to read.
-    if (env.GITHUB_STEP_SUMMARY && (decides || laneRed)) {
+    if (env.GITHUB_STEP_SUMMARY && (decides || laneRed || lane)) {
       appendFileSync(env.GITHUB_STEP_SUMMARY, summary + "\n");
       written.summary = true;
     }
@@ -454,7 +505,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     else if (announce) {
       // The same labels as the E2E check's text (see statusDescription), and its re-run wording.
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", flakyOnly ? `${run.counts.flaky} flaky, passed on retry · no test failed` : (flag && !result.findings.length
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", lane ? description : flakyOnly ? `${run.counts.flaky} flaky, passed on retry · no test failed` : (flag && !result.findings.length
         ? `${run.counts.failed} failed · not triaged, ${runFlag(flag)}`
         : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed, pullBase).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }

@@ -436,7 +436,7 @@ with a warning, and the rest of the evidence still loads.
 `rerun-attempts` (default `0`, off) lets a lane that is red only because jobs sent no
 results (a shard that reported nothing, reports that never arrived; no test blocks), or
 because a job outside the tests died while every report arrived and no test failed (a
-worker whose specs the others ran; the lane says "E2E upstream execution failed"), be
+worker whose specs the others ran; the lane says "E2E jobs failed outside the tests"), be
 re-run instead of asking a person to. A dead job's failed step decides as before: the
 network or the runner (including `Failed to get ID Token`, GitHub's OIDC token service)
 re-runs it, a build or test-server failure holds it. While the run's attempt is within the allowance,
@@ -457,6 +457,42 @@ asked of the model once per run; without an answer a person decides, as before.
 The log is the job's own output and is never taken as an instruction. The triage
 job needs `actions: read` to read the jobs; without it nothing is re-run
 automatically.
+
+## Lane verdicts
+
+A lane can be red with no test to judge: a worker died, a report never arrived, TSIO has
+no results at all, or so many specs failed that the run is flagged rather than judged.
+Triage then judges the lane as a whole, so every red lane ends with a verdict instead of
+"re-run the failed jobs". The verdict rests on the lane's TSIO orchestration
+(`/orchestration/status`: every spec unit and each lease's result, which a worker reports
+as soon as the spec finishes, whether or not its shard report later arrives), the run's
+jobs on this attempt with their failed step's log, and the base branch's own run of the
+lane (`<context>/<base>`) at the PR's merge base and now.
+
+| Label | When | State | Whose fault | What to do |
+|---|---|---|---|---|
+| `all specs ran` | Every dispatched spec ran and passed (a late report of a spec counts) | green | nobody | nothing |
+| `broken on main` | Most specs failed (20 or more, a quarter of those that ran), or the setup failed on every worker, and the base branch fails the same way at the merge base | red | base branch | merge the base branch once it is fixed |
+| `fixed on main` | As above, and the base branch is green now | red | base branch | merge the base branch |
+| `caused by PR` | As above with the base branch green; or a spec the PR changed outlasted its worker; or a spec the PR changed failed in a report that never arrived | red | PR | fix the change |
+| `out of date` | A setup failure with the base branch green, where the base branch has since changed the lane's test root or support paths | red | PR | merge the base branch |
+| `machine failure` | Jobs died on the runner, the network, GitHub or the cache (or on some workers only, while the same code ran on the others) | red | infrastructure | re-run (triage does, within `rerun-attempts`) |
+| `needs investigation` | None of the above can be shown | red | unknown | the failed step and its error are named |
+
+The check reads `(<label>, <what to do>) <what happened>`, e.g. `(broken on main, not
+your change) 300 of 320 specs failed: Error: expect(locator).toBeVisible() failed`, and
+the job summary adds whose fault it is and the evidence. Only `all specs ran` turns a
+lane green, and the `basis` output is then `orchestration`: a caller's gate may accept a
+green verdict on a lane whose jobs failed only on that basis. A lane without an
+orchestration (one that does not lease its specs) keeps the judgement it had before.
+
+A machine failure after the lane's TSIO run began is re-run from the lane's first job
+(`lane-start-job`, default `prepare-run`) with every job after it, so the new attempt
+starts a new TSIO run: re-running only the failed jobs finds the old run closed, and
+its workers take no specs. The marker carries that job's id and `e2e-test-rerun`
+re-runs it (every job of the run when several lanes ask, or the job was not found). A
+"re-run failed jobs" a person started on such a lane is read the same way, and the
+verdict says to re-run all jobs.
 
 ## Step log
 

@@ -64,6 +64,10 @@ export function releaseFromDescriptions(descriptions: readonly (string | null | 
 /** Why a lane triage left red is still red, read from the status triage wrote on it. */
 export function redReason(description: string | null | undefined = "", release = false): string {
   const d = String(description);
+  // A lane triage judged as a whole (see diagnoseLane in e2e-test-triage): its label and what to do.
+  const lane = /^\((machine failure, [^)]+|broken on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
+  if (lane) return lane;
+  if (/triage is checking why/.test(d)) return "triage is checking why";
   const { cleared, caused, appBug, fixed, outdated, check } = namedIn(d);
   const parts: string[] = [];
   if (cleared) parts.push(`${cleared} not caused by PR`);
@@ -106,15 +110,23 @@ export function redReason(description: string | null | undefined = "", release =
  */
 export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], release?: boolean): LaneSummary {
   const seen = lanes.filter((l): l is { context: string; status: CommitStatus } => Boolean(l.status));
-  // A red check triage does not cover keeps "all lanes green" from being said; its own state still gates the PR.
-  const otherRed = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending").map((l) => laneName(l.context));
-  const otherText = otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "";
+  // A red check outside the aggregate's lanes (an upgrade lane) keeps "all lanes green" from being said; its own state
+  // still gates the PR. One its own triage judged (its text starts with a label) is named with that verdict.
+  const redOthers = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending");
+  const judgedOther = (l: LaneStatus): boolean => /^\([^)]+\) /.test(String(l.status?.description ?? ""));
+  const otherRed = redOthers.filter((l) => !judgedOther(l)).map((l) => laneName(l.context));
+  const otherJudged = redOthers.filter(judgedOther).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false)}`);
+  const otherText = [
+    ...otherJudged.slice(0, 2),
+    otherJudged.length > 2 ? `+${otherJudged.length - 2} triaged red` : "",
+    otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : "",
+  ].filter(Boolean).join(" · ");
   // The status is cut at 140 characters, so the warning comes last but always fits: by name, else by count, and the
   // text before it gives way.
   const withOther = (text: string): string => {
     if (!otherText) return text;
     if (`${text} · ${otherText}`.length <= 140) return `${text} · ${otherText}`;
-    const count = `not triaged: ${otherRed.length} red`;
+    const count = otherJudged.length ? `${otherJudged.length + otherRed.length} other E2E check(s) red` : `not triaged: ${otherRed.length} red`;
     const room = 140 - count.length - 3;
     return `${text.length > room ? `${text.slice(0, room - 1)}…` : text} · ${count}`;
   };

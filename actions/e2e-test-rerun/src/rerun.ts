@@ -3,10 +3,12 @@
 import type { Env, FetchImpl } from "../../shared/src/github.ts";
 
 /**
- * The marker e2e-test-triage uploads when a lane is red only for jobs that sent no results: the attempt that asks, the
- * attempts its rerun-attempts allows in all, and the lane.
+ * The marker e2e-test-triage uploads when a lane is red only on a machine failure: the attempt that asks, the attempts
+ * its rerun-attempts allows in all, optionally the lane's first job ("job-<id>-", 0 when it was not found), and the
+ * lane. A marker with a job asks for the whole lane afresh: its TSIO run began, and re-running only its failed jobs
+ * finds that run closed (their workers take no specs).
  */
-const MARKER = /^e2e-triage-rerun-attempt-(\d+)-of-(\d+)-(.+)$/;
+const MARKER = /^e2e-triage-rerun-attempt-(\d+)-of-(\d+)-(?:job-(\d+)-)?(.+)$/;
 
 export interface RerunOptions {
   env: Env;
@@ -60,15 +62,27 @@ export async function requestRerun({ env, fetchImpl = fetch, log = console.log }
     .filter((a) => !a.expired)
     .map((a) => MARKER.exec(a.name))
     .filter((m): m is RegExpExecArray => m != null && Number(m[1]) === attempt);
-  const lanes = asks.map((m) => m[3]).sort();
+  const lanes = asks.map((m) => m[4]).sort();
+  // The lanes that need a fresh start, by their first job (0: not found, so the whole run is re-run).
+  const fresh = asks.filter((m) => m[3] !== undefined).map((m) => Number(m[3]));
   // The lanes' own limit, and max-attempts as the backstop.
   const limit = Math.min(max, ...asks.map((m) => Number(m[2])));
   let result: RerunResult;
   if (!lanes.length) result = { rerun: false, reason: `no lane asked for a re-run on attempt ${attempt}` };
   else if (attempt >= limit) result = { rerun: false, reason: `attempt ${attempt} is the last of ${limit}; a person re-runs it` };
-  else {
+  else if (!fresh.length) {
     await call("POST", `/repos/${repo}/actions/runs/${runId}/rerun-failed-jobs`);
     result = { rerun: true, reason: `re-running the failed jobs for ${lanes.join(", ")} (attempt ${attempt + 1} of ${limit})` };
+  } else if (asks.length === 1 && fresh[0] > 0) {
+    // One lane, started afresh: GitHub re-runs this job and every job that depends on it, as a new attempt, so the
+    // lane makes a new TSIO run under that attempt. The run's other lanes keep their results.
+    await call("POST", `/repos/${repo}/actions/jobs/${fresh[0]}/rerun`);
+    result = { rerun: true, reason: `re-running the whole lane ${lanes[0]} from its first job (attempt ${attempt + 1} of ${limit})` };
+  } else {
+    // Several lanes asked, or a lane's first job was not found: one request can start only one job's chain, and a run
+    // takes no second re-run while one is going. Every job of the run is re-run.
+    await call("POST", `/repos/${repo}/actions/runs/${runId}/rerun`);
+    result = { rerun: true, reason: `re-running every job of the run for ${lanes.join(", ")} (attempt ${attempt + 1} of ${limit})` };
   }
   log(`e2e-test-rerun: ${result.reason}`);
   return result;

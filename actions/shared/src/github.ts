@@ -25,7 +25,9 @@ const sleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // A commit status POST only sets that context's latest state: posting it again posts the same
 // row, so a GitHub 5xx, a 429 or a dropped connection is tried again. Left failed, the lane
-// stays at the pending its claim posted, and nothing after it writes the context.
+// stays at the pending its claim posted, and nothing after it writes the context. A GET changes
+// nothing, so it is retried the same way: a statuses read that answered 500 once stopped three
+// PR lanes before they began (prepare-run's claim).
 const STATUS_POST = /^\/repos\/[^/]+\/[^/]+\/statuses\/[^/?]+$/;
 export const RETRY_DELAYS_MS: readonly number[] = Object.freeze([1000, 3000]);
 
@@ -40,12 +42,12 @@ const networkError = (e: unknown): boolean =>
   (e instanceof TypeError && (e.message === "fetch failed" || e.message === "terminated")) ||
   (e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError"));
 
-/** Returns a GitHub REST client that retries commit-status POST requests on transient HTTP or network failures. */
+/** Returns a GitHub REST client that retries reads and commit-status POST requests on transient HTTP or network failures. */
 export function gh(fetchImpl: FetchImpl, token: string, wait: Sleep = sleep): GhApi {
   return async (method, path, body) => {
-    // Only a status write is safe to repeat; other writes (a re-run request) are not.
+    // Only a read or a status write is safe to repeat; other writes (a re-run request) are not.
     const isStatusPost = method === "POST" && STATUS_POST.test(path);
-    const delays = isStatusPost ? RETRY_DELAYS_MS : [];
+    const delays = isStatusPost || method === "GET" ? RETRY_DELAYS_MS : [];
     // Outside the retry: a body that cannot be serialized is the caller's error, not the network's.
     const payload = body ? JSON.stringify(body) : undefined;
     for (let attempt = 0; ; attempt++) {

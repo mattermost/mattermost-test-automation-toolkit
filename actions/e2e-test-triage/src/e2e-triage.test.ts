@@ -569,8 +569,8 @@ test("history is asked by run count, not by title or by window, and both queries
   assert.equal(history.has(identityKey({ ...failing, title: "some other test in the same file" })), false);
   assert.equal(history.get(identityKey({ ...failing, title: "t2" })), undefined, "a title with no rows stays unknown, so it stays blocking");
 });
-// One history read: a timeout, a dropped connection or a 5xx answer is retried once; a 4xx is the answer.
-test("a history read that fails in transit or answers 5xx is retried once, then its error is surfaced", async () => {
+// One history read: a timeout, a dropped connection or a 5xx answer is retried up to three times; a 4xx is the answer.
+test("a history read that fails in transit or answers 5xx is retried, then its error is surfaced", async () => {
   const historyBody = (): Response => Response.json({ observations: trunkPasses(8) });
   const serverError = (): Response => Response.json({}, { status: 503 });
   const readHistory = (fetchImpl: FetchImpl) => fetchHistory(fetchImpl, "http://tsio", "o/r", [failing], "2026-09-11T00:00:00Z", DEFAULTS, null);
@@ -584,7 +584,11 @@ test("a history read that fails in transit or answers 5xx is retried once, then 
   assert.equal(retried.calls.length, 2, "a dropped connection is retried the same way");
   const down = fakeFetch([["/reports/history", serverError]]);
   await assert.rejects(() => readHistory(down), /TSIO history 503/);
-  assert.equal(down.calls.length, 2, "a second 503 is the error, after one retry");
+  assert.equal(down.calls.length, 4, "a fourth 503 is the error, after three retries");
+  const twice504 = [() => Response.json({}, { status: 504 }), () => Response.json({}, { status: 504 }), historyBody];
+  const gateway = fakeFetch([["/reports/history", () => twice504.shift()!()]]);
+  assert.equal((await readHistory(gateway)).get(identityKey(failing))?.length, 8, "two gateway timeouts in a row no longer end triage");
+  assert.equal(gateway.calls.length, 3);
   const refused = fakeFetch([["/reports/history", () => Response.json({}, { status: 400 })]]);
   await assert.rejects(() => readHistory(refused), /TSIO history 400/);
   assert.equal(refused.calls.length, 1, "a client error is not retried");
@@ -2759,12 +2763,12 @@ test("a run that triage cannot finish writes its reason to the job summary, in b
   }
 });
 
-test("a history read that still fails after its retry ends triage with the error in the summary, report-only", async () => {
+test("a history read that still fails after its retries ends triage with the error in the summary, report-only", async () => {
   await inTmp(async (dir) => {
     const summaryPath = join(dir, "s.md");
     const fetchImpl = fakeFetch([...runRoutes([spec("t1", "failed")]), ["/reports/history", () => Response.json({}, { status: 503 })]]);
     await assert.rejects(() => triage({ env: { ...env, MODE: "report-only", GITHUB_STEP_SUMMARY: summaryPath }, fetchImpl, log: () => {} }), /TSIO history 503/);
-    assert.equal(fetchImpl.calls.filter((c) => c.url.includes("/reports/history")).length, 2, "one retry");
+    assert.equal(fetchImpl.calls.filter((c) => c.url.includes("/reports/history")).length, 4, "three retries");
     assert.match(readFileSync(summaryPath, "utf8"), /\*\*triage could not finish: TSIO history 503\*\*/);
   });
 });
@@ -3218,20 +3222,21 @@ test("a run a newer dispatch replaced is not triaged: the summary names that run
   }
 });
 
-test("a run TSIO has no results for is not triaged: the summary says the tests may not have run, and the red status keeps its state with a note", async () => {
+test("a run TSIO has no results for is judged as a lane: with nothing readable it names why, and the lane stays red", async () => {
   for (const mode of ["enforce", "report-only"]) {
     await inTmp(async (dir) => {
       const statuses: StatusBody[] = [];
       const summaryPath = join(dir, "s.md");
       const findingsPath = join(dir, "findings.json");
-      const fetchImpl = fakeFetch([["/reports?", () => Response.json({ reports: [] })], statusSink(statuses)]);
-      // The default status is failure from run 12, this run: the note goes on it and the state stays.
-      await assert.rejects(() => triage({ env: { ...env, MODE: mode, GITHUB_STEP_SUMMARY: summaryPath, FINDINGS_FILE: findingsPath }, fetchImpl, log: () => {} }), /no group for/, mode);
-      assert.match(readFileSync(summaryPath, "utf8"), /^\*\*Not triaged: TSIO has no results for playwright-full at abc \(the tests may not have run\)\.\*\*$/m, mode);
-      assert.deepEqual(statuses.map((s) => [s.context, s.state, s.description]), [["e2e-test/playwright", "failure", "(not triaged: no results)"]], mode);
+      // No TSIO group, no orchestration (404), and the run's jobs unreadable: the verdict says what could not be read.
+      const fetchImpl = fakeFetch([["/reports?", () => Response.json({ reports: [] })], ["/orchestration/status", () => new Response("", { status: 404 })], statusSink(statuses)]);
+      const result = await triage({ env: { ...env, MODE: mode, GITHUB_STEP_SUMMARY: summaryPath, FINDINGS_FILE: findingsPath }, fetchImpl, log: () => {} });
+      assert.equal(result.verdict, "FAILURE", mode);
+      assert.match(readFileSync(summaryPath, "utf8"), /E2E triage · playwright-full: ❌ needs investigation/, mode);
+      assert.deepEqual(statuses.filter((s) => s.context === "e2e-test/playwright").map((s) => s.state), ["failure"], mode);
+      assert.match(String(statuses.find((s) => s.context === "e2e-test/playwright")?.description), /^\(needs investigation\) the run's jobs could not be read/, mode);
       const record = parsed<Record<string, unknown>>(readFileSync(findingsPath, "utf8"));
-      assert.equal(record.triaged, false, mode);
-      assert.match(String(record.not_triaged_reason), /^no_results: /, mode);
+      assert.equal(record.verdict, "FAILURE", mode);
     });
   }
 });

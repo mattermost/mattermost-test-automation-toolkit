@@ -135,6 +135,18 @@ inputs:
       and logs are read: a build or test-server failure holds the re-run (needs actions: read). 0 (the default) turns it off
     required: false
     default: "0"
+  lane-job-prefix:
+    description: >-
+      The lane's prefix in the run's job names (e.g. "e2e-cypress / cypress-full / "), for a run that holds several lanes.
+      Empty finds it from this job's own name (the jobs before its lane-result job)
+    required: false
+    default: ""
+  lane-start-job:
+    description: >-
+      The lane's first job, without the prefix. A lane red on a machine failure after its TSIO run began is re-run from
+      this job, with every job after it, so it starts a new TSIO run (see e2e-test-rerun)
+    required: false
+    default: prepare-run
 outputs:
   published:
     description: Whether triage wrote its verdict to the required status
@@ -163,6 +175,14 @@ outputs:
   rerun:
     description: Whether triage asked for the failed jobs to be re-run (see rerun-attempts)
     value: ${{ steps.triage.outputs.rerun }}
+  basis:
+    description: >-
+      What the verdict rests on: "tests" (the reports' tests), "orchestration" (every spec the lane dispatched ran and
+      passed, by TSIO's orchestration, though a job or a report was lost) or "lane" (a lane-wide verdict, red)
+    value: ${{ steps.triage.outputs.basis }}
+  lane-label:
+    description: The lane verdict's label when triage judged the lane as a whole (see the README); empty otherwise
+    value: ${{ steps.triage.outputs.lane_label }}
 runs:
   using: composite
   steps:
@@ -198,6 +218,8 @@ runs:
         ANSWERS_CACHE: ${{ inputs.answers-cache }}
         FINDINGS_FILE: ${{ inputs.findings-file }}
         RERUN_ATTEMPTS: ${{ inputs.rerun-attempts }}
+        LANE_JOB_PREFIX: ${{ inputs.lane-job-prefix }}
+        LANE_START_JOB: ${{ inputs.lane-start-job }}
       run: node "${{ github.action_path }}/dist/index.js"
     # The request for a re-run, for e2e-test-rerun: one marker per lane and attempt, named with the attempt and the
     # attempts the lane allows in all, so the listener acts on this attempt's requests within the lane's limit.
@@ -208,13 +230,17 @@ runs:
         STATUS_CONTEXT: ${{ inputs.status-context }}
         DESCRIPTION: ${{ steps.triage.outputs.description }}
         RERUN_OF: ${{ steps.triage.outputs.rerun_of }}
+        RERUN_JOB: ${{ steps.triage.outputs.rerun_job }}
       run: |
         lane=$(printf '%s' "$STATUS_CONTEXT" | tr -c 'A-Za-z0-9._-' '-')
         dir="$RUNNER_TEMP/e2e-triage-rerun"
         mkdir -p "$dir"
-        jq -n --arg context "$STATUS_CONTEXT" --arg description "$DESCRIPTION" --arg attempt "$GITHUB_RUN_ATTEMPT" \
-          '{status_context: $context, description: $description, attempt: ($attempt | tonumber)}' > "$dir/request.json"
-        echo "name=e2e-triage-rerun-attempt-${GITHUB_RUN_ATTEMPT}-of-${RERUN_OF}-${lane}" >> "$GITHUB_OUTPUT"
+        jq -n --arg context "$STATUS_CONTEXT" --arg description "$DESCRIPTION" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg job "$RERUN_JOB" \
+          '{status_context: $context, description: $description, attempt: ($attempt | tonumber), lane_job: $job}' > "$dir/request.json"
+        # A lane whose TSIO run began is re-run whole, from its first job (e2e-test-rerun); "job-0" when it was not found.
+        job=""
+        if [ -n "$RERUN_JOB" ]; then job="job-${RERUN_JOB}-"; fi
+        echo "name=e2e-triage-rerun-attempt-${GITHUB_RUN_ATTEMPT}-of-${RERUN_OF}-${job}${lane}" >> "$GITHUB_OUTPUT"
         echo "path=$dir/request.json" >> "$GITHUB_OUTPUT"
     - if: ${{ !cancelled() && steps.marker.outputs.name != '' }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

@@ -8,13 +8,22 @@ import type { CompositeIdentity } from "./tsio.ts";
 
 /**
  * A lane's status text when its jobs failed outside the tests (setup, a worker, the upload) and every report arrived.
- * e2e-test-status writes it; triage reads it to tell a lane red outside the tests from one red for its tests.
+ * e2e-test-status writes it; triage reads it to tell a lane red outside the tests from one red for its tests, and
+ * replaces it with its verdict. It does not say "re-run": a re-run of the failed jobs often cannot help (triage says
+ * when it can).
  */
-export const UPSTREAM_FAILED = "E2E upstream execution failed; re-run the failed jobs";
+export const UPSTREAM_FAILED = "E2E jobs failed outside the tests; triage is checking why";
 /** A lane's status text when the summary said it passed but its reports contain failed tests (see UPSTREAM_FAILED). */
 export const FAILED_TESTS = "E2E reports contain failed tests";
 /** A lane's status text when its reports did not all arrive (see UPSTREAM_FAILED). */
-export const REPORTS_INCOMPLETE = "E2E reports unavailable or incomplete; re-run the failed jobs";
+export const REPORTS_INCOMPLETE = "E2E reports unavailable or incomplete; triage is checking why";
+/** What statuses written before the texts above said: still read as the same reasons. */
+export const LEGACY_UPSTREAM_FAILED = "E2E upstream execution failed; re-run the failed jobs";
+export const LEGACY_REPORTS_INCOMPLETE = "E2E reports unavailable or incomplete; re-run the failed jobs";
+/** Whether a status text is e2e-test-status's "failed outside the tests", in either wording. */
+export const isUpstreamFailed = (text: string): boolean => text.startsWith(UPSTREAM_FAILED) || text.startsWith(LEGACY_UPSTREAM_FAILED);
+/** Whether a status text is e2e-test-status's "reports incomplete", in either wording. */
+export const isReportsIncomplete = (text: string): boolean => text.startsWith(REPORTS_INCOMPLETE) || text.startsWith(LEGACY_REPORTS_INCOMPLETE);
 
 // GitHub commit statuses have no compare-and-swap API. Every caller MUST hold
 // the same non-cancelling, SHA-scoped job concurrency lock across these reads

@@ -102,16 +102,23 @@ test("a 4xx fails at once: the request is wrong, not GitHub", async () => {
   assert.equal(calls.length, 1);
 });
 
-test("other calls are not retried: a re-run request is not safe to repeat, and reads keep their own handling", async () => {
-  for (const [method, path] of [
-    ["POST", "/repos/mattermost/mattermost/actions/runs/1/rerun-failed-jobs"],
-    ["GET", "/repos/mattermost/mattermost/commits/abc123/statuses?per_page=100&page=1"],
-    ["GET", "/repos/mattermost/mattermost/pulls/5/files?per_page=100&page=1"],
-  ]) {
-    const { calls, fetchImpl } = scripted(503, 200);
-    await assert.rejects(gh(fetchImpl, "t", async () => {})(method, path), /: 503/, path);
-    assert.equal(calls.length, 1, path);
+test("a write other than a status is not retried: a re-run request is not safe to repeat", async () => {
+  const { calls, fetchImpl } = scripted(503, 200);
+  await assert.rejects(gh(fetchImpl, "t", async () => {})("POST", "/repos/mattermost/mattermost/actions/runs/1/rerun-failed-jobs"), /: 503/);
+  assert.equal(calls.length, 1);
+});
+
+test("a read is retried on a 5xx like a status write: a statuses GET that answered 500 once must not stop a lane", async () => {
+  for (const path of ["/repos/mattermost/mattermost/commits/abc123/statuses?per_page=100&page=1", "/repos/mattermost/mattermost/pulls/5/files?per_page=100&page=1"]) {
+    const { calls, fetchImpl } = scripted(500, 200);
+    const waits: number[] = [];
+    assert.deepEqual(await gh(fetchImpl, "t", async (ms) => void waits.push(ms))("GET", path), { step: 200 }, path);
+    assert.equal(calls.length, 2, path);
+    assert.deepEqual(waits, [RETRY_DELAYS_MS[0]], path);
   }
+  const { calls, fetchImpl } = scripted(404, 200);
+  await assert.rejects(gh(fetchImpl, "t", async () => {})("GET", "/repos/o/r/pulls/5"), /: 404/);
+  assert.equal(calls.length, 1, "a 4xx read is the answer");
 });
 
 test("a success returns the body, and 204 returns null", async () => {
