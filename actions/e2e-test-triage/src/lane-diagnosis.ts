@@ -199,9 +199,14 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
   // 1b. Tests that failed outside dispatch (an upgrade harness) on some workers, while the others ran them clean: the
   // same code passed there, so it is re-run, and the summary names the test step that failed. On every worker it is a
   // lane-wide failure, judged below.
-  if (hidden.length && hidden.length < workers.length) {
+  // Workers are counted by the step they died on, not by whose log was read (at most ten are): one whose log was not read
+  // but died at the same step is not counted as a pass.
+  const sameStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step) : [];
+  const hiddenAll = hidden.length > 0 && sameStep.length === workers.length;
+  if (hidden.length && !hiddenAll) {
     const h = hidden[0];
-    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(hidden.length, "worker")} and passed on the others: ${quote(hiddenLine(h))}`, rerun: rerunKind, evidence: [`${hidden.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; the other ${plural(workers.length - hidden.length, "worker")} passed it`, ...evidence] };
+    const passed = workers.length - sameStep.length;
+    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(sameStep.length, "worker")} and passed on the other ${passed}: ${quote(hiddenLine(h))}`, rerun: rerunKind, evidence: [`${sameStep.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; ${plural(passed, "worker")} passed it`, ...evidence] };
   }
 
   // 2. A lane-wide failure: most specs failed, or the setup broke on every worker that started.
@@ -213,8 +218,7 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
   const allWorkersSetup = workers.length > 0 && deadWorkers.length === workers.length && finished === 0 && readDead.length > 0 &&
     readDead.every((c) => c.cause.kind === "code") && new Set(deadWorkers.map((c) => c.job.step)).size === 1;
   const setupJob = codeDead.find((c) => !c.job.worker);
-  // Harness tests that failed on every worker: the same code failed them everywhere, a lane-wide test failure.
-  const hiddenAll = hidden.length > 0 && hidden.length === workers.length;
+  // Harness tests that failed on every worker (hiddenAll): the same code failed them everywhere, a lane-wide test failure.
   if (massTests || allWorkersSetup || hiddenAll || (setupJob && finished === 0)) {
     const call = baselineCall(facts, !massTests, (setupJob ?? codeDead[0])?.cause.short ?? null);
     // The error the failed specs share, as the dead workers' logs give it: an assertion or error line, the most repeated first.

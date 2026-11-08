@@ -3527,9 +3527,12 @@ function diagnoseLane(facts) {
     for (const u of slow.slice(0, 2)) ev.push(`${u.spec} ran ${Math.round(longestRun(u) / 6e4)} min, past its lease: split it or it can outlast a worker`);
     return { label: "all specs ran", state: "success", fault: "nobody", action: "nothing", what: lost ? `${plural(lost, "worker")} lost after the other workers ran every spec` : "a job outside the tests failed after every spec ran", rerun: "none", evidence: ev };
   }
-  if (hidden.length && hidden.length < workers.length) {
+  const sameStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step) : [];
+  const hiddenAll = hidden.length > 0 && sameStep.length === workers.length;
+  if (hidden.length && !hiddenAll) {
     const h = hidden[0];
-    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(hidden.length, "worker")} and passed on the others: ${quote(hiddenLine(h))}`, rerun: rerunKind, evidence: [`${hidden.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; the other ${plural(workers.length - hidden.length, "worker")} passed it`, ...evidence] };
+    const passed = workers.length - sameStep.length;
+    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(sameStep.length, "worker")} and passed on the other ${passed}: ${quote(hiddenLine(h))}`, rerun: rerunKind, evidence: [`${sameStep.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; ${plural(passed, "worker")} passed it`, ...evidence] };
   }
   const finished2 = o ? o.units.length - o.unfinished.length : 0;
   const massTests = Boolean(o && o.failed.length >= 20 && o.failed.length * 4 >= finished2);
@@ -3537,7 +3540,6 @@ function diagnoseLane(facts) {
   const readDead = deadWorkers.filter((c) => c.job.tail || c.job.errors.length);
   const allWorkersSetup = workers.length > 0 && deadWorkers.length === workers.length && finished2 === 0 && readDead.length > 0 && readDead.every((c) => c.cause.kind === "code") && new Set(deadWorkers.map((c) => c.job.step)).size === 1;
   const setupJob = codeDead.find((c) => !c.job.worker);
-  const hiddenAll = hidden.length > 0 && hidden.length === workers.length;
   if (massTests || allWorkersSetup || hiddenAll || setupJob && finished2 === 0) {
     const call = baselineCall(facts, !massTests, (setupJob ?? codeDead[0])?.cause.short ?? null);
     const errs = deadWorkers.flatMap((c) => c.job.errors).filter((l) => !INFRA_RE3.test(l));

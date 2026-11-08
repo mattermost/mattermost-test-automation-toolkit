@@ -67,9 +67,23 @@ export async function requestRerun({ env, fetchImpl = fetch, log = console.log }
   const fresh = asks.filter((m) => m[3] !== undefined).map((m) => Number(m[3]));
   // The lanes' own limit, and max-attempts as the backstop.
   const limit = Math.min(max, ...asks.map((m) => Number(m[2])));
+  // A newer run of the workflow on the same branch supersedes this one: re-running this one would cancel it through the
+  // branch's concurrency group. A lookup that fails does not stop the re-run.
+  const newerRun = async (): Promise<number | null> => {
+    try {
+      const run = (await (await call("GET", `/repos/${repo}/actions/runs/${runId}`)).json()) as { workflow_id: number; head_branch: string; run_number: number };
+      const { workflow_runs: rows = [] } = (await (await call("GET", `/repos/${repo}/actions/workflows/${run.workflow_id}/runs?branch=${encodeURIComponent(run.head_branch)}&per_page=5`)).json()) as { workflow_runs?: { id: number; run_number: number }[] };
+      return rows.find((r) => r.run_number > run.run_number)?.id ?? null;
+    } catch (e) {
+      log(`e2e-test-rerun: could not check for a newer run: ${String(e).slice(0, 160)}`);
+      return null;
+    }
+  };
   let result: RerunResult;
+  let newer: number | null = null;
   if (!lanes.length) result = { rerun: false, reason: `no lane asked for a re-run on attempt ${attempt}` };
   else if (attempt >= limit) result = { rerun: false, reason: `attempt ${attempt} is the last of ${limit}; a person re-runs it` };
+  else if ((newer = await newerRun())) result = { rerun: false, reason: `run ${newer} superseded this run on its branch; not re-run` };
   else if (!fresh.length) {
     await call("POST", `/repos/${repo}/actions/runs/${runId}/rerun-failed-jobs`);
     result = { rerun: true, reason: `re-running the failed jobs for ${lanes.join(", ")} (attempt ${attempt + 1} of ${limit})` };

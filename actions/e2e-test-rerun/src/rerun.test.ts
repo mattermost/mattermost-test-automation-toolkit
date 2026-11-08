@@ -37,6 +37,18 @@ test("a lane's request for this attempt re-runs the run's failed jobs once, what
   assert.equal(posts(gh.calls), 1);
 });
 
+test("a run a newer push superseded is not re-run: that would cancel the newer run", async () => {
+  const gh = github([{ name: "e2e-triage-rerun-attempt-1-of-3-e2e-test-detox-ios" }]);
+  const inner = gh.fetchImpl;
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/actions/runs/40301634711")) return Response.json({ workflow_id: 7, head_branch: "pr-1", run_number: 10 });
+    if (url.includes("/actions/workflows/7/runs?branch=pr-1")) return Response.json({ workflow_runs: [{ id: 40301634999, run_number: 11 }, { id: 40301634711, run_number: 10 }] });
+    return inner(url, init);
+  }) as FetchImpl;
+  assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: () => {} }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
+  assert.equal(posts(gh.calls), 0);
+});
+
 test("an earlier attempt's request, an expired one, or none at all re-runs nothing", async () => {
   for (const artifacts of [[{ name: "e2e-triage-rerun-attempt-1-of-3-e2e-test-detox-ios" }], [{ name: "e2e-triage-rerun-attempt-2-of-3-e2e-test-detox-ios", expired: true }], [{ name: "jest-results-1" }]]) {
     const gh = github(artifacts);
