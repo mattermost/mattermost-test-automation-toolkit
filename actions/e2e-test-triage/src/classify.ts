@@ -79,6 +79,17 @@ export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_C
 // standing breakage, and greening it would hide it.
 export const EXONERATED_ON_TRUNK = new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 export const exoneratedSet = (isTrunkRun: boolean): Set<string> => (isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED);
+
+/**
+ * Whether a finding carries evidence that the change under test caused it: the change edits the test, fails it on its
+ * last commits and never on trunk (a PR streak), changes what the test looks for or a file its error names, or the
+ * judge blamed it from a hunk. Only these may keep a PR's failure red (see settlePR); a base-branch fix never is one.
+ */
+export function causedByPR(f: Finding): boolean {
+  if (f.out_of_date && f.class !== "OWNED_BY_PR") return false;
+  return f.class === "OWNED_BY_PR" || Boolean(f.pr_streak) || Boolean(f.changed_by_pr) || f.untouched === false || Boolean(f.mass) ||
+    f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto";
+}
 export const BORDERLINE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
 // An environment error still blocking is judged too: its repo's PRs can break their own environment, or it was held on a
 // run that failed mostly on its environment.
@@ -357,6 +368,11 @@ export function classify(
     while (rough < trunk.length && (FAILED_STATUSES.has(trunk[rough].status) || trunk[rough].status === "flaky")) rough++;
     if (rough >= 2 && trunk.slice(0, rough).some((o) => FAILED_STATUSES.has(o.status)))
       return out("BROKEN_ON_TRUNK", `Still failing: failed or passed only on retry in each of the previous ${rough} ${lane ?? "trunk"} runs. A pass on retry is not a fix.`, true);
+    // Other PRs failing it the same way while trunk passes: the test's or the environment's flake, not this commit's
+    // break. Two are enough here, where the PR rule wants crossPRMinPRs: trunk's own last run passed, so this commit is
+    // the one change in question, and two unrelated changes failing it the same way already rule that change out.
+    if (failedPRs.length >= Math.min(2, cfg.crossPRMinPRs) && trunkFails === 0 && trunkPasses > 0)
+      return out("FLAKY_CROSS_PR", `Failed${ownKey.kind === "distinctive" ? " with the same error" : ownKey.kind === "stuck" ? " stuck at the same step" : ""} on ${failedPRs.length} PRs in the last ${cfg.crossPRRuns} runs (${stats.cross_pr.examples.slice(0, 3).join(", ")}) while ${trunkBranch || "trunk"} passed ${trunkPasses} of ${trunk.length}.`, false);
     // Intermittent clears only as a PR's failure would: often enough (pMin; one flake in 48 runs says little about a
     // failure now) and the same failure (its error, or for one that failed every try, the same kind of failure).
     if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0) {

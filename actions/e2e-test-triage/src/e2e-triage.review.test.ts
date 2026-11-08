@@ -69,8 +69,11 @@ test("both failing sibling tests keep independent full-title history", async () 
   console.log("BOTH_FAIL", JSON.stringify({ verdict: r.verdict, findings: r.findings.map((x) => ({
     full_title: x.full_title, class: x.class, blocking: x.blocking, trunk: x.trunk,
   })) }));
-  assert.equal(r.findings.find((x) => x.full_title === "Suite A > same leaf")?.blocking, true,
-    "Suite A passed on trunk and must not borrow Suite B failures");
+  // Suite A passed on trunk: never cleared as broken on trunk by Suite B's failures. Nothing in the PR touches it, so its
+  // first failure is not blamed on the PR (see settlePR).
+  const a = r.findings.find((x) => x.full_title === "Suite A > same leaf");
+  assert.notEqual(a?.class, "BROKEN_ON_TRUNK", "Suite A passed on trunk and must not borrow Suite B failures");
+  assert.equal(a?.decision, "first_failure");
 });
 
 test("unresolved test identity cannot reach or be cleared by the judge", async () => {
@@ -80,7 +83,8 @@ test("unresolved test identity cannot reach or be cleared by the judge", async (
     class: x.class, identity_unresolved: x.identity_unresolved, blocking: x.blocking, decision: x.decision,
   })) }));
   assert.equal(f.asked(), 0, "Judge must not receive unresolved identity evidence");
-  assert.equal(r.verdict, "FAILURE");
+  // History never clears it; nothing in the PR touches it, so it is cleared as a first failure (see settlePR).
+  assert.ok(r.findings.every((x) => x.identity_unresolved && x.decision === "first_failure" && x.history_unused));
 });
 test("use-staging true with a conflicting tsio-base-url stops triage before any request", async () => {
   let requests = 0;

@@ -311,7 +311,8 @@ test("release workflows preserve out of date and fixed on main labels across ref
     fetchImpl: f.fetchImpl,
   });
   assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 1 fixed on main, 1 out of date");
-  // Explicit RELEASE: "false" overrides inference for non-release callers.
+  // Explicit RELEASE: "false" overrides inference for non-release callers: a PR's fixed on main is not blocking, and the
+  // legacy "out of date" keeps its old pull guidance.
   await publish({ env: { ...baseEnv, RELEASE: "false", OPERATION: "refresh" }, fetchImpl: f.fetchImpl });
-  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: pull main changes");
+  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 1 not caused by PR, pull main changes");
 });

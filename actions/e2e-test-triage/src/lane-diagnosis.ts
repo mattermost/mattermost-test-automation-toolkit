@@ -12,14 +12,17 @@ import type { LaneJob } from "./lane-jobs.ts";
  *
  * - "all specs ran": the orchestration says every spec ran and passed; only a job or a report was lost. Green.
  * - "broken on main": the base branch fails the same way at the PR's merge base (or, on a trunk run, this commit or an
- *   earlier one broke it). Not the author's fault; merge the base branch once it is fixed.
- * - "fixed on main": broken at the merge base, green on the base branch now. Merge the base branch.
+ *   earlier one broke it). Not the author's fault. A PR's lane whose specs ran and failed that way is green (the tests
+ *   say the same on their own); one whose setup broke ran nothing, so it stays red until the base branch is fixed.
+ * - "fixed on main": broken at the merge base, or the base branch changed the code the lane's setup needs since the PR
+ *   left it, and green on the base branch now. Not the author's fault: green where the specs ran, else merge the base.
  * - "caused by PR": the lane fails on every worker, or on a spec the PR changed, and the base branch does not.
- * - "out of date": as caused by PR, but the base branch changed the code the lane runs through since the PR left it.
- * - "machine failure": a runner, the network or a service failed on some jobs; the same code ran fine on the others.
- * - "needs investigation": none of the above can be shown; the failed step and its error are named.
+ * - "machine failure": a runner, the network or a service failed, or a report was lost; the same code ran fine on the
+ *   other jobs, or nothing shows the code failed. Re-run.
+ * There is no "needs a look": a lane red for no reason shown is re-run as a machine failure, unless the PR changes the
+ * lane's own code, which makes it the PR's.
  */
-export type LaneLabel = "all specs ran" | "broken on main" | "fixed on main" | "caused by PR" | "out of date" | "machine failure" | "needs investigation";
+export type LaneLabel = "all specs ran" | "broken on main" | "fixed on main" | "caused by PR" | "machine failure";
 export type Fault = "nobody" | "base branch" | "PR" | "infrastructure" | "unknown";
 /** How the lane is re-run: not at all, its failed jobs (the orchestration never began), or the whole lane afresh. */
 export type RerunKind = "none" | "failed-jobs" | "lane";
@@ -142,19 +145,21 @@ function baselineCall(facts: LaneFacts, setup: boolean, setupShort: string | nul
     // Green at the merge base. A setup failure where the base branch since changed the lane's own code is a branch out
     // of date with what the workflow (always the base branch's) now expects.
     if (setup && behind > 0 && touched.length)
-      return { label: "out of date", fault: "PR", action: `merge ${b?.base}: it changed ${clip(touched.slice(0, 2).join(", "), 60)} since this branch left it`, evidence: `at the merge base ${name(at)}; ${plural(behind, "commit")} behind` };
+      return { label: "fixed on main", fault: "base branch", action: `merge ${b?.base}: it changed ${clip(touched.slice(0, 2).join(", "), 60)} since this branch left it`, evidence: `at the merge base ${name(at)}; ${plural(behind, "commit")} behind` };
     // The lane's own test setup (not the product: its server, build or dependencies) failed everywhere, and this PR
     // changes none of the lane's code: the setup the workflow (always the base branch's) asks for is newer than this
     // branch's test code.
     const prTouchesLane = (facts.prFiles ?? []).some((f) => facts.lanePaths.some((p) => p && f.startsWith(p.endsWith("/") ? p : `${p}/`)));
     if (setup && setupShort === "the test setup failed" && behind > 0 && facts.prFiles && !prTouchesLane)
-      return { label: "out of date", fault: "PR", action: `merge ${b?.base}: the lane's setup comes from ${b?.base}'s workflow, newer than this branch's test code`, evidence: `at the merge base ${name(at)}; ${plural(behind, "commit")} behind; the PR changes none of ${facts.lanePaths.join(", ")}` };
+      return { label: "fixed on main", fault: "base branch", action: `merge ${b?.base}: the lane's setup comes from ${b?.base}'s workflow, newer than this branch's test code`, evidence: `at the merge base ${name(at)}; ${plural(behind, "commit")} behind; the PR changes none of ${facts.lanePaths.join(", ")}` };
     return { label: "caused by PR", fault: "PR", action: "fix the change: the base branch passes this lane", evidence: `at the merge base ${name(at)}` };
   }
   // The merge base has no finished run of this lane: judge by the base branch now.
   if (tip && trunkBroken(tip)) return { label: "broken on main", fault: "base branch", action: `not your change: merge ${b?.base} once it is fixed`, evidence: `the base branch now: ${name(tip)}` };
-  if (behind > 0) return { label: "out of date", fault: "PR", action: `merge ${b?.base} and push: if it still fails, the change broke it`, evidence: `no run of this lane at the merge base; ${plural(behind, "commit")} behind${tip ? `; now ${name(tip)}` : ""}` };
-  return { label: "caused by PR", fault: "PR", action: "fix the change: the base branch passes this lane", evidence: tip ? `the base branch now: ${name(tip)}` : "the PR is up to date with its base branch" };
+  // No run at the merge base, and the base branch passes the lane now (or has no run to say otherwise): the lane failed
+  // as a whole on this PR's code, which is the PR's whether or not the branch is behind.
+  const lag = behind > 0 ? `no run of this lane at the merge base; ${plural(behind, "commit")} behind` : "the PR is up to date with its base branch";
+  return { label: "caused by PR", fault: "PR", action: "fix the change: the base branch passes this lane", evidence: tip ? `${lag}; the base branch now: ${name(tip)}` : lag };
 }
 
 /**
@@ -202,7 +207,10 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
       : setupJob
         ? `${setupJob.job.short} ${setupJob.job.step ?? ""} failed: ${quote(setupJob.cause.line)}`
         : `${codeDead[0].job.step ?? "setup"} failed on ${deadWorkers.length} of ${workers.length} workers: ${quote(codeDead[0].cause.line)}`;
-    return { label: call.label, state: "failure", fault: call.fault, action: call.action, what, rerun: "none", evidence: [call.evidence, ...evidence] };
+    // A PR's specs that ran and failed as the base branch does are not the PR's: green, as each test would be (see
+    // settlePR). A setup that broke ran no spec, so nothing vouches for the PR: red until the base branch is fixed.
+    const notYours = !facts.trunkRun && massTests && (call.label === "broken on main" || call.label === "fixed on main");
+    return { label: call.label, state: notYours ? "success" : "failure", fault: call.fault, action: call.action, what, rerun: "none", evidence: [call.evidence, ...evidence] };
   }
 
   // 3. Specs that failed in a report that never arrived: real test failures triage could not judge test by test.
@@ -210,13 +218,15 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
   if (o && unjudged.length) {
     const specs = unjudged.map((u) => shortSpec(u.spec));
     const mine = unjudged.filter((u) => changedByPR(u.spec, facts.prFiles));
+    // A report that never arrived is lost in delivery: re-run so its specs arrive and are judged test by test. One the PR
+    // changed is the PR's to look at either way.
     return {
-      label: mine.length ? "caused by PR" : "needs investigation",
+      label: mine.length ? "caused by PR" : "machine failure",
       state: "failure",
-      fault: mine.length ? "PR" : "unknown",
-      action: mine.length ? "fix the specs this PR changed" : "open the run: these specs failed in a report that never arrived",
+      fault: mine.length ? "PR" : "infrastructure",
+      action: mine.length ? "fix the specs this PR changed" : rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs",
       what: `${plural(unjudged.length, "spec")} failed in a lost report: ${clip(specs.join(", "), 80)}`,
-      rerun: "none",
+      rerun: mine.length ? "none" : rerunKind,
       evidence: [`TSIO orchestration: ${o.failed.length} failed, ${o.unfinished.length} unfinished of ${o.totalUnits} specs`, ...evidence],
     };
   }
@@ -251,15 +261,17 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
     return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what, rerun: rerunKind, evidence: ev };
   }
 
-  // 7. Nothing above can be shown: name the step and its error.
+  // 7. Nothing above shows the code failed. A PR that changes the lane's own code (its specs or support paths) owns the
+  // red lane; otherwise it is re-run as a machine failure, naming the step and its error.
   const lead = causes[0];
+  const prTouchesLane = !facts.trunkRun && (facts.prFiles ?? []).some((f) => facts.lanePaths.some((p) => p && f.startsWith(p.endsWith("/") ? p : `${p}/`)));
   return {
-    label: "needs investigation",
+    label: prTouchesLane ? "caused by PR" : "machine failure",
     state: "failure",
-    fault: "unknown",
-    action: "open the failed job's log",
+    fault: prTouchesLane ? "PR" : "infrastructure",
+    action: prTouchesLane ? "fix the change: it changes this lane's code" : rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs",
     what: lead ? `${lead.job.short}: ${lead.job.step ?? "a step"} — ${quote(lead.cause.line)}` : facts.jobsError ? `the run's jobs could not be read (${clip(facts.jobsError, 60)})` : o && unfinished.length ? `${plural(unfinished.length, "spec")} never finished and no job says why` : o ? "every spec finished, no test failed in TSIO, and no job failed: the lane's status says why" : "no TSIO results and no failed job",
-    rerun: "none",
+    rerun: prTouchesLane ? "none" : rerunKind,
     evidence: [...(facts.orchestrationError ? [`TSIO orchestration unreadable: ${facts.orchestrationError}`] : []), ...evidence],
   };
 }
@@ -269,8 +281,7 @@ export function laneDescription(v: LaneVerdict, rerunning: boolean, base = "main
   const head =
     v.label === "machine failure" ? `machine failure, ${rerunning ? (v.rerun === "lane" ? "re-running the lane" : "re-running the failed jobs") : v.action}` :
     v.label === "broken on main" ? (v.action.startsWith("fix the base branch") ? "broken on main" : "broken on main, not your change") :
-    v.label === "fixed on main" ? `fixed on main, merge ${base}` :
-    v.label === "out of date" ? `out of date, merge ${base}` :
+    v.label === "fixed on main" ? (v.state === "success" ? "fixed on main, not your change" : `fixed on main, merge ${base}`) :
     v.label;
   return clip(`(${head}) ${v.what}`, 140);
 }

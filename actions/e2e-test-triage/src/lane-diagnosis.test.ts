@@ -123,18 +123,22 @@ test("most specs failing is the base branch's when it fails the same way at the 
   const atBase = trunk("failure", massBroken);
   const v = diagnoseLane(facts({ orchestration: massBroken, jobs: workers(30, Array(30).fill(dead)), baseline: baseline({ atBase, tip: atBase }) }));
   assert.deepEqual([v.label, v.fault, v.rerun], ["broken on main", "base branch", "none"]);
+  // The specs ran and failed as the base branch does: not the PR's, so the PR's lane is green (as each test would be).
+  assert.equal(v.state, "success");
   assert.match(v.what, /^300 of 320 specs failed: Error: expect\(locator\)\.toBeVisible\(\) failed/);
   assert.equal(laneDescription(v, false, "master"), "(broken on main, not your change) 300 of 320 specs failed: Error: expect(locator).toBeVisible() failed");
   // Fixed since: merge the base branch.
   const fixed = diagnoseLane(facts({ orchestration: massBroken, jobs: workers(30, Array(30).fill(dead)), baseline: baseline({ atBase, tip: trunk("success", null, "bbbbbbb2") }) }));
-  assert.deepEqual([fixed.label, fixed.action], ["fixed on main", "merge master and push"]);
+  assert.deepEqual([fixed.label, fixed.action, fixed.state], ["fixed on main", "merge master and push", "success"]);
+  assert.equal(laneDescription(fixed, false, "master").startsWith("(fixed on main, not your change) "), true);
   // Green at the merge base: the PR broke it.
   const mine = diagnoseLane(facts({ orchestration: massBroken, jobs: workers(30, Array(30).fill(dead)), baseline: baseline({ atBase: trunk("success") }) }));
-  assert.deepEqual([mine.label, mine.fault], ["caused by PR", "PR"]);
+  assert.deepEqual([mine.label, mine.fault, mine.state], ["caused by PR", "PR", "failure"]);
   // A trunk run: the base branch is broken; green before this commit says this commit did it.
   const onTrunk = diagnoseLane(facts({ trunkRun: true, orchestration: massBroken, jobs: workers(30, Array(30).fill(dead)), baseline: baseline({ atBase: trunk("success") }) }));
   assert.deepEqual([onTrunk.label, onTrunk.action], ["broken on main", "fix the base branch: this commit broke the lane"]);
   assert.match(laneDescription(onTrunk, false), /^\(broken on main\) /);
+  assert.equal(onTrunk.state, "failure", "the base branch's own run stays red");
 });
 
 test("the base branch's run at the merge base not finished yet: other PRs failing the same way at the same time make it the base branch's", async () => {
@@ -160,13 +164,14 @@ test("the merge base's own run still going but already failing most specs is the
   assert.match(v.evidence[0], /on 69d345c is still running and has already failed 150 specs/);
 });
 
-test("a test setup failing everywhere on a PR that changes none of the lane's code is out of date", () => {
+test("a test setup failing everywhere on a PR that changes none of the lane's code is fixed on main: not the PR's, merge main", () => {
   // PR 39106: master's workflow passes the nginx service; the branch, 341 commits behind, has the lib that rejects it.
   const nginx = { conclusion: "failure", step: "ci/prepare-playwright", tail: "Error: Unknown PW_TESTCONTAINERS_SERVICES entry: nginx" };
   const pending = orch(Array.from({ length: 382 }, (_, i) => unit(`specs/s${i}.spec.ts`, "pending", [])), "timed_out");
   const at = { ...trunk("success"), exact: true };
   const v = diagnoseLane(facts({ orchestration: pending, jobs: workers(30, Array(30).fill(nginx)), prFiles: ["server/channels/app/x.go"], baseline: baseline({ atBase: at, behindBy: 341, baseChanged: null }) }));
-  assert.deepEqual([v.label, v.fault], ["out of date", "PR"]);
+  // No spec ran, so nothing vouches for the PR: red, but the base branch's to explain, with the merge as the fix.
+  assert.deepEqual([v.label, v.fault, v.state], ["fixed on main", "base branch", "failure"]);
   // The same failure on a PR that edits the lane's test code is the PR's.
   assert.equal(diagnoseLane(facts({ orchestration: pending, jobs: workers(30, Array(30).fill(nginx)), prFiles: ["e2e-tests/playwright/lib/src/server.ts"], baseline: baseline({ atBase: at, behindBy: 341, baseChanged: null }) })).label, "caused by PR");
 });
@@ -176,10 +181,10 @@ test("every worker dead on the same setup step is judged by the logs read: ten o
   const unread = { conclusion: "failure", step: "ci/prepare-playwright" };
   const pending = orch(Array.from({ length: 382 }, (_, i) => unit(`specs/s${i}.spec.ts`, "pending", [])), "timed_out");
   const v = diagnoseLane(facts({ orchestration: pending, jobs: workers(30, [...Array(10).fill(nginx), ...Array(20).fill(unread)]), baseline: baseline({ atBase: { ...trunk("success"), exact: true }, behindBy: 341, baseChanged: ["e2e-tests/playwright/lib/src/server/testcontainers.ts"] }) }));
-  assert.deepEqual([v.label, v.fault], ["out of date", "PR"]);
+  assert.deepEqual([v.label, v.fault], ["fixed on main", "base branch"]);
 });
 
-test("a setup that fails on every worker is the PR's, or out of date when the base branch changed the lane's code", () => {
+test("a setup that fails on every worker is the PR's, or fixed on main when the base branch changed the lane's code", () => {
   // PR 39465 (Go FIPS bump): the FIPS server never booted on any of 40 workers; master's FIPS lane was green.
   const server = { conclusion: "failure", step: "ci/start-server", tail: "Mattermost container not healthy, retry attempts exhausted. Giving up." };
   const pending = orch(passing(0).concat(Array.from({ length: 421 }, (_, i) => unit(`specs/s${i}.spec.ts`, "pending", []))), "timed_out");
@@ -189,8 +194,8 @@ test("a setup that fails on every worker is the PR's, or out of date when the ba
   // PR 39106: the workflow (master's) passes the nginx service; the branch's lib, 40 commits old, rejects it.
   const nginx = { conclusion: "failure", step: "ci/prepare-playwright", tail: "Error: Unknown PW_TESTCONTAINERS_SERVICES entry: nginx" };
   const old = diagnoseLane(facts({ orchestration: pending, jobs: workers(30, Array(30).fill(nginx)), baseline: baseline({ atBase: trunk("success"), behindBy: 40, baseChanged: ["e2e-tests/playwright/lib/src/testcontainers/services.ts"] }) }));
-  assert.deepEqual([old.label, old.fault], ["out of date", "PR"]);
-  assert.equal(laneDescription(old, false, "master").startsWith("(out of date, merge master) ci/prepare-playwright failed on 30 of 30 workers"), true);
+  assert.deepEqual([old.label, old.fault], ["fixed on main", "base branch"]);
+  assert.equal(laneDescription(old, false, "master").startsWith("(fixed on main, merge master) ci/prepare-playwright failed on 30 of 30 workers"), true);
   // A lockfile out of sync breaks prep-deps itself: no worker ran.
   const lock = diagnoseLane(facts({ orchestration: null, jobs: [job({ short: "prep-deps", worker: false, conclusion: "failure", step: "ci/install-playwright-deps", tail: "npm error `npm ci` can only install packages when your package.json and package-lock.json are in sync." }), ...workers(30).slice(2).map((j) => ({ ...j, conclusion: "skipped" }))], baseline: baseline({ atBase: trunk("success") }) }));
   assert.deepEqual([lock.label, lock.fault], ["caused by PR", "PR"]);
@@ -232,8 +237,23 @@ test("a spec the PR changed that outlasts its worker is the PR's; specs failed i
   const named = diagnoseLane(facts({ orchestration: lost, jobs: workers(30, { 2: OIDC }), prFiles: ["e2e-tests/playwright/specs/functional/a.spec.ts"] }));
   assert.deepEqual([named.label, named.state], ["caused by PR", "failure"]);
   assert.match(named.what, /2 specs failed in a lost report: a\.spec\.ts, b\.spec\.ts/);
+  // Not the PR's specs: the report was lost in delivery, so the lane is re-run for it (never "needs a look").
+  const unowned = diagnoseLane(facts({ orchestration: lost, jobs: workers(30, { 2: OIDC }), prFiles: ["server/x.go"] }));
+  assert.deepEqual([unowned.label, unowned.fault, unowned.rerun], ["machine failure", "infrastructure", "lane"]);
   // Failures the arrived reports hold were judged test by test: they are not judged again here.
   assert.equal(diagnoseLane(facts({ orchestration: lost, jobs: workers(30, { 2: OIDC }), judgedSpecs: ["functional/a.spec.ts", "functional/b.spec.ts"] })).label, "machine failure");
+});
+
+test("a lane red for no reason shown is re-run as a machine failure, or the PR's when it changes the lane's code", () => {
+  // A spec never finished, no job failed, nothing timed out.
+  const o = orch([...passing(400), unit("specs/functional/x.spec.ts", "pending", [])], "timed_out");
+  const machine = diagnoseLane(facts({ orchestration: o, jobs: workers(30), prFiles: ["server/x.go"] }));
+  assert.deepEqual([machine.label, machine.fault, machine.rerun], ["machine failure", "infrastructure", "lane"]);
+  assert.match(machine.what, /1 spec never finished and no job says why/);
+  const mine = diagnoseLane(facts({ orchestration: o, jobs: workers(30), prFiles: ["e2e-tests/playwright/lib/src/server.ts"] }));
+  assert.deepEqual([mine.label, mine.fault, mine.rerun], ["caused by PR", "PR", "none"]);
+  // No label is ever "needs investigation" or "out of date".
+  for (const v of [machine, mine]) assert.doesNotMatch(laneDescription(v, false, "master"), /needs investigation|out of date/);
 });
 
 test("a trunk run counts as broken only when most of its specs failed or none ran", () => {

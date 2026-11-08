@@ -52,6 +52,8 @@ function namedIn(description) {
     appBug: count(/(\d+) app bug/),
     fixed: count(/(\d+) fixed on main/),
     outdated: count(/(\d+) out of date/),
+    machine: count(/(\d+) machine failures?\b/),
+    brokenBranch: count(/(\d+) broken on branch/),
     check: count(/(\d+) unresolved/) + count(/(\d+) needs investigation/)
   };
 }
@@ -59,28 +61,27 @@ var PULL_GUIDANCE = /\bpull [^\s,;)][^\n,;)]*? changes\b/;
 function releaseFromDescriptions(descriptions) {
   const ds = descriptions.map((d) => String(d ?? ""));
   if (ds.some((d) => PULL_GUIDANCE.test(d))) return false;
-  if (ds.some((d) => /\b\d+ (?:test bug|server compat)\b/.test(d))) return true;
+  if (ds.some((d) => /\b\d+ (?:test bug|server compat|broken on branch)\b/.test(d))) return true;
   if (ds.some((d) => /\b\d+ caused by PR\b/.test(d))) return false;
-  if (ds.some((d) => /\b\d+ (?:out of date|fixed on main)\b/.test(d))) return true;
+  if (ds.some((d) => /\b\d+ out of date\b/.test(d))) return true;
   return void 0;
 }
 function redReason(description = "", release = false) {
   const d = String(description);
-  const lane = /^\((machine failure, [^)]+|broken on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
+  const lane = /^\((machine failure, [^)]+|broken on main, not your change|broken on main|fixed on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
   if (lane) return lane;
   if (/triage is checking why/.test(d)) return "triage is checking why";
-  const { cleared, caused, appBug, fixed, outdated, check } = namedIn(d);
+  const { cleared, caused, appBug, fixed, outdated, machine, brokenBranch, check } = namedIn(d);
   const parts = [];
-  if (cleared) parts.push(`${cleared} not caused by PR`);
+  const pull = PULL_GUIDANCE.exec(d)?.[0];
+  const notYours = cleared + (release ? 0 : fixed);
+  if (notYours) parts.push(`${notYours} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
-  const pull = PULL_GUIDANCE.exec(d)?.[0];
-  if (release) {
-    if (fixed) parts.push(`${fixed} fixed on main`);
-    if (outdated) parts.push(`${outdated} out of date`);
-  } else if (pull || fixed || outdated) {
-    parts.push(pull ?? "pull main changes");
-  }
+  if (release && fixed) parts.push(`${fixed} fixed on main`);
+  if (brokenBranch) parts.push(`${brokenBranch} broken on branch`);
+  if (outdated || pull) parts.push(release ? `${outdated} out of date` : pull ?? "pull main changes");
+  if (machine) parts.push(`${machine} machine failure${machine === 1 ? "" : "s"}, re-run`);
   if (check) parts.push(`${check} to check`);
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";
@@ -119,7 +120,10 @@ function laneSummary(lanes, untriaged = [], release) {
   if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
   const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
-  const cleared = seen.filter((l) => l.status.state === "success" && namedIn(l.status.description).cleared > 0);
+  const cleared = seen.filter((l) => {
+    const n = namedIn(l.status.description);
+    return l.status.state === "success" && n.cleared + (isRelease ? 0 : n.fixed) > 0;
+  });
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
   if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
   if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" \xB7 ")) };

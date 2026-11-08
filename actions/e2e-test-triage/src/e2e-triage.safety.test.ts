@@ -10,6 +10,7 @@ import { fetchRun } from "../../shared/src/tsio.ts";
 import { classify } from "./classify.ts";
 import { decide, judge } from "./decision.ts";
 import { buildPack } from "./pack.ts";
+import { statusLabelOf } from "./render.ts";
 import { triage } from "./triage.ts";
 import type { Answer, BatchResult, ChangedFile, Observation, PrRef } from "./types.ts";
 
@@ -153,8 +154,9 @@ test("qualified current ancestry cannot borrow legacy leaf-only history", async 
   f.cases[0].full_title = "New parent > A > leaf";
   f.history.forEach((o) => { o.full_title = ""; o.status = "failed"; });
   const result = await live(f);
-  assert.equal(result.verdict, "FAILURE");
+  // Its history is never borrowed, so nothing clears by history; the PR touches none of it, so it is not blamed (settlePR).
   assert.equal(result.findings[0].identity_unresolved, true);
+  assert.equal(result.findings[0].decision, "first_failure");
   assert.equal(f.modelCalls, 0);
 });
 
@@ -179,8 +181,10 @@ for (const scenario of ["duplicate current report", "duplicate historical report
       f.history.push({ ...f.history[0], full_title: "B > leaf", suite_title: "B", group_id: "sibling" });
     } else f.history.push({ ...f.history[0], status: "passed" });
     const result = await live(f);
-    assert.equal(result.verdict, "FAILURE");
+    // Trunk "failed" it, yet nothing clears by that history; the PR touches none of it, so it is not blamed (settlePR).
+    assert.notEqual(result.findings[0].class, "BROKEN_ON_TRUNK");
     assert.equal(result.findings[0].identity_unresolved, true);
+    assert.equal(result.findings[0].decision, "first_failure");
     assert.equal(f.modelCalls, 0);
   });
 }
@@ -207,7 +211,7 @@ test("judge boundary rejects unresolved identity even when a caller supplied a p
 });
 
 for (const scenario of ["owned spec", "missing diff", "missing test root", "missing trunk branch", "missing report identity", "truncated history", "trunk excludes itself"]) {
-  test(`incomplete evidence clears nothing and asks no one: ${scenario}`, async () => {
+  test(`incomplete evidence clears nothing by history and asks no one: ${scenario}`, async () => {
     const f = fixture();
     f.history.forEach((o) => { o.status = "failed"; });
     if (scenario === "owned spec") f.files = [{ filename: "e2e/a.spec.ts", patch: "@@ spec" }];
@@ -226,7 +230,11 @@ for (const scenario of ["owned spec", "missing diff", "missing test root", "miss
       }
     }
     const result = await live(f);
-    assert.equal(result.verdict, "FAILURE");
+    // On a PR run whose change list and test root are known, a failure the PR touches none of is not blamed on it, though
+    // its history cannot be used (settlePR). One it owns, or whose ownership is unknown, and a trunk run's, stay red.
+    const notBlamed = scenario === "missing report identity" || scenario === "truncated history";
+    assert.equal(result.verdict, notBlamed ? "SUCCESS" : "FAILURE");
+    if (notBlamed) assert.ok(result.findings.every((x) => x.decision === "first_failure" && x.history_unused && statusLabelOf(x) === "flaky"));
     assert.equal(f.modelCalls, 0);
     // Report only: the only write is triage's line on the check, which stays red.
     const writes = f.calls.filter((c) => c.url.hostname === "api.github.com" && c.method !== "GET");
@@ -269,16 +277,17 @@ test("summary and outputs in both modes; only enforce sets the state, and never 
       assert.equal(statuses.length, mode === "enforce" ? 3 : 1, "plus the triage check, pending then verdict, only when enforcing");
       if (mode !== "enforce") assert.equal(bodyOf(statuses[0]).state, "failure", "report only keeps the state the check had");
       const summary = readFileSync(summaryPath, "utf8");
-      assert.match(summary, /🟡 1 needs a look/);
-      assert.match(summary, /\*\*1 failure: 1 needs a look\.\*\*/);
-      assert.doesNotMatch(summary, /required status is green|attributable to the PR/);
+      // Nothing in the PR touches the one failure: not blamed on it (settlePR).
+      assert.match(summary, /✅ none caused by this PR/);
+      assert.match(summary, /\*\*1 failure: 1 not caused by this PR \(1 flaky\)\.\*\*/);
+      assert.doesNotMatch(summary, /required status is green|attributable to the PR|needs a look/);
       assert.match(summary, mode === "enforce" ? /Triage sets the E2E check/ : /\*\*Report only\.\*\*/);
-      assert.match(readFileSync(outputPath, "utf8"), /verdict=FAILURE\nblocking=1/);
+      assert.match(readFileSync(outputPath, "utf8"), /verdict=SUCCESS\nblocking=0/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
 });
 
-test("mass failures require investigation without claiming the PR is innocent", async () => {
+test("mass failures are the PR's while the base branch passes, never called innocent, and the summary says to check shared causes", async () => {
   const f = fixture(), dir = mkdtempSync(join(tmpdir(), "triage-infra-"));
   const summaryPath = join(dir, "summary.md");
   f.cases = Array.from({ length: 30 }, (_, i) => ({ ...f.cases[0], full_title: `test-${i}` }));
@@ -287,12 +296,13 @@ test("mass failures require investigation without claiming the PR is innocent", 
     const result = await live(f);
     assert.equal(result.verdict, "ACTION_REQUIRED");
     const summary = readFileSync(summaryPath, "utf8");
-    assert.match(summary, /⚠️ needs investigation/);
+    assert.match(summary, /🔴 30 caused by this PR/);
+    assert.doesNotMatch(summary, /needs investigation|needs a look/);
     assert.match(summary, /30 tests failed in one run; check for a shared environment/);
     assert.match(summary, /product failure/);
     // Each failure is still sorted, so the author sees which ones need a look.
     assert.match(summary, /30 failures: /);
-    assert.match(summary, /### (Needs a look|May be caused by this PR) \(\d+\)/);
+    assert.match(summary, /### Your PR \(30\)/);
     assert.doesNotMatch(summary, /not this PR|none caused/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

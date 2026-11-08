@@ -3,7 +3,7 @@
 
 import { identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
-import { BORDERLINE, classify, classifyNotRun, errorSignature, holdFailedEverywhere, infraVerdict, isShardPlaceholder, isSpecNotRun, isSpecStopped, isProductChange, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
+import { BORDERLINE, causedByPR, classify, classifyNotRun, errorSignature, holdFailedEverywhere, infraVerdict, isShardPlaceholder, isSpecNotRun, isSpecStopped, isProductChange, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, historyLane, repoPath } from "./config.ts";
 import { commonSenseClear } from "./common-sense.ts";
 import { sameTestOnOtherReports } from "./enrich.ts";
@@ -158,7 +158,8 @@ export async function evaluateRun({
     }
     // Incomplete evidence makes the rules unsound: nothing clears, and the model isn't asked.
     const blind =
-      history.truncated ? "History was truncated at the page cap"
+      history.unavailable ? `TSIO's history could not be read (${history.unavailable})`
+      : history.truncated ? "History was truncated at the page cap"
       : !diff.ok ? "The list of changed files could not be read in full"
       : testRoot == null ? "No test root is configured, so whether this PR edits the failing spec cannot be determined"
       : !trunkBranch ? "The trunk branch is unknown, so trunk history cannot be told from another branch's"
@@ -270,6 +271,9 @@ export async function evaluateRun({
       if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
     }
     if (!blind && prNumber) sameFailure(result.findings);
+    // Whether the PR touches a test is known only from a complete change list and a test root to place the spec in it.
+    if (prNumber && !branchBase) settlePR(result.findings, changed, diff.ok && testRoot != null, Boolean(result.infra));
+    if (isTrunkRun && !branchBase) for (const f of result.findings) f.trunk_run = true;
   }
   // A release branch's spec that never ran is untested in that build: spec history, which has no branch, does not clear it.
   if (branchBase)
@@ -281,4 +285,44 @@ export async function evaluateRun({
   result.missing = missingReports(run.missing);
   if ((result.missing || result.unnamed) && result.verdict === "SUCCESS") result.verdict = "FAILURE";
   return result;
+}
+
+/**
+ * The last word on a PR's failures: one stays red only with evidence that this PR caused it (see causedByPR), or as a
+ * machine failure, so nothing is left as "needs a look" and nothing the base branch explains blocks the PR.
+ * - The base branch changed or fixed the test after this PR last merged it (out_of_date): cleared, as fixed on main. The
+ *   base branch's copy passes there, and merging gives the PR that copy.
+ * - Held on a run that failed in bulk (the run-level flag) while the base branch passes: an environment error stays a
+ *   machine failure; any other failure is the PR's (mass), since the change broke something those tests share. Not
+ *   where the judge cleared some of the run: then each is read on its own, as below.
+ * - A spec that never ran (NOT_RUN), or a PR whose change list could not be read in full (or whose spec cannot be placed
+ *   in it, with no test root): red as a machine failure, for a re-run.
+ * - Otherwise, the PR changes the test's error-named file: the PR's. If it changes neither, the failure is cleared: the
+ *   first one that nothing ties to the PR is not blamed on it. The same failure on the PR's next commit is a PR streak
+ *   (see classify), which is held as the PR's.
+ */
+export function settlePR(findings: Finding[], changed: string[], ownershipKnown: boolean, flagged: boolean): void {
+  // A flagged run the judge cleared any of is not a bulk break: those it judged are its environment's or flaky, and the
+  // rest are read one by one like any other run's.
+  const bulk = flagged && !findings.some((f) => f.decision === "adjudicator_unblock");
+  for (const f of findings) {
+    if (f.out_of_date && f.class !== "OWNED_BY_PR") {
+      if (f.blocking) Object.assign(f, { blocking: false, decision: "base_fixed" });
+      continue;
+    }
+    if (!f.blocking || causedByPR(f)) continue;
+    if (f.class === "NOT_RUN" || (f.class === "INFRA_ERROR" && flagged)) continue;
+    if (bulk) {
+      f.mass = true;
+      continue;
+    }
+    if (!ownershipKnown) continue;
+    const own = f.repo_path ?? f.file;
+    if (changed.some((name) => name === own || namesChangedFile(f, name))) {
+      f.untouched = false;
+      continue;
+    }
+    const unused = f.decision === "evidence_incomplete" || Boolean(f.identity_unresolved);
+    Object.assign(f, { blocking: false, untouched: true, decision: "first_failure", ...(unused ? { history_unused: true } : {}) });
+  }
 }

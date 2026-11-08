@@ -13,11 +13,22 @@ test("a lane's name in the PR-wide check drops the shared prefix", () => {
   assert.equal(laneName("e2e/linux"), "linux");
 });
 
+test("a lane a PR's fixed on main cleared is named as cleared", () => {
+  const lane = (context: string, state: string, description: string) => ({ context, status: { state, description } as never });
+  assert.deepEqual(laneSummary([lane("e2e-test/cypress-full/enterprise", "success", "(1 fixed on main) 99.9% passed (1289 passed, 1 failed, 20 skipped)")]),
+    { state: "success", description: "cypress-full/enterprise cleared by triage · all lanes green" });
+});
+
 test("the red reason reads the labels a status now carries", () => {
   assert.equal(redReason("(2 flaky, 2 caused by PR) 99.7% passed (1186 passed, 4 failed, 164 skipped)"), "2 not caused by PR, 2 caused by PR");
   assert.equal(redReason("(1 broken on main, 4 needs investigation) 90.0% passed (9 passed, 5 failed, 0 skipped)"), "1 not caused by PR, 4 to check");
   assert.equal(redReason("(1 out of date, 1 caused by PR) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, pull main changes");
-  assert.equal(redReason("(1 caused by PR, 2 fixed on main) 25.0% passed (1 passed, 3 failed, 0 skipped)"), "1 caused by PR, pull main changes");
+  // A PR's fixed on main is not blocking: counted with the rest the PR did not cause.
+  assert.equal(redReason("(2 fixed on main, 1 caused by PR) 25.0% passed (1 passed, 3 failed, 0 skipped)"), "2 not caused by PR, 1 caused by PR");
+  assert.equal(redReason("(1 flaky, 2 machine failure) 25.0% passed (1 passed, 3 failed, 0 skipped)"), "1 not caused by PR, 2 machine failures, re-run");
+  assert.equal(redReason("(1 broken on branch) 50.0% passed (1 passed, 1 failed, 0 skipped)", true), "1 broken on branch");
+  assert.equal(redReason("(fixed on main, not your change) 1 report(s) missing"), "fixed on main, not your change");
+  assert.equal(redReason("(broken on main) 40 of 400 specs failed"), "broken on main");
   assert.equal(redReason("(1 caused by PR, pull main changes) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, pull main changes", "the label the check now carries");
   assert.equal(redReason("(pull main changes) 50.0% passed (1 passed, 1 failed, 0 skipped)"), "pull main changes");
   assert.equal(redReason("(1 caused by PR, pull release-10.5 changes) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, pull release-10.5 changes", "a non-default base branch keeps its name");

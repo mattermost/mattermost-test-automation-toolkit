@@ -24,8 +24,25 @@ reads its recent history on the PR's base branch and on other PRs:
 | `BROKEN_ON_TRUNK` | Master's latest run fails it too, the same way (see below) | Cleared |
 | `FLAKY_ON_TRUNK` | It is intermittent on master (see below) | Cleared |
 | `FLAKY_CROSS_PR` | 3+ other PRs fail it with the same error, and master passes it | Cleared |
-| `REGRESSION`, `INSUFFICIENT_DATA` | History can't clear it | Blocking, unless the model clears it with evidence |
+| `REGRESSION`, `INSUFFICIENT_DATA` | History can't clear it | Blocking, unless the model clears it with evidence; on a PR, then settled as below |
 | `SAME_FAILURE_AS_CLEARED` | Same spec and error as a test history cleared in this run | Cleared |
+
+**What blocks a PR:** after the rules and the model, a PR's failure stays red only with
+evidence that this PR caused it, or as a machine failure. Every failure ends with one of
+these labels, and none is left as "needs investigation" or "out of date":
+
+| Label | When | Blocks the PR |
+| --- | --- | --- |
+| caused by PR | The PR edits the spec, fails it the same way on its last commits and never on the base branch (a PR streak), changes what the test looks for or a file its error names, or the model blames it from a hunk. On a run flagged as a whole that the model cleared none of, every failure while the base branch passes | Yes, with the change to look at (and the model's fix, when it is sure) |
+| fixed on main | The base branch changed or fixed the test after the PR last merged it, and its copy passes | No: merging gives the PR that copy |
+| broken on main | The base branch fails it the same way now | No |
+| flaky | A flake on the base branch or other PRs, the environment, or a first failure nothing ties to the PR: the PR changes neither the test nor a file its error names. The same failure on the PR's next commit is a PR streak, held as caused by PR | No |
+| machine failure | An environment error on a run flagged as mostly environment errors, a spec that never ran, or a PR whose change list (or test root) could not be read, so ownership is unknown | Yes, re-run |
+
+History that can't be used (truncated, unread, or not tied to the test) never clears a
+failure by itself; the PR not touching the test does. That is the cost of not blocking
+without evidence: a break the diff does not explain passes its first commit, and the
+base branch's own run (or the PR's next commit) catches it.
 
 **Shard placeholders are not tests.** Some failed rows stand for a shard that
 produced no results: a row with no test name; desktop's
@@ -50,20 +67,21 @@ and passed where it ran (at least `minTrunkRuns` runs, failing in at most 1 of 2
 or when it skipped every test in all its recent runs, and `NOT_RUN` when not.
 
 A failure still blocking whose spec the base branch changed after the PR last
-merged it is **out of date**: the PR ran its old copy of the test (for example
-against an app build from the base branch). It stays blocking, the summary names
-the base-branch commit that changed the test and says to merge the base branch,
-and the model is not asked. One GitHub compare of the PR's commit with the base
+merged it is **fixed on main**: the PR ran its old copy of the test (for example
+against an app build from the base branch), and the base branch's copy passes. On a
+PR it is cleared: the summary names the base-branch commit that changed the test,
+merging gives the PR that copy, and the model is not asked. One GitHub compare of the PR's commit with the base
 branch finds these. GitHub lists at most 300 changed files per comparison. Past
-that, a spec in the list is still out of date; for the rest, triage asks for the
+that, a spec in the list is still fixed on main; for the rest, triage asks for the
 base branch's newest commit in each failing spec's directory since the merge base
 (up to the run's time, at most 20 directories). A commit there marks the failure
-out of date with that commit; none leaves it to the usual rules. A spec no check
-settled (over 20 directories, an error, a merge base with no date) stays blocking
-as unchecked evidence (the summary says so), and the model is not asked about it.
+fixed on main with that commit; none leaves it to the usual rules. A spec no check
+settled (over 20 directories, an error, a merge base with no date) is unchecked
+evidence (the summary says so): the model is not asked about it, and on a PR it is
+settled like any failure history can't clear (see "What blocks a PR").
 `support-paths` names the code the specs run through (page objects, support
 commands, fixtures; for example `e2e-tests/playwright/lib`). A failure whose spec
-is unchanged is out of date too where one base-branch commit since the merge base
+is unchanged is fixed on main too where one base-branch commit since the merge base
 changed both one of those directories and another spec failing in this run (a
 migration of specs and their page objects, from the same list, or by directory up
 to the run's time when it is cut off). The summary names the directory and the
@@ -107,22 +125,22 @@ cleared by the model or a same-failure match; the model may still name the PR. A
 flake rarely does that, and a change to shared code does. A clear by the rules is
 undone too, even one that master's flakes of the same error would support: those
 flakes say nothing about the same test failing on two platforms of this commit.
-Such a failure is held: a flaky clear becomes `REGRESSION` and needs
-investigation, and a blocking `REGRESSION` or `INSUFFICIENT_DATA` keeps its class.
+Such a failure is held from the model: a flaky clear becomes `REGRESSION`, and a
+blocking `REGRESSION` or `INSUFFICIENT_DATA` keeps its class. On a PR it is then
+settled as in "What blocks a PR".
 A break on master, an environment error, and a spec the PR edits keep their own
 calls. Either condition alone changes nothing. The hold is not
 final on a release branch: the model may still unblock a test bug or a server
 compat problem (see the release section below). On a run flagged as a whole
 (`INFRA`), sibling TSIO groups are not read (other reports in the same group
 still are), so the hold applies only where another platform's result is in the
-same group. A held failure that is also out of date shows in the
-out-of-date bucket ("merge and re-run") because the out-of-date mark is set after
-the hold.
+same group. A held failure that is also fixed on main shows in the
+fixed-on-main group because that mark is set after the hold.
 
 **Fixed on master:** master failed the test the same way in at least 3 runs in a
 row and has passed since. That is a break master fixed, not a flake: a branch
-without master's last failing commit is held as **fixed on main** ("The failure
-first passed on master (#PR, date) after this PR last merged master"), and one
+without master's last failing commit is **fixed on main**, cleared on a PR ("master
+fixed this failure (#PR, date) after this PR last merged master"), and one
 that has master's first passing commit goes to the model as a `REGRESSION`. If
 the base branch's commit list is cut off, it stays unchecked.
 
@@ -156,7 +174,7 @@ run stays red as `ACTION_REQUIRED`. Once every failure is cleared the run is
 (a release candidate's compatibility matrix) runs that branch's own copies of the
 tests, which the default branch may have fixed since the branch was cut. Every
 failure held there is checked against the default branch: one whose spec master
-changed since the branch was cut is **out of date** ("master changed this test
+changed since the branch was cut is **fixed on main**, and stays red ("master changed this test
 (#PR, date) after release-6.3 branched from it, so this run used release-6.3's old
 copy"; next step: backport the test change, or ignore it for this release). With
 fewer than 5 earlier runs of its own, history is read from the default branch;
@@ -178,7 +196,7 @@ server compat cites the other lanes, where the test passes against another
 server version on this build; flaky cites other PRs failing the same way or an
 infrastructure error (never the history), and is never accepted for a test that
 failed every try here and on every other lane. An app bug at 85% is named ("app
-bug") and stays red; anything else stays red as needs investigation. The check
+bug") and stays red; anything else stays red as **broken on branch**. The check
 names what was found: `(1 test bug, 2 server compat, 1 app bug)`.
 
 **Lanes the base branch rarely runs:** history is read per lane. A lane master
@@ -280,14 +298,12 @@ model fails or is unavailable, the rules' outcome stands.
 
 - **E2E check text**, in both modes: `(2 flaky, 2 caused by PR) 99.7% passed (1186
   passed, 4 failed, 164 skipped)`. The labels, each only when non-zero and in this
-  order: flaky, broken on main, test bug, server compat, caused by PR, app bug,
-  fixed on main, out of date, needs investigation (test bug, server compat and
-  app bug only on a release branch). On a PR, fixed on main and out of date are
-  named once, by what to do, with no count: `(1 caused by PR, pull main changes)`
-  (or `pull <base> changes` when the PR targets another branch).
-  A release branch keeps them as labels: its fix is a backport, not a merge. The
-  PR-wide triage check reads the same way (`playwright-full/enterprise: pull main
-  changes`). The
+  order: flaky, broken on main, fixed on main, test bug, server compat, caused by
+  PR, app bug, broken on branch, machine failure (test bug, server compat, app bug
+  and broken on branch only on a release branch). On a PR, fixed on main is not
+  blocking; on a release branch it is, as its fix is a backport. The PR-wide triage
+  check counts a PR's flaky, broken on main and fixed on main together
+  (`playwright-full/enterprise: 2 not caused by PR, 1 caused by PR`). The
   rate is passed ÷ (passed + failed), as in
   mattermost's own E2E check; it never reads 100% while something failed.
   Shard placeholders add "re-run the failed jobs" after the labels (alone when
@@ -472,18 +488,18 @@ lane (`<context>/<base>`) at the PR's merge base and now.
 | Label | When | State | Whose fault | What to do |
 |---|---|---|---|---|
 | `all specs ran` | Every dispatched spec ran and passed (a late report of a spec counts) | green | nobody | nothing |
-| `broken on main` | Most specs failed (20 or more, a quarter of those that ran), or the setup failed on every worker, and the base branch fails the same way at the merge base | red | base branch | merge the base branch once it is fixed |
-| `fixed on main` | As above, and the base branch is green now | red | base branch | merge the base branch |
-| `caused by PR` | As above with the base branch green; or a spec the PR changed outlasted its worker; or a spec the PR changed failed in a report that never arrived | red | PR | fix the change |
-| `out of date` | A setup failure with the base branch green, where the base branch has since changed the lane's test root or support paths | red | PR | merge the base branch |
-| `machine failure` | Jobs died on the runner, the network, GitHub or the cache (or on some workers only, while the same code ran on the others) | red | infrastructure | re-run (triage does, within `rerun-attempts`) |
-| `needs investigation` | None of the above can be shown | red | unknown | the failed step and its error are named |
+| `broken on main` | Most specs failed (20 or more, a quarter of those that ran), or the setup failed on every worker, and the base branch fails the same way at the merge base | green on a PR where the specs ran (red where the setup broke: nothing ran), red on the base branch's own run | base branch | nothing, or merge the base branch once it is fixed where nothing ran |
+| `fixed on main` | As above, and the base branch is green now; or a setup failure with the base branch green, where the base branch has since changed the lane's test root or support paths (or the lane's setup comes from its newer workflow) | green on a PR where the specs ran, red where the setup broke | base branch | merge the base branch |
+| `caused by PR` | As above with the base branch green; or a spec the PR changed outlasted its worker; or a spec the PR changed failed in a report that never arrived; or nothing else explains a red lane and the PR changes the lane's own code | red | PR | fix the change |
+| `machine failure` | Jobs died on the runner, the network, GitHub or the cache (or on some workers only, while the same code ran on the others); a report that never arrived; or nothing explains a red lane and the PR changes none of the lane's code | red | infrastructure | re-run (triage does, within `rerun-attempts`) |
 
 The check reads `(<label>, <what to do>) <what happened>`, e.g. `(broken on main, not
 your change) 300 of 320 specs failed: Error: expect(locator).toBeVisible() failed`, and
-the job summary adds whose fault it is and the evidence. Only `all specs ran` turns a
-lane green, and the `basis` output is then `orchestration`: a caller's gate may accept a
-green verdict on a lane whose jobs failed only on that basis. A lane without an
+the job summary adds whose fault it is and the evidence. Only `all specs ran` gives the
+`basis` output `orchestration`: a caller's gate may accept a green verdict on a lane whose
+jobs failed or reports are missing only on that basis. A PR's `broken on main` or `fixed
+on main` lane whose specs ran is green with `basis` `lane`, so such a gate still keeps it
+red while results are missing. A lane without an
 orchestration (one that does not lease its specs) keeps the judgement it had before.
 
 A machine failure after the lane's TSIO run began is re-run from the lane's first job
@@ -540,9 +556,9 @@ characters at most). Fields, in `schema` 2:
 - `ai.cost_usd` is `null` when a call's model is unpriced.
 - `ai.cleared` is `true` when the model cleared the test; `ai.cited` lists the
   evidence it cited, and `ai.explanation` what it found (200 characters at most).
-- `label` is what the E2E check counts the test as: flaky, broken on main, test
-  bug, server compat, caused by PR, app bug, fixed on main, out of date, or needs
-  investigation.
+- `label` is what the E2E check counts the test as: flaky, broken on main, fixed on
+  main, test bug, server compat, caused by PR, app bug, broken on branch, or machine
+  failure. Files written before held "out of date" and "needs investigation" too.
 - Schema 2 added `label` and `ai.explanation`.
 
 Consumers check `schema` first. A future change to the shape bumps it.
@@ -564,8 +580,11 @@ on the error:
 - A bare or unusable error that passed on some try, or whose tries are unknown: the
   rate alone.
 
-Otherwise the failure stays blocking as a `REGRESSION`. Failing again in the next run
-makes it `BROKEN_ON_TRUNK`.
+A failure two or more other PRs had the same way while trunk passes is
+`FLAKY_CROSS_PR`, cleared: the commit under test is the one change in question, and
+two unrelated changes failing it the same way rule it out. Otherwise the failure stays
+blocking as a `REGRESSION`, labelled broken on main (this commit is the first to fail
+it). Failing again in the next run makes it `BROKEN_ON_TRUNK`.
 
 A failure that failed every try here and on another platform of the same commit
 is held there too, as on a PR (when the run is not flagged as `INFRA`, or the

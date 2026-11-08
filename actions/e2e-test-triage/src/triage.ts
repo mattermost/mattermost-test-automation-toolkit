@@ -24,7 +24,7 @@ import type { JudgedLane } from "./lane-verdict.ts";
 import type { RerunDecision } from "./rerun-check.ts";
 import { ledgerTotals } from "./pricing.ts";
 import { activeFlag, noResultsText, otherRunText, passLine, renderLane, renderNotTriaged, renderSummary, renderUnfinished, RERUN, RERUNNING, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
-import type { AskFn, Config, Diff, HistoryLike, SpecHistory } from "./types.ts";
+import type { AskFn, Config, Diff, HistoryLike, Observation, SpecHistory } from "./types.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
 export interface TriageIdentity extends CompositeIdentity {
@@ -78,6 +78,20 @@ function identityOrNull(env: Env): TriageIdentity | null {
 
 /** The first line of what went wrong, with secrets redacted: what the summary and the findings file say. */
 const errorLine = (e: unknown, secrets: string[]): string => redact((e instanceof Error ? e.message : String(e)).split(/\r?\n/)[0] ?? "", secrets);
+
+/**
+ * A history read that still fails after its retries (a TSIO 504 under load) does not stop triage: the run is judged
+ * without history, as evaluate's blind case, where only this PR's own change can hold a failure (see settlePR).
+ */
+async function unreadHistory(read: Promise<HistoryLike>, log: (message: string) => void): Promise<HistoryLike> {
+  try {
+    return await read;
+  } catch (e) {
+    const why = String(e).replace(/^Error: /, "").slice(0, 120);
+    log(`e2e-test-triage: history unavailable, judging without it: ${why}`);
+    return Object.assign(new Map<string, Observation[]>(), { unavailable: why });
+  }
+}
 
 /**
  * Triages a run. However it ends without a verdict (a read that fails, a history that stays down), the job summary
@@ -299,7 +313,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // run window over the files asked for, so dropping one would change which past runs the real tests are judged on.
     if (run.failing.some((t) => !isShardPlaceholder(t))) {
       [history, diff] = await Promise.all([
-        fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)),
+        unreadHistory(fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log),
         fetchChangedFiles(api, id, prNumber, log),
       ]);
       if (branchBase && id.branch) {
@@ -307,7 +321,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         if (ownRuns < cfg.minTrunkRuns) {
           trunkBranch = branchBase;
           notes.push(`History is read from ${branchBase}, the default branch: ${id.branch} has ${ownRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg));
+          history = await unreadHistory(fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log);
         }
       }
       const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;
@@ -316,7 +330,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         if (fallback && fallback !== prBase) {
           trunkBranch = fallback;
           notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-          history = await fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg));
+          history = await unreadHistory(fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log);
         }
       }
       await dropStormRuns({ history, fetchImpl, base, minFailures: cfg.infraMinFailures, trunkBranch, own: run.group_id, pr: prNumber, log });
@@ -401,7 +415,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         prFiles: diff.ok ? diff.files.map((f) => f.filename) : null, lanePaths: lanePathsOf(testRoot, cfg.supportPaths),
         judgedSpecs: run.failing.map((t) => t.file), noResults: Boolean(laneOnly), log,
       });
-      const mass = ["broken on main", "fixed on main", "caused by PR", "out of date"].includes(judged.verdict.label);
+      const mass = ["broken on main", "fixed on main", "caused by PR"].includes(judged.verdict.label);
       const testsBlock = result.findings.some((f) => f.blocking);
       // A lane without an orchestration (one that does not lease its specs) keeps the judgement it had: its jobs alone
       // cannot show that every spec ran. A lane with no results at all is judged on whatever could be read.
@@ -454,17 +468,16 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const laneSection = lane ? renderLane({ verdict: lane.verdict, rerunning: Boolean(rerun), lane: env.LANE || id.name, runURL, base: lane.baseline?.base ?? prBase ?? trunkBranch ?? null }) : "";
     const testsSummary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
     const summary = lane && !result.findings.length ? laneSection : [laneSection, testsSummary].filter(Boolean).join("\n");
-    const pullBase = result.findings.find((f) => f.out_of_date?.base)?.out_of_date?.base ?? trunkBranch ?? prBase;
     const description = lane
       ? laneDescription(lane.verdict, Boolean(rerun), lane.baseline?.base ?? prBase ?? "main")
       : flakyOnly
       ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}`
-      : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held, pullBase);
+      : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
       appendFileSync(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}\nverdict=${result.verdict}\nblocking=${flag ? run.counts.failed : result.findings.filter((f) => f.blocking).length + (result.unnamed ?? 0)}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\nrerun=${Boolean(rerun)}\nrerun_of=${rerun?.of ?? ""}\nrerun_held=${held ?? ""}\n` +
-        `rerun_job=${rerun && laneRerun === "lane" ? String(lane?.startJobId ?? 0) : ""}\nlane_label=${lane?.verdict.label ?? ""}\nlane_fault=${lane?.verdict.fault ?? ""}\nbasis=${lane ? (lane.verdict.state === "success" ? "orchestration" : "lane") : "tests"}\n` +
+        `rerun_job=${rerun && laneRerun === "lane" ? String(lane?.startJobId ?? 0) : ""}\nlane_label=${lane?.verdict.label ?? ""}\nlane_fault=${lane?.verdict.fault ?? ""}\nbasis=${lane ? (lane.verdict.label === "all specs ran" ? "orchestration" : "lane") : "tests"}\n` +
         `ai_calls=${spend.calls}\nai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}\nai_input_tokens=${spend.input_tokens}\nai_output_tokens=${spend.output_tokens}\n`);
     // A lane with nothing failed or missing has nothing to report, so it writes no job
     // summary: the run page then shows only the lanes someone needs to read.
@@ -507,7 +520,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
       await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", lane ? description : flakyOnly ? `${run.counts.flaky} flaky, passed on retry · no test failed` : (flag && !result.findings.length
         ? `${run.counts.failed} failed · not triaged, ${runFlag(flag)}`
-        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed, pullBase).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
+        : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));

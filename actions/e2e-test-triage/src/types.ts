@@ -118,6 +118,15 @@ export interface Finding extends TestRef {
   other_lanes?: { platform: string; result: string }[];
   /** A failure of a release branch's run: the model is asked what kind of failure it is (see SYSTEM_RELEASE). */
   release?: boolean;
+  /** A failure of a run with no PR on the default branch: what still blocks is that branch's own break. */
+  trunk_run?: boolean;
+  /**
+   * Held on a PR run that failed in bulk (see settlePR): most of the run failed while the base branch passes, so the
+   * change broke something those tests share. It is the PR's, though no one test points at it.
+   */
+  mass?: boolean;
+  /** Cleared by settlePR although its history could not be used (unchecked, or not tied to this test). */
+  history_unused?: boolean;
   /** The other platforms of this commit where it also failed, after failing every try here (see holdFailedEverywhere). */
   failed_everywhere?: string[];
   /** The earliest test of the same spec that failed before this one in this run, with another error (see markEarlierFailures). */
@@ -433,6 +442,8 @@ export interface Counts {
 /** A TSIO history result: rows by test identity, with the flags the rules read. */
 export interface HistoryLike extends Map<string, Observation[]> {
   truncated?: boolean;
+  /** Why TSIO's history could not be read after its retries (see unreadHistory): the run is judged without it. */
+  unavailable?: string;
   reportUnknown?: boolean;
   ambiguous?: Set<string>;
 }
