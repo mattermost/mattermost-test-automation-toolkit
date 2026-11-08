@@ -111,6 +111,11 @@ test("every spec ran and passed: green, whatever worker or report was lost (fix 
   // mattermost run 42288723475: worker 14's server never started; the other 39 ran all 421 specs.
   const v = diagnoseLane(facts({ orchestration: orch(passing(421)), jobs: workers(40, { 13: { conclusion: "failure", step: "ci/start-server", tail: "Mattermost container not healthy, retry attempts exhausted. Giving up." } }) }));
   assert.deepEqual([v.label, v.state, v.fault, v.rerun], ["all specs ran", "success", "nobody", "none"]);
+  // A rolling-upgrade worker whose harness failed (ci/upgrade-to) before dispatch: its tests ran where the orchestration
+  // never sees them, so the other workers' clean run does not vouch for the lane.
+  const harness = diagnoseLane(facts({ orchestration: orch(passing(421)), jobs: workers(40, { 13: { conclusion: "failure", step: "ci/upgrade-to", tail: "  ✘  1 [upgrade-to] › upgrade_to.ts:12 › baseline survives the upgrade\n  1 failed\n  4 passed (2.1m)" } }) }));
+  assert.notEqual(harness.label, "all specs ran");
+  assert.equal(harness.state, "failure");
   // run 41940673353: the abandoned spec's late report passed; the slow spec is named in the evidence.
   const slow = diagnoseLane(facts({ orchestration: orch([...passing(409), unit("specs/functional/system_console/abac/teams/team_advanced_rules.spec.ts", "abandoned", [{ status: "passed", actual_duration_ms: 874041, expired: true }, { status: null, expired: true }])], "timed_out"), jobs: workers(30, { 8: { conclusion: "failure", step: "ci/dispatch-run", tail: "##[error]The action 'ci/dispatch-run' has timed out after 25 minutes." } }) }));
   assert.equal(slow.state, "success");
@@ -267,6 +272,10 @@ test("a lane the base branch explains turns the run green only with complete res
 
 test("a trunk run counts as broken only when most of its specs failed or none ran", () => {
   assert.equal(trunkBroken(trunk("failure", massBroken)), true);
+  // Without an orchestration, the status text decides, in today's wording and the old one alike.
+  assert.equal(trunkBroken({ sha: "a", state: "failure", description: "E2E jobs failed outside the tests; triage is checking why", orchestration: null }), true);
+  assert.equal(trunkBroken({ sha: "a", state: "failure", description: "E2E upstream execution failed; re-run the failed jobs", orchestration: null }), true);
+  assert.equal(trunkBroken({ sha: "a", state: "failure", description: "(1 flaky) 99.9% passed", orchestration: null }), false);
   assert.equal(trunkBroken(trunk("failure", orch([...failing(2), ...passing(400)]))), false, "a couple of failed tests is not a broken base branch");
   assert.equal(trunkBroken(trunk("failure", orch(Array.from({ length: 5 }, (_, i) => unit(`s${i}`, "pending", []))))), true, "none ran");
   assert.equal(trunkBroken(trunk("success")), false);

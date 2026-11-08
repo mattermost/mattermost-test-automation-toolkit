@@ -71,6 +71,8 @@ const CODE_RE: [RegExp, string][] = [
 ];
 const AFTER_TESTS_STEP = /upload-debug-artifacts|upload-artifact|debug artifacts|teardown/i;
 const RUN_STEP = /dispatch-run|run tests|run specs|\btest\b/i;
+// A test runner's failed count (Playwright "  2 failed", mocha "2 failing") in a dead job's log.
+const TESTS_FAILED = /^\s*\d+ (?:failed|failing)\b/m;
 const TIMED_OUT = /has timed out after \d+ minutes|exceeded the maximum execution time|The job running on runner .* has exceeded/i;
 
 /** How one dead job died: outside the code ("infra"), in code the lane runs ("code"), its time, after the tests, or unclear. */
@@ -179,8 +181,10 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
   if (dead.length > 6) evidence.push(`… and ${plural(dead.length - 6, "more dead job")}`);
   const rerunKind: RerunKind = o ? "lane" : "failed-jobs";
 
-  // 1. Every spec ran and passed: only a worker, its report or a job after the tests was lost.
-  if (allPassed(o)) {
+  // 1. Every spec ran and passed: only a worker, its report or a job after the tests was lost. Not where a worker's log
+  // shows tests that failed in a step outside dispatch (an upgrade harness): the orchestration never sees those.
+  const hidden = deadWorkers.filter((c) => !(c.job.step && RUN_STEP.test(c.job.step)) && TESTS_FAILED.test([c.job.tail, ...c.job.errors].join("\n")));
+  if (allPassed(o) && !hidden.length) {
     const slow = o!.units.filter((u) => u.attempts.some((a) => a.expired) && longestRun(u) > 0).sort((a, b) => longestRun(b) - longestRun(a));
     const lost = deadWorkers.length;
     const ev = [`TSIO orchestration ${o!.status}: ${o!.units.length} of ${o!.totalUnits} specs ran, ${o!.tests.total} tests, 0 failed`, ...evidence];

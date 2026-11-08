@@ -3,7 +3,7 @@
 import type { CommitStatus, FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { fetchOrchestration } from "../../shared/src/orchestration.ts";
 import type { Orchestration } from "../../shared/src/orchestration.ts";
-import { statusOwner } from "../../shared/src/status.ts";
+import { isReportsIncomplete, isUpstreamFailed, readStatuses, statusOwner } from "../../shared/src/status.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
 
 /** The base branch's own run of this lane on one commit: its final status and, where TSIO has it, its orchestration. */
@@ -120,7 +120,7 @@ export function trunkBroken(run: TrunkRun | null): boolean {
   // A run still going counts once its orchestration already shows the lane-wide failure.
   if (!run || (run.state !== "failure" && run.state !== "error" && !(run.state === "pending" && run.orchestration))) return false;
   const o = run.orchestration;
-  if (!o) return /reports unavailable|upstream execution failed|broken on main|caused by|many failures|investigation required/.test(run.description);
+  if (!o) return isUpstreamFailed(run.description) || isReportsIncomplete(run.description) || /reports unavailable|upstream execution failed|broken on main|caused by|many failures|investigation required/.test(run.description);
   const finished = o.units.length - o.unfinished.length;
   if (finished === 0) return true;
   return o.failed.length >= 20 && o.failed.length * 4 >= finished;
@@ -137,7 +137,8 @@ async function firstFinished(api: GhApi, fetchImpl: FetchImpl, tsio: string, rep
   for (const sha of shas) {
     let rows: CommitStatus[];
     try {
-      rows = (await api("GET", `/repos/${repository}/commits/${sha}/statuses?per_page=100`)) as CommitStatus[];
+      // Every page: a commit with many lanes and checks lists the trunk lane's row past the first 100.
+      rows = await readStatuses(api, { repository, commit_sha: sha } as CompositeIdentity);
     } catch (e) {
       log(`statuses of ${sha.slice(0, 7)} unavailable: ${String(e).slice(0, 120)}`);
       continue;

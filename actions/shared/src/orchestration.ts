@@ -114,13 +114,15 @@ export function orchestrationFrom(raw: RawStatus): Orchestration {
  * orchestration never began: TSIO answers 404). Any other failure throws: a caller must not read an unread
  * orchestration as "none".
  */
-export async function fetchOrchestration(fetchImpl: FetchImpl, base: string, id: CompositeIdentity, framework: string | null = null): Promise<Orchestration | null> {
+export async function fetchOrchestration(fetchImpl: FetchImpl, base: string, id: CompositeIdentity, framework: string | null = null, sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))): Promise<Orchestration | null> {
   const q = new URLSearchParams({ repository: id.repository, commit_sha: id.commit_sha, gh_run_id: String(id.gh_run_id ?? ""), name: String(id.name ?? ""), gh_run_attempt: String(id.gh_run_attempt ?? "") });
   if (id.branch) q.set("branch", String(id.branch));
   if (framework) q.set("framework", framework);
   const path = `/orchestration/status?${q}`;
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 3; attempt++) {
+    // A 429 or 5xx is usually still in effect a moment later: wait before the next try, not before the first.
+    if (attempt > 0) await sleep(500 * attempt);
     try {
       const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(60000) });
       if (res.status === 404) return null;

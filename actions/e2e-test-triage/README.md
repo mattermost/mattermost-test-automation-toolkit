@@ -321,22 +321,24 @@ model fails or is unavailable, the rules' outcome stands.
 - **Job summary**, for a lane where something failed, a report is missing, or
   the lane is red with no failed test, shortest first: a one-line answer, then
   the failed tests in five fixed groups, one line each with why and the next step:
-  - **Your PR**: the PR edits the test, changes a file its error names, or the
-    model points to the PR's change. The model
-    needs the same bar to name the PR as to clear a test: at least
-    `min-confidence` and a change in the diff it can point to. A weaker guess
-    stays under **Needs a look**.
-  - **Out of date**: the base branch changed the test after this PR last merged
-    it, so the PR ran its old copy; or it failed the same way on this PR's last
-    commits and never on master, whose latest run passes it. Next step: merge
-    master and re-run. The model is not asked.
-  - **Needs a look**: nothing explains it yet. Next step: read the error before
-    re-running (a real break can pass on a re-run).
+  - **Your PR**: the PR edits the test, fails it the same way on its last commits
+    and never on master, changes what the test looks for or a file its error
+    names, or the model points to the PR's change. The model needs the same bar
+    to name the PR as to clear a test: at least `min-confidence` and a change in
+    the diff it can point to. A weaker guess names nothing, and the failure is
+    settled by the rules (see "What blocks a PR").
+  - **Fixed on main**: master changed or fixed the test after this PR last
+    merged it, and master's copy passes. Cleared on a PR: nothing for you; the
+    PR gets the fix when it is merged or updated. The model is not asked.
+  - **Machine failure**: an environment error on a run flagged as mostly
+    environment errors, a spec that never ran, or a change list that could not
+    be read. Next step: re-run the failed jobs.
   - **Broken on master**: master's latest run fails it too. The row names the PR
     merged between master's last pass and first failure (one compare call per
     break; several commits are listed, none blamed).
-  - **Flaky**: intermittent on master, failing the same way on 3+ other PRs, or
-    cleared by the model. No PR is named.
+  - **Flaky**: intermittent on master, failing the same way on 3+ other PRs,
+    cleared by the model, or a first failure the PR touches none of. No PR is
+    named.
 
   A failed test that also failed on other platforms in the same run gets
   "Also failed on <platforms> in this run: likely environment or a shared

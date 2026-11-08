@@ -484,6 +484,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // (decides is false) is left to the gate.
     if (decides && result.verdict === "SUCCESS" && lane?.verdict.label !== "all specs ran" && context && (outsideTests || (run.failing.length > 0 && (await redOutsideTests(api, id, context, log)))))
       result.verdict = "FAILURE";
+    // The lane's own text agrees with what is written: a verdict held red above renders red too (report-only keeps it).
+    if (enforce && lane && lane.verdict.state === "success" && result.verdict !== "SUCCESS") lane = { ...lane, verdict: { ...lane.verdict, state: "failure" } };
     const laneSection = lane ? renderLane({ verdict: lane.verdict, rerunning: Boolean(rerun), lane: env.LANE || id.name, runURL, base: lane.baseline?.base ?? prBase ?? trunkBranch ?? null }) : "";
     const testsSummary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
     const summary = lane && !result.findings.length ? laneSection : [laneSection, testsSummary].filter(Boolean).join("\n");

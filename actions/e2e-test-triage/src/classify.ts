@@ -310,7 +310,10 @@ export function classify(
   // there is one (see prStreak). Out of date only where markOutOfDate finds the base branch changed the test since.
   // Not where another PR failed the same way: a failure other changes share is more likely the test's or the
   // environment's than this PR's, so the rules below (the cross-PR flake, the judge) decide it instead.
-  if (!isTrunkRun && currentPR != null && !test.identity_unresolved && !failedPRs.length) {
+  // Where the PR cannot touch the environment (infraClears: an app against a separate test server), an environment
+  // error that recurs on its commits is still the environment's (see INFRA_ERROR below). Where it can (a server PR),
+  // the repeat is the streak.
+  if (!isTrunkRun && currentPR != null && !test.identity_unresolved && !failedPRs.length && !(cfg.infraClears && isInfraError(test.error))) {
     const earlier = new Set<string>();
     for (const o of mine) {
       if (!FAILED_STATUSES.has(o.status) || !sameFirstLine(o.error_excerpt, test.error)) break;

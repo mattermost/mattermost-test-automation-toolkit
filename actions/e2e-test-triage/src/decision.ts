@@ -250,7 +250,7 @@ export async function judge(
         g.error = a;
       } else {
         g.answer = a;
-        if (cfg.answers) cfg.answers[answerKey(model, g.lead.pack)] = { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence, explanation: a.explanation, provenance: a.provenance };
+        if (cfg.answers) cfg.answers[answerKey(model, g.lead.pack)] = { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence, explanation: a.explanation, ...(a.fix ? { fix: a.fix } : {}), provenance: a.provenance };
       }
       for (const m of g.members) m.f.ai = { model, cost_usd: (m.f.ai?.cost_usd ?? 0) + share };
     }

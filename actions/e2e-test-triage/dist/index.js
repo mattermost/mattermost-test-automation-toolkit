@@ -835,7 +835,7 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
   };
   if (own.has(test.repo_path ?? test.file))
     return out("OWNED_BY_PR", isTrunkRun ? `This commit changes ${test.file}; a failure in a spec the commit edits is not noise.` : `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
-  if (!isTrunkRun && currentPR != null && !test.identity_unresolved && !failedPRs.length) {
+  if (!isTrunkRun && currentPR != null && !test.identity_unresolved && !failedPRs.length && !(cfg.infraClears && isInfraError(test.error))) {
     const earlier = /* @__PURE__ */ new Set();
     for (const o of mine) {
       if (!FAILED_STATUSES.has(o.status) || !sameFirstLine(o.error_excerpt, test.error)) break;
@@ -2395,7 +2395,7 @@ async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
         g.error = a;
       } else {
         g.answer = a;
-        if (cfg.answers) cfg.answers[answerKey(model, g.lead.pack)] = { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence, explanation: a.explanation, provenance: a.provenance };
+        if (cfg.answers) cfg.answers[answerKey(model, g.lead.pack)] = { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence, explanation: a.explanation, ...a.fix ? { fix: a.fix } : {}, provenance: a.provenance };
       }
       for (const m of g.members) m.f.ai = { model, cost_usd: (m.f.ai?.cost_usd ?? 0) + share };
     }
@@ -3270,13 +3270,14 @@ function orchestrationFrom(raw) {
     leaseTimeoutMs: typeof raw.lease_timeout_ms === "number" ? raw.lease_timeout_ms : null
   };
 }
-async function fetchOrchestration(fetchImpl, base, id, framework = null) {
+async function fetchOrchestration(fetchImpl, base, id, framework = null, sleep2 = (ms) => new Promise((r) => setTimeout(r, ms))) {
   const q = new URLSearchParams({ repository: id.repository, commit_sha: id.commit_sha, gh_run_id: String(id.gh_run_id ?? ""), name: String(id.name ?? ""), gh_run_attempt: String(id.gh_run_attempt ?? "") });
   if (id.branch) q.set("branch", String(id.branch));
   if (framework) q.set("framework", framework);
   const path = `/orchestration/status?${q}`;
   let lastError = null;
   for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await sleep2(500 * attempt);
     try {
       const res = await fetchImpl(`${base}/api/v1${path}`, { signal: AbortSignal.timeout(6e4) });
       if (res.status === 404) return null;
@@ -3350,7 +3351,7 @@ var nameInLink = (url) => {
 function trunkBroken(run) {
   if (!run || run.state !== "failure" && run.state !== "error" && !(run.state === "pending" && run.orchestration)) return false;
   const o = run.orchestration;
-  if (!o) return /reports unavailable|upstream execution failed|broken on main|caused by|many failures|investigation required/.test(run.description);
+  if (!o) return isUpstreamFailed(run.description) || isReportsIncomplete(run.description) || /reports unavailable|upstream execution failed|broken on main|caused by|many failures|investigation required/.test(run.description);
   const finished2 = o.units.length - o.unfinished.length;
   if (finished2 === 0) return true;
   return o.failed.length >= 20 && o.failed.length * 4 >= finished2;
@@ -3360,7 +3361,7 @@ async function firstFinished(api, fetchImpl, tsio, repository, context, name, sh
   for (const sha of shas) {
     let rows;
     try {
-      rows = await api("GET", `/repos/${repository}/commits/${sha}/statuses?per_page=100`);
+      rows = await readStatuses(api, { repository, commit_sha: sha });
     } catch (e) {
       log(`statuses of ${sha.slice(0, 7)} unavailable: ${String(e).slice(0, 120)}`);
       continue;
@@ -3443,6 +3444,8 @@ var CODE_RE = [
   [/Unknown [A-Z_]+ entry|Error: No tests found|Error: Project\(s\) .* not found/i, "the test setup failed"]
 ];
 var AFTER_TESTS_STEP = /upload-debug-artifacts|upload-artifact|debug artifacts|teardown/i;
+var RUN_STEP = /dispatch-run|run tests|run specs|\btest\b/i;
+var TESTS_FAILED = /^\s*\d+ (?:failed|failing)\b/m;
 var TIMED_OUT = /has timed out after \d+ minutes|exceeded the maximum execution time|The job running on runner .* has exceeded/i;
 function jobCause(job) {
   const text = [job.tail, ...job.errors].join("\n");
@@ -3514,7 +3517,8 @@ function diagnoseLane(facts) {
   const evidence = causes.slice(0, 6).map(({ job, cause }) => `${job.short}: ${job.step ?? "a step"} \u2014 ${quote(cause.line)}`);
   if (dead.length > 6) evidence.push(`\u2026 and ${plural(dead.length - 6, "more dead job")}`);
   const rerunKind = o ? "lane" : "failed-jobs";
-  if (allPassed(o)) {
+  const hidden = deadWorkers.filter((c) => !(c.job.step && RUN_STEP.test(c.job.step)) && TESTS_FAILED.test([c.job.tail, ...c.job.errors].join("\n")));
+  if (allPassed(o) && !hidden.length) {
     const slow = o.units.filter((u) => u.attempts.some((a) => a.expired) && longestRun(u) > 0).sort((a, b) => longestRun(b) - longestRun(a));
     const lost = deadWorkers.length;
     const ev = [`TSIO orchestration ${o.status}: ${o.units.length} of ${o.totalUnits} specs ran, ${o.tests.total} tests, 0 failed`, ...evidence];
@@ -4068,6 +4072,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     else if (lane) result.verdict = "FAILURE";
     if (decides && result.verdict === "SUCCESS" && lane?.verdict.label !== "all specs ran" && context && (outsideTests || run.failing.length > 0 && await redOutsideTests(api, id, context, log)))
       result.verdict = "FAILURE";
+    if (enforce && lane && lane.verdict.state === "success" && result.verdict !== "SUCCESS") lane = { ...lane, verdict: { ...lane.verdict, state: "failure" } };
     const laneSection = lane ? renderLane({ verdict: lane.verdict, rerunning: Boolean(rerun), lane: env.LANE || id.name, runURL, base: lane.baseline?.base ?? prBase ?? trunkBranch ?? null }) : "";
     const testsSummary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
     const summary = lane && !result.findings.length ? laneSection : [laneSection, testsSummary].filter(Boolean).join("\n");

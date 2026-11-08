@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { canChange, decide, decideRelease, judge, unblocks } from "./decision.ts";
 import { EXONERATED_ON_TRUNK, changeTouchesFailure, classify, classifyNotRun, errorSignature, failureAnchors, holdFailedEverywhere, infraVerdict, isInfraError, isShardPlaceholder, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, laneOfReport, repoPath } from "./config.ts";
-import { SYSTEM_RELEASE, answerKey, askModelBatch, packKey, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
+import { SYSTEM_RELEASE, answerKey, askModelBatch, cachedAnswer, packKey, parseAnswer, samplingFor, servedMatches } from "./judge.ts";
 import type { OutOfDateResult } from "./history.ts";
 import { OUT_OF_DATE_DIR_CAP, dropStormRuns, fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markFixedOnTrunk, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { commonSenseClear, onlyOnPlatform, platformOf } from "./common-sense.ts";
@@ -1362,6 +1362,17 @@ test("tests failing with one spec and error share one question", async () => {
   assert.equal(ledger.skipped.duplicate, 2);
   assert.equal(findings.every((f) => f.decision === "adjudicator_unblock"), true, "each is decided against its own evidence");
   assert.ok(Math.abs(findings.reduce((n, f) => n + (f.ai?.cost_usd ?? 0), 0) - (ledger.calls[0].cost_usd ?? NaN)) < 1e-12, "the call's cost is split across the tests it answered");
+});
+
+test("a cached answer keeps the model's suggested fix", async () => {
+  const f = classify(failing, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1);
+  const pack = buildPack(f, [], prCtx, []);
+  const blame: Answer = { cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "x", fix: "keep the notice", provenance: { served_model: DEFAULTS.model } };
+  const answers: Record<string, unknown> = {};
+  await judge([f], [pack], ok(blame), { ...DEFAULTS, escalationModel: "", answers }, () => {}, false, newLedger());
+  const entry = answers[answerKey(DEFAULTS.model, pack)];
+  assert.equal((entry as { fix?: string }).fix, "keep the notice", "written with the fix");
+  assert.equal(cachedAnswer(entry, pack)?.fix, "keep the notice", "and read back with it");
 });
 
 test("an answer already given for the same evidence is reused, not paid for again", async () => {
@@ -3738,11 +3749,16 @@ test("PR streak: failing the same way on this PR's last commits, and never on tr
   assert.equal(statusLabelOf(f), "caused by PR", "out of date only where the base branch changed the test (markOutOfDate)");
 });
 
-test("branch state comes before the environment rule: an infrastructure error repeated on this PR's commits is held, not cleared", () => {
+test("an infrastructure error repeated on this PR's commits is a streak only where the PR can break its environment", () => {
   const infra = 'Error: server at "http://localhost:8065" is not healthy after 30 seconds of retries';
-  const cfg = { ...DEFAULTS, infraClears: true };
-  const held = classify({ ...branchTest, error: infra }, [prRun("c2", "failed", infra), prRun("c1", "failed", infra), ...trunkPasses(8)], [], cfg, 5);
+  const runs = [prRun("c2", "failed", infra), prRun("c1", "failed", infra), ...trunkPasses(8)];
+  // A server PR (infraClears off) can hang its own server: the repeat is held as the PR's.
+  const held = classify({ ...branchTest, error: infra }, runs, [], { ...DEFAULTS, infraClears: false }, 5);
   assert.deepEqual([held.class, held.blocking, held.pr_streak], ["REGRESSION", true, 3]);
+  // An app against a separate test server (infraClears on) cannot: the repeat is still the environment's, cleared.
+  const cfg = { ...DEFAULTS, infraClears: true };
+  const env = classify({ ...branchTest, error: infra }, runs, [], cfg, 5);
+  assert.deepEqual([env.class, env.blocking, env.pr_streak], ["INFRA_ERROR", false, undefined]);
   assert.equal(classify({ ...branchTest, error: infra }, [...trunkPasses(8)], [], cfg, 5).class, "INFRA_ERROR", "one failing commit is still the environment's, as before");
 });
 
