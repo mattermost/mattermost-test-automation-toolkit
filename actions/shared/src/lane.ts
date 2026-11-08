@@ -71,7 +71,8 @@ export function redReason(description: string | null | undefined = "", release =
   const d = String(description);
   // A lane triage judged as a whole (see diagnoseLane in e2e-test-triage): its label and what to do.
   const lane = /^\((machine failure, [^)]+|broken on main, not your change|broken on main|fixed on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
-  if (lane) return lane;
+  // A status written before today's lane labels keeps its meaning in today's words.
+  if (lane) return lane.replace(/^out of date/, "fixed on main").replace(/^needs investigation$/, "machine failure, re-run");
   if (/triage is checking why/.test(d)) return "triage is checking why";
   const { cleared, caused, appBug, fixed, outdated, machine, brokenBranch, check } = namedIn(d);
   const parts: string[] = [];
@@ -82,11 +83,14 @@ export function redReason(description: string | null | undefined = "", release =
   if (notYours) parts.push(`${notYours} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
-  if (release && fixed) parts.push(`${fixed} fixed on main`);
+  // A release run's fixed on main stays named (its fix is a backport). Statuses written before today's labels said "out of
+  // date" or gave pull guidance (no count) for the same thing, and "needs investigation" for a failure nothing explained,
+  // held as a machine failure is. Their words are not repeated.
+  const fixedHere = (release ? fixed : 0) + outdated;
+  if (fixedHere) parts.push(`${fixedHere} fixed on main`);
+  else if (pull) parts.push("fixed on main");
   if (brokenBranch) parts.push(`${brokenBranch} broken on branch`);
-  if (outdated || pull) parts.push(release ? `${outdated} out of date` : pull ?? "pull main changes");
-  if (machine) parts.push(`${machine} machine failure${machine === 1 ? "" : "s"}, re-run`);
-  if (check) parts.push(`${check} to check`);
+  if (machine + check) parts.push(`${machine + check} machine failure${machine + check === 1 ? "" : "s"}, re-run`);
   // Triage asked for the re-run itself, held it for a fix, or a person has to.
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";

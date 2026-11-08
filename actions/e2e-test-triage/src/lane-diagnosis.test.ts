@@ -285,7 +285,8 @@ test("a trunk run counts as broken only when most of its specs failed or none ra
 test("the PR-wide check names a lane's verdict and the interim texts", () => {
   assert.equal(redReason("(broken on main, not your change) 300 of 320 specs failed: Error"), "broken on main, not your change");
   assert.equal(redReason("(machine failure, re-running the lane) dispatch-run-14: …"), "machine failure, re-running the lane");
-  assert.equal(redReason("(out of date, merge master) ci/prepare-playwright failed"), "out of date, merge master");
+  assert.equal(redReason("(out of date, merge master) ci/prepare-playwright failed"), "fixed on main, merge master", "a status written before, in today's words");
+  assert.equal(redReason("(needs investigation) nothing explains it"), "machine failure, re-run");
   assert.equal(redReason(REPORTS_INCOMPLETE), "triage is checking why");
   assert.equal(redReason("(1 caused by PR) 99.9% passed (1 failed)"), "1 caused by PR", "a test's label is read as before");
 });

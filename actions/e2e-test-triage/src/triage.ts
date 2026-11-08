@@ -285,7 +285,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   // What triage decides from the tests: failures, missing reports, or a lane red only for tests that passed on a retry.
   // A lane red outside its tests is decided too, but only once its verdict rests on what TSIO's orchestration says
   // (see grounded below): a job that died is not, by itself, a reason to write anything.
-  let decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly;
+  // A lane red only because a job outside the tests died is decided too: its re-run, or why not (see onlyDeadJobs).
+  let decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly || redWhy === "upstream";
   // Like the required status, only an enforcing run writes to the PR.
   const announce = enforce && decides;
   // TRIAGE_LANES lists every lane's required context: then the triage check is one
@@ -444,7 +445,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // The later of the run's own attempt and the identity's: a re-run of failed jobs keeps the first attempt's TSIO
     // identity (gh_run_attempt 1), so the identity alone would promise a re-run the listener will not make.
     const attempt = Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1);
-    const onlyNoResults = (result.unnamed || result.missing) && !result.findings.some((f) => f.blocking);
+    // A spec that never ran (NOT_RUN) is no test's result either: re-running its shard is how it runs.
+    const onlyNoResults = (result.unnamed || result.missing || result.findings.some((f) => f.class === "NOT_RUN")) && !result.findings.some((f) => f.blocking && f.class !== "NOT_RUN");
     // Every report arrived and no test failed, but a job outside the tests died (a worker whose specs the others ran):
     // the lane is red only for that job, and its failed step decides the re-run as for a shard that sent nothing.
     const onlyDeadJobs = redWhy === "upstream" && !run.failing.length && !result.findings.some((f) => f.blocking);
@@ -478,6 +480,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const laneRerun = lane && lane.verdict.rerun !== "none" && attempt <= cfg.rerunAttempts && Number(env.GITHUB_RUN_ATTEMPT || attempt) <= cfg.rerunAttempts ? lane.verdict.rerun : null;
     const rerun = (lane ? laneRerun : rerunCheck?.rerun) ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = lane ? null : rerunCheck?.held ?? null;
+    // A bulk failure the base branch explains (the lane fails the same way there) is not the PR's: its tests are cleared
+    // as broken on main, as the lane is.
+    if (lane && lane.verdict.fault === "base branch")
+      for (const f of result.findings) if (f.mass) Object.assign(f, { mass: false, blocking: false, decision: "base_broken" });
     if (lane && laneTurnsGreen(lane.verdict, outsideTests) && !result.findings.some((f) => f.blocking)) result.verdict = "SUCCESS";
     else if (lane) result.verdict = "FAILURE";
     // The lane-result gate's line, held before the status is written: a lane red outside its tests (a job outside them
@@ -495,6 +501,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       ? laneDescription(lane.verdict, Boolean(rerun), lane.baseline?.base ?? prBase ?? "main")
       : flakyOnly
       ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}`
+      : onlyDeadJobs
+      ? `(${held ? `not re-run: ${held}` : `machine failure, ${rerun ? RERUNNING : RERUN}`}) ${passLine(run.counts)}`
       : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);

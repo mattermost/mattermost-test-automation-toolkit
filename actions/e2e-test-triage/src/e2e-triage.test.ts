@@ -937,14 +937,14 @@ test("one triage check for the whole PR summarises every lane", async () => {
     "e2e-test/maestro-ios": st("success", "6 passed, 1 failed (1 cleared by triage), 1 skipped"),
     "e2e-test/detox-ipad": st("success", "19 passed, 0 skipped"),
     "e2e-test/maestro-android": null,
-  }), { state: "failure", description: "detox-ios: 2 not caused by PR, 5 to check · maestro-ios cleared by triage" });
+  }), { state: "failure", description: "detox-ios: 2 not caused by PR, 5 machine failures, re-run · maestro-ios cleared by triage" });
   // mattermost#38601: every failure cleared, but two runners timed out without a report.
   assert.deepEqual(lanes({ "e2e-test/playwright-full/enterprise": st("failure", "1119 passed, 26 failed (26 cleared by triage), 118 skipped; 2 report(s) missing") }),
     { state: "failure", description: "playwright-full/enterprise: 26 not caused by PR, 2 report(s) missing, re-run" });
   assert.deepEqual(lanes({ "e2e-test/detox-ios": st("failure", "49 passed, 132 failed (not triaged, investigation required), 29 skipped") }),
     { state: "failure", description: "detox-ios: many failures in one run" });
   assert.deepEqual(lanes({ "e2e-test/detox-android": st("failure", "(49 cleared by triage, 4 unresolved; investigation required) 91.3% passed (555 passed, 53 failed, 42 skipped)") }),
-    { state: "failure", description: "detox-android: 49 not caused by PR, 4 to check, many failures in one run" });
+    { state: "failure", description: "detox-android: 49 not caused by PR, 4 machine failures, re-run, many failures in one run" });
   assert.deepEqual(lanes({ "e2e/linux": st("failure", "10 passed, 2 failed (not triaged: triage could not finish)") }),
     { state: "failure", description: "linux: triage could not finish" });
   assert.deepEqual(lanes({ "e2e-test/maestro-ios": st("success", "6 passed, 1 failed (1 cleared by triage), 1 skipped"), "e2e-test/detox-ios": st("success", "597 passed, 0 failed (0 cleared by triage)") }),
@@ -3337,7 +3337,11 @@ test("a lane red for a job outside the tests, or for no stated test failure, sta
       ]),
       log: () => {},
     });
-    assert.deepEqual(statuses, [], "upstream execution failed: a flaky test does not make that lane green");
+    // A job outside the tests died: triage says so on the lane (a machine failure, with its re-run or why not), and a
+    // flaky test never turns it green.
+    const lane = statuses.filter((s) => s.context === "e2e-test/playwright");
+    assert.ok(lane.length > 0 && lane.every((s) => s.state === "failure"), JSON.stringify(statuses));
+    assert.match(String(lane.at(-1)?.description), /^\((machine failure, re-run(ning)? the failed jobs|not re-run: [^)]+)\) /);
     assert.match(readFileSync(summaryPath, "utf8"), /^## E2E triage · playwright-full: 🔴 red outside the tests$/m);
   });
   // Only a status that says tests failed is one triage can turn green: no text, or any other, is not.
@@ -5412,7 +5416,7 @@ test("a release branch's run whose default-branch lookup fails leaves release to
   });
   assert.ok(lookedUp, "the default branch was asked for");
   const aggregate = written.filter((s) => s.context === "e2e-test/triage").at(-1);
-  assert.match(aggregate?.description ?? "", /other: 1 out of date/);
+  assert.match(aggregate?.description ?? "", /other: 1 fixed on main/, "a status written before reads in today's words");
   assert.doesNotMatch(aggregate?.description ?? "", /pull main changes/);
 });
 
@@ -5465,4 +5469,10 @@ test("a lane whose tests all clear while a job outside them died is never writte
   assert.ok(dead.written.every((s) => s.state !== "success"), JSON.stringify(dead.written));
   const plain = await run("99.9% passed (1383 passed, 1 failed, 63 skipped)");
   assert.equal(plain.verdict, "SUCCESS", "tests alone red: the cleared failure turns it green");
+});
+
+test("a bulk failure the base branch's lane explains is labelled broken on main, never the PR's", () => {
+  const cleared = finding({ title: "t1", class: "REGRESSION", blocking: false, decision: "base_broken" });
+  assert.deepEqual([statusLabelOf(cleared), bucketOf(cleared)], ["broken on main", "broken"]);
+  assert.equal(statusDescription("SUCCESS", [cleared], null, { passed: 9, failed: 1 }), "(1 broken on main) 90.0% passed (9 passed, 1 failed, 0 skipped)");
 });

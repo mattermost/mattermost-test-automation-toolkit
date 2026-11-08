@@ -1277,7 +1277,7 @@ function bucketOf(f) {
     return machineFailure(f) ? "check" : "broken";
   }
   if (f.decision === "first_failure") return "flaky";
-  if (brokeOnBase) return "broken";
+  if (brokeOnBase || f.decision === "base_broken") return "broken";
   if (f.release) return "flaky";
   const cause = f.decision === "adjudicator_unblock" ? f.judge?.cause : null;
   return cause === "bug_on_master" || cause === "test_bug" ? "broken" : "flaky";
@@ -1595,6 +1595,7 @@ function statusLabelOf(f) {
     return f.release ? "broken on branch" : "broken on main";
   }
   if (f.out_of_date && !f.release) return "fixed on main";
+  if (f.decision === "base_broken") return "broken on main";
   if (f.decision === "first_failure") return "flaky";
   if (f.class === "SAME_FAILURE_AS_CLEARED") return f.same_as_class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
   if (f.decision === "adjudicator_unblock") {
@@ -1701,7 +1702,7 @@ function releaseFromDescriptions(descriptions) {
 function redReason(description = "", release = false) {
   const d = String(description);
   const lane = /^\((machine failure, [^)]+|broken on main, not your change|broken on main|fixed on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
-  if (lane) return lane;
+  if (lane) return lane.replace(/^out of date/, "fixed on main").replace(/^needs investigation$/, "machine failure, re-run");
   if (/triage is checking why/.test(d)) return "triage is checking why";
   const { cleared, caused, appBug, fixed, outdated, machine, brokenBranch, check } = namedIn(d);
   const parts = [];
@@ -1710,11 +1711,11 @@ function redReason(description = "", release = false) {
   if (notYours) parts.push(`${notYours} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
-  if (release && fixed) parts.push(`${fixed} fixed on main`);
+  const fixedHere = (release ? fixed : 0) + outdated;
+  if (fixedHere) parts.push(`${fixedHere} fixed on main`);
+  else if (pull) parts.push("fixed on main");
   if (brokenBranch) parts.push(`${brokenBranch} broken on branch`);
-  if (outdated || pull) parts.push(release ? `${outdated} out of date` : pull ?? "pull main changes");
-  if (machine) parts.push(`${machine} machine failure${machine === 1 ? "" : "s"}, re-run`);
-  if (check) parts.push(`${check} to check`);
+  if (machine + check) parts.push(`${machine + check} machine failure${machine + check === 1 ? "" : "s"}, re-run`);
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";
   const missing = /(\d+) report\(s\) missing/.exec(d)?.[1];
@@ -3112,7 +3113,7 @@ function writeFindings(facts, log) {
 var INFRA_RE2 = /Failed to get ID Token|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|socket hang up|network (?:error|aborted|timeout)|Could not resolve host|TLS handshake timeout|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|429 Too Many Requests|rate limit exceeded|The runner has received a shutdown signal|lost communication with the server|hosted runner encountered an error|No space left on device|Unable to download artifact|Failed to download action|<!DOCTYPE html|answered with an HTML page/i;
 var HOLDS = [
   [/\*\* BUILD FAILED \*\*|error TS\d{4}:|Module not found|SyntaxError:|xcodebuild: error|Execution failed for task|Compilation failed|BUILD FAILURE|cannot find symbol/i, "the build failed"],
-  [/npm (?:ERR!|error) (?:code )?(?:ERESOLVE|ETARGET)|No matching version found|Could not find a version that satisfies/i, "the dependencies did not install"],
+  [/npm (?:ERR!|error) (?:code )?(?:ERESOLVE|ETARGET)|No matching version found|Could not find a version that satisfies|`npm ci` can only install packages when your package\.json and package-lock\.json/i, "the dependencies did not install"],
   [/server (?:is )?not healthy|server at "[^"]*" is not healthy|failed to start (?:the )?(?:test )?server|server did not (?:start|become ready)|health ?check failed|Timed out waiting for the server|panic:/i, "the test server did not start"]
 ];
 var SERVER_STEP = /start[- ]?server|\bserver\b|docker[- ]?compose/i;
@@ -3134,8 +3135,7 @@ function classifyDeadJob(job) {
     if (line) return { verdict: "hold", short, reason: `${job.name}: step "${step}" failed: ${line.slice(0, 200)}` };
   }
   const last = (lines.at(-1) ?? "no log").slice(0, 200);
-  if (SERVER_STEP.test(step)) return { verdict: "hold", short: "the test server did not start", reason: `${job.name}: step "${step}" ${how}: ${last}` };
-  if (BUILD_STEP.test(step)) return { verdict: "hold", short: "the build failed", reason: `${job.name}: step "${step}" ${how}: ${last}` };
+  if (SERVER_STEP.test(step) || BUILD_STEP.test(step)) return { verdict: "unclear", short: null, reason: `${job.name}: step "${step}" ${how}: ${last}` };
   if (SETUP_STEP.test(step)) return { verdict: "rerun", short: null, reason: `${job.name}: setup step "${step}" ${how}` };
   return { verdict: "unclear", short: null, reason: `${job.name}: step "${step}" ${how}` };
 }
@@ -3206,9 +3206,10 @@ async function decideRerun(jobs, ask, log = () => {
     const byId = new Map(answers.map((a) => [a.id, a]));
     const blamed = unclear.find((c) => byId.get(c.job.id)?.cause === "change");
     if (blamed) return { rerun: false, held: "the AI reads it as the change", reason: `${blamed.job.name}: ${byId.get(blamed.job.id)?.reason ?? ""} (AI)` };
-    const open = unclear.filter((c) => byId.get(c.job.id)?.cause !== "infrastructure");
-    if (open.length) return { rerun: false, held: null, reason: `could not tell why ${open.map((c) => c.job.name).join(", ")} stopped` };
-    for (const c of unclear) c.call = { verdict: "rerun", short: null, reason: `${c.job.name}: ${byId.get(c.job.id)?.reason ?? ""} (AI)` };
+    for (const c of unclear) {
+      const a = byId.get(c.job.id);
+      c.call = { verdict: "rerun", short: null, reason: a?.cause === "infrastructure" ? `${c.job.name}: ${a.reason} (AI)` : `${c.job.name}: could not tell why it stopped; re-run to tell the machine from the change` };
+    }
   }
   return { rerun: true, held: null, reason: calls.map((c) => c.call.reason).join("; ") };
 }
@@ -3506,7 +3507,7 @@ function baselineCall(facts, setup, setupShort = null) {
     return { label: "caused by PR", fault: "PR", action: "fix the change: the base branch passes this lane", evidence: `at the merge base ${name(at)}` };
   }
   if (tip && trunkBroken(tip)) return { label: "broken on main", fault: "base branch", action: `not your change: merge ${b?.base} once it is fixed`, evidence: `the base branch now: ${name(tip)}` };
-  const lag = behind > 0 ? `no run of this lane at the merge base; ${plural(behind, "commit")} behind` : "the PR is up to date with its base branch";
+  const lag = b?.behindBy == null ? "the base branch's run of this lane could not be read" : behind > 0 ? `no run of this lane at the merge base; ${plural(behind, "commit")} behind` : "the PR is up to date with its base branch";
   return { label: "caused by PR", fault: "PR", action: "fix the change: the base branch passes this lane", evidence: tip ? `${lag}; the base branch now: ${name(tip)}` : lag };
 }
 function diagnoseLane(facts) {
@@ -3897,7 +3898,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
   const redWhy = !run.failing.length && !run.missing && context ? await laneRedWhy(api, id, context, run.counts.flaky, log) : null;
   const flakyOnly = redWhy === "flaky";
   const outsideTests = Boolean(laneOnly) || Boolean(run.missing) || redWhy === "upstream" || redWhy === "outside";
-  let decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly;
+  let decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly || redWhy === "upstream";
   const announce = enforce && decides;
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
   let branchBase = null;
@@ -4042,7 +4043,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       log(`e2e-test-triage: lane ${lane ? "verdict" : "read (tests decide)"}: ${judged.verdict.label} (${judged.verdict.fault}): ${judged.verdict.what}`);
     }
     const attempt = Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1);
-    const onlyNoResults = (result.unnamed || result.missing) && !result.findings.some((f) => f.blocking);
+    const onlyNoResults = (result.unnamed || result.missing || result.findings.some((f) => f.class === "NOT_RUN")) && !result.findings.some((f) => f.blocking && f.class !== "NOT_RUN");
     const onlyDeadJobs = redWhy === "upstream" && !run.failing.length && !result.findings.some((f) => f.blocking);
     let rerunCheck = null;
     if (!lane && (onlyNoResults || onlyDeadJobs) && attempt <= cfg.rerunAttempts) {
@@ -4070,6 +4071,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const laneRerun = lane && lane.verdict.rerun !== "none" && attempt <= cfg.rerunAttempts && Number(env.GITHUB_RUN_ATTEMPT || attempt) <= cfg.rerunAttempts ? lane.verdict.rerun : null;
     const rerun = (lane ? laneRerun : rerunCheck?.rerun) ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = lane ? null : rerunCheck?.held ?? null;
+    if (lane && lane.verdict.fault === "base branch") {
+      for (const f of result.findings) if (f.mass) Object.assign(f, { mass: false, blocking: false, decision: "base_broken" });
+    }
     if (lane && laneTurnsGreen(lane.verdict, outsideTests) && !result.findings.some((f) => f.blocking)) result.verdict = "SUCCESS";
     else if (lane) result.verdict = "FAILURE";
     if (decides && result.verdict === "SUCCESS" && lane?.verdict.label !== "all specs ran" && context && (outsideTests || run.failing.length > 0 && await redOutsideTests(api, id, context, log)))
@@ -4078,7 +4082,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const laneSection = lane ? renderLane({ verdict: lane.verdict, rerunning: Boolean(rerun), lane: env.LANE || id.name, runURL, base: lane.baseline?.base ?? prBase ?? trunkBranch ?? null }) : "";
     const testsSummary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
     const summary = lane && !result.findings.length ? laneSection : [laneSection, testsSummary].filter(Boolean).join("\n");
-    const description = lane ? laneDescription(lane.verdict, Boolean(rerun), lane.baseline?.base ?? prBase ?? "main") : flakyOnly ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}` : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
+    const description = lane ? laneDescription(lane.verdict, Boolean(rerun), lane.baseline?.base ?? prBase ?? "main") : flakyOnly ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}` : onlyDeadJobs ? `(${held ? `not re-run: ${held}` : `machine failure, ${rerun ? RERUNNING : RERUN}`}) ${passLine(run.counts)}` : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
       (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}

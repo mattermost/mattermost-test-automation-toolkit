@@ -66,7 +66,7 @@ export function bucketOf(f: Finding): Bucket {
   }
   // Cleared as a first failure nothing ties to the PR (see settlePR): its class may rest on history that was not used.
   if (f.decision === "first_failure") return "flaky";
-  if (brokeOnBase) return "broken";
+  if (brokeOnBase || f.decision === "base_broken") return "broken";
   // A release run's cleared failure is not an app bug, whatever the model named it.
   if (f.release) return "flaky";
   const cause = f.decision === "adjudicator_unblock" ? f.judge?.cause : null;
@@ -566,6 +566,7 @@ export function statusLabelOf(f: Finding): StatusLabel {
     return f.release ? "broken on branch" : "broken on main";
   }
   if (f.out_of_date && !f.release) return "fixed on main";
+  if (f.decision === "base_broken") return "broken on main";
   if (f.decision === "first_failure") return "flaky";
   if (f.class === "SAME_FAILURE_AS_CLEARED") return f.same_as_class === "BROKEN_ON_TRUNK" ? "broken on main" : "flaky";
   if (f.decision === "adjudicator_unblock") {

@@ -69,7 +69,7 @@ function releaseFromDescriptions(descriptions) {
 function redReason(description = "", release = false) {
   const d = String(description);
   const lane = /^\((machine failure, [^)]+|broken on main, not your change|broken on main|fixed on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
-  if (lane) return lane;
+  if (lane) return lane.replace(/^out of date/, "fixed on main").replace(/^needs investigation$/, "machine failure, re-run");
   if (/triage is checking why/.test(d)) return "triage is checking why";
   const { cleared, caused, appBug, fixed, outdated, machine, brokenBranch, check } = namedIn(d);
   const parts = [];
@@ -78,11 +78,11 @@ function redReason(description = "", release = false) {
   if (notYours) parts.push(`${notYours} not caused by PR`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
-  if (release && fixed) parts.push(`${fixed} fixed on main`);
+  const fixedHere = (release ? fixed : 0) + outdated;
+  if (fixedHere) parts.push(`${fixedHere} fixed on main`);
+  else if (pull) parts.push("fixed on main");
   if (brokenBranch) parts.push(`${brokenBranch} broken on branch`);
-  if (outdated || pull) parts.push(release ? `${outdated} out of date` : pull ?? "pull main changes");
-  if (machine) parts.push(`${machine} machine failure${machine === 1 ? "" : "s"}, re-run`);
-  if (check) parts.push(`${check} to check`);
+  if (machine + check) parts.push(`${machine + check} machine failure${machine + check === 1 ? "" : "s"}, re-run`);
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";
   const missing = /(\d+) report\(s\) missing/.exec(d)?.[1];

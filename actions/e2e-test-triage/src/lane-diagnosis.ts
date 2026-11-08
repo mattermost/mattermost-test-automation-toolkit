@@ -160,7 +160,7 @@ function baselineCall(facts: LaneFacts, setup: boolean, setupShort: string | nul
   if (tip && trunkBroken(tip)) return { label: "broken on main", fault: "base branch", action: `not your change: merge ${b?.base} once it is fixed`, evidence: `the base branch now: ${name(tip)}` };
   // No run at the merge base, and the base branch passes the lane now (or has no run to say otherwise): the lane failed
   // as a whole on this PR's code, which is the PR's whether or not the branch is behind.
-  const lag = behind > 0 ? `no run of this lane at the merge base; ${plural(behind, "commit")} behind` : "the PR is up to date with its base branch";
+  const lag = b?.behindBy == null ? "the base branch's run of this lane could not be read" : behind > 0 ? `no run of this lane at the merge base; ${plural(behind, "commit")} behind` : "the PR is up to date with its base branch";
   return { label: "caused by PR", fault: "PR", action: "fix the change: the base branch passes this lane", evidence: tip ? `${lag}; the base branch now: ${name(tip)}` : lag };
 }
 
