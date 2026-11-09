@@ -38,7 +38,7 @@ const INFRA_RE =
 // What the change can break before a test runs, with the words the check uses for it.
 const HOLDS: [RegExp, string][] = [
   [/\*\* BUILD FAILED \*\*|error TS\d{4}:|Module not found|SyntaxError:|xcodebuild: error|Execution failed for task|Compilation failed|BUILD FAILURE|cannot find symbol/i, "the build failed"],
-  [/npm (?:ERR!|error) (?:code )?(?:ERESOLVE|ETARGET)|No matching version found|Could not find a version that satisfies/i, "the dependencies did not install"],
+  [/npm (?:ERR!|error) (?:code )?(?:ERESOLVE|ETARGET)|No matching version found|Could not find a version that satisfies|`npm ci` can only install packages when your package\.json and package-lock\.json/i, "the dependencies did not install"],
   [/server (?:is )?not healthy|server at "[^"]*" is not healthy|failed to start (?:the )?(?:test )?server|server did not (?:start|become ready)|health ?check failed|Timed out waiting for the server|panic:/i, "the test server did not start"],
 ];
 const SERVER_STEP = /start[- ]?server|\bserver\b|docker[- ]?compose/i;
@@ -65,8 +65,9 @@ export function classifyDeadJob(job: DeadJob): JobCall {
     if (line) return { verdict: "hold", short, reason: `${job.name}: step "${step}" failed: ${line.slice(0, 200)}` };
   }
   const last = (lines.at(-1) ?? "no log").slice(0, 200);
-  if (SERVER_STEP.test(step)) return { verdict: "hold", short: "the test server did not start", reason: `${job.name}: step "${step}" ${how}: ${last}` };
-  if (BUILD_STEP.test(step)) return { verdict: "hold", short: "the build failed", reason: `${job.name}: step "${step}" ${how}: ${last}` };
+  // A build or server step whose log names no failure holds nothing: only a log line that shows the change broke it
+  // does (HOLDS above). The rest is re-run once, which tells the machine from the change.
+  if (SERVER_STEP.test(step) || BUILD_STEP.test(step)) return { verdict: "unclear", short: null, reason: `${job.name}: step "${step}" ${how}: ${last}` };
   if (SETUP_STEP.test(step)) return { verdict: "rerun", short: null, reason: `${job.name}: setup step "${step}" ${how}` };
   return { verdict: "unclear", short: null, reason: `${job.name}: step "${step}" ${how}` };
 }
@@ -141,9 +142,9 @@ export async function readDeadJobs({ fetchImpl, token, repository, runId, attemp
 }
 
 /**
- * Re-run only when every dead job died on its setup, network or runner. One that the change broke (build, test server,
- * dependencies) holds the re-run and says why. Jobs the rules can't settle go to the model once; one it can't settle,
- * or a failed call, leaves the re-run to a person. No dead job: nothing for "re-run failed jobs" to re-run.
+ * Re-run unless a dead job's log shows the change broke it (build, test server, dependencies), which holds the re-run
+ * and says why, as does the model reading a job as the change. Jobs nothing explains are re-run once. No dead job:
+ * nothing for "re-run failed jobs" to re-run.
  */
 export async function decideRerun(jobs: DeadJob[], ask: AskCause | null, log: (message: string) => void = () => {}): Promise<RerunDecision> {
   if (!jobs.length) return { rerun: false, held: null, reason: "no failed job to re-run" };
@@ -163,9 +164,12 @@ export async function decideRerun(jobs: DeadJob[], ask: AskCause | null, log: (m
     const byId = new Map(answers.map((a) => [a.id, a]));
     const blamed = unclear.find((c) => byId.get(c.job.id)?.cause === "change");
     if (blamed) return { rerun: false, held: "the AI reads it as the change", reason: `${blamed.job.name}: ${byId.get(blamed.job.id)?.reason ?? ""} (AI)` };
-    const open = unclear.filter((c) => byId.get(c.job.id)?.cause !== "infrastructure");
-    if (open.length) return { rerun: false, held: null, reason: `could not tell why ${open.map((c) => c.job.name).join(", ")} stopped` };
-    for (const c of unclear) c.call = { verdict: "rerun", short: null, reason: `${c.job.name}: ${byId.get(c.job.id)?.reason ?? ""} (AI)` };
+    // Nothing shows the change broke them: re-run once (within the repo's allowance), which tells the machine from the
+    // change. A failure the change caused fails the same way again, on the last attempt, for a person to read.
+    for (const c of unclear) {
+      const a = byId.get(c.job.id);
+      c.call = { verdict: "rerun", short: null, reason: a?.cause === "infrastructure" ? `${c.job.name}: ${a.reason} (AI)` : `${c.job.name}: could not tell why it stopped; re-run to tell the machine from the change` };
+    }
   }
   return { rerun: true, held: null, reason: calls.map((c) => c.call.reason).join("; ") };
 }

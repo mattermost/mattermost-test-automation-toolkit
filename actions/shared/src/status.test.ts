@@ -45,6 +45,8 @@ test("release from status text: PR-only labels, then release-only labels, then t
   assert.equal(releaseFromDescriptions(["(1 server compat) 50% passed", "(pull main changes) 50% passed"]), false);
   assert.equal(releaseFromDescriptions(["(1 test bug, 1 caused by PR) 50% passed"]), true);
   assert.equal(releaseFromDescriptions(["(1 caused by PR) 50% passed", "(1 out of date) 50% passed"]), false);
-  assert.equal(releaseFromDescriptions(["(1 fixed on main) 50% passed", null]), true);
+  // A PR writes "fixed on main" too now (cleared), so it says nothing; "broken on branch" is a release run's.
+  assert.equal(releaseFromDescriptions(["(1 fixed on main) 50% passed", null]), undefined);
+  assert.equal(releaseFromDescriptions(["(1 broken on branch) 50% passed"]), true);
   assert.equal(releaseFromDescriptions(["(1 app bug) 50% passed", undefined, ""]), undefined);
 });

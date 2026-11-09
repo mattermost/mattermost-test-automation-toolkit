@@ -16,7 +16,8 @@ const github = (artifacts: { name: string; expired?: boolean }[], pages = 1) => 
   const fetchImpl = (async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     calls.push({ method, url });
-    if (method === "POST" && url.endsWith("/actions/runs/40301634711/rerun-failed-jobs")) return new Response(null, { status: 201 });
+    if (method === "POST" && (url.endsWith("/actions/runs/40301634711/rerun-failed-jobs") || url.endsWith("/actions/runs/40301634711/rerun") || /\/actions\/jobs\/\d+\/rerun$/.test(url))) return new Response(null, { status: 201 });
+    if (method === "GET" && /\/actions\/jobs\/\d+$/.test(url)) return Response.json({ run_id: 40301634711 });
     const page = Number(new URL(url).searchParams.get("page") ?? 1);
     if (method === "GET" && url.includes("/actions/runs/40301634711/artifacts")) {
       const rows = page <= pages ? artifacts.filter((_, i) => i % pages === page - 1) : [];
@@ -35,6 +36,62 @@ test("a lane's request for this attempt re-runs the run's failed jobs once, what
   const result = await requestRerun({ env: env("1"), fetchImpl: gh.fetchImpl, log: () => {} });
   assert.deepEqual(result, { rerun: true, reason: "re-running the failed jobs for e2e-test-detox-android, e2e-test-detox-ios (attempt 2 of 3)" });
   assert.equal(posts(gh.calls), 1);
+});
+
+test("a run a newer run on the same PR or concurrency group superseded is not re-run; dispatches for different PRs do not supersede each other", async () => {
+  const gh = github([{ name: "e2e-triage-rerun-attempt-1-of-3-e2e-test-detox-ios" }]);
+  const inner = gh.fetchImpl;
+  let headBranch = "pr-1";
+  let newerSha = "b2";
+  let ownPr: number | null = null;
+  let newerPr: number | null = null;
+  let sharedGroup: string | null = null;
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/actions/runs/40301634711"))
+      return Response.json({
+        id: 40301634711,
+        workflow_id: 7,
+        head_branch: headBranch,
+        head_sha: "a1",
+        run_number: 10,
+        ...(ownPr ? { pull_requests: [{ number: ownPr }] } : {}),
+        ...(sharedGroup ? { concurrency_group: sharedGroup } : {}),
+      });
+    if (url.includes(`/actions/workflows/7/runs?branch=${headBranch}`))
+      return Response.json({
+        workflow_runs: [
+          {
+            id: 40301634999,
+            head_branch: headBranch,
+            head_sha: newerSha,
+            run_number: 11,
+            ...(newerPr ? { pull_requests: [{ number: newerPr }] } : {}),
+            ...(sharedGroup ? { concurrency_group: sharedGroup } : {}),
+          },
+          { id: 40301634711, head_branch: headBranch, head_sha: "a1", run_number: 10 },
+        ],
+      });
+    return inner(url, init);
+  }) as FetchImpl;
+  assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: () => {} }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
+  assert.equal(posts(gh.calls), 0);
+  // A newer run on the same PR branch with the same head SHA still shares the branch's concurrency group: not re-run.
+  newerSha = "a1";
+  assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: () => {} }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
+  assert.equal(posts(gh.calls), 0);
+  // Manual dispatches from master for different PRs do not supersede each other, even when master moved between them.
+  headBranch = "master";
+  newerSha = "b2";
+  ownPr = 101;
+  newerPr = 102;
+  assert.equal((await requestRerun({ env: env("1"), fetchImpl, log: () => {} })).rerun, true);
+  // A newer manual dispatch from master for the same PR does supersede the earlier run.
+  newerPr = 101;
+  assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: () => {} }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
+  // When dispatches for different PRs share the workflow's concurrency group, the newer run still blocks the re-run.
+  newerPr = 102;
+  sharedGroup = "e2e-refs/heads/master";
+  assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: () => {} }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
 });
 
 test("an earlier attempt's request, an expired one, or none at all re-runs nothing", async () => {
@@ -93,4 +150,108 @@ test("the marker e2e-test-triage's action uploads is one this action acts on: na
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a lane whose TSIO run began is re-run whole from its first job, so its workers find a new run instead of a closed one", async () => {
+  // mattermost run 41940673353: a worker timed out holding a spec; re-running only the failed jobs found the run closed.
+  const gh = github([{ name: "e2e-triage-rerun-attempt-1-of-2-job-126961998001-e2e-test-playwright-full-enterprise" }]);
+  const result = await requestRerun({ env: env("1"), fetchImpl: gh.fetchImpl, log: () => {} });
+  assert.deepEqual(result, { rerun: true, reason: "re-running the whole lane e2e-test-playwright-full-enterprise from its first job (attempt 2 of 2)" });
+  assert.deepEqual(gh.calls.filter((c) => c.method === "POST").map((c) => new URL(c.url).pathname), ["/repos/mattermost/mattermost-mobile/actions/jobs/126961998001/rerun"]);
+});
+
+test("a marker whose job ID belongs to another run is refused before any re-run POST", async () => {
+  const gh = github([{ name: "e2e-triage-rerun-attempt-1-of-2-job-126961998001-e2e-test-playwright-full-enterprise" }]);
+  const inner = gh.fetchImpl;
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    if ((init?.method ?? "GET") === "GET" && url.endsWith("/actions/jobs/126961998001")) return Response.json({ run_id: 99999999999 });
+    return inner(url, init);
+  }) as FetchImpl;
+  await assert.rejects(requestRerun({ env: env("1"), fetchImpl, log: () => {} }), /e2e-test-rerun: job 126961998001 does not belong to run 40301634711/);
+  assert.equal(posts(gh.calls), 0);
+});
+
+test("two lanes that need a fresh start, or a lane whose first job was not found, re-run every job of the run", async () => {
+  for (const artifacts of [
+    [{ name: "e2e-triage-rerun-attempt-1-of-2-job-11-e2e-test-cypress-full-enterprise" }, { name: "e2e-triage-rerun-attempt-1-of-2-job-12-e2e-test-playwright-full-enterprise" }],
+    [{ name: "e2e-triage-rerun-attempt-1-of-2-job-11-e2e-test-cypress-full-enterprise" }, { name: "e2e-triage-rerun-attempt-1-of-2-e2e-test-playwright-full-enterprise" }],
+    [{ name: "e2e-triage-rerun-attempt-1-of-2-job-0-e2e-test-cypress-full-enterprise" }],
+  ]) {
+    const gh = github(artifacts);
+    const result = await requestRerun({ env: env("1"), fetchImpl: gh.fetchImpl, log: () => {} });
+    assert.equal(result.rerun, true);
+    assert.match(result.reason, /^re-running every job of the run for /);
+    assert.deepEqual(gh.calls.filter((c) => c.method === "POST").map((c) => new URL(c.url).pathname), ["/repos/mattermost/mattermost-mobile/actions/runs/40301634711/rerun"], JSON.stringify(artifacts));
+  }
+});
+
+test("a fresh-start request on the last allowed attempt asks a person, like any other", async () => {
+  const gh = github([{ name: "e2e-triage-rerun-attempt-2-of-2-job-11-e2e-test-cypress-full-enterprise" }]);
+  const result = await requestRerun({ env: env("2"), fetchImpl: gh.fetchImpl, log: () => {} });
+  assert.deepEqual(result, { rerun: false, reason: "attempt 2 is the last of 2; a person re-runs it" });
+  assert.equal(posts(gh.calls), 0);
+});
+
+test("push runs on trunk are never told apart by their commit titles: an unresolved identity is superseded, not re-run", async () => {
+  const gh = github([{ name: "e2e-triage-rerun-attempt-1-of-3-e2e-test-detox-ios" }]);
+  const inner = gh.fetchImpl;
+  let event = "push";
+  let ownTitle = "Fix the sidebar (#100)";
+  let newerTitle = "Bump deps (#101)";
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/actions/runs/40301634711"))
+      return Response.json({ id: 40301634711, workflow_id: 7, head_branch: "main", head_sha: "a1", run_number: 10, event, display_title: ownTitle });
+    if (url.includes("/actions/workflows/7/runs?branch=main"))
+      return Response.json({ workflow_runs: [
+        { id: 40301634999, head_branch: "main", head_sha: "b2", run_number: 11, event, display_title: newerTitle },
+        { id: 40301634711, head_branch: "main", head_sha: "a1", run_number: 10, event, display_title: ownTitle },
+      ] });
+    return inner(url, init);
+  }) as FetchImpl;
+  // Commit titles name merged PRs (#100, #101), not the runs' identities; with no group either, the newer run may share
+  // the concurrency group, so the older run is left to a person.
+  const logged: string[] = [];
+  assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: (m) => logged.push(m) }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
+  assert.equal(posts(gh.calls), 0);
+  assert.ok(logged.some((m) => /run 40301634711 \(\{"pr":null,"group":null\}\) vs newer run 40301634999 .*an unresolved identity/.test(m)), "the skip names the unresolved identity");
+  // A dispatched run's run-name does name the PR it tests: dispatches for different PRs still do not supersede each other.
+  event = "workflow_dispatch";
+  ownTitle = "E2E for PR #100";
+  newerTitle = "E2E for PR #101";
+  assert.equal((await requestRerun({ env: env("1"), fetchImpl, log: () => {} })).rerun, true);
+});
+
+// mattermost#39803 review: a lane can leave its marker while another lane still runs; a later cancel must win over it.
+test("a cancelled run is re-run only when a job ran past its time limit and nothing cancelled the run", async () => {
+  const gh = github([{ name: "e2e-triage-rerun-attempt-1-of-3-e2e-test-detox-ios" }]);
+  const inner = gh.fetchImpl;
+  let conclusion = "cancelled";
+  let notes: Record<number, string[]> = {};
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/actions/runs/40301634711/attempts/1")) return Response.json({ conclusion });
+    if (url.includes("/actions/runs/40301634711/attempts/1/jobs"))
+      return Response.json({ total_count: 3, jobs: [{ id: 1, conclusion: "success" }, { id: 2, conclusion: "cancelled" }, { id: 3, conclusion: "cancelled" }] });
+    const note = /\/check-runs\/(\d+)\/annotations$/.exec(url);
+    if (note) return Response.json((notes[Number(note[1])] ?? []).map((message) => ({ message })));
+    if (url.endsWith("/actions/runs/40301634711")) return Response.json({ id: 40301634711, workflow_id: 7, head_branch: "pr-1", head_sha: "a1", run_number: 10 });
+    if (url.includes("/actions/workflows/7/runs")) return Response.json({ workflow_runs: [] });
+    return inner(url, init);
+  }) as FetchImpl;
+  const run = () => requestRerun({ env: env("1"), fetchImpl, log: () => {} });
+  // mattermost run 42195788698: a cypress worker hit its 35-minute limit; the run ended "cancelled". Re-run.
+  notes = { 2: ["The job has exceeded the maximum execution time of 35m0s"] };
+  assert.equal((await run()).rerun, true);
+  // A person cancelled the run after the marker was left: not re-run, even beside a timed-out job.
+  notes = { 2: ["The job has exceeded the maximum execution time of 35m0s"], 3: ["The run was canceled by @someone."] };
+  assert.deepEqual(await run(), { rerun: false, reason: "the run was cancelled by @someone, not by a job's time limit; not re-run" });
+  // A newer run cancelled it through the concurrency group (mattermost-mobile run 42516258120): not re-run either.
+  notes = { 2: ["The run was canceled by @github-actions[bot].", "The operation was canceled."] };
+  assert.deepEqual(await run(), { rerun: false, reason: "the run was cancelled by @github-actions[bot], not by a job's time limit; not re-run" });
+  // Cancelled with no job past its limit: nothing shows a timeout, so not re-run.
+  notes = { 2: ["The operation was canceled."] };
+  assert.deepEqual(await run(), { rerun: false, reason: "the run was cancelled and no job ran past its time limit; not re-run" });
+  // A failed run is not checked for cancels.
+  conclusion = "failure";
+  assert.equal((await run()).rerun, true);
+  assert.equal(gh.calls.filter((c) => c.method === "POST").length, 2, "only the timed-out and the failed run were re-run");
 });

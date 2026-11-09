@@ -3,7 +3,7 @@
 
 import { FAILED_STATUSES } from "../../shared/src/tsio.ts";
 import { DEFAULTS, laneOf } from "./config.ts";
-import type { At, Config, Finding, Observation, SpecRun, TestRef, TsioId } from "./types.ts";
+import type { At, ChangedFile, ChangedByPR, Config, Finding, Observation, SpecRun, TestRef, TsioId } from "./types.ts";
 
 // The last alternative: a mobile spec whose shard uploaded nothing never ran.
 const INFRA_RE =
@@ -79,6 +79,18 @@ export const EXONERATED = new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_C
 // standing breakage, and greening it would hide it.
 export const EXONERATED_ON_TRUNK = new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
 export const exoneratedSet = (isTrunkRun: boolean): Set<string> => (isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED);
+
+/**
+ * Whether a finding carries evidence that the change under test caused it: the change edits the test, fails it on its
+ * last commits and never on trunk (a PR streak), changes what the test looks for or a file its error names, fails it on
+ * every try of this build while trunk and other PRs never do (a reproducible regression), or the judge blamed it from a
+ * hunk. Only these may keep a PR's failure red (see settlePR); a base-branch fix never is one.
+ */
+export function causedByPR(f: Finding): boolean {
+  if (f.out_of_date && f.class !== "OWNED_BY_PR") return false;
+  return f.class === "OWNED_BY_PR" || Boolean(f.pr_streak) || Boolean(f.changed_by_pr) || f.untouched === false || (Boolean(f.mass) && !f.mass_unproven) ||
+    f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto" || f.decision === "reproducible_regression";
+}
 export const BORDERLINE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
 // An environment error still blocking is judged too: its repo's PRs can break their own environment, or it was held on a
 // run that failed mostly on its environment.
@@ -90,6 +102,117 @@ export interface ClassifyOptions {
   trunkBranch?: string | null | undefined;
   /** The commit this run tested: its re-runs are not earlier commits of the PR. */
   commitSha?: string | null;
+  /**
+   * The PR's changed files with their patches, only when that list is complete: a PR streak names the PR's changed line
+   * that holds what the test looked for (see changeTouchesFailure, prStreak).
+   */
+  patches?: ChangedFile[] | null;
+}
+
+// A selector's class, id or test id that names one element: it has "_" or "-" or an inner capital (no-results__title,
+// adminConsoleWrapper), so a plain word (.active, #root) that many elements share is not one.
+const ANCHOR_NAME = /^(?=.{6,})[A-Za-z_][\w-]*[A-Za-z0-9_]$/;
+const namesOneElement = (name: string): boolean => ANCHOR_NAME.test(name) && /[_-]|[a-z][A-Z]/.test(name);
+// Where an error names a selector: .class or #id after a quote, a space, a paren, a combinator or an element tag as
+// chai-jquery prints one ('<div.SidebarChannel__dragHandle>'), never ".toHaveText" after "expect(locator)".
+const SELECTOR_RE = /(?:^|[\s'"`(\[>+~,]|<[a-z][\w-]*)[.#]([A-Za-z_][\w-]*)/g;
+const TEST_ID_RE = /(?:getByTestId\(\s*|data-testid\s*=\s*\\?|testid\s*[:=]\s*)['"`]([^'"`]+)['"`]/gi;
+// The text a test waited for: Playwright's "Expected: ...", getByText and accessible names, Cypress's content.
+const TEXT_RES = [
+  /^Expected(?: string| substring| pattern)?:\s*"(.+)"\s*$/i,
+  /getByText\(\s*(['"`])(.+?)\1/i,
+  /\bname:\s*(['"`])(.+?)\1/i,
+  /Expected to find content:\s*'(.+?)'/i,
+  /to (?:have|contain) text\s*'(.+?)'/i,
+];
+/** Text as words to compare: ICU arguments ({limit, number}) and numbers (10,000) dropped, punctuation and case gone. */
+const words = (text: string): string => text.toLowerCase().replace(/\{[^{}]*\}/g, " ").replace(/\d[\d,.]*/g, " ").replace(/[^\p{L}\s]+/gu, " ").replace(/\s+/g, " ").trim();
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** What a failure looked for, from its error's message (not its stack): element names and expected texts. */
+export function failureAnchors(error: string | null | undefined): { names: { name: string; kind: "selector" | "test id" }[]; texts: string[] } {
+  const message: string[] = [];
+  for (const raw of String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (/^at\s/.test(line)) break;
+    if (line) message.push(line);
+  }
+  const names = new Map<string, "selector" | "test id">();
+  const texts = new Set<string>();
+  for (const line of message) {
+    for (const m of line.matchAll(TEST_ID_RE)) if (m[1].length >= 4) names.set(m[1], "test id");
+    for (const m of line.matchAll(SELECTOR_RE)) if (namesOneElement(m[1]) && !names.has(m[1])) names.set(m[1], "selector");
+    for (const re of TEXT_RES) {
+      const m = re.exec(line);
+      const text = m?.[m.length - 1];
+      // Three words or more: a short label ("Save", "Cancel") is in too many lines to point at one change.
+      if (text && words(text).split(" ").length >= 3) texts.add(text);
+    }
+  }
+  return { names: [...names].map(([name, kind]) => ({ name, kind })), texts: [...texts] };
+}
+
+// Unit tests and snapshots repeat what the product renders: a product file that changes it is named first.
+const secondary = (file: string): boolean => /(?:^|\/)__snapshots__\/|\.snap$|\.(?:test|spec)\.[cm]?[jt]sx?$|_test\.go$/.test(file);
+// A lock file repeats its manifest's dependency names and hashes thousands of times; the manifest is what the PR chose.
+const LOCK_FILE = /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|go\.sum|Gemfile\.lock|Podfile\.lock)$/;
+// Text no build or test runs: documentation and plain-text notes. A selector or phrase in one changes nothing a test sees.
+const NOT_EXECUTED = /\.(?:md|mdx|markdown|rst|adoc|txt)$|(?:^|\/)(?:LICENSE|NOTICE|CHANGELOG|AUTHORS)(?:\.[^/]*)?$/i;
+/** A changed file that can change what the app does: not a unit test, a snapshot, a lock file or documentation. */
+export const isProductChange = (file: string): boolean => !secondary(file) && !LOCK_FILE.test(file) && !NOT_EXECUTED.test(file);
+
+/**
+ * The first changed line of the PR (added or removed) that holds what the failure looked for: a selector's class or id,
+ * a test id, or the expected text (compared as words, so "Only the latest 10,000 entries" matches the message
+ * "Only the latest {limit, number} entries"). The failing spec itself is the edits-the-test rule's. Null when nothing
+ * matches or no patch is known; a file GitHub shows no patch for is not searched.
+ */
+export function changeTouchesFailure(test: TestRef, files: ChangedFile[] | null | undefined): ChangedByPR | null {
+  if (!files?.length) return null;
+  const { names, texts } = failureAnchors(test.error);
+  if (!names.length && !texts.length) return null;
+  const spec = test.repo_path ?? test.file;
+  const nameRes = names.map((a) => ({ ...a, re: new RegExp(`(?<![\\w-])${escapeRe(a.name)}(?![\\w-])`) }));
+  const textWords = texts.map((t) => ({ text: t, words: words(t) }));
+  const ordered = [...files].sort((a, b) => Number(secondary(a.filename)) - Number(secondary(b.filename)));
+  for (const f of ordered) {
+    if (!f.patch || f.filename === spec || LOCK_FILE.test(f.filename) || NOT_EXECUTED.test(f.filename)) continue;
+    const changedLines = f.patch.split("\n").filter((line) => /^[+-]/.test(line) && !/^(?:\+\+\+|---)\s/.test(line));
+    const holds = (body: string, a: { re?: RegExp; words?: string }): boolean => (a.re ? a.re.test(body) : Boolean(a.words) && words(body).includes(a.words!));
+    // Removed: on a removed line and on no added line of the file (a moved or re-indented line is a change, not a removal).
+    const removedHere = (a: { re?: RegExp; words?: string }): boolean => !changedLines.some((l) => l.startsWith("+") && holds(l.slice(1), a));
+    // A kept anchor is shown on its added line (the PR's version); a removed one on the line that removed it.
+    const shown = (line: string, a: { re?: RegExp; words?: string }): string =>
+      (line.startsWith("-") ? changedLines.find((l) => l.startsWith("+") && holds(l.slice(1), a)) ?? line : line).slice(1).trim().slice(0, 200);
+    for (const line of changedLines) {
+      const body = line.slice(1);
+      const gone = line.startsWith("-");
+      const named = nameRes.find((a) => holds(body, a));
+      if (named) return { file: f.filename, anchor: named.name, kind: named.kind, line: shown(line, named), removed: gone && removedHere(named) };
+      const said = textWords.find((t) => holds(body, t));
+      if (said) return { file: f.filename, anchor: said.text, kind: "text", line: shown(line, said), removed: gone && removedHere(said) };
+    }
+  }
+  return null;
+}
+
+/** How a changed line names what the test looked for, in a sentence. */
+export const describeChange = (c: ChangedByPR): string => (c.kind === "text" ? `the text "${c.anchor.slice(0, 120)}"` : `the ${c.kind} ${c.anchor}`);
+
+/**
+ * A PR streak: this PR's last commits failed the same way, and trunk never did. That is not a flake, so it is a
+ * REGRESSION held red that no rule or model answer clears (see pr_streak); the judge may still blame the PR from a
+ * changed hunk. It is out of date only where the base branch changed the test (or the code it runs through) since this
+ * PR last merged it, which markOutOfDate checks and names; a branch a few commits behind is not, by itself, the cause.
+ */
+export function prStreak(f: Finding, streak: number, base: string, touched: ChangedByPR | null): Finding {
+  return Object.assign(f, {
+    class: "REGRESSION",
+    blocking: true,
+    pr_streak: streak,
+    ...(touched ? { changed_by_pr: touched, untouched: false } : {}),
+    reason: `Failed the same way on this PR's last ${streak} commits and never on ${base}, so it is not a flake${touched ? `; this PR changes ${describeChange(touched)} that the test looks for, in ${touched.file}` : ""}.`,
+  });
 }
 
 /** Classify one failing test from its history and the PR's changed files. */
@@ -102,7 +225,7 @@ export function classify(
   lane: string | null = null,
   opts: ClassifyOptions = {},
 ): Finding {
-  const { isTrunkRun = false, groupId = null, trunkBranch = null, commitSha = null } = opts;
+  const { isTrunkRun = false, groupId = null, trunkBranch = null, commitSha = null, patches = null } = opts;
   const own = new Set(changedFiles);
   // A run is never part of its own history.
   const seen = groupId == null ? observations : observations.filter((o) => o.group_id !== groupId);
@@ -119,6 +242,8 @@ export function classify(
   // with nothing related changed since, did not break because of the PR.
   const mine = currentPR == null ? [] : inLane.filter((o) => prOf(o) === currentPR);
   const minePassed = mine.filter((o) => o.status === "passed" || o.status === "flaky");
+  // Trunk runs known to be the history lane's own: with a lane set, a row that names no lane is kept in trunk but not here.
+  const laneRuns = lane == null ? trunk.length : trunk.filter((o) => o.name != null && laneOf(o.name) === lane).length;
   const trunkFails = trunk.filter((o) => FAILED_STATUSES.has(o.status)).length;
   const trunkFlaky = trunk.filter((o) => o.status === "flaky").length;
   const trunkPasses = trunk.filter((o) => o.status === "passed").length;
@@ -149,7 +274,10 @@ export function classify(
     .map((o) => sameKey(o.error_excerpt))
     .filter((k): k is string => Boolean(k)))];
   const stats = {
-    trunk: { runs: trunk.length, fails: trunkFails, flaky: trunkFlaky, passes: trunkPasses, latest: latestTrunk?.status ?? "" },
+    trunk: {
+      runs: trunk.length, fails: trunkFails, flaky: trunkFlaky, passes: trunkPasses, latest: latestTrunk?.status ?? "",
+      lane_runs: laneRuns,
+    },
     cross_pr: {
       prs: failedPRs,
       examples: crossFailures
@@ -183,23 +311,28 @@ export function classify(
     return out("OWNED_BY_PR", isTrunkRun
       ? `This commit changes ${test.file}; a failure in a spec the commit edits is not noise.`
       : `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
-  // Branch state: this PR's last commits fail the same way, and trunk does not. The PR's own runs count (newest
-  // first) while they fail with this first line; a pass or flaky run in between ends the streak. Commits count, not
-  // runs: re-runs of one commit (this one included) are one. The current commit counts as one. Blocking, in the
-  // out-of-date bucket: merge trunk and re-run, never a clear. Needs enough trunk history to say "never on trunk".
-  if (!isTrunkRun && currentPR != null && !test.identity_unresolved) {
+  // PR streak: this PR's last commits fail the same way, and trunk does not. The PR's own runs count (newest first)
+  // while they fail with this first line; a pass or flaky run in between ends the streak. Commits count, not runs:
+  // re-runs of one commit (this one included) are one. The current commit counts as one. Needs enough trunk history to
+  // say "never on trunk". Held, never cleared, with the PR's changed line that holds what the test looked for when
+  // there is one (see prStreak). Out of date only where markOutOfDate finds the base branch changed the test since.
+  // Not where another PR failed the same way: a failure other changes share is more likely the test's or the
+  // environment's than this PR's, so the rules below (the cross-PR flake, the judge) decide it instead.
+  // Not an environment error: one that recurs on the PR's commits (a test-server outage across two pushes) is still
+  // the environment's, decided by the INFRA_ERROR rule below. A PR that breaks its own server fails the lane's setup on
+  // every worker, which the lane verdict names as the PR's.
+  if (!isTrunkRun && currentPR != null && !test.identity_unresolved && !failedPRs.length && !isInfraError(test.error)) {
     const earlier = new Set<string>();
     for (const o of mine) {
       if (!FAILED_STATUSES.has(o.status) || !sameFirstLine(o.error_excerpt, test.error)) break;
       if (o.commit_sha && o.commit_sha !== commitSha) earlier.add(o.commit_sha);
     }
     const streak = earlier.size + 1;
-    const trunkFailedSame = trunk.some((o) => FAILED_STATUSES.has(o.status) && sameFirstLine(o.error_excerpt, test.error));
-    if (streak >= 2 && trunk.length >= cfg.minTrunkRuns && latestTrunk?.status === "passed" && !trunkFailedSame) {
-      const base = trunkBranch || "the default branch";
-      return Object.assign(out("BRANCH_STATE", `Failed the same way on this PR's last ${streak} commits and never on ${base}: the branch is behind or broken; merge ${base} and re-run.`, true), {
-        out_of_date: { base, behind: null, commit: null, streak },
-      });
+    // A trunk run that failed this way counts, whether or not a retry then passed it (a flaky pass is the same failure).
+    const trunkFailedSame = trunk.some((o) => (FAILED_STATUSES.has(o.status) || o.status === "flaky") && sameFirstLine(o.error_excerpt, test.error));
+    // "Never on trunk" needs enough trunk runs known to be this lane's: a row naming no lane is not one (as in settlePR).
+    if (streak >= 2 && trunk.length >= cfg.minTrunkRuns && laneRuns >= cfg.minTrunkRuns && latestTrunk?.status === "passed" && !trunkFailedSame) {
+      return prStreak(out("REGRESSION", "", true), streak, trunkBranch || "the default branch", changeTouchesFailure(test, patches));
     }
   }
   // The test's own error says the environment failed (the test server down or behind a proxy page,
@@ -248,6 +381,11 @@ export function classify(
     while (rough < trunk.length && (FAILED_STATUSES.has(trunk[rough].status) || trunk[rough].status === "flaky")) rough++;
     if (rough >= 2 && trunk.slice(0, rough).some((o) => FAILED_STATUSES.has(o.status)))
       return out("BROKEN_ON_TRUNK", `Still failing: failed or passed only on retry in each of the previous ${rough} ${lane ?? "trunk"} runs. A pass on retry is not a fix.`, true);
+    // Other PRs failing it the same way while trunk passes: the test's or the environment's flake, not this commit's
+    // break. Two are enough here, where the PR rule wants crossPRMinPRs: trunk's own last run passed, so this commit is
+    // the one change in question, and two unrelated changes failing it the same way already rule that change out.
+    if (failedPRs.length >= Math.min(2, cfg.crossPRMinPRs) && trunkFails === 0 && trunkPasses > 0)
+      return out("FLAKY_CROSS_PR", `Failed${ownKey.kind === "distinctive" ? " with the same error" : ownKey.kind === "stuck" ? " stuck at the same step" : ""} on ${failedPRs.length} PRs in the last ${cfg.crossPRRuns} runs (${stats.cross_pr.examples.slice(0, 3).join(", ")}) while ${trunkBranch || "trunk"} passed ${trunkPasses} of ${trunk.length}.`, false);
     // Intermittent clears only as a PR's failure would: often enough (pMin; one flake in 48 runs says little about a
     // failure now) and the same failure (its error, or for one that failed every try, the same kind of failure).
     if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0) {
@@ -444,7 +582,8 @@ export function sameFailure(findings: Finding[]): Finding[] {
     if (!anchors.has(k)) anchors.set(k, f);
   }
   for (const f of findings) {
-    if (!f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.decision === "evidence_incomplete" || f.failed_everywhere || blamed(f)) continue;
+    // A failure that failed on this PR's last commits and never on trunk is no flake, whatever another test shows.
+    if (!f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.decision === "evidence_incomplete" || f.failed_everywhere || f.pr_streak || blamed(f)) continue;
     const k = keyOf(f);
     const anchor = k ? anchors.get(k) : undefined;
     if (!anchor) continue;

@@ -13,18 +13,29 @@ test("a lane's name in the PR-wide check drops the shared prefix", () => {
   assert.equal(laneName("e2e/linux"), "linux");
 });
 
+test("a lane a PR's fixed on main cleared is named as cleared", () => {
+  const lane = (context: string, state: string, description: string) => ({ context, status: { state, description } as never });
+  assert.deepEqual(laneSummary([lane("e2e-test/cypress-full/enterprise", "success", "(1 fixed on main) 99.9% passed (1289 passed, 1 failed, 20 skipped)")]),
+    { state: "success", description: "cypress-full/enterprise cleared by triage · all lanes green" });
+});
+
 test("the red reason reads the labels a status now carries", () => {
   assert.equal(redReason("(2 flaky, 2 caused by PR) 99.7% passed (1186 passed, 4 failed, 164 skipped)"), "2 not caused by PR, 2 caused by PR");
-  assert.equal(redReason("(1 broken on main, 4 needs investigation) 90.0% passed (9 passed, 5 failed, 0 skipped)"), "1 not caused by PR, 4 to check");
-  assert.equal(redReason("(1 out of date, 1 caused by PR) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, pull main changes");
-  assert.equal(redReason("(1 caused by PR, 2 fixed on main) 25.0% passed (1 passed, 3 failed, 0 skipped)"), "1 caused by PR, pull main changes");
-  assert.equal(redReason("(1 caused by PR, pull main changes) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, pull main changes", "the label the check now carries");
-  assert.equal(redReason("(pull main changes) 50.0% passed (1 passed, 1 failed, 0 skipped)"), "pull main changes");
-  assert.equal(redReason("(1 caused by PR, pull release-10.5 changes) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, pull release-10.5 changes", "a non-default base branch keeps its name");
-  assert.equal(redReason("(1 out of date, 1 app bug) 50.0% passed (1 passed, 2 failed, 0 skipped)", true), "1 app bug, 1 out of date", "a release run keeps its out-of-date label");
+  assert.equal(redReason("(1 broken on main, 4 needs investigation) 90.0% passed (9 passed, 5 failed, 0 skipped)"), "1 not caused by PR, 4 machine failures, re-run");
+  assert.equal(redReason("(1 out of date, 1 caused by PR) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, 1 fixed on main");
+  // A PR's fixed on main is not blocking: counted with the rest the PR did not cause.
+  assert.equal(redReason("(2 fixed on main, 1 caused by PR) 25.0% passed (1 passed, 3 failed, 0 skipped)"), "2 not caused by PR, 1 caused by PR");
+  assert.equal(redReason("(1 flaky, 2 machine failure) 25.0% passed (1 passed, 3 failed, 0 skipped)"), "1 not caused by PR, 2 machine failures, re-run");
+  assert.equal(redReason("(1 broken on branch) 50.0% passed (1 passed, 1 failed, 0 skipped)", true), "1 broken on branch");
+  assert.equal(redReason("(fixed on main, not your change) 1 report(s) missing"), "fixed on main, not your change");
+  assert.equal(redReason("(broken on main) 40 of 400 specs failed"), "broken on main");
+  assert.equal(redReason("(1 caused by PR, pull main changes) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, fixed on main", "the label the check now carries");
+  assert.equal(redReason("(pull main changes) 50.0% passed (1 passed, 1 failed, 0 skipped)"), "fixed on main");
+  assert.equal(redReason("(1 caused by PR, pull release-10.5 changes) 50.0% passed (1 passed, 2 failed, 0 skipped)"), "1 caused by PR, fixed on main", "a non-default base branch keeps its name");
+  assert.equal(redReason("(1 out of date, 1 app bug) 50.0% passed (1 passed, 2 failed, 0 skipped)", true), "1 app bug, 1 fixed on main", "a release run keeps its out-of-date label");
   assert.equal(redReason("(1 fixed on main) 50.0% passed (1 passed, 1 failed, 0 skipped)", true), "1 fixed on main", "a release run keeps its fixed-on-main label");
-  assert.equal(redReason("(3 flaky, 1 needs investigation; many failures in one run) 80.0% passed (4 passed, 1 failed, 0 skipped)"), "3 not caused by PR, 1 to check, many failures in one run");
-  assert.equal(redReason("(17 flaky, 2 needs investigation; mostly environment errors, re-run) 96.9% passed (587 passed, 19 failed, 42 skipped)"), "17 not caused by PR, 2 to check, environment errors, re-run");
+  assert.equal(redReason("(3 flaky, 1 needs investigation; many failures in one run) 80.0% passed (4 passed, 1 failed, 0 skipped)"), "3 not caused by PR, 1 machine failure, re-run, many failures in one run");
+  assert.equal(redReason("(17 flaky, 2 needs investigation; mostly environment errors, re-run) 96.9% passed (587 passed, 19 failed, 42 skipped)"), "17 not caused by PR, 2 machine failures, re-run, environment errors, re-run");
   assert.equal(redReason("(not triaged, mostly environment errors, re-run) 99.2% passed (240 passed, 2 failed, 3 skipped)"), "environment errors, re-run");
   assert.equal(redReason("(1 flaky; 2 report(s) missing) 0% passed (0 passed, 1 failed, 0 skipped)"), "1 not caused by PR, 2 report(s) missing, re-run");
   assert.equal(redReason("(re-run the failed jobs; 1 report(s) missing) 0% passed (0 passed, 1 failed, 0 skipped)"), "1 report(s) missing, re-run");
@@ -36,15 +47,15 @@ test("the red reason reads the labels a status now carries", () => {
   assert.equal(redReason("(re-running the failed jobs; 1 report(s) missing) 0% passed (0 passed, 1 failed, 0 skipped)"), "1 report(s) missing, re-running");
   assert.equal(redReason("(re-running the failed jobs) 0% passed (0 passed, 1 failed, 0 skipped)"), "re-running the failed jobs");
   assert.equal(redReason("(not re-run: the build failed) 615 passed, 0 failed, 2 not run, 17 skipped"), "not re-run: the build failed", "a held re-run names why");
-  assert.equal(redReason("(1 flaky, 1 needs investigation) 10 passed, 1 failed, 1 not run, 0 skipped"), "1 not caused by PR, 1 to check", "a spec that did not run is not a re-run unless the status asks for one");
+  assert.equal(redReason("(1 flaky, 1 needs investigation) 10 passed, 1 failed, 1 not run, 0 skipped"), "1 not caused by PR, 1 machine failure, re-run", "a spec that did not run is not a re-run unless the status asks for one");
   assert.equal(redReason("(1 flaky; re-run the failed jobs) 10 passed, 1 failed, 3 not run, 0 skipped"), "1 not caused by PR, re-run the failed jobs", "beside other labels the not-run count is not all re-run");
 });
 
 test("the red reason still reads the wording a status written before the labels carries", () => {
-  assert.equal(redReason("(49 cleared by triage, 4 unresolved; investigation required) 91.3% passed (555 passed, 53 failed, 42 skipped)"), "49 not caused by PR, 4 to check, many failures in one run");
+  assert.equal(redReason("(49 cleared by triage, 4 unresolved; investigation required) 91.3% passed (555 passed, 53 failed, 42 skipped)"), "49 not caused by PR, 4 machine failures, re-run, many failures in one run");
   assert.equal(redReason("(0 cleared by triage; 1 report(s) missing) 100% passed (1 passed, 0 failed, 0 skipped)"), "1 report(s) missing, re-run");
   assert.equal(redReason("(not triaged, investigation required) 99.2% passed"), "many failures in one run");
-  assert.equal(redReason("(3 flaky, 1 needs investigation; investigation required) 80.0% passed (4 passed, 1 failed, 0 skipped)"), "3 not caused by PR, 1 to check, many failures in one run");
+  assert.equal(redReason("(3 flaky, 1 needs investigation; investigation required) 80.0% passed (4 passed, 1 failed, 0 skipped)"), "3 not caused by PR, 1 machine failure, re-run, many failures in one run");
   assert.equal(redReason("10 passed, 2 failed (not triaged: triage could not finish)"), "triage could not finish");
   assert.equal(redReason("(0 flaky) 100% passed (9 passed, 0 failed, 0 skipped)"), "still red", "nothing named is nothing to explain");
   assert.equal(redReason(undefined), "still red");
@@ -56,27 +67,27 @@ test("a lane summary reads red lanes by their labels and old wording alike, and 
     "e2e-test/maestro-ios": st("success", "(1 flaky) 99.9% passed (5000 passed, 1 failed, 0 skipped)"),
     "e2e-test/detox-ipad": st("success", "(0 flaky) 100% passed (19 passed, 0 failed, 0 skipped)"),
     "e2e-test/maestro-android": null,
-  }), { state: "failure", description: "detox-ios: 2 not caused by PR, 5 to check · maestro-ios cleared by triage" });
+  }), { state: "failure", description: "detox-ios: 2 not caused by PR, 5 machine failures, re-run · maestro-ios cleared by triage" });
   assert.deepEqual(lanes({
     "e2e-test/playwright-full/enterprise": st("failure", "(1 out of date, 2 caused by PR) 50% passed (4 passed, 4 failed, 0 skipped)"),
     "e2e/linux": st("success", "235 passed, 0 failed"),
-  }), { state: "failure", description: "playwright-full/enterprise: 2 caused by PR, pull main changes" });
+  }), { state: "failure", description: "playwright-full/enterprise: 2 caused by PR, 1 fixed on main" });
   assert.deepEqual(laneSummary([
     { context: "e2e-test/ubuntu-11.11", status: st("failure", "(1 out of date) 50% passed (1 passed, 1 failed, 0 skipped)") },
-  ]), { state: "failure", description: "ubuntu-11.11: 1 out of date" }, "a release run keeps its labels in the lane summary even without explicit release flag");
+  ]), { state: "failure", description: "ubuntu-11.11: 1 fixed on main" }, "a release run keeps its labels in the lane summary even without explicit release flag");
   assert.deepEqual(lanes({ "e2e-test/detox-ios": st("success", "(0 flaky) 597 passed, 0 failed") }), { state: "success", description: "All lanes green" });
 });
 
 test("pull guidance in a lane is kept even beside a label only a release run writes", () => {
   assert.deepEqual(lanes({ "e2e-test/playwright-full/enterprise": st("failure", "(1 app bug, pull main changes) 50.0% passed (1 passed, 2 failed, 0 skipped)") }),
-    { state: "failure", description: "playwright-full/enterprise: 1 app bug, pull main changes" });
+    { state: "failure", description: "playwright-full/enterprise: 1 app bug, fixed on main" });
   const across = lanes({
     "e2e-test/detox-ios": st("failure", "(1 test bug) 50.0% passed (1 passed, 1 failed, 0 skipped)"),
     "e2e-test/detox-android": st("failure", "(1 out of date) 50.0% passed (1 passed, 1 failed, 0 skipped)"),
     "e2e-test/maestro-ios": st("failure", "(pull main changes) 50.0% passed (1 passed, 1 failed, 0 skipped)"),
   }).description;
-  assert.match(across, /detox-android: pull main changes/, "an old out-of-date lane takes the PR wording");
-  assert.match(across, /maestro-ios: pull main changes/);
+  assert.match(across, /detox-android: 1 fixed on main/, "an old out-of-date lane reads in today's words");
+  assert.match(across, /maestro-ios: fixed on main/);
 });
 
 test("a flagged run reads the same way: its flag while a failure blocks, none once all are cleared", () => {
@@ -85,8 +96,8 @@ test("a flagged run reads the same way: its flag while a failure blocks, none on
     { state: "success", description: "playwright cleared by triage · all lanes green" });
   // One still blocks: the flag stays, after the labels.
   assert.equal(redReason("(3 flaky, 1 caused by PR; mostly environment errors, re-run) 0% passed (0 passed, 4 failed, 0 skipped)"), "3 not caused by PR, 1 caused by PR, environment errors, re-run");
-  assert.equal(redReason("(24 flaky, 6 needs investigation; many failures in one run) 0% passed (0 passed, 30 failed, 0 skipped)"), "24 not caused by PR, 6 to check, many failures in one run");
-  assert.equal(redReason("(4 needs investigation; mostly environment errors, re-run) 0% passed (0 passed, 4 failed, 0 skipped)"), "4 to check, environment errors, re-run");
+  assert.equal(redReason("(24 flaky, 6 needs investigation; many failures in one run) 0% passed (0 passed, 30 failed, 0 skipped)"), "24 not caused by PR, 6 machine failures, re-run, many failures in one run");
+  assert.equal(redReason("(4 needs investigation; mostly environment errors, re-run) 0% passed (0 passed, 4 failed, 0 skipped)"), "4 machine failures, re-run, environment errors, re-run");
 });
 
 test("a lane that is pending keeps the PR-wide check pending, whatever its labels", () => {
@@ -112,4 +123,13 @@ test("a red check triage does not cover keeps the aggregate from saying all lane
   const reds = ["cypress-full/enterprise", "playwright-full/enterprise", "cypress-full/fips"].map((n) => ({ context: `e2e-test/${n}`, status: st("failure", "(3 caused by PR, 2 needs investigation) 99.1% passed") }));
   const red = laneSummary(reds, [upgrade]).description;
   assert.ok(red.length <= 140 && red.endsWith(" · not triaged: 1 red"), `the warning survives the cut on a red check too: ${red}`);
+});
+
+test("an upgrade check its own triage judged is named with its verdict, not as untriaged", () => {
+  const green = { context: "e2e-test/playwright-full/enterprise", status: st("success", "100% passed (1315)") };
+  const judged = { context: "e2e-test/playwright-full/enterprise/upgrade-from-release-11.11", status: st("failure", "(1 broken on main) 99.9% passed (1385 passed, 1 failed)") };
+  assert.deepEqual(laneSummary([green], [judged]), { state: "success", description: "triaged lanes green · playwright-full/enterprise/upgrade-from-release-11.11: 1 not caused by PR" });
+  const machine = { context: "e2e-test/fips/upgrade-11.10", status: st("failure", "(machine failure, re-running the lane) worker 3: Failed to get ID Token.") };
+  assert.equal(laneSummary([green], [machine, { context: "e2e-test/upgrade-x", status: st("failure", "x") }]).description,
+    "triaged lanes green · fips/upgrade-11.10: machine failure, re-running the lane · not triaged: upgrade-x red");
 });

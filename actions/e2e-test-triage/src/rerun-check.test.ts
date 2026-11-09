@@ -30,7 +30,11 @@ test("a dead shard whose build, test server or dependencies broke is held, with 
   const server = classifyDeadJob(job({ step: "start-server", tail: "Waiting for http://localhost:8065\nserver is not healthy after 120s" }));
   assert.deepEqual([server.verdict, server.short], ["hold", "the test server did not start"]);
   assert.match(server.reason, /server is not healthy after 120s/);
-  assert.equal(classifyDeadJob(job({ step: "start-server", tail: "exited with code 1" })).short, "the test server did not start", "the step says what broke");
+  // A step's name alone, with no log line that shows what broke, holds nothing: it is re-run once to tell.
+  assert.equal(classifyDeadJob(job({ step: "start-server", tail: "exited with code 1" })).verdict, "unclear");
+  assert.equal(classifyDeadJob(job({ step: "Build app", tail: "" })).verdict, "unclear");
+  // A lockfile out of sync with package.json is the change's (mobile PR 10306: expo bumped, lock not updated).
+  assert.equal(classifyDeadJob(job({ step: "Install", tail: "npm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync." })).short, "the dependencies did not install");
   assert.equal(classifyDeadJob(job({ step: "npm ci", tail: "npm error code ERESOLVE\nnpm error ERESOLVE unable to resolve dependency tree" })).short, "the dependencies did not install");
   assert.equal(classifyDeadJob(job({ step: "npm ci", tail: "npm warn ERESOLVE overriding peer dependency\nnpm error Exit handler never called!" })).verdict, "rerun", "an ERESOLVE warning is a healthy install's noise");
 });
@@ -96,7 +100,7 @@ test("an API call the test server answers with an HTML page is its environment, 
   assert.equal(classifyDeadJob(job({ step: "e2e/enable-public-links", tail: "Error: POST /api/v4/users/login 403 <!DOCTYPE html><html>" })).verdict, "rerun");
 });
 
-test("one held job holds the re-run; unclear ones go to the model, and an unanswered one asks a person", async () => {
+test("one held job holds the re-run; unclear ones go to the model, and an unanswered one is re-run once", async () => {
   const infra = job({ id: 1, step: "npm ci", tail: "ECONNRESET" });
   const build = job({ id: 2, name: "machine-2", step: "Build", tail: "** BUILD FAILED **" });
   const hung = job({ id: 3, name: "machine-3", conclusion: "cancelled", step: "Run tests", tail: "Running 40 tests" });
@@ -105,9 +109,10 @@ test("one held job holds the re-run; unclear ones go to the model, and an unansw
   assert.deepEqual([held.rerun, held.held], [false, "the build failed"]);
   assert.match(held.reason, /^machine-2: step "Build" failed: \*\* BUILD FAILED \*\*/);
   assert.deepEqual(await decideRerun([], null), { rerun: false, held: null, reason: "no failed job to re-run" });
+  // Nothing shows the change broke it: re-run once, which tells the machine from the change.
   const unasked = await decideRerun([infra, hung], null);
-  assert.deepEqual([unasked.rerun, unasked.held], [false, null]);
-  assert.match(unasked.reason, /could not tell why machine-3 stopped/);
+  assert.deepEqual([unasked.rerun, unasked.held], [true, null]);
+  assert.match(unasked.reason, /machine-3: could not tell why it stopped; re-run to tell the machine from the change/);
   const asked: DeadJob[][] = [];
   const ask = (cause: "infrastructure" | "change" | "unclear"): AskCause => async (jobs) => { asked.push(jobs); return jobs.map((j) => ({ id: j.id, cause, reason: "the simulator froze" })); };
   assert.equal((await decideRerun([infra, hung], ask("infrastructure"))).rerun, true);
@@ -115,9 +120,9 @@ test("one held job holds the re-run; unclear ones go to the model, and an unansw
   const blamed = await decideRerun([infra, hung], ask("change"));
   assert.deepEqual([blamed.rerun, blamed.held], [false, "the AI reads it as the change"]);
   assert.match(blamed.reason, /machine-3: the simulator froze \(AI\)/);
-  assert.equal((await decideRerun([hung], ask("unclear"))).rerun, false);
+  assert.equal((await decideRerun([hung], ask("unclear"))).rerun, true, "the model unsure: re-run once");
   const broken: AskCause = async () => { throw new Error("anthropic 529"); };
-  assert.equal((await decideRerun([hung], broken)).rerun, false, "a failed call asks a person");
+  assert.equal((await decideRerun([hung], broken)).rerun, true, "a failed call: re-run once, as with no model");
 });
 
 test("the check names the hold; the summary says why and what to do", () => {

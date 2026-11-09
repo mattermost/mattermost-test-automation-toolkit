@@ -159,7 +159,9 @@ export async function judge(
     // An environment error the rules cleared is not asked; one still blocking is the judge's to clear or blame.
     // A release run asks about every failure still held, whatever the class.
     if (!pack || f.identity_unresolved || !(pack.release ? f.blocking : (JUDGED.has(f.class) && f.blocking) || exoneratedSet(isTrunkRun).has(f.class))) continue;
-    const advisory = !pack.release && !canChange(f.class, pack, isTrunkRun);
+    // A held streak with a related hunk is asked: the one change an answer can make is to blame the PR from it.
+    const blamable = Boolean(f.pr_streak) && evidenceIds(pack).some((id) => id.startsWith("hunk_"));
+    const advisory = !pack.release && !blamable && !canChange(f.class, pack, isTrunkRun);
     if (advisory && !(cfg.advise && f.blocking && JUDGED.has(f.class))) {
       ledger.skipped.no_effect++;
       f.ai = { skipped: "nothing the model could change" };
@@ -191,8 +193,9 @@ export async function judge(
         continue;
       }
       const d = decide(m.f.class, answer, m.pack, cfg, isTrunkRun, false);
-      // A failure held as failing everywhere may be blamed on the PR, never cleared; decideRelease reads the lanes itself.
-      if (m.f.failed_everywhere && !d.blocking && !m.pack.release) Object.assign(m.f, { decision: "advice", judge: d.answer });
+      // A failure held as failing everywhere, or on this PR's last commits and never on trunk, may be blamed on the PR,
+      // never cleared; decideRelease reads the lanes itself.
+      if ((m.f.failed_everywhere || m.f.pr_streak) && !d.blocking && !m.pack.release) Object.assign(m.f, { decision: "advice", judge: d.answer });
       else Object.assign(m.f, { blocking: d.blocking, decision: d.decision, judge: d.answer });
     }
   };
@@ -247,7 +250,7 @@ export async function judge(
         g.error = a;
       } else {
         g.answer = a;
-        if (cfg.answers) cfg.answers[answerKey(model, g.lead.pack)] = { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence, explanation: a.explanation, provenance: a.provenance };
+        if (cfg.answers) cfg.answers[answerKey(model, g.lead.pack)] = { cause: a.cause, confidence: a.confidence, cited_evidence: a.cited_evidence, explanation: a.explanation, ...(a.fix ? { fix: a.fix } : {}), provenance: a.provenance };
       }
       for (const m of g.members) m.f.ai = { model, cost_usd: (m.f.ai?.cost_usd ?? 0) + share };
     }

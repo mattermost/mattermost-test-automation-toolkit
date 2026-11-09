@@ -19,16 +19,18 @@ interface HistoryPage {
   has_more?: boolean;
 }
 
-const HISTORY_RETRY_MS = 500;
+// Waits before each retry of a history page. TSIO's history read can time out at its gateway (504) under load: two runs
+// of PR 38885 lost their triage to one 504 each, so a failed read is tried four times over about six seconds.
+const HISTORY_RETRY_MS: readonly number[] = [500, 1500, 4000];
 
 /**
- * POSTs one history page. A timeout, a dropped connection or a 5xx answer is retried once after a short pause;
- * any other answer is returned for the caller to refuse. Each attempt has its own timeout.
+ * POSTs one history page. A timeout, a dropped connection or a 5xx answer is retried (see HISTORY_RETRY_MS); any other
+ * answer is returned for the caller to refuse. Each attempt has its own timeout.
  */
 async function postHistory(fetchImpl: FetchImpl, url: string, body: Record<string, unknown>): Promise<Response> {
   let failure: unknown;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    if (attempt > 1) await new Promise<void>((resolve) => setTimeout(resolve, HISTORY_RETRY_MS));
+  for (let attempt = 0; attempt <= HISTORY_RETRY_MS.length; attempt++) {
+    if (attempt > 0) await new Promise<void>((resolve) => setTimeout(resolve, HISTORY_RETRY_MS[attempt - 1]));
     try {
       const res = await fetchImpl(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(120000) });
       if (res.status < 500) return res;
@@ -127,15 +129,22 @@ export async function fetchHistory(
     if (!byLeaf.has(leaf)) byLeaf.set(leaf, []);
     byLeaf.get(leaf)!.push(t);
   }
-  const queries: { branch?: string; runs: number }[] = [];
+  const queries: ({ branch?: string; runs: number } | { branch: string; since: string })[] = [];
   if (trunkBranch) queries.push({ branch: trunkBranch, runs: cfg.trunkRuns });
   queries.push({ runs: cfg.crossPRRuns });
+  // The trunk query counts its runs over every lane: a lane the base branch runs rarely (an upgrade lane, once a day
+  // among a dozen lanes per commit) gets one run or none in it. Such a lane's trunk history is read again over the
+  // whole window (see windowDays), its own runs filtered here as before.
+  const laneTrunkRuns = new Set<string>();
+  const allTrunkRuns = new Set<string>();
+  let widened = false;
   // The trunk query overlaps the other, so rows with a group id are deduplicated.
   const seen = new Map<string, string>();
   const ancestryByLeaf = new Map<string, Set<string>>();
   const fallbackByLeaf = new Map<string, Set<string>>();
   const dedupe = queries.length > 1;
-  for (const q of queries) {
+  for (let qi = 0; qi < queries.length; qi++) {
+    const q = queries[qi];
     for (let page = 1; page <= HISTORY_MAX_PAGES; page++) {
       const body: Record<string, unknown> = { repository, until, files, page, per_page: HISTORY_PER_PAGE, ...q };
       if (reportName) body.report = reportName;
@@ -148,8 +157,10 @@ export async function fetchHistory(
         const leaf = `${o.file}\n${o.title}`;
         const candidates = byLeaf.get(leaf);
         if (!candidates) continue;
+        if (qi === 0 && o.group_id != null) allTrunkRuns.add(String(o.group_id));
         // Another lane's rows are never evidence, nor grounds for ambiguity.
         if (lane != null && o.name != null && laneOf(o.name) !== lane) continue;
+        if (qi === 0 && o.group_id != null) laneTrunkRuns.add(String(o.group_id));
         if (reportName) {
           if (!o.report_name) byTest.reportUnknown = true;
           else if (!String(o.report_name).startsWith(reportName)) continue;
@@ -198,6 +209,13 @@ export async function fetchHistory(
         byTest.truncated = true;
         warn(`history for ${files.length} file(s) hit the ${HISTORY_MAX_PAGES}-page cap with more to come; nothing will be cleared on partial history`);
       }
+    }
+    // Widened only when other lanes crowded this one out of the trunk window: it held enough runs, few of them its own.
+    if (qi === 0 && trunkBranch && lane != null && !widened && laneTrunkRuns.size < cfg.minTrunkRuns && allTrunkRuns.size >= cfg.minTrunkRuns) {
+      widened = true;
+      const since = new Date(Date.parse(until) - cfg.windowDays * 86400000).toISOString();
+      warn(`only ${laneTrunkRuns.size} run(s) of ${lane} among ${trunkBranch}'s last ${cfg.trunkRuns}; reading ${trunkBranch}'s history since ${since.slice(0, 10)}`);
+      queries.splice(1, 0, { branch: trunkBranch, since });
     }
   }
   // Rows are attempts; the rules count runs. Collapse each run's attempts to one outcome.

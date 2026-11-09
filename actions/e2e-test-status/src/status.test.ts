@@ -294,7 +294,7 @@ test("the aggregate names a red E2E check under its own prefix that triage does 
   assert.equal((f.posts.at(-1) as CommitStatus).description, "triaged lanes green · not triaged: playwright-full/enterprise/upgrade-from-release-11.10 red");
 });
 
-test("release workflows preserve out of date and fixed on main labels across refresh and summarize, including for legacy callers", async () => {
+test("release workflows read old out of date labels as fixed on main across refresh and summarize, including for legacy callers", async () => {
   const f = fixture([{ ...status("20", "1", "failure"), description: "(1 out of date, 1 fixed on main) 50.0% passed (2 passed, 2 failed, 0 skipped)" }]);
   const baseEnv = {
     COMPOSITE_IDENTITY: JSON.stringify(id), GITHUB_TOKEN: "fake", STATUS_CONTEXT: lane,
@@ -303,15 +303,16 @@ test("release workflows preserve out of date and fixed on main labels across ref
   };
   // Legacy caller (no RELEASE input, default ""): derived from release lane status or composite-identity branch.
   await publish({ env: { ...baseEnv, OPERATION: "refresh" }, fetchImpl: f.fetchImpl });
-  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 1 fixed on main, 1 out of date");
+  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 2 fixed on main");
   await publish({ env: { ...baseEnv, OPERATION: "summarize" }, fetchImpl: f.fetchImpl });
-  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 1 fixed on main, 1 out of date");
+  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 2 fixed on main");
   await publish({
     env: { ...baseEnv, COMPOSITE_IDENTITY: JSON.stringify({ ...id, branch: "release-11.7" }), OPERATION: "refresh" },
     fetchImpl: f.fetchImpl,
   });
-  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 1 fixed on main, 1 out of date");
-  // Explicit RELEASE: "false" overrides inference for non-release callers.
+  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 2 fixed on main");
+  // Explicit RELEASE: "false" overrides inference for non-release callers: a PR's fixed on main is not blocking, and the
+  // legacy "out of date" keeps its old pull guidance.
   await publish({ env: { ...baseEnv, RELEASE: "false", OPERATION: "refresh" }, fetchImpl: f.fetchImpl });
-  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: pull main changes");
+  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 1 not caused by PR, 1 fixed on main");
 });

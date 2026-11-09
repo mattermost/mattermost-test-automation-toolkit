@@ -44,7 +44,8 @@ const onlyElsewhere = (platform: string, file: string): boolean =>
  * to the judge, which reads those changes.
  */
 export function commonSenseClear(f: Finding, pack: Pack | null | undefined): string | null {
-  if (!pack || !f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete") return null;
+  // A held streak (pr_streak) failed on this PR's last commits and never on trunk: no flake, on any platform.
+  if (!pack || !f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.out_of_date || f.pr_streak || f.decision === "evidence_incomplete") return null;
   const platform = platformOf(f.report_name);
   const lanes = f.other_lanes ?? [];
   const passedOn = lanes.filter((l) => l.result === "passed").map((l) => l.platform);

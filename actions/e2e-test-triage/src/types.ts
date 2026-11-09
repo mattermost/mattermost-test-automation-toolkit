@@ -54,6 +54,11 @@ export interface TrunkStats {
   flaky: number;
   passes: number;
   latest: string;
+  /**
+   * The runs known to be the history lane's own: with a lane set, a row that names no lane counts in runs but not here.
+   * Absent: every run counts (no lane set, or stats built elsewhere).
+   */
+  lane_runs?: number;
 }
 
 export interface CrossPRStats {
@@ -101,6 +106,15 @@ export interface Finding extends TestRef {
   trunk_fixed?: { last_fail: At | null; first_pass: At | null };
   this_pr: ThisPRStats;
   untouched?: boolean;
+  /** The PR's changed line that holds what the failing test looked for (see changeTouchesFailure). */
+  changed_by_pr?: ChangedByPR;
+  /**
+   * A PR streak (see prStreak): how many of this PR's last commits failed the same way, never on trunk. Unless the base
+   * branch changed the test since (markOutOfDate), the PR's change is the cause: held, never cleared, and labelled so.
+   */
+  pr_streak?: number;
+  /** For a PR streak: the PR's changed product files most likely behind it (at most 3), for the summary to name. */
+  suspects?: string[];
   producer?: Evidence;
   out_of_date?: OutOfDate;
   broke_by?: BrokeBy;
@@ -109,6 +123,22 @@ export interface Finding extends TestRef {
   other_lanes?: { platform: string; result: string }[];
   /** A failure of a release branch's run: the model is asked what kind of failure it is (see SYSTEM_RELEASE). */
   release?: boolean;
+  /** A failure of a run with no PR on the default branch: what still blocks is that branch's own break. */
+  trunk_run?: boolean;
+  /**
+   * Held on a PR run that failed in bulk (see settlePR): most of the run failed while the base branch passes, so the
+   * change broke something those tests share. It is the PR's, though no one test points at it, only where the base
+   * branch is seen to pass it (see mass_unproven).
+   */
+  mass?: boolean;
+  /**
+   * A bulk failure (mass) whose base-branch pass is not shown: its history is unusable or names no passing run, or the
+   * PR's change list is unknown. Not the PR's on that evidence: red as a machine failure, re-run. The lane verdict can
+   * still clear it as broken on main.
+   */
+  mass_unproven?: boolean;
+  /** Cleared by settlePR although its history could not be used (unchecked, or not tied to this test). */
+  history_unused?: boolean;
   /** The other platforms of this commit where it also failed, after failing every try here (see holdFailedEverywhere). */
   failed_everywhere?: string[];
   /** The earliest test of the same spec that failed before this one in this run, with another error (see markEarlierFailures). */
@@ -151,6 +181,8 @@ export interface Answer {
   confidence: number;
   cited_evidence: string[];
   explanation: string;
+  /** With caused_by_pr: what to change, naming the file (the judge's suggestion). Absent otherwise. */
+  fix?: string;
   provenance?: Provenance;
 }
 
@@ -191,6 +223,12 @@ export interface Pack {
   earlier_failure_same_spec?: { id: "earlier_failure_same_spec" } & EarlierFailure;
   tries_in_this_run?: { ran: number; failed: number };
   test_code_near_failure?: string;
+  /**
+   * A PR streak (see prStreak): the test failed the same way on this PR's last `failed_commits` commits, passed in all
+   * `trunk_runs` recent trunk runs, and trunk did not change it since this PR last merged trunk. The judge is asked
+   * which change in the hunks causes it, and the fix.
+   */
+  pr_streak?: { id: "pr_streak"; failed_commits: number; trunk_runs: number };
   /** A release branch's run (see releasePack): what the run is, instead of a PR. */
   release?: { id: "release"; branch: string; base: string; history_branch: string; server: string | null };
   /** The default branch changed the test's file after the release branch was cut: its commits, and the file's diff since. */
@@ -268,15 +306,13 @@ export interface CommitRef {
 
 export interface OutOfDate {
   base: string;
-  /** Commits the PR is behind the base; null for the branch-state hold, where no comparison was made. */
+  /** Commits the PR is behind the base; null where no comparison was made. */
   behind: number | null;
   commit: CommitRef | null;
   /** The base branch's earlier commits to the test since this PR (or branch) last had it, newest first, after `commit` (at most 4). */
   also?: CommitRef[];
   /** The test file's diff on the base branch since the merge base, as GitHub's compare gave it (cut to 4000 characters). */
   diff?: string;
-  /** The branch-state hold: this PR failed the same way on its last `streak` commits (this run included), never on the base. */
-  streak?: number;
   /** The failure first passed on the base branch at `commit` (see markFixedOnTrunk), after this PR last merged it. */
   fixed?: boolean;
   /** The support-paths directory the base branch changed at `commit`, where the test itself is unchanged. */
@@ -381,6 +417,17 @@ export interface ChangedFile {
   patch?: string;
 }
 
+/** A changed line of the PR that holds what a failing test looked for: a selector, a test id, or the expected text. */
+export interface ChangedByPR {
+  file: string;
+  anchor: string;
+  kind: "selector" | "test id" | "text";
+  /** The changed line, trimmed (at most 200 characters). */
+  line: string;
+  /** The PR removes it: it is on a removed line and on no added line of that file. */
+  removed: boolean;
+}
+
 /** The changed files of a PR (or commit), and whether that list is complete. */
 export interface Diff {
   files: ChangedFile[];
@@ -407,6 +454,8 @@ export interface Counts {
 /** A TSIO history result: rows by test identity, with the flags the rules read. */
 export interface HistoryLike extends Map<string, Observation[]> {
   truncated?: boolean;
+  /** Why TSIO's history could not be read after its retries (see unreadHistory): the run is judged without it. */
+  unavailable?: string;
   reportUnknown?: boolean;
   ambiguous?: Set<string>;
 }
