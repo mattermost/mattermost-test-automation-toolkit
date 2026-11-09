@@ -2640,12 +2640,13 @@ function settlePR(findings, changed, ownershipKnown, flagged, files = [], minTru
     const unused = f.decision === "evidence_incomplete" || Boolean(f.identity_unresolved);
     const t = f.trunk;
     const everyTry = Boolean(f.tries && f.tries.ran >= 2 && f.tries.failed === f.tries.ran);
-    const trunkClean = Boolean(t && t.runs >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
+    const elsewhere = f.failed_everywhere?.length ? f.failed_everywhere : null;
+    const trunkClean = Boolean(t && t.runs >= minTrunkRuns && t.fails === 0 && (t.flaky === 0 || elsewhere) && t.latest === "passed");
     if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length) {
       Object.assign(f, {
         untouched: true,
         decision: "reproducible_regression",
-        reason: `Failed all ${f.tries.ran} tries of this build and passed all ${t.runs} recent runs on trunk, and no other PR failed it this way: this PR's change causes it.`
+        reason: `Failed all ${f.tries.ran} tries of this build${elsewhere ? ` and on ${elsewhere.join(" and ")} of this same commit` : ""}, never failed in its ${t.runs} recent runs on trunk, and no other PR failed it this way: this PR's change causes it.`
       });
       continue;
     }
@@ -2746,8 +2747,9 @@ function whyNext(f, branch, pr, branchRun = null) {
       if (c) return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and ${c.file} changes the line with ${describeChange(c)} that the test looks for: "${c.line}".`, fix ?? `Make that line give the test what it expects again, or update ${spec} to match the change.`];
       if (f.decision === "reproducible_regression") {
         const at = errorFirstLine(f.error);
+        const elsewhere = f.failed_everywhere?.length ? ` and on ${f.failed_everywhere.join(" and ")} of this same commit` : "";
         return [
-          `Failed all ${f.tries?.ran ?? 2} tries of this build, passes on ${branch} (${t.passes} of ${t.runs} runs), and no other PR fails it this way: this PR's change causes it.${at ? ` It fails at: "${at.slice(0, 160)}".` : ""}`,
+          `Failed all ${f.tries?.ran ?? 2} tries of this build${elsewhere}, passes on ${branch} (${t.passes} of ${t.runs} runs), and no other PR fails it this way: this PR's change causes it.${at ? ` It fails at: "${at.slice(0, 160)}".` : ""}`,
           fix ?? (f.suspects?.length ? `Look first at this PR's changes to ${f.suspects.join(", ")}.` : "Check what this PR changes that the test uses.")
         ];
       }

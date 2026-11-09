@@ -5513,7 +5513,8 @@ test("settlePR: a test that failed every try of this build, never on trunk or an
   const cases: [string, Partial<Finding>][] = [
     ["a retry passed", { tries: { ran: 2, failed: 1 } }],
     ["it ran once", { tries: { ran: 1, failed: 1 } }],
-    ["trunk passed it only on a retry", { trunk: { runs: 25, fails: 0, flaky: 1, passes: 24, latest: "passed" } }],
+    ["trunk passed it only on a retry, and it failed on no other platform", { trunk: { runs: 25, fails: 0, flaky: 1, passes: 24, latest: "passed" } }],
+    ["trunk failed it, though it failed on another platform here too", { trunk: { runs: 25, fails: 1, flaky: 0, passes: 24, latest: "passed" }, failed_everywhere: ["android"] }],
     ["trunk failed it", { trunk: { runs: 25, fails: 1, flaky: 0, passes: 24, latest: "passed" } }],
     ["too little trunk history", { trunk: { runs: 4, fails: 0, flaky: 0, passes: 4, latest: "passed" } }],
     ["another PR failed it the same way", { cross_pr: { prs: [7], examples: [], passes: 0 } }],
@@ -5525,4 +5526,14 @@ test("settlePR: a test that failed every try of this build, never on trunk or an
     settlePR([g], [], true, false, []);
     assert.deepEqual([g.decision, g.blocking], ["first_failure", false], why);
   }
+});
+
+// mattermost-mobile#10223: the same failure on detox-ios and detox-android of one commit, every try, is held on both.
+test("settlePR: failing every try here and on another platform of the commit, a trunk retry pass does not clear it", () => {
+  const f = firstFailure({ tries: { ran: 4, failed: 4 }, failed_everywhere: ["android"], trunk: { runs: 25, fails: 0, flaky: 1, passes: 24, latest: "passed" } });
+  settlePR([f], [], true, false, []);
+  assert.deepEqual([f.blocking, f.decision, statusLabelOf(f)], [true, "reproducible_regression", "caused by PR"]);
+  assert.match(f.reason, /Failed all 4 tries of this build and on android of this same commit, never failed in its 25 recent runs on trunk/);
+  const c = summary({ verdict: "FAILURE", findings: [f], infra: null, runURL: "u", counts: { failed: 1, passed: 10, skipped: 0 }, ai: newLedger() });
+  assert.match(c, /Failed all 4 tries of this build and on android of this same commit, passes on the default branch \(24 of 25 runs\)/);
 });

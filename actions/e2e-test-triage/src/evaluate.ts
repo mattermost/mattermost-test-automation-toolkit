@@ -301,8 +301,9 @@ export async function evaluateRun({
  *   test id or expected text; see changeTouchesFailure): the PR's.
  * - A test that failed every try of this build (retries and retests included) while trunk passed all of its recent runs
  *   (at least minTrunkRuns, none flaky, the latest a pass) and no other PR failed it the same way is a regression this
- *   build brought, not a flake: the PR's, as a reproducible regression. Not for an environment error, nor where the
- *   test's history could not be used.
+ *   build brought, not a flake: the PR's, as a reproducible regression. One that also failed on another platform of this
+ *   commit is held even where trunk passed it once only on a retry; a trunk failure still clears it. Not for an
+ *   environment error, nor where the test's history could not be used.
  * - If none holds, the failure is cleared: the first one that nothing ties to the PR is not blamed on it. The same
  *   failure on the PR's next commit is a PR streak (see classify), which is held as the PR's.
  */
@@ -335,12 +336,15 @@ export function settlePR(findings: Finding[], changed: string[], ownershipKnown:
     const unused = f.decision === "evidence_incomplete" || Boolean(f.identity_unresolved);
     const t = f.trunk;
     const everyTry = Boolean(f.tries && f.tries.ran >= 2 && f.tries.failed === f.tries.ran);
-    const trunkClean = Boolean(t && t.runs >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
+    // Failing on another platform of this same commit too (see holdFailedEverywhere), a trunk pass that needed a retry does
+    // not excuse it: only a trunk failure does.
+    const elsewhere = f.failed_everywhere?.length ? f.failed_everywhere : null;
+    const trunkClean = Boolean(t && t.runs >= minTrunkRuns && t.fails === 0 && (t.flaky === 0 || elsewhere) && t.latest === "passed");
     if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length) {
       Object.assign(f, {
         untouched: true,
         decision: "reproducible_regression",
-        reason: `Failed all ${f.tries!.ran} tries of this build and passed all ${t.runs} recent runs on trunk, and no other PR failed it this way: this PR's change causes it.`,
+        reason: `Failed all ${f.tries!.ran} tries of this build${elsewhere ? ` and on ${elsewhere.join(" and ")} of this same commit` : ""}, never failed in its ${t.runs} recent runs on trunk, and no other PR failed it this way: this PR's change causes it.`,
       });
       continue;
     }
