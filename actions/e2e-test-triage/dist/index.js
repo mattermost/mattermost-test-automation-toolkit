@@ -702,13 +702,13 @@ var EXONERATED_ON_TRUNK = /* @__PURE__ */ new Set(["FLAKY_ON_TRUNK", "FLAKY_CROS
 var exoneratedSet = (isTrunkRun) => isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED;
 function causedByPR(f) {
   if (f.out_of_date && f.class !== "OWNED_BY_PR") return false;
-  return f.class === "OWNED_BY_PR" || Boolean(f.pr_streak) || Boolean(f.changed_by_pr) || f.untouched === false || Boolean(f.mass) || f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto";
+  return f.class === "OWNED_BY_PR" || Boolean(f.pr_streak) || Boolean(f.changed_by_pr) || f.untouched === false || Boolean(f.mass) || f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto" || f.decision === "reproducible_regression";
 }
 var BORDERLINE = /* @__PURE__ */ new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
 var JUDGED = /* @__PURE__ */ new Set([...BORDERLINE, "INFRA_ERROR"]);
 var ANCHOR_NAME = /^(?=.{6,})[A-Za-z_][\w-]*[A-Za-z0-9_]$/;
 var namesOneElement = (name) => ANCHOR_NAME.test(name) && /[_-]|[a-z][A-Z]/.test(name);
-var SELECTOR_RE = /(?:^|[\s'"`(\[>+~,])[.#]([A-Za-z_][\w-]*)/g;
+var SELECTOR_RE = /(?:^|[\s'"`(\[>+~,]|<[a-z][\w-]*)[.#]([A-Za-z_][\w-]*)/g;
 var TEST_ID_RE = /(?:getByTestId\(\s*|data-testid\s*=\s*\\?|testid\s*[:=]\s*)['"`]([^'"`]+)['"`]/gi;
 var TEXT_RES = [
   /^Expected(?: string| substring| pattern)?:\s*"(.+)"\s*$/i,
@@ -2600,7 +2600,7 @@ async function evaluateRun({
       if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
     }
     if (!blind && prNumber) sameFailure(result.findings);
-    if (prNumber && !branchBase) settlePR(result.findings, changed, diff.ok && testRoot != null, Boolean(result.infra));
+    if (prNumber && !branchBase) settlePR(result.findings, changed, diff.ok && testRoot != null, Boolean(result.infra), files, cfg.minTrunkRuns);
     if (isTrunkRun && !branchBase) for (const f of result.findings) f.trunk_run = true;
   }
   if (branchBase) {
@@ -2613,7 +2613,7 @@ async function evaluateRun({
   if ((result.missing || result.unnamed) && result.verdict === "SUCCESS") result.verdict = "FAILURE";
   return result;
 }
-function settlePR(findings, changed, ownershipKnown, flagged) {
+function settlePR(findings, changed, ownershipKnown, flagged, files = [], minTrunkRuns = DEFAULTS.minTrunkRuns) {
   const bulk = flagged && !findings.some((f) => f.decision === "adjudicator_unblock");
   for (const f of findings) {
     if (f.out_of_date && f.class !== "OWNED_BY_PR") {
@@ -2632,7 +2632,23 @@ function settlePR(findings, changed, ownershipKnown, flagged) {
       f.untouched = false;
       continue;
     }
+    const touched = changeTouchesFailure(f, files);
+    if (touched) {
+      Object.assign(f, { changed_by_pr: touched, untouched: true });
+      continue;
+    }
     const unused = f.decision === "evidence_incomplete" || Boolean(f.identity_unresolved);
+    const t = f.trunk;
+    const everyTry = Boolean(f.tries && f.tries.ran >= 2 && f.tries.failed === f.tries.ran);
+    const trunkClean = Boolean(t && t.runs >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
+    if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length) {
+      Object.assign(f, {
+        untouched: true,
+        decision: "reproducible_regression",
+        reason: `Failed all ${f.tries.ran} tries of this build and passed all ${t.runs} recent runs on trunk, and no other PR failed it this way: this PR's change causes it.`
+      });
+      continue;
+    }
     Object.assign(f, { blocking: false, untouched: true, decision: "first_failure", ...unused ? { history_unused: true } : {} });
   }
 }
@@ -2728,6 +2744,13 @@ function whyNext(f, branch, pr, branchRun = null) {
       const spec = f.file.split("/").pop() ?? f.file;
       if (c?.removed) return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and ${c.file} removes ${describeChange(c)}, which the test expects.`, fix ?? `Keep ${describeChange(c)} in ${c.file}; if removing it is intended, update ${spec} to the new behavior.`];
       if (c) return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and ${c.file} changes the line with ${describeChange(c)} that the test looks for: "${c.line}".`, fix ?? `Make that line give the test what it expects again, or update ${spec} to match the change.`];
+      if (f.decision === "reproducible_regression") {
+        const at = errorFirstLine(f.error);
+        return [
+          `Failed all ${f.tries?.ran ?? 2} tries of this build, passes on ${branch} (${t.passes} of ${t.runs} runs), and no other PR fails it this way: this PR's change causes it.${at ? ` It fails at: "${at.slice(0, 160)}".` : ""}`,
+          fix ?? (f.suspects?.length ? `Look first at this PR's changes to ${f.suspects.join(", ")}.` : "Check what this PR changes that the test uses.")
+        ];
+      }
       return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and this PR changes a file its error names.`, fix ?? "Check your change to that file."];
     }
     case "outdated": {
@@ -2947,7 +2970,7 @@ var FAULT_TEXT = {
   "base branch": "the base branch's, not this change's",
   PR: "this change's",
   infrastructure: "the CI machines' or an outside service's, not this change's",
-  unknown: "not shown by the logs"
+  unknown: "not known yet: the failure's error is in the lost report, which the re-run recovers"
 };
 function renderLane({ verdict, rerunning, lane = null, runURL, base = null }) {
   const where = lane ? ` \xB7 ${md(lane)}` : "";
@@ -3559,7 +3582,7 @@ function diagnoseLane(facts) {
     return {
       label: mine.length ? "caused by PR" : "machine failure",
       state: "failure",
-      fault: mine.length ? "PR" : "infrastructure",
+      fault: mine.length ? "PR" : "unknown",
       action: mine.length ? "fix the specs this PR changed" : rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs",
       what: `${plural(unjudged.length, "spec")} failed in a lost report: ${clip2(specs.join(", "), 80)}`,
       rerun: mine.length ? "none" : rerunKind,

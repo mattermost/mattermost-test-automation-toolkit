@@ -3,7 +3,7 @@
 
 import { identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
-import { BORDERLINE, causedByPR, classify, classifyNotRun, errorSignature, holdFailedEverywhere, infraVerdict, isShardPlaceholder, isSpecNotRun, isSpecStopped, isProductChange, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
+import { BORDERLINE, causedByPR, changeTouchesFailure, classify, classifyNotRun, errorSignature, holdFailedEverywhere, infraVerdict, isShardPlaceholder, isSpecNotRun, isSpecStopped, isProductChange, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, historyLane, repoPath } from "./config.ts";
 import { commonSenseClear } from "./common-sense.ts";
 import { sameTestOnOtherReports } from "./enrich.ts";
@@ -272,7 +272,7 @@ export async function evaluateRun({
     }
     if (!blind && prNumber) sameFailure(result.findings);
     // Whether the PR touches a test is known only from a complete change list and a test root to place the spec in it.
-    if (prNumber && !branchBase) settlePR(result.findings, changed, diff.ok && testRoot != null, Boolean(result.infra));
+    if (prNumber && !branchBase) settlePR(result.findings, changed, diff.ok && testRoot != null, Boolean(result.infra), files, cfg.minTrunkRuns);
     if (isTrunkRun && !branchBase) for (const f of result.findings) f.trunk_run = true;
   }
   // A release branch's spec that never ran is untested in that build: spec history, which has no branch, does not clear it.
@@ -297,11 +297,16 @@ export async function evaluateRun({
  *   where the judge cleared some of the run: then each is read on its own, as below.
  * - A spec that never ran (NOT_RUN), or a PR whose change list could not be read in full (or whose spec cannot be placed
  *   in it, with no test root): red as a machine failure, for a re-run.
- * - Otherwise, the PR changes the test's error-named file: the PR's. If it changes neither, the failure is cleared: the
- *   first one that nothing ties to the PR is not blamed on it. The same failure on the PR's next commit is a PR streak
- *   (see classify), which is held as the PR's.
+ * - Otherwise, the PR changes the test's error-named file, or a changed line holds what the test looked for (a selector,
+ *   test id or expected text; see changeTouchesFailure): the PR's.
+ * - A test that failed every try of this build (retries and retests included) while trunk passed all of its recent runs
+ *   (at least minTrunkRuns, none flaky, the latest a pass) and no other PR failed it the same way is a regression this
+ *   build brought, not a flake: the PR's, as a reproducible regression. Not for an environment error, nor where the
+ *   test's history could not be used.
+ * - If none holds, the failure is cleared: the first one that nothing ties to the PR is not blamed on it. The same
+ *   failure on the PR's next commit is a PR streak (see classify), which is held as the PR's.
  */
-export function settlePR(findings: Finding[], changed: string[], ownershipKnown: boolean, flagged: boolean): void {
+export function settlePR(findings: Finding[], changed: string[], ownershipKnown: boolean, flagged: boolean, files: ChangedFile[] = [], minTrunkRuns = DEFAULTS.minTrunkRuns): void {
   // A flagged run the judge cleared any of is not a bulk break: those it judged are its environment's or flaky, and the
   // rest are read one by one like any other run's.
   const bulk = flagged && !findings.some((f) => f.decision === "adjudicator_unblock");
@@ -322,7 +327,23 @@ export function settlePR(findings: Finding[], changed: string[], ownershipKnown:
       f.untouched = false;
       continue;
     }
+    const touched = changeTouchesFailure(f, files);
+    if (touched) {
+      Object.assign(f, { changed_by_pr: touched, untouched: true });
+      continue;
+    }
     const unused = f.decision === "evidence_incomplete" || Boolean(f.identity_unresolved);
+    const t = f.trunk;
+    const everyTry = Boolean(f.tries && f.tries.ran >= 2 && f.tries.failed === f.tries.ran);
+    const trunkClean = Boolean(t && t.runs >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
+    if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length) {
+      Object.assign(f, {
+        untouched: true,
+        decision: "reproducible_regression",
+        reason: `Failed all ${f.tries!.ran} tries of this build and passed all ${t.runs} recent runs on trunk, and no other PR failed it this way: this PR's change causes it.`,
+      });
+      continue;
+    }
     Object.assign(f, { blocking: false, untouched: true, decision: "first_failure", ...(unused ? { history_unused: true } : {}) });
   }
 }

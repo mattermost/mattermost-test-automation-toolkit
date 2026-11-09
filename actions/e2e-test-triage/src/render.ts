@@ -153,6 +153,11 @@ function whyNext(f: Finding, branch: string, pr: boolean, branchRun: string | nu
       const spec = f.file.split("/").pop() ?? f.file;
       if (c?.removed) return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and ${c.file} removes ${describeChange(c)}, which the test expects.`, fix ?? `Keep ${describeChange(c)} in ${c.file}; if removing it is intended, update ${spec} to the new behavior.`];
       if (c) return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and ${c.file} changes the line with ${describeChange(c)} that the test looks for: "${c.line}".`, fix ?? `Make that line give the test what it expects again, or update ${spec} to match the change.`];
+      if (f.decision === "reproducible_regression") {
+        const at = errorFirstLine(f.error);
+        return [`Failed all ${f.tries?.ran ?? 2} tries of this build, passes on ${branch} (${t.passes} of ${t.runs} runs), and no other PR fails it this way: this PR's change causes it.${at ? ` It fails at: "${at.slice(0, 160)}".` : ""}`,
+          fix ?? (f.suspects?.length ? `Look first at this PR's changes to ${f.suspects.join(", ")}.` : "Check what this PR changes that the test uses.")];
+      }
       return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and this PR changes a file its error names.`, fix ?? "Check your change to that file."];
     }
     case "outdated": {
@@ -502,7 +507,7 @@ const FAULT_TEXT: Record<string, string> = {
   "base branch": "the base branch's, not this change's",
   PR: "this change's",
   infrastructure: "the CI machines' or an outside service's, not this change's",
-  unknown: "not shown by the logs",
+  unknown: "not known yet: the failure's error is in the lost report, which the re-run recovers",
 };
 
 /**

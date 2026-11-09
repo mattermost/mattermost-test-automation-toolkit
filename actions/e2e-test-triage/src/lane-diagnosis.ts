@@ -249,11 +249,12 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
     const specs = unjudged.map((u) => shortSpec(u.spec));
     const mine = unjudged.filter((u) => changedByPR(u.spec, facts.prFiles));
     // A report that never arrived is lost in delivery: re-run so its specs arrive and are judged test by test. One the PR
-    // changed is the PR's to look at either way.
+    // changed is the PR's to look at either way. The rest failed with an error only the lost report holds, so whose
+    // fault the failure is stays unknown until the re-run judges it: never the machines' on the lost delivery alone.
     return {
       label: mine.length ? "caused by PR" : "machine failure",
       state: "failure",
-      fault: mine.length ? "PR" : "infrastructure",
+      fault: mine.length ? "PR" : "unknown",
       action: mine.length ? "fix the specs this PR changed" : rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs",
       what: `${plural(unjudged.length, "spec")} failed in a lost report: ${clip(specs.join(", "), 80)}`,
       rerun: mine.length ? "none" : rerunKind,

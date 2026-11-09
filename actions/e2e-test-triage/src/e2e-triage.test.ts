@@ -19,7 +19,7 @@ import type { OtherFailure } from "./pack.ts";
 import { PRICES, costOf, newLedger, priceFor } from "./pricing.ts";
 import { bucketOf, passLine, passRate, renderSummary, STATUS_LABELS, statusDescription, statusLabelOf, statusLabels } from "./render.ts";
 import type { SummaryInput } from "./render.ts";
-import { evaluateRun, verdictOf } from "./evaluate.ts";
+import { evaluateRun, settlePR, verdictOf } from "./evaluate.ts";
 import type { EvaluatedRun, EvaluateParams } from "./evaluate.ts";
 import { NotTriagedError, triage } from "./triage.ts";
 import { FINDINGS_SCHEMA, checkFindingsShape, findingLogLine, redact } from "./findings.ts";
@@ -5476,4 +5476,53 @@ test("a bulk failure the base branch's lane explains is labelled broken on main,
   const cleared = finding({ title: "t1", class: "REGRESSION", blocking: false, decision: "base_broken" });
   assert.deepEqual([statusLabelOf(cleared), bucketOf(cleared)], ["broken on main", "broken"]);
   assert.equal(statusDescription("SUCCESS", [cleared], null, { passed: 9, failed: 1 }), "(1 broken on main) 90.0% passed (9 passed, 1 failed, 0 skipped)");
+});
+
+// mattermost/mattermost#39572 and #39608: a first failure the PR caused is the PR's, not a flake that turns the lane green.
+const sidebarError = "AssertionError: Timed out retrying after 30000ms: expected '<div.SidebarChannel__dragHandle>' to have class 'active'\n    at Context.eval (webpack:///./tests/integration/channels/keyboard_shortcuts/alt_option_plus_up_down_spec.js:110:14)";
+const firstFailure = (over: Partial<Finding> = {}): Finding => finding({
+  file: "tests/integration/channels/keyboard_shortcuts/alt_option_plus_up_down_spec.js", title: "MM-T1229 Alt/Option + Up", class: "REGRESSION", blocking: true,
+  reason: "New here.", error: "Error: expect(locator).toBeVisible() failed", trunk: { runs: 25, fails: 0, flaky: 0, passes: 25, latest: "passed" },
+  cross_pr: { prs: [], examples: [], passes: 0 }, tries: { ran: 1, failed: 1 }, ...over,
+});
+
+test("failureAnchors reads a selector in chai-jquery's element form ('<div.Class>')", () => {
+  assert.deepEqual(failureAnchors(sidebarError).names, [{ name: "SidebarChannel__dragHandle", kind: "selector" }]);
+  assert.deepEqual(failureAnchors("expected '<div#channel-header-wrapper>' to be visible").names, [{ name: "channel-header-wrapper", kind: "selector" }]);
+});
+
+test("settlePR: a first failure whose selector a changed line of the PR holds is the PR's", () => {
+  const f = firstFailure({ error: sidebarError });
+  const file = "webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel.tsx";
+  settlePR([f], [file], true, false, [{ filename: file, patch: "@@ -1 +1,2 @@\n+                                className='SidebarChannel__dragHandle'" }]);
+  assert.equal(f.blocking, true);
+  assert.equal(f.changed_by_pr?.anchor, "SidebarChannel__dragHandle");
+  assert.deepEqual([statusLabelOf(f), bucketOf(f)], ["caused by PR", "yours"]);
+  const c = summary({ verdict: "FAILURE", findings: [f], infra: null, runURL: "u", counts: { failed: 1, passed: 10, skipped: 0 }, ai: newLedger() });
+  assert.match(c, /sidebar_channel\.tsx changes the line with the selector SidebarChannel\\_\\_dragHandle that the test looks for/);
+  assert.match(c, /\| Does this PR change a file its error names\? \| No \|/, "the error names no file the PR changes; the selector row says why");
+});
+
+test("settlePR: a test that failed every try of this build, never on trunk or another PR, is a reproducible regression", () => {
+  const f = firstFailure({ tries: { ran: 4, failed: 4 } });
+  settlePR([f], ["server/channels/app/team_access_control.go"], true, false, []);
+  assert.deepEqual([f.blocking, f.decision, statusLabelOf(f), bucketOf(f)], [true, "reproducible_regression", "caused by PR", "yours"]);
+  const c = summary({ verdict: "FAILURE", findings: [f], infra: null, runURL: "u", counts: { failed: 1, passed: 10, skipped: 0 }, ai: newLedger() });
+  assert.match(c, /Failed all 4 tries of this build, passes on the default branch \(25 of 25 runs\), and no other PR fails it this way: this PR's change causes it\./);
+  // Anything that points away from the PR leaves it a first failure, cleared.
+  const cases: [string, Partial<Finding>][] = [
+    ["a retry passed", { tries: { ran: 2, failed: 1 } }],
+    ["it ran once", { tries: { ran: 1, failed: 1 } }],
+    ["trunk passed it only on a retry", { trunk: { runs: 25, fails: 0, flaky: 1, passes: 24, latest: "passed" } }],
+    ["trunk failed it", { trunk: { runs: 25, fails: 1, flaky: 0, passes: 24, latest: "passed" } }],
+    ["too little trunk history", { trunk: { runs: 4, fails: 0, flaky: 0, passes: 4, latest: "passed" } }],
+    ["another PR failed it the same way", { cross_pr: { prs: [7], examples: [], passes: 0 } }],
+    ["an environment error", { class: "INFRA_ERROR" }],
+    ["its history could not be used", { identity_unresolved: true }],
+  ];
+  for (const [why, over] of cases) {
+    const g = firstFailure({ tries: { ran: 4, failed: 4 }, ...over });
+    settlePR([g], [], true, false, []);
+    assert.deepEqual([g.decision, g.blocking], ["first_failure", false], why);
+  }
 });

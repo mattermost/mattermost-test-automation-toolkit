@@ -82,13 +82,14 @@ export const exoneratedSet = (isTrunkRun: boolean): Set<string> => (isTrunkRun ?
 
 /**
  * Whether a finding carries evidence that the change under test caused it: the change edits the test, fails it on its
- * last commits and never on trunk (a PR streak), changes what the test looks for or a file its error names, or the
- * judge blamed it from a hunk. Only these may keep a PR's failure red (see settlePR); a base-branch fix never is one.
+ * last commits and never on trunk (a PR streak), changes what the test looks for or a file its error names, fails it on
+ * every try of this build while trunk and other PRs never do (a reproducible regression), or the judge blamed it from a
+ * hunk. Only these may keep a PR's failure red (see settlePR); a base-branch fix never is one.
  */
 export function causedByPR(f: Finding): boolean {
   if (f.out_of_date && f.class !== "OWNED_BY_PR") return false;
   return f.class === "OWNED_BY_PR" || Boolean(f.pr_streak) || Boolean(f.changed_by_pr) || f.untouched === false || Boolean(f.mass) ||
-    f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto";
+    f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto" || f.decision === "reproducible_regression";
 }
 export const BORDERLINE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
 // An environment error still blocking is judged too: its repo's PRs can break their own environment, or it was held on a
@@ -112,9 +113,9 @@ export interface ClassifyOptions {
 // adminConsoleWrapper), so a plain word (.active, #root) that many elements share is not one.
 const ANCHOR_NAME = /^(?=.{6,})[A-Za-z_][\w-]*[A-Za-z0-9_]$/;
 const namesOneElement = (name: string): boolean => ANCHOR_NAME.test(name) && /[_-]|[a-z][A-Z]/.test(name);
-// Where an error names a selector: .class or #id after a quote, a space, a paren or a combinator, never ".toHaveText"
-// after "expect(locator)".
-const SELECTOR_RE = /(?:^|[\s'"`(\[>+~,])[.#]([A-Za-z_][\w-]*)/g;
+// Where an error names a selector: .class or #id after a quote, a space, a paren, a combinator or an element tag as
+// chai-jquery prints one ('<div.SidebarChannel__dragHandle>'), never ".toHaveText" after "expect(locator)".
+const SELECTOR_RE = /(?:^|[\s'"`(\[>+~,]|<[a-z][\w-]*)[.#]([A-Za-z_][\w-]*)/g;
 const TEST_ID_RE = /(?:getByTestId\(\s*|data-testid\s*=\s*\\?|testid\s*[:=]\s*)['"`]([^'"`]+)['"`]/gi;
 // The text a test waited for: Playwright's "Expected: ...", getByText and accessible names, Cypress's content.
 const TEXT_RES = [

@@ -267,7 +267,7 @@ test("a spec the PR changed that outlasts its worker is the PR's; specs failed i
   assert.match(named.what, /2 specs failed in a lost report: a\.spec\.ts, b\.spec\.ts/);
   // Not the PR's specs: the report was lost in delivery, so the lane is re-run for it (never "needs a look").
   const unowned = diagnoseLane(facts({ orchestration: lost, jobs: workers(30, { 2: OIDC }), prFiles: ["server/x.go"] }));
-  assert.deepEqual([unowned.label, unowned.fault, unowned.rerun], ["machine failure", "infrastructure", "lane"]);
+  assert.deepEqual([unowned.label, unowned.fault, unowned.rerun], ["machine failure", "unknown", "lane"], "the failure's error is in the lost report: not blamed on the machines");
   // Failures the arrived reports hold were judged test by test: they are not judged again here.
   assert.equal(diagnoseLane(facts({ orchestration: lost, jobs: workers(30, { 2: OIDC }), judgedSpecs: ["functional/a.spec.ts", "functional/b.spec.ts"] })).label, "machine failure");
 });
