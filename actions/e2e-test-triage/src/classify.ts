@@ -88,7 +88,7 @@ export const exoneratedSet = (isTrunkRun: boolean): Set<string> => (isTrunkRun ?
  */
 export function causedByPR(f: Finding): boolean {
   if (f.out_of_date && f.class !== "OWNED_BY_PR") return false;
-  return f.class === "OWNED_BY_PR" || Boolean(f.pr_streak) || Boolean(f.changed_by_pr) || f.untouched === false || Boolean(f.mass) ||
+  return f.class === "OWNED_BY_PR" || Boolean(f.pr_streak) || Boolean(f.changed_by_pr) || f.untouched === false || (Boolean(f.mass) && !f.mass_unproven) ||
     f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto" || f.decision === "reproducible_regression";
 }
 export const BORDERLINE = new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
@@ -156,8 +156,10 @@ export function failureAnchors(error: string | null | undefined): { names: { nam
 const secondary = (file: string): boolean => /(?:^|\/)__snapshots__\/|\.snap$|\.(?:test|spec)\.[cm]?[jt]sx?$|_test\.go$/.test(file);
 // A lock file repeats its manifest's dependency names and hashes thousands of times; the manifest is what the PR chose.
 const LOCK_FILE = /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|go\.sum|Gemfile\.lock|Podfile\.lock)$/;
+// Text no build or test runs: documentation and plain-text notes. A selector or phrase in one changes nothing a test sees.
+const NOT_EXECUTED = /\.(?:md|mdx|markdown|rst|adoc|txt)$|(?:^|\/)(?:LICENSE|NOTICE|CHANGELOG|AUTHORS)(?:\.[^/]*)?$/i;
 /** A changed file that can change what the app does: not a unit test, a snapshot, a lock file or documentation. */
-export const isProductChange = (file: string): boolean => !secondary(file) && !LOCK_FILE.test(file) && !/\.md$/i.test(file);
+export const isProductChange = (file: string): boolean => !secondary(file) && !LOCK_FILE.test(file) && !NOT_EXECUTED.test(file);
 
 /**
  * The first changed line of the PR (added or removed) that holds what the failure looked for: a selector's class or id,
@@ -174,7 +176,7 @@ export function changeTouchesFailure(test: TestRef, files: ChangedFile[] | null 
   const textWords = texts.map((t) => ({ text: t, words: words(t) }));
   const ordered = [...files].sort((a, b) => Number(secondary(a.filename)) - Number(secondary(b.filename)));
   for (const f of ordered) {
-    if (!f.patch || f.filename === spec || LOCK_FILE.test(f.filename)) continue;
+    if (!f.patch || f.filename === spec || LOCK_FILE.test(f.filename) || NOT_EXECUTED.test(f.filename)) continue;
     const changedLines = f.patch.split("\n").filter((line) => /^[+-]/.test(line) && !/^(?:\+\+\+|---)\s/.test(line));
     const holds = (body: string, a: { re?: RegExp; words?: string }): boolean => (a.re ? a.re.test(body) : Boolean(a.words) && words(body).includes(a.words!));
     // Removed: on a removed line and on no added line of the file (a moved or re-indented line is a change, not a removal).
@@ -240,6 +242,8 @@ export function classify(
   // with nothing related changed since, did not break because of the PR.
   const mine = currentPR == null ? [] : inLane.filter((o) => prOf(o) === currentPR);
   const minePassed = mine.filter((o) => o.status === "passed" || o.status === "flaky");
+  // Trunk runs known to be the history lane's own: with a lane set, a row that names no lane is kept in trunk but not here.
+  const laneRuns = lane == null ? trunk.length : trunk.filter((o) => o.name != null && laneOf(o.name) === lane).length;
   const trunkFails = trunk.filter((o) => FAILED_STATUSES.has(o.status)).length;
   const trunkFlaky = trunk.filter((o) => o.status === "flaky").length;
   const trunkPasses = trunk.filter((o) => o.status === "passed").length;
@@ -272,8 +276,7 @@ export function classify(
   const stats = {
     trunk: {
       runs: trunk.length, fails: trunkFails, flaky: trunkFlaky, passes: trunkPasses, latest: latestTrunk?.status ?? "",
-      // Rows with no lane name are kept in trunk (inLane) but are not known to be this lane's (see settlePR).
-      lane_runs: lane == null ? trunk.length : trunk.filter((o) => o.name != null && laneOf(o.name) === lane).length,
+      lane_runs: laneRuns,
     },
     cross_pr: {
       prs: failedPRs,
@@ -325,8 +328,10 @@ export function classify(
       if (o.commit_sha && o.commit_sha !== commitSha) earlier.add(o.commit_sha);
     }
     const streak = earlier.size + 1;
-    const trunkFailedSame = trunk.some((o) => FAILED_STATUSES.has(o.status) && sameFirstLine(o.error_excerpt, test.error));
-    if (streak >= 2 && trunk.length >= cfg.minTrunkRuns && latestTrunk?.status === "passed" && !trunkFailedSame) {
+    // A trunk run that failed this way counts, whether or not a retry then passed it (a flaky pass is the same failure).
+    const trunkFailedSame = trunk.some((o) => (FAILED_STATUSES.has(o.status) || o.status === "flaky") && sameFirstLine(o.error_excerpt, test.error));
+    // "Never on trunk" needs enough trunk runs known to be this lane's: a row naming no lane is not one (as in settlePR).
+    if (streak >= 2 && trunk.length >= cfg.minTrunkRuns && laneRuns >= cfg.minTrunkRuns && latestTrunk?.status === "passed" && !trunkFailedSame) {
       return prStreak(out("REGRESSION", "", true), streak, trunkBranch || "the default branch", changeTouchesFailure(test, patches));
     }
   }

@@ -127,9 +127,16 @@ export interface Finding extends TestRef {
   trunk_run?: boolean;
   /**
    * Held on a PR run that failed in bulk (see settlePR): most of the run failed while the base branch passes, so the
-   * change broke something those tests share. It is the PR's, though no one test points at it.
+   * change broke something those tests share. It is the PR's, though no one test points at it, only where the base
+   * branch is seen to pass it (see mass_unproven).
    */
   mass?: boolean;
+  /**
+   * A bulk failure (mass) whose base-branch pass is not shown: its history is unusable or names no passing run, or the
+   * PR's change list is unknown. Not the PR's on that evidence: red as a machine failure, re-run. The lane verdict can
+   * still clear it as broken on main.
+   */
+  mass_unproven?: boolean;
   /** Cleared by settlePR although its history could not be used (unchecked, or not tied to this test). */
   history_unused?: boolean;
   /** The other platforms of this commit where it also failed, after failing every try here (see holdFailedEverywhere). */

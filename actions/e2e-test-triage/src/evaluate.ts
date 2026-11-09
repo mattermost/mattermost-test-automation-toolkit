@@ -292,9 +292,11 @@ export async function evaluateRun({
  * machine failure, so nothing is left as "needs a look" and nothing the base branch explains blocks the PR.
  * - The base branch changed or fixed the test after this PR last merged it (out_of_date): cleared, as fixed on main. The
  *   base branch's copy passes there, and merging gives the PR that copy.
- * - Held on a run that failed in bulk (the run-level flag) while the base branch passes: an environment error stays a
- *   machine failure; any other failure is the PR's (mass), since the change broke something those tests share. Not
- *   where the judge cleared some of the run: then each is read on its own, as below.
+ * - Held on a run that failed in bulk (the run-level flag): an environment error stays a machine failure; any other
+ *   failure is marked mass, and is the PR's only where the base branch is seen to pass it (its recent runs usable, none
+ *   failed, the latest a pass) and the PR's change list is known, since the change broke something those tests share.
+ *   Without that evidence it is mass_unproven: a machine failure, re-run. Not where the judge cleared some of the run:
+ *   then each is read on its own, as below.
  * - A spec that never ran (NOT_RUN), or a PR whose change list could not be read in full (or whose spec cannot be placed
  *   in it, with no test root): red as a machine failure, for a re-run.
  * - Otherwise, the PR changes the test's error-named file, or a changed line holds what the test looked for (a selector,
@@ -320,7 +322,10 @@ export function settlePR(findings: Finding[], changed: string[], ownershipKnown:
     if (!f.blocking || causedByPR(f)) continue;
     if (f.class === "NOT_RUN" || (f.class === "INFRA_ERROR" && flagged)) continue;
     if (bulk) {
-      f.mass = true;
+      const t = f.trunk;
+      const usable = f.decision !== "evidence_incomplete" && !f.identity_unresolved;
+      const basePasses = Boolean(t && (t.lane_runs ?? t.runs) > 0 && t.fails === 0 && t.latest === "passed");
+      Object.assign(f, { mass: true, ...(ownershipKnown && usable && basePasses ? {} : { mass_unproven: true }) });
       continue;
     }
     if (!ownershipKnown) continue;

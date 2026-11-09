@@ -210,8 +210,10 @@ test("push runs on trunk are never told apart by their commit titles: an unresol
   }) as FetchImpl;
   // Commit titles name merged PRs (#100, #101), not the runs' identities; with no group either, the newer run may share
   // the concurrency group, so the older run is left to a person.
-  assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: () => {} }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
+  const logged: string[] = [];
+  assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: (m) => logged.push(m) }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
   assert.equal(posts(gh.calls), 0);
+  assert.ok(logged.some((m) => /run 40301634711 \(\{"pr":null,"group":null\}\) vs newer run 40301634999 .*an unresolved identity/.test(m)), "the skip names the unresolved identity");
   // A dispatched run's run-name does name the PR it tests: dispatches for different PRs still do not supersede each other.
   event = "workflow_dispatch";
   ownTitle = "E2E for PR #100";

@@ -287,10 +287,28 @@ test("summary and outputs in both modes; only enforce sets the state, and never 
   }
 });
 
+test("mass failures the base branch is not seen to pass are a machine failure, re-run, never the PR's", async () => {
+  // The same bulk failure with no base-branch history for these tests: nothing ties it to the change.
+  const f = fixture(), dir = mkdtempSync(join(tmpdir(), "triage-infra-"));
+  const summaryPath = join(dir, "summary.md");
+  f.cases = Array.from({ length: 30 }, (_, i) => ({ ...f.cases[0], full_title: `test-${i}` }));
+  f.env.GITHUB_STEP_SUMMARY = summaryPath;
+  try {
+    const result = await live(f);
+    assert.notEqual(result.verdict, "SUCCESS");
+    const summary = readFileSync(summaryPath, "utf8");
+    assert.match(summary, /30 machine failures, re-run/);
+    assert.match(summary, /history does not show it passing \(no runs on record\), so nothing ties the bulk failure to this change/);
+    assert.doesNotMatch(summary, /🔴 \d+ caused by this PR|### Your PR|while master passes/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("mass failures are the PR's while the base branch passes, never called innocent, and the summary says to check shared causes", async () => {
   const f = fixture(), dir = mkdtempSync(join(tmpdir(), "triage-infra-"));
   const summaryPath = join(dir, "summary.md");
   f.cases = Array.from({ length: 30 }, (_, i) => ({ ...f.cases[0], full_title: `test-${i}` }));
+  // The base branch is seen to pass every one of them: six passing master runs each.
+  f.history = f.cases.flatMap((c) => f.history.map((o) => ({ ...o, full_title: c.full_title })));
   f.env.GITHUB_STEP_SUMMARY = summaryPath;
   try {
     const result = await live(f);

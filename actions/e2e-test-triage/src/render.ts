@@ -148,7 +148,8 @@ function whyNext(f: Finding, branch: string, pr: boolean, branchRun: string | nu
       if (a?.cause === "app_bug" && f.decision === "adjudicator_blame") return [`Looks like an app bug in this build (${ai}): ${a.explanation}`, "Read the error, and file it against this release if it holds."];
       const fix = a?.cause === "caused_by_pr" && a.fix ? `Suggested fix (AI): ${a.fix}` : null;
       if (f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto") return [`Points to this PR's change (${ai}): ${a?.explanation ?? "see the evidence"}`, fix ?? "Check the change named in the evidence."];
-      if (f.mass) return [`Failed with most of this run while ${branch} passes${t.runs ? ` (${t.passes} of ${t.runs} runs)` : ""}: this change broke something these tests share.`, "Start from the error most of the failures share."];
+      // Only a bulk failure the base branch is seen to pass reaches here (see settlePR, mass_unproven).
+      if (f.mass) return [`Failed with most of this run while ${branch} passes (${t.passes} of ${t.runs} runs): this change broke something these tests share.`, "Start from the error most of the failures share."];
       const c = f.changed_by_pr;
       const spec = f.file.split("/").pop() ?? f.file;
       if (c?.removed) return [`Passes on ${branch} (${t.passes} of ${t.runs} runs), and ${c.file} removes ${describeChange(c)}, which the test expects.`, fix ?? `Keep ${describeChange(c)} in ${c.file}; if removing it is intended, update ${spec} to the new behavior.`];
@@ -181,6 +182,7 @@ function whyNext(f: Finding, branch: string, pr: boolean, branchRun: string | nu
     case "check":
       if (f.class === "NOT_RUN") return [f.reason, "Re-run the failed jobs: the spec never ran."];
       if (f.class === "INFRA_ERROR") return [`Failed on its environment (see the error) in a run where most tests failed on theirs.`, "Re-run the failed jobs once the environment recovers."];
+      if (f.mass_unproven) return [`Failed with most of this run, and ${branch}'s history does not show it passing (${t.runs ? `passed ${t.passes} of ${t.runs} runs${t.latest ? `, latest ${t.latest}` : ""}` : "no runs on record"}), so nothing ties the bulk failure to this change.`, "Re-run the failed jobs: a run that fails in bulk again on a base branch that passes is this change's."];
       if (f.decision === "evidence_incomplete") return [f.reason, "Re-run the failed jobs to triage it again."];
       return ["This PR's list of changed files could not be read, so whether the change touches this test is unknown.", "Re-run the failed jobs to triage it again."];
     case "broken": {

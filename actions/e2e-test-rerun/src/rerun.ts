@@ -57,9 +57,9 @@ const TRUNK_BRANCH = /^(?:main|master|release[/_.-])/i;
  * nor inputs) may share the newer run's group, and re-running it could cancel that run: it counts as superseded, so a
  * person re-runs it. A PR branch's run always resolves (its branch), so only a trunk run can land here.
  */
+const unresolved = (i: RunIdentity): boolean => !i.pr && !i.group;
 const supersedes = (own: RunIdentity, other: RunIdentity): boolean => {
   if (own.group && other.group && own.group === other.group) return true;
-  const unresolved = (i: RunIdentity): boolean => !i.pr && !i.group;
   if (unresolved(own) || unresolved(other)) return true;
   if (own.pr || other.pr) return Boolean(own.pr && other.pr && own.pr === other.pr);
   return false;
@@ -174,7 +174,12 @@ export async function requestRerun({ env, fetchImpl = fetch, log = console.log }
       if (!candidates.length) return null;
       const own = await runIdentity(run, branch);
       for (const r of candidates) {
-        if (supersedes(own, await runIdentity(r, branch))) return r.id;
+        const other = await runIdentity(r, branch);
+        if (!supersedes(own, other)) continue;
+        // Skipped on an identity that resolved to neither a PR nor a group: say which, so a person can re-run it.
+        if (unresolved(own) || unresolved(other))
+          log(`e2e-test-rerun: run ${runId} (${JSON.stringify(own)}) vs newer run ${r.id} (${JSON.stringify(other)}): an unresolved identity may share the concurrency group, so not re-run`);
+        return r.id;
       }
       return null;
     } catch (e) {

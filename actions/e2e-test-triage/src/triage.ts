@@ -288,7 +288,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   // A lane red only because a job outside the tests died is decided too: its re-run, or why not (see onlyDeadJobs).
   let decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly || redWhy === "upstream";
   // Like the required status, only an enforcing run writes to the PR.
-  const announce = enforce && decides;
+  // A lane verdict found later can make a run decide that did not at first (see judgeLane below): it announces then.
+  let announce = enforce && decides;
   // TRIAGE_LANES lists every lane's required context: then the triage check is one
   // for the whole PR, summarising all lanes, rather than one per lane.
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
@@ -435,7 +436,13 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       // cannot show that every spec ran. A lane with no results at all is judged on whatever could be read.
       const grounded = Boolean(judged.orchestration) || Boolean(laneOnly);
       if (grounded && (outsideTests ? !testsBlock || (flagged && mass) : mass)) lane = judged;
-      if (lane) decides = true;
+      if (lane) {
+        decides = true;
+        if (enforce && !announce) {
+          announce = true;
+          await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : "Triage is checking this lane");
+        }
+      }
       log(`e2e-test-triage: lane ${lane ? "verdict" : "read (tests decide)"}: ${judged.verdict.label} (${judged.verdict.fault}): ${judged.verdict.what}`);
     }
     // A lane red only for placeholders and missing reports, no test's result. Within the repo's allowance the failed jobs

@@ -137,8 +137,10 @@ export async function fetchOrchestration(fetchImpl: FetchImpl, base: string, id:
 }
 
 /** Whether every unit finished and passed: every spec the lane dispatched ran, and none failed. */
+// At least one test ran and passed: a run whose every unit completed with all its tests skipped (or with no test rollup)
+// shows nothing passed.
 export const allPassed = (o: Orchestration | null): boolean =>
-  Boolean(o && o.units.length > 0 && o.units.length === o.totalUnits && !o.unfinished.length && !o.failed.length && o.tests.failed === 0);
+  Boolean(o && o.units.length > 0 && o.units.length === o.totalUnits && !o.unfinished.length && !o.failed.length && o.tests.failed === 0 && o.tests.passed + o.tests.flaky > 0);
 
 /** The longest a unit's spec ran on one lease, for a spec that outlasted its lease (a late report). */
 export const longestRun = (u: OrchestrationUnit): number => Math.max(0, ...u.attempts.map((a) => a.durationMs ?? 0));

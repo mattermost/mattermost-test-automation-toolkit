@@ -58,6 +58,11 @@ test("a unit's result: its final state, else any lease that reported, else unfin
 
 test("every spec passed needs every unit dispatched, none unfinished or failed, and no failed test", () => {
   assert.equal(allPassed(orch(passing(10))), true);
+  // Every unit completed but no test passed (all skipped, or no test rollup): nothing shows the lane passed.
+  const units = passing(10);
+  assert.equal(allPassed(orchestrationFrom({ status: "completed", total_units: 10, units, tests: { passed: 0, failed: 0, flaky: 0, skipped: 40, total: 40 } })), false);
+  assert.equal(allPassed(orchestrationFrom({ status: "completed", total_units: 10, units })), false, "no test rollup");
+  assert.equal(allPassed(orchestrationFrom({ status: "completed", total_units: 10, units, tests: { passed: 0, failed: 0, flaky: 3, skipped: 0, total: 3 } })), true, "a test that passed on retry passed");
   assert.equal(allPassed(orch([...passing(9), unit("specs/x.spec.ts", "abandoned", [{ status: null }])], "timed_out")), false);
   assert.equal(allPassed(orch([...passing(9), unit("specs/x.spec.ts", "completed_fail")])), false);
   assert.equal(allPassed(orch(passing(10), "completed", 1)), false, "a failed test in TSIO's rollup is not a pass");

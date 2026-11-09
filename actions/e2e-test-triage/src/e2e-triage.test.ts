@@ -3823,7 +3823,8 @@ const noResultsPatches: ChangedFile[] = [
 const streakOf = (t: TestRef): Observation[] => [
   obs({ file: t.file, title: t.title, gh_pr_number: 5, status: "failed", commit_sha: "c2", created_at: "2026-09-12T00:00:00Z", error_excerpt: t.error }),
   obs({ file: t.file, title: t.title, gh_pr_number: 5, status: "failed", commit_sha: "c1", created_at: "2026-09-11T00:00:00Z", error_excerpt: t.error }),
-  ...trunkPasses(8).map((o) => ({ ...o, file: t.file, title: t.title })),
+  // The lane's own master runs, named as TSIO names them (runId's lane is playwright-full).
+  ...trunkPasses(8).map((o) => ({ ...o, file: t.file, title: t.title, name: "playwright-full-master" })),
 ];
 
 test("PR streak, diff: a PR that deletes the text the test expects is held for the author, not out of date", () => {
@@ -4045,7 +4046,7 @@ test("PR streak, end to end: fixed on main where master changed the test since, 
       ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
       ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: "t1", status: "failed", retry_count: 0, ordinal: 0, error_message: branchError, error_stack: null }])],
       // The other-PRs query (no branch) gets this PR's rows only; the trunk query (branch master) gets trunk's.
-      ["/reports/history", (i) => Response.json({ observations: parsed<HistoryBody>(bodyText(i)).branch ? trunkPasses(8) : [prRun("c2", "failed"), prRun("c1", "failed", branchError, "2026-09-11T00:00:00Z")] })],
+      ["/reports/history", (i) => Response.json({ observations: parsed<HistoryBody>(bodyText(i)).branch ? trunkPasses(8).map((o) => ({ ...o, name: "playwright-full-master" })) : [prRun("c2", "failed"), prRun("c1", "failed", branchError, "2026-09-11T00:00:00Z")] })],
       ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
       ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
       // The tested commit lacks 3 of master's commits, and one of them (#123) changed the failing spec.
@@ -4073,7 +4074,7 @@ test("PR streak, end to end: where master did not change the test, it is caused 
       ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
       ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
       ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: "t1", status: "failed", retry_count: 0, ordinal: 0, error_message: branchError, error_stack: null }])],
-      ["/reports/history", (i) => Response.json({ observations: parsed<HistoryBody>(bodyText(i)).branch ? trunkPasses(8) : [prRun("c2", "failed"), prRun("c1", "failed", branchError, "2026-09-11T00:00:00Z")] })],
+      ["/reports/history", (i) => Response.json({ observations: parsed<HistoryBody>(bodyText(i)).branch ? trunkPasses(8).map((o) => ({ ...o, name: "playwright-full-master" })) : [prRun("c2", "failed"), prRun("c1", "failed", branchError, "2026-09-11T00:00:00Z")] })],
       ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
       ["/pulls/5", () => Response.json({ title: "t", base: { ref: "master" } })],
       // A PR that just merged master: the commit lacks none of it.
@@ -5548,4 +5549,27 @@ test("classify: with a history lane, trunk rows that name no lane count in runs 
   const f = classify(failing, rows, [], undefined, 1, "playwright-full-enterprise");
   assert.deepEqual([f.trunk.runs, f.trunk.lane_runs], [10, 4]);
   assert.equal(classify(failing, rows, [], undefined, 1).trunk.lane_runs, 10, "no lane set: every run counts");
+});
+
+// toolkit#20 review: a PR streak needs the same evidence as a reproducible regression.
+test("PR streak: a same-error flaky pass on trunk, or too few lane-known trunk runs, is no streak", () => {
+  const lane = "playwright-full";
+  const named = (o: Observation): Observation => ({ ...o, name: "playwright-full-master" });
+  const base = streakOf(noticeTest).map((o) => (o.gh_pr_number == null ? named(o) : o));
+  assert.ok(classify(noticeTest, base, [], DEFAULTS, 5, lane, { trunkBranch: "master" }).pr_streak, "the lane's own eight master passes: a streak");
+  // One master run failed this way and passed on retry: the same failure, so not "never on trunk".
+  const flakyOnTrunk = base.map((o, i) => (i === 2 ? { ...o, status: "flaky", error_excerpt: noticeTest.error } : o));
+  assert.equal(classify(noticeTest, flakyOnTrunk, [], DEFAULTS, 5, lane, { trunkBranch: "master" }).pr_streak, undefined);
+  // The master rows name no lane: kept in trunk, but not known to be this lane's.
+  const unnamed = streakOf(noticeTest).map((o) => ({ ...o, name: null }));
+  const f = classify(noticeTest, unnamed, [], DEFAULTS, 5, lane, { trunkBranch: "master" });
+  assert.deepEqual([f.pr_streak, f.trunk.runs, f.trunk.lane_runs], [undefined, 8, 0]);
+});
+
+test("changeTouchesFailure: a selector or phrase in documentation or a plain-text file is no evidence", () => {
+  const sel: TestRef = { ...noResultsTest };
+  const line = "@@ -1 +1 @@\n+<h3 className='no-results__title'/>";
+  for (const filename of ["docs/empty-states.md", "webapp/README.mdx", "CHANGELOG.md", "notes/selectors.txt", "LICENSE"])
+    assert.equal(changeTouchesFailure(sel, [{ filename, patch: line }]), null, filename);
+  assert.equal(changeTouchesFailure(sel, [{ filename: "docs/empty-states.md", patch: line }, { filename: "a.tsx", patch: line }])?.file, "a.tsx");
 });

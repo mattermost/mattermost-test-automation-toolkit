@@ -6,9 +6,9 @@ var import_node_fs = require("fs");
 // src/rerun.ts
 var MARKER = /^e2e-triage-rerun-attempt-(\d+)-of-(\d+)-(?:job-(\d+)-)?(.+)$/;
 var TRUNK_BRANCH = /^(?:main|master|release[/_.-])/i;
+var unresolved = (i) => !i.pr && !i.group;
 var supersedes = (own, other) => {
   if (own.group && other.group && own.group === other.group) return true;
-  const unresolved = (i) => !i.pr && !i.group;
   if (unresolved(own) || unresolved(other)) return true;
   if (own.pr || other.pr) return Boolean(own.pr && other.pr && own.pr === other.pr);
   return false;
@@ -97,7 +97,11 @@ async function requestRerun({ env, fetchImpl = fetch, log = console.log }) {
       if (!candidates.length) return null;
       const own = await runIdentity(run, branch);
       for (const r of candidates) {
-        if (supersedes(own, await runIdentity(r, branch))) return r.id;
+        const other = await runIdentity(r, branch);
+        if (!supersedes(own, other)) continue;
+        if (unresolved(own) || unresolved(other))
+          log(`e2e-test-rerun: run ${runId} (${JSON.stringify(own)}) vs newer run ${r.id} (${JSON.stringify(other)}): an unresolved identity may share the concurrency group, so not re-run`);
+        return r.id;
       }
       return null;
     } catch (e) {
