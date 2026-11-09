@@ -191,3 +191,30 @@ test("a fresh-start request on the last allowed attempt asks a person, like any 
   assert.deepEqual(result, { rerun: false, reason: "attempt 2 is the last of 2; a person re-runs it" });
   assert.equal(posts(gh.calls), 0);
 });
+
+test("push runs on trunk are never told apart by their commit titles: an unresolved identity is superseded, not re-run", async () => {
+  const gh = github([{ name: "e2e-triage-rerun-attempt-1-of-3-e2e-test-detox-ios" }]);
+  const inner = gh.fetchImpl;
+  let event = "push";
+  let ownTitle = "Fix the sidebar (#100)";
+  let newerTitle = "Bump deps (#101)";
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/actions/runs/40301634711"))
+      return Response.json({ id: 40301634711, workflow_id: 7, head_branch: "main", head_sha: "a1", run_number: 10, event, display_title: ownTitle });
+    if (url.includes("/actions/workflows/7/runs?branch=main"))
+      return Response.json({ workflow_runs: [
+        { id: 40301634999, head_branch: "main", head_sha: "b2", run_number: 11, event, display_title: newerTitle },
+        { id: 40301634711, head_branch: "main", head_sha: "a1", run_number: 10, event, display_title: ownTitle },
+      ] });
+    return inner(url, init);
+  }) as FetchImpl;
+  // Commit titles name merged PRs (#100, #101), not the runs' identities; with no group either, the newer run may share
+  // the concurrency group, so the older run is left to a person.
+  assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: () => {} }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
+  assert.equal(posts(gh.calls), 0);
+  // A dispatched run's run-name does name the PR it tests: dispatches for different PRs still do not supersede each other.
+  event = "workflow_dispatch";
+  ownTitle = "E2E for PR #100";
+  newerTitle = "E2E for PR #101";
+  assert.equal((await requestRerun({ env: env("1"), fetchImpl, log: () => {} })).rerun, true);
+});

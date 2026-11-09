@@ -810,7 +810,15 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
   const otherPasses = others.filter((o) => o.status === "passed" || o.status === "flaky").length;
   const failureSignatures = [...new Set([...trunk, ...others].filter((o) => FAILED_STATUSES.has(o.status)).map((o) => sameKey(o.error_excerpt)).filter((k) => Boolean(k)))];
   const stats = {
-    trunk: { runs: trunk.length, fails: trunkFails, flaky: trunkFlaky, passes: trunkPasses, latest: latestTrunk?.status ?? "" },
+    trunk: {
+      runs: trunk.length,
+      fails: trunkFails,
+      flaky: trunkFlaky,
+      passes: trunkPasses,
+      latest: latestTrunk?.status ?? "",
+      // Rows with no lane name are kept in trunk (inLane) but are not known to be this lane's (see settlePR).
+      lane_runs: lane == null ? trunk.length : trunk.filter((o) => o.name != null && laneOf(o.name) === lane).length
+    },
     cross_pr: {
       prs: failedPRs,
       examples: crossFailures.filter((o, i, all) => all.findIndex((x) => prOf(x) === prOf(o)) === i).slice(0, 12).map((o) => `PR ${prOf(o)} (${o.commit_sha?.slice(0, 7) ?? "unknown"}, ${o.created_at?.slice(5, 10) ?? "?"})`),
@@ -2641,7 +2649,7 @@ function settlePR(findings, changed, ownershipKnown, flagged, files = [], minTru
     const t = f.trunk;
     const everyTry = Boolean(f.tries && f.tries.ran >= 2 && f.tries.failed === f.tries.ran);
     const elsewhere = f.failed_everywhere?.length ? f.failed_everywhere : null;
-    const trunkClean = Boolean(t && t.runs >= minTrunkRuns && t.fails === 0 && (t.flaky === 0 || elsewhere) && t.latest === "passed");
+    const trunkClean = Boolean(t && t.runs >= minTrunkRuns && (t.lane_runs ?? t.runs) >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
     if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length) {
       Object.assign(f, {
         untouched: true,

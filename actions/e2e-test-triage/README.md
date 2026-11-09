@@ -33,16 +33,17 @@ these labels, and none is left as "needs investigation" or "out of date":
 
 | Label | When | Blocks the PR |
 | --- | --- | --- |
-| caused by PR | The PR edits the spec, fails it the same way on its last commits and never on the base branch (a PR streak), changes what the test looks for or a file its error names, or the model blames it from a hunk. On a run flagged as a whole that the model cleared none of, every failure while the base branch passes | Yes, with the change to look at (and the model's fix, when it is sure) |
+| caused by PR | The PR edits the spec, fails it the same way on its last commits and never on the base branch (a PR streak), changes what the test looks for (a selector, test id or expected text on a changed line, also on a first failure) or a file its error names, fails it on every try of this build while the base branch passed every recent run of the lane (none flaky, at least the minimum known to be the lane's) and no other PR fails it that way (a reproducible regression), or the model blames it from a hunk. On a run flagged as a whole that the model cleared none of, every failure while the base branch passes | Yes, with the change to look at (and the model's fix, when it is sure) |
 | fixed on main | The base branch changed or fixed the test after the PR last merged it, and its copy passes | No: merging gives the PR that copy |
 | broken on main | The base branch fails it the same way now | No |
-| flaky | A flake on the base branch or other PRs, the environment, or a first failure nothing ties to the PR: the PR changes neither the test nor a file its error names. The same failure on the PR's next commit is a PR streak, held as caused by PR | No |
+| flaky | A flake on the base branch or other PRs, the environment, or a first failure nothing ties to the PR: the PR changes neither the test, nor a file its error names, nor a line holding what it looks for, and it is no reproducible regression (a retry passed it here, or the base branch failed or retried it, or another PR fails it). The same failure on the PR's next commit is a PR streak, held as caused by PR | No |
 | machine failure | An environment error on a run flagged as mostly environment errors, a spec that never ran, or a PR whose change list (or test root) could not be read, so ownership is unknown | Yes, re-run |
 
 History that can't be used (truncated, unread, or not tied to the test) never clears a
 failure by itself; the PR not touching the test does. That is the cost of not blocking
-without evidence: a break the diff does not explain passes its first commit, and the
-base branch's own run (or the PR's next commit) catches it.
+without evidence: a break the diff does not explain, and that a retry or the base branch's
+history leaves in doubt, passes its first commit, and the base branch's own run (or the PR's
+next commit) catches it.
 
 **Shard placeholders are not tests.** Some failed rows stand for a shard that
 produced no results: a row with no test name; desktop's

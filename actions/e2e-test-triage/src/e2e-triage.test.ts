@@ -5528,12 +5528,24 @@ test("settlePR: a test that failed every try of this build, never on trunk or an
   }
 });
 
-// mattermost-mobile#10223: the same failure on detox-ios and detox-android of one commit, every try, is held on both.
-test("settlePR: failing every try here and on another platform of the commit, a trunk retry pass does not clear it", () => {
+// mattermost-mobile#10223: detox-ios failed every try and detox-android failed the same test, but with another error
+// (other_lanes keeps no error to match). A trunk pass that needed a retry still clears it; android's own lane holds it.
+test("settlePR: another platform's failure does not excuse a trunk retry pass; only lane-known trunk runs count", () => {
   const f = firstFailure({ tries: { ran: 4, failed: 4 }, failed_everywhere: ["android"], trunk: { runs: 25, fails: 0, flaky: 1, passes: 24, latest: "passed" } });
   settlePR([f], [], true, false, []);
-  assert.deepEqual([f.blocking, f.decision, statusLabelOf(f)], [true, "reproducible_regression", "caused by PR"]);
-  assert.match(f.reason, /Failed all 4 tries of this build and on android of this same commit, never failed in its 25 recent runs on trunk/);
-  const c = summary({ verdict: "FAILURE", findings: [f], infra: null, runURL: "u", counts: { failed: 1, passed: 10, skipped: 0 }, ai: newLedger() });
-  assert.match(c, /Failed all 4 tries of this build and on android of this same commit, passes on the default branch \(24 of 25 runs\)/);
+  assert.deepEqual([f.blocking, f.decision], [false, "first_failure"]);
+  // Clean trunk, but only 3 of its 25 runs name the history lane: not enough evidence to blame the PR.
+  const unlabelled = firstFailure({ tries: { ran: 4, failed: 4 }, trunk: { runs: 25, fails: 0, flaky: 0, passes: 25, latest: "passed", lane_runs: 3 } });
+  settlePR([unlabelled], [], true, false, []);
+  assert.deepEqual([unlabelled.blocking, unlabelled.decision], [false, "first_failure"]);
+  const labelled = firstFailure({ tries: { ran: 4, failed: 4 }, trunk: { runs: 25, fails: 0, flaky: 0, passes: 25, latest: "passed", lane_runs: 25 } });
+  settlePR([labelled], [], true, false, []);
+  assert.equal(labelled.decision, "reproducible_regression");
+});
+
+test("classify: with a history lane, trunk rows that name no lane count in runs but not in lane_runs", () => {
+  const rows = [...trunkPasses(4).map((o) => ({ ...o, name: "playwright-full-enterprise-master" })), ...trunkPasses(6).map((o, i) => ({ ...o, commit_sha: `u${i}`, name: null }))];
+  const f = classify(failing, rows, [], undefined, 1, "playwright-full-enterprise");
+  assert.deepEqual([f.trunk.runs, f.trunk.lane_runs], [10, 4]);
+  assert.equal(classify(failing, rows, [], undefined, 1).trunk.lane_runs, 10, "no lane set: every run counts");
 });

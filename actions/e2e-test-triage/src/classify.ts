@@ -270,7 +270,11 @@ export function classify(
     .map((o) => sameKey(o.error_excerpt))
     .filter((k): k is string => Boolean(k)))];
   const stats = {
-    trunk: { runs: trunk.length, fails: trunkFails, flaky: trunkFlaky, passes: trunkPasses, latest: latestTrunk?.status ?? "" },
+    trunk: {
+      runs: trunk.length, fails: trunkFails, flaky: trunkFlaky, passes: trunkPasses, latest: latestTrunk?.status ?? "",
+      // Rows with no lane name are kept in trunk (inLane) but are not known to be this lane's (see settlePR).
+      lane_runs: lane == null ? trunk.length : trunk.filter((o) => o.name != null && laneOf(o.name) === lane).length,
+    },
     cross_pr: {
       prs: failedPRs,
       examples: crossFailures

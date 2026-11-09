@@ -34,6 +34,7 @@ interface WorkflowRun {
   run_number: number;
   name?: string | null;
   display_title?: string | null;
+  event?: string | null;
   concurrency_group?: string | null;
   inputs?: Record<string, unknown> | null;
   pull_requests?: {
@@ -50,9 +51,16 @@ interface RunIdentity {
 
 const TRUNK_BRANCH = /^(?:main|master|release[/_.-])/i;
 
-/** Whether a newer workflow run tests the same PR or shares the concurrency group that a re-run would contend with. */
+/**
+ * Whether a newer workflow run tests the same PR or shares the concurrency group that a re-run would contend with. A run
+ * whose identity could not be resolved at all (no PR, no group: GitHub's run object carries neither concurrency_group
+ * nor inputs) may share the newer run's group, and re-running it could cancel that run: it counts as superseded, so a
+ * person re-runs it. A PR branch's run always resolves (its branch), so only a trunk run can land here.
+ */
 const supersedes = (own: RunIdentity, other: RunIdentity): boolean => {
   if (own.group && other.group && own.group === other.group) return true;
+  const unresolved = (i: RunIdentity): boolean => !i.pr && !i.group;
+  if (unresolved(own) || unresolved(other)) return true;
   if (own.pr || other.pr) return Boolean(own.pr && other.pr && own.pr === other.pr);
   return false;
 };
@@ -115,7 +123,9 @@ export async function requestRerun({ env, fetchImpl = fetch, log = console.log }
       );
       if (ownPr?.number != null) pr = String(ownPr.number);
     }
-    if (!pr) {
+    // A push run's title is its commit message: "Fix X (#100)" names the merged PR, not the PR the run tests, and two
+    // pushes would read as two PRs. Only a dispatched run's title (its run-name) can name the PR it tests.
+    if (!pr && w.event !== "push") {
       const titlePr = /(?:\bpr[ #:-]+|#)(\d+)\b/i.exec(`${w.display_title ?? ""} ${w.name ?? ""}`);
       if (titlePr) pr = titlePr[1];
     }

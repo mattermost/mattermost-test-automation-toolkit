@@ -54,6 +54,11 @@ export interface TrunkStats {
   flaky: number;
   passes: number;
   latest: string;
+  /**
+   * The runs known to be the history lane's own: with a lane set, a row that names no lane counts in runs but not here.
+   * Absent: every run counts (no lane set, or stats built elsewhere).
+   */
+  lane_runs?: number;
 }
 
 export interface CrossPRStats {

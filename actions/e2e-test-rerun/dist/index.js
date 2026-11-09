@@ -8,6 +8,8 @@ var MARKER = /^e2e-triage-rerun-attempt-(\d+)-of-(\d+)-(?:job-(\d+)-)?(.+)$/;
 var TRUNK_BRANCH = /^(?:main|master|release[/_.-])/i;
 var supersedes = (own, other) => {
   if (own.group && other.group && own.group === other.group) return true;
+  const unresolved = (i) => !i.pr && !i.group;
+  if (unresolved(own) || unresolved(other)) return true;
   if (own.pr || other.pr) return Boolean(own.pr && other.pr && own.pr === other.pr);
   return false;
 };
@@ -54,7 +56,7 @@ async function requestRerun({ env, fetchImpl = fetch, log = console.log }) {
       );
       if (ownPr?.number != null) pr = String(ownPr.number);
     }
-    if (!pr) {
+    if (!pr && w.event !== "push") {
       const titlePr = /(?:\bpr[ #:-]+|#)(\d+)\b/i.exec(`${w.display_title ?? ""} ${w.name ?? ""}`);
       if (titlePr) pr = titlePr[1];
     }
