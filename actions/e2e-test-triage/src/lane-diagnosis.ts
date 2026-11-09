@@ -201,13 +201,18 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
   // lane-wide failure, judged below.
   // Workers are counted by the step they died on, not by whose log was read (at most ten are): one whose log was not read
   // but died at the same step is not counted as a pass.
-  // A worker that died there on the network or the runner is the machine's, not a harness failure.
-  const sameStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step && c.cause.kind !== "infra") : [];
+  // A worker that died there on the network/runner, or timed out without failed-test evidence, is not a harness test failure
+  // and not a pass either: it is unknown, so the lane is re-run rather than blamed on the PR or base branch.
+  const hiddenSet = new Set(hidden);
+  const sameStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step && (hiddenSet.has(c) || (c.cause.kind !== "infra" && c.cause.kind !== "timeout"))) : [];
+  const unknownStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step && !sameStep.includes(c)) : [];
   const hiddenAll = hidden.length > 0 && sameStep.length === workers.length;
   if (hidden.length && !hiddenAll) {
     const h = hidden[0];
-    const passed = workers.length - sameStep.length;
-    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(sameStep.length, "worker")} and passed on the other ${passed}: ${quote(hiddenLine(h))}`, rerun: rerunKind, evidence: [`${sameStep.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; ${plural(passed, "worker")} passed it`, ...evidence] };
+    const passed = workers.length - sameStep.length - unknownStep.length;
+    const rest = unknownStep.length === 0 ? `passed on the other ${passed}` : passed ? `passed on ${plural(passed, "worker")} (${unknownStep.length} did not finish)` : `the other ${plural(unknownStep.length, "worker")} did not finish it`;
+    const evRest = unknownStep.length === 0 ? `${plural(passed, "worker")} passed it` : `${passed ? `${plural(passed, "worker")} passed it, ` : ""}${plural(unknownStep.length, "worker")} did not finish it`;
+    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(sameStep.length, "worker")} and ${rest}: ${quote(hiddenLine(h))}`, rerun: rerunKind, evidence: [`${sameStep.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; ${evRest}`, ...evidence] };
   }
 
   // 2. A lane-wide failure: most specs failed, or the setup broke on every worker that started.

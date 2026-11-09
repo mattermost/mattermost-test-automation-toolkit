@@ -130,6 +130,15 @@ test("every spec ran and passed: green, whatever worker or report was lost (fix 
   const net = { conclusion: "failure", step: "ci/upgrade-to", tail: "Error: read ECONNRESET" };
   const mixed = diagnoseLane(facts({ orchestration: orch(passing(0).concat(Array.from({ length: 10 }, (_, i) => unit(`specs/s${i}.spec.ts`, "pending", [])))), jobs: workers(4, [failedUpgrade, net, net, net]), baseline: baseline({ atBase: trunk("success") }) }));
   assert.equal(mixed.label, "machine failure");
+  // Timed-out workers at the harness step without failed-test evidence are unknown (neither failed nor passed): re-run.
+  const timedOutNoTest = { conclusion: "timed_out", step: "ci/upgrade-to", tail: "##[error]The action 'ci/upgrade-to' has timed out after 25 minutes." };
+  const unprovenTimeout = diagnoseLane(facts({ orchestration: orch(passing(0).concat(Array.from({ length: 10 }, (_, i) => unit(`specs/s${i}.spec.ts`, "pending", [])))), jobs: workers(4, [failedUpgrade, timedOutNoTest, timedOutNoTest, timedOutNoTest]), baseline: baseline({ atBase: trunk("success") }) }));
+  assert.deepEqual([unprovenTimeout.label, unprovenTimeout.fault, unprovenTimeout.rerun], ["machine failure", "infrastructure", "lane"]);
+  assert.match(unprovenTimeout.what, /^ci\/upgrade-to tests failed on 1 worker and the other 3 workers did not finish it:/);
+  // Timed-out workers whose logs do show a test failure still count toward a lane-wide harness failure.
+  const timedOutWithFailure = { conclusion: "timed_out", step: "ci/upgrade-to", tail: `${failedUpgrade.tail}\n##[error]The action 'ci/upgrade-to' has timed out after 25 minutes.` };
+  const provenTimeout = diagnoseLane(facts({ orchestration: orch(passing(0).concat(Array.from({ length: 10 }, (_, i) => unit(`specs/s${i}.spec.ts`, "pending", [])))), jobs: workers(4, [failedUpgrade, timedOutWithFailure, timedOutWithFailure, timedOutWithFailure]), baseline: baseline({ atBase: trunk("success") }) }));
+  assert.deepEqual([provenTimeout.label, provenTimeout.fault, provenTimeout.rerun], ["caused by PR", "PR", "none"]);
   // run 41940673353: the abandoned spec's late report passed; the slow spec is named in the evidence.
   const slow = diagnoseLane(facts({ orchestration: orch([...passing(409), unit("specs/functional/system_console/abac/teams/team_advanced_rules.spec.ts", "abandoned", [{ status: "passed", actual_duration_ms: 874041, expired: true }, { status: null, expired: true }])], "timed_out"), jobs: workers(30, { 8: { conclusion: "failure", step: "ci/dispatch-run", tail: "##[error]The action 'ci/dispatch-run' has timed out after 25 minutes." } }) }));
   assert.equal(slow.state, "success");

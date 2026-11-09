@@ -17,6 +17,7 @@ const github = (artifacts: { name: string; expired?: boolean }[], pages = 1) => 
     const method = init?.method ?? "GET";
     calls.push({ method, url });
     if (method === "POST" && (url.endsWith("/actions/runs/40301634711/rerun-failed-jobs") || url.endsWith("/actions/runs/40301634711/rerun") || /\/actions\/jobs\/\d+\/rerun$/.test(url))) return new Response(null, { status: 201 });
+    if (method === "GET" && /\/actions\/jobs\/\d+$/.test(url)) return Response.json({ run_id: 40301634711 });
     const page = Number(new URL(url).searchParams.get("page") ?? 1);
     if (method === "GET" && url.includes("/actions/runs/40301634711/artifacts")) {
       const rows = page <= pages ? artifacts.filter((_, i) => i % pages === page - 1) : [];
@@ -37,20 +38,60 @@ test("a lane's request for this attempt re-runs the run's failed jobs once, what
   assert.equal(posts(gh.calls), 1);
 });
 
-test("a run a newer push superseded is not re-run: that would cancel the newer run", async () => {
+test("a run a newer run on the same PR or concurrency group superseded is not re-run; dispatches for different PRs do not supersede each other", async () => {
   const gh = github([{ name: "e2e-triage-rerun-attempt-1-of-3-e2e-test-detox-ios" }]);
   const inner = gh.fetchImpl;
+  let headBranch = "pr-1";
+  let newerSha = "b2";
+  let ownPr: number | null = null;
+  let newerPr: number | null = null;
+  let sharedGroup: string | null = null;
   const fetchImpl = (async (url: string, init?: RequestInit) => {
-    if (url.endsWith("/actions/runs/40301634711")) return Response.json({ workflow_id: 7, head_branch: "pr-1", head_sha: "a1", run_number: 10 });
-    if (url.includes("/actions/workflows/7/runs?branch=pr-1")) return Response.json({ workflow_runs: [{ id: 40301634999, head_sha: newerSha, run_number: 11 }, { id: 40301634711, head_sha: "a1", run_number: 10 }] });
+    if (url.endsWith("/actions/runs/40301634711"))
+      return Response.json({
+        id: 40301634711,
+        workflow_id: 7,
+        head_branch: headBranch,
+        head_sha: "a1",
+        run_number: 10,
+        ...(ownPr ? { pull_requests: [{ number: ownPr }] } : {}),
+        ...(sharedGroup ? { concurrency_group: sharedGroup } : {}),
+      });
+    if (url.includes(`/actions/workflows/7/runs?branch=${headBranch}`))
+      return Response.json({
+        workflow_runs: [
+          {
+            id: 40301634999,
+            head_branch: headBranch,
+            head_sha: newerSha,
+            run_number: 11,
+            ...(newerPr ? { pull_requests: [{ number: newerPr }] } : {}),
+            ...(sharedGroup ? { concurrency_group: sharedGroup } : {}),
+          },
+          { id: 40301634711, head_branch: headBranch, head_sha: "a1", run_number: 10 },
+        ],
+      });
     return inner(url, init);
   }) as FetchImpl;
-  let newerSha = "b2";
   assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: () => {} }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
   assert.equal(posts(gh.calls), 0);
-  // A newer run of the same commit (another manual dispatch from it) is not a newer push: the re-run goes ahead.
+  // A newer run on the same PR branch with the same head SHA still shares the branch's concurrency group: not re-run.
   newerSha = "a1";
+  assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: () => {} }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
+  assert.equal(posts(gh.calls), 0);
+  // Manual dispatches from master for different PRs do not supersede each other, even when master moved between them.
+  headBranch = "master";
+  newerSha = "b2";
+  ownPr = 101;
+  newerPr = 102;
   assert.equal((await requestRerun({ env: env("1"), fetchImpl, log: () => {} })).rerun, true);
+  // A newer manual dispatch from master for the same PR does supersede the earlier run.
+  newerPr = 101;
+  assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: () => {} }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
+  // When dispatches for different PRs share the workflow's concurrency group, the newer run still blocks the re-run.
+  newerPr = 102;
+  sharedGroup = "e2e-refs/heads/master";
+  assert.deepEqual(await requestRerun({ env: env("1"), fetchImpl, log: () => {} }), { rerun: false, reason: "run 40301634999 superseded this run on its branch; not re-run" });
 });
 
 test("an earlier attempt's request, an expired one, or none at all re-runs nothing", async () => {
@@ -117,6 +158,17 @@ test("a lane whose TSIO run began is re-run whole from its first job, so its wor
   const result = await requestRerun({ env: env("1"), fetchImpl: gh.fetchImpl, log: () => {} });
   assert.deepEqual(result, { rerun: true, reason: "re-running the whole lane e2e-test-playwright-full-enterprise from its first job (attempt 2 of 2)" });
   assert.deepEqual(gh.calls.filter((c) => c.method === "POST").map((c) => new URL(c.url).pathname), ["/repos/mattermost/mattermost-mobile/actions/jobs/126961998001/rerun"]);
+});
+
+test("a marker whose job ID belongs to another run is refused before any re-run POST", async () => {
+  const gh = github([{ name: "e2e-triage-rerun-attempt-1-of-2-job-126961998001-e2e-test-playwright-full-enterprise" }]);
+  const inner = gh.fetchImpl;
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    if ((init?.method ?? "GET") === "GET" && url.endsWith("/actions/jobs/126961998001")) return Response.json({ run_id: 99999999999 });
+    return inner(url, init);
+  }) as FetchImpl;
+  await assert.rejects(requestRerun({ env: env("1"), fetchImpl, log: () => {} }), /e2e-test-rerun: job 126961998001 does not belong to run 40301634711/);
+  assert.equal(posts(gh.calls), 0);
 });
 
 test("two lanes that need a fresh start, or a lane whose first job was not found, re-run every job of the run", async () => {

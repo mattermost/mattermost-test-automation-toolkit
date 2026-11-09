@@ -3529,12 +3529,16 @@ function diagnoseLane(facts) {
     for (const u of slow.slice(0, 2)) ev.push(`${u.spec} ran ${Math.round(longestRun(u) / 6e4)} min, past its lease: split it or it can outlast a worker`);
     return { label: "all specs ran", state: "success", fault: "nobody", action: "nothing", what: lost ? `${plural(lost, "worker")} lost after the other workers ran every spec` : "a job outside the tests failed after every spec ran", rerun: "none", evidence: ev };
   }
-  const sameStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step && c.cause.kind !== "infra") : [];
+  const hiddenSet = new Set(hidden);
+  const sameStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step && (hiddenSet.has(c) || c.cause.kind !== "infra" && c.cause.kind !== "timeout")) : [];
+  const unknownStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step && !sameStep.includes(c)) : [];
   const hiddenAll = hidden.length > 0 && sameStep.length === workers.length;
   if (hidden.length && !hiddenAll) {
     const h = hidden[0];
-    const passed = workers.length - sameStep.length;
-    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(sameStep.length, "worker")} and passed on the other ${passed}: ${quote(hiddenLine(h))}`, rerun: rerunKind, evidence: [`${sameStep.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; ${plural(passed, "worker")} passed it`, ...evidence] };
+    const passed = workers.length - sameStep.length - unknownStep.length;
+    const rest = unknownStep.length === 0 ? `passed on the other ${passed}` : passed ? `passed on ${plural(passed, "worker")} (${unknownStep.length} did not finish)` : `the other ${plural(unknownStep.length, "worker")} did not finish it`;
+    const evRest = unknownStep.length === 0 ? `${plural(passed, "worker")} passed it` : `${passed ? `${plural(passed, "worker")} passed it, ` : ""}${plural(unknownStep.length, "worker")} did not finish it`;
+    return { label: "machine failure", state: "failure", fault: "infrastructure", action: rerunKind === "lane" ? "re-run all jobs" : "re-run the failed jobs", what: `${h.job.step} tests failed on ${plural(sameStep.length, "worker")} and ${rest}: ${quote(hiddenLine(h))}`, rerun: rerunKind, evidence: [`${sameStep.map((c) => jobLabel(c.job)).join(", ")}: ${h.job.step} failed; ${evRest}`, ...evidence] };
   }
   const finished2 = o ? o.units.length - o.unfinished.length : 0;
   const massTests = Boolean(o && o.failed.length >= 20 && o.failed.length * 4 >= finished2);
