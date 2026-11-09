@@ -40,7 +40,7 @@ async function requestRerun({ env, fetchImpl = fetch, log = console.log }) {
     try {
       const run = await (await call("GET", `/repos/${repo}/actions/runs/${runId}`)).json();
       const { workflow_runs: rows = [] } = await (await call("GET", `/repos/${repo}/actions/workflows/${run.workflow_id}/runs?branch=${encodeURIComponent(run.head_branch)}&per_page=5`)).json();
-      return rows.find((r) => r.run_number > run.run_number)?.id ?? null;
+      return rows.find((r) => r.run_number > run.run_number && r.head_sha !== run.head_sha)?.id ?? null;
     } catch (e) {
       log(`e2e-test-rerun: could not check for a newer run: ${String(e).slice(0, 160)}`);
       return null;

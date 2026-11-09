@@ -3527,7 +3527,7 @@ function diagnoseLane(facts) {
     for (const u of slow.slice(0, 2)) ev.push(`${u.spec} ran ${Math.round(longestRun(u) / 6e4)} min, past its lease: split it or it can outlast a worker`);
     return { label: "all specs ran", state: "success", fault: "nobody", action: "nothing", what: lost ? `${plural(lost, "worker")} lost after the other workers ran every spec` : "a job outside the tests failed after every spec ran", rerun: "none", evidence: ev };
   }
-  const sameStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step) : [];
+  const sameStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step && c.cause.kind !== "infra") : [];
   const hiddenAll = hidden.length > 0 && sameStep.length === workers.length;
   if (hidden.length && !hiddenAll) {
     const h = hidden[0];

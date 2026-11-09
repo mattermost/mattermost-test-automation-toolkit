@@ -71,9 +71,12 @@ export async function requestRerun({ env, fetchImpl = fetch, log = console.log }
   // branch's concurrency group. A lookup that fails does not stop the re-run.
   const newerRun = async (): Promise<number | null> => {
     try {
-      const run = (await (await call("GET", `/repos/${repo}/actions/runs/${runId}`)).json()) as { workflow_id: number; head_branch: string; run_number: number };
-      const { workflow_runs: rows = [] } = (await (await call("GET", `/repos/${repo}/actions/workflows/${run.workflow_id}/runs?branch=${encodeURIComponent(run.head_branch)}&per_page=5`)).json()) as { workflow_runs?: { id: number; run_number: number }[] };
-      return rows.find((r) => r.run_number > run.run_number)?.id ?? null;
+      const run = (await (await call("GET", `/repos/${repo}/actions/runs/${runId}`)).json()) as { workflow_id: number; head_branch: string; head_sha: string; run_number: number };
+      const { workflow_runs: rows = [] } = (await (await call("GET", `/repos/${repo}/actions/workflows/${run.workflow_id}/runs?branch=${encodeURIComponent(run.head_branch)}&per_page=5`)).json()) as { workflow_runs?: { id: number; head_sha: string; run_number: number }[] };
+      // A newer push moved the branch. Runs dispatched from one commit (manual runs of different PRs from master) do not
+      // supersede each other. ponytail: master moving between two such dispatches reads as a newer push; compare the
+      // tested PR from the run's inputs if that ever skips a re-run that was needed.
+      return rows.find((r) => r.run_number > run.run_number && r.head_sha !== run.head_sha)?.id ?? null;
     } catch (e) {
       log(`e2e-test-rerun: could not check for a newer run: ${String(e).slice(0, 160)}`);
       return null;

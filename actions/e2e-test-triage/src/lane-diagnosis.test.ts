@@ -126,6 +126,10 @@ test("every spec ran and passed: green, whatever worker or report was lost (fix 
   const unread = { conclusion: "failure", step: "ci/upgrade-to" };
   const mostUnread = diagnoseLane(facts({ orchestration: orch(passing(0).concat(Array.from({ length: 10 }, (_, i) => unit(`specs/s${i}.spec.ts`, "pending", [])))), jobs: workers(4, [failedUpgrade, unread, unread, unread]), baseline: baseline({ atBase: trunk("success") }) }));
   assert.deepEqual([mostUnread.label, mostUnread.fault], ["caused by PR", "PR"]);
+  // The others died at that step on the network: the machine's, so not lane-wide. Re-run.
+  const net = { conclusion: "failure", step: "ci/upgrade-to", tail: "Error: read ECONNRESET" };
+  const mixed = diagnoseLane(facts({ orchestration: orch(passing(0).concat(Array.from({ length: 10 }, (_, i) => unit(`specs/s${i}.spec.ts`, "pending", [])))), jobs: workers(4, [failedUpgrade, net, net, net]), baseline: baseline({ atBase: trunk("success") }) }));
+  assert.equal(mixed.label, "machine failure");
   // run 41940673353: the abandoned spec's late report passed; the slow spec is named in the evidence.
   const slow = diagnoseLane(facts({ orchestration: orch([...passing(409), unit("specs/functional/system_console/abac/teams/team_advanced_rules.spec.ts", "abandoned", [{ status: "passed", actual_duration_ms: 874041, expired: true }, { status: null, expired: true }])], "timed_out"), jobs: workers(30, { 8: { conclusion: "failure", step: "ci/dispatch-run", tail: "##[error]The action 'ci/dispatch-run' has timed out after 25 minutes." } }) }));
   assert.equal(slow.state, "success");

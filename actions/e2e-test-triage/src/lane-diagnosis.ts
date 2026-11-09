@@ -201,7 +201,8 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
   // lane-wide failure, judged below.
   // Workers are counted by the step they died on, not by whose log was read (at most ten are): one whose log was not read
   // but died at the same step is not counted as a pass.
-  const sameStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step) : [];
+  // A worker that died there on the network or the runner is the machine's, not a harness failure.
+  const sameStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step && c.cause.kind !== "infra") : [];
   const hiddenAll = hidden.length > 0 && sameStep.length === workers.length;
   if (hidden.length && !hiddenAll) {
     const h = hidden[0];
