@@ -490,7 +490,7 @@ lane (`<context>/<base>`) at the PR's merge base and now.
 
 | Label | When | State | Whose fault | What to do |
 |---|---|---|---|---|
-| `all specs ran` | Every dispatched spec ran and passed (a late report of a spec counts) | green | nobody | nothing |
+| `all specs ran` | Every dispatched spec ran and passed (a late report of a spec counts), whatever killed the other workers: a runner, a lost report, or a per-worker setup step (`prepare-playwright`, `prepare-cypress`) that failed on an outside service, such as the demo-plugin download from GitHub. Not where an upgrade harness (`upgrade-from`, `upgrade-to`) failed tests on a worker: the orchestration never sees those | green | nobody | nothing |
 | `broken on main` | Most specs failed (20 or more, a quarter of those that ran), or the setup failed on every worker, and the base branch fails the same way at the merge base | green on a PR where the specs ran (red where the setup broke: nothing ran), red on the base branch's own run | base branch | nothing, or merge the base branch once it is fixed where nothing ran |
 | `fixed on main` | As above, and the base branch is green now; or a setup failure with the base branch green, where the base branch has since changed the lane's test root or support paths (or the lane's setup comes from its newer workflow) | green on a PR where the specs ran, red where the setup broke | base branch | merge the base branch |
 | `caused by PR` | As above with the base branch green; or a spec the PR changed outlasted its worker; or a spec the PR changed failed in a report that never arrived; or nothing else explains a red lane and the PR changes the lane's own code | red | PR | fix the change |

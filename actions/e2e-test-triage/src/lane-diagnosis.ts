@@ -71,6 +71,11 @@ const CODE_RE: [RegExp, string][] = [
 ];
 const AFTER_TESTS_STEP = /upload-debug-artifacts|upload-artifact|debug artifacts|teardown/i;
 const RUN_STEP = /dispatch-run|run tests|run specs|\btest\b/i;
+// A lane's per-worker setup (Playwright's `setup` project, Cypress's prepare step): the same steps on every worker, before
+// it leases a spec. Tests failing there (a plugin download that timed out) cover no spec: a worker that failed it took
+// none, and the others passed the same setup and ran the specs. An upgrade harness (ci/upgrade-from, ci/upgrade-to) is
+// not one: its tests are the lane's own, and the orchestration never sees them.
+const SETUP_STEP = /\bprepare-(?:playwright|cypress)\b/i;
 // A test runner's failed count (Playwright "  2 failed", mocha "2 failing") in a dead job's log.
 const TESTS_FAILED = /^\s*\d+ (?:failed|failing)\b/m;
 const TIMED_OUT = /has timed out after \d+ minutes|exceeded the maximum execution time|The job running on runner .* has exceeded/i;
@@ -186,14 +191,21 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
   const rerunKind: RerunKind = o ? "lane" : "failed-jobs";
 
   // 1. Every spec ran and passed: only a worker, its report or a job after the tests was lost. Not where a worker's log
-  // shows tests that failed in a step outside dispatch (an upgrade harness): the orchestration never sees those.
+  // shows tests that failed in a step outside dispatch (an upgrade harness): the orchestration never sees those. A
+  // worker's setup step is not such a step (see SETUP_STEP): a worker that failed it ran no spec.
   const hidden = deadWorkers.filter((c) => !(c.job.step && RUN_STEP.test(c.job.step)) && TESTS_FAILED.test([c.job.tail, ...c.job.errors].join("\n")));
-  if (allPassed(o) && !hidden.length) {
+  const unseen = hidden.filter((c) => !SETUP_STEP.test(c.job.step ?? ""));
+  if (allPassed(o) && !unseen.length) {
     const slow = o!.units.filter((u) => u.attempts.some((a) => a.expired) && longestRun(u) > 0).sort((a, b) => longestRun(b) - longestRun(a));
     const lost = deadWorkers.length;
     const ev = [`TSIO orchestration ${o!.status}: ${o!.units.length} of ${o!.totalUnits} specs ran, ${o!.tests.total} tests, 0 failed`, ...evidence];
     for (const u of slow.slice(0, 2)) ev.push(`${u.spec} ran ${Math.round(longestRun(u) / 60000)} min, past its lease: split it or it can outlast a worker`);
-    return { label: "all specs ran", state: "success", fault: "nobody", action: "nothing", what: lost ? `${plural(lost, "worker")} lost after the other workers ran every spec` : "a job outside the tests failed after every spec ran", rerun: "none", evidence: ev };
+    // Workers whose setup failed are named with what failed there (an outside service, as a rule), not just "lost".
+    const inSetup = deadWorkers.filter((c) => SETUP_STEP.test(c.job.step ?? ""));
+    const what = inSetup.length
+      ? `${plural(inSetup.length, "worker")} failed ${inSetup[0].job.step} (${quote(inSetup[0].cause.line)}) and ran no spec; the other workers ran every spec`
+      : lost ? `${plural(lost, "worker")} lost after the other workers ran every spec` : "a job outside the tests failed after every spec ran";
+    return { label: "all specs ran", state: "success", fault: "nobody", action: "nothing", what, rerun: "none", evidence: ev };
   }
 
   // 1b. Tests that failed outside dispatch (an upgrade harness) on some workers, while the others ran them clean: the

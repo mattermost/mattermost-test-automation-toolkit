@@ -3481,6 +3481,7 @@ var CODE_RE = [
 ];
 var AFTER_TESTS_STEP = /upload-debug-artifacts|upload-artifact|debug artifacts|teardown/i;
 var RUN_STEP = /dispatch-run|run tests|run specs|\btest\b/i;
+var SETUP_STEP2 = /\bprepare-(?:playwright|cypress)\b/i;
 var TESTS_FAILED = /^\s*\d+ (?:failed|failing)\b/m;
 var TIMED_OUT = /has timed out after \d+ minutes|exceeded the maximum execution time|The job running on runner .* has exceeded/i;
 function jobCause(job) {
@@ -3555,12 +3556,15 @@ function diagnoseLane(facts) {
   if (dead.length > 6) evidence.push(`\u2026 and ${plural(dead.length - 6, "more dead job")}`);
   const rerunKind = o ? "lane" : "failed-jobs";
   const hidden = deadWorkers.filter((c) => !(c.job.step && RUN_STEP.test(c.job.step)) && TESTS_FAILED.test([c.job.tail, ...c.job.errors].join("\n")));
-  if (allPassed(o) && !hidden.length) {
+  const unseen = hidden.filter((c) => !SETUP_STEP2.test(c.job.step ?? ""));
+  if (allPassed(o) && !unseen.length) {
     const slow = o.units.filter((u) => u.attempts.some((a) => a.expired) && longestRun(u) > 0).sort((a, b) => longestRun(b) - longestRun(a));
     const lost = deadWorkers.length;
     const ev = [`TSIO orchestration ${o.status}: ${o.units.length} of ${o.totalUnits} specs ran, ${o.tests.total} tests, 0 failed`, ...evidence];
     for (const u of slow.slice(0, 2)) ev.push(`${u.spec} ran ${Math.round(longestRun(u) / 6e4)} min, past its lease: split it or it can outlast a worker`);
-    return { label: "all specs ran", state: "success", fault: "nobody", action: "nothing", what: lost ? `${plural(lost, "worker")} lost after the other workers ran every spec` : "a job outside the tests failed after every spec ran", rerun: "none", evidence: ev };
+    const inSetup = deadWorkers.filter((c) => SETUP_STEP2.test(c.job.step ?? ""));
+    const what = inSetup.length ? `${plural(inSetup.length, "worker")} failed ${inSetup[0].job.step} (${quote(inSetup[0].cause.line)}) and ran no spec; the other workers ran every spec` : lost ? `${plural(lost, "worker")} lost after the other workers ran every spec` : "a job outside the tests failed after every spec ran";
+    return { label: "all specs ran", state: "success", fault: "nobody", action: "nothing", what, rerun: "none", evidence: ev };
   }
   const hiddenSet = new Set(hidden);
   const sameStep = hidden.length ? deadWorkers.filter((c) => c.job.step === hidden[0].job.step && (hiddenSet.has(c) || c.cause.kind !== "infra" && c.cause.kind !== "timeout")) : [];

@@ -117,6 +117,14 @@ test("every spec ran and passed: green, whatever worker or report was lost (fix 
   assert.deepEqual([harness.label, harness.state, harness.rerun], ["machine failure", "failure", "lane"], "passed on the other workers: re-run");
   assert.match(harness.what, /^ci\/upgrade-to tests failed on 1 worker and passed on the other 39: ✘ 1 \[upgrade-to\] › upgrade_to\.ts:12 › baseline survives the upgrade/);
   assert.equal(harness.action, "re-run all jobs");
+  // mattermost#39806 run 42578813912: 10 of 30 workers failed the setup project's demo-plugin download from GitHub
+  // releases (an outage); the other 20 passed the same setup and ran all 413 specs. Setup leases no spec: green.
+  const plugin = { conclusion: "failure", step: "ci/prepare-playwright", errors: ["Error: An error occurred while downloading the plugin."], tail: "  ✘  3 [setup] › specs/test_setup.ts:16:6 › ensure demo plugin (2.1s)\n  1 failed\n  3 passed (2.5m)\n##[error]Process completed with exit code 1." };
+  const setup = diagnoseLane(facts({ orchestration: orch(passing(413)), jobs: workers(30, Array(10).fill(plugin)) }));
+  assert.deepEqual([setup.label, setup.state, setup.fault, setup.rerun], ["all specs ran", "success", "nobody", "none"]);
+  assert.match(setup.what, /^10 workers failed ci\/prepare-playwright \(.+\) and ran no spec; the other workers ran every spec$/);
+  // A spec the orchestration counts as failed still keeps the lane red: setup failures vouch for nothing.
+  assert.notEqual(diagnoseLane(facts({ orchestration: orch([...passing(412), unit("specs/functional/x.spec.ts", "completed_fail")]), jobs: workers(30, Array(10).fill(plugin)) })).state, "success");
   // On every worker, with the base branch green: the same code failed the harness everywhere, the PR's.
   const failedUpgrade = { conclusion: "failure", step: "ci/upgrade-to", tail: "  ✘  1 [upgrade-to] › upgrade_to.ts:12 › baseline survives the upgrade\n  1 failed" };
   const everywhere = diagnoseLane(facts({ orchestration: orch(passing(0).concat(Array.from({ length: 10 }, (_, i) => unit(`specs/s${i}.spec.ts`, "pending", [])))), jobs: workers(4, Array(4).fill(failedUpgrade)), baseline: baseline({ atBase: trunk("success") }) }));
