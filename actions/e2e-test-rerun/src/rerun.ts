@@ -182,10 +182,47 @@ export async function requestRerun({ env, fetchImpl = fetch, log = console.log }
       return null;
     }
   };
+  // A run that ended "cancelled": re-run only when a job ran past its time limit (GitHub annotates it "The job has
+  // exceeded the maximum execution time") and nothing cancelled the run ("The run was canceled by @who": a person, or a
+  // newer run through the concurrency group). A lane's marker can predate the cancel, since another lane may still have
+  // been running. Null: re-run it; else why not. A run that did not end cancelled, or whose conclusion cannot be read,
+  // is left to the other checks, as before; a cancelled run whose jobs cannot be read is not re-run.
+  const cancelledWhy = async (): Promise<string | null> => {
+    let conclusion: string | null = null;
+    try {
+      conclusion = ((await (await call("GET", `/repos/${repo}/actions/runs/${runId}/attempts/${attempt}`)).json()) as { conclusion?: string | null }).conclusion ?? null;
+    } catch (e) {
+      log(`e2e-test-rerun: could not read the run's conclusion: ${String(e).slice(0, 160)}`);
+      return null;
+    }
+    if (conclusion !== "cancelled") return null;
+    try {
+      const jobs: { id: number; conclusion?: string | null }[] = [];
+      for (let page = 1; page <= 10; page++) {
+        const { total_count: total = 0, jobs: rows = [] } = (await (await call("GET", `/repos/${repo}/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=100&page=${page}`)).json()) as { total_count?: number; jobs?: { id: number; conclusion?: string | null }[] };
+        jobs.push(...rows);
+        if (!rows.length || jobs.length >= total) break;
+      }
+      let timedOut = false;
+      for (const job of jobs.filter((j) => j.conclusion === "cancelled").slice(0, 30)) {
+        const notes = (await (await call("GET", `/repos/${repo}/check-runs/${job.id}/annotations`)).json()) as { message?: string | null }[];
+        for (const { message = "" } of notes) {
+          const by = /The run was canceled by (@\S+?)\.?$/m.exec(message ?? "");
+          if (by) return `the run was cancelled by ${by[1]}, not by a job's time limit; not re-run`;
+          if (/exceeded the maximum execution time/i.test(message ?? "")) timedOut = true;
+        }
+      }
+      return timedOut ? null : "the run was cancelled and no job ran past its time limit; not re-run";
+    } catch (e) {
+      return `the run was cancelled and its jobs could not be read (${String(e).slice(0, 120)}); not re-run`;
+    }
+  };
   let result: RerunResult;
   let newer: number | null = null;
+  let cancelled: string | null = null;
   if (!lanes.length) result = { rerun: false, reason: `no lane asked for a re-run on attempt ${attempt}` };
   else if (attempt >= limit) result = { rerun: false, reason: `attempt ${attempt} is the last of ${limit}; a person re-runs it` };
+  else if ((cancelled = await cancelledWhy())) result = { rerun: false, reason: cancelled };
   else if ((newer = await newerRun())) result = { rerun: false, reason: `run ${newer} superseded this run on its branch; not re-run` };
   else if (!fresh.length) {
     await call("POST", `/repos/${repo}/actions/runs/${runId}/rerun-failed-jobs`);

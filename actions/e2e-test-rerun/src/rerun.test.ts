@@ -218,3 +218,38 @@ test("push runs on trunk are never told apart by their commit titles: an unresol
   newerTitle = "E2E for PR #101";
   assert.equal((await requestRerun({ env: env("1"), fetchImpl, log: () => {} })).rerun, true);
 });
+
+// mattermost#39803 review: a lane can leave its marker while another lane still runs; a later cancel must win over it.
+test("a cancelled run is re-run only when a job ran past its time limit and nothing cancelled the run", async () => {
+  const gh = github([{ name: "e2e-triage-rerun-attempt-1-of-3-e2e-test-detox-ios" }]);
+  const inner = gh.fetchImpl;
+  let conclusion = "cancelled";
+  let notes: Record<number, string[]> = {};
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/actions/runs/40301634711/attempts/1")) return Response.json({ conclusion });
+    if (url.includes("/actions/runs/40301634711/attempts/1/jobs"))
+      return Response.json({ total_count: 3, jobs: [{ id: 1, conclusion: "success" }, { id: 2, conclusion: "cancelled" }, { id: 3, conclusion: "cancelled" }] });
+    const note = /\/check-runs\/(\d+)\/annotations$/.exec(url);
+    if (note) return Response.json((notes[Number(note[1])] ?? []).map((message) => ({ message })));
+    if (url.endsWith("/actions/runs/40301634711")) return Response.json({ id: 40301634711, workflow_id: 7, head_branch: "pr-1", head_sha: "a1", run_number: 10 });
+    if (url.includes("/actions/workflows/7/runs")) return Response.json({ workflow_runs: [] });
+    return inner(url, init);
+  }) as FetchImpl;
+  const run = () => requestRerun({ env: env("1"), fetchImpl, log: () => {} });
+  // mattermost run 42195788698: a cypress worker hit its 35-minute limit; the run ended "cancelled". Re-run.
+  notes = { 2: ["The job has exceeded the maximum execution time of 35m0s"] };
+  assert.equal((await run()).rerun, true);
+  // A person cancelled the run after the marker was left: not re-run, even beside a timed-out job.
+  notes = { 2: ["The job has exceeded the maximum execution time of 35m0s"], 3: ["The run was canceled by @someone."] };
+  assert.deepEqual(await run(), { rerun: false, reason: "the run was cancelled by @someone, not by a job's time limit; not re-run" });
+  // A newer run cancelled it through the concurrency group (mattermost-mobile run 42516258120): not re-run either.
+  notes = { 2: ["The run was canceled by @github-actions[bot].", "The operation was canceled."] };
+  assert.deepEqual(await run(), { rerun: false, reason: "the run was cancelled by @github-actions[bot], not by a job's time limit; not re-run" });
+  // Cancelled with no job past its limit: nothing shows a timeout, so not re-run.
+  notes = { 2: ["The operation was canceled."] };
+  assert.deepEqual(await run(), { rerun: false, reason: "the run was cancelled and no job ran past its time limit; not re-run" });
+  // A failed run is not checked for cancels.
+  conclusion = "failure";
+  assert.equal((await run()).rerun, true);
+  assert.equal(gh.calls.filter((c) => c.method === "POST").length, 2, "only the timed-out and the failed run were re-run");
+});
