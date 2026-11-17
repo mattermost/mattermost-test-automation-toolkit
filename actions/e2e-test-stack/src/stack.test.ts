@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
+import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -498,22 +499,29 @@ test("ARNs and account ids in the control plane's errors are redacted wherever t
 });
 
 test("the Lambda client fails a call that runs past the request timeout, instead of only warning", async () => {
-  // Accepts the connection and never answers, as a stuck invoke would.
-  const server = createServer(() => {});
+  // Accepts the connection, reads the request and never answers, as a stuck invoke would.
+  const sockets = new Set<Socket>();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.resume();
+    socket.on("close", () => sockets.delete(socket));
+  });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as { port: number };
+  const client = new LambdaClient({
+    ...lambdaClientConfig("us-east-1", 300),
+    endpoint: `http://127.0.0.1:${port}`,
+    credentials: { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "example" },
+  });
   try {
-    const client = new LambdaClient({
-      ...lambdaClientConfig("us-east-1", 300),
-      endpoint: `http://127.0.0.1:${port}`,
-      credentials: { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "example" },
-    });
     await assert.rejects(
       client.send(new InvokeCommand({ FunctionName: "f", Qualifier: "q", Payload: new Uint8Array() })),
       (e: Error) => e.name === "TimeoutError",
     );
   } finally {
-    server.close();
+    client.destroy();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())));
   }
 });
 
