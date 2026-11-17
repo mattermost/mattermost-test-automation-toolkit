@@ -2,6 +2,7 @@
 // See LICENSE.txt for license information.
 import { Agent } from "node:https";
 import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
+import type { LambdaClientConfig } from "@aws-sdk/client-lambda";
 import type { Sleep } from "../../shared/src/github.ts";
 import type { Invoke } from "./stack.ts";
 
@@ -18,19 +19,26 @@ export interface LambdaSend {
 const sleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * The Lambda client, with credentials from the environment. The SDK makes one attempt: a create retried after a timeout
- * would make a second batch. TCP keep-alive holds the connection open through NAT while a create runs.
+ * The Lambda client's settings. The SDK makes one attempt: a create retried after a timeout would make a second batch.
+ * TCP keep-alive holds the connection open through NAT while a create runs.
  */
-export function lambdaClient(region: string): LambdaClient {
-  return new LambdaClient({
+export function lambdaClientConfig(region: string, requestTimeout = REQUEST_TIMEOUT_MS): LambdaClientConfig {
+  return {
     region,
     maxAttempts: 1,
     requestHandler: {
       connectionTimeout: 60_000,
-      requestTimeout: REQUEST_TIMEOUT_MS,
+      requestTimeout,
+      // Without it the SDK only logs a warning at requestTimeout and keeps waiting.
+      throwOnRequestTimeout: true,
       httpsAgent: new Agent({ keepAlive: true, keepAliveMsecs: 30_000 }),
     },
-  });
+  };
+}
+
+/** The Lambda client, with credentials from the environment. */
+export function lambdaClient(region: string): LambdaClient {
+  return new LambdaClient(lambdaClientConfig(region));
 }
 
 /**

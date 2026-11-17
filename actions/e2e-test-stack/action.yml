@@ -5,11 +5,15 @@ description: >-
   Uses the AWS credentials the job holds: run aws-actions/configure-aws-credentials with the repository's CI role first.
 inputs:
   operation:
-    description: create, fetch, logs or destroy
+    description: >-
+      create, fetch, logs or destroy, which call the control plane; or open, which opens a create response's secrets
+      with private-key and calls nothing, for a test job that has no AWS credentials
     required: true
   caller-key:
-    description: The repository's key in the control plane's callers (e.g. mobile); the action invokes only the alias <caller-key>-<channel>
-    required: true
+    description: >-
+      The repository's key in the control plane's callers (e.g. mobile); the action invokes only the alias
+      <caller-key>-<channel>. Required for every operation but open
+    default: ""
   channel:
     description: v1 (the promoted build) or edge (main's newest build). fetch, logs and destroy use the channel the batch was created on
     default: v1
@@ -21,8 +25,8 @@ inputs:
     default: us-east-1
   private-key:
     description: >-
-      The repository's X25519 private key, base64 (the E2E_STACK_PRIVATE_KEY secret). Required for create, fetch and logs,
-      and for destroy with create-response; it opens the secrets the control plane seals to the repository
+      The repository's X25519 private key, base64 (the E2E_STACK_PRIVATE_KEY secret). Required for create, fetch, logs and
+      open, and for destroy with create-response; it opens the secrets the control plane seals to the repository
     default: ""
   batch-id:
     description: The batch to fetch, read the logs of or destroy (create's batch-id output)
@@ -33,7 +37,7 @@ inputs:
   create-response:
     description: >-
       Instead of batch-token: a create response file written by response-path, from which the batch id and its sealed
-      token are read with private-key. For a later job or run, through an uploaded artifact
+      token are read with private-key. For a later job or run, through an uploaded artifact. Required for open
     default: ""
   instance-key:
     description: For create. Names the stack and prefixes its hostnames (e.g. pr-1234); lowercase letters, digits and hyphens
@@ -85,7 +89,9 @@ inputs:
     description: For fetch. Comma-separated instance indexes; empty fetches the whole batch
     default: ""
   index:
-    description: For logs. The instance whose logs to collect; empty is 0
+    description: >-
+      For logs, the instance whose logs to collect (empty is 0). For open, the instance whose fields to set as
+      site-url, admin-username, admin-password and mail-token
     default: ""
   logs-path:
     description: For logs. Where to write the decoded log tail, which may hold secrets; empty is a file under RUNNER_TEMP
@@ -107,15 +113,27 @@ outputs:
     value: ${{ steps.stack.outputs.sites }}
   instances:
     description: >-
-      From create and fetch. JSON array, index-aligned, null where an instance failed or was not fetched: site_url,
+      From create, fetch and open. JSON array, index-aligned, null where an instance failed or was not fetched: site_url,
       state, admin_username, admin_email, admin_password, mail_token, credentials and facts. Its secrets are masked
     value: ${{ steps.stack.outputs.instances }}
+  site-url:
+    description: From open with index. That instance's site URL
+    value: ${{ steps.stack.outputs.site_url }}
+  admin-username:
+    description: From open with index. That instance's admin username
+    value: ${{ steps.stack.outputs.admin_username }}
+  admin-password:
+    description: From open with index. That instance's admin password; masked
+    value: ${{ steps.stack.outputs.admin_password }}
+  mail-token:
+    description: From open with index. That instance's Inbucket HTTP Basic password, user inbucket; masked
+    value: ${{ steps.stack.outputs.mail_token }}
   ready:
     description: How many instances are ready
     value: ${{ steps.stack.outputs.ready }}
   state:
     description: >-
-      The batch's state: ready or failed from create and fetch; destroyed, partially_destroyed, destroy_failed or
+      The batch's state: ready or failed from create, fetch and open (as created); destroyed, partially_destroyed, destroy_failed or
       "not found" from destroy
     value: ${{ steps.stack.outputs.state }}
   error:

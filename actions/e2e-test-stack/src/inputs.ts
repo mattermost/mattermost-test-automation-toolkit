@@ -2,7 +2,7 @@
 // See LICENSE.txt for license information.
 import type { Env } from "../../shared/src/github.ts";
 
-export type Operation = "create" | "fetch" | "logs" | "destroy";
+export type Operation = "create" | "fetch" | "logs" | "destroy" | "open";
 export type Channel = "edge" | "v1";
 
 /** The create request's fields, as the control plane names them; absent ones take its defaults. */
@@ -188,12 +188,15 @@ const createFields = (env: Env): CreateFields => {
 export function readInputs(env: Env): Inputs {
   const get = (k: string) => (env[k] ?? "").trim();
   const operation = get("STACK_OPERATION");
-  if (!["create", "fetch", "logs", "destroy"].includes(operation))
-    refuse(`operation must be create, fetch, logs or destroy, got ${JSON.stringify(operation)}`);
+  if (!["create", "fetch", "logs", "destroy", "open"].includes(operation))
+    refuse(`operation must be create, fetch, logs, destroy or open, got ${JSON.stringify(operation)}`);
   const op = operation as Operation;
   const callerKey = get("STACK_CALLER_KEY");
-  if (!callerKey) refuse("caller-key is required: the repository's key in the control plane's callers, e.g. mobile");
-  matching("caller-key", callerKey, LABEL, "the repository's key: lowercase letters, digits and hyphens");
+  // open calls nothing, so it names no alias.
+  if (!callerKey && op !== "open")
+    refuse("caller-key is required: the repository's key in the control plane's callers, e.g. mobile");
+  if (callerKey)
+    matching("caller-key", callerKey, LABEL, "the repository's key: lowercase letters, digits and hyphens");
   const channel = get("STACK_CHANNEL") || "v1";
   if (channel !== "edge" && channel !== "v1") refuse(`channel must be v1 or edge, got ${JSON.stringify(channel)}`);
   const project = get("STACK_PROJECT") || "e2e-test-stack";
@@ -206,12 +209,25 @@ export function readInputs(env: Env): Inputs {
 
   for (const [name, key] of CREATE_ONLY)
     if (op !== "create" && get(key)) refuse(`${name} is a create input; ${op} does not take it`);
-  if (op !== "logs" && get("STACK_INDEX")) refuse(`index is a logs input; ${op} does not take it`);
+  if (op !== "logs" && op !== "open" && get("STACK_INDEX"))
+    refuse(`index is a logs and open input; ${op} does not take it`);
   if (op !== "logs" && get("STACK_LOGS_PATH")) refuse(`logs-path is a logs input; ${op} does not take it`);
   if (op !== "fetch" && get("STACK_INDEXES")) refuse(`indexes is a fetch input; ${op} does not take it`);
 
   const privateKey = get("STACK_PRIVATE_KEY");
   if (privateKey) inputs.privateKey = privateKeyFrom(privateKey);
+
+  if (op === "open") {
+    for (const name of ["batch-id", "batch-token", "response-path"])
+      if (get(`STACK_${name.replace(/-/g, "_").toUpperCase()}`))
+        refuse(`${name} is not an open input; open reads the batch from create-response and calls nothing`);
+    const createResponse = get("STACK_CREATE_RESPONSE");
+    if (!createResponse) refuse("create-response is required for open: the create response file to open");
+    if (!inputs.privateKey) refuse("private-key is required for open: the create response's secrets are sealed to it");
+    inputs.createResponse = createResponse;
+    if (get("STACK_INDEX")) inputs.index = integer("index", get("STACK_INDEX"), 0);
+    return inputs;
+  }
 
   if (op === "create") {
     for (const name of ["batch-id", "batch-token", "create-response"])

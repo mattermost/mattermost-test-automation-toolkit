@@ -2,14 +2,15 @@
 // See LICENSE.txt for license information.
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { gzipSync } from "node:zlib";
-import { InvokeCommand } from "@aws-sdk/client-lambda";
+import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
 import sodium from "libsodium-wrappers";
 import { readInputs } from "./inputs.ts";
-import { lambdaInvoke, THROTTLE_ATTEMPTS } from "./lambda.ts";
+import { lambdaClientConfig, lambdaInvoke, THROTTLE_ATTEMPTS } from "./lambda.ts";
 import { openSealed, SealedError } from "./sealed.ts";
 import { buildRequest, run, writeOutputs } from "./stack.ts";
 import type { InvokeInput, InvokeOutput } from "./stack.ts";
@@ -301,7 +302,7 @@ test("an invoke that fails names the action and the alias, keeps ARNs and accoun
     const m = (e as Error).message;
     assert.equal(
       m,
-      "e2e-test-stack: the invoke of e2e-test-stack-v1:test-public-project-v1 failed: AccessDeniedException: User: <arn> is not authorized to perform: lambda:InvokeFunction. A batch may have been created; it is reaped at its ttl.",
+      "e2e-test-stack: the invoke of e2e-test-stack-v1:test-public-project-v1 failed: AccessDeniedException: User: [arn] is not authorized to perform: lambda:InvokeFunction. A batch may have been created; it is reaped at its ttl.",
     );
     assert.ok(!m.includes("123456789012") && !m.includes("pr-1234"));
     return true;
@@ -422,6 +423,203 @@ test("logs masks the URL, writes the decoded tail, and summarizes without either
   const summary = readFileSync(h.summary, "utf8");
   assert.match(summary, /\| Tail \| 1 lines, 60 bytes \|/);
   assert.ok(!summary.includes("X-Amz-Signature") && !summary.includes("Server is listening"));
+});
+
+test("a response-path that cannot be written fails the create after its batch id and token are set", async () => {
+  const notADirectory = file("plain");
+  writeFileSync(notADirectory, "");
+  const responsePath = join(notADirectory, "create.json");
+  const body = createResponse({
+    error: undefined,
+    sites: ["https://pr-1234-abc-00.test.example"],
+    batch: { state: "ready", ready: 1, instances: [lease(0)], secrets: seal(SECRETS) },
+  });
+  const h = harness(createEnv({ STACK_RESPONSE_PATH: responsePath }), ok(body));
+  await assert.rejects(
+    h.go(),
+    /response-path .*create\.json could not be written: .*\. Batch pr-1234-abc was created; destroy it\.$/,
+  );
+  const out = readOutputs(h.output);
+  assert.equal(out.batch_id, "pr-1234-abc");
+  assert.equal(out.batch_token, "batch-token-1");
+  assert.equal(out.response_path, undefined);
+});
+
+test("a response-path that cannot be written is reported with any other failure", async () => {
+  const unwritable = () => {
+    const notADirectory = file("plain");
+    writeFileSync(notADirectory, "");
+    return join(notADirectory, "create.json");
+  };
+  const refused = harness(createEnv({ STACK_RESPONSE_PATH: unwritable() }), {
+    StatusCode: 200,
+    FunctionError: "Unhandled",
+    Payload: new TextEncoder().encode('{"errorMessage":"no capacity"}'),
+  });
+  await assert.rejects(
+    refused.go(),
+    /refused the create: no capacity\..* Also, response-path .* could not be written: /,
+  );
+
+  const partial = harness(createEnv({ STACK_RESPONSE_PATH: unwritable() }), ok(createResponse()));
+  await assert.rejects(
+    partial.go(),
+    /create reported: 1 of 2 instances failed: \[1\]\. Batch pr-1234-abc was created; destroy it\. Also, response-path .* could not be written: /,
+  );
+  assert.equal(readOutputs(partial.output).batch_token, "batch-token-1");
+});
+
+test("a response error that is not a string is reported, and the batch is still handed back", async () => {
+  const h = harness(createEnv(), ok(createResponse({ error: { code: "partial", failed: [1] } })));
+  await assert.rejects(h.go(), /create reported: \{"code":"partial","failed":\[1\]\}\. Batch pr-1234-abc was created/);
+  const out = readOutputs(h.output);
+  assert.equal(out.batch_id, "pr-1234-abc");
+  assert.equal(out.batch_token, "batch-token-1");
+});
+
+test("ARNs and account ids in the control plane's errors are redacted wherever they are reported", async () => {
+  const arn = "arn:aws:sts::123456789012:assumed-role/e2e-test-stack-control-plane/x";
+  const refused = harness(createEnv(), {
+    StatusCode: 200,
+    FunctionError: "Unhandled",
+    Payload: new TextEncoder().encode(JSON.stringify({ errorMessage: `${arn} is not authorized` })),
+  });
+  await assert.rejects(refused.go(), (e: Error) => {
+    assert.match(e.message, /refused the create: \[arn\] is not authorized\./);
+    assert.ok(!e.message.includes("123456789012"));
+    return true;
+  });
+
+  const reported = harness(createEnv(), ok(createResponse({ error: `account 123456789012 refused: ${arn}` })));
+  await assert.rejects(reported.go(), /create reported: account \[account\] refused: \[arn\]\./);
+  assert.equal(readOutputs(reported.output).error, "account [account] refused: [arn]");
+  const summary = readFileSync(reported.summary, "utf8");
+  assert.ok(!summary.includes("123456789012") && !summary.includes("arn:aws"));
+});
+
+test("the Lambda client fails a call that runs past the request timeout, instead of only warning", async () => {
+  // Accepts the connection and never answers, as a stuck invoke would.
+  const server = createServer(() => {});
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as { port: number };
+  try {
+    const client = new LambdaClient({
+      ...lambdaClientConfig("us-east-1", 300),
+      endpoint: `http://127.0.0.1:${port}`,
+      credentials: { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "example" },
+    });
+    await assert.rejects(
+      client.send(new InvokeCommand({ FunctionName: "f", Qualifier: "q", Payload: new Uint8Array() })),
+      (e: Error) => e.name === "TimeoutError",
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test("open reads every instance from a create response with the private key, masks first, and calls nothing", async () => {
+  const responsePath = file("open.json");
+  writeFileSync(responsePath, JSON.stringify(createResponse()));
+  const h = harness(
+    { STACK_OPERATION: "open", STACK_PRIVATE_KEY: PRIVATE_KEY, STACK_CREATE_RESPONSE: responsePath },
+    () => assert.fail("open must not call the control plane"),
+  );
+  await h.go();
+  assert.equal(h.calls.length, 0);
+  const out = readOutputs(h.output);
+  assert.equal(out.batch_id, "pr-1234-abc");
+  assert.equal(out.state, "failed");
+  assert.equal(out.ready, "1");
+  assert.equal(out.batch_token, undefined);
+  assert.equal(out.admin_password, undefined);
+  const instances = JSON.parse(out.instances) as ({ admin_password: string; site_url: string } | null)[];
+  assert.equal(instances[0]?.admin_password, "admin-pw-0");
+  assert.equal(instances[0]?.site_url, "https://pr-1234-abc-00.test.example");
+  assert.equal(instances[1], null);
+  assert.deepEqual(masks(h).sort(), [...SECRET_VALUES].sort());
+});
+
+test("open with an index sets that instance's fields as their own outputs, and fails for one that did not come up", async () => {
+  const responsePath = file("open-index.json");
+  writeFileSync(responsePath, JSON.stringify(createResponse()));
+  const env = { STACK_OPERATION: "open", STACK_PRIVATE_KEY: PRIVATE_KEY, STACK_CREATE_RESPONSE: responsePath };
+  const h = harness({ ...env, STACK_INDEX: "0" }, () => assert.fail("open must not call the control plane"));
+  await h.go();
+  const out = readOutputs(h.output);
+  assert.equal(out.site_url, "https://pr-1234-abc-00.test.example");
+  assert.equal(out.admin_username, "sysadmin");
+  assert.equal(out.admin_password, "admin-pw-0");
+  assert.equal(out.mail_token, "mail-0");
+  assert.ok(masks(h).includes("admin-pw-0") && masks(h).includes("mail-0"));
+
+  const failed = harness({ ...env, STACK_INDEX: "1" }, () => assert.fail("open must not call the control plane"));
+  await assert.rejects(
+    failed.go(),
+    /batch pr-1234-abc has no ready instance 1 to open: it failed, or the batch has 2$/,
+  );
+  assert.equal(readOutputs(failed.output).batch_id, "pr-1234-abc");
+
+  const other = harness(
+    {
+      STACK_OPERATION: "open",
+      STACK_PRIVATE_KEY: Buffer.from(sodium.crypto_box_keypair().privateKey).toString("base64"),
+      STACK_CREATE_RESPONSE: responsePath,
+    },
+    () => assert.fail("open must not call the control plane"),
+  );
+  await assert.rejects(other.go(), SealedError);
+  assert.deepEqual(readOutputs(other.output), {});
+});
+
+test("open refuses an instance that is not ready, and names the file it cannot read or open", async () => {
+  const notReady = file("open-not-ready.json");
+  writeFileSync(
+    notReady,
+    JSON.stringify(
+      createResponse({ batch: { ...createResponse().batch, instances: [lease(0), { ...lease(1), state: "failed" }] } }),
+    ),
+  );
+  const env = { STACK_OPERATION: "open", STACK_PRIVATE_KEY: PRIVATE_KEY };
+  const never = () => assert.fail("open must not call the control plane");
+  const failed = harness({ ...env, STACK_CREATE_RESPONSE: notReady, STACK_INDEX: "1" }, never);
+  await assert.rejects(failed.go(), /has no ready instance 1 to open/);
+
+  const truncated = file("open-truncated.json");
+  writeFileSync(truncated, '{"batch_id":');
+  const bad = harness({ ...env, STACK_CREATE_RESPONSE: truncated }, never);
+  await assert.rejects(bad.go(), new RegExp(`create-response ${truncated} could not be read as JSON: SyntaxError`));
+
+  const other = harness(
+    {
+      ...env,
+      STACK_PRIVATE_KEY: Buffer.from(sodium.crypto_box_keypair().privateKey).toString("base64"),
+      STACK_CREATE_RESPONSE: notReady,
+    },
+    never,
+  );
+  await assert.rejects(other.go(), (e: Error) => {
+    assert.ok(e instanceof SealedError);
+    assert.match(
+      e.message,
+      /did not open with private-key; is it the key of the repository that created batch pr-1234-abc\?$/,
+    );
+    assert.ok(e.message.includes(notReady));
+    return true;
+  });
+});
+
+test("redaction keeps a 12-digit run inside a hyphenated name, and uses placeholders Markdown shows", async () => {
+  const h = harness(
+    createEnv(),
+    ok(createResponse({ batch_id: "run-123456789012-abc", error: "account 123456789012 is over its quota" })),
+  );
+  await assert.rejects(
+    h.go(),
+    /reported: account \[account\] is over its quota\. Batch run-123456789012-abc was created/,
+  );
+  const summary = readFileSync(h.summary, "utf8");
+  assert.match(summary, /run-123456789012-abc/);
+  assert.match(summary, /account \[account\] is over its quota/);
 });
 
 test("a reply's batch id that is not one does not name the logs file", async () => {

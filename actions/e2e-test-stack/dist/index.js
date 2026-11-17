@@ -26202,16 +26202,21 @@ var InvokeCommand = class extends command5(_ep05, _mw05, "Invoke", Invoke$) {
 var REQUEST_TIMEOUT_MS = 96e4;
 var THROTTLE_ATTEMPTS = 5;
 var sleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
-function lambdaClient(region) {
-  return new LambdaClient({
+function lambdaClientConfig(region, requestTimeout = REQUEST_TIMEOUT_MS) {
+  return {
     region,
     maxAttempts: 1,
     requestHandler: {
       connectionTimeout: 6e4,
-      requestTimeout: REQUEST_TIMEOUT_MS,
+      requestTimeout,
+      // Without it the SDK only logs a warning at requestTimeout and keeps waiting.
+      throwOnRequestTimeout: true,
       httpsAgent: new import_node_https3.Agent({ keepAlive: true, keepAliveMsecs: 3e4 })
     }
-  });
+  };
+}
+function lambdaClient(region) {
+  return new LambdaClient(lambdaClientConfig(region));
 }
 function lambdaInvoke(client, wait = sleep, log = console.log) {
   return async (input) => {
@@ -26369,12 +26374,14 @@ var createFields = (env2) => {
 function readInputs(env2) {
   const get = (k7) => (env2[k7] ?? "").trim();
   const operation2 = get("STACK_OPERATION");
-  if (!["create", "fetch", "logs", "destroy"].includes(operation2))
-    refuse(`operation must be create, fetch, logs or destroy, got ${JSON.stringify(operation2)}`);
+  if (!["create", "fetch", "logs", "destroy", "open"].includes(operation2))
+    refuse(`operation must be create, fetch, logs, destroy or open, got ${JSON.stringify(operation2)}`);
   const op = operation2;
   const callerKey = get("STACK_CALLER_KEY");
-  if (!callerKey) refuse("caller-key is required: the repository's key in the control plane's callers, e.g. mobile");
-  matching("caller-key", callerKey, LABEL, "the repository's key: lowercase letters, digits and hyphens");
+  if (!callerKey && op !== "open")
+    refuse("caller-key is required: the repository's key in the control plane's callers, e.g. mobile");
+  if (callerKey)
+    matching("caller-key", callerKey, LABEL, "the repository's key: lowercase letters, digits and hyphens");
   const channel = get("STACK_CHANNEL") || "v1";
   if (channel !== "edge" && channel !== "v1") refuse(`channel must be v1 or edge, got ${JSON.stringify(channel)}`);
   const project = get("STACK_PROJECT") || "e2e-test-stack";
@@ -26385,11 +26392,23 @@ function readInputs(env2) {
   if (get("STACK_RESPONSE_PATH")) inputs.responsePath = get("STACK_RESPONSE_PATH");
   for (const [name, key] of CREATE_ONLY)
     if (op !== "create" && get(key)) refuse(`${name} is a create input; ${op} does not take it`);
-  if (op !== "logs" && get("STACK_INDEX")) refuse(`index is a logs input; ${op} does not take it`);
+  if (op !== "logs" && op !== "open" && get("STACK_INDEX"))
+    refuse(`index is a logs and open input; ${op} does not take it`);
   if (op !== "logs" && get("STACK_LOGS_PATH")) refuse(`logs-path is a logs input; ${op} does not take it`);
   if (op !== "fetch" && get("STACK_INDEXES")) refuse(`indexes is a fetch input; ${op} does not take it`);
   const privateKey = get("STACK_PRIVATE_KEY");
   if (privateKey) inputs.privateKey = privateKeyFrom(privateKey);
+  if (op === "open") {
+    for (const name of ["batch-id", "batch-token", "response-path"])
+      if (get(`STACK_${name.replace(/-/g, "_").toUpperCase()}`))
+        refuse(`${name} is not an open input; open reads the batch from create-response and calls nothing`);
+    const createResponse2 = get("STACK_CREATE_RESPONSE");
+    if (!createResponse2) refuse("create-response is required for open: the create response file to open");
+    if (!inputs.privateKey) refuse("private-key is required for open: the create response's secrets are sealed to it");
+    inputs.createResponse = createResponse2;
+    if (get("STACK_INDEX")) inputs.index = integer("index", get("STACK_INDEX"), 0);
+    return inputs;
+  }
   if (op === "create") {
     for (const name of ["batch-id", "batch-token", "create-response"])
       if (get(`STACK_${name.replace(/-/g, "_").toUpperCase()}`))
@@ -29912,19 +29931,34 @@ var writeFile2 = (path, content) => {
   (0, import_node_fs5.writeFileSync)(full, content);
   return full;
 };
+var redact = (text) => text.replace(/arn:aws[a-z-]*:[^\s"',]*/g, "[arn]").replace(/(?<![\w-])\d{12}(?![\w-])/g, "[account]");
 var handlerError = (text) => {
   try {
     const parsed = JSON.parse(text);
-    if (typeof parsed?.errorMessage === "string") return parsed.errorMessage;
+    if (typeof parsed?.errorMessage === "string") return redact(parsed.errorMessage);
   } catch {
   }
-  return text.trim().slice(0, 500) || "no reason given";
+  return redact(text.trim()).slice(0, 500) || "no reason given";
 };
 var invokeError = (e6) => {
   const name = e6?.name || "Error";
-  const message = String(e6?.message ?? e6).replace(/arn:aws[a-z-]*:[^\s"',]*/g, "<arn>").replace(/\b\d{12}\b/g, "<account>").split("\n")[0].slice(0, 200);
+  const message = redact(String(e6?.message ?? e6)).split("\n")[0].slice(0, 200);
   return `${name}: ${message}`;
 };
+var instancesFrom = (leases, sites, opened) => leases.map((lease, i7) => {
+  if (!lease) return null;
+  const s3 = opened[i7] ?? {};
+  return {
+    site_url: lease.site_url || sites[i7] || "",
+    state: lease.state ?? "",
+    admin_username: lease.admin?.username ?? "",
+    admin_email: lease.admin?.email ?? "",
+    admin_password: s3.admin_password ?? "",
+    mail_token: s3.mail_token ?? "",
+    credentials: s3.credentials ?? {},
+    facts: s3.facts ?? {}
+  };
+});
 var cell = (s3) => String(s3 ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
 async function run({ env: env2, connect, log = console.log }) {
   const inputs = readInputs(env2);
@@ -29942,21 +29976,79 @@ async function run({ env: env2, connect, log = console.log }) {
       log(`::add-mask::${escapeData(quoted)}`);
     }
   };
+  const maskBatch = (secrets) => {
+    mask(secrets.batch_token);
+    for (const s3 of secrets.instances ?? []) {
+      if (!s3) continue;
+      mask(s3.admin_password);
+      mask(s3.mail_token);
+      for (const [k7, v2] of Object.entries(s3.credentials ?? {})) if (!NOT_SECRET.has(k7)) mask(v2);
+      for (const [k7, v2] of Object.entries(s3.facts ?? {})) if (SECRET_FACT.test(k7)) mask(v2);
+    }
+  };
+  let responseWriteError;
+  const writeFailure = () => `response-path ${inputs.responsePath} could not be written: ${invokeError(responseWriteError)}.`;
+  const readCreateResponse = async (path) => {
+    let created;
+    try {
+      created = JSON.parse((0, import_node_fs5.readFileSync)(path, "utf8"));
+    } catch (e6) {
+      throw new Error(`e2e-test-stack: create-response ${path} could not be read as JSON: ${invokeError(e6)}`, {
+        cause: e6
+      });
+    }
+    if (!created.batch_id || !created.batch?.secrets)
+      throw new Error(`e2e-test-stack: ${path} is not a create response with a batch: no batch_id or batch.secrets`);
+    try {
+      return { created, secrets: await openSealed(created.batch.secrets, inputs.privateKey) };
+    } catch (e6) {
+      if (!(e6 instanceof SealedError)) throw e6;
+      throw new SealedError(
+        `e2e-test-stack: the secrets in ${path} did not open with private-key; is it the key of the repository that created batch ${created.batch_id}?`,
+        { cause: e6 }
+      );
+    }
+  };
+  const openCreateResponse = async () => {
+    const { created, secrets } = await readCreateResponse(inputs.createResponse);
+    maskBatch(secrets);
+    const sites = created.sites ?? [];
+    const leases = created.batch?.instances ?? [];
+    const instances = instancesFrom(leases, sites, secrets.instances ?? []);
+    Object.assign(outputs, {
+      batch_id: created.batch_id,
+      sites: JSON.stringify(sites),
+      ready: String(created.batch?.ready ?? leases.filter((l4) => l4?.state === "ready").length),
+      state: created.batch?.state ?? "",
+      instances: JSON.stringify(instances)
+    });
+    if (inputs.index === void 0) return;
+    const one = instances[inputs.index];
+    if (!one || one.state !== "ready" || !secrets.instances?.[inputs.index])
+      throw new Error(
+        `e2e-test-stack: batch ${created.batch_id} has no ready instance ${inputs.index} to open: it failed, or the batch has ${instances.length}`
+      );
+    Object.assign(outputs, {
+      site_url: one.site_url,
+      admin_username: one.admin_username,
+      admin_password: one.admin_password,
+      mail_token: one.mail_token
+    });
+  };
   try {
+    if (operation2 === "open") {
+      await openCreateResponse();
+      return;
+    }
     let batchId = inputs.batchId;
     let batchToken = inputs.batchToken;
     mask(batchToken);
     if (inputs.createResponse) {
-      const created = JSON.parse((0, import_node_fs5.readFileSync)(inputs.createResponse, "utf8"));
-      if (!created.batch_id || !created.batch?.secrets)
-        throw new Error(
-          `e2e-test-stack: ${inputs.createResponse} is not a create response with a batch: no batch_id or batch.secrets`
-        );
+      const { created, secrets } = await readCreateResponse(inputs.createResponse);
       if (batchId && batchId !== created.batch_id)
         throw new Error(
           `e2e-test-stack: batch-id ${batchId} is not the batch in create-response (${created.batch_id})`
         );
-      const secrets = await openSealed(created.batch.secrets, inputs.privateKey);
       if (!secrets?.batch_token)
         throw new Error(
           `e2e-test-stack: ${inputs.createResponse} holds no batch token; only a create response carries one`
@@ -29984,7 +30076,13 @@ async function run({ env: env2, connect, log = console.log }) {
       );
     }
     const text = Buffer.from(reply.Payload ?? new Uint8Array()).toString("utf8");
-    if (inputs.responsePath) outputs.response_path = writeFile2(inputs.responsePath, text);
+    if (inputs.responsePath) {
+      try {
+        outputs.response_path = writeFile2(inputs.responsePath, text);
+      } catch (e6) {
+        responseWriteError = e6;
+      }
+    }
     if (reply.FunctionError)
       throw new Error(`e2e-test-stack: the control plane refused the ${operation2}: ${handlerError(text)}.${mayExist}`);
     if (reply.StatusCode !== 200)
@@ -29993,8 +30091,10 @@ async function run({ env: env2, connect, log = console.log }) {
     try {
       response = JSON.parse(text);
     } catch {
-      throw new Error(`e2e-test-stack: the control plane's reply is not JSON: ${text.slice(0, 200)}`);
+      throw new Error(`e2e-test-stack: the control plane's reply is not JSON: ${redact(text).slice(0, 200)}`);
     }
+    const rawError = response.error;
+    const responseError = rawError === void 0 || rawError === null || rawError === "" ? "" : redact(typeof rawError === "string" ? rawError : JSON.stringify(rawError));
     const sites = response.sites ?? [];
     const leases = response.batch?.instances ?? [];
     const state2 = response.batch?.state ?? "";
@@ -30004,7 +30104,7 @@ async function run({ env: env2, connect, log = console.log }) {
       sites: JSON.stringify(sites),
       ready: String(ready),
       state: state2,
-      error: response.error ?? "",
+      error: responseError,
       deployment_version: response.deployment?.version ?? ""
     });
     summary.push(`### E2E test stack: ${operation2}`, "", "| | |", "|---|---|");
@@ -30015,11 +30115,11 @@ async function run({ env: env2, connect, log = console.log }) {
       summary.push(
         `| Control plane | ${cell(response.deployment.invoked || request.qualifier)}, version ${cell(response.deployment.version || "unknown")} |`
       );
-    if (response.error) summary.push(`| Error | ${cell(response.error)} |`);
+    if (responseError) summary.push(`| Error | ${cell(responseError)} |`);
     if ((operation2 === "create" || operation2 === "fetch") && response.batch_id) {
       if (!response.batch?.secrets)
         throw new Error(
-          `e2e-test-stack: batch ${response.batch_id} came back with no sealed secrets${response.error ? ` (${response.error})` : ""}`
+          `e2e-test-stack: batch ${response.batch_id} came back with no sealed secrets${responseError ? ` (${responseError})` : ""}`
         );
       let secrets;
       try {
@@ -30032,30 +30132,8 @@ async function run({ env: env2, connect, log = console.log }) {
           );
         throw e6;
       }
-      mask(secrets.batch_token);
-      const opened = secrets.instances ?? [];
-      for (const s3 of opened) {
-        if (!s3) continue;
-        mask(s3.admin_password);
-        mask(s3.mail_token);
-        for (const [k7, v2] of Object.entries(s3.credentials ?? {})) if (!NOT_SECRET.has(k7)) mask(v2);
-        for (const [k7, v2] of Object.entries(s3.facts ?? {})) if (SECRET_FACT.test(k7)) mask(v2);
-      }
-      const instances = leases.map((lease, i7) => {
-        if (!lease) return null;
-        const s3 = opened[i7] ?? {};
-        return {
-          site_url: lease.site_url || sites[i7] || "",
-          state: lease.state ?? "",
-          admin_username: lease.admin?.username ?? "",
-          admin_email: lease.admin?.email ?? "",
-          admin_password: s3.admin_password ?? "",
-          mail_token: s3.mail_token ?? "",
-          credentials: s3.credentials ?? {},
-          facts: s3.facts ?? {}
-        };
-      });
-      outputs.instances = JSON.stringify(instances);
+      maskBatch(secrets);
+      outputs.instances = JSON.stringify(instancesFrom(leases, sites, secrets.instances ?? []));
       if (operation2 === "create") {
         if (!secrets.batch_token)
           throw new Error(
@@ -30092,20 +30170,25 @@ async function run({ env: env2, connect, log = console.log }) {
         (site, i7) => summary.push(`| ${i7} | ${cell(leases[i7]?.state ?? (site ? "" : "failed"))} | ${cell(site)} |`)
       );
     }
-    if (response.error) {
-      const teardown = operation2 === "create" && outputs.batch_id ? ` Batch ${outputs.batch_id} was created; destroy it.` : "";
-      throw new Error(`e2e-test-stack: ${operation2} reported: ${response.error}.${teardown}`);
-    }
+    const teardown = operation2 === "create" && outputs.batch_id ? ` Batch ${outputs.batch_id} was created; destroy it.` : "";
+    if (responseError) throw new Error(`e2e-test-stack: ${operation2} reported: ${responseError}.${teardown}`);
+    if (responseWriteError)
+      throw new Error(`e2e-test-stack: ${writeFailure()}${teardown}`, { cause: responseWriteError });
     if (operation2 === "create" && !outputs.batch_id) throw new Error("e2e-test-stack: create returned no batch id");
+  } catch (e6) {
+    if (responseWriteError !== void 0 && e6 instanceof Error && e6.cause !== responseWriteError)
+      e6.message = `${e6.message} Also, ${writeFailure()}`;
+    throw e6;
   } finally {
     writeOutputs(env2.GITHUB_OUTPUT, outputs);
-    if (summary.length && env2.GITHUB_STEP_SUMMARY) (0, import_node_fs5.appendFileSync)(env2.GITHUB_STEP_SUMMARY, summary.join("\n") + "\n");
+    if (summary.length && env2.GITHUB_STEP_SUMMARY)
+      (0, import_node_fs5.appendFileSync)(env2.GITHUB_STEP_SUMMARY, redact(summary.join("\n")) + "\n");
   }
 }
 
 // src/index.ts
 run({ env: process.env, connect: (region) => lambdaInvoke(lambdaClient(region)) }).catch((e6) => {
   const message = e6 instanceof Error ? e6.message : String(e6);
-  console.error(message.startsWith("e2e-test-stack:") ? message : `e2e-test-stack: ${message}`);
+  console.error(redact(message.startsWith("e2e-test-stack:") ? message : `e2e-test-stack: ${message}`));
   process.exit(1);
 });

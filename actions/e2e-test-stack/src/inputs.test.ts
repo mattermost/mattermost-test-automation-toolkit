@@ -78,7 +78,7 @@ test("a create carries every field it exposes, typed as the control plane reads 
 });
 
 test("the common inputs are checked before anything is called", () => {
-  refused(create({ STACK_OPERATION: "reap" }), /operation must be create, fetch, logs or destroy/);
+  refused(create({ STACK_OPERATION: "reap" }), /operation must be create, fetch, logs, destroy or open/);
   refused(create({ STACK_CALLER_KEY: "" }), /caller-key is required/);
   refused(create({ STACK_CALLER_KEY: "Mobile" }), /caller-key must be/);
   refused(create({ STACK_CHANNEL: "edge-v1" }), /channel must be v1 or edge/);
@@ -128,7 +128,7 @@ test("fetch, logs and destroy need the batch and its token, or a create response
     /private-key is required with create-response/,
   );
   refused(destroy({ STACK_INSTANCE_KEY: "pr-1" }), /instance-key is a create input; destroy does not take it/);
-  refused(destroy({ STACK_INDEX: "0" }), /index is a logs input/);
+  refused(destroy({ STACK_INDEX: "0" }), /index is a logs and open input/);
   refused(destroy({ STACK_OPERATION: "fetch" }), /private-key is required for fetch/);
   refused(destroy({ STACK_OPERATION: "logs", STACK_PRIVATE_KEY: KEY, STACK_INDEXES: "0" }), /indexes is a fetch input/);
   refused(destroy({ STACK_OPERATION: "logs", STACK_PRIVATE_KEY: KEY, STACK_INDEX: "-1" }), /index must be 0 or more/);
@@ -148,4 +148,29 @@ test("fetch, logs and destroy need the batch and its token, or a create response
     [0, 3],
   );
   assert.equal(readInputs(destroy({ STACK_OPERATION: "logs", STACK_PRIVATE_KEY: KEY, STACK_INDEX: "2" })).index, 2);
+});
+
+test("open needs a create response and the private key, takes an index, needs no caller key, and refuses the rest", () => {
+  const open = (over: Record<string, string> = {}) => ({
+    STACK_OPERATION: "open",
+    STACK_PRIVATE_KEY: KEY,
+    STACK_CREATE_RESPONSE: "/tmp/create.json",
+    ...over,
+  });
+  const inputs = readInputs(open({ STACK_INDEX: "2" }));
+  assert.equal(inputs.operation, "open");
+  assert.equal(inputs.createResponse, "/tmp/create.json");
+  assert.equal(inputs.index, 2);
+  assert.equal(inputs.callerKey, "");
+  assert.equal(readInputs(open()).index, undefined);
+
+  refused(open({ STACK_CREATE_RESPONSE: "" }), /create-response is required for open/);
+  refused(open({ STACK_PRIVATE_KEY: "" }), /private-key is required for open/);
+  refused(open({ STACK_INDEX: "-1" }), /index must be 0 or more/);
+  refused(open({ STACK_BATCH_ID: "pr-1234-abc" }), /batch-id is not an open input/);
+  refused(open({ STACK_BATCH_TOKEN: "tok" }), /batch-token is not an open input/);
+  refused(open({ STACK_RESPONSE_PATH: "/tmp/r.json" }), /response-path is not an open input/);
+  refused(open({ STACK_INDEXES: "0,1" }), /indexes is a fetch input; open does not take it/);
+  refused(open({ STACK_TTL: "1h" }), /ttl is a create input; open does not take it/);
+  refused(open({ STACK_LOGS_PATH: "/tmp/l" }), /logs-path is a logs input; open does not take it/);
 });
