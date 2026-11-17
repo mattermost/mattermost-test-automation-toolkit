@@ -1,0 +1,565 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
+import { gzipSync } from "node:zlib";
+import { InvokeCommand } from "@aws-sdk/client-lambda";
+import sodium from "libsodium-wrappers";
+import { readInputs } from "./inputs.ts";
+import { lambdaInvoke, THROTTLE_ATTEMPTS } from "./lambda.ts";
+import { openSealed, SealedError } from "./sealed.ts";
+import { buildRequest, run, writeOutputs } from "./stack.ts";
+import type { InvokeInput, InvokeOutput } from "./stack.ts";
+
+await sodium.ready;
+const keys = sodium.crypto_box_keypair();
+const other = sodium.crypto_box_keypair();
+const PRIVATE_KEY = Buffer.from(keys.privateKey).toString("base64");
+const seal = (value: unknown, publicKey = keys.publicKey): string =>
+  Buffer.from(sodium.crypto_box_seal(JSON.stringify(value), publicKey)).toString("base64");
+
+const dir = mkdtempSync(join(tmpdir(), "e2e-test-stack-test-"));
+after(() => rmSync(dir, { recursive: true, force: true }));
+let files = 0;
+const file = (name: string): string => join(dir, `${++files}-${name}`);
+
+/** Parses GITHUB_OUTPUT's delimited entries. */
+const readOutputs = (path: string): Record<string, string> => {
+  const out: Record<string, string> = {};
+  const lines = existsSync(path) ? readFileSync(path, "utf8").split("\n") : [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^([\w-]+)<<(.+)$/.exec(lines[i]);
+    if (!m) continue;
+    const value: string[] = [];
+    while (lines[++i] !== m[2]) value.push(lines[i]);
+    out[m[1]] = value.join("\n");
+  }
+  return out;
+};
+
+const SECRETS = {
+  batch_token: "batch-token-1",
+  instances: [
+    {
+      admin_password: "admin-pw-0",
+      mail_token: "mail-0",
+      credentials: {
+        "postgres.user": "mmuser",
+        "postgres.database": "mattermost",
+        "postgres.password": "pg-pw-0",
+        "minio.secret_key": "minio-0",
+      },
+      facts: { "openldap.bind_dn": "cn=admin,dc=mm,dc=test", "openldap.bind_password": "ldap-pw-0" },
+    },
+    null,
+  ],
+};
+const lease = (i: number) => ({
+  instance_id: `pr-1234-abc-0${i}`,
+  state: "ready",
+  site_url: `https://pr-1234-abc-0${i}.test.example`,
+  admin: { username: "sysadmin", email: "sysadmin@sample.mattermost.com" },
+});
+const createResponse = (over: Record<string, unknown> = {}) => ({
+  batch_id: "pr-1234-abc",
+  sites: ["https://pr-1234-abc-00.test.example", ""],
+  error: "1 of 2 instances failed: [1]",
+  deployment: { build: "lambda/abc/lambda.zip", version: "7", invoked: "test-public-project-v1" },
+  batch: {
+    state: "failed",
+    ready: 1,
+    expires_at: "2026-11-17T13:00:00Z",
+    instances: [lease(0), null],
+    secrets: seal(SECRETS),
+  },
+  ...over,
+});
+
+interface Harness {
+  calls: InvokeInput[];
+  regions: string[];
+  logged: string[];
+  output: string;
+  summary: string;
+  go: () => Promise<void>;
+}
+const harness = (
+  env: Record<string, string>,
+  reply: InvokeOutput | ((input: InvokeInput) => InvokeOutput),
+): Harness => {
+  const h: Harness = {
+    calls: [],
+    regions: [],
+    logged: [],
+    output: file("output"),
+    summary: file("summary"),
+    go: () =>
+      run({
+        env: {
+          GITHUB_OUTPUT: h.output,
+          GITHUB_STEP_SUMMARY: h.summary,
+          RUNNER_TEMP: dir,
+          STACK_CALLER_RUN_ID: "1234567890",
+          ...env,
+        },
+        connect: (region) => {
+          h.regions.push(region);
+          return async (input) => {
+            h.calls.push(input);
+            return typeof reply === "function" ? reply(input) : reply;
+          };
+        },
+        log: (m) => h.logged.push(m),
+      }),
+  };
+  return h;
+};
+const ok = (body: unknown): InvokeOutput => ({
+  StatusCode: 200,
+  Payload: new TextEncoder().encode(typeof body === "string" ? body : JSON.stringify(body)),
+});
+const masks = (h: Harness) =>
+  h.logged.filter((l) => l.startsWith("::add-mask::")).map((l) => l.slice("::add-mask::".length));
+const createEnv = (over: Record<string, string> = {}) => ({
+  STACK_OPERATION: "create",
+  STACK_CALLER_KEY: "test-public-project",
+  STACK_PRIVATE_KEY: PRIVATE_KEY,
+  STACK_INSTANCE_KEY: "pr-1234",
+  STACK_SERVER_IMAGE: "mattermostdevelopment/mattermost-enterprise-edition:master",
+  ...over,
+});
+const SECRET_VALUES = ["batch-token-1", "admin-pw-0", "mail-0", "pg-pw-0", "minio-0", "ldap-pw-0"];
+
+test("each operation invokes the caller's own alias with the control plane's request JSON, naming no repository", () => {
+  const base = { STACK_CALLER_KEY: "test-public-project", STACK_PRIVATE_KEY: PRIVATE_KEY, STACK_CALLER_RUN_ID: "42" };
+  const created = buildRequest(
+    readInputs({ ...base, ...createEnv(), STACK_CHANNEL: "edge", STACK_COUNT: "2", STACK_SERVER_ENV: '{"MM_X":"1"}' }),
+  );
+  assert.equal(created.functionName, "e2e-test-stack-edge");
+  assert.equal(created.qualifier, "test-public-project-edge");
+  assert.equal(
+    JSON.stringify(created.payload),
+    '{"action":"create","instance_key":"pr-1234","caller_run_id":"42","server_image":"mattermostdevelopment/mattermost-enterprise-edition:master","count":2,"server_env":{"MM_X":"1"}}',
+  );
+  const batch = { ...base, STACK_BATCH_ID: "pr-1234-abc", STACK_BATCH_TOKEN: "tok" };
+  const fetched = buildRequest(
+    readInputs({ ...batch, STACK_OPERATION: "fetch", STACK_INDEXES: "1,0", STACK_PROJECT: "other-stack" }),
+    "pr-1234-abc",
+    "tok",
+  );
+  assert.deepEqual([fetched.functionName, fetched.qualifier], ["other-stack-v1", "test-public-project-v1"]);
+  assert.equal(
+    JSON.stringify(fetched.payload),
+    '{"action":"fetch","batch_id":"pr-1234-abc","batch_token":"tok","indexes":[1,0]}',
+  );
+  assert.equal(
+    JSON.stringify(
+      buildRequest(readInputs({ ...batch, STACK_OPERATION: "logs", STACK_INDEX: "0" }), "pr-1234-abc", "tok").payload,
+    ),
+    '{"action":"logs","batch_id":"pr-1234-abc","batch_token":"tok","index":0}',
+  );
+  assert.equal(
+    JSON.stringify(buildRequest(readInputs({ ...batch, STACK_OPERATION: "logs" }), "pr-1234-abc", "tok").payload),
+    '{"action":"logs","batch_id":"pr-1234-abc","batch_token":"tok"}',
+  );
+  assert.equal(
+    JSON.stringify(buildRequest(readInputs({ ...batch, STACK_OPERATION: "destroy" }), "pr-1234-abc", "tok").payload),
+    '{"action":"destroy","batch_id":"pr-1234-abc","batch_token":"tok"}',
+  );
+});
+
+test("a create that came up whole sets every output, masks every secret first, and writes the raw response", async () => {
+  const body = createResponse({
+    error: undefined,
+    sites: ["https://pr-1234-abc-00.test.example"],
+    batch: {
+      state: "ready",
+      ready: 1,
+      instances: [lease(0)],
+      secrets: seal({ ...SECRETS, instances: [SECRETS.instances[0]] }),
+    },
+  });
+  const raw = JSON.stringify(body);
+  const responsePath = file("create.json");
+  const h = harness(createEnv({ STACK_RESPONSE_PATH: responsePath, STACK_REGION: "us-west-2" }), ok(raw));
+  await h.go();
+  assert.deepEqual(h.regions, ["us-west-2"]);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].FunctionName, "e2e-test-stack-v1");
+  assert.equal(h.calls[0].Qualifier, "test-public-project-v1");
+  assert.equal((JSON.parse(h.calls[0].Payload) as { caller_run_id: string }).caller_run_id, "1234567890");
+  assert.equal(readFileSync(responsePath, "utf8"), raw);
+
+  const out = readOutputs(h.output);
+  assert.equal(out.batch_id, "pr-1234-abc");
+  assert.equal(out.batch_token, "batch-token-1");
+  assert.equal(out.sites, '["https://pr-1234-abc-00.test.example"]');
+  assert.equal(out.ready, "1");
+  assert.equal(out.state, "ready");
+  assert.equal(out.error, "");
+  assert.equal(out.deployment_version, "7");
+  assert.equal(out.response_path, responsePath);
+  assert.deepEqual(JSON.parse(out.instances), [
+    {
+      site_url: "https://pr-1234-abc-00.test.example",
+      state: "ready",
+      admin_username: "sysadmin",
+      admin_email: "sysadmin@sample.mattermost.com",
+      admin_password: "admin-pw-0",
+      mail_token: "mail-0",
+      credentials: SECRETS.instances[0]!.credentials,
+      facts: SECRETS.instances[0]!.facts,
+    },
+  ]);
+
+  // Every secret is masked; names that unlock nothing are not, or every line naming them would be redacted.
+  assert.deepEqual(masks(h).sort(), [...SECRET_VALUES].sort());
+  const summary = readFileSync(h.summary, "utf8");
+  assert.match(summary, /### E2E test stack: create/);
+  assert.match(summary, /\| Ready \| 1 of 1 \|/);
+  for (const secret of SECRET_VALUES) {
+    assert.ok(!summary.includes(secret), `summary carries ${secret}`);
+    assert.ok(!h.logged.some((l) => !l.startsWith("::add-mask::") && l.includes(secret)), `log carries ${secret}`);
+  }
+});
+
+test("a secret that differs inside JSON is masked in that form too", async () => {
+  const secrets = { batch_token: "t", instances: [{ admin_password: 'a"b\\c' }] };
+  const h = harness(
+    createEnv(),
+    ok(
+      createResponse({
+        error: undefined,
+        sites: ["s"],
+        batch: { state: "ready", instances: [lease(0)], secrets: seal(secrets) },
+      }),
+    ),
+  );
+  await h.go();
+  assert.deepEqual(masks(h), ["t", 'a"b\\c', 'a\\"b\\\\c']);
+});
+
+test("a partial create still sets its outputs and writes the response, then fails naming the batch to destroy", async () => {
+  const responsePath = file("partial.json");
+  const h = harness(createEnv({ STACK_RESPONSE_PATH: responsePath }), ok(createResponse()));
+  await assert.rejects(
+    h.go(),
+    /create reported: 1 of 2 instances failed: \[1\]\. Batch pr-1234-abc was created; destroy it\./,
+  );
+  const out = readOutputs(h.output);
+  assert.equal(out.batch_id, "pr-1234-abc");
+  assert.equal(out.batch_token, "batch-token-1");
+  assert.equal(out.state, "failed");
+  assert.equal(out.error, "1 of 2 instances failed: [1]");
+  assert.equal(out.sites, '["https://pr-1234-abc-00.test.example",""]');
+  assert.equal((JSON.parse(out.instances) as unknown[])[1], null);
+  assert.equal(out.response_path, responsePath);
+  assert.ok(existsSync(responsePath));
+  assert.match(readFileSync(h.summary, "utf8"), /\| 1 \| failed \| {2}\|/);
+  assert.deepEqual(masks(h).sort(), [...SECRET_VALUES].sort());
+});
+
+test("a handler error fails the step with the control plane's message, and writes nothing but the response", async () => {
+  const responsePath = file("refused.json");
+  const h = harness(createEnv({ STACK_RESPONSE_PATH: responsePath }), {
+    StatusCode: 200,
+    FunctionError: "Unhandled",
+    Payload: new TextEncoder().encode(
+      '{"errorMessage":"ttl 5h0m0s is above the ceiling of 4h0m0s","errorType":"errorString"}',
+    ),
+  });
+  await assert.rejects(
+    h.go(),
+    /the control plane refused the create: ttl 5h0m0s is above the ceiling of 4h0m0s\. A batch may have been created; it is reaped at its ttl\.$/,
+  );
+  assert.deepEqual(readOutputs(h.output), { response_path: responsePath });
+});
+
+test("a create reply with an error and no sealed secrets fails with the control plane's error", async () => {
+  const h = harness(createEnv(), ok(createResponse({ batch: { state: "failed", ready: 0, instances: [null] } })));
+  await assert.rejects(
+    h.go(),
+    /batch pr-1234-abc came back with no sealed secrets \(1 of 2 instances failed: \[1\]\)$/,
+  );
+  assert.equal(readOutputs(h.output).batch_id, "pr-1234-abc");
+});
+
+test("an invoke that fails names the action and the alias, keeps ARNs and accounts out, and warns that a create may have run", async () => {
+  const denied = Object.assign(
+    new Error(
+      "User: arn:aws:sts::123456789012:assumed-role/e2e-test-stack-ci-mobile/x is not authorized to perform: lambda:InvokeFunction",
+    ),
+    { name: "AccessDeniedException" },
+  );
+  const h = harness(createEnv(), () => {
+    throw denied;
+  });
+  await assert.rejects(h.go(), (e: unknown) => {
+    const m = (e as Error).message;
+    assert.equal(
+      m,
+      "e2e-test-stack: the invoke of e2e-test-stack-v1:test-public-project-v1 failed: AccessDeniedException: User: <arn> is not authorized to perform: lambda:InvokeFunction. A batch may have been created; it is reaped at its ttl.",
+    );
+    assert.ok(!m.includes("123456789012") && !m.includes("pr-1234"));
+    return true;
+  });
+  const timeout = harness(
+    {
+      STACK_OPERATION: "destroy",
+      STACK_CALLER_KEY: "mobile",
+      STACK_BATCH_ID: "pr-1234-abc",
+      STACK_BATCH_TOKEN: "tok-1",
+    },
+    () => {
+      throw Object.assign(new Error("socket hang up"), { name: "TimeoutError" });
+    },
+  );
+  await assert.rejects(
+    timeout.go(),
+    /^Error: e2e-test-stack: the invoke of e2e-test-stack-v1:mobile-v1 failed: TimeoutError: socket hang up\.$/,
+  );
+});
+
+test("secrets that do not open with the private key fail the create, after its batch id is set", async () => {
+  const h = harness(
+    createEnv(),
+    ok(
+      createResponse({
+        error: undefined,
+        batch: { state: "ready", instances: [lease(0)], secrets: seal(SECRETS, other.publicKey) },
+      }),
+    ),
+  );
+  await assert.rejects(
+    h.go(),
+    /batch pr-1234-abc: the sealed secrets did not open with private-key.*cannot be destroyed/,
+  );
+  const out = readOutputs(h.output);
+  assert.equal(out.batch_id, "pr-1234-abc");
+  assert.equal(out.batch_token, undefined);
+  assert.deepEqual(masks(h), []);
+});
+
+test("sealed boxes open with the private key alone, and not with another", async () => {
+  assert.deepEqual(await openSealed(seal({ a: 1 }), keys.privateKey), { a: 1 });
+  await assert.rejects(
+    openSealed(seal({ a: 1 }), other.privateKey),
+    (e: unknown) => e instanceof SealedError && /^e2e-test-stack: the sealed secrets did not open/.test(e.message),
+  );
+  await assert.rejects(openSealed("bm90IGEgYm94", keys.privateKey), SealedError);
+});
+
+test("fetch masks and returns the instances it asked for, holes kept", async () => {
+  const h = harness(
+    {
+      STACK_OPERATION: "fetch",
+      STACK_CALLER_KEY: "mobile",
+      STACK_CHANNEL: "edge",
+      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_BATCH_ID: "pr-1234-abc",
+      STACK_BATCH_TOKEN: "batch-token-1",
+      STACK_INDEXES: "0",
+    },
+    ok(
+      createResponse({
+        error: undefined,
+        batch: {
+          state: "ready",
+          ready: 1,
+          instances: [lease(0), null],
+          secrets: seal({ instances: SECRETS.instances }),
+        },
+      }),
+    ),
+  );
+  await h.go();
+  assert.equal(h.calls[0].FunctionName, "e2e-test-stack-edge");
+  assert.equal(h.calls[0].Qualifier, "mobile-edge");
+  const out = readOutputs(h.output);
+  assert.equal(out.batch_token, undefined);
+  const instances = JSON.parse(out.instances) as ({ admin_password: string } | null)[];
+  assert.equal(instances[0]?.admin_password, "admin-pw-0");
+  assert.equal(instances[1], null);
+  assert.deepEqual(masks(h).sort(), [...SECRET_VALUES].sort());
+});
+
+test("logs masks the URL, writes the decoded tail, and summarizes without either", async () => {
+  const tail = 'server  | {"level":"info","msg":"Server is listening"}\n';
+  const url = "https://bucket.s3.amazonaws.com/logs/x?X-Amz-Signature=abc";
+  const h = harness(
+    {
+      STACK_OPERATION: "logs",
+      STACK_CALLER_KEY: "mobile",
+      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_BATCH_ID: "pr-1234-abc",
+      STACK_BATCH_TOKEN: "batch-token-1",
+      STACK_INDEX: "0",
+    },
+    ok({
+      batch_id: "pr-1234-abc",
+      sites: ["https://pr-1234-abc-00.test.example"],
+      batch: { state: "ready", instances: [lease(0)] },
+      logs: {
+        instance_id: "pr-1234-abc-00",
+        index: 0,
+        containers: ["server"],
+        lines: 1,
+        bytes: 60,
+        truncated: false,
+        secrets: seal({ url, content_gzip: gzipSync(tail).toString("base64") }),
+      },
+    }),
+  );
+  await h.go();
+  const out = readOutputs(h.output);
+  assert.equal(out.logs_url, url);
+  assert.equal(out.logs_path, join(dir, "e2e-test-stack-pr-1234-abc-0.log"));
+  assert.equal(readFileSync(out.logs_path, "utf8"), tail);
+  assert.deepEqual(masks(h).sort(), ["batch-token-1", url].sort());
+  const summary = readFileSync(h.summary, "utf8");
+  assert.match(summary, /\| Tail \| 1 lines, 60 bytes \|/);
+  assert.ok(!summary.includes("X-Amz-Signature") && !summary.includes("Server is listening"));
+});
+
+test("a reply's batch id that is not one does not name the logs file", async () => {
+  const h = harness(
+    {
+      STACK_OPERATION: "logs",
+      STACK_CALLER_KEY: "mobile",
+      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_BATCH_ID: "pr-1234-abc",
+      STACK_BATCH_TOKEN: "batch-token-1",
+    },
+    ok({
+      batch_id: "../../escape",
+      batch: { state: "ready", instances: [lease(0)] },
+      logs: {
+        instance_id: "pr-1234-abc-00",
+        index: 0,
+        secrets: seal({ content_gzip: gzipSync("x\n").toString("base64") }),
+      },
+    }),
+  );
+  await h.go();
+  assert.equal(readOutputs(h.output).logs_path, join(dir, "e2e-test-stack-batch-0.log"));
+});
+
+test("destroy reads the batch and its sealed token from a create response, and fails on a partial destroy", async () => {
+  const created = file("created.json");
+  writeFileSync(created, JSON.stringify(createResponse()));
+  const env = {
+    STACK_OPERATION: "destroy",
+    STACK_CALLER_KEY: "test-public-project",
+    STACK_PRIVATE_KEY: PRIVATE_KEY,
+    STACK_CREATE_RESPONSE: created,
+  };
+  const done = harness(
+    env,
+    ok({
+      batch_id: "pr-1234-abc",
+      sites: ["https://pr-1234-abc-00.test.example", ""],
+      batch: { state: "destroyed", instances: [{ ...lease(0), state: "destroyed" }, null] },
+    }),
+  );
+  await done.go();
+  assert.equal(done.calls[0].Payload, '{"action":"destroy","batch_id":"pr-1234-abc","batch_token":"batch-token-1"}');
+  assert.deepEqual(masks(done), ["batch-token-1"]);
+  assert.equal(readOutputs(done.output).state, "destroyed");
+
+  const partial = harness(
+    env,
+    ok({
+      batch_id: "pr-1234-abc",
+      error: "1 instance could not be stopped",
+      batch: { state: "partially_destroyed", instances: [] },
+    }),
+  );
+  await assert.rejects(partial.go(), /destroy reported: 1 instance could not be stopped\.$/);
+  assert.equal(readOutputs(partial.output).state, "partially_destroyed");
+
+  const mismatch = harness({ ...env, STACK_BATCH_ID: "pr-9-xyz" }, ok({}));
+  await assert.rejects(mismatch.go(), /batch-id pr-9-xyz is not the batch in create-response \(pr-1234-abc\)/);
+  assert.equal(mismatch.calls.length, 0);
+});
+
+test("a destroy with a batch token input masks it and needs no private key", async () => {
+  const h = harness(
+    {
+      STACK_OPERATION: "destroy",
+      STACK_CALLER_KEY: "mobile",
+      STACK_BATCH_ID: "pr-1234-abc",
+      STACK_BATCH_TOKEN: "tok-1",
+    },
+    ok({ batch_id: "pr-1234-abc", batch: { state: "not found" } }),
+  );
+  await h.go();
+  assert.deepEqual(masks(h), ["tok-1"]);
+  assert.equal(readOutputs(h.output).state, "not found");
+});
+
+test("outputs are written in the delimited form, so a multi-line value survives", () => {
+  const path = file("outputs");
+  writeOutputs(path, { a: "1", b: "x\ny" });
+  assert.deepEqual(readOutputs(path), { a: "1", b: "x\ny" });
+});
+
+test("the Lambda client is sent a synchronous Invoke, and only a throttle is tried again", async () => {
+  const sent: InvokeCommand[] = [];
+  let throttles = 2;
+  const waits: number[] = [];
+  const invoke = lambdaInvoke(
+    {
+      send: async (command) => {
+        sent.push(command);
+        if (throttles-- > 0) throw Object.assign(new Error("Rate exceeded"), { name: "TooManyRequestsException" });
+        return { StatusCode: 200, Payload: new TextEncoder().encode("{}") };
+      },
+    },
+    async (ms) => void waits.push(ms),
+    () => {},
+  );
+  const reply = await invoke({
+    FunctionName: "e2e-test-stack-v1",
+    Qualifier: "mobile-v1",
+    Payload: '{"action":"fetch"}',
+  });
+  assert.equal(reply.StatusCode, 200);
+  assert.equal(sent.length, 3);
+  assert.ok(sent[0] instanceof InvokeCommand);
+  assert.equal(sent[0].input.FunctionName, "e2e-test-stack-v1");
+  assert.equal(sent[0].input.Qualifier, "mobile-v1");
+  assert.equal(sent[0].input.InvocationType, "RequestResponse");
+  assert.equal(new TextDecoder().decode(sent[0].input.Payload as Uint8Array), '{"action":"fetch"}');
+  assert.deepEqual(waits, [10000, 20000]);
+
+  let calls = 0;
+  const denied = lambdaInvoke(
+    {
+      send: async () => {
+        calls++;
+        throw Object.assign(new Error("not authorized"), { name: "AccessDeniedException" });
+      },
+    },
+    async () => {},
+    () => {},
+  );
+  await assert.rejects(denied({ FunctionName: "f", Qualifier: "q", Payload: "{}" }), /not authorized/);
+  assert.equal(calls, 1);
+
+  calls = 0;
+  const throttled = lambdaInvoke(
+    {
+      send: async () => {
+        calls++;
+        throw Object.assign(new Error("Rate exceeded"), { name: "TooManyRequestsException" });
+      },
+    },
+    async () => {},
+    () => {},
+  );
+  await assert.rejects(throttled({ FunctionName: "f", Qualifier: "q", Payload: "{}" }), /Rate exceeded/);
+  assert.equal(calls, THROTTLE_ATTEMPTS);
+});

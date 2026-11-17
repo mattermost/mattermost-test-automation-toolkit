@@ -1,0 +1,176 @@
+---
+name: E2E test stack
+description: >-
+  Create, fetch, collect logs of and destroy remote Mattermost test servers through the e2e-test-stack control plane.
+  Uses the AWS credentials the job holds: run aws-actions/configure-aws-credentials with the repository's CI role first.
+inputs:
+  operation:
+    description: create, fetch, logs or destroy
+    required: true
+  caller-key:
+    description: The repository's key in the control plane's callers (e.g. mobile); the action invokes only the alias <caller-key>-<channel>
+    required: true
+  channel:
+    description: v1 (the promoted build) or edge (main's newest build). fetch, logs and destroy use the channel the batch was created on
+    default: v1
+  project:
+    description: The control plane's project, the prefix of its function names
+    default: e2e-test-stack
+  region:
+    description: AWS region of the control plane
+    default: us-east-1
+  private-key:
+    description: >-
+      The repository's X25519 private key, base64 (the E2E_STACK_PRIVATE_KEY secret). Required for create, fetch and logs,
+      and for destroy with create-response; it opens the secrets the control plane seals to the repository
+    default: ""
+  batch-id:
+    description: The batch to fetch, read the logs of or destroy (create's batch-id output)
+    default: ""
+  batch-token:
+    description: The batch's token (create's batch-token output), which authorizes fetch, logs and destroy
+    default: ""
+  create-response:
+    description: >-
+      Instead of batch-token: a create response file written by response-path, from which the batch id and its sealed
+      token are read with private-key. For a later job or run, through an uploaded artifact
+    default: ""
+  instance-key:
+    description: For create. Names the stack and prefixes its hostnames (e.g. pr-1234); lowercase letters, digits and hyphens
+    default: ""
+  server-image:
+    description: For create. The Mattermost server image under test, by tag (e.g. mattermostdevelopment/mattermost-enterprise-edition:master)
+    default: ""
+  count:
+    description: For create. Instances in the batch; empty is 1. The control plane's ceiling is 40
+    default: ""
+  services:
+    description: >-
+      For create. Comma-separated optional services: minio or azurite, elasticsearch or opensearch, keycloak, openldap.
+      Empty runs Postgres, Inbucket and the server alone
+    default: ""
+  ttl:
+    description: For create. How long the batch lives before it is reaped, as a duration (90m, 4h); empty is 1h, the ceiling 4h
+    default: ""
+  os:
+    description: For create. The OS variant the instances run (e.g. ubuntu-24.04); empty is the control plane's default
+    default: ""
+  postgres:
+    description: For create. Postgres version (e.g. 16); empty is the control plane's default
+    default: ""
+  license:
+    description: For create. Licence SKU to apply (e.g. enterprise-advanced); empty runs unlicensed
+    default: ""
+  instance-type:
+    description: For create. EC2 instance type (e.g. m7i.xlarge); empty is sized by the control plane
+    default: ""
+  server-env:
+    description: >-
+      For create. Server settings as a JSON object of strings, e.g. {"MM_FEATUREFLAGS_TESTFEATURE":"true"}. Holds no
+      credential: the control plane refuses one
+    default: ""
+  retries:
+    description: For create. Attempts per failed instance; empty is 1, a negative number none, the ceiling 3
+    default: ""
+  shared-admin-password:
+    description: For create. true gives every instance of the batch the same admin password
+    default: ""
+  wait-for-migrations:
+    description: For create. true waits for the server's migrations before an instance is ready
+    default: ""
+  caller-run-id:
+    description: For create. The workflow run tagged on the batch, for attribution
+    default: ${{ github.run_id }}
+  indexes:
+    description: For fetch. Comma-separated instance indexes; empty fetches the whole batch
+    default: ""
+  index:
+    description: For logs. The instance whose logs to collect; empty is 0
+    default: ""
+  logs-path:
+    description: For logs. Where to write the decoded log tail, which may hold secrets; empty is a file under RUNNER_TEMP
+    default: ""
+  response-path:
+    description: >-
+      Where to write the control plane's raw response JSON. Its secrets are sealed to the repository's key, so it is
+      safe to upload as an artifact; create-response reads it back
+    default: ""
+outputs:
+  batch-id:
+    description: The batch's id
+    value: ${{ steps.stack.outputs.batch_id }}
+  batch-token:
+    description: From create. The batch's token, which fetch, logs and destroy need; masked
+    value: ${{ steps.stack.outputs.batch_token }}
+  sites:
+    description: JSON array of site URLs, index-aligned with the batch; "" where an instance failed
+    value: ${{ steps.stack.outputs.sites }}
+  instances:
+    description: >-
+      From create and fetch. JSON array, index-aligned, null where an instance failed or was not fetched: site_url,
+      state, admin_username, admin_email, admin_password, mail_token, credentials and facts. Its secrets are masked
+    value: ${{ steps.stack.outputs.instances }}
+  ready:
+    description: How many instances are ready
+    value: ${{ steps.stack.outputs.ready }}
+  state:
+    description: >-
+      The batch's state: ready or failed from create and fetch; destroyed, partially_destroyed, destroy_failed or
+      "not found" from destroy
+    value: ${{ steps.stack.outputs.state }}
+  error:
+    description: The control plane's error for a call that still returned a batch (a partial create or destroy); empty otherwise
+    value: ${{ steps.stack.outputs.error }}
+  deployment-version:
+    description: The control plane's Lambda version that answered
+    value: ${{ steps.stack.outputs.deployment_version }}
+  logs-path:
+    description: From logs. The file holding the decoded log tail; empty when there was none
+    value: ${{ steps.stack.outputs.logs_path }}
+  logs-url:
+    description: From logs. Presigned URL of the full log object, valid for 30 minutes; masked
+    value: ${{ steps.stack.outputs.logs_url }}
+  response-path:
+    description: The file response-path was written to
+    value: ${{ steps.stack.outputs.response_path }}
+runs:
+  using: composite
+  steps:
+    - id: stack
+      shell: bash
+      env:
+        STACK_OPERATION: ${{ inputs.operation }}
+        STACK_CALLER_KEY: ${{ inputs.caller-key }}
+        STACK_CHANNEL: ${{ inputs.channel }}
+        STACK_PROJECT: ${{ inputs.project }}
+        STACK_REGION: ${{ inputs.region }}
+        STACK_PRIVATE_KEY: ${{ inputs.private-key }}
+        STACK_BATCH_ID: ${{ inputs.batch-id }}
+        STACK_BATCH_TOKEN: ${{ inputs.batch-token }}
+        STACK_CREATE_RESPONSE: ${{ inputs.create-response }}
+        STACK_INSTANCE_KEY: ${{ inputs.instance-key }}
+        STACK_SERVER_IMAGE: ${{ inputs.server-image }}
+        STACK_COUNT: ${{ inputs.count }}
+        STACK_SERVICES: ${{ inputs.services }}
+        STACK_TTL: ${{ inputs.ttl }}
+        STACK_OS: ${{ inputs.os }}
+        STACK_POSTGRES: ${{ inputs.postgres }}
+        STACK_LICENSE: ${{ inputs.license }}
+        STACK_INSTANCE_TYPE: ${{ inputs.instance-type }}
+        STACK_SERVER_ENV: ${{ inputs.server-env }}
+        STACK_RETRIES: ${{ inputs.retries }}
+        STACK_SHARED_ADMIN_PASSWORD: ${{ inputs.shared-admin-password }}
+        STACK_WAIT_FOR_MIGRATIONS: ${{ inputs.wait-for-migrations }}
+        STACK_CALLER_RUN_ID: ${{ inputs.caller-run-id }}
+        STACK_INDEXES: ${{ inputs.indexes }}
+        STACK_INDEX: ${{ inputs.index }}
+        STACK_LOGS_PATH: ${{ inputs.logs-path }}
+        STACK_RESPONSE_PATH: ${{ inputs.response-path }}
+      # Checked before the bundle is loaded: it is built for Node 26 and may not parse on an older one.
+      run: |
+        major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
+        if ! [[ "$major" =~ ^[0-9]+$ ]] || [ "$major" -lt 26 ]; then
+          echo "::error::e2e-test-stack needs Node 26 or later; found $(node --version 2>/dev/null || echo none). Run actions/setup-node with node-version 26 before it."
+          exit 1
+        fi
+        node "${{ github.action_path }}/dist/index.js"

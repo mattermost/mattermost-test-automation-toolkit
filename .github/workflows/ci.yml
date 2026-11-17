@@ -16,14 +16,18 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
-      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903  # v6.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
-          node-version: "24"
+          node-version: "26"
       - name: ci/shared-test
         run: node --experimental-strip-types --test actions/shared/src/*.test.ts
       # One install for every action: the workspaces in the root package.json share one lockfile.
       - name: ci/install
         run: npm ci
+      - name: ci/fmt
+        run: npm run fmt:check --workspaces --if-present
+      - name: ci/lint
+        run: npm run lint --workspaces --if-present
       - name: ci/tsc
         run: npm run tsc --workspaces
       - name: ci/test
