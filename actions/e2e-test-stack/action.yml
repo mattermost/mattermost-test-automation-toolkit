@@ -133,7 +133,8 @@ outputs:
     value: ${{ steps.stack.outputs.ready }}
   state:
     description: >-
-      The batch's state: ready or failed from create, fetch and open (as created); destroyed, partially_destroyed, destroy_failed or
+      The batch's state: ready or failed from create, and from open as it was created; found from fetch, which rebuilds
+      the batch from its live instances (ready counts those ready); destroyed, partially_destroyed, destroy_failed or
       "not found" from destroy
     value: ${{ steps.stack.outputs.state }}
   error:
