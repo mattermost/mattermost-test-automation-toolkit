@@ -330,7 +330,7 @@ export async function run({ env, connect, download = downloadLog, log = console.
         throw new Error(
           `e2e-test-stack: ${inputs.createResponse} holds no batch token; only a create response carries one`,
         );
-      // Every credential the batch holds, so a logs tail that prints one has it taken out too.
+      // Every credential of the batch, not only its token.
       maskBatch(secrets);
       batchId = created.batch_id;
       batchToken = secrets.batch_token;

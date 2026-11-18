@@ -57,15 +57,10 @@ same for a create response without calling anything, so a test job needs the pri
 
 The response file `response-path` writes is safe to upload as an artifact: every secret in it is sealed.
 
-`logs` downloads the full log and writes it to `logs-path` as plain text, with what the action knows to be secret taken
-out: every value it masks in the job log is replaced with `***`, and ARNs and AWS account ids with `[arn]` and
-`[account]`. Given `create-response`, that is every credential of the batch (admin passwords, mail tokens, service
-credentials and the batch token); given `batch-id` and `batch-token`, only the batch token. Anything else a container
-prints stays, such as a value passed in through `server-env`. Upload it from a public repository only if the servers'
-own output may be public. If the full log is not saved (the download fails, or the tail is truncated and no URL came back), `logs-path` holds the tail the response carried, and the step fails.
-
-The control plane returns the full log as a presigned S3 URL, sealed. The action opens it, masks it and downloads
-through it, and never hands it out: no output, file or summary carries it.
+`logs` downloads the full log and writes it to `logs-path`, with every value the action masks replaced with `***`. If
+the full log is not saved (the download fails, or the tail is truncated and no URL came back), `logs-path` holds the
+tail the response carried, and the step fails. The control plane returns the full log as a presigned S3 URL, sealed;
+the action uses it only for the download, and no output, file or summary carries it.
 
 ## Inputs
 
@@ -97,7 +92,7 @@ through it, and never hands it out: no output, file or summary carries it.
 | `create-response`       | fetch, logs, destroy, open | Instead of `batch-id` and `batch-token`: a create response written by `response-path`; the token is opened from it with `private-key`. Required for open       |
 | `indexes`               | fetch                      | Comma-separated instance indexes; empty fetches the whole batch                                                                                                |
 | `index`                 | logs, open                 | logs: the instance whose logs to collect, default 0. open: the instance whose fields to set as `site-url`, `admin-username`, `admin-password` and `mail-token` |
-| `logs-path`             | logs                       | Where to write the full log, with known secrets taken out ([Secrets at rest](#secrets-at-rest)); default a file under `RUNNER_TEMP`                            |
+| `logs-path`             | logs                       | Where to write the full log ([Secrets at rest](#secrets-at-rest)); default a file under `RUNNER_TEMP`                                                          |
 
 An input that belongs to another operation is refused, as is any malformed value, before the control plane is called.
 
@@ -117,7 +112,7 @@ An input that belongs to another operation is refused, as is any malformed value
 | `state`              | The batch's state: `ready` or `failed` from create, and from open as it was created; `found` from fetch, which rebuilds the batch from its live instances (`ready` counts those ready); `destroyed`, `partially_destroyed`, `destroy_failed` or `not found` from destroy                                                                           |
 | `error`              | The control plane's error for a call that still returned a batch; empty otherwise                                                                                                                                                                                                                                                                  |
 | `deployment-version` | The Lambda version that answered                                                                                                                                                                                                                                                                                                                   |
-| `logs-path`          | From logs. The full log, or the tail if it did not download, known secrets taken out; empty when there was none                                                                                                                                                                                                                                    |
+| `logs-path`          | From logs. The full log, or the tail if it did not download; empty when there was none                                                                                                                                                                                                                                                             |
 | `logs-full`          | From logs. `true` when `logs-path` holds the whole log, `false` when only a truncated tail                                                                                                                                                                                                                                                         |
 | `response-path`      | Where `response-path` was written                                                                                                                                                                                                                                                                                                                  |
 
