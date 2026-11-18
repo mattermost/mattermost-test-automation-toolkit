@@ -70,6 +70,20 @@ test("a run with no PR names what is broken on main, and the rest it did not cau
     { state: "failure", description: "maestro-ios: 1 broken on main" });
 });
 
+test("a summary that would pass 140 characters names what triage cleared in one word, and keeps every re-run instruction", () => {
+  const lane = (context: string, description: string) => ({ context, status: { state: "failure", description } as never });
+  const lanes = [
+    lane("e2e-test/maestro-ios", "(1 flaky, 1 machine failure) 50.0% passed (1 passed, 2 failed, 0 skipped)"),
+    lane("e2e-test/cypress-full/enterprise", "(1 flaky; re-run the failed jobs) 50.0% passed (1 passed, 1 failed, 0 skipped)"),
+  ];
+  assert.deepEqual(laneSummary(lanes, [], false, false),
+    { state: "failure", description: "maestro-ios: 1 cleared, 1 machine failure, re-run · cypress-full/enterprise: 1 cleared, re-run the failed jobs" });
+  assert.deepEqual(laneSummary(lanes, [], false, true), {
+    state: "failure",
+    description: "maestro-ios: 1 not caused by PR, 1 machine failure, re-run · cypress-full/enterprise: 1 not caused by PR, re-run the failed jobs",
+  }, "the full wording stays when it fits");
+});
+
 test("a lane summary reads red lanes by their labels and old wording alike, and names the lanes cleared by triage", () => {
   assert.deepEqual(lanes({
     "e2e-test/detox-ios": st("failure", "(2 flaky, 5 needs investigation) 88% passed (590 passed, 7 failed, 41 skipped)"),

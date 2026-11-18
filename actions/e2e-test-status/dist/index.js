@@ -46,9 +46,10 @@ var laneName = (context) => String(context).replace(/^e2e(-test)?\//, "");
 function namedIn(description) {
   const d = String(description ?? "");
   const count = (re) => Number(re.exec(d)?.[1] ?? 0);
+  const brokenMain = count(/(\d+) broken on main/);
   return {
-    cleared: count(/(\d+) cleared by triage/) + count(/(\d+) flaky/) + count(/(\d+) broken on main/) + count(/(\d+) test bug/) + count(/(\d+) server compat/),
-    brokenMain: count(/(\d+) broken on main/),
+    cleared: count(/(\d+) cleared by triage/) + count(/(\d+) flaky/) + brokenMain + count(/(\d+) test bug/) + count(/(\d+) server compat/),
+    brokenMain,
     caused: count(/(\d+) caused by PR/),
     appBug: count(/(\d+) app bug/),
     fixed: count(/(\d+) fixed on main/),
@@ -67,7 +68,7 @@ function releaseFromDescriptions(descriptions) {
   if (ds.some((d) => /\b\d+ out of date\b/.test(d))) return true;
   return void 0;
 }
-function redReason(description = "", release = false, pr = true) {
+function redReason(description = "", release = false, pr = true, compact = false) {
   const d = String(description);
   const lane = /^\((machine failure, [^)]+|broken on main, not your change|broken on main|fixed on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
   if (lane) return lane.replace(/^out of date/, "fixed on main").replace(/^needs investigation$/, "machine failure, re-run");
@@ -78,7 +79,7 @@ function redReason(description = "", release = false, pr = true) {
   const brokenMain = pr ? 0 : brokenOnMain;
   const notYours = cleared - brokenMain + (release ? 0 : fixed);
   if (brokenMain) parts.push(`${brokenMain} broken on main`);
-  if (notYours) parts.push(`${notYours} not caused by ${pr ? "PR" : "this commit"}`);
+  if (notYours) parts.push(compact ? `${notYours} cleared` : `${notYours} not caused by ${pr ? "PR" : "this commit"}`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
   const fixedHere = (release ? fixed : 0) + outdated;
@@ -128,7 +129,12 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
     return l.status.state === "success" && n.cleared + (isRelease ? 0 : n.fixed) > 0;
   });
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease, pr)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
+  if (red.length) {
+    const redText = (compact) => [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease, pr, compact)}`), clearedText].filter(Boolean).join(" \xB7 ");
+    const full = redText(false);
+    const fits = (otherText ? `${full} \xB7 ${otherText}` : full).length <= 140;
+    return { state: "failure", description: withOther(fits ? full : redText(true)) };
+  }
   if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" \xB7 ")) };
   return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
 }

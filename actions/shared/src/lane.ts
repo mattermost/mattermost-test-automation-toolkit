@@ -36,9 +36,11 @@ interface Named {
 function namedIn(description: string | null | undefined): Named {
   const d = String(description ?? "");
   const count = (re: RegExp): number => Number(re.exec(d)?.[1] ?? 0);
+  // One count for both fields: redReason takes brokenMain out of cleared on a run with no PR.
+  const brokenMain = count(/(\d+) broken on main/);
   return {
-    cleared: count(/(\d+) cleared by triage/) + count(/(\d+) flaky/) + count(/(\d+) broken on main/) + count(/(\d+) test bug/) + count(/(\d+) server compat/),
-    brokenMain: count(/(\d+) broken on main/),
+    cleared: count(/(\d+) cleared by triage/) + count(/(\d+) flaky/) + brokenMain + count(/(\d+) test bug/) + count(/(\d+) server compat/),
+    brokenMain,
     caused: count(/(\d+) caused by PR/),
     appBug: count(/(\d+) app bug/),
     fixed: count(/(\d+) fixed on main/),
@@ -70,8 +72,9 @@ export function releaseFromDescriptions(descriptions: readonly (string | null | 
 
 /** Why a lane triage left red is still red, read from the status triage wrote on it. A run with no PR (a trunk or release
  * run) has no PR to clear: what triage cleared is not caused by the commit under test, and what is broken on main is
- * named as such, since on such a run it stays red (a standing breakage, see EXONERATED_ON_TRUNK in e2e-test-triage). */
-export function redReason(description: string | null | undefined = "", release = false, pr = true): string {
+ * named as such, since on such a run it stays red (a standing breakage, see EXONERATED_ON_TRUNK in e2e-test-triage).
+ * compact names what triage cleared in one word, for a summary that would not fit otherwise. */
+export function redReason(description: string | null | undefined = "", release = false, pr = true, compact = false): string {
   const d = String(description);
   // A lane triage judged as a whole (see diagnoseLane in e2e-test-triage): its label and what to do.
   const lane = /^\((machine failure, [^)]+|broken on main, not your change|broken on main|fixed on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
@@ -86,7 +89,7 @@ export function redReason(description: string | null | undefined = "", release =
   const brokenMain = pr ? 0 : brokenOnMain;
   const notYours = cleared - brokenMain + (release ? 0 : fixed);
   if (brokenMain) parts.push(`${brokenMain} broken on main`);
-  if (notYours) parts.push(`${notYours} not caused by ${pr ? "PR" : "this commit"}`);
+  if (notYours) parts.push(compact ? `${notYours} cleared` : `${notYours} not caused by ${pr ? "PR" : "this commit"}`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
   // A release run's fixed on main stays named (its fix is a backport). Statuses written before today's labels said "out of
@@ -155,7 +158,14 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], r
     return l.status.state === "success" && n.cleared + (isRelease ? 0 : n.fixed) > 0;
   });
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease, pr)}`), clearedText].filter(Boolean).join(" · ")) };
+  if (red.length) {
+    const redText = (compact: boolean): string =>
+      [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease, pr, compact)}`), clearedText].filter(Boolean).join(" · ");
+    // The status is cut at 140 characters: what triage cleared is named in one word before a re-run instruction is cut.
+    const full = redText(false);
+    const fits = (otherText ? `${full} · ${otherText}` : full).length <= 140;
+    return { state: "failure", description: withOther(fits ? full : redText(true)) };
+  }
   if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" · ")) };
   return { state: "success", description: clearedText ? `${clearedText} · all lanes green` : "All lanes green" };
 }
