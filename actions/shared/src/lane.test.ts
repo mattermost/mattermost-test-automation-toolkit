@@ -197,7 +197,8 @@ test("a red check triage does not cover keeps the aggregate from saying all lane
     "Triage is checking: waiting for playwright-full/enterprise · not triaged: playwright-full/enterprise/upgrade-from-release-11.10 red", "named while a lane runs too");
   const slow = ["cypress-full/enterprise", "playwright-full/enterprise"].map((n) => ({ context: `e2e-test/${n}`, status: st("pending", "running") }));
   const description = laneSummary(slow, [upgrade, { ...upgrade, context: `${upgrade.context}-fips` }]).description;
-  assert.equal(description, "Triage is checking: waiting for cypress-full/enterprise, playwright-full/enterprise · not triaged: 2 red", "counted when the names would not fit");
+  assert.equal(description, "Triage is checking: waiting for cypress-full/enterprise +1 more · not triaged: playwright-full/enterprise/upgrade-from-release-11.10 +1 red",
+    "a lane still running is counted before a red check's name is");
   assert.ok(description.length <= 140);
   const reds = ["cypress-full/enterprise", "playwright-full/enterprise", "cypress-full/fips"].map((n) => ({ context: `e2e-test/${n}`, status: st("failure", "(3 caused by PR, 2 needs investigation) 99.1% passed") }));
   const red = laneSummary(reds, [upgrade]).description;
@@ -236,4 +237,9 @@ test("a summary that would pass 140 characters keeps every re-run instruction an
   const long = ["11.10", "11.9", "11.8"].map((v) => l(`playwright-full/enterprise/upgrade-from-release-${v}-to-the-current-head-of-master`, "failure",
     "(5 machine failure; mostly environment errors, re-run) 50% passed"));
   assert.equal(laneSummary(long).description, "3 lane(s) red, re-run", "every lane is counted, with its re-run, before any text is cut");
+  assert.equal(laneSummary([l("maestro-ios", "pending", "running"), l("playwright-full/enterprise", "pending", "running")], [l(upgrade, "failure", "(1 machine failure) 50% passed")]).description,
+    `Triage is checking: waiting for maestro-ios +1 more · ${upgrade}: 1 machine failure, re-run`, "the lanes it waits for are counted before another check's name");
+  assert.equal(laneSummary([l("maestro-ios", "success", "100% passed")], [l(upgrade, "failure", "(3 caused by PR, 2 app bug, 1 fixed on main, 2 broken on branch, 3 machine failure) 50% passed"),
+    l("playwright-full/enterprise/upgrade-from-release-11.10", "failure", "(1 app bug) 50% passed")], true, false).description,
+  `triaged lanes green · ${upgrade}: 3 machine failures, re-run · +1 triaged red`, "another check says what a person has to do before it is only counted");
 });

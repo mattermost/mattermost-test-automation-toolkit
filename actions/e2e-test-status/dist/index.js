@@ -128,11 +128,13 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
     const fits = (text) => text.length <= STATUS_LIMIT;
     const own = [...new Set(texts)];
     if (redOthers.length) {
-      for (const names of [2, 1]) {
-        for (const text of own) {
-          for (const wording of CLEARED_WORDINGS) {
-            const candidate = join(text, otherNamed(wording, names));
-            if (fits(candidate)) return candidate;
+      for (const wordings of [CLEARED_WORDINGS, ["action"]]) {
+        for (const names of [2, 1]) {
+          for (const text of own) {
+            for (const wording of wordings) {
+              const candidate = join(text, otherNamed(wording, names));
+              if (fits(candidate)) return candidate;
+            }
           }
         }
       }
@@ -149,7 +151,7 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
   const waiting = seen.filter((l) => l.status.state === "pending").map((l) => laneName(l.context));
   if (waiting.length) {
     const waitingFor = (shown) => shown ? `Triage is checking: waiting for ${waiting.slice(0, shown).join(", ")}${shown < waiting.length ? ` +${waiting.length - shown} more` : ""}` : `Triage is checking: waiting for ${waiting.length} lane(s)`;
-    return { state: "pending", description: fit([waitingFor(waiting.length)], waiting.map((_, i) => waitingFor(waiting.length - 1 - i))) };
+    return { state: "pending", description: fit(Array.from({ length: waiting.length + 1 }, (_, i) => waitingFor(waiting.length - i))) };
   }
   const red = seen.filter((l) => l.status.state !== "success");
   const cleared = seen.filter((l) => {

@@ -167,18 +167,21 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], r
   const join = (...parts: string[]): string => parts.filter(Boolean).join(" · ");
   // GitHub cuts the status at 140 characters, so the most detailed text that fits is written. `texts` is the text before
   // the warning about other checks, most detailed first; `fewer` is what it gives way to when none fits. Another check's
-  // name goes last: its cleared wording is shortened, then left out, then the text's own detail gives way, then two
-  // other checks are named, then one, then they are only counted (keeping a re-run any of them asks for). Then the text
-  // gives way to `fewer`, and only when that does not fit either is it cut; the warning still fits whole.
+  // name goes late: its cleared wording is shortened, then left out, then the text's own detail gives way, then two
+  // other checks are named, then one; then, the same way, with only what a person has to do in their verdicts; then
+  // they are only counted (keeping a re-run any of them asks for). Only then does `fewer` give a red lane's name up: a red lane outranks
+  // another check. Only when that does not fit either is the text cut; the warning still fits whole.
   const fit = (texts: readonly string[], fewer: readonly string[] = []): string => {
     const fits = (text: string): boolean => text.length <= STATUS_LIMIT;
     const own = [...new Set(texts)];
     if (redOthers.length) {
-      for (const names of [2, 1]) {
-        for (const text of own) {
-          for (const wording of CLEARED_WORDINGS) {
-            const candidate = join(text, otherNamed(wording, names));
-            if (fits(candidate)) return candidate;
+      for (const wordings of [CLEARED_WORDINGS, ["action"] as const]) {
+        for (const names of [2, 1]) {
+          for (const text of own) {
+            for (const wording of wordings) {
+              const candidate = join(text, otherNamed(wording, names));
+              if (fits(candidate)) return candidate;
+            }
           }
         }
       }
@@ -194,11 +197,12 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], r
   };
   const waiting = seen.filter((l) => l.status.state === "pending").map((l) => laneName(l.context));
   if (waiting.length) {
-    // The last lanes it waits for are counted when their names do not fit.
+    // The last lanes it waits for are counted when their names do not fit, before another red check's name is: a lane
+    // still running says less than a red check and its verdict.
     const waitingFor = (shown: number): string => shown
       ? `Triage is checking: waiting for ${waiting.slice(0, shown).join(", ")}${shown < waiting.length ? ` +${waiting.length - shown} more` : ""}`
       : `Triage is checking: waiting for ${waiting.length} lane(s)`;
-    return { state: "pending", description: fit([waitingFor(waiting.length)], waiting.map((_, i) => waitingFor(waiting.length - 1 - i))) };
+    return { state: "pending", description: fit(Array.from({ length: waiting.length + 1 }, (_, i) => waitingFor(waiting.length - i))) };
   }
   const red = seen.filter((l) => l.status.state !== "success");
   // A PR's fixed on main is cleared too; a release run's never is.
