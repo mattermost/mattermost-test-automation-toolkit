@@ -143,6 +143,12 @@ outputs:
   deployment-version:
     description: The control plane's Lambda version that answered
     value: ${{ steps.stack.outputs.deployment_version }}
+  duration-seconds:
+    description: From create. Seconds from the request to every server ready, as the control plane measured it; empty when a server failed
+    value: ${{ steps.stack.outputs.duration_seconds }}
+  cost-usd:
+    description: From destroy. The batch's estimated cost in USD; empty unless every server was destroyed and priced at a known rate
+    value: ${{ steps.stack.outputs.cost_usd }}
   logs-path:
     description: From logs. The file holding the full log, or the tail; empty when there was none
     value: ${{ steps.stack.outputs.logs_path }}

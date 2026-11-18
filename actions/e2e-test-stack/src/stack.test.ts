@@ -610,6 +610,153 @@ test("the full log download refuses a redirect, an error status and a log over t
   }
 });
 
+test("create reports its duration, and each server's type, time to ready, slowest service and critical path", async () => {
+  const timed = {
+    ...lease(0),
+    instance_type: "c7i.large",
+    timing: { total_seconds: 202.724, phases: [{ name: "stack", seconds: 178.1 }] },
+    service_seconds: { keycloak: 123.39, postgres: 127.9, server: 21.3 },
+    image_pull_seconds: 27.401,
+    critical_path: { chain: ["postgres", "pull server image", "server"], seconds: 176.64 },
+  };
+  const body = createResponse({
+    error: null,
+    sites: ["https://pr-1234-abc-00.test.example"],
+    batch: { ...createResponse().batch, state: "ready", instances: [timed], timing: { total_seconds: 233.615 } },
+  });
+  const h = harness(createEnv(), ok(body));
+  await h.go();
+  assert.equal(readOutputs(h.output).duration_seconds, "233.615");
+  const summary = readFileSync(h.summary, "utf8");
+  assert.match(summary, /\| Duration \| 233\.6 s, request to every server ready \|/);
+  assert.match(
+    summary,
+    /\| Index \| State \| Site \| Type \| Ready in \| Image pull \| Slowest service \| Critical path \|/,
+  );
+  assert.match(
+    summary,
+    /\| 0 \| ready \| https:\/\/pr-1234-abc-00\.test\.example \| c7i\.large \| 202\.7 s \| 27\.4 s \| postgres 127\.9 s \| postgres → pull server image → server, 176\.6 s \|/,
+  );
+});
+
+test("destroy reports the cost, the sizing advice and each server's cost and CPU, and outputs the total", async () => {
+  const h = harness(
+    { STACK_OPERATION: "destroy", STACK_CALLER_KEY: "mobile", STACK_BATCH_ID: "pr-1234-abc", STACK_BATCH_TOKEN: "t" },
+    ok({
+      batch_id: "pr-1234-abc",
+      sites: ["https://pr-1234-abc-00.test.example", ""],
+      batch: {
+        state: "destroyed",
+        cost: { hours: 0.42, total: 0.0714, estimated: true, currency: "USD" },
+        sizing: {
+          instance_type: "c7i.large",
+          sustained_cpu: 12.4,
+          alternative: "m7i.large",
+          counterfactual: 0.05,
+          saving: 0.02,
+        },
+        instances: [
+          {
+            ...lease(0),
+            state: "destroyed",
+            instance_type: "c7i.large",
+            cost: { hours: 0.21, total: 0.0357, estimated: true, currency: "USD" },
+            metrics: { cpu_average: 12.4, cpu_peak: 88.9 },
+          },
+          null,
+        ],
+      },
+    }),
+  );
+  await h.go();
+  assert.equal(readOutputs(h.output).cost_usd, "0.0714");
+  const summary = readFileSync(h.summary, "utf8");
+  assert.match(summary, /\| Cost \| 0\.07 USD, 0\.42 instance-hours \|/);
+  assert.match(
+    summary,
+    /\| Sizing \| sustained CPU 12% on c7i\.large; m7i\.large would have cost 0\.05 USD, 0\.02 less \|/,
+  );
+  assert.match(summary, /\| Index \| State \| Site \| Type \| Hours \| Cost \| CPU avg \/ peak \|/);
+  assert.match(
+    summary,
+    /\| 0 \| destroyed \| https:\/\/pr-1234-abc-00\.test\.example \| c7i\.large \| 0\.21 \| 0\.04 USD \| 12% \/ 89% \|/,
+  );
+  assert.match(summary, /\| 1 \| failed \| {2}\| {2}\| {2}\| {2}\| {2}\|/);
+});
+
+test("a cost with no known rate is reported as such and not output as a number", async () => {
+  const h = harness(
+    { STACK_OPERATION: "destroy", STACK_CALLER_KEY: "mobile", STACK_BATCH_ID: "pr-1234-abc", STACK_BATCH_TOKEN: "t" },
+    ok({
+      batch_id: "pr-1234-abc",
+      batch: { state: "destroyed", cost: { hours: 1, estimated: false, currency: "USD" } },
+    }),
+  );
+  await h.go();
+  assert.equal(readOutputs(h.output).cost_usd, undefined);
+  assert.match(readFileSync(h.summary, "utf8"), /\| Cost \| no known rate, 1\.00 instance-hours \|/);
+});
+
+test("a partial destroy reports the cost as a lower bound and outputs none", async () => {
+  const priced = {
+    ...lease(0),
+    state: "destroyed",
+    cost: { hours: 0.2, total: 0.03, estimated: true, currency: "USD" },
+  };
+  const h = harness(
+    { STACK_OPERATION: "destroy", STACK_CALLER_KEY: "mobile", STACK_BATCH_ID: "pr-1234-abc", STACK_BATCH_TOKEN: "t" },
+    ok({
+      batch_id: "pr-1234-abc",
+      sites: ["https://pr-1234-abc-00.test.example", "https://pr-1234-abc-01.test.example"],
+      batch: {
+        state: "partially_destroyed",
+        cost: { hours: 0.2, total: 0.03, estimated: true, currency: "USD" },
+        instances: [priced, { ...lease(1), state: "destroy_failed", metrics: { cpu_peak: 89 } }],
+      },
+    }),
+  );
+  await h.go();
+  assert.equal(readOutputs(h.output).cost_usd, undefined);
+  const summary = readFileSync(h.summary, "utf8");
+  assert.match(summary, /\| Cost \| at least 0\.03 USD, 0\.20 instance-hours; 1 of 2 servers priced \|/);
+  assert.match(summary, /\| 1 \| destroy_failed \| [^|]* \| {2}\| {2}\| {2}\| – \/ 89% \|/);
+});
+
+test("a destroy that priced every server at no cost outputs 0, which the control plane sends without a total", async () => {
+  const h = harness(
+    { STACK_OPERATION: "destroy", STACK_CALLER_KEY: "mobile", STACK_BATCH_ID: "pr-1234-abc", STACK_BATCH_TOKEN: "t" },
+    ok({
+      batch_id: "pr-1234-abc",
+      batch: { state: "destroyed", cost: { estimated: true, currency: "USD" }, instances: [] },
+    }),
+  );
+  await h.go();
+  assert.equal(readOutputs(h.output).cost_usd, "0");
+});
+
+test("a failed create reports its time to failure, with no duration output and no time to ready", async () => {
+  const failed = { ...lease(0), state: "failed", instance_type: "c7i.large", timing: { total_seconds: 90 } };
+  const h = harness(
+    createEnv(),
+    ok(
+      createResponse({
+        batch: {
+          ...createResponse().batch,
+          state: "failed",
+          ready: 0,
+          instances: [failed],
+          timing: { total_seconds: 95 },
+        },
+      }),
+    ),
+  );
+  await assert.rejects(h.go());
+  assert.equal(readOutputs(h.output).duration_seconds, undefined);
+  const summary = readFileSync(h.summary, "utf8");
+  assert.match(summary, /\| Duration \| 95\.0 s, request to failure \|/);
+  assert.match(summary, /\| 0 \| failed \| [^|]+ \| c7i\.large \| {2}\|/);
+});
+
 test("a response-path that cannot be written fails the create after its batch id and token are set", async () => {
   const notADirectory = file("plain");
   writeFileSync(notADirectory, "");

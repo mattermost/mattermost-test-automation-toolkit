@@ -26,12 +26,37 @@ export interface InvokeOutput {
 
 export type Invoke = (input: InvokeInput) => Promise<InvokeOutput>;
 
+/** What a stack's time and money were spent on, as the control plane reports it. */
+interface Timing {
+  total_seconds?: number;
+  phases?: { name?: string; seconds?: number }[];
+}
+interface Cost {
+  instance_type?: string;
+  hours?: number;
+  total?: number;
+  /** False when the instance type has no known rate: a zero total is then not free. */
+  estimated?: boolean;
+  currency?: string;
+  /** No usable start time, so nothing was computed. */
+  start_unknown?: boolean;
+}
+
 /** One instance of a batch, as the control plane describes it in the clear. */
 interface Lease {
   instance_id?: string;
   state?: string;
   site_url?: string;
   admin?: { username?: string; email?: string };
+  instance_type?: string;
+  /** From create: launch to ready. */
+  timing?: Timing;
+  service_seconds?: Record<string, number>;
+  image_pull_seconds?: number;
+  critical_path?: { chain?: string[]; seconds?: number };
+  /** From destroy. */
+  cost?: Cost;
+  metrics?: { cpu_average?: number; cpu_peak?: number };
 }
 
 /** The control plane's reply; every secret in it is sealed. */
@@ -46,6 +71,16 @@ export interface StackResponse {
     expires_at?: string;
     instances?: (Lease | null)[] | null;
     secrets?: string;
+    timing?: Timing;
+    cost?: Cost;
+    sizing?: {
+      instance_type?: string;
+      sustained_cpu?: number;
+      alternative?: string;
+      counterfactual?: number;
+      saving?: number;
+      note?: string;
+    };
   };
   logs?: {
     instance_id?: string;
@@ -180,6 +215,24 @@ const instancesFrom = (
       facts: s.facts ?? {},
     };
   });
+
+const seconds = (n: number | undefined): string => (typeof n === "number" ? `${n.toFixed(1)} s` : "");
+// The control plane leaves a zero total out of its JSON.
+const money = (c: Cost | undefined): string =>
+  !c
+    ? ""
+    : c.start_unknown
+      ? "unknown start"
+      : c.estimated === false
+        ? "no known rate"
+        : `${(c.total ?? 0).toFixed(2)} ${c.currency || "USD"}`;
+const percent = (n: number | undefined): string => (typeof n === "number" ? `${n.toFixed(0)}%` : "");
+
+/** The service that took longest to start, with its time. */
+const slowest = (taken: Record<string, number> | undefined): string => {
+  const [name, s] = Object.entries(taken ?? {}).sort((a, b) => b[1] - a[1])[0] ?? [];
+  return name ? `${name} ${seconds(s)}` : "";
+};
 
 const cell = (s: string | number | null | undefined): string =>
   String(s ?? "")
@@ -414,6 +467,21 @@ export async function run({ env, connect, download = downloadLog, log = console.
       error: responseError,
       deployment_version: response.deployment?.version ?? "",
     });
+    // Timed whether or not every server became ready; a duration to ready only when they did.
+    const batchTiming = response.batch?.timing?.total_seconds;
+    if (operation === "create" && state === "ready" && typeof batchTiming === "number")
+      outputs.duration_seconds = String(batchTiming);
+    // A server that was already gone, or failed to terminate, is not priced; the total is then only part of the cost.
+    const batchCost = response.batch?.cost;
+    const present = leases.filter((l): l is Lease => !!l);
+    const priced = present.filter((l) => l.cost).length;
+    const wholeCost =
+      !!batchCost &&
+      state === "destroyed" &&
+      priced === present.length &&
+      batchCost.estimated !== false &&
+      !batchCost.start_unknown;
+    if (operation === "destroy" && wholeCost) outputs.cost_usd = String(batchCost.total ?? 0);
 
     summary.push(`### E2E test stack: ${operation}`, "", "| | |", "|---|---|");
     summary.push(`| Batch | \`${cell(outputs.batch_id || "none")}\` |`, `| State | ${cell(state || "unknown")} |`);
@@ -423,6 +491,25 @@ export async function run({ env, connect, download = downloadLog, log = console.
       summary.push(
         `| Control plane | ${cell(response.deployment.invoked || request.qualifier)}, version ${cell(response.deployment.version || "unknown")} |`,
       );
+    if (operation === "create" && typeof batchTiming === "number")
+      summary.push(
+        `| Duration | ${seconds(batchTiming)}, ${state === "ready" ? "request to every server ready" : "request to failure"} |`,
+      );
+    if (operation === "destroy" && batchCost) {
+      const hours = typeof batchCost.hours === "number" ? `, ${batchCost.hours.toFixed(2)} instance-hours` : "";
+      const part = priced === present.length ? "" : `; ${priced} of ${present.length} servers priced`;
+      const amount = money(batchCost);
+      summary.push(`| Cost | ${cell(part && /\d/.test(amount) ? `at least ${amount}` : amount)}${hours}${part} |`);
+    }
+    const sizing = operation === "destroy" ? response.batch?.sizing : undefined;
+    if (sizing) {
+      const cpu = `sustained CPU ${percent(sizing.sustained_cpu) || "unknown"} on ${sizing.instance_type || "the instance type"}`;
+      const alternative =
+        sizing.alternative && typeof sizing.saving === "number" && sizing.saving > 0
+          ? `; ${sizing.alternative} would have cost ${sizing.counterfactual?.toFixed(2) ?? "?"} USD, ${sizing.saving.toFixed(2)} less`
+          : "";
+      summary.push(`| Sizing | ${cell(`${cpu}${alternative}${sizing.note ? `. ${sizing.note}` : ""}`)} |`);
+    }
     if (responseError) summary.push(`| Error | ${cell(responseError)} |`);
 
     // Opened and masked before any output is written.
@@ -520,10 +607,48 @@ export async function run({ env, connect, download = downloadLog, log = console.
     }
 
     if (sites.length) {
-      summary.push("", "| Index | State | Site |", "|---|---|---|");
-      sites.forEach((site, i) =>
-        summary.push(`| ${i} | ${cell(leases[i]?.state ?? (site ? "" : "failed"))} | ${cell(site)} |`),
-      );
+      // Per server: what create measured, or what destroy charged.
+      const extra: [string, (l: Lease) => string][] =
+        operation === "create"
+          ? [
+              ["Type", (l) => l.instance_type ?? ""],
+              ["Ready in", (l) => (l.state === "ready" ? seconds(l.timing?.total_seconds) : "")],
+              ["Image pull", (l) => seconds(l.image_pull_seconds)],
+              ["Slowest service", (l) => slowest(l.service_seconds)],
+              [
+                "Critical path",
+                (l) =>
+                  l.critical_path?.chain?.length
+                    ? `${l.critical_path.chain.join(" → ")}, ${seconds(l.critical_path.seconds)}`
+                    : "",
+              ],
+            ]
+          : operation === "destroy"
+            ? [
+                ["Type", (l) => l.instance_type || l.cost?.instance_type || ""],
+                ["Hours", (l) => (typeof l.cost?.hours === "number" ? l.cost.hours.toFixed(2) : "")],
+                ["Cost", (l) => money(l.cost)],
+                [
+                  "CPU avg / peak",
+                  (l) =>
+                    l.metrics?.cpu_average === undefined && l.metrics?.cpu_peak === undefined
+                      ? ""
+                      : `${percent(l.metrics.cpu_average) || "–"} / ${percent(l.metrics.cpu_peak) || "–"}`,
+                ],
+              ]
+            : [];
+      const head = ["Index", "State", "Site", ...extra.map(([name]) => name)];
+      summary.push("", `| ${head.join(" | ")} |`, `|${head.map(() => "---|").join("")}`);
+      sites.forEach((site, i) => {
+        const lease = leases[i];
+        const cells = [
+          String(i),
+          lease?.state ?? (site ? "" : "failed"),
+          site,
+          ...extra.map(([, f]) => (lease ? f(lease) : "")),
+        ];
+        summary.push(`| ${cells.map(cell).join(" | ")} |`);
+      });
     }
 
     const teardown =

@@ -729,11 +729,11 @@ var init_date_utils = __esm({
       if (!match) {
         throw new TypeError("Invalid RFC-3339 date-time value");
       }
-      const [_2, yearStr, monthStr, dayStr, hours, minutes, seconds, fractionalMilliseconds] = match;
+      const [_2, yearStr, monthStr, dayStr, hours, minutes, seconds2, fractionalMilliseconds] = match;
       const year2 = strictParseShort(stripLeadingZeroes(yearStr));
       const month = parseDateValue(monthStr, "month", 1, 12);
       const day = parseDateValue(dayStr, "day", 1, 31);
-      return buildDate(year2, month, day, { hours, minutes, seconds, fractionalMilliseconds });
+      return buildDate(year2, month, day, { hours, minutes, seconds: seconds2, fractionalMilliseconds });
     };
     RFC3339_WITH_OFFSET = new RegExp(/^(\d{4})-(\d{2})-(\d{2})[tT](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(([-+]\d{2}:\d{2})|[zZ])$/);
     parseRfc3339DateTimeWithOffset = (value) => {
@@ -747,11 +747,11 @@ var init_date_utils = __esm({
       if (!match) {
         throw new TypeError("Invalid RFC-3339 date-time value");
       }
-      const [_2, yearStr, monthStr, dayStr, hours, minutes, seconds, fractionalMilliseconds, offsetStr] = match;
+      const [_2, yearStr, monthStr, dayStr, hours, minutes, seconds2, fractionalMilliseconds, offsetStr] = match;
       const year2 = strictParseShort(stripLeadingZeroes(yearStr));
       const month = parseDateValue(monthStr, "month", 1, 12);
       const day = parseDateValue(dayStr, "day", 1, 31);
-      const date2 = buildDate(year2, month, day, { hours, minutes, seconds, fractionalMilliseconds });
+      const date2 = buildDate(year2, month, day, { hours, minutes, seconds: seconds2, fractionalMilliseconds });
       if (offsetStr.toUpperCase() != "Z") {
         date2.setTime(date2.getTime() - parseOffsetToMilliseconds(offsetStr));
       }
@@ -769,23 +769,23 @@ var init_date_utils = __esm({
       }
       let match = IMF_FIXDATE.exec(value);
       if (match) {
-        const [_2, dayStr, monthStr, yearStr, hours, minutes, seconds, fractionalMilliseconds] = match;
-        return buildDate(strictParseShort(stripLeadingZeroes(yearStr)), parseMonthByShortName(monthStr), parseDateValue(dayStr, "day", 1, 31), { hours, minutes, seconds, fractionalMilliseconds });
+        const [_2, dayStr, monthStr, yearStr, hours, minutes, seconds2, fractionalMilliseconds] = match;
+        return buildDate(strictParseShort(stripLeadingZeroes(yearStr)), parseMonthByShortName(monthStr), parseDateValue(dayStr, "day", 1, 31), { hours, minutes, seconds: seconds2, fractionalMilliseconds });
       }
       match = RFC_850_DATE.exec(value);
       if (match) {
-        const [_2, dayStr, monthStr, yearStr, hours, minutes, seconds, fractionalMilliseconds] = match;
+        const [_2, dayStr, monthStr, yearStr, hours, minutes, seconds2, fractionalMilliseconds] = match;
         return adjustRfc850Year(buildDate(parseTwoDigitYear(yearStr), parseMonthByShortName(monthStr), parseDateValue(dayStr, "day", 1, 31), {
           hours,
           minutes,
-          seconds,
+          seconds: seconds2,
           fractionalMilliseconds
         }));
       }
       match = ASC_TIME.exec(value);
       if (match) {
-        const [_2, monthStr, dayStr, hours, minutes, seconds, fractionalMilliseconds, yearStr] = match;
-        return buildDate(strictParseShort(stripLeadingZeroes(yearStr)), parseMonthByShortName(monthStr), parseDateValue(dayStr.trimLeft(), "day", 1, 31), { hours, minutes, seconds, fractionalMilliseconds });
+        const [_2, monthStr, dayStr, hours, minutes, seconds2, fractionalMilliseconds, yearStr] = match;
+        return buildDate(strictParseShort(stripLeadingZeroes(yearStr)), parseMonthByShortName(monthStr), parseDateValue(dayStr.trimLeft(), "day", 1, 31), { hours, minutes, seconds: seconds2, fractionalMilliseconds });
       }
       throw new TypeError("Invalid RFC-7231 date-time value");
     };
@@ -985,13 +985,13 @@ var init_schema_date_utils = __esm({
       if (!matches) {
         throw new TypeError(`Invalid RFC3339 timestamp format ${value}`);
       }
-      const [, yearStr, monthStr, dayStr, hours, minutes, seconds, , ms, offsetStr] = matches;
+      const [, yearStr, monthStr, dayStr, hours, minutes, seconds2, , ms, offsetStr] = matches;
       range(monthStr, 1, 12);
       range(dayStr, 1, 31);
       range(hours, 0, 23);
       range(minutes, 0, 59);
-      range(seconds, 0, 60);
-      const date2 = new Date(Date.UTC(Number(yearStr), Number(monthStr) - 1, Number(dayStr), Number(hours), Number(minutes), Number(seconds), Number(ms) ? Math.round(parseFloat(`0.${ms}`) * 1e3) : 0));
+      range(seconds2, 0, 60);
+      const date2 = new Date(Date.UTC(Number(yearStr), Number(monthStr) - 1, Number(dayStr), Number(hours), Number(minutes), Number(seconds2), Number(ms) ? Math.round(parseFloat(`0.${ms}`) * 1e3) : 0));
       date2.setUTCFullYear(Number(yearStr));
       if (offsetStr.toUpperCase() != "Z") {
         const [, sign2, offsetH, offsetM] = /([+-])(\d\d):(\d\d)/.exec(offsetStr) || [void 0, "+", 0, 0];
@@ -29959,6 +29959,13 @@ var instancesFrom = (leases, sites, opened) => leases.map((lease, i7) => {
     facts: s3.facts ?? {}
   };
 });
+var seconds = (n4) => typeof n4 === "number" ? `${n4.toFixed(1)} s` : "";
+var money = (c7) => !c7 ? "" : c7.start_unknown ? "unknown start" : c7.estimated === false ? "no known rate" : `${(c7.total ?? 0).toFixed(2)} ${c7.currency || "USD"}`;
+var percent = (n4) => typeof n4 === "number" ? `${n4.toFixed(0)}%` : "";
+var slowest = (taken) => {
+  const [name, s3] = Object.entries(taken ?? {}).sort((a7, b7) => b7[1] - a7[1])[0] ?? [];
+  return name ? `${name} ${seconds(s3)}` : "";
+};
 var cell = (s3) => String(s3 ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
 var DOWNLOAD_TIMEOUT_MS = 12e4;
 var MAX_LOG_BYTES = 256 << 20;
@@ -30137,6 +30144,14 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
       error: responseError,
       deployment_version: response.deployment?.version ?? ""
     });
+    const batchTiming = response.batch?.timing?.total_seconds;
+    if (operation2 === "create" && state2 === "ready" && typeof batchTiming === "number")
+      outputs.duration_seconds = String(batchTiming);
+    const batchCost = response.batch?.cost;
+    const present = leases.filter((l4) => !!l4);
+    const priced = present.filter((l4) => l4.cost).length;
+    const wholeCost = !!batchCost && state2 === "destroyed" && priced === present.length && batchCost.estimated !== false && !batchCost.start_unknown;
+    if (operation2 === "destroy" && wholeCost) outputs.cost_usd = String(batchCost.total ?? 0);
     summary.push(`### E2E test stack: ${operation2}`, "", "| | |", "|---|---|");
     summary.push(`| Batch | \`${cell(outputs.batch_id || "none")}\` |`, `| State | ${cell(state2 || "unknown")} |`);
     if (operation2 === "create" || operation2 === "fetch") summary.push(`| Ready | ${ready} of ${leases.length} |`);
@@ -30145,6 +30160,22 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
       summary.push(
         `| Control plane | ${cell(response.deployment.invoked || request.qualifier)}, version ${cell(response.deployment.version || "unknown")} |`
       );
+    if (operation2 === "create" && typeof batchTiming === "number")
+      summary.push(
+        `| Duration | ${seconds(batchTiming)}, ${state2 === "ready" ? "request to every server ready" : "request to failure"} |`
+      );
+    if (operation2 === "destroy" && batchCost) {
+      const hours = typeof batchCost.hours === "number" ? `, ${batchCost.hours.toFixed(2)} instance-hours` : "";
+      const part = priced === present.length ? "" : `; ${priced} of ${present.length} servers priced`;
+      const amount = money(batchCost);
+      summary.push(`| Cost | ${cell(part && /\d/.test(amount) ? `at least ${amount}` : amount)}${hours}${part} |`);
+    }
+    const sizing = operation2 === "destroy" ? response.batch?.sizing : void 0;
+    if (sizing) {
+      const cpu = `sustained CPU ${percent(sizing.sustained_cpu) || "unknown"} on ${sizing.instance_type || "the instance type"}`;
+      const alternative = sizing.alternative && typeof sizing.saving === "number" && sizing.saving > 0 ? `; ${sizing.alternative} would have cost ${sizing.counterfactual?.toFixed(2) ?? "?"} USD, ${sizing.saving.toFixed(2)} less` : "";
+      summary.push(`| Sizing | ${cell(`${cpu}${alternative}${sizing.note ? `. ${sizing.note}` : ""}`)} |`);
+    }
     if (responseError) summary.push(`| Error | ${cell(responseError)} |`);
     if ((operation2 === "create" || operation2 === "fetch") && response.batch_id) {
       if (!response.batch?.secrets)
@@ -30231,10 +30262,36 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
       }
     }
     if (sites.length) {
-      summary.push("", "| Index | State | Site |", "|---|---|---|");
-      sites.forEach(
-        (site, i7) => summary.push(`| ${i7} | ${cell(leases[i7]?.state ?? (site ? "" : "failed"))} | ${cell(site)} |`)
-      );
+      const extra = operation2 === "create" ? [
+        ["Type", (l4) => l4.instance_type ?? ""],
+        ["Ready in", (l4) => l4.state === "ready" ? seconds(l4.timing?.total_seconds) : ""],
+        ["Image pull", (l4) => seconds(l4.image_pull_seconds)],
+        ["Slowest service", (l4) => slowest(l4.service_seconds)],
+        [
+          "Critical path",
+          (l4) => l4.critical_path?.chain?.length ? `${l4.critical_path.chain.join(" \u2192 ")}, ${seconds(l4.critical_path.seconds)}` : ""
+        ]
+      ] : operation2 === "destroy" ? [
+        ["Type", (l4) => l4.instance_type || l4.cost?.instance_type || ""],
+        ["Hours", (l4) => typeof l4.cost?.hours === "number" ? l4.cost.hours.toFixed(2) : ""],
+        ["Cost", (l4) => money(l4.cost)],
+        [
+          "CPU avg / peak",
+          (l4) => l4.metrics?.cpu_average === void 0 && l4.metrics?.cpu_peak === void 0 ? "" : `${percent(l4.metrics.cpu_average) || "\u2013"} / ${percent(l4.metrics.cpu_peak) || "\u2013"}`
+        ]
+      ] : [];
+      const head = ["Index", "State", "Site", ...extra.map(([name]) => name)];
+      summary.push("", `| ${head.join(" | ")} |`, `|${head.map(() => "---|").join("")}`);
+      sites.forEach((site, i7) => {
+        const lease = leases[i7];
+        const cells = [
+          String(i7),
+          lease?.state ?? (site ? "" : "failed"),
+          site,
+          ...extra.map(([, f7]) => lease ? f7(lease) : "")
+        ];
+        summary.push(`| ${cells.map(cell).join(" | ")} |`);
+      });
     }
     const teardown = operation2 === "create" && outputs.batch_id ? ` Batch ${outputs.batch_id} was created; destroy it.` : "";
     if (responseError) throw new Error(`e2e-test-stack: ${operation2} reported: ${responseError}.${teardown}`);
