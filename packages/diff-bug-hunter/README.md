@@ -43,8 +43,9 @@ holds the skill, never from the checked-out head.
 
 ## Requirements
 
-`git`, `gh` (authenticated), Python 3.10+, Go (matching the target), Node 22.18+ or 24.11+ (the self-test's Babel 8
-fixture needs it; hunting a webapp PR uses the webapp's own toolchain).
+`git`, `gh` (authenticated), Python 3.10+, Go (matching the target), Node `^22.18` or `>=24.11` (the
+self-test's Babel 8 fixture needs it; hunting a webapp PR uses the webapp's own toolchain).
+For `make self-test lint`: `pip install pytest ruff mypy` and ShellCheck (`apt install shellcheck` or `pip install shellcheck-py`).
 Server packages that use `Setup(t)` (`api4`, `app`, `platform`, `store`) also need Postgres 16
 (`mmuser`/`mostest`, db `mattermost_test`) and Redis on localhost. If they are down and Postgres 16 is installed
 locally, `scripts/start_pg.sh` starts a throwaway cluster.

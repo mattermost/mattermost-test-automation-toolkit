@@ -166,19 +166,24 @@ def changed_go_tests(patch: str, head_src: str) -> list[str]:
     return sorted(names)
 
 
-def own_tests(repo: Path, mb: str, head: str, dirs: set[str]) -> dict[str, list[str]]:
+def own_tests(repo: Path, mb: str, head: str, dirs: set[str]) -> dict[str, Any]:
     """Tests the PR itself adds or changes in the hunted dirs: Go test names, Jest file paths."""
     names: list[str] = []
+    by_dir: dict[str, set[str]] = {}
     jest: list[str] = []
     for f in git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head).splitlines():
         if str(Path(f).parent) not in dirs:
             continue
         if f.endswith("_test.go"):
             patch = git(repo, "diff", mb, head, "--", f)
-            names += changed_go_tests(patch, git(repo, "show", f"{head}:{f}"))
+            found = changed_go_tests(patch, git(repo, "show", f"{head}:{f}"))
+            names += found
+            if found:
+                by_dir.setdefault(str(Path(f).parent), set()).update(found)
         elif re.search(r"\.test\.[jt]sx?$", f):
             jest.append(f)
-    return {"go": sorted(set(names)), "jest": sorted(jest)}
+    return {"go": sorted(set(names)), "go_by_dir": {d: sorted(v) for d, v in sorted(by_dir.items())},
+            "jest": sorted(jest)}
 
 
 def file_diffs(repo: Path, mb: str, head: str) -> list[prefilter.FileDiff]:

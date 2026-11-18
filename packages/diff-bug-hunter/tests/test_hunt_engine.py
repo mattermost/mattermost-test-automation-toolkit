@@ -339,6 +339,7 @@ async function save() {
   document.getElementById('l').appendChild(li); }</script></body></html>""",
     "/boom": """<html><body><main><button onclick="throw new Error('kaboom')">Boom</button></main></body></html>""",
     "/fail500": """<html><body><main><button onclick="fetch('/api/v4/broken')">Break</button></main></body></html>""",
+    "/redirpage": """<html><body><main><p>r</p></main><script>fetch('/redir').catch(() => {});</script></body></html>""",
     "/slow": """<html><body><main><button onclick="fetch('/api/v4/slow')">Slow</button></main></body></html>""",
     "/external": """<html><body><main><p>ok</p><script src="http://blocked.invalid/x.js"></script></main></body></html>""",
     # the browser's own credentials (cookies or the Bearer header), as the Mattermost webapp would send them
@@ -390,6 +391,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             port = self.server.server_address[1]
             self._send(200, f'<html><body><main><p>x</p><script src="http://localhost:{port}/asset.js"></script></main></body></html>',
                        "text/html")
+        elif self.path == "/redir":
+            port = self.server.server_address[1]
+            self._send(302, "", "text/plain", headers={"Location": f"http://localhost:{port}/asset.js"})
         elif self.path == "/asset.js":
             self._send(200, "document.title = 'asset loaded';", "application/javascript")
         elif self.path in PAGES:
@@ -595,7 +599,7 @@ def test_frozen_spec_reuses_the_api_login_with_only_a_token(tmp_path, ui_server)
     assert code == 0, out
     spec = (tmp_path / "frozen.spec.ts").read_text()
     assert "async function apiLogin(context, base, env)" in spec and "await apiLogin(page.context(), BASE, process.env)" in spec
-    assert "getByLabel" not in spec and "fill(" not in spec  # no login form steps
+    assert "getByLabel(" not in spec and ".fill(" not in spec  # no login form steps
     (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
     cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
     for auth, ok in (("token", True), ("none", False)):
@@ -718,9 +722,9 @@ def test_token_mode_keeps_the_bearer_on_the_server_and_writes_pass_csrf(tmp_path
         "base_url": ui_server, "allow_origins": [other],
         "steps": [{"goto": "/xorigin"}, {"goto": "/ok"}, {"click": {"role": "button", "name": "Save"}}],
         "expect": [{"text": {"role": "list"}, "contains": "saved"}]}, auth="token")
-    assert code == 0 and "token auth as tester (Bearer header, same origin only)" in out, out
-    asset = [a for host, path, a in SEEN if path == "/asset.js"]
-    assert asset == [None], SEEN  # the other origin never sees the token
+    assert code == 0 and "token auth as tester (Bearer header on same-origin API calls only)" in out, out
+    assert [a for host, path, a in SEEN if path == "/asset.js"] == [None], SEEN  # the other origin never sees it
+    assert [a for host, path, a in SEEN if path == "/xorigin"] == [None], SEEN  # pages need no token
     writes = [a for host, path, a in SEEN if path == "/api/v4/things"]
     assert writes == [f"Bearer {TOKEN}"], SEEN  # header auth, so the write needs no CSRF token
 
@@ -748,3 +752,34 @@ def test_place_rolls_back_a_file_that_failed_mid_write(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         run.place(wt, files, {"calc"})
     assert not list(wt.rglob("*.go"))
+
+
+@needs_playwright
+def test_token_never_follows_a_redirect_to_another_origin(tmp_path, ui_server):
+    SEEN.clear()
+    other = ui_server.replace("127.0.0.1", "localhost")
+    code, out = verify(tmp_path, {"base_url": ui_server, "allow_origins": [other], "steps": [{"goto": "/redirpage"}],
+                                  "expect": [{"text": {"role": "main"}, "contains": "r"}]}, auth="token")
+    assert code == 0, out
+    redirect = [a for host, path, a in SEEN if path == "/redir"]
+    asset = [a for host, path, a in SEEN if path == "/asset.js"]
+    assert redirect == [f"Bearer {TOKEN}"] and asset == [None], SEEN
+
+
+def test_pr_own_go_tests_run_only_in_their_own_package():
+    state = {"targets": [{"lang": "go", "dir": "a"}, {"lang": "go", "dir": "b"}],
+             "own_tests": {"go": ["TestX"], "go_by_dir": {"a": ["TestX"]}, "jest": []}}
+    assert run.suite_for("PR", state, [], Path(".")).go_patterns == {"a": "^(TestX)$"}
+
+
+def test_mutant_that_only_breaks_package_teardown_is_killed(tmp_path):
+    hdir, state = make_hunt(tmp_path, "clean")
+    teardown = ("package calc\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\n"
+                "func TestMain(m *testing.M) {\n\tcode := m.Run()\n\tif Percent(0, 0) != 0 {\n\t\tos.Exit(1)\n\t}\n\tos.Exit(code)\n}\n\n"
+                "func TestHuntA_Full(t *testing.T) {\n\tif Percent(5, 5) != 100 {\n\t\tt.Fatal(Percent(5, 5))\n\t}\n}\n")
+    (hdir / "A" / "response.json").write_text(json.dumps({"files": [{"path": "calc/hunt_hunta_test.go", "content": teardown}]}))
+    (hdir / "M" / "response.json").write_text(json.dumps({"mutants": [
+        {"id": "M1", "file": "calc/percent.go", "old": "\t\treturn 0\n", "new": "\t\treturn 1\n", "what_breaks": "zero total"}]}))
+    (hdir / "M2" / "response.json").unlink()
+    v = run.cmd_mutants(hdir, state, "A")
+    assert v[0]["verdict"] == "KILLED" and v[0]["killers"] == ["calc::(package failed)"], v

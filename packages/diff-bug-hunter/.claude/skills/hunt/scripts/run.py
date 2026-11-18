@@ -32,8 +32,7 @@ class CompileError(RuntimeError):
 @dataclass
 class Suite:
     """What to run in one worktree: Go packages with a -run pattern, and/or Jest test files with a title prefix."""
-    go_dirs: list[str] = field(default_factory=list)
-    go_pattern: str = ""
+    go_patterns: dict[str, str] = field(default_factory=dict)  # package dir -> -run pattern
     jest_files: list[str] = field(default_factory=list)
     jest_prefix: str = ""
 
@@ -72,19 +71,19 @@ def suite_for(tag: str, state: dict[str, Any], placed: list[Path], wt: Path) -> 
     s = Suite()
     if tag == "PR":
         own = state["own_tests"]
-        if own["go"]:
-            s.go_dirs = [t["dir"] for t in state["targets"] if t["lang"] == "go"]
-            s.go_pattern = "^(" + "|".join(own["go"]) + ")$"
+        # each package runs only the PR tests it contains (a name missing from a package would run 0 tests there)
+        by_dir = own.get("go_by_dir") or ({t["dir"]: own["go"] for t in state["targets"] if t["lang"] == "go"}
+                                          if own["go"] else {})
+        s.go_patterns = {d: "^(" + "|".join(names) + ")$" for d, names in by_dir.items() if names}
         s.jest_files = own["jest"]
         return s
     mode = tag[0]
     for p in placed:
         rel = str(p.relative_to(wt))
         if rel.endswith(".go"):
-            s.go_dirs.append(str(Path(rel).parent))
+            s.go_patterns[str(Path(rel).parent)] = f"^TestHunt{mode}_"
         else:
             s.jest_files.append(rel)
-    s.go_pattern = f"^TestHunt{mode}_"
     s.jest_prefix = f"Hunt{mode}_"
     return s
 
@@ -100,10 +99,10 @@ def go_root(wt: Path, d: str) -> Path:
     raise InfraError(f"no go.mod above {d}")
 
 
-def go_run(wt: Path, dirs: list[str], pattern: str, race: bool) -> tuple[dict[str, str], str]:
+def go_run(wt: Path, patterns: dict[str, str], race: bool) -> tuple[dict[str, str], str]:
     res: dict[str, str] = {}
     outs = []
-    for d in sorted(set(dirs)):
+    for d, pattern in sorted(patterns.items()):
         root = go_root(wt, d)
         pkg = "./" + os.path.relpath(wt / d, root)
         args = ["go", "test", "-count=1", "-v", "-run", pattern] + (["-race"] if race else []) + [pkg]
@@ -182,8 +181,8 @@ def jest_compiles(wt: Path, file: str) -> str | None:
 def run_suite(wt: Path, s: Suite, race: bool) -> tuple[dict[str, str], str]:
     res: dict[str, str] = {}
     out = ""
-    if s.go_dirs:
-        r, o = go_run(wt, s.go_dirs, s.go_pattern, race)
+    if s.go_patterns:
+        r, o = go_run(wt, s.go_patterns, race)
         res.update(r)
         out += o
     if s.jest_files:
@@ -286,7 +285,10 @@ def cmd_mutants(hdir: Path, state: dict[str, Any], tag: str) -> list[dict[str, A
                 except CompileError as e:
                     verdicts.append({**v, "verdict": "NEEDS_REGENERATION", "detail": str(e)[-1500:]})
                     continue
-                killers = sorted(n for n, s in r.items() if s == "FAIL" and base.get(n) == "PASS")
+                # A "(package failed)" key exists only when a package failed; its absence in the baseline means the
+                # package passed there, so a mutant that newly breaks teardown still counts as a kill.
+                killers = sorted(n for n, s in r.items() if s == "FAIL" and base.get(
+                    n, "PASS" if n.endswith("::(package failed)") else None) == "PASS")
                 verdicts.append({**v, "verdict": "KILLED" if killers else "SURVIVED", "killers": killers})
             finally:
                 path.write_text(orig)

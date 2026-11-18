@@ -11,7 +11,8 @@
 // --freeze writes a passing plan as a plain @playwright/test spec, so the check reruns in CI with no model at all.
 //
 // Auth (API, before the first step, so no step is spent on the login form):
-//   VERIFY_TOKEN                   session or personal access token: Bearer header (same origin only) + MMUSERID cookie;
+//   VERIFY_TOKEN                   session or personal access token: Bearer header on same-origin fetch/XHR only, never
+//                                  across redirects, + MMUSERID cookie;
 //                                  no cookie session, so no CSRF; the webapp's websocket stays unauthenticated
 //   VERIFY_USER + VERIFY_PASSWORD  POST /api/v4/users/login; the server sets MMAUTHTOKEN, MMUSERID and MMCSRF
 // Frozen specs embed the same apiLogin() and read the same variables.
@@ -155,6 +156,8 @@ async function snapshot(page, loc) {
 export async function apiLogin(context, base, env) {
     const headers = {'X-Requested-With': 'XMLHttpRequest'};
     if (env.VERIFY_TOKEN) {
+        // A session cookie from a loaded storageState would win over the header and run as another user.
+        await context.clearCookies({name: 'MMAUTHTOKEN'});
         const me = await context.request.get(new URL('/api/v4/users/me', base).toString(),
             {headers: {...headers, Authorization: `Bearer ${env.VERIFY_TOKEN}`}});
         if (!me.ok()) {
@@ -167,14 +170,23 @@ export async function apiLogin(context, base, env) {
         await context.addCookies([{name: 'MMUSERID', value: user.id, url: base}]);
         // The token goes only to the server under test, never to another origin the page loads.
         const origin = new URL(base).origin;
-        await context.route('**/*', (route) => {
+        await context.route('**/*', async (route) => {
             const request = route.request();
-            if (new URL(request.url()).origin !== origin) {
+            // Only the webapp's API calls (fetch/XHR) to the server under test carry the token. Pages and static
+            // assets are served without auth and pass through untouched (fulfilling a document would also change
+            // how Chromium classifies the page for local-network checks).
+            if (new URL(request.url()).origin !== origin || !['fetch', 'xhr'].includes(request.resourceType())) {
                 return route.fallback();
             }
-            return route.fallback({headers: {...request.headers(), authorization: `Bearer ${env.VERIFY_TOKEN}`}});
+            // Fetch with the token here and never follow redirects: a redirect goes back to the browser, whose new
+            // request passes this origin check again, so the token can't ride a redirect to another host.
+            const response = await route.fetch({
+                headers: {...request.headers(), authorization: `Bearer ${env.VERIFY_TOKEN}`},
+                maxRedirects: 0,
+            });
+            return route.fulfill({response});
         });
-        return `token auth as ${user.username} (Bearer header, same origin only)`;
+        return `token auth as ${user.username} (Bearer header on same-origin API calls only)`;
     }
     const res = await context.request.post(new URL('/api/v4/users/login', base).toString(),
         {data: {login_id: env.VERIFY_USER, password: env.VERIFY_PASSWORD}, headers});
