@@ -48,6 +48,7 @@ function namedIn(description) {
   const count2 = (re) => Number(re.exec(d)?.[1] ?? 0);
   return {
     cleared: count2(/(\d+) cleared by triage/) + count2(/(\d+) flaky/) + count2(/(\d+) broken on main/) + count2(/(\d+) test bug/) + count2(/(\d+) server compat/),
+    brokenMain: count2(/(\d+) broken on main/),
     caused: count2(/(\d+) caused by PR/),
     appBug: count2(/(\d+) app bug/),
     fixed: count2(/(\d+) fixed on main/),
@@ -66,16 +67,18 @@ function releaseFromDescriptions(descriptions) {
   if (ds.some((d) => /\b\d+ out of date\b/.test(d))) return true;
   return void 0;
 }
-function redReason(description = "", release = false) {
+function redReason(description = "", release = false, pr = true) {
   const d = String(description);
   const lane = /^\((machine failure, [^)]+|broken on main, not your change|broken on main|fixed on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
   if (lane) return lane.replace(/^out of date/, "fixed on main").replace(/^needs investigation$/, "machine failure, re-run");
   if (/triage is checking why/.test(d)) return "triage is checking why";
-  const { cleared, caused, appBug, fixed, outdated, machine, brokenBranch, check } = namedIn(d);
+  const { cleared, brokenMain: brokenOnMain, caused, appBug, fixed, outdated, machine, brokenBranch, check } = namedIn(d);
   const parts = [];
   const pull = PULL_GUIDANCE.exec(d)?.[0];
-  const notYours = cleared + (release ? 0 : fixed);
-  if (notYours) parts.push(`${notYours} not caused by PR`);
+  const brokenMain = pr ? 0 : brokenOnMain;
+  const notYours = cleared - brokenMain + (release ? 0 : fixed);
+  if (brokenMain) parts.push(`${brokenMain} broken on main`);
+  if (notYours) parts.push(`${notYours} not caused by ${pr ? "PR" : "this commit"}`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
   const fixedHere = (release ? fixed : 0) + outdated;
@@ -98,12 +101,12 @@ function redReason(description = "", release = false) {
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
   return parts.length ? parts.join(", ") : "still red";
 }
-function laneSummary(lanes, untriaged = [], release) {
+function laneSummary(lanes, untriaged = [], release, pr = true) {
   const seen = lanes.filter((l) => Boolean(l.status));
   const redOthers = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending");
   const judgedOther = (l) => /^\([^)]+\) /.test(String(l.status?.description ?? ""));
   const otherRed = redOthers.filter((l) => !judgedOther(l)).map((l) => laneName(l.context));
-  const otherJudged = redOthers.filter(judgedOther).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false)}`);
+  const otherJudged = redOthers.filter(judgedOther).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false, pr)}`);
   const otherText = [
     ...otherJudged.slice(0, 2),
     otherJudged.length > 2 ? `+${otherJudged.length - 2} triaged red` : "",
@@ -125,7 +128,7 @@ function laneSummary(lanes, untriaged = [], release) {
     return l.status.state === "success" && n.cleared + (isRelease ? 0 : n.fixed) > 0;
   });
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
+  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease, pr)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
   if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" \xB7 ")) };
   return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
 }
@@ -237,7 +240,8 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
     const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
-    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease), context: summaryContext }, snapshotOwner());
+    const pr = Number(id.gh_pr_number || 0) > 0;
+    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease, pr), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,

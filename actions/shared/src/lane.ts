@@ -20,6 +20,7 @@ export const laneName = (context: string): string => String(context).replace(/^e
 /** How many of a lane's failures a status description names, by kind. Reads the labels and the older wording alike. */
 interface Named {
   cleared: number;
+  brokenMain: number;
   caused: number;
   appBug: number;
   fixed: number;
@@ -37,6 +38,7 @@ function namedIn(description: string | null | undefined): Named {
   const count = (re: RegExp): number => Number(re.exec(d)?.[1] ?? 0);
   return {
     cleared: count(/(\d+) cleared by triage/) + count(/(\d+) flaky/) + count(/(\d+) broken on main/) + count(/(\d+) test bug/) + count(/(\d+) server compat/),
+    brokenMain: count(/(\d+) broken on main/),
     caused: count(/(\d+) caused by PR/),
     appBug: count(/(\d+) app bug/),
     fixed: count(/(\d+) fixed on main/),
@@ -66,21 +68,25 @@ export function releaseFromDescriptions(descriptions: readonly (string | null | 
   return undefined;
 }
 
-/** Why a lane triage left red is still red, read from the status triage wrote on it. */
-export function redReason(description: string | null | undefined = "", release = false): string {
+/** Why a lane triage left red is still red, read from the status triage wrote on it. A run with no PR (a trunk or release
+ * run) has no PR to clear: what triage cleared is not caused by the commit under test, and what is broken on main is
+ * named as such, since on such a run it stays red (a standing breakage, see EXONERATED_ON_TRUNK in e2e-test-triage). */
+export function redReason(description: string | null | undefined = "", release = false, pr = true): string {
   const d = String(description);
   // A lane triage judged as a whole (see diagnoseLane in e2e-test-triage): its label and what to do.
   const lane = /^\((machine failure, [^)]+|broken on main, not your change|broken on main|fixed on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
   // A status written before today's lane labels keeps its meaning in today's words.
   if (lane) return lane.replace(/^out of date/, "fixed on main").replace(/^needs investigation$/, "machine failure, re-run");
   if (/triage is checking why/.test(d)) return "triage is checking why";
-  const { cleared, caused, appBug, fixed, outdated, machine, brokenBranch, check } = namedIn(d);
+  const { cleared, brokenMain: brokenOnMain, caused, appBug, fixed, outdated, machine, brokenBranch, check } = namedIn(d);
   const parts: string[] = [];
   // A PR's failures the base branch changed or fixed are cleared with the rest; a release run's stay named: its fix is
   // a backport. Pull guidance and "out of date" are a PR status written before.
   const pull = PULL_GUIDANCE.exec(d)?.[0];
-  const notYours = cleared + (release ? 0 : fixed);
-  if (notYours) parts.push(`${notYours} not caused by PR`);
+  const brokenMain = pr ? 0 : brokenOnMain;
+  const notYours = cleared - brokenMain + (release ? 0 : fixed);
+  if (brokenMain) parts.push(`${brokenMain} broken on main`);
+  if (notYours) parts.push(`${notYours} not caused by ${pr ? "PR" : "this commit"}`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
   // A release run's fixed on main stays named (its fix is a backport). Statuses written before today's labels said "out of
@@ -116,14 +122,14 @@ export function redReason(description: string | null | undefined = "", release =
  * An unavailable or report-only triage must not hide a real failure as pending.
  * Lanes with no status did not run.
  */
-export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], release?: boolean): LaneSummary {
+export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], release?: boolean, pr = true): LaneSummary {
   const seen = lanes.filter((l): l is { context: string; status: CommitStatus } => Boolean(l.status));
   // A red check outside the aggregate's lanes (an upgrade lane) keeps "all lanes green" from being said; its own state
   // still gates the PR. One its own triage judged (its text starts with a label) is named with that verdict.
   const redOthers = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending");
   const judgedOther = (l: LaneStatus): boolean => /^\([^)]+\) /.test(String(l.status?.description ?? ""));
   const otherRed = redOthers.filter((l) => !judgedOther(l)).map((l) => laneName(l.context));
-  const otherJudged = redOthers.filter(judgedOther).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false)}`);
+  const otherJudged = redOthers.filter(judgedOther).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false, pr)}`);
   const otherText = [
     ...otherJudged.slice(0, 2),
     otherJudged.length > 2 ? `+${otherJudged.length - 2} triaged red` : "",
@@ -149,7 +155,7 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], r
     return l.status.state === "success" && n.cleared + (isRelease ? 0 : n.fixed) > 0;
   });
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" · ")) };
+  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease, pr)}`), clearedText].filter(Boolean).join(" · ")) };
   if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" · ")) };
   return { state: "success", description: clearedText ? `${clearedText} · all lanes green` : "All lanes green" };
 }
