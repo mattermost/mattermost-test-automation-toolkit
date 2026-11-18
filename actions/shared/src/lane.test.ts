@@ -104,6 +104,40 @@ test("a summary keeps the names of other red checks, shortening wording first, a
     "(1 flaky, 2 machine failure) 50.0% passed (1 passed, 3 failed, 0 skipped)");
   assert.deepEqual(laneSummary([lane("e2e-test/maestro-ios", "failure", "(1 flaky) 50.0% passed (1 passed, 1 failed, 0 skipped)")], [long("11.11"), long("11.10")], false, true),
     { state: "failure", description: "maestro-ios: 1 not caused by PR · 2 other E2E check(s) red" });
+  const green = lane("e2e-test/maestro-ios", "success", "(0 flaky) 100% passed (6 passed, 0 failed, 0 skipped)");
+  const upgrade10 = { ...upgrade, context: "e2e-test/playwright-full/enterprise/upgrade-from-release-11.10" };
+  assert.deepEqual(laneSummary([green], [upgrade, upgrade10], false, false), {
+    state: "success",
+    description: "triaged lanes green · playwright-full/enterprise/upgrade-from-release-11.11: 1 app bug, 2 machine failures, re-run · +1 triaged red",
+  }, "one other check is named before they are only counted");
+  const required = lane("e2e-test/maestro-ios", "failure", "(1 flaky) 50.0% passed (1 passed, 1 failed, 0 skipped)");
+  assert.deepEqual(laneSummary([required], [upgrade], false, true), {
+    state: "failure",
+    description: "maestro-ios: 1 not caused by PR · playwright-full/enterprise/upgrade-from-release-11.11: 1 cleared, 1 app bug, 2 machine failures, re-run",
+  }, "the other check's wording is shortened before the lane's");
+  const flaky = lane("e2e-test/maestro-ios", "success", "(1 flaky) 99.9% passed (6 passed, 1 failed, 0 skipped)");
+  assert.deepEqual(laneSummary([flaky], [upgrade], false, false), {
+    state: "success",
+    description: "triaged lanes green · playwright-full/enterprise/upgrade-from-release-11.11: 1 cleared, 1 app bug, 2 machine failures, re-run",
+  }, "the lanes triage cleared give way before another check's name");
+});
+
+test("a green summary with too many cleared lanes to name counts them", () => {
+  const names = ["cypress-full/enterprise", "playwright-full/enterprise", "cypress-full/fips", "maestro-ios", "detox-ios", "maestro-android"];
+  assert.deepEqual(laneSummary(names.map((n) => ({ context: `e2e-test/${n}`, status: st("success", "(1 flaky) 99.9% passed (9 passed, 1 failed, 0 skipped)") }))),
+    { state: "success", description: "6 lane(s) cleared by triage · all lanes green" });
+});
+
+test("a summary with too many red lanes to fit counts the last ones, keeping their re-run instruction", () => {
+  const lane = (n: string, description: string) => ({ context: `e2e-test/${n}`, status: st("failure", description) });
+  const reds = ["cypress-full/enterprise", "playwright-full/enterprise", "cypress-full/fips"].map((n) => lane(n, "(3 caused by PR, 2 needs investigation) 99.1% passed"));
+  assert.deepEqual(laneSummary(reds), {
+    state: "failure",
+    description: "cypress-full/enterprise: 3 caused by PR, 2 machine failures, re-run · +2 more lane(s) red, re-run",
+  });
+  const caused = ["cypress-full/enterprise", "playwright-full/enterprise", "cypress-full/fips"].map((n) => lane(n, "(3 caused by PR, 2 app bug, 1 broken on branch) 99.1% passed"));
+  assert.equal(laneSummary(caused, [], true).description,
+    "cypress-full/enterprise: 3 caused by PR, 2 app bug, 1 broken on branch · +2 more lane(s) red", "no re-run is asked for when none of them asks");
 });
 
 test("a lane summary reads red lanes by their labels and old wording alike, and names the lanes cleared by triage", () => {

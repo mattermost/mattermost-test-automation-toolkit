@@ -1763,28 +1763,37 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
   const judgedOther = (l) => /^\([^)]+\) /.test(String(l.status?.description ?? ""));
   const otherRed = redOthers.filter((l) => !judgedOther(l)).map((l) => laneName(l.context));
   const judged = redOthers.filter(judgedOther);
-  const otherNamed = (wording) => [
-    ...judged.slice(0, 2).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false, pr, wording)}`),
-    judged.length > 2 ? `+${judged.length - 2} triaged red` : "",
-    otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : ""
+  const otherNamed = (wording, names) => [
+    ...judged.slice(0, names).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false, pr, wording)}`),
+    judged.length > names ? `+${judged.length - names} triaged red` : "",
+    otherRed.length ? `not triaged: ${otherRed.slice(0, names).join(", ")}${otherRed.length > names ? ` +${otherRed.length - names}` : ""} red` : ""
   ].filter(Boolean).join(" \xB7 ");
   const otherCount = judged.length ? `${judged.length + otherRed.length} other E2E check(s) red` : `not triaged: ${otherRed.length} red`;
-  const fit = (textAt) => {
-    const join2 = (text2, other) => [text2, other].filter(Boolean).join(" \xB7 ");
-    const others = redOthers.length ? [otherNamed, () => otherCount] : [() => ""];
-    for (const other of others) {
-      for (const wording of CLEARED_WORDINGS) {
-        const text2 = join2(textAt(wording), other(wording));
-        if (text2.length <= STATUS_LIMIT) return text2;
+  const join2 = (...parts) => parts.filter(Boolean).join(" \xB7 ");
+  const fit = (texts, fewer = []) => {
+    const fits = (text) => text.length <= STATUS_LIMIT;
+    const own = [...new Set(texts)];
+    if (redOthers.length) {
+      for (const names of [2, 1]) {
+        for (const text of own) {
+          for (const wording of CLEARED_WORDINGS) {
+            const candidate = join2(text, otherNamed(wording, names));
+            if (fits(candidate)) return candidate;
+          }
+        }
       }
     }
-    const text = textAt("none");
-    if (!redOthers.length) return text;
-    const room = STATUS_LIMIT - otherCount.length - 3;
-    return `${text.length > room ? `${text.slice(0, room - 1)}\u2026` : text} \xB7 ${otherCount}`;
+    const other = redOthers.length ? otherCount : "";
+    const all = [...own, ...fewer];
+    for (const text of all) {
+      const candidate = join2(text, other);
+      if (fits(candidate)) return candidate;
+    }
+    const room = STATUS_LIMIT - (other ? other.length + 3 : 0);
+    return join2(`${(all[all.length - 1] ?? "").slice(0, room - 1)}\u2026`, other);
   };
   const waiting = seen.filter((l) => l.status.state === "pending");
-  if (waiting.length) return { state: "pending", description: fit(() => `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
+  if (waiting.length) return { state: "pending", description: fit([`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`]) };
   const red = seen.filter((l) => l.status.state !== "success");
   const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
   const cleared = seen.filter((l) => {
@@ -1793,13 +1802,20 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
   });
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
   if (red.length) {
-    return {
-      state: "failure",
-      description: fit((wording) => [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease, pr, wording)}`), clearedText].filter(Boolean).join(" \xB7 "))
-    };
+    const verdicts = (wording) => red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease, pr, wording)}`);
+    const texts = [...CLEARED_WORDINGS.map((wording) => join2(...verdicts(wording), clearedText)), join2(...verdicts("none"))];
+    const terse = verdicts("none");
+    const fewer = [];
+    for (let shown = terse.length - 1; shown > 0; shown--) {
+      const rest = terse.slice(shown);
+      const rerun = rest.some((v) => /(?<!not )\bre-run\b/.test(v)) ? ", re-run" : "";
+      fewer.push(join2(...terse.slice(0, shown), `+${rest.length} more lane(s) red${rerun}`));
+    }
+    return { state: "failure", description: fit(texts, fewer) };
   }
-  if (redOthers.length) return { state: "success", description: fit(() => [clearedText, "triaged lanes green"].filter(Boolean).join(" \xB7 ")) };
-  return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
+  if (redOthers.length) return { state: "success", description: fit([join2(clearedText, "triaged lanes green"), "triaged lanes green"]) };
+  if (clearedText) return { state: "success", description: fit([`${clearedText} \xB7 all lanes green`, `${cleared.length} lane(s) cleared by triage \xB7 all lanes green`]) };
+  return { state: "success", description: "All lanes green" };
 }
 
 // ../shared/src/status.ts
