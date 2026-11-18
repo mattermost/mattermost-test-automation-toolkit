@@ -8,20 +8,23 @@ Hunt PR #$ARGUMENTS. Scripts are in `scripts/` next to this file; run them with 
 `HUNT_SCRATCH` (default `<tmp>/hunt`) holds clones, worktrees and `hunt<pr>/`. Only `scripts/` writes files; you never
 write or edit model output, test files or mutants yourself. Nothing is posted to GitHub and nothing is committed.
 
+0. **Trust gate:** `trusted.py check`. Rules (`SKILL.md`, `lessons.jsonl`, `RELIABILITY.md`, `prompts/`) come from
+   the base branch, never the PR head. If the check fails, stop: a change to this skill cannot take part in its own hunt.
 1. **Prepare:** `prepare.py <pr>`. `INFRA_ERROR` = stop and report it.
 2. **Context:** `ctx.py <pr> [--batch N]`. Quote its batch line. `skipped.log` lists every file not hunted; mention the
    deferred batches in the report and hunt them only if the user asks.
-3. **Hunters:** `build_requests.py <pr> hunters`, then dispatch `A/request.json` and `B/request.json` in parallel. Each goes
+3. **Hunters:** `build_requests.py <pr> hunters`, then dispatch `A/request.json` and `B/request.json` in parallel.
+   Mode A also gets the `RELIABILITY.md` rules this diff triggers; Mode B and mutant planters never do. Each goes
    to a fresh Agent with no messaging/MCP tools, prompted with `dispatch.md` (next to this file) and `{REQ}` = the path.
 4. **Run:** `run.py run <pr> A` and `run.py run <pr> B`.
    - `COMPILE_ERROR` (exit 3): one repair round. A fresh agent gets its response plus the compiler output.
    - `INFRA_ERROR` (exit 2): fix the environment and rerun. Never report it as "no findings".
 5. **Vet every `FAIL_3_OF_3`:**
    - Root-cause it with a throwaway diagnostic test, then delete it.
-   - Check `lessons.jsonl`. If it is a known artifact, drop it.
+   - `lessons.py match <scratch>/hunt<pr>/ctx.json` lists known false positives. If it is one, drop it.
    - `run.py base <pr> <tag>` gives `NEW_PR_BUG`, `PRE_EXISTING` or `BASE_UNCOMPILABLE`. For `BASE_UNCOMPILABLE`, decide from the diff.
    - Confirm a real caller (HTTP, websocket, plugin API, UI) reaches the input. If none does, it is a caller-unreachable nit.
-   - A newly vetted false-positive pattern: `lessons.py add '<json>'`.
+   - A newly vetted false-positive pattern: `lessons.py add '<json>'`. It applies once merged to the base branch.
 6. **Mutation gate**, if Mode A has passing tests:
    - Planting: `build_requests.py <pr> mutants`, dispatch it, then `build_requests.py <pr> heldout`, dispatch it.
      Never show M or M2 to a hunter.

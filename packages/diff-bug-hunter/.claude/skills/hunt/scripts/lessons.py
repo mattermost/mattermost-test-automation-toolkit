@@ -15,16 +15,17 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import trusted
 from hunt_common import LESSONS_FILE
 
 REQUIRED = ("pattern", "applies_to", "keywords", "symptom", "check", "source_pr")
 TOP = 5
 
 
-def load(path: Path = LESSONS_FILE) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+def load(path: Path | None = None) -> list[dict[str, Any]]:
+    """Lessons from the trusted base ref by default; from `path` when given (adding a lesson, tests)."""
+    text = trusted.read(LESSONS_FILE.name) if path is None else (path.read_text() if path.exists() else "")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 def add(lesson: dict[str, Any], path: Path = LESSONS_FILE) -> dict[str, Any]:
@@ -33,7 +34,7 @@ def add(lesson: dict[str, Any], path: Path = LESSONS_FILE) -> dict[str, Any]:
         raise ValueError(f"lesson missing {missing}")
     if not isinstance(lesson["applies_to"].get("path_globs"), list):
         raise TypeError("applies_to.path_globs must be a list")
-    existing = load(path)
+    existing = load(path)  # the working copy being appended to
     if any(e["pattern"] == lesson["pattern"] for e in existing):
         raise ValueError(f"duplicate pattern: {lesson['pattern']}")
     lesson = {"id": f"L{len(existing) + 1:03d}", **{k: v for k, v in lesson.items() if k != "id"}}

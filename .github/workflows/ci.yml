@@ -71,12 +71,18 @@ jobs:
           node-version: "24"
       - name: ci/install
         if: steps.changes.outputs.run == 'true'
-        run: python -m pip install pytest==9.1.1 ruff==0.16.9 mypy==2.3.1
+        run: |
+          python -m pip install pytest==9.1.1 ruff==0.16.9 mypy==2.3.1
+          make -C packages/diff-bug-hunter jest-deps verify-deps
+          cd packages/diff-bug-hunter/tests/verify_fixtures && npx playwright install --with-deps chromium
       - name: ci/lint
         if: steps.changes.outputs.run == 'true'
         run: make -C packages/diff-bug-hunter lint
+      # HUNT_REQUIRE_DEPS turns "dependency missing" skips into failures.
       - name: ci/self-test
         if: steps.changes.outputs.run == 'true'
+        env:
+          HUNT_REQUIRE_DEPS: "1"
         run: make -C packages/diff-bug-hunter self-test
 
   yamllint:

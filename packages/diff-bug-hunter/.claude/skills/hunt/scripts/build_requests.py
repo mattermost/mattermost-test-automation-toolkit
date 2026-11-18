@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Any
 
 import lessons
-from hunt_common import PROMPTS_DIR, hunt_dir, load_json, read_state, write_json
+import reliability
+import trusted
+from hunt_common import hunt_dir, load_json, read_state, write_json
 
 HUNTER_SCHEMA = {"type": "object", "required": ["files", "tests"],
                  "properties": {"files": {"type": "array"}, "tests": {"type": "array"}}}
@@ -26,7 +28,7 @@ MUTANT_SCHEMA = {"type": "object", "required": ["mutants"], "properties": {"muta
 
 
 def prompt(name: str) -> str:
-    return (PROMPTS_DIR / f"{name}.md").read_text()
+    return trusted.read(f"prompts/{name}.md")
 
 
 def langs(state: dict[str, Any]) -> list[str]:
@@ -43,7 +45,8 @@ def write(hdir: Path, tag: str, system: str, user: dict[str, Any], schema: dict[
 def hunter_system(mode: str, state: dict[str, Any], ctx: dict[str, Any]) -> str:
     lang_rules = "".join(prompt(f"lang_{lang}") for lang in langs(state))
     common = prompt("common").replace("{lang_rules}", lang_rules).replace("{lessons}", lessons.render(lessons.match(ctx)))
-    return prompt(f"mode_{mode.lower()}") + common
+    rules = reliability.render(reliability.match(ctx)) if mode.startswith("A") else ""
+    return prompt(f"mode_{mode.lower()}") + rules + common
 
 
 def hunter_user(mode: str, ctx: dict[str, Any]) -> dict[str, Any]:
