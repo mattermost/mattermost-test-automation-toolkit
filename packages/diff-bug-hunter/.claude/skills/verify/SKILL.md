@@ -14,12 +14,13 @@ request or read screenshots.
      form. Put `"login": true` in the plan so missing credentials fail as `INFRA_ERROR`.
    - `VERIFY_USER` + `VERIFY_PASSWORD`: `POST /api/v4/users/login`. The server sets `MMAUTHTOKEN`, `MMUSERID` and
      `MMCSRF`, and the runner checks that all three are present.
-   - `VERIFY_TOKEN` (session or personal access token): a Bearer header on same-origin requests plus an `MMUSERID`
-     cookie, with no `MMAUTHTOKEN` cookie. Mattermost reads the cookie before the header, and cookie sessions need CSRF
-     on every write. The webapp's websocket is not authenticated in this mode, so use `VERIFY_USER` /
-     `VERIFY_PASSWORD` for anything that depends on realtime events.
+   - `VERIFY_TOKEN` (session or personal access token): a Bearer header on the webapp's same-origin fetch/XHR calls
+     only, plus an `MMUSERID` cookie, with no `MMAUTHTOKEN` cookie. Mattermost reads the cookie before the header, and
+     cookie sessions need CSRF on every write. The websocket, images (avatars, file previews) and downloads are not
+     authenticated in this mode, so use `VERIFY_USER` / `VERIFY_PASSWORD` for anything that depends on them.
    - Never write credentials into the plan.
-2. **Plan:** write a plan of at most 10 steps (`MAX_STEPS`). The format is in the header of `verify_ui.mjs`.
+2. **Plan:** write a plan of at most 10 steps (`MAX_STEPS`). The format is in the header of `verify_ui.mjs`. `goto`
+   takes a path (`/team/channels/town-square`), never a URL.
    - Locate by role and accessible name first; use `testid`/`css` only when there is no accessible name.
    - Add a `snapshot` step scoped to the region you need (e.g. `{"role": "dialog"}`), not the whole page. The default
      scope is `#app-content`. Open menus, dialogs and listboxes render in React portals outside it and are always

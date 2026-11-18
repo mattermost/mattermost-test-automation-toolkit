@@ -28,7 +28,7 @@ a suite is slow, and never kill one: an interrupted run is cleaned up by `prepar
    - Root-cause it with a throwaway diagnostic test, then delete it (`run.py` refuses to run on a dirty worktree).
    - `lessons.py match <scratch>/hunt<pr>/ctx.json` lists known false positives. If it is one, drop it.
    - `run.py base <pr> <tag>` gives `NEW_PR_BUG`, `PRE_EXISTING`, `BASE_UNCOMPILABLE` or `BASE_FAILS_DIFFERENTLY`
-     (decide those two from the diff); `NOT_A_HEAD_FAILURE` means there is nothing to vet.
+     (decide those from the diff, as for `NOT_RUN_ON_BASE`); `NOT_A_HEAD_FAILURE` means there is nothing to vet.
    - Confirm a real caller (HTTP, websocket, plugin API, UI) reaches the input. If none does, it is a caller-unreachable nit.
    - A newly vetted false-positive pattern: `lessons.py add '<json>'`. Hunters see it once it is merged to the base
      branch; until then it stays in the working copy without blocking the trust gate.

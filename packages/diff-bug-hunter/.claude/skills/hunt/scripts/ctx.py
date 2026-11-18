@@ -10,9 +10,18 @@ Nothing here is summarised or chosen by a model.
 """
 from __future__ import annotations
 
+import sys as _sys
+import tempfile as _tempfile
+
+# Never load bytecode from the skill directory: a committed __pycache__/*.pyc (an unchecked-hash .pyc, say) would run
+# code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
+if not _sys.pycache_prefix:
+    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
+
 import argparse
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -51,7 +60,7 @@ def changed_symbols(patch: str, lang: str) -> set[str]:
     text = "\n".join(line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
     headers = "\n".join(re.findall(r"^@@.*@@(.*)$", patch, re.M))
     if lang == "go":
-        rx = r"func (?:\([^)]*\) )?([A-Za-z_]\w*)\(|^type ([A-Z]\w*) "
+        rx = r"func (?:\([^)]*\) )?([A-Za-z_]\w*)\s*[\[(]|^type ([A-Z]\w*)[\s\[]"
     else:
         rx = r"(?:export (?:default )?(?:function|const|class)|function|const) ([A-Za-z_]\w*)"
     for src in (text, headers):
@@ -202,6 +211,22 @@ def file_diffs(repo: Path, mb: str, head: str) -> list[prefilter.FileDiff]:
     return out
 
 
+# Outputs of an earlier hunt or batch. Left in place they would be reused (an old regenerated mutant, an old compile
+# log, old verdicts), so a new context removes them; prepare.json stays.
+STALE = ("A", "B", "A2", "M", "M2", "R_*", "run_*", "base_*", "mutants_*", "compile_*", "ctx.json", "state.json",
+         "skipped.log")
+
+
+def reset_hunt_dir(hdir: Path) -> None:
+    hdir.mkdir(parents=True, exist_ok=True)
+    for pattern in STALE:
+        for p in hdir.glob(pattern):
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p)
+            else:
+                p.unlink(missing_ok=True)
+
+
 def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
     repo, wt, mb, head = Path(prep["repo"]), Path(prep["wt"]), prep["merge_base"], prep["head"]
     diffs = file_diffs(repo, mb, head)
@@ -212,6 +237,7 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> di
     deleted = git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=D", mb, head).splitlines()
     plan.skipped += [(path, "deleted") for path in deleted]
     hdir = Path(prep.get("hunt_dir") or hunt_dir(pr))
+    reset_hunt_dir(hdir)
     (hdir / "skipped.log").write_text("\n".join(prefilter.describe(plan, batch)) + "\n")
     if not plan.batches:
         raise InfraError("prefilter left no source files to hunt (see skipped.log)")

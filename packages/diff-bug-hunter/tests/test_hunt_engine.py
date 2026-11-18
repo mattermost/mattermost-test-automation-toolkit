@@ -42,6 +42,12 @@ GIT_ENV = {**hunt_common.git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": 
            "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 
 
+@pytest.fixture(autouse=True)
+def _no_user_git_config(monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True, env=GIT_ENV).stdout.strip()
 
@@ -72,10 +78,10 @@ def make_hunt(tmp: Path, name: str) -> tuple[Path, dict]:
         if (w / "web").is_dir():
             (w / "web" / "node_modules").symlink_to(JESTDEPS)
     hdir = tmp / "hunt"
-    shutil.copytree(FIX / name / "responses", hdir)
     prep = {"repo": str(repo), "wt": str(wt), "wt_base": str(wt_base), "merge_base": mb,
             "head": _git(repo, "rev-parse", "feature"), "hunt_dir": str(hdir)}
     state = ctx.build("1", 1, prep, {"title": f"fixture {name}", "body": "Clamp keeps values in range."})
+    shutil.copytree(FIX / name / "responses", hdir, dirs_exist_ok=True)  # after ctx.build, which clears old outputs
     return hdir, state
 
 
@@ -164,7 +170,7 @@ def test_place_refuses_paths_outside_hunt_files(tmp_path):
     wt = tmp_path / "wt"
     (wt / "calc").mkdir(parents=True)
     for bad in ("calc/calc.go", "../escape/hunt_hunta_test.go", "other/hunt_hunta_test.go", "/etc/hunt_hunta_test.go"):
-        with pytest.raises(ValueError):
+        with pytest.raises(run.CompileError):  # a model's path mistake goes to the repair round
             run.place(wt, [{"path": bad, "content": "x"}], {"calc"})
 
 
@@ -345,6 +351,7 @@ async function save() {
 setTimeout(() => { document.getElementById('s').textContent = 'done'; fetch('/api/v4/slow500'); }, 400);</script></body></html>""",
     "/xfetch": """<html><body><main><p>x</p></main><script>
 fetch('http://localhost:' + location.port + '/api/v4/users/me').catch(() => {});</script></body></html>""",
+    "/link": """<html><body><main><a href="http://localhost:PORT/x">away</a></main></body></html>""",
     "/redirpage": """<html><body><main><p>r</p></main><script>fetch('/redir').catch(() => {});</script></body></html>""",
     "/slow": """<html><body><main><button onclick="fetch('/api/v4/slow')">Slow</button></main></body></html>""",
     "/external": """<html><body><main><p>ok</p><script src="http://blocked.invalid/x.js"></script></main></body></html>""",
@@ -414,6 +421,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send(302, "", "text/plain", headers={"Location": f"http://localhost:{port}/asset.js"})
         elif self.path == "/asset.js":
             self._send(200, "document.title = 'asset loaded';", "application/javascript")
+        elif self.path == "/link":
+            port = str(self.server.server_address[1])
+            self._send(200, PAGES["/link"].replace("PORT", port), "text/html")
+        elif self.path == "/api/v4/redirme":
+            port = self.server.server_address[1]
+            self._send(302, "", "text/plain", headers={"Location": f"http://localhost:{port}/api/v4/users/me"})
         elif self.path in PAGES:
             self._send(200, PAGES[self.path], "text/html")
         elif self.path == "/api/v4/users/me":
@@ -554,7 +567,7 @@ def test_verify_stays_on_the_server_under_test(tmp_path, ui_server):
     assert code == 0 and "blocked other origins: http://blocked.invalid" in out, out
     code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "https://example.com/"}],
                                   "expect": [{"visible": {"role": "main"}}]})
-    assert code == 2 and "leaves" in out, out
+    assert code == 2 and "goto must be a path" in out, out
 
 
 @needs_playwright
@@ -704,7 +717,7 @@ def test_place_writes_nothing_when_any_path_is_rejected(tmp_path):
     wt = tmp_path / "wt"
     (wt / "calc").mkdir(parents=True)
     files = [{"path": "calc/hunt_hunta_test.go", "content": "x"}, {"path": "calc/evil.go", "content": "y"}]
-    with pytest.raises(ValueError):
+    with pytest.raises(run.CompileError):
         run.place(wt, files, {"calc"})
     assert not list(wt.rglob("*.go"))
 
@@ -960,8 +973,11 @@ def test_verify_strict_plan_validation_exits_2(tmp_path, ui_server):
         ({"steps": [], "expect": [{"text": {"role": "main"}}]}, 'needs a non-empty "contains"'),
         ({"steps": [], "expect": [{"count": {"role": "button"}, "min": 0}]}, "min must be an integer >= 1"),
         ({"steps": [], "expect": [{"visible": {"role": "main", "nth": "1"}}]}, "nth must be an integer"),
-        ({"steps": [{"goto": "javascript:alert(1)"}], "expect": [{"visible": {"role": "main"}}]}, "leaves"),
-        ({"steps": [{"goto": "//evil.example/x"}], "expect": [{"visible": {"role": "main"}}]}, "leaves"),
+        ({"steps": [{"goto": "javascript:alert(1)"}], "expect": [{"visible": {"role": "main"}}]}, "goto must be a path"),
+        ({"steps": [{"goto": "//evil.example/x"}], "expect": [{"visible": {"role": "main"}}]}, "goto must be a path"),
+        ({"steps": [{"goto": "http://127.0.0.1:1/ok"}], "expect": [{"visible": {"role": "main"}}]}, "goto must be a path"),
+        ({"base_url": "http://user:pw@127.0.0.1:1", "steps": [], "expect": [{"visible": {"role": "main"}}]},
+         "must not contain user:password"),
         ({"steps": [], "expect": [{"visible": {"role": "main"}}], "extra": 1}, "unknown plan key(s) extra"),
     ]
     for plan, msg in bad:
@@ -1036,6 +1052,8 @@ def test_frozen_spec_type_checks_strictly(tmp_path, ui_server):
                        {"api": {"path": "/api/v4/users/me", "status": 200, "json_has": {"username": "tester"}}}]}
     code, out = verify(tmp_path, plan, "--freeze", "typed.spec.ts", auth="token")
     assert code == 0, out
+    # the test timeout covers the plan at its limits: 2 steps and 4 expectations
+    assert "test.setTimeout(60000 + 2 * (TIMEOUT + SETTLE_MS) + 4 * TIMEOUT + SETTLE_MS);" in (tmp_path / "typed.spec.ts").read_text()
     (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
     (tmp_path / "tsconfig.json").write_text(json.dumps({"compilerOptions": {
         "strict": True, "noEmit": True, "target": "es2022", "module": "esnext", "moduleResolution": "bundler",
@@ -1062,3 +1080,187 @@ def test_token_is_not_added_to_api_calls_on_other_allowed_origins(tmp_path, ui_s
     cross = [a for host, path, a in SEEN if host.startswith("localhost") and path == "/api/v4/users/me"]
     same = [a for host, path, a in SEEN if host.startswith("127.0.0.1") and path == "/api/v4/users/me"]
     assert cross == [None] and same and all(a == f"Bearer {TOKEN}" for a in same), SEEN
+
+
+
+# ------------------------------------------------------------------ second review round
+
+def test_new_context_clears_the_previous_hunts_outputs(tmp_path):
+    hdir, _ = make_hunt(tmp_path, "clean")
+    (hdir / "R_M1").mkdir()
+    (hdir / "R_M1" / "response.json").write_text("{}")
+    (hdir / "compile_A.log").write_text("old")
+    (hdir / "mutants_A.json").write_text("[]")
+    ctx.reset_hunt_dir(hdir)
+    assert not (hdir / "R_M1").exists() and not (hdir / "compile_A.log").exists()
+    assert not (hdir / "mutants_A.json").exists() and not (hdir / "A").exists()
+
+
+def test_base_vetting_compares_whole_failures_and_covers_missing_tests(tmp_path):
+    out = "=== RUN   TestX\n    x_test.go:9: got 3, want 5\n--- FAIL: TestX (0.01s)\n=== RUN   TestY\n--- PASS: TestY (0.00s)\n"
+    assert "got 3, want 5" in run.go_test_output(out)["TestX"]
+    wt = tmp_path / "wt"
+    a = run.normalize_failure(f"{wt}/a.go:9: got 3 (0.01s) 0xc000123 \n    at foo ({wt}/x.js:1:2)", wt)
+    b = run.normalize_failure(f"{wt}/a.go:9: got 3 (0.20s) 0xc000999 \n    at bar ({wt}/y.js:3:4)", wt)
+    assert a == b and "<wt>/a.go:9: got 3" in a
+    head = {"d::TestX": "FAIL_3_OF_3", "d::TestZ": "FAIL_3_OF_3", "e::TestW": "FAIL_3_OF_3"}
+    msgs = {"d::TestX": "got 3, want 5"}
+    o = run.Outcome(results={"d::TestX": "FAIL", "d::(package failed)": "FAIL"}, messages={"d::TestX": "got 7, want 5"})
+    table = run.base_table(head, msgs, o)
+    assert table["d::TestX"] == "BASE_FAILS_DIFFERENTLY"  # fails on base, but not the same way
+    assert table["d::TestZ"] == "BASE_FAILS_DIFFERENTLY"  # no line on base, its package died
+    assert table["e::TestW"] == "NOT_RUN_ON_BASE"
+
+
+def test_wrong_test_path_from_a_model_is_a_repairable_compile_error(tmp_path, monkeypatch):
+    hdir, _ = make_hunt(tmp_path, "clean")
+    (hdir / "B").mkdir()
+    (hdir / "B" / "response.json").write_text(json.dumps({"files": [{"path": "calc/other_test.go", "content": "x"}]}))
+    monkeypatch.setattr(run, "hunt_dir", lambda pr: hdir)
+    assert run.main(["run.py", "run", "1", "B"]) == 3
+    assert "refusing to write" in (hdir / "compile_B.log").read_text()
+
+
+def test_rule_and_prefilter_precision():
+    rules = reliability.parse((SKILL / "RELIABILITY.md").read_text())
+    r05 = next(r for r in rules if r.id == "R05")
+    assert not r05.diff.search("if (value === null) {") and r05.diff.search("strip NUL bytes")
+    assert prefilter.excluded("server/channels/store/storetest/channel_store.go") == "test helper"
+    assert prefilter.excluded("server/channels/api4/apitestlib.go") == "test helper"
+    assert "MapAll" in ctx.changed_symbols("+func MapAll[T any](xs []T) []T {\n", "go")  # generic
+
+
+def test_committed_bytecode_cannot_run_and_fails_the_trust_gate(tmp_path, monkeypatch):
+    import py_compile
+    monkeypatch.delenv("HUNT_TRUSTED_REF", raising=False)
+    repo, skill = _skill_repo(tmp_path)
+    _git(repo, "checkout", "-q", "main")
+    scripts = skill / "scripts"
+    payload = tmp_path / "payload.py"
+    payload.write_text((scripts / "hunt_common.py").read_text() + '\nprint("PWNED")\n')
+    pyc = scripts / "__pycache__" / f"hunt_common.{sys.implementation.cache_tag}.pyc"
+    pyc.parent.mkdir(exist_ok=True)
+    py_compile.compile(str(payload), cfile=str(pyc), dfile=str(scripts / "hunt_common.py"),
+                       invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+    _git(repo, "add", "-f", str(pyc))
+    _git(repo, "commit", "-qm", "plant bytecode")
+    p = subprocess.run([sys.executable, "trusted.py", "check"], cwd=scripts, capture_output=True, text=True, check=False,
+                       env={**GIT_ENV, "PYTHONPYCACHEPREFIX": ""})
+    assert "PWNED" not in p.stdout + p.stderr  # the planted file is never loaded
+    assert p.returncode == 2 and "compiled bytecode is committed" in p.stdout, p.stdout + p.stderr
+
+
+def test_git_output_ignores_colour_and_prefix_config(tmp_path, monkeypatch):
+    cfg = tmp_path / "gitconfig"
+    cfg.write_text("[color]\n\tui = always\n[diff]\n\tnoprefix = true\n")
+    _, state = make_hunt(tmp_path, "go_bug")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    own = ctx.own_tests(Path(state["repo"]), state["merge_base"], state["head"], {"calc"})
+    assert own["go"] == ["TestClampMiddle"]
+    assert "\x1b[" not in hunt_common.git(Path(state["repo"]), "diff", state["merge_base"], state["head"])
+
+
+def test_webapp_deps_install_in_the_worktree_and_share_when_the_lockfile_is_unchanged(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "npm.log"
+    (bin_dir / "npm").write_text(f'#!/bin/sh\npwd >> "{log}"\nmkdir -p node_modules\n')
+    (bin_dir / "npm").chmod(0o755)
+    (bin_dir / "node").write_text("#!/bin/sh\nexit 0\n")
+    (bin_dir / "node").chmod(0o755)
+    monkeypatch.setenv("HUNT_NODE_BIN", str(bin_dir))
+    repo = tmp_path / "repo"
+    (repo / "webapp").mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "webapp" / "package-lock.json").write_text("{}")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    mb = _git(repo, "rev-parse", "HEAD")
+    (repo / "webapp" / "x.ts").write_text("x")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "head")
+    base_wt = tmp_path / "base"
+    (base_wt / "webapp").mkdir(parents=True)
+    prepare.webapp_deps(repo, base_wt, mb, _git(repo, "rev-parse", "HEAD"))
+    assert log.read_text().splitlines() == [str(repo / "webapp")]
+    assert (base_wt / "webapp" / "node_modules").is_symlink()
+    (repo / "webapp" / "package-lock.json").write_text('{"changed": 1}')
+    _git(repo, "commit", "-qam", "lock changes")
+    base2 = tmp_path / "base2"
+    (base2 / "webapp").mkdir(parents=True)
+    prepare.webapp_deps(repo, base2, mb, _git(repo, "rev-parse", "HEAD"))
+    assert log.read_text().splitlines()[-1] == str(base2 / "webapp")  # its own install
+
+
+def test_install_skill_keeps_the_exclude_file_intact_and_respects_other_worktrees(tmp_path):
+    script = ROOT / "scripts" / "install-skill.sh"
+    target = tmp_path / "target"
+    target.mkdir()
+    _git(target, "init", "-q", "-b", "main")
+    _git(target, "commit", "-q", "--allow-empty", "-m", "init")
+    (target / ".git" / "info").mkdir(exist_ok=True)
+    (target / ".git" / "info" / "exclude").write_text("*.log")  # no trailing newline
+    p = subprocess.run(["bash", str(script), "--skill", "hunt", str(target)], capture_output=True, text=True,
+                       check=False, env=GIT_ENV)
+    assert p.returncode == 0, p.stderr
+    assert (target / ".git" / "info" / "exclude").read_text().splitlines() == ["*.log", "/.claude/skills/hunt"]
+    other = tmp_path / "other"
+    _git(target, "worktree", "add", "-q", str(other))
+    p = subprocess.run(["bash", str(script), "--copy", "--skill", "hunt", str(other)], capture_output=True, text=True,
+                       check=False, env=GIT_ENV)
+    assert p.returncode == 0 and "git add -f" in p.stdout, p.stdout + p.stderr
+    assert _git(target, "status", "--porcelain") == ""  # the main worktree's symlink stays ignored
+
+
+@needs_playwright
+def test_verify_login_never_replays_the_password_through_a_redirect(tmp_path):
+    captured: list[bytes] = []
+
+    class Redirecting(_Handler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            if self.path == "/api/v4/users/login" and self.headers.get("Host", "").startswith("127.0.0.1"):
+                port = self.server.server_address[1]
+                self._send(307, "", "text/plain", headers={"Location": f"http://localhost:{port}/api/v4/users/login"})
+                return
+            captured.append(body)
+            self._send(200, "{}")
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirecting)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        code, out = verify(tmp_path, {"base_url": base, "steps": [], "expect": [{"visible": {"role": "main"}}]})
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert captured == [] and code == 2 and "login as tester failed: HTTP 307" in out, (captured, out)
+
+
+@needs_playwright
+def test_verify_fails_on_navigation_or_api_redirect_off_the_allowed_origins(tmp_path, ui_server):
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/link"}, {"click": {"role": "link", "name": "away"}}],
+                                  "expect": [{"api": {"path": "/api/v4/users/me"}}]})
+    assert code == 1 and "navigated to a non-allowed origin" in out, out
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [], "expect": [{"api": {"path": "/api/v4/redirme"}}]})
+    assert code == 1 and "returned 302, want 200" in out, out
+
+
+@needs_playwright
+def test_verify_plan_mistakes_found_at_runtime_are_invalid_plans(tmp_path, ui_server):
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/ok"}],
+                                  "expect": [{"visible": {"css": "div["}}]}, auth="none")
+    assert code == 2 and "INVALID_PLAN expect 1" in out, out
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/ok"}, {"press": "Entr"}],
+                                  "expect": [{"visible": {"role": "main"}}]}, auth="none")
+    assert code == 2 and "INVALID_PLAN step 2/2" in out and "Unknown key" in out, out
+
+
+@needs_playwright
+def test_verify_library_call_uses_the_env_it_is_given(tmp_path, ui_server):
+    code = ("import(process.env.VERIFY_UI_MODULE).then(async (m) => { const r = await m.verify(JSON.parse(process.env.PLAN),"
+            " () => {}, null, {VERIFY_TOKEN: process.env.T, VERIFY_BASE_URL: process.env.B}); console.log('code=' + r); })")
+    plan = {"base_url": ui_server, "steps": [], "expect": [{"api": {"path": "/api/v4/users/me", "json_has": {"username": "tester"}}}]}
+    env = {**_node_env("none"), "VERIFY_UI_MODULE": str(VERIFY_UI), "PLAN": json.dumps(plan), "T": TOKEN, "B": ui_server}
+    p = subprocess.run(["node", "-e", code], env=env, capture_output=True, text=True, timeout=120, check=False)
+    assert "code=0" in p.stdout, p.stdout + p.stderr

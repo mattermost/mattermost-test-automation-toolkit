@@ -15,6 +15,14 @@ usage: trusted.py check    print the trusted ref and fail (exit 2) if any skill 
 """
 from __future__ import annotations
 
+import sys as _sys
+import tempfile as _tempfile
+
+# Never load bytecode from the skill directory: a committed __pycache__/*.pyc (an unchecked-hash .pyc, say) would run
+# code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
+if not _sys.pycache_prefix:
+    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
+
 import os
 import sys
 from pathlib import Path
@@ -81,13 +89,19 @@ def check(skill_dir: Path = SKILL_DIR) -> str:
     rel = skill_dir.resolve().relative_to(root.resolve()).as_posix()
     if _git(root, "ls-files", "--error-unmatch", rel, check=False)[0] != 0:
         return f"{rel} is not tracked: local install, read from disk"
+    _, tracked = _git(root, "ls-files", "--", rel, check=False)
+    bytecode = [f for f in tracked.splitlines() if "__pycache__/" in f or f.endswith((".pyc", ".pyo"))]
+    if bytecode:
+        raise InfraError(f"compiled bytecode is committed in the skill ({', '.join(bytecode[:3])}); Python could run it "
+                         "instead of the reviewed source. Remove it from git.")
     ref = trusted_ref(root)
     code, changed = _git(root, "diff", "--name-only", ref, "--", rel, check=False)
     _, untracked = _git(root, "ls-files", "--others", "--exclude-standard", "--", rel, check=False)
     # lessons.jsonl may hold lessons added since the base (lessons.py add appends there); read() takes the trusted
     # copy anyway, so an edited working copy cannot change what hunters see and must not block hunting.
-    dirty = [f for f in (changed.splitlines() + untracked.splitlines())
-             if f and "__pycache__" not in f and not f.endswith("/lessons.jsonl")]
+    # Locally generated caches are untracked noise; anything tracked was already refused above.
+    dirty = [f for f in changed.splitlines() + [u for u in untracked.splitlines() if "__pycache__" not in u]
+             if f and not f.endswith("/lessons.jsonl")]
     if code != 0:
         raise InfraError(f"{rel} is not on the trusted ref {ref[:12]}; the skill must land on the base branch first")
     if dirty:

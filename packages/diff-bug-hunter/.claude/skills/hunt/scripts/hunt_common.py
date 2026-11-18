@@ -79,8 +79,9 @@ def git(repo: Path, *args: str, check: bool = True) -> str:
 
 
 def git_cmd(*args: str) -> list[str]:
-    """git argv with non-ASCII paths printed verbatim (core.quotePath would quote and octal-escape them)."""
-    return ["git", "-c", "core.quotePath=false", *args]
+    """git argv whose output does not depend on the user's config: non-ASCII paths verbatim (core.quotePath would
+    octal-escape them), no colour codes, standard a/ b/ diff prefixes."""
+    return ["git", "-c", "core.quotePath=false", "-c", "color.ui=never", "-c", "diff.noprefix=false", *args]
 
 
 def load_json(path: Path) -> Any:

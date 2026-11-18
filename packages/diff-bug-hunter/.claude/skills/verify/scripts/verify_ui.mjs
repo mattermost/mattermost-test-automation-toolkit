@@ -19,7 +19,7 @@
 // Auth (API, before the first step, so no step is spent on the login form):
 //   VERIFY_TOKEN                   session or personal access token: a Bearer header on same-origin fetch/XHR only
 //                                  (fetched without following redirects) + the MMUSERID cookie; no cookie session, so
-//                                  no CSRF; the webapp's websocket stays unauthenticated
+//                                  no CSRF; the webapp's websocket, images and downloads stay unauthenticated
 //   VERIFY_USER + VERIFY_PASSWORD  POST /api/v4/users/login; the server sets MMAUTHTOKEN, MMUSERID and MMCSRF
 // Frozen specs embed the same apiLogin() and read the same variables. VERIFY_SETTLE_MS (default 10000) bounds settling.
 //
@@ -32,7 +32,7 @@
 //                                                  dialogs, menus and listboxes outside it are always appended.)
 //   "allow_origins": ["https://cdn.example.com"], (extra origins the page may load)
 //   "steps": [ at most MAX_STEPS of, each with exactly one action:
-//     {"goto": "/team/channels/town-square"} | {"click": LOC} | {"fill": LOC, "value": "text"} |
+//     {"goto": "/team/channels/town-square"} (a path) | {"click": LOC} | {"fill": LOC, "value": "text"} |
 //     {"press": "Enter", "on"?: LOC} | {"select": LOC, "value": "x"} | {"check": LOC} | {"wait_for": LOC} |
 //     {"snapshot": LOC | null} ],
 //   "expect": [ at least one of
@@ -85,10 +85,13 @@ function httpOrigin(url, what) {
     try {
         u = new URL(url);
     } catch {
-        throw new PlanError(`${what} ${JSON.stringify(url)} is not an absolute URL`);
+        throw new PlanError(`${what} is not an absolute URL`);
     }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-        throw new PlanError(`${what} ${JSON.stringify(url)} must be http or https`);
+        throw new PlanError(`${what} must be http or https (got ${u.protocol})`);
+    }
+    if (u.username || u.password) {
+        throw new PlanError(`${what} must not contain user:password (it would be logged and frozen into specs)`);
     }
     return u.origin;
 }
@@ -174,17 +177,10 @@ export function validatePlan(plan, env = process.env) {
         const where = `step ${i + 1}`;
         const action = exactlyOne(s, STEP_EXTRAS, where);
         if (action === 'goto') {
-            if (!nonEmpty(s.goto)) {
-                throw new PlanError(`${where}: goto must be a non-empty path`);
-            }
-            let target;
-            try {
-                target = new URL(s.goto, base);
-            } catch {
-                throw new PlanError(`${where}: goto ${JSON.stringify(s.goto)} is not a URL`);
-            }
-            if (target.origin !== origin) {
-                throw new PlanError(`${where}: goto ${s.goto} leaves ${origin}; plans stay on the server under test`);
+            // A path on the server under test ("/team/channels/x"), never a URL: a frozen spec must be able to target
+            // another server, and plans never leave this one.
+            if (!nonEmpty(s.goto) || !s.goto.startsWith('/') || s.goto.startsWith('//') || s.goto.includes('\\')) {
+                throw new PlanError(`${where}: goto must be a path starting with "/" (got ${JSON.stringify(s.goto)}); plans stay on the server under test`);
             }
         } else if (action === 'press') {
             if (!nonEmpty(s.press)) {
@@ -314,7 +310,7 @@ export async function apiLogin(context, base, env) {
         let me;
         try {
             me = await context.request.get(new URL('/api/v4/users/me', base).toString(),
-                {headers: {...headers, Authorization: `Bearer ${token}`}});
+                {headers: {...headers, Authorization: `Bearer ${token}`}, maxRedirects: 0});
         } catch (err) {
             throw new Error(String(err instanceof Error ? err.message : err).split('\n')[0]);
         }
@@ -353,8 +349,9 @@ export async function apiLogin(context, base, env) {
     }
     let res;
     try {
+        // maxRedirects: 0, so a 307/308 can never replay the password to another host.
         res = await context.request.post(new URL('/api/v4/users/login', base).toString(),
-            {data: {login_id: env.VERIFY_USER, password: env.VERIFY_PASSWORD}, headers});
+            {data: {login_id: env.VERIFY_USER, password: env.VERIFY_PASSWORD}, headers, maxRedirects: 0});
     } catch (err) {
         throw new Error(String(err instanceof Error ? err.message : err).split('\n')[0]);
     }
@@ -434,6 +431,12 @@ async function settle(page, limit) {
     return `${page.inflight.size} request(s) still in flight after ${limit}ms: ${urls.join(', ')}`;
 }
 
+// Errors that mean the plan is wrong (a malformed selector, an unknown key name), not that the app is.
+function planMistake(err) {
+    return /Unknown key: |is not a valid selector|while parsing (?:css )?selector|Unexpected token .* selector|Failed to parse/i
+        .test(firstLine(err));
+}
+
 // Re-reads until `ok` holds or ACTION_TIMEOUT_MS passes, like Playwright's expect.poll in frozen specs; returns the
 // last value read.
 async function poll(read, ok) {
@@ -446,9 +449,14 @@ async function poll(read, ok) {
     return value;
 }
 
-async function checkExpect(page, base, e) {
+async function checkExpect(page, base, e, env) {
     if (e.visible) {
-        const ok = await locate(page, e.visible).waitFor({state: 'visible', timeout: ACTION_TIMEOUT_MS}).then(() => true, () => false);
+        const ok = await locate(page, e.visible).waitFor({state: 'visible', timeout: ACTION_TIMEOUT_MS}).then(() => true, (err) => {
+            if (err?.name === 'TimeoutError') {
+                return false;
+            }
+            throw err;
+        });
         return ok ? null : `not visible within ${ACTION_TIMEOUT_MS}ms: ${JSON.stringify(e.visible)}`;
     }
     if (e.text) {
@@ -460,8 +468,10 @@ async function checkExpect(page, base, e) {
         const n = await poll(() => locateAll(page, e.count).count(), (c) => c >= min);
         return n >= min ? null : `count of ${JSON.stringify(e.count)} is ${n}, want >= ${min}`;
     }
-    const auth = process.env.VERIFY_TOKEN ? {Authorization: `Bearer ${process.env.VERIFY_TOKEN}`} : {};
-    const res = await page.request.get(new URL(e.api.path, base).toString(), {headers: {'X-Requested-With': 'XMLHttpRequest', ...auth}});
+    const auth = env.VERIFY_TOKEN ? {Authorization: `Bearer ${env.VERIFY_TOKEN}`} : {};
+    // No redirects: an answer from another host must never satisfy an expectation.
+    const res = await page.request.get(new URL(e.api.path, base).toString(),
+        {headers: {'X-Requested-With': 'XMLHttpRequest', ...auth}, maxRedirects: 0});
     if (res.status() >= 500) {
         return `GET ${e.api.path} returned ${res.status()}; a server error never satisfies an expectation`;
     }
@@ -535,6 +545,8 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                 blocked.add(origin);
                 if (r.redirectedFrom()) {
                     problems.push(`redirected to a non-allowed origin: ${r.method()} ${origin}`);
+                } else if (r.isNavigationRequest() && r.frame() === page.mainFrame()) {
+                    problems.push(`navigated to a non-allowed origin: ${origin}`);
                 }
             }
         });
@@ -559,8 +571,8 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                 problems.push(late);
             }
             const origin = originOf(page.url());
-            if (origin !== null && !allowedSet.has(origin)) {
-                problems.push(`the page left the allowed origins: now on ${origin}`);
+            if (page.url().startsWith('chrome-error:') || (origin !== null && !allowedSet.has(origin))) {
+                problems.push(`the page left the allowed origins: now on ${origin ?? page.url()}`);
             }
         };
         if (authed) {
@@ -582,6 +594,9 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                 await afterStep();
             } catch (err) {
                 const msg = firstLine(err);
+                if (planMistake(err)) {
+                    throw new PlanError(`${label}: ${msg}`);
+                }
                 if (/net::ERR_|ECONNREFUSED/.test(msg) && !(await reachable(context, base))) {
                     throw new InfraError(`server unreachable at ${base}: ${msg}`);
                 }
@@ -594,7 +609,12 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
             log(`${label} ok`);
         }
         for (const [i, e] of plan.expect.entries()) {
-            const why = await checkExpect(page, base, e).catch((err) => firstLine(err));
+            const why = await checkExpect(page, base, e, env).catch((err) => {
+                if (planMistake(err)) {
+                    throw new PlanError(`expect ${i + 1}: ${firstLine(err)}`);
+                }
+                return firstLine(err);
+            });
             if (why || problems.length) {
                 return finish(1, `expect ${i + 1}: ${why ?? problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
             }
@@ -658,6 +678,8 @@ function typedSubset() {
 export function freeze(plan, base, allowOrigins = [], authed = false) {
     const q = JSON.stringify;
     const lines = [];
+    const steps = (plan.steps ?? []).filter((s) => !('snapshot' in s)).length;
+    const expects = plan.expect.length;
     for (const s of plan.steps ?? []) {
         if ('goto' in s) {
             lines.push(`await page.goto(new URL(${q(s.goto)}, BASE).toString(), {waitUntil: 'domcontentloaded'});`);
@@ -728,7 +750,8 @@ ${typedSubset()}
 async function apiGet(page: Page, path: string) {
   const auth: Record<string, string> = process.env.VERIFY_TOKEN ? {Authorization: \`Bearer \${process.env.VERIFY_TOKEN}\`} : {};
   try {
-    return await page.request.get(new URL(path, BASE).toString(), {headers: {'X-Requested-With': 'XMLHttpRequest', ...auth}});
+    return await page.request.get(new URL(path, BASE).toString(),
+      {headers: {'X-Requested-With': 'XMLHttpRequest', ...auth}, maxRedirects: 0});
   } catch (err) {
     throw new Error(String(err instanceof Error ? err.message : err).split('\\n')[0]);
   }
@@ -736,6 +759,8 @@ async function apiGet(page: Page, path: string) {
 ${loginFn}
 test(${q(plan.name ?? 'frozen /verify plan')}, async ({page, context}) => {
   expect(Number.isFinite(SETTLE_MS) && SETTLE_MS > 0, 'VERIFY_SETTLE_MS must be a positive number').toBe(true);
+  // As long as the runner may take: login, every step and expectation at their limits, and the final settle.
+  test.setTimeout(60000 + ${steps} * (TIMEOUT + SETTLE_MS) + ${expects} * TIMEOUT + SETTLE_MS);
   const problems: string[] = [];
   const inflight = new Set<unknown>();
   await context.route('**/*', (route) => {
@@ -747,6 +772,8 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async ({page, context}) => {
     const origin = originOf(r.url());
     if (origin !== null && !ALLOWED.has(origin) && r.redirectedFrom()) {
       problems.push(\`redirected to a non-allowed origin: \${r.method()} \${origin}\`);
+    } else if (origin !== null && !ALLOWED.has(origin) && r.isNavigationRequest() && r.frame() === page.mainFrame()) {
+      problems.push(\`navigated to a non-allowed origin: \${origin}\`);
     }
   });
   page.on('requestfinished', (r) => inflight.delete(r));
@@ -776,7 +803,8 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async ({page, context}) => {
     }
     expect(inflight.size, 'requests still in flight at the settle deadline').toBe(0);
     const origin = originOf(page.url());
-    expect(origin === null || ALLOWED.has(origin), \`the page left the allowed origins: \${page.url()}\`).toBe(true);
+    expect(!page.url().startsWith('chrome-error:') && (origin === null || ALLOWED.has(origin)),
+      \`the page left the allowed origins: \${page.url()}\`).toBe(true);
     expect(problems).toEqual([]);
   };${login}
 ${lines.map((l) => `  ${l}`).join('\n')}

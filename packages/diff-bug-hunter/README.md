@@ -36,8 +36,12 @@ holds the skill, never from the checked-out head.
 
 - `trusted.py check` (step 0 of `/hunt`) fails closed when any skill file differs from that ref.
 - A tracked rule file missing on the base also fails closed, as does a repository without a base branch.
-- A skill that is not tracked at `HEAD` (a local symlink or uncommitted copy) is read from disk: no pull request can
-  change it.
+- A skill copy that is not tracked by any repository (an uncommitted `--copy`) is read from disk: no pull request can
+  change it. A symlink install (the installer's default) resolves into this toolkit checkout, where the skill is
+  tracked, so its rules come from the toolkit's `origin/main`: keep that checkout on `origin/main` (fetched), or use
+  `--copy`.
+- Bytecode is never loaded from the skill directory (each script keeps its cache in a private temp dir), and committed
+  `__pycache__` files fail the trust gate.
 - People editing the rules themselves set `HUNT_TRUSTED_REF=worktree`; `HUNT_TRUSTED_REF=<ref>` pins another ref.
 - New lessons apply once they are merged.
 
@@ -71,8 +75,9 @@ validated strictly (one action per step, one locator kind, known keys only) befo
   - Allowed origins only (`base_url` plus `allow_origins`): other hosts are blocked and logged, a `goto` that leaves
     the server is refused, and a redirect, navigation or websocket that reaches another host fails the run.
 - **API login:** `VERIFY_TOKEN`, or `VERIFY_USER` + `VERIFY_PASSWORD`, logs in through `/api/v4/` before the first step
-  (password: the server's `MMAUTHTOKEN` / `MMUSERID` / `MMCSRF` cookies; token: a same-origin Bearer header, no cookie
-  session, so no CSRF and no realtime websocket), so all 10 steps test the feature. Frozen specs embed the same login.
+  (password: the server's `MMAUTHTOKEN` / `MMUSERID` / `MMCSRF` cookies; token: a Bearer header on same-origin
+  fetch/XHR only, no cookie session, so no CSRF, and no authenticated websocket, images or downloads), so all 10 steps
+  test the feature. Neither login follows redirects. Frozen specs embed the same login.
 - **Text, not pixels:** `snapshot` prints a scoped `locator.ariaSnapshot()` (default `#app-content`). Menus, dialogs
   and listboxes rendered in React portals outside the scope are appended, so they are never hidden. The runner never
   takes screenshots.
@@ -123,7 +128,8 @@ packages/diff-bug-hunter/scripts/install-skill.sh ~/src/mattermost
 ```
 
 That symlinks `.claude/skills/hunt` and `.claude/skills/verify` into the target repository and git-ignores them
-locally. Use `--copy` to vendor a snapshot you can commit (plugins, forks), `--skill hunt|verify` to install one, and
+locally (the ignore entry lives in the repository's shared `info/exclude`, so it covers every worktree). /hunt then
+reads its rules from this toolkit checkout's base branch (see "Rules come from the base branch"). Use `--copy` to vendor a snapshot you can commit (plugins, forks), `--skill hunt|verify` to install one, and
 `--force` to replace an existing install. Then, in Claude Code inside that repository:
 
 ```text
@@ -131,7 +137,8 @@ locally. Use `--copy` to vendor a snapshot you can commit (plugins, forks), `--s
 /verify the channel header edit dialog saves and shows the new header
 ```
 
-Webapp PRs need `npm ci` once in `$HUNT_MM/webapp`; the skill links that `node_modules` into its worktrees.
+Webapp PRs run `npm ci` once in the PR worktree's `webapp/` (`prepare.py` does it); the merge-base worktree reuses
+those `node_modules` unless the PR changes `package-lock.json`.
 
 ## CI integration
 
@@ -144,7 +151,7 @@ make -C packages/diff-bug-hunter jest-deps verify-deps
 ```
 
 ```bash
-cd packages/diff-bug-hunter/tests/verify_fixtures && npx playwright install chromium
+cd packages/diff-bug-hunter/tests/verify_fixtures && npx playwright install --with-deps chromium
 ```
 
 ```bash

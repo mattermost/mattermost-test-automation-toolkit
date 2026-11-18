@@ -33,7 +33,7 @@ probe: Register web connections for a member, a non-member and a guest; trigger 
 
 ## R05 Mention, HTML and NULL sanitization
 paths: server/public/model/post.go, server/channels/app/post*.go, server/channels/app/notification*.go, server/channels/app/mention*.go, webapp/channels/src/utils/text_formatting*, webapp/channels/src/utils/markdown/*
-diff: mention|@channel|@here|@all|\\x00|\\u0000|NUL|sanitiz|escape|dangerouslySetInnerHTML|innerHTML|SanitizeUnicode
+diff: mention|@channel|@here|@all|\\x00|\\u0000|(?-i:\bNUL\b)|sanitiz|escape|dangerouslySetInnerHTML|innerHTML|SanitizeUnicode
 invariant: Text with NUL bytes is rejected or stripped before storage; escaped, backslashed or code-fenced mentions never notify; rendered output never executes or injects user-supplied HTML.
 probe: Property-test the changed function with random text mixing `@channel`/`@here`, `\_`, backslashes, code fences, NUL and `<script>`; assert notification sets and rendered output against a reference.
 

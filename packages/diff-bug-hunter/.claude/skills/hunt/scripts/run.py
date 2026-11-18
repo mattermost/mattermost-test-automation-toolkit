@@ -12,6 +12,14 @@ Exit codes: 0 ok, 2 INFRA_ERROR (0 tests executed, dirty worktree, dead DB, miss
 """
 from __future__ import annotations
 
+import sys as _sys
+import tempfile as _tempfile
+
+# Never load bytecode from the skill directory: a committed __pycache__/*.pyc (an unchecked-hash .pyc, say) would run
+# code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
+if not _sys.pycache_prefix:
+    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
+
 import fcntl
 import json
 import os
@@ -51,8 +59,38 @@ class Suite:
 @dataclass
 class Outcome:
     results: dict[str, str] = field(default_factory=dict)   # identity -> PASS | FAIL | SKIP
-    messages: dict[str, str] = field(default_factory=dict)  # identity -> first line of the failure (Jest)
+    messages: dict[str, str] = field(default_factory=dict)  # identity -> normalized failure text
     log: str = ""
+
+
+def normalize_failure(text: str, wt: Path) -> str:
+    """Failure text with what differs between two runs of the same failure removed: worktree paths, stack frames,
+    durations, addresses and goroutine ids. Two failures compare equal only if they say the same thing."""
+    text = text.replace(str(wt.resolve()), "<wt>").replace(str(wt), "<wt>")
+    keep = [line for line in text.splitlines() if not re.match(r"\s+at |\s*goroutine \d+|\s*created by ", line)]
+    text = "\n".join(keep)
+    text = re.sub(r"\(\d+(?:\.\d+)?m?s\)", "", text)
+    text = re.sub(r"0x[0-9a-fA-F]+", "0x?", text)
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    return text[:4000]
+
+
+def go_test_output(out: str) -> dict[str, str]:
+    """Output lines per top-level Go test, from -v output (=== RUN / === CONT switch the current test)."""
+    blocks: dict[str, list[str]] = {}
+    current = None
+    for line in out.splitlines():
+        m = re.match(r"=== (?:RUN|CONT|PAUSE) +(\S+)", line)
+        if m:
+            current = m.group(1).split("/")[0]
+            continue
+        m = re.match(r"\s*--- (?:PASS|FAIL|SKIP): (\S+)", line)
+        if m:
+            current = m.group(1).split("/")[0]
+            continue
+        if current:
+            blocks.setdefault(current, []).append(line)
+    return {k: "\n".join(v) for k, v in blocks.items()}
 
 
 # ---------------------------------------------------------------- worktree hygiene
@@ -70,13 +108,17 @@ def place(wt: Path, files: list[dict[str, str]], target_dirs: set[str]) -> list[
     anything is written (only hunt_* test files inside a target dir pass), and a failed write removes what was written."""
     targets = []
     for f in files:
-        rel = f["path"]
+        rel = str(f.get("path", ""))
         if not HUNT_FILE.match(Path(rel).name) or str(Path(rel).parent) not in target_dirs:
-            raise ValueError(f"refusing to write {rel!r}: not a hunt_* test file in a target dir")
-        p = under(wt, rel)
+            # Model output chose a wrong name or directory: the repair round can fix that, so report it as such.
+            raise CompileError(f"refusing to write {rel!r}: not a hunt_* test file in one of {sorted(target_dirs)}")
+        try:
+            p = under(wt, rel)
+        except ValueError as e:
+            raise CompileError(str(e)) from e
         if not p.parent.is_dir():
             raise CompileError(f"{p.parent} does not exist in this worktree")
-        targets.append((p, f["content"]))
+        targets.append((p, str(f.get("content", ""))))
     placed: list[Path] = []
     try:
         for p, content in targets:
@@ -148,6 +190,11 @@ def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome) -> Non
             # test line says so. Record it instead of reporting PASS.
             got[f"{d}::{PACKAGE_FAILED}"] = "FAIL"
         into.results.update(got)
+        for name, block in go_test_output(out).items():
+            if got.get(f"{d}::{name}") == "FAIL":
+                into.messages[f"{d}::{name}"] = normalize_failure(block, wt)
+        if got.get(f"{d}::{PACKAGE_FAILED}") == "FAIL":
+            into.messages[f"{d}::{PACKAGE_FAILED}"] = normalize_failure(out[-4000:], wt)
         into.log += out
 
 
@@ -194,7 +241,7 @@ def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
                 into.results[key] = {"passed": "PASS", "failed": "FAIL"}.get(a["status"], "SKIP")
                 failures = a.get("failureMessages") or []
                 if failures:
-                    into.messages[key] = failures[0].strip().splitlines()[0] if failures[0].strip() else ""
+                    into.messages[key] = normalize_failure("\n".join(failures), wt)
                     into.log += "\n".join(failures) + "\n"
     if files and not found:
         raise InfraError(f"0 tests matching {prefix!r} executed in {files}")
@@ -268,14 +315,26 @@ def base_verdict(name: str, base_status: str, head: dict[str, str], head_msgs: d
     if MISSING_ON_BASE.search(base_msg):
         # Jest (Babel, no type check) loads a test of a function the PR adds; on base it fails as "not a function".
         return "BASE_UNCOMPILABLE"
-    if name in head_msgs and head_msgs[name] != base_msg:
+    if head_msgs.get(name, "") != base_msg:
         return "BASE_FAILS_DIFFERENTLY"  # decide from the diff, as for BASE_UNCOMPILABLE
     return "PRE_EXISTING"
 
 
+def base_table(head: dict[str, str], head_msgs: dict[str, str], o: Outcome) -> dict[str, str]:
+    """One verdict per test the base run reported, plus one for every head failure it did not report."""
+    out = {n: base_verdict(n, s, head, head_msgs, o.messages.get(n, "")) for n, s in o.results.items()}
+    for n, status in head.items():
+        if status == "FAIL_3_OF_3" and n not in o.results:
+            # No result line for it on base: its package died (panic, timeout) or the test is absent there.
+            pkg_failed = o.results.get(n.rsplit("::", 1)[0] + f"::{PACKAGE_FAILED}") == "FAIL"
+            out[n] = "BASE_FAILS_DIFFERENTLY" if pkg_failed else "NOT_RUN_ON_BASE"
+    return out
+
+
 def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, str]:
-    """NEW_PR_BUG: failed 3/3 on head, passes on base. PRE_EXISTING: fails the same way on base.
-    BASE_UNCOMPILABLE / BASE_FAILS_DIFFERENTLY: decide from the diff. NOT_A_HEAD_FAILURE: nothing to vet."""
+    """NEW_PR_BUG: failed 3/3 on head, passes on base. PRE_EXISTING: fails with the same normalized failure on base.
+    BASE_UNCOMPILABLE / BASE_FAILS_DIFFERENTLY / NOT_RUN_ON_BASE: decide from the diff. NOT_A_HEAD_FAILURE: nothing
+    to vet."""
     wt = Path(state["wt_base"])
     ensure_clean(wt)
     files = load_json(hdir / tag / "response.json")["files"]
@@ -287,8 +346,7 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, str]:
     try:
         if files:
             placed = place(wt, files, {t["dir"] for t in state["targets"]})
-            o = run_suite(wt, suite_for(tag, state, placed, wt), race=True)
-            out = {n: base_verdict(n, s, head, head_msgs, o.messages.get(n, "")) for n, s in o.results.items()}
+            out = base_table(head, head_msgs, run_suite(wt, suite_for(tag, state, placed, wt), race=True))
     except CompileError as e:
         out = {"*": "BASE_UNCOMPILABLE", "detail": str(e)[-800:]}
     finally:

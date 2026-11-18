@@ -10,12 +10,20 @@ environment failure.
 """
 from __future__ import annotations
 
+import sys as _sys
+import tempfile as _tempfile
+
+# Never load bytecode from the skill directory: a committed __pycache__/*.pyc (an unchecked-hash .pyc, say) would run
+# code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
+if not _sys.pycache_prefix:
+    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
+
 import json
 import shutil
 import sys
 from pathlib import Path
 
-from hunt_common import REPO, SKILL_DIR, InfraError, git, hunt_dir, mm_clone, scratch, sh, write_json
+from hunt_common import REPO, SKILL_DIR, InfraError, git, git_cmd, hunt_dir, mm_clone, node_env, scratch, sh, write_json
 
 STATEFUL = ("server/channels/api4/", "server/channels/app/", "server/channels/store/", "server/channels/web/",
             "server/channels/wsapi/")
@@ -61,18 +69,22 @@ def services_up() -> None:
         sh(["redis-cli", "ping"], Path("."))
 
 
-def link_node_modules(mm: Path, wts: list[Path]) -> None:
-    for sub in ("webapp/node_modules", "webapp/channels/node_modules"):
-        src = mm / sub
-        if not src.is_dir():
-            raise InfraError(f"{src} missing: run `npm ci` in {mm / 'webapp'} once")
-        for wt in wts:
-            dst = wt / sub
-            if dst.is_symlink() or dst.exists():
-                continue
-            dst.symlink_to(src)
-    if not shutil.which("node"):
+def webapp_deps(wt: Path, wt_base: Path, mb: str, head: str) -> None:
+    """`npm ci` in the head worktree's webapp/ (the shared clone has no checkout). The merge-base worktree reuses those
+    node_modules when package-lock.json is unchanged, and installs its own otherwise."""
+    if not shutil.which("node", path=node_env().get("PATH")):
         raise InfraError("node not on PATH (set HUNT_NODE_BIN)")
+    if not (wt / "webapp" / "node_modules").is_dir():
+        sh(["npm", "ci", "--no-audit", "--no-fund"], wt / "webapp", timeout=3600, env=node_env())
+    lock_changed = sh(git_cmd("diff", "--quiet", mb, head, "--", "webapp/package-lock.json"), wt, check=False).returncode != 0
+    if lock_changed:
+        if not (wt_base / "webapp" / "node_modules").is_dir():
+            sh(["npm", "ci", "--no-audit", "--no-fund"], wt_base / "webapp", timeout=3600, env=node_env())
+        return
+    for sub in ("webapp/node_modules", "webapp/channels/node_modules"):
+        src, dst = wt / sub, wt_base / sub
+        if src.is_dir() and not (dst.exists() or dst.is_symlink()):
+            dst.symlink_to(src)
 
 
 def main(pr: str) -> None:
@@ -92,7 +104,7 @@ def main(pr: str) -> None:
     if any(f.startswith(STATEFUL) or "/app/platform/" in f for f in changed):
         services_up()
     if web_changed:
-        link_node_modules(mm, [wt, wt_base])
+        webapp_deps(wt, wt_base, mb, git(mm, "rev-parse", f"pr-{pr}"))
     write_json(hunt_dir(pr) / "prepare.json", {"pr": pr, "repo": str(mm), "wt": str(wt), "wt_base": str(wt_base),
                                               "head": git(mm, "rev-parse", f"pr-{pr}"), "merge_base": mb,
                                               "base_ref": base})

@@ -9,6 +9,14 @@ Only add a lesson after a failure was root-caused to the pattern with a diagnost
 """
 from __future__ import annotations
 
+import sys as _sys
+import tempfile as _tempfile
+
+# Never load bytecode from the skill directory: a committed __pycache__/*.pyc (an unchecked-hash .pyc, say) would run
+# code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
+if not _sys.pycache_prefix:
+    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
+
 import fnmatch
 import json
 import sys
