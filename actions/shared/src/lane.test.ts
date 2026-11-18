@@ -242,4 +242,8 @@ test("a summary that would pass 140 characters keeps every re-run instruction an
   assert.equal(laneSummary([l("maestro-ios", "success", "100% passed")], [l(upgrade, "failure", "(3 caused by PR, 2 app bug, 1 fixed on main, 2 broken on branch, 3 machine failure) 50% passed"),
     l("playwright-full/enterprise/upgrade-from-release-11.10", "failure", "(1 app bug) 50% passed")], true, false).description,
   `triaged lanes green · ${upgrade}: 3 machine failures, re-run · +1 triaged red`, "another check says what a person has to do before it is only counted");
+  assert.equal(laneSummary([l("maestro-ios", "pending", "running"), l("detox-ios", "pending", "running")],
+    [l("fips/upgrade-11.11", "failure", "(1 machine failure) 50% passed"), l("playwright-full/enterprise/upgrade-from-release-11.10-to-the-current-head-of-master", "failure", "99.8% passed, 2 failed")]).description,
+  "Triage is checking: waiting for maestro-ios, detox-ios · fips/upgrade-11.11: 1 machine failure, re-run · not triaged: 1 red",
+  "a judged check keeps its name while one triage did not judge is counted");
 });

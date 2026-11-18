@@ -156,32 +156,53 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], r
   const otherRed = redOthers.filter((l) => !judgedOther(l)).map((l) => laneName(l.context));
   const judged = redOthers.filter(judgedOther);
   const otherReason = (l: LaneStatus, wording: ClearedWording): string => redReason(l.status?.description, isRelease, pr, wording);
-  const otherNamed = (wording: ClearedWording, names: number): string => [
-    ...judged.slice(0, names).map((l) => `${laneName(l.context)}: ${otherReason(l, wording)}`),
-    judged.length > names ? `+${judged.length - names} triaged red${rerunNote(judged.slice(names).map((l) => otherReason(l, "none")))}` : "",
-    otherRed.length ? `not triaged: ${otherRed.slice(0, names).join(", ")}${otherRed.length > names ? ` +${otherRed.length - names}` : ""} red` : "",
-  ].filter(Boolean).join(" · ");
+  // The first `shownJudged` checks triage judged by name and verdict, the first `shownRed` it did not by name; the rest
+  // of each counted.
+  const otherNamed = (wording: ClearedWording, shownJudged: number, shownRed: number): string => {
+    const restJudged = judged.slice(shownJudged);
+    const restRed = otherRed.length - shownRed;
+    const redNames = [otherRed.slice(0, shownRed).join(", "), restRed > 0 ? `${shownRed ? "+" : ""}${restRed}` : ""].filter(Boolean).join(" ");
+    return [
+      ...judged.slice(0, shownJudged).map((l) => `${laneName(l.context)}: ${otherReason(l, wording)}`),
+      restJudged.length ? `${shownJudged ? "+" : ""}${restJudged.length} triaged red${rerunNote(restJudged.map((l) => otherReason(l, "none")))}` : "",
+      otherRed.length ? `not triaged: ${redNames} red` : "",
+    ].filter(Boolean).join(" · ");
+  };
+  // How many of each kind are named, most first: a judged check (its verdict says what to do) keeps its name longer than
+  // one triage did not judge. Each judged check named is tried with every cleared wording, then with only what a person
+  // has to do; only then are the judged checks all counted beside an untriaged name. Naming none is the count below.
+  const shownOthers: (readonly [number, number])[] = [];
+  for (const j of [2, 1, 0]) {
+    for (const r of [2, 1, 0]) {
+      const shown = [Math.min(j, judged.length), Math.min(r, otherRed.length)] as const;
+      if (shown[0] + shown[1] > 0 && !shownOthers.some(([a, b]) => a === shown[0] && b === shown[1])) shownOthers.push(shown);
+    }
+  }
+  const withVerdicts = shownOthers.filter(([j]) => j > 0 || !judged.length);
+  const otherSteps: (readonly [readonly [number, number], readonly ClearedWording[]])[] = [
+    ...withVerdicts.map((shown) => [shown, CLEARED_WORDINGS] as const),
+    ...withVerdicts.filter(([j]) => j > 0).map((shown) => [shown, ["action"]] as const),
+    ...shownOthers.filter(([j]) => j === 0 && judged.length).map((shown) => [shown, ["none"]] as const),
+  ];
   const otherCount = judged.length
     ? `${judged.length + otherRed.length} other E2E check(s) red${rerunNote(judged.map((l) => otherReason(l, "none")))}`
     : `not triaged: ${otherRed.length} red`;
   const join = (...parts: string[]): string => parts.filter(Boolean).join(" · ");
   // GitHub cuts the status at 140 characters, so the most detailed text that fits is written. `texts` is the text before
   // the warning about other checks, most detailed first; `fewer` is what it gives way to when none fits. Another check's
-  // name goes late: its cleared wording is shortened, then left out, then the text's own detail gives way, then two
-  // other checks are named, then one; then, the same way, with only what a person has to do in their verdicts; then
-  // they are only counted (keeping a re-run any of them asks for). Only then does `fewer` give a red lane's name up: a red lane outranks
-  // another check. Only when that does not fit either is the text cut; the warning still fits whole.
+  // name goes late: its cleared wording is shortened, then left out, then the text's own detail gives way, then fewer
+  // other checks are named (`otherSteps`); then they are only counted (keeping a re-run any of them asks for). Only
+  // then does `fewer` give a red lane's name up: a red lane outranks another check. Only when that does not fit either
+  // is the text cut; the warning still fits whole.
   const fit = (texts: readonly string[], fewer: readonly string[] = []): string => {
     const fits = (text: string): boolean => text.length <= STATUS_LIMIT;
     const own = [...new Set(texts)];
     if (redOthers.length) {
-      for (const wordings of [CLEARED_WORDINGS, ["action"] as const]) {
-        for (const names of [2, 1]) {
-          for (const text of own) {
-            for (const wording of wordings) {
-              const candidate = join(text, otherNamed(wording, names));
-              if (fits(candidate)) return candidate;
-            }
+      for (const [[shownJudged, shownRed], wordings] of otherSteps) {
+        for (const text of own) {
+          for (const wording of wordings) {
+            const candidate = join(text, otherNamed(wording, shownJudged, shownRed));
+            if (fits(candidate)) return candidate;
           }
         }
       }
