@@ -65,7 +65,10 @@ plain Node decides the verdict.
   - At most `MAX_STEPS = 10` steps of `goto`/`click`/`fill`/`press`/`select`/`check`/`wait_for`/`snapshot`.
   - Locators by role and accessible name first.
   - Same-origin only: other hosts are blocked and logged, and a `goto` that leaves the server is refused.
-- **Text, not pixels:** `snapshot` prints a scoped `locator.ariaSnapshot()` (e.g. just the dialog). The runner never
+- **API login:** `VERIFY_TOKEN`, or `VERIFY_USER` + `VERIFY_PASSWORD`, logs in through `/api/v4/` before the first step
+  (`MMAUTHTOKEN` / `MMUSERID` / `MMCSRF` cookies), so all 10 steps test the feature. Frozen specs embed the same login.
+- **Text, not pixels:** `snapshot` prints a scoped `locator.ariaSnapshot()` (default `#app-content`). Menus, dialogs
+  and listboxes rendered in React portals outside the scope are appended, so they are never hidden. The runner never
   takes screenshots.
 - **Automatic failures:** any `pageerror`, or any `/api/v4/` response >= 500, fails the run. Each step waits until
   in-flight requests settle, so a late 500 is not missed.
@@ -75,10 +78,34 @@ plain Node decides the verdict.
   check reruns in CI with no model.
 
 ```bash
-MM_USERNAME=sysadmin MM_PASSWORD=... node .claude/skills/verify/scripts/verify_ui.mjs plan.json --freeze save.spec.ts
+VERIFY_USER=sysadmin VERIFY_PASSWORD=... node .claude/skills/verify/scripts/verify_ui.mjs plan.json --freeze save.spec.ts
 ```
 
 Run it where `require("playwright")` resolves (e.g. `mattermost/e2e-tests/playwright`), or set `NODE_PATH`.
+
+### Running against Testcontainers, Docker or a Cursor Automation
+
+`/verify` needs only a reachable server and credentials (`VERIFY_BASE_URL`, plus `VERIFY_TOKEN` or `VERIFY_USER` /
+`VERIFY_PASSWORD`).
+
+- **Mattermost Testcontainers** (`mattermost/mattermost`, `e2e-tests/playwright`):
+
+  ```bash
+  cd e2e-tests/playwright && npm run tc:up      # SERVER_IMAGE=mattermostdevelopment/mattermost-enterprise-edition:<tag> for a PR/release build
+  export VERIFY_BASE_URL=http://localhost:8055  # tc:up publishes Mattermost on the fixed host port 8055
+  # tc:up starts a fresh server with no users; on a fresh server the first user created becomes system admin:
+  curl -sf -X POST "$VERIFY_BASE_URL/api/v4/users" -H 'Content-Type: application/json' \
+    -d '{"email":"admin@example.com","username":"sysadmin","password":"'"$VERIFY_PASSWORD"'"}'
+  export VERIFY_USER=sysadmin
+  ```
+
+  Run `verify_ui.mjs` from `e2e-tests/playwright`, where `require("playwright")` resolves, and finish with
+  `npm run tc:down`.
+- **Docker:** `docker run -d -p 8065:8065 mattermost/mattermost-preview`, then the same user bootstrap against
+  `http://localhost:8065`.
+- **Cursor Automation (PR or release check):** start the stack as above, install the skill
+  (`install-skill.sh --copy`), let the agent run `/verify <behaviour>` with the `VERIFY_*` secrets set, and keep
+  `--freeze` output as the artifact. The frozen spec uses the same API login and needs no model on reruns.
 
 ## Install and run locally
 
@@ -99,7 +126,7 @@ Webapp PRs need `npm ci` once in `$HUNT_MM/webapp`; the skill links that `node_m
 
 ## CI integration
 
-Package self-test (runs in this repository's `ci.yml` when `packages/diff-bug-hunter/` changes; it needs a Chromium
+Package self-test (runs in this repository's `.github/workflows/diff-bug-hunter.yml` when `packages/diff-bug-hunter/` changes; it needs a Chromium
 from `npx playwright install chromium`):
 
 ```bash

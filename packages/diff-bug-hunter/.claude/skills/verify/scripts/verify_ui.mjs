@@ -10,11 +10,17 @@
 // for in-flight requests to settle, and success is a deterministic DOM or /api/v4/ check, never a model's judgement.
 // --freeze writes a passing plan as a plain @playwright/test spec, so the check reruns in CI with no model at all.
 //
+// Auth (API, before the first step, so no step is spent on the login form):
+//   VERIFY_TOKEN                   session or personal access token: MMAUTHTOKEN + MMUSERID cookies and a Bearer header
+//   VERIFY_USER + VERIFY_PASSWORD  POST /api/v4/users/login; the server sets MMAUTHTOKEN, MMUSERID and MMCSRF
+// Frozen specs embed the same apiLogin() and read the same variables.
+//
 // Plan:
 // {
-//   "base_url": "http://localhost:8065",          (default: $MM_URL or http://localhost:8065)
-//   "login": true,                                (POST /api/v4/users/login with $MM_USERNAME / $MM_PASSWORD)
-//   "scope": {"role": "main"},                    (default locator for snapshots; default: body)
+//   "base_url": "http://localhost:8065",          (default: $VERIFY_BASE_URL, $MM_URL or http://localhost:8065)
+//   "login": true,                                (require auth: INFRA_ERROR when no VERIFY_* credentials are set)
+//   "scope": {"role": "main"},                    (snapshot scope; default: #app-content if present, else body.
+//                                                  Open dialogs, menus and listboxes outside it are always added.)
 //   "allow_origins": ["https://cdn.example.com"], (extra origins the page may load; default: base_url only)
 //   "steps": [ at most MAX_STEPS of
 //     {"goto": "/team/channels/town-square"} | {"click": LOC} | {"fill": LOC, "value": "text"} |
@@ -112,10 +118,67 @@ function locate(page, loc) {
     return loc.nth === undefined ? l.first() : l.nth(loc.nth);
 }
 
+// Mattermost renders menus, modals, pickers and autocompletes in React portals at the end of <body>, outside
+// #app-content. A snapshot scoped to the app would hide them, so every visible top-level portal outside the scope is
+// appended to it.
+const PORTAL_SELECTOR = '[role="dialog"], [role="menu"], [role="listbox"]';
+
+const cap = (text) => (text.length > SNAPSHOT_CHARS ? `${text.slice(0, SNAPSHOT_CHARS)}\n... (truncated)` : text);
+
 async function snapshot(page, loc) {
-    const text = await locate(page, loc).ariaSnapshot({timeout: ACTION_TIMEOUT_MS});
-    return text.length > SNAPSHOT_CHARS ? `${text.slice(0, SNAPSHOT_CHARS)}\n... (truncated)` : text;
+    const scope = loc ?? ((await page.locator('#app-content').count()) ? {css: '#app-content'} : {css: 'body'});
+    const scoped = locate(page, scope);
+    const parts = [cap(await scoped.ariaSnapshot({timeout: ACTION_TIMEOUT_MS}))];
+    const scopeEl = await scoped.elementHandle();
+    const portals = page.locator(PORTAL_SELECTOR);
+    const n = await portals.count();
+    for (let i = 0; i < n; i++) {
+        const portal = portals.nth(i);
+        if (!(await portal.isVisible())) {
+            continue;
+        }
+        const outsideAndTopLevel = await portal.evaluate(
+            (el, [s, sel]) => !(s && s.contains(el)) && !el.parentElement?.closest(sel), [scopeEl, PORTAL_SELECTOR]);
+        if (outsideAndTopLevel) {
+            parts.push(`portal [role=${await portal.getAttribute('role')}]:\n${cap(await portal.ariaSnapshot())}`);
+        }
+    }
+    return parts.join('\n');
 }
+
+// Self-contained on purpose: --freeze copies this function's source into the generated spec, so frozen tests log in
+// exactly the way the run that produced them did.
+export async function apiLogin(context, base, env) {
+    const headers = {'X-Requested-With': 'XMLHttpRequest'};
+    if (env.VERIFY_TOKEN) {
+        const me = await context.request.get(new URL('/api/v4/users/me', base).toString(),
+            {headers: {...headers, Authorization: `Bearer ${env.VERIFY_TOKEN}`}});
+        if (!me.ok()) {
+            throw new Error(`VERIFY_TOKEN rejected by GET /api/v4/users/me: HTTP ${me.status()}`);
+        }
+        const user = await me.json();
+        await context.addCookies([
+            {name: 'MMAUTHTOKEN', value: env.VERIFY_TOKEN, url: base, httpOnly: true},
+            {name: 'MMUSERID', value: user.id, url: base},
+        ]);
+        // Header tokens skip the server's CSRF check, so no MMCSRF cookie is needed (or invented) in token mode.
+        await context.setExtraHTTPHeaders({Authorization: `Bearer ${env.VERIFY_TOKEN}`});
+        return `token auth as ${user.username}`;
+    }
+    const res = await context.request.post(new URL('/api/v4/users/login', base).toString(),
+        {data: {login_id: env.VERIFY_USER, password: env.VERIFY_PASSWORD}, headers});
+    if (!res.ok()) {
+        throw new Error(`login as ${env.VERIFY_USER} failed: HTTP ${res.status()}`);
+    }
+    const names = new Set((await context.cookies(base)).map((c) => c.name));
+    const missing = ['MMAUTHTOKEN', 'MMUSERID', 'MMCSRF'].filter((name) => !names.has(name));
+    if (missing.length) {
+        throw new Error(`login as ${env.VERIFY_USER} set no ${missing.join(', ')} cookie`);
+    }
+    return `password login as ${env.VERIFY_USER} (MMAUTHTOKEN, MMUSERID, MMCSRF set)`;
+}
+
+const hasCredentials = (env) => Boolean(env.VERIFY_TOKEN || (env.VERIFY_USER && env.VERIFY_PASSWORD));
 
 function subset(want, got) {
     if (want === null || typeof want !== 'object') {
@@ -191,13 +254,13 @@ async function checkExpect(page, base, e) {
 
 export async function verify(plan, log = console.log, freezeTo = null) {
     const steps = validatePlan(plan);
-    const base = plan.base_url ?? process.env.MM_URL ?? 'http://localhost:8065';
+    const base = plan.base_url ?? process.env.VERIFY_BASE_URL ?? process.env.MM_URL ?? 'http://localhost:8065';
     for (const s of steps) {
         if ('goto' in s && new URL(s.goto, base).origin !== new URL(base).origin) {
             throw new PlanError(`goto ${s.goto} leaves ${new URL(base).origin}; plans stay on the server under test`);
         }
     }
-    const scope = plan.scope ?? {css: 'body'};
+    const scope = plan.scope ?? null;
     const {chromium} = loadPlaywright();
     const browser = await chromium.launch();
     const problems = [];
@@ -225,17 +288,17 @@ export async function verify(plan, log = console.log, freezeTo = null) {
                 problems.push(`HTTP ${res.status()} from ${res.request().method()} ${new URL(res.url()).pathname}`);
             }
         });
-        if (plan.login) {
-            const {MM_USERNAME: user, MM_PASSWORD: pass} = process.env;
-            if (!user || !pass) {
-                throw new InfraError('login requested but MM_USERNAME / MM_PASSWORD are not set');
+        const authed = hasCredentials(process.env);
+        if (plan.login && !authed) {
+            throw new InfraError('login required but neither VERIFY_TOKEN nor VERIFY_USER + VERIFY_PASSWORD is set');
+        }
+        if (authed) {
+            try {
+                log(await apiLogin(context, base, process.env));
+            } catch (err) {
+                const msg = String(err.message ?? err).split('\n')[0];
+                throw new InfraError(/ECONNREFUSED|ENOTFOUND|net::ERR_/.test(msg) ? `server unreachable at ${base}: ${msg}` : msg);
             }
-            const res = await context.request.post(new URL('/api/v4/users/login', base).toString(),
-                {data: {login_id: user, password: pass}, headers: {'X-Requested-With': 'XMLHttpRequest'}});
-            if (!res.ok()) {
-                throw new InfraError(`login as ${user} failed: HTTP ${res.status()}`);
-            }
-            log(`login ok as ${user}`);
         }
         for (const [i, step] of steps.entries()) {
             const label = `step ${i + 1}/${steps.length} ${JSON.stringify(step)}`;
@@ -272,7 +335,7 @@ export async function verify(plan, log = console.log, freezeTo = null) {
         }
         log('VERDICT: PASS');
         if (freezeTo) {
-            writeFileSync(freezeTo, freeze(plan, base));
+            writeFileSync(freezeTo, freeze(plan, base, authed));
             log(`frozen to ${freezeTo}: rerun with \`npx playwright test ${path.basename(freezeTo)}\` (no model needed)`);
         }
         return 0;
@@ -302,7 +365,7 @@ function locatorCode(loc) {
 
 const one = (loc) => `${locatorCode(loc)}.${loc.nth === undefined ? 'first()' : `nth(${loc.nth})`}`;
 
-export function freeze(plan, base) {
+export function freeze(plan, base, authed = false) {
     const q = JSON.stringify;
     const lines = [];
     for (const s of plan.steps ?? []) {
@@ -342,20 +405,19 @@ export function freeze(plan, base) {
         }
     }
     lines.push('await settle();');
-    const login = plan.login ? `
-  const login = await page.request.post(new URL('/api/v4/users/login', BASE).toString(), {
-    data: {login_id: process.env.MM_USERNAME, password: process.env.MM_PASSWORD},
-    headers: {'X-Requested-With': 'XMLHttpRequest'},
-  });
-  expect(login.ok()).toBe(true);` : '';
+    const login = plan.login || authed ? `
+  expect(Boolean(process.env.VERIFY_TOKEN || (process.env.VERIFY_USER && process.env.VERIFY_PASSWORD)),
+    'set VERIFY_TOKEN or VERIFY_USER + VERIFY_PASSWORD').toBe(true);
+  await apiLogin(page.context(), BASE, process.env);` : '';
+    const loginFn = login ? `\n// Same API login as verify_ui.mjs (copied from its apiLogin): no steps spent on the login form.\n${apiLogin.toString()}\n` : '';
     return `// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
 // Frozen by verify_ui.mjs from a passing plan. Same oracle: page errors and >= 500 /api/v4/ responses fail the test.
 import {expect, test} from '@playwright/test';
 
-const BASE = process.env.MM_URL ?? ${q(base)};
-
+const BASE = process.env.VERIFY_BASE_URL ?? process.env.MM_URL ?? ${q(base)};
+${loginFn}
 test(${q(plan.name ?? 'frozen /verify plan')}, async ({page}) => {
   const problems: string[] = [];
   const inflight = new Set<unknown>();

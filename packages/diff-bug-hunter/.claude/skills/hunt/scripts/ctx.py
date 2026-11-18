@@ -140,7 +140,7 @@ def own_tests(repo: Path, mb: str, head: str, dirs: set[str]) -> dict[str, list[
     """Tests the PR itself adds or changes in the hunted dirs: Go test names, Jest file paths."""
     names: list[str] = []
     jest: list[str] = []
-    for f in git(repo, "diff", "--name-only", mb, head).splitlines():
+    for f in git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head).splitlines():
         if str(Path(f).parent) not in dirs:
             continue
         if f.endswith("_test.go"):
@@ -152,8 +152,9 @@ def own_tests(repo: Path, mb: str, head: str, dirs: set[str]) -> dict[str, list[
 
 
 def file_diffs(repo: Path, mb: str, head: str) -> list[prefilter.FileDiff]:
+    """Added and modified files only. Renames count as delete + add, so every path exists at head."""
     out = []
-    for row in git(repo, "diff", "--numstat", mb, head).splitlines():
+    for row in git(repo, "diff", "--numstat", "--no-renames", "--diff-filter=AM", mb, head).splitlines():
         a, r, path = row.split("\t", 2)
         if a == "-":  # binary
             out.append(prefilter.FileDiff(path, 0, 0))
@@ -169,6 +170,8 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> di
         if not prefilter.excluded(f.path):
             f.patch = git(repo, "diff", mb, head, "--", f.path)
     plan = prefilter.plan(diffs)
+    deleted = git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=D", mb, head).splitlines()
+    plan.skipped += [(path, "deleted") for path in deleted]
     hdir = Path(prep.get("hunt_dir") or hunt_dir(pr))
     (hdir / "skipped.log").write_text("\n".join(prefilter.describe(plan, batch)) + "\n")
     if not plan.batches:

@@ -336,7 +336,24 @@ async function save() { const r = await fetch('/api/v4/things', {method: 'POST'}
     "/boom": """<html><body><main><button onclick="throw new Error('kaboom')">Boom</button></main></body></html>""",
     "/fail500": """<html><body><main><button onclick="fetch('/api/v4/broken')">Break</button></main></body></html>""",
     "/external": """<html><body><main><p>ok</p><script src="http://blocked.invalid/x.js"></script></main></body></html>""",
+    # the browser's own credentials (cookies or the Bearer header), as the Mattermost webapp would send them
+    "/whoami": """<html><body><main><p id="who">loading</p></main><script>
+fetch('/api/v4/users/me', {credentials: 'include'}).then(async (r) => {
+  document.getElementById('who').textContent = r.ok ? 'signed in as ' + (await r.json()).username : 'HTTP ' + r.status;
+});</script></body></html>""",
+    # Mattermost-style React portals: the menu and the dialog are appended to <body>, outside #app-content
+    "/portal": """<html><body><div id="app-content"><main><button onclick="openMenu()">Channel menu</button></main></div>
+<script>
+function openMenu() {
+  const m = document.createElement('div'); m.setAttribute('role', 'menu'); m.setAttribute('aria-label', 'Channel menu');
+  const item = document.createElement('button'); item.setAttribute('role', 'menuitem'); item.textContent = 'Leave channel';
+  item.onclick = () => { m.remove(); const d = document.createElement('div'); d.setAttribute('role', 'dialog');
+    d.setAttribute('aria-label', 'Leave channel'); d.innerHTML = '<button>Yes, leave</button>'; document.body.appendChild(d); };
+  m.appendChild(item); document.body.appendChild(m);
+}</script></body></html>""",
 }
+
+TOKEN, USER_ID = "tok-123", "uid1"
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -355,8 +372,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if self.path in PAGES:
             self._send(200, PAGES[self.path], "text/html")
         elif self.path == "/api/v4/users/me":
-            authed = "MMAUTHTOKEN=t" in (self.headers.get("Cookie") or "")
-            self._send(200 if authed else 401, json.dumps({"username": "tester"} if authed else {"id": "unauthorized"}))
+            cookie, bearer = self.headers.get("Cookie") or "", self.headers.get("Authorization") or ""
+            authed = f"MMAUTHTOKEN={TOKEN}" in cookie or bearer == f"Bearer {TOKEN}"
+            self._send(200 if authed else 401,
+                       json.dumps({"id": USER_ID, "username": "tester"} if authed else {"id": "unauthorized"}))
         elif self.path == "/api/v4/broken":
             self._send(500, '{"id": "boom"}')
         else:
@@ -366,7 +385,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         if self.path == "/api/v4/users/login":
             ok = json.loads(body or b"{}") == {"login_id": "tester", "password": "pw"}
-            self._send(200 if ok else 401, "{}", headers={"Set-Cookie": "MMAUTHTOKEN=t; Path=/"} if ok else None)
+            if not ok:
+                self._send(401, "{}")
+                return
+            # what Mattermost sets on login: the session token, the user id and the CSRF token
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Token", TOKEN)
+            for c in (f"MMAUTHTOKEN={TOKEN}; Path=/; HttpOnly", f"MMUSERID={USER_ID}; Path=/", "MMCSRF=csrf1; Path=/"):
+                self.send_header("Set-Cookie", c)
+            self.end_headers()
+            self.wfile.write(json.dumps({"id": USER_ID, "username": "tester"}).encode())
         elif self.path == "/api/v4/things":
             self._send(201, "{}")
         else:
@@ -381,8 +410,12 @@ def ui_server():
     srv.shutdown()
 
 
-def _node_env() -> dict[str, str]:
-    env = {**os.environ, "MM_USERNAME": "tester", "MM_PASSWORD": "pw"}
+def _node_env(auth: str = "password") -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("VERIFY_")}
+    if auth == "password":
+        env.update(VERIFY_USER="tester", VERIFY_PASSWORD="pw")
+    elif auth == "token":
+        env["VERIFY_TOKEN"] = TOKEN
     paths = [str(VERIFY_DEPS)] + [p for p in env.get("NODE_PATH", "").split(os.pathsep) if p]
     env["NODE_PATH"] = os.pathsep.join(paths)
     if os.environ.get("HUNT_NODE_BIN"):
@@ -400,9 +433,9 @@ REQUIRE_DEPS = bool(os.environ.get("HUNT_REQUIRE_DEPS"))
 needs_playwright = pytest.mark.skipif(not REQUIRE_DEPS and not _playwright_available(), reason="run `make verify-deps` first")
 
 
-def verify(tmp: Path, plan: dict, *extra: str) -> tuple[int, str]:
+def verify(tmp: Path, plan: dict, *extra: str, auth: str = "password") -> tuple[int, str]:
     (tmp / "plan.json").write_text(json.dumps(plan))
-    p = subprocess.run(["node", str(VERIFY_UI), "plan.json", *extra], cwd=tmp, env=_node_env(), capture_output=True,
+    p = subprocess.run(["node", str(VERIFY_UI), "plan.json", *extra], cwd=tmp, env=_node_env(auth), capture_output=True,
                        text=True, timeout=120, check=False)
     assert not list(tmp.rglob("*.png")), "verify_ui must never write screenshots"
     return p.returncode, p.stdout + p.stderr
@@ -418,7 +451,8 @@ def test_verify_passes_with_dom_and_api_checks(tmp_path, ui_server):
                    {"count": {"role": "button"}, "min": 1},
                    {"api": {"path": "/api/v4/users/me", "status": 200, "json_has": {"username": "tester"}}}]})
     assert code == 0, out
-    assert "login ok as tester" in out and '- button "Save"' in out and "VERDICT: PASS" in out
+    assert "password login as tester (MMAUTHTOKEN, MMUSERID, MMCSRF set)" in out
+    assert '- button "Save"' in out and "VERDICT: PASS" in out
 
 
 @needs_playwright
@@ -507,3 +541,87 @@ def test_install_skill_links_both_skills_and_refuses_to_clobber(tmp_path):
                        text=True, check=False)
     copied = target / ".claude" / "skills" / "verify"
     assert p.returncode == 0 and not copied.is_symlink() and (copied / "scripts" / "verify_ui.mjs").exists()
+
+
+@needs_playwright
+def test_verify_api_login_reaches_the_app_with_password_or_token(tmp_path, ui_server):
+    plan = {"base_url": ui_server, "steps": [{"goto": "/whoami"}],
+            "expect": [{"text": {"css": "#who"}, "contains": "signed in as tester"}]}
+    for auth, line in (("password", "password login as tester"), ("token", "token auth as tester")):
+        code, out = verify(tmp_path, plan, auth=auth)
+        assert code == 0 and line in out, (auth, out)
+    code, out = verify(tmp_path, {**plan, "login": True}, auth="none")
+    assert code == 2 and "INFRA_ERROR login required" in out, out
+    code, out = verify(tmp_path, plan, auth="none")
+    assert code == 1 and "HTTP 401" in out, out  # without credentials the page really is signed out
+
+
+@needs_playwright
+def test_frozen_spec_reuses_the_api_login_with_only_a_token(tmp_path, ui_server):
+    plan = {"name": "whoami", "base_url": ui_server, "login": True, "steps": [{"goto": "/whoami"}],
+            "expect": [{"text": {"css": "#who"}, "contains": "signed in as tester"}]}
+    code, out = verify(tmp_path, plan, "--freeze", "frozen.spec.ts", auth="password")
+    assert code == 0, out
+    spec = (tmp_path / "frozen.spec.ts").read_text()
+    assert "async function apiLogin(context, base, env)" in spec and "await apiLogin(page.context(), BASE, process.env)" in spec
+    assert "getByLabel" not in spec and "fill(" not in spec  # no login form steps
+    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
+    cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
+    for auth, ok in (("token", True), ("none", False)):
+        env = {**_node_env(auth), "VERIFY_BASE_URL": ui_server}
+        p = subprocess.run(["node", str(cli), "test", "frozen.spec.ts", "--reporter=line"], cwd=tmp_path, env=env,
+                           capture_output=True, text=True, timeout=180, check=False)
+        assert (p.returncode == 0) == ok, (auth, p.stdout + p.stderr)
+    assert "set VERIFY_TOKEN or VERIFY_USER + VERIFY_PASSWORD" in p.stdout + p.stderr
+
+
+@needs_playwright
+def test_verify_snapshots_show_portals_outside_app_content(tmp_path, ui_server):
+    code, out = verify(tmp_path, {
+        "base_url": ui_server, "scope": {"css": "#app-content"},
+        "steps": [{"goto": "/portal"}, {"click": {"role": "button", "name": "Channel menu"}}, {"snapshot": None},
+                  {"click": {"role": "menuitem", "name": "Leave channel"}}, {"snapshot": {"css": "#app-content"}}],
+        "expect": [{"visible": {"role": "dialog", "name": "Leave channel"}}]})
+    assert code == 0, out
+    first, second = out.split("step 5/5")
+    assert 'portal [role=menu]:' in first and '- menuitem "Leave channel"' in first
+    assert 'portal [role=dialog]:' in second and '- button "Yes, leave"' in second
+    assert "portal [role=menu]" not in second  # closed portals are not reported
+
+
+# ------------------------------------------------------------------ Bugbot regressions
+
+def test_context_skips_deleted_and_renamed_files(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "master")
+    _overlay(FIX / "clean" / "base", repo)
+    (repo / "calc" / "old.go").write_text("package calc\n\nfunc Old() int { return 1 }\n")
+    (repo / "calc" / "moved.go").write_text("package calc\n\nfunc Moved() int { return 2 }\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    _git(repo, "checkout", "-qb", "feature")
+    _git(repo, "rm", "-q", "calc/old.go")
+    _git(repo, "mv", "calc/moved.go", "calc/renamed.go")
+    _overlay(FIX / "clean" / "head", repo)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "head")
+    wt, wt_base = tmp_path / "wt", tmp_path / "wt.base"
+    mb = prepare.worktrees(repo, "feature", "master", wt, wt_base)
+    hdir = tmp_path / "hunt"
+    hdir.mkdir()
+    prep = {"repo": str(repo), "wt": str(wt), "wt_base": str(wt_base), "merge_base": mb,
+            "head": _git(repo, "rev-parse", "feature"), "hunt_dir": str(hdir)}
+    state = ctx.build("1", 1, prep, {"title": "t", "body": ""})
+    assert sorted(state["changed"]) == ["calc/percent.go", "calc/renamed.go"]
+    log = (hdir / "skipped.log").read_text()
+    assert "calc/old.go\tdeleted" in log and "calc/moved.go\tdeleted" in log
+
+
+def test_place_writes_nothing_when_any_path_is_rejected(tmp_path):
+    wt = tmp_path / "wt"
+    (wt / "calc").mkdir(parents=True)
+    files = [{"path": "calc/hunt_hunta_test.go", "content": "x"}, {"path": "calc/evil.go", "content": "y"}]
+    with pytest.raises(ValueError):
+        run.place(wt, files, {"calc"})
+    assert not list(wt.rglob("*.go"))

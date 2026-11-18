@@ -8,13 +8,20 @@ Verify: $ARGUMENTS. The runner is `scripts/verify_ui.mjs` next to this file. It 
 Its output is text only: step results, scoped `ariaSnapshot()` YAML, and a final `VERDICT:` line. Never take,
 request or read screenshots.
 
-1. **Server:** check that `MM_URL` (default `http://localhost:8065`) answers `GET /api/v4/system/ping`.
-   If it doesn't, stop and report `INFRA_ERROR`; do not start or reconfigure servers unasked. For logged-in pages, set
-   `MM_USERNAME` / `MM_PASSWORD` in the environment and put `"login": true` in the plan. Never write credentials into
-   the plan.
+1. **Server and auth:** check that `VERIFY_BASE_URL` (or `MM_URL`, default `http://localhost:8065`) answers
+   `GET /api/v4/system/ping`. If it doesn't, stop and report `INFRA_ERROR`; do not start or reconfigure servers unasked.
+   - Logged-in pages: the runner authenticates through the API before the first step, so no step goes to the login
+     form. Put `"login": true` in the plan so missing credentials fail as `INFRA_ERROR`.
+   - `VERIFY_USER` + `VERIFY_PASSWORD`: `POST /api/v4/users/login`. The server sets `MMAUTHTOKEN`, `MMUSERID` and
+     `MMCSRF`, and the runner checks that all three are present.
+   - `VERIFY_TOKEN` (session or personal access token): `MMAUTHTOKEN` + `MMUSERID` cookies and a Bearer header. Header
+     tokens skip the CSRF check, so `MMCSRF` is not needed in this mode.
+   - Never write credentials into the plan.
 2. **Plan:** write a plan of at most 10 steps (`MAX_STEPS`). The format is in the header of `verify_ui.mjs`.
    - Locate by role and accessible name first; use `testid`/`css` only when there is no accessible name.
-   - Add a `snapshot` step scoped to the region you need (e.g. `{"role": "dialog"}`), not the whole page.
+   - Add a `snapshot` step scoped to the region you need (e.g. `{"role": "dialog"}`), not the whole page. The default
+     scope is `#app-content`. Open menus, dialogs and listboxes render in React portals outside it and are always
+     appended as `portal [role=…]:` blocks, so click their items by role and name as usual.
    - Stay on the server under test. Other origins are blocked; add `allow_origins` only for assets the app really
      loads.
    - `expect` must hold at least one deterministic check: a DOM assertion (`visible`, `text` + `contains`,

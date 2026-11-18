@@ -41,8 +41,9 @@ class Suite:
 # ---------------------------------------------------------------- placing model-written test files
 
 def place(wt: Path, files: list[dict[str, str]], target_dirs: set[str]) -> list[Path]:
-    """Write hunter files into wt. Model output picks the paths, so only hunt_* test files inside a target dir pass."""
-    placed = []
+    """Write hunter files into wt, all or nothing. Model output picks the paths, so every path is validated before
+    anything is written (only hunt_* test files inside a target dir pass), and a failed write removes what was written."""
+    targets = []
     for f in files:
         rel = f["path"]
         if not HUNT_FILE.match(Path(rel).name) or str(Path(rel).parent) not in target_dirs:
@@ -50,8 +51,15 @@ def place(wt: Path, files: list[dict[str, str]], target_dirs: set[str]) -> list[
         p = under(wt, rel)
         if not p.parent.is_dir():
             raise CompileError(f"{p.parent} does not exist in this worktree")
-        p.write_text(f["content"])
-        placed.append(p)
+        targets.append((p, f["content"]))
+    placed: list[Path] = []
+    try:
+        for p, content in targets:
+            p.write_text(content)
+            placed.append(p)
+    except OSError:
+        unplace(placed)
+        raise
     return placed
 
 

@@ -1,0 +1,47 @@
+name: diff-bug-hunter
+
+# Separate from ci.yml, which this repo keeps install-free (see actions/shared/src/workflow-config.test.ts).
+on:
+  push:
+    branches: [main]
+    paths:
+      - packages/diff-bug-hunter/**
+      - .github/workflows/diff-bug-hunter.yml
+  pull_request:
+    paths:
+      - packages/diff-bug-hunter/**
+      - .github/workflows/diff-bug-hunter.yml
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    name: diff-bug-hunter self-test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+        with:
+          go-version: "1.24"
+          cache: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903  # v6.0.0
+        with:
+          node-version: "24"
+      - name: ci/install
+        run: |
+          python -m pip install pytest==9.1.1 ruff==0.16.9 mypy==2.3.1
+          make -C packages/diff-bug-hunter jest-deps verify-deps
+          cd packages/diff-bug-hunter/tests/verify_fixtures && npx playwright install --with-deps chromium
+      - name: ci/lint
+        run: make -C packages/diff-bug-hunter lint
+      # HUNT_REQUIRE_DEPS turns "dependency missing" skips into failures.
+      - name: ci/self-test
+        env:
+          HUNT_REQUIRE_DEPS: "1"
+        run: make -C packages/diff-bug-hunter self-test
