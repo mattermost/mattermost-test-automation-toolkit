@@ -67,7 +67,8 @@ plain Node decides the verdict.
   - Locators by role and accessible name first.
   - Same-origin only: other hosts are blocked and logged, and a `goto` that leaves the server is refused.
 - **API login:** `VERIFY_TOKEN`, or `VERIFY_USER` + `VERIFY_PASSWORD`, logs in through `/api/v4/` before the first step
-  (`MMAUTHTOKEN` / `MMUSERID` / `MMCSRF` cookies), so all 10 steps test the feature. Frozen specs embed the same login.
+  (password: the server's `MMAUTHTOKEN` / `MMUSERID` / `MMCSRF` cookies; token: a same-origin Bearer header, no cookie
+  session, so no CSRF and no realtime websocket), so all 10 steps test the feature. Frozen specs embed the same login.
 - **Text, not pixels:** `snapshot` prints a scoped `locator.ariaSnapshot()` (default `#app-content`). Menus, dialogs
   and listboxes rendered in React portals outside the scope are appended, so they are never hidden. The runner never
   takes screenshots.

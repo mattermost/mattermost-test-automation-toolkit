@@ -55,8 +55,8 @@ def place(wt: Path, files: list[dict[str, str]], target_dirs: set[str]) -> list[
     placed: list[Path] = []
     try:
         for p, content in targets:
+            placed.append(p)  # before writing: a write that fails halfway must be rolled back too
             p.write_text(content)
-            placed.append(p)
     except OSError:
         unplace(placed)
         raise

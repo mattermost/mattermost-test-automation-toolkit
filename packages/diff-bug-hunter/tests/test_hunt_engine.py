@@ -331,7 +331,10 @@ def test_reliability_rules_go_to_mode_a_only(monkeypatch):
 
 PAGES = {
     "/ok": """<html><body><main><h1>Fixture</h1><button onclick="save()">Save</button><ul id="l"></ul></main><script>
-async function save() { const r = await fetch('/api/v4/things', {method: 'POST'});
+async function save() {
+  // like the Mattermost webapp: echo the MMCSRF cookie in X-CSRF-Token on writes
+  const csrf = (document.cookie.match(/(?:^|; )MMCSRF=([^;]*)/) || [])[1] || '';
+  const r = await fetch('/api/v4/things', {method: 'POST', headers: {'X-CSRF-Token': csrf}});
   const li = document.createElement('li'); li.textContent = r.ok ? 'saved' : 'error';
   document.getElementById('l').appendChild(li); }</script></body></html>""",
     "/boom": """<html><body><main><button onclick="throw new Error('kaboom')">Boom</button></main></body></html>""",
@@ -356,6 +359,7 @@ function openMenu() {
 }
 
 TOKEN, USER_ID = "tok-123", "uid1"
+SEEN: list[tuple[str, str, str | None]] = []  # (Host, path, Authorization) of every request the fixture server saw
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -370,12 +374,28 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body.encode())
 
+    def _auth(self) -> str | None:
+        """Mattermost's order: the MMAUTHTOKEN cookie wins over the Authorization header. Cookie sessions need a
+        matching X-CSRF-Token on writes ("Appears to be a CSRF attempt")."""
+        cookies = dict(c.strip().split("=", 1) for c in (self.headers.get("Cookie") or "").split(";") if "=" in c)
+        if "MMAUTHTOKEN" in cookies:
+            if self.command != "GET" and self.headers.get("X-CSRF-Token") != cookies.get("MMCSRF"):
+                return None
+            return cookies["MMAUTHTOKEN"] if cookies["MMAUTHTOKEN"] == TOKEN else None
+        return TOKEN if self.headers.get("Authorization") == f"Bearer {TOKEN}" else None
+
     def do_GET(self):
-        if self.path in PAGES:
+        SEEN.append((self.headers.get("Host", ""), self.path, self.headers.get("Authorization")))
+        if self.path == "/xorigin":
+            port = self.server.server_address[1]
+            self._send(200, f'<html><body><main><p>x</p><script src="http://localhost:{port}/asset.js"></script></main></body></html>',
+                       "text/html")
+        elif self.path == "/asset.js":
+            self._send(200, "document.title = 'asset loaded';", "application/javascript")
+        elif self.path in PAGES:
             self._send(200, PAGES[self.path], "text/html")
         elif self.path == "/api/v4/users/me":
-            cookie, bearer = self.headers.get("Cookie") or "", self.headers.get("Authorization") or ""
-            authed = f"MMAUTHTOKEN={TOKEN}" in cookie or bearer == f"Bearer {TOKEN}"
+            authed = self._auth() is not None
             self._send(200 if authed else 401,
                        json.dumps({"id": USER_ID, "username": "tester"} if authed else {"id": "unauthorized"}))
         elif self.path == "/api/v4/broken":
@@ -403,7 +423,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"id": USER_ID, "username": "tester"}).encode())
         elif self.path == "/api/v4/things":
-            self._send(201, "{}")
+            SEEN.append((self.headers.get("Host", ""), self.path, self.headers.get("Authorization")))
+            self._send(201 if self._auth() else 401, "{}")
         else:
             self._send(404, "{}")
 
@@ -682,3 +703,43 @@ def test_git_commands_ignore_inherited_repository_variables(tmp_path, monkeypatc
     monkeypatch.setenv("GIT_DIR", str(outer / ".git"))
     monkeypatch.setenv("GIT_WORK_TREE", str(outer))
     assert hunt_common.git(inner, "rev-parse", "--show-toplevel") == str(inner.resolve())
+
+
+@needs_playwright
+def test_token_mode_keeps_the_bearer_on_the_server_and_writes_pass_csrf(tmp_path, ui_server):
+    SEEN.clear()
+    other = ui_server.replace("127.0.0.1", "localhost")  # same server, different origin
+    code, out = verify(tmp_path, {
+        "base_url": ui_server, "allow_origins": [other],
+        "steps": [{"goto": "/xorigin"}, {"goto": "/ok"}, {"click": {"role": "button", "name": "Save"}}],
+        "expect": [{"text": {"role": "list"}, "contains": "saved"}]}, auth="token")
+    assert code == 0 and "token auth as tester (Bearer header, same origin only)" in out, out
+    asset = [a for host, path, a in SEEN if path == "/asset.js"]
+    assert asset == [None], SEEN  # the other origin never sees the token
+    writes = [a for host, path, a in SEEN if path == "/api/v4/things"]
+    assert writes == [f"Bearer {TOKEN}"], SEEN  # header auth, so the write needs no CSRF token
+
+
+@needs_playwright
+def test_password_mode_writes_carry_the_csrf_cookie(tmp_path, ui_server):
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/ok"}, {"click": {"role": "button", "name": "Save"}}],
+                                  "expect": [{"text": {"role": "list"}, "contains": "saved"}]}, auth="password")
+    assert code == 0, out
+
+
+def test_place_rolls_back_a_file_that_failed_mid_write(tmp_path, monkeypatch):
+    wt = tmp_path / "wt"
+    (wt / "calc").mkdir(parents=True)
+    real_write = Path.write_text
+
+    def flaky_write(self, data, *args, **kwargs):
+        if self.name == "hunt_huntb_test.go":
+            real_write(self, data[:3], *args, **kwargs)  # partial file on disk, then the disk "fills up"
+            raise OSError("No space left on device")
+        return real_write(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", flaky_write)
+    files = [{"path": "calc/hunt_hunta_test.go", "content": "a"}, {"path": "calc/hunt_huntb_test.go", "content": "bbbbbb"}]
+    with pytest.raises(OSError):
+        run.place(wt, files, {"calc"})
+    assert not list(wt.rglob("*.go"))

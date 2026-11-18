@@ -11,7 +11,8 @@
 // --freeze writes a passing plan as a plain @playwright/test spec, so the check reruns in CI with no model at all.
 //
 // Auth (API, before the first step, so no step is spent on the login form):
-//   VERIFY_TOKEN                   session or personal access token: MMAUTHTOKEN + MMUSERID cookies and a Bearer header
+//   VERIFY_TOKEN                   session or personal access token: Bearer header (same origin only) + MMUSERID cookie;
+//                                  no cookie session, so no CSRF; the webapp's websocket stays unauthenticated
 //   VERIFY_USER + VERIFY_PASSWORD  POST /api/v4/users/login; the server sets MMAUTHTOKEN, MMUSERID and MMCSRF
 // Frozen specs embed the same apiLogin() and read the same variables.
 //
@@ -160,13 +161,20 @@ export async function apiLogin(context, base, env) {
             throw new Error(`VERIFY_TOKEN rejected by GET /api/v4/users/me: HTTP ${me.status()}`);
         }
         const user = await me.json();
-        await context.addCookies([
-            {name: 'MMAUTHTOKEN', value: env.VERIFY_TOKEN, url: base, httpOnly: true},
-            {name: 'MMUSERID', value: user.id, url: base},
-        ]);
-        // Header tokens skip the server's CSRF check, so no MMCSRF cookie is needed (or invented) in token mode.
-        await context.setExtraHTTPHeaders({Authorization: `Bearer ${env.VERIFY_TOKEN}`});
-        return `token auth as ${user.username}`;
+        // No MMAUTHTOKEN cookie: Mattermost reads that cookie before the Authorization header, and a cookie session
+        // gets CSRF checks on every non-GET request, which a bare token cannot satisfy. With the token only in the
+        // header the server authenticates by header and skips CSRF. MMUSERID tells the webapp it is signed in.
+        await context.addCookies([{name: 'MMUSERID', value: user.id, url: base}]);
+        // The token goes only to the server under test, never to another origin the page loads.
+        const origin = new URL(base).origin;
+        await context.route('**/*', (route) => {
+            const request = route.request();
+            if (new URL(request.url()).origin !== origin) {
+                return route.fallback();
+            }
+            return route.fallback({headers: {...request.headers(), authorization: `Bearer ${env.VERIFY_TOKEN}`}});
+        });
+        return `token auth as ${user.username} (Bearer header, same origin only)`;
     }
     const res = await context.request.post(new URL('/api/v4/users/login', base).toString(),
         {data: {login_id: env.VERIFY_USER, password: env.VERIFY_PASSWORD}, headers});
@@ -246,7 +254,8 @@ async function checkExpect(page, base, e) {
         const n = await locateAll(page, e.count).count();
         return n >= (e.min ?? 1) ? null : `count of ${JSON.stringify(e.count)} is ${n}, want >= ${e.min ?? 1}`;
     }
-    const res = await page.request.get(new URL(e.api.path, base).toString(), {headers: {'X-Requested-With': 'XMLHttpRequest'}});
+    const auth = process.env.VERIFY_TOKEN ? {Authorization: `Bearer ${process.env.VERIFY_TOKEN}`} : {};
+    const res = await page.request.get(new URL(e.api.path, base).toString(), {headers: {'X-Requested-With': 'XMLHttpRequest', ...auth}});
     if (res.status() >= 500) {
         return `GET ${e.api.path} returned ${res.status()}; a server error never satisfies an expectation`;
     }
@@ -407,7 +416,8 @@ export function freeze(plan, base, authed = false) {
         } else if (e.count) {
             lines.push(`await expect.poll(() => ${locatorCode(e.count)}.count()).toBeGreaterThanOrEqual(${e.min ?? 1});`);
         } else {
-            lines.push(`{`, `  const res = await page.request.get(new URL(${q(e.api.path)}, BASE).toString(), {headers: {'X-Requested-With': 'XMLHttpRequest'}});`,
+            lines.push(`{`, `  const auth = process.env.VERIFY_TOKEN ? {Authorization: \`Bearer \${process.env.VERIFY_TOKEN}\`} : {};`,
+                `  const res = await page.request.get(new URL(${q(e.api.path)}, BASE).toString(), {headers: {'X-Requested-With': 'XMLHttpRequest', ...auth}});`,
                 '  expect(res.status(), \'no server error\').toBeLessThan(500);', `  expect(res.status()).toBe(${e.api.status ?? 200});`);
             if (e.api.json_has) {
                 lines.push(`  expect(await res.json()).toMatchObject(${q(e.api.json_has)});`);
