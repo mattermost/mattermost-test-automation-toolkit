@@ -680,6 +680,11 @@ def test_changed_go_tests_include_edited_bodies_not_only_new_declarations():
     assert ctx.changed_go_tests(patch, head) == ["TestA"]
     helper_only = "@@ -3,1 +3,1 @@\n-func helper() int { return 0 }\n+func helper() int { return 1 }\n"
     assert ctx.changed_go_tests(helper_only, head) == []
+    # TestMain, receivers and benchmarks are not runnable by -run: never selected (Bugbot on 97b48b4)
+    other = ("package calc\n\nfunc TestMain(m *testing.M) {\n\tm.Run()\n}\n\n"
+             "func (s *suite) TestThing(t *testing.T) {\n\tx := 1\n}\n\nfunc TestReal(t *testing.T) {\n\ty := 1\n}\n")
+    edits = "@@ -4,1 +4,1 @@\n-\tm.Run() \n+\tm.Run()\n@@ -8,1 +8,1 @@\n-\tx := 0\n+\tx := 1\n@@ -12,1 +12,1 @@\n-\ty := 0\n+\ty := 1\n"
+    assert ctx.changed_go_tests(edits, other) == ["TestReal"]
 
 
 def test_go_package_exit_after_passing_tests_is_a_failure(tmp_path):

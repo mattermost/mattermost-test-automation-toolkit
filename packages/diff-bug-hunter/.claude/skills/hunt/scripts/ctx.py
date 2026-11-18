@@ -141,10 +141,12 @@ def changed_go_tests(patch: str, head_src: str) -> list[str]:
     lines = head_src.split("\n")
     decls = []  # (first line, last line, name); gofmt puts a top-level closing brace alone in column 0
     for i, line in enumerate(lines, 1):
-        m = re.match(r"func (?:\([^)]*\) )?(\w+)\(", line)
-        if m:
+        if line.startswith("func "):
             end = next((j for j in range(i, len(lines) + 1) if lines[j - 1].startswith("}")), len(lines))
-            decls.append((i, end, m.group(1)))
+            # Only what `go test -run` executes: top-level func TestX(t *testing.T). Not TestMain, benchmarks,
+            # helpers or methods whose names happen to start with Test.
+            m = re.match(r"func (Test(?:[A-Z_0-9]\w*)?)\(\w+ \*testing\.T\)", line)
+            decls.append((i, end, m.group(1) if m else ""))
     touched: set[int] = set()
     ln = 0
     for line in patch.splitlines():
@@ -160,7 +162,7 @@ def changed_go_tests(patch: str, head_src: str) -> list[str]:
             ln += 1
     names = set()
     for t in touched:
-        names |= {name for start, end, name in decls if start <= t <= end and re.match(r"Test[A-Z_0-9]", name)}
+        names |= {name for start, end, name in decls if name and start <= t <= end}
     return sorted(names)
 
 
