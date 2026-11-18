@@ -118,27 +118,24 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
   const judged = redOthers.filter(judgedOther);
   const otherReason = (l, wording) => redReason(l.status?.description, isRelease, pr, wording);
   const otherNamed = (wording, shownJudged, shownRed) => {
-    const restJudged = judged.slice(shownJudged);
-    const restRed = otherRed.length - shownRed;
-    const redNames = [otherRed.slice(0, shownRed).join(", "), restRed > 0 ? `${shownRed ? "+" : ""}${restRed}` : ""].filter(Boolean).join(" ");
+    const namedJudged = judged.filter((_, i) => shownJudged.includes(i));
+    const restJudged = judged.filter((_, i) => !shownJudged.includes(i));
+    const namedRed = otherRed.filter((_, i) => shownRed.includes(i));
+    const restRed = otherRed.length - namedRed.length;
+    const red2 = [namedRed.join(", "), restRed ? `${namedRed.length ? "+" : ""}${restRed}` : ""].filter(Boolean).join(" ");
     return [
-      ...judged.slice(0, shownJudged).map((l) => `${laneName(l.context)}: ${otherReason(l, wording)}`),
-      restJudged.length ? `${shownJudged ? "+" : ""}${restJudged.length} triaged red${rerunNote(restJudged.map((l) => otherReason(l, "none")))}` : "",
-      otherRed.length ? `not triaged: ${redNames} red` : ""
+      ...namedJudged.map((l) => `${laneName(l.context)}: ${otherReason(l, wording)}`),
+      restJudged.length ? `${namedJudged.length ? "+" : ""}${restJudged.length} triaged red${rerunNote(restJudged.map((l) => otherReason(l, "none")))}` : "",
+      otherRed.length ? `not triaged: ${red2} red` : ""
     ].filter(Boolean).join(" \xB7 ");
   };
-  const shownOthers = [];
-  for (const j of [2, 1, 0]) {
-    for (const r of [2, 1, 0]) {
-      const shown = [Math.min(j, judged.length), Math.min(r, otherRed.length)];
-      if (shown[0] + shown[1] > 0 && !shownOthers.some(([a, b]) => a === shown[0] && b === shown[1])) shownOthers.push(shown);
-    }
-  }
-  const withVerdicts = shownOthers.filter(([j]) => j > 0 || !judged.length);
+  const subsets = (n, k) => k === 0 ? [[]] : Array.from({ length: n }, (_, i) => i).flatMap((i) => subsets(n - i - 1, k - 1).map((rest) => [i, ...rest.map((j) => j + i + 1)]));
+  const choices = (n, min = 0) => [.../* @__PURE__ */ new Set([Math.min(2, n), Math.min(1, n), 0])].filter((k) => k >= min).flatMap((k) => subsets(n, k));
+  const judgedNamed = choices(judged.length, 1).flatMap((j) => choices(otherRed.length).map((r) => [j, r]));
   const otherSteps = [
-    ...withVerdicts.map((shown) => [shown, CLEARED_WORDINGS]),
-    ...withVerdicts.filter(([j]) => j > 0).map((shown) => [shown, ["action"]]),
-    ...shownOthers.filter(([j]) => j === 0 && judged.length).map((shown) => [shown, ["none"]])
+    ...judgedNamed.flatMap((shown) => [[shown, CLEARED_WORDINGS], [shown, ["action"]]]),
+    ...choices(otherRed.length, 1).map((r) => [[[], r], ["none"]]),
+    ...judged.length && otherRed.length ? [[[[], []], ["none"]]] : []
   ];
   const otherCount = judged.length ? `${judged.length + otherRed.length} other E2E check(s) red${rerunNote(judged.map((l) => otherReason(l, "none")))}` : `not triaged: ${otherRed.length} red`;
   const join = (...parts) => parts.filter(Boolean).join(" \xB7 ");
@@ -190,10 +187,11 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
       named("none", red.length)
     ];
     const fewer = [];
-    for (const wording of ["none", "action"]) {
-      for (let shown = red.length; shown > 0; shown--) fewer.push(named(wording, shown));
+    for (let shown = red.length; shown >= 0; shown--) {
+      for (const wording of ["none", "action"]) {
+        if (shown || wording === "action") fewer.push(join(named(wording, shown), clearedCount), named(wording, shown));
+      }
     }
-    fewer.push(named("action", 0));
     return { state: "failure", description: fit(texts, fewer) };
   }
   if (redOthers.length) {

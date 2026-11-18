@@ -156,33 +156,34 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], r
   const otherRed = redOthers.filter((l) => !judgedOther(l)).map((l) => laneName(l.context));
   const judged = redOthers.filter(judgedOther);
   const otherReason = (l: LaneStatus, wording: ClearedWording): string => redReason(l.status?.description, isRelease, pr, wording);
-  // The first `shownJudged` checks triage judged by name and verdict, the first `shownRed` it did not by name; the rest
-  // of each counted.
-  const otherNamed = (wording: ClearedWording, shownJudged: number, shownRed: number): string => {
-    const restJudged = judged.slice(shownJudged);
-    const restRed = otherRed.length - shownRed;
-    const redNames = [otherRed.slice(0, shownRed).join(", "), restRed > 0 ? `${shownRed ? "+" : ""}${restRed}` : ""].filter(Boolean).join(" ");
+  // The checks triage judged at `shownJudged` by name and verdict, the ones it did not at `shownRed` by name; the rest of
+  // each counted, with a re-run any of the counted ones asks for.
+  const otherNamed = (wording: ClearedWording, shownJudged: readonly number[], shownRed: readonly number[]): string => {
+    const namedJudged = judged.filter((_, i) => shownJudged.includes(i));
+    const restJudged = judged.filter((_, i) => !shownJudged.includes(i));
+    const namedRed = otherRed.filter((_, i) => shownRed.includes(i));
+    const restRed = otherRed.length - namedRed.length;
+    const red = [namedRed.join(", "), restRed ? `${namedRed.length ? "+" : ""}${restRed}` : ""].filter(Boolean).join(" ");
     return [
-      ...judged.slice(0, shownJudged).map((l) => `${laneName(l.context)}: ${otherReason(l, wording)}`),
-      restJudged.length ? `${shownJudged ? "+" : ""}${restJudged.length} triaged red${rerunNote(restJudged.map((l) => otherReason(l, "none")))}` : "",
-      otherRed.length ? `not triaged: ${redNames} red` : "",
+      ...namedJudged.map((l) => `${laneName(l.context)}: ${otherReason(l, wording)}`),
+      restJudged.length ? `${namedJudged.length ? "+" : ""}${restJudged.length} triaged red${rerunNote(restJudged.map((l) => otherReason(l, "none")))}` : "",
+      otherRed.length ? `not triaged: ${red} red` : "",
     ].filter(Boolean).join(" · ");
   };
-  // How many of each kind are named, most first: a judged check (its verdict says what to do) keeps its name longer than
-  // one triage did not judge. Each judged check named is tried with every cleared wording, then with only what a person
-  // has to do; only then are the judged checks all counted beside an untriaged name. Naming none is the count below.
-  const shownOthers: (readonly [number, number])[] = [];
-  for (const j of [2, 1, 0]) {
-    for (const r of [2, 1, 0]) {
-      const shown = [Math.min(j, judged.length), Math.min(r, otherRed.length)] as const;
-      if (shown[0] + shown[1] > 0 && !shownOthers.some(([a, b]) => a === shown[0] && b === shown[1])) shownOthers.push(shown);
-    }
-  }
-  const withVerdicts = shownOthers.filter(([j]) => j > 0 || !judged.length);
-  const otherSteps: (readonly [readonly [number, number], readonly ClearedWording[]])[] = [
-    ...withVerdicts.map((shown) => [shown, CLEARED_WORDINGS] as const),
-    ...withVerdicts.filter(([j]) => j > 0).map((shown) => [shown, ["action"]] as const),
-    ...shownOthers.filter(([j]) => j === 0 && judged.length).map((shown) => [shown, ["none"]] as const),
+  // Which of `n` checks to name, most first and in order among as many: two, then one, then (from `min`) none. Any of
+  // them may be named, so a long name does not keep a shorter one out.
+  const subsets = (n: number, k: number): number[][] =>
+    k === 0 ? [[]] : Array.from({ length: n }, (_, i) => i).flatMap((i) => subsets(n - i - 1, k - 1).map((rest) => [i, ...rest.map((j) => j + i + 1)]));
+  const choices = (n: number, min = 0): number[][] => [...new Set([Math.min(2, n), Math.min(1, n), 0])].filter((k) => k >= min).flatMap((k) => subsets(n, k));
+  // A judged check (its verdict says what to do) keeps its name longer than one triage did not judge: each choice of
+  // judged checks is tried with every cleared wording, then with only what a person has to do, before the next choice;
+  // then only untriaged ones are named; then each kind is counted on its own. Counting them together is the last resort.
+  type Shown = readonly [readonly number[], readonly number[]];
+  const judgedNamed: Shown[] = choices(judged.length, 1).flatMap((j) => choices(otherRed.length).map((r) => [j, r] as const));
+  const otherSteps: (readonly [Shown, readonly ClearedWording[]])[] = [
+    ...judgedNamed.flatMap((shown) => [[shown, CLEARED_WORDINGS] as const, [shown, ["action"]] as const]),
+    ...choices(otherRed.length, 1).map((r) => [[[], r], ["none"]] as const),
+    ...(judged.length && otherRed.length ? [[[[], []], ["none"]] as const] : []),
   ];
   const otherCount = judged.length
     ? `${judged.length + otherRed.length} other E2E check(s) red${rerunNote(judged.map((l) => otherReason(l, "none")))}`
@@ -249,12 +250,14 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], r
       join(named("none", red.length), clearedCount),
       named("none", red.length),
     ];
-    // Then the last red lanes are counted; then each lane says only what a person has to do; last, every lane is counted.
+    // Then each lane says only what a person has to do, then the last red lanes are counted, so a red lane's name goes
+    // last; the count of lanes triage cleared stays while it fits. Last, every lane is counted.
     const fewer: string[] = [];
-    for (const wording of ["none", "action"] as const) {
-      for (let shown = red.length; shown > 0; shown--) fewer.push(named(wording, shown));
+    for (let shown = red.length; shown >= 0; shown--) {
+      for (const wording of ["none", "action"] as const) {
+        if (shown || wording === "action") fewer.push(join(named(wording, shown), clearedCount), named(wording, shown));
+      }
     }
-    fewer.push(named("action", 0));
     return { state: "failure", description: fit(texts, fewer) };
   }
   if (redOthers.length) {

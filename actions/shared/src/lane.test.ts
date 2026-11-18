@@ -133,8 +133,8 @@ test("a summary with too many red lanes to fit counts the last ones, keeping the
   const reds = ["cypress-full/enterprise", "playwright-full/enterprise", "cypress-full/fips"].map((n) => lane(n, "(3 caused by PR, 2 needs investigation) 99.1% passed"));
   assert.deepEqual(laneSummary(reds), {
     state: "failure",
-    description: "cypress-full/enterprise: 3 caused by PR, 2 machine failures, re-run · +2 more lane(s) red, re-run",
-  });
+    description: "cypress-full/enterprise: 2 machine failures, re-run · playwright-full/enterprise: 2 machine failures, re-run · +1 more lane(s) red, re-run",
+  }, "a lane says only what a person has to do before another lane's name gives way");
   const caused = ["cypress-full/enterprise", "playwright-full/enterprise", "cypress-full/fips"].map((n) => lane(n, "(3 caused by PR, 2 app bug, 1 broken on branch) 99.1% passed"));
   assert.equal(laneSummary(caused, [], true).description,
     "cypress-full/enterprise: 3 caused by PR, 2 app bug, 1 broken on branch · +2 more lane(s) red", "no re-run is asked for when none of them asks");
@@ -246,4 +246,11 @@ test("a summary that would pass 140 characters keeps every re-run instruction an
     [l("fips/upgrade-11.11", "failure", "(1 machine failure) 50% passed"), l("playwright-full/enterprise/upgrade-from-release-11.10-to-the-current-head-of-master", "failure", "99.8% passed, 2 failed")]).description,
   "Triage is checking: waiting for maestro-ios, detox-ios · fips/upgrade-11.11: 1 machine failure, re-run · not triaged: 1 red",
   "a judged check keeps its name while one triage did not judge is counted");
+  const longJudged = "playwright-full/enterprise/upgrade-from-release-11.10-to-the-current-head-of-master";
+  const running = [l("maestro-ios", "pending", "running"), l("detox-ios", "pending", "running")];
+  assert.equal(laneSummary(running, [l(longJudged, "failure", "(2 app bug) 50% passed"), l("fips/upgrade-11.11", "failure", "(1 machine failure) 50% passed"), l("upgrade-raw", "failure", "99% passed")]).description,
+    "Triage is checking: waiting for 2 lane(s) · fips/upgrade-11.11: 1 machine failure, re-run · +1 triaged red · not triaged: upgrade-raw red",
+    "a shorter judged check is named when the first one's name does not fit");
+  assert.equal(laneSummary(running, [l(longJudged, "failure", "(1 machine failure) 50% passed"), l(`${longJudged}-fips`, "failure", "99% passed")]).description,
+    "Triage is checking: waiting for maestro-ios, detox-ios · 1 triaged red, re-run · not triaged: 1 red", "each kind is counted on its own before they are counted together");
 });
