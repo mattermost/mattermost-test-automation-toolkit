@@ -4,25 +4,33 @@
 """Steps 4-5: run hunter tests, vet on the merge-base, score mutants. Go and Jest adapters.
 
 usage: run.py run <pr> <A|B|A2>        3 runs on unmodified PR head (Go with -race); writes run_<tag>.json
-       run.py base <pr> <A|B|A2>       same tests once on the merge-base worktree; writes base_<tag>.json
+       run.py base <pr> <A|B|A2>       the same tests once on the merge-base worktree; writes base_<tag>.json
        run.py mutants <pr> <A|A2|PR>   compile-check then score every mutant (M, then held-back M2); writes mutants_<tag>.json
-Exit codes: 0 ok, 2 INFRA_ERROR (0 tests executed, dead DB, missing tool), 3 COMPILE_ERROR in hunter tests (repair round).
+Run these one at a time (they share the PR worktrees; a lock enforces it). Long runs belong in the background.
+Exit codes: 0 ok, 2 INFRA_ERROR (0 tests executed, dirty worktree, dead DB, missing tool),
+3 COMPILE_ERROR in hunter tests (repair round).
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from hunt_common import InfraError, hunt_dir, load_json, node_env, read_state, sh, under, write_json
+from hunt_common import InfraError, git, hunt_dir, load_json, node_env, read_state, sh, under, write_json
 
 HUNT_FILE = re.compile(r"^(hunt_hunt[a-z0-9]+_test\.go|hunt_[a-z0-9]+\.test\.tsx?)$")
 RESULT_GO = re.compile(r"^\s*--- (PASS|FAIL|SKIP): (\S+)", re.M)
+PACKAGE_FAILED = "(package failed)"
+# A failure on the merge-base that only says the code under test does not exist there.
+MISSING_ON_BASE = re.compile(r"is not a function|is not defined|is not a constructor|Cannot find module|"
+                             r"Cannot read propert(?:y|ies) of undefined|undefined is not", re.I)
 
 
 class CompileError(RuntimeError):
@@ -36,8 +44,26 @@ class Suite:
     jest_files: list[str] = field(default_factory=list)
     jest_prefix: str = ""
 
+    def empty(self) -> bool:
+        return not self.go_patterns and not self.jest_files
 
-# ---------------------------------------------------------------- placing model-written test files
+
+@dataclass
+class Outcome:
+    results: dict[str, str] = field(default_factory=dict)   # identity -> PASS | FAIL | SKIP
+    messages: dict[str, str] = field(default_factory=dict)  # identity -> first line of the failure (Jest)
+    log: str = ""
+
+
+# ---------------------------------------------------------------- worktree hygiene
+
+def ensure_clean(wt: Path) -> None:
+    """Refuse to run on a worktree with leftovers (an interrupted mutant, stray hunt files): results would be wrong."""
+    status = git(wt, "status", "--porcelain", "--untracked-files=all")
+    dirty = [line for line in status.splitlines() if "node_modules" not in line and "go.work" not in line]
+    if dirty:
+        raise InfraError(f"{wt} has leftover changes ({'; '.join(dirty[:5])}); rerun prepare.py to reset it")
+
 
 def place(wt: Path, files: list[dict[str, str]], target_dirs: set[str]) -> list[Path]:
     """Write hunter files into wt, all or nothing. Model output picks the paths, so every path is validated before
@@ -99,9 +125,7 @@ def go_root(wt: Path, d: str) -> Path:
     raise InfraError(f"no go.mod above {d}")
 
 
-def go_run(wt: Path, patterns: dict[str, str], race: bool) -> tuple[dict[str, str], str]:
-    res: dict[str, str] = {}
-    outs = []
+def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome) -> None:
     for d, pattern in sorted(patterns.items()):
         root = go_root(wt, d)
         pkg = "./" + os.path.relpath(wt / d, root)
@@ -113,14 +137,18 @@ def go_run(wt: Path, patterns: dict[str, str], race: bool) -> tuple[dict[str, st
         if not got:
             if "[build failed]" in out or "[setup failed]" in out:
                 raise CompileError(f"{pkg}:\n{out[-2500:]}")
-            raise InfraError(f"0 tests executed in {pkg} (exit {p.returncode}):\n{out[-2500:]}")
-        if p.returncode != 0 and "FAIL" not in got.values():
+            if p.returncode != 0 and ("=== RUN" in out or "panic:" in out or "test timed out" in out):
+                # A test started and the binary died before any result line (panic in a goroutine, timeout):
+                # that is a test failure, not an environment problem.
+                got = {f"{d}::{PACKAGE_FAILED}": "FAIL"}
+            else:
+                raise InfraError(f"0 tests executed in {pkg} (exit {p.returncode}):\n{out[-2500:]}")
+        elif p.returncode != 0 and "FAIL" not in got.values():
             # e.g. TestMain teardown, a race report or a panic after the last test: the package failed even though no
             # test line says so. Record it instead of reporting PASS.
-            got[f"{d}::(package failed)"] = "FAIL"
-        res.update(got)
-        outs.append(out)
-    return res, "\n".join(outs)
+            got[f"{d}::{PACKAGE_FAILED}"] = "FAIL"
+        into.results.update(got)
+        into.log += out
 
 
 def go_compiles(wt: Path, file: str) -> str | None:
@@ -141,9 +169,8 @@ def jest_root(wt: Path, rel: str) -> Path:
     raise InfraError(f"no jest.config above {rel}")
 
 
-def jest_run(wt: Path, files: list[str], prefix: str) -> tuple[dict[str, str], str]:
-    res: dict[str, str] = {}
-    msgs: list[str] = []
+def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
+    found = 0
     for rel in files:
         root = jest_root(wt, rel)
         with tempfile.TemporaryDirectory() as td:
@@ -159,14 +186,18 @@ def jest_run(wt: Path, files: list[str], prefix: str) -> tuple[dict[str, str], s
                     raise CompileError(f"{rel}:\n{f['message'][-2500:]}")
                 raise InfraError(f"0 tests executed in {rel}")
             for a in f["assertionResults"]:
-                if not prefix or a["title"].startswith(prefix):
-                    # file + full name: equal titles in two describe blocks or files never overwrite each other
-                    key = f"{rel}::{a.get('fullName') or a['title']}"
-                    res[key] = {"passed": "PASS", "failed": "FAIL"}.get(a["status"], "SKIP")
-                    msgs += a.get("failureMessages") or []
-    if files and not res:
+                if prefix and not a["title"].startswith(prefix):
+                    continue
+                found += 1
+                # file + full name: equal titles in two describe blocks or files never overwrite each other
+                key = f"{rel}::{a.get('fullName') or a['title']}"
+                into.results[key] = {"passed": "PASS", "failed": "FAIL"}.get(a["status"], "SKIP")
+                failures = a.get("failureMessages") or []
+                if failures:
+                    into.messages[key] = failures[0].strip().splitlines()[0] if failures[0].strip() else ""
+                    into.log += "\n".join(failures) + "\n"
+    if files and not found:
         raise InfraError(f"0 tests matching {prefix!r} executed in {files}")
-    return res, "\n".join(msgs)
 
 
 def jest_compiles(wt: Path, file: str) -> str | None:
@@ -178,20 +209,15 @@ def jest_compiles(wt: Path, file: str) -> str | None:
 
 # ---------------------------------------------------------------- suite level
 
-def run_suite(wt: Path, s: Suite, race: bool) -> tuple[dict[str, str], str]:
-    res: dict[str, str] = {}
-    out = ""
-    if s.go_patterns:
-        r, o = go_run(wt, s.go_patterns, race)
-        res.update(r)
-        out += o
-    if s.jest_files:
-        r, o = jest_run(wt, s.jest_files, s.jest_prefix)
-        res.update(r)
-        out += o
-    if not res:
+def run_suite(wt: Path, s: Suite, race: bool) -> Outcome:
+    if s.empty():
         raise InfraError("suite is empty: no Go packages or Jest files to run")
-    return res, out
+    o = Outcome()
+    if s.go_patterns:
+        go_run(wt, s.go_patterns, race, o)
+    if s.jest_files:
+        jest_run(wt, s.jest_files, s.jest_prefix, o)
+    return o
 
 
 def compiles(wt: Path, file: str) -> str | None:
@@ -203,39 +229,66 @@ def classify(statuses: list[str]) -> str:
         return "PASS"
     if all(x == "FAIL" for x in statuses):
         return "FAIL_3_OF_3"
+    if all(x == "SKIP" for x in statuses):
+        return "SKIP"
     return "FLAKY"
 
 
 def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[str, Any]:
     wt = Path(state["wt"])
+    ensure_clean(wt)
     files = load_json(hdir / tag / "response.json")["files"]
-    placed = place(wt, files, {t["dir"] for t in state["targets"]})
+    if not files:  # e.g. a Mode B hunter for a PR whose description promises nothing testable
+        write_json(hdir / f"run_{tag}.json", {})
+        return {}
+    placed: list[Path] = []
+    outcomes = []
     try:
-        results = []
-        log = []
+        placed = place(wt, files, {t["dir"] for t in state["targets"]})
         for _ in range(runs):
-            r, out = run_suite(wt, suite_for(tag, state, placed, wt), race=True)
-            results.append(r)
-            log.append(out)
+            outcomes.append(run_suite(wt, suite_for(tag, state, placed, wt), race=True))
     finally:
         unplace(placed)
-    names = sorted(set().union(*results))
-    table = {n: classify([r.get(n, "MISSING") for r in results]) for n in names}
+    names = sorted(set().union(*(o.results for o in outcomes)))
+    table = {n: classify([o.results.get(n, "MISSING") for o in outcomes]) for n in names}
     write_json(hdir / f"run_{tag}.json", table)
-    (hdir / f"run_{tag}.log").write_text("\n\n=== run ===\n".join(log))
+    write_json(hdir / f"run_{tag}.messages.json", outcomes[0].messages)
+    (hdir / f"run_{tag}.log").write_text("\n\n=== run ===\n".join(o.log for o in outcomes))
     return table
 
 
+def base_verdict(name: str, base_status: str, head: dict[str, str], head_msgs: dict[str, str], base_msg: str) -> str:
+    """Only a test that failed 3/3 on head gets a bug verdict; anything else is labelled as not a failure."""
+    if head and head.get(name) != "FAIL_3_OF_3":
+        return "NOT_A_HEAD_FAILURE"
+    if base_status == "PASS":
+        return "NEW_PR_BUG"
+    if base_status != "FAIL":
+        return base_status
+    if MISSING_ON_BASE.search(base_msg):
+        # Jest (Babel, no type check) loads a test of a function the PR adds; on base it fails as "not a function".
+        return "BASE_UNCOMPILABLE"
+    if name in head_msgs and head_msgs[name] != base_msg:
+        return "BASE_FAILS_DIFFERENTLY"  # decide from the diff, as for BASE_UNCOMPILABLE
+    return "PRE_EXISTING"
+
+
 def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, str]:
-    """PASS on base -> the failure is new in the PR. FAIL on base -> pre-existing. BASE_UNCOMPILABLE -> decide from diff."""
+    """NEW_PR_BUG: failed 3/3 on head, passes on base. PRE_EXISTING: fails the same way on base.
+    BASE_UNCOMPILABLE / BASE_FAILS_DIFFERENTLY: decide from the diff. NOT_A_HEAD_FAILURE: nothing to vet."""
     wt = Path(state["wt_base"])
+    ensure_clean(wt)
     files = load_json(hdir / tag / "response.json")["files"]
+    head = load_json(hdir / f"run_{tag}.json") if (hdir / f"run_{tag}.json").exists() else {}
+    head_msgs = (load_json(hdir / f"run_{tag}.messages.json")
+                 if (hdir / f"run_{tag}.messages.json").exists() else {})
     out: dict[str, str] = {}
     placed: list[Path] = []
     try:
-        placed = place(wt, files, {t["dir"] for t in state["targets"]})
-        r, _ = run_suite(wt, suite_for(tag, state, placed, wt), race=True)
-        out = {n: {"PASS": "NEW_PR_BUG", "FAIL": "PRE_EXISTING"}.get(s, s) for n, s in r.items()}
+        if files:
+            placed = place(wt, files, {t["dir"] for t in state["targets"]})
+            o = run_suite(wt, suite_for(tag, state, placed, wt), race=True)
+            out = {n: base_verdict(n, s, head, head_msgs, o.messages.get(n, "")) for n, s in o.results.items()}
     except CompileError as e:
         out = {"*": "BASE_UNCOMPILABLE", "detail": str(e)[-800:]}
     finally:
@@ -255,71 +308,101 @@ def all_mutants(hdir: Path) -> list[dict[str, Any]]:
     return ms
 
 
+def is_kill(name: str, status: str, base: dict[str, str]) -> bool:
+    # A "(package failed)" key exists only when a package failed; its absence in the baseline means the package
+    # passed there, so a mutant that newly breaks teardown still counts as a kill.
+    default = "PASS" if name.endswith(f"::{PACKAGE_FAILED}") else None
+    return status == "FAIL" and base.get(name, default) == "PASS"
+
+
+def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: dict[str, str],
+                 m: dict[str, Any]) -> dict[str, Any]:
+    v: dict[str, Any] = {"id": m["id"], "held_back": m["held_back"], "file": m["file"],
+                         "what_breaks": m["what_breaks"], "killers": [], "mutant": m}
+    if m["file"] not in state["changed"]:
+        return {**v, "verdict": "INVALID", "detail": "file is not a hunted production file"}
+    path = under(wt, m["file"])
+    orig = path.read_text()
+    if orig.count(m["old"]) != 1:
+        return {**v, "verdict": "INVALID", "detail": f"`old` occurs {orig.count(m['old'])} times"}
+    try:
+        path.write_text(orig.replace(m["old"], m["new"], 1))
+        err = compiles(wt, m["file"])
+        if err:
+            return {**v, "verdict": "NEEDS_REGENERATION", "detail": err}
+        try:
+            r = run_suite(wt, suite, race=False).results
+        except CompileError as e:
+            return {**v, "verdict": "NEEDS_REGENERATION", "detail": str(e)[-1500:]}
+        except InfraError as e:  # one mutant's environment failure must not lose every other verdict
+            return {**v, "verdict": "ERROR", "detail": str(e)[-1500:]}
+        killers = sorted(n for n, s in r.items() if is_kill(n, s, base))
+        return {**v, "verdict": "KILLED" if killers else "SURVIVED", "killers": killers}
+    finally:
+        path.write_text(orig)
+
+
 def cmd_mutants(hdir: Path, state: dict[str, Any], tag: str) -> list[dict[str, Any]]:
     wt = Path(state["wt"])
-    placed = [] if tag == "PR" else place(wt, load_json(hdir / tag / "response.json")["files"],
-                                          {t["dir"] for t in state["targets"]})
+    ensure_clean(wt)
+    files = [] if tag == "PR" else load_json(hdir / tag / "response.json")["files"]
+    placed: list[Path] = []
     verdicts = []
     try:
+        placed = place(wt, files, {t["dir"] for t in state["targets"]})
         suite = suite_for(tag, state, placed, wt)
-        base, _ = run_suite(wt, suite, race=False)
-        for m in all_mutants(hdir):
-            v: dict[str, Any] = {"id": m["id"], "held_back": m["held_back"], "file": m["file"],
-                                 "what_breaks": m["what_breaks"], "killers": [], "mutant": m}
-            if m["file"] not in state["changed"]:
-                verdicts.append({**v, "verdict": "INVALID", "detail": "file is not a hunted production file"})
-                continue
-            path = under(wt, m["file"])
-            orig = path.read_text()
-            if orig.count(m["old"]) != 1:
-                verdicts.append({**v, "verdict": "INVALID", "detail": f"`old` occurs {orig.count(m['old'])} times"})
-                continue
-            try:
-                path.write_text(orig.replace(m["old"], m["new"], 1))
-                err = compiles(wt, m["file"])
-                if err:
-                    verdicts.append({**v, "verdict": "NEEDS_REGENERATION", "detail": err})
-                    continue
-                try:
-                    r, _ = run_suite(wt, suite, race=False)
-                except CompileError as e:
-                    verdicts.append({**v, "verdict": "NEEDS_REGENERATION", "detail": str(e)[-1500:]})
-                    continue
-                # A "(package failed)" key exists only when a package failed; its absence in the baseline means the
-                # package passed there, so a mutant that newly breaks teardown still counts as a kill.
-                killers = sorted(n for n, s in r.items() if s == "FAIL" and base.get(
-                    n, "PASS" if n.endswith("::(package failed)") else None) == "PASS")
-                verdicts.append({**v, "verdict": "KILLED" if killers else "SURVIVED", "killers": killers})
-            finally:
-                path.write_text(orig)
+        if suite.empty():  # the PR (or the hunter) has no tests in the hunted packages: nothing can kill a mutant
+            verdicts = [{"id": m["id"], "held_back": m["held_back"], "file": m["file"], "what_breaks": m["what_breaks"],
+                         "killers": [], "mutant": m, "verdict": "SURVIVED", "detail": "no tests to score"}
+                        for m in all_mutants(hdir)]
+        else:
+            base = run_suite(wt, suite, race=False).results
+            verdicts = [score_mutant(wt, state, suite, base, m) for m in all_mutants(hdir)]
     finally:
         unplace(placed)
     write_json(hdir / f"mutants_{tag}.json", verdicts)
     return verdicts
 
 
+def _terminate(signum: int, _frame: Any) -> None:
+    # SIGTERM / SIGHUP (a tool timeout, a closed terminal) unwind through the finally blocks, so a mutated file is
+    # restored and hunt files are removed instead of being left in the worktree.
+    raise SystemExit(128 + signum)
+
+
 def main(argv: list[str]) -> int:
+    if len(argv) != 4 or argv[1] not in ("run", "base", "mutants"):
+        print(__doc__)
+        return 1
     cmd, pr, tag = argv[1], argv[2], argv[3]
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _terminate)
     hdir = hunt_dir(pr)
-    state = read_state(hdir)
     try:
-        if cmd == "run":
-            for n, c in cmd_run(hdir, state, tag).items():
-                print(f"[{tag}] {n}: {c}")
-        elif cmd == "base":
-            for n, c in cmd_base(hdir, state, tag).items():
-                print(f"[{tag} @merge-base] {n}: {c if n != 'detail' else c[:300]}")
-        elif cmd == "mutants":
-            for v in cmd_mutants(hdir, state, tag):
-                extra = v["killers"] or v.get("detail", "")[:160]
-                print(f"{v['id']}{' (held back)' if v['held_back'] else ''}: {v['verdict']} {extra}")
-        else:
-            print(__doc__)
-            return 1
+        state = read_state(hdir)
+        with (hdir / ".lock").open("w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as e:
+                raise InfraError(f"another run.py is using the worktrees of PR {pr}; run them one at a time") from e
+            if cmd == "run":
+                table = cmd_run(hdir, state, tag)
+                for n, c in table.items():
+                    print(f"[{tag}] {n}: {c}")
+                if not table:
+                    print(f"[{tag}] no tests in the hunter response")
+            elif cmd == "base":
+                for n, c in cmd_base(hdir, state, tag).items():
+                    print(f"[{tag} @merge-base] {n}: {c if n != 'detail' else c[:300]}")
+            else:
+                for v in cmd_mutants(hdir, state, tag):
+                    extra = v["killers"] or v.get("detail", "")[:160]
+                    print(f"{v['id']}{' (held back)' if v['held_back'] else ''}: {v['verdict']} {extra}")
     except InfraError as e:
         print(f"INFRA_ERROR {e}")
         return 2
     except CompileError as e:
+        (hdir / f"compile_{tag}.log").write_text(str(e))  # input for `build_requests.py <pr> repair <tag>`
         print(f"COMPILE_ERROR {e}")
         return 3
     return 0

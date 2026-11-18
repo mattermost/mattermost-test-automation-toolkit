@@ -8,6 +8,8 @@ usage: build_requests.py <pr> hunters            -> A/, B/
        build_requests.py <pr> heldout            -> M2/ (2 held-back faults; needs M/response.json)
        build_requests.py <pr> strengthen <ids>   -> A2/ (needs A/response.json; ids = surviving mutants, e.g. M1,M3)
        build_requests.py <pr> regen <id>         -> R_<id>/ (one mutant that did not compile, with the compiler error)
+       build_requests.py <pr> repair <tag>       -> <tag>/request.repair.json (hunter files that did not compile, with
+                                                   compile_<tag>.log; the old response is kept as response.prev.json)
 Each request is {tier, system, user, schema, response_path}; dispatch it with ../dispatch.md, one fresh agent each.
 """
 from __future__ import annotations
@@ -88,11 +90,28 @@ def main(pr: str, what: str, arg: str = "") -> None:
                 "surviving_faults": [m["what_breaks"] for m in planted if m["id"] in survivors]}
         print(write(hdir, "A2", hunter_system("A", state, ctx) + prompt("strengthen"), user, HUNTER_SCHEMA))
     elif what == "regen":
-        verdicts = json.loads((hdir / "mutants_A.json").read_text())
-        bad = next(v for v in verdicts if v["id"] == arg)
+        bad = next((v for f in sorted(hdir.glob("mutants_*.json")) for v in json.loads(f.read_text())
+                    if v["id"] == arg and v["verdict"] == "NEEDS_REGENERATION"), None)
+        if bad is None:
+            sys.exit(f"no NEEDS_REGENERATION verdict for {arg} in {hdir}/mutants_*.json")
         user = {**mutant_user(ctx), "previous_attempt": bad["mutant"], "compiler_error": bad["detail"]}
         system = mutant_system(state, 1, arg, " Fix the previous attempt so it compiles and keeps its intent.")
         print(write(hdir, f"R_{arg}", system, user, MUTANT_SCHEMA))
+    elif what == "repair":
+        tag = arg
+        log = hdir / f"compile_{tag}.log"
+        if not log.exists():
+            sys.exit(f"{log} missing: run.py run {pr} {tag} must have reported COMPILE_ERROR")
+        prev = hdir / tag / "response.json"
+        kept = hdir / tag / "response.prev.json"
+        kept.write_text(prev.read_text())
+        user = {**hunter_user(tag, ctx), "your_previous_files": load_json(kept)["files"],
+                "compiler_error": log.read_text()[-4000:]}
+        system = hunter_system(tag[0], state, ctx) + prompt("repair")
+        req = {"tier": "opus", "system": system, "user": json.dumps(user, indent=1), "schema": HUNTER_SCHEMA,
+               "response_path": str(prev)}
+        write_json(hdir / tag / "request.repair.json", req)
+        print(hdir / tag / "request.repair.json")
     else:
         sys.exit(__doc__)
 

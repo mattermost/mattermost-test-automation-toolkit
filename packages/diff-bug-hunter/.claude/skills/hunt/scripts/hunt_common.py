@@ -75,7 +75,12 @@ def sh(args: list[str], cwd: Path, *, check: bool = True, timeout: int = 1800,
 
 
 def git(repo: Path, *args: str, check: bool = True) -> str:
-    return sh(["git", *args], repo, check=check).stdout.strip()
+    return sh(git_cmd(*args), repo, check=check).stdout.strip()
+
+
+def git_cmd(*args: str) -> list[str]:
+    """git argv with non-ASCII paths printed verbatim (core.quotePath would quote and octal-escape them)."""
+    return ["git", "-c", "core.quotePath=false", *args]
 
 
 def load_json(path: Path) -> Any:
@@ -84,7 +89,9 @@ def load_json(path: Path) -> Any:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        return json.loads(re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", raw))
+        # Keep valid escapes (including an escaped backslash) and double every other lone backslash.
+        return json.loads(re.sub(r'\\(["\\/bfnrt]|u[0-9a-fA-F]{4})|\\',
+                                 lambda m: m.group(0) if m.group(1) else "\\\\", raw))
 
 
 def write_json(path: Path, data: Any) -> None:

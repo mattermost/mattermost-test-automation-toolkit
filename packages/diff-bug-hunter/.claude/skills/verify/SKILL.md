@@ -24,17 +24,17 @@ request or read screenshots.
    - Add a `snapshot` step scoped to the region you need (e.g. `{"role": "dialog"}`), not the whole page. The default
      scope is `#app-content`. Open menus, dialogs and listboxes render in React portals outside it and are always
      appended as `portal [role=…]:` blocks, so click their items by role and name as usual.
-   - Stay on the server under test. Other origins are blocked; add `allow_origins` only for assets the app really
-     loads.
+   - Stay on the server under test. Other origins are blocked, and a redirect, navigation or websocket to one fails
+     the run; add `allow_origins` only for assets the app really loads.
    - `expect` must hold at least one deterministic check: a DOM assertion (`visible`, `text` + `contains`,
      `count` + `min`) or an `/api/v4/` read (`api.path`, `status`, `json_has`). Choose checks that would fail if
      the change were broken.
 3. **Run:** `node <this dir>/scripts/verify_ui.mjs plan.json` from a directory where `require("playwright")` resolves
    (e.g. `mattermost/e2e-tests/playwright`), or with `NODE_PATH` pointing at a `node_modules` that has it.
    - Exit 0 `PASS`.
-   - Exit 1 `FAIL`: an assertion failed, the page threw (`pageerror`), or an `/api/v4/` call returned >= 500. Each one
-     fails automatically.
-   - Exit 2: `INVALID_PLAN` or `INFRA_ERROR`.
+   - Exit 1 `FAIL`: an assertion failed, the page threw (`pageerror`), an `/api/v4/` call returned >= 500, a request
+     was still running at the settle deadline, or the page left the allowed origins. Each one fails automatically.
+   - Exit 2: `INVALID_PLAN` (fix the plan) or `INFRA_ERROR` (fix the environment; never report it as a finding).
    - Add `--freeze <name>.spec.ts` once the plan passes. It writes a plain `@playwright/test` spec with the same
      oracle, which reruns in CI with no model and no tokens. Offer it to the user; do not commit it unasked.
 4. **Iterate:** on `FAIL`, read the failure snapshot and fix the plan only when the plan was wrong (wrong name, wrong

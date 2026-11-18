@@ -37,8 +37,9 @@ import reliability  # noqa: E402
 import run  # noqa: E402
 import trusted  # noqa: E402
 
+# Fixture repos ignore the developer's git config (signing, hooks, templates) and inherited repository locations.
 GIT_ENV = {**hunt_common.git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
-           "GIT_COMMITTER_EMAIL": "t@t"}
+           "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -268,7 +269,7 @@ def test_rules_come_from_base_branch_not_pr_head(tmp_path, monkeypatch):
     base_lessons = trusted.read("lessons.jsonl", skill)
     assert "Setup(t) stale client config" in base_lessons
     assert len(reliability.parse(trusted.read("RELIABILITY.md", skill))) == 10
-    with pytest.raises(trusted.InfraError, match="lessons.jsonl"):
+    with pytest.raises(trusted.InfraError, match="RELIABILITY.md"):
         trusted.check(skill)
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
     assert trusted.read("lessons.jsonl", skill) == ""  # explicit rule-editing mode reads the disk
@@ -339,6 +340,11 @@ async function save() {
   document.getElementById('l').appendChild(li); }</script></body></html>""",
     "/boom": """<html><body><main><button onclick="throw new Error('kaboom')">Boom</button></main></body></html>""",
     "/fail500": """<html><body><main><button onclick="fetch('/api/v4/broken')">Break</button></main></body></html>""",
+    "/droppage": """<html><body><main><p>d</p></main><script>fetch('/api/v4/drop').catch(() => {});</script></body></html>""",
+    "/late500": """<html><body><main><p id="s">wait</p></main><script>
+setTimeout(() => { document.getElementById('s').textContent = 'done'; fetch('/api/v4/slow500'); }, 400);</script></body></html>""",
+    "/xfetch": """<html><body><main><p>x</p></main><script>
+fetch('http://localhost:' + location.port + '/api/v4/users/me').catch(() => {});</script></body></html>""",
     "/redirpage": """<html><body><main><p>r</p></main><script>fetch('/redir').catch(() => {});</script></body></html>""",
     "/slow": """<html><body><main><button onclick="fetch('/api/v4/slow')">Slow</button></main></body></html>""",
     "/external": """<html><body><main><p>ok</p><script src="http://blocked.invalid/x.js"></script></main></body></html>""",
@@ -391,6 +397,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             port = self.server.server_address[1]
             self._send(200, f'<html><body><main><p>x</p><script src="http://localhost:{port}/asset.js"></script></main></body></html>',
                        "text/html")
+        elif self.path == "/api/v4/drop":
+            self.close_connection = True
+            self.connection.shutdown(2)  # hang up without a response
+        elif self.path == "/api/v4/slow500":
+            import time
+            time.sleep(0.3)
+            self._send(500, '{"id": "late"}')
+        elif self.path == "/off":
+            port = self.server.server_address[1]
+            self._send(302, "", "text/plain", headers={"Location": f"http://localhost:{port}/landing"})
+        elif self.path == "/landing":
+            self._send(200, "<html><body><main><p>landing</p></main></body></html>", "text/html")
         elif self.path == "/redir":
             port = self.server.server_address[1]
             self._send(302, "", "text/plain", headers={"Location": f"http://localhost:{port}/asset.js"})
@@ -437,8 +455,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 def ui_server():
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    yield f"http://127.0.0.1:{srv.server_address[1]}"
-    srv.shutdown()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def _node_env(auth: str = "password") -> dict[str, str]:
@@ -456,7 +477,9 @@ def _node_env(auth: str = "password") -> dict[str, str]:
 
 def _playwright_available() -> bool:
     try:
-        p = subprocess.run(["node", "-e", "require('playwright')"], env=_node_env(), capture_output=True, check=False)
+        # the library and a browser build that matches it (make verify-deps installs only the library)
+        check = "const fs = require('fs'); process.exit(fs.existsSync(require('playwright').chromium.executablePath()) ? 0 : 1)"
+        p = subprocess.run(["node", "-e", check], env=_node_env(), capture_output=True, check=False)
     except FileNotFoundError:  # no node at all: optional /verify tests skip (HUNT_REQUIRE_DEPS makes them fail)
         return False
     return p.returncode == 0
@@ -469,7 +492,10 @@ needs_playwright = pytest.mark.skipif(not REQUIRE_DEPS and not _playwright_avail
 
 def verify(tmp: Path, plan: dict, *extra: str, auth: str = "password", env: dict | None = None) -> tuple[int, str]:
     (tmp / "plan.json").write_text(json.dumps(plan))
-    p = subprocess.run(["node", str(VERIFY_UI), "plan.json", *extra], cwd=tmp, env={**_node_env(auth), **(env or {})},
+    # credentials only go to VERIFY_BASE_URL, so point it at the plan's server unless a test says otherwise
+    target = {"VERIFY_BASE_URL": plan["base_url"]} if "base_url" in plan else {}
+    p = subprocess.run(["node", str(VERIFY_UI), "plan.json", *extra], cwd=tmp,
+                       env={**_node_env(auth), **target, **(env or {})},
                        capture_output=True,
                        text=True, timeout=120, check=False)
     assert not list(tmp.rglob("*.png")), "verify_ui must never write screenshots"
@@ -511,7 +537,7 @@ def test_verify_fails_on_wrong_expectation_with_scoped_snapshot(tmp_path, ui_ser
 def test_verify_rejects_bad_plans(tmp_path, ui_server):
     eleven = [{"goto": "/ok"}] * 11
     for plan, msg in [({"steps": eleven, "expect": [{"visible": {"role": "main"}}]}, "MAX_STEPS is 10"),
-                      ({"steps": [{"screenshot": "x.png"}], "expect": [{"visible": {"role": "main"}}]}, "unknown action"),
+                      ({"steps": [{"screenshot": "x.png"}], "expect": [{"visible": {"role": "main"}}]}, "needs exactly one of goto"),
                       ({"steps": [{"goto": "/ok"}]}, "at least one deterministic"),
                       ({"steps": [], "expect": [{"api": {"path": "/etc/passwd"}}]}, "must start with /api/v4/")]:
         code, out = verify(tmp_path, {"base_url": ui_server, **plan})
@@ -561,7 +587,7 @@ def test_install_skill_links_both_skills_and_refuses_to_clobber(tmp_path):
     target.mkdir()
     _git(target, "init", "-q")
     script = ROOT / "scripts" / "install-skill.sh"
-    p = subprocess.run(["bash", str(script), str(target)], capture_output=True, text=True, check=False)
+    p = subprocess.run(["bash", str(script), str(target)], capture_output=True, text=True, check=False, env=GIT_ENV)
     assert p.returncode == 0, p.stdout + p.stderr
     for name in ("hunt", "verify"):
         link = target / ".claude" / "skills" / name
@@ -570,12 +596,33 @@ def test_install_skill_links_both_skills_and_refuses_to_clobber(tmp_path):
     assert "/.claude/skills/hunt" in exclude and "/.claude/skills/verify" in exclude
     assert _git(target, "status", "--porcelain") == ""  # symlinks are local-only
     p = subprocess.run(["bash", str(script), "--copy", "--skill", "verify", str(target)], capture_output=True, text=True,
-                       check=False)
+                       check=False, env=GIT_ENV)
     assert p.returncode == 1 and "--force" in p.stderr
     p = subprocess.run(["bash", str(script), "--copy", "--force", "--skill", "verify", str(target)], capture_output=True,
-                       text=True, check=False)
+                       text=True, check=False, env=GIT_ENV)
     copied = target / ".claude" / "skills" / "verify"
     assert p.returncode == 0 and not copied.is_symlink() and (copied / "scripts" / "verify_ui.mjs").exists()
+    # the vendored copy is no longer git-ignored, and re-running the same copy is a no-op
+    assert ".claude/" in _git(target, "status", "--porcelain", "--untracked-files=all")
+    p = subprocess.run(["bash", str(script), "--copy", "--skill", "verify", str(target)], capture_output=True, text=True,
+                       check=False, env=GIT_ENV)
+    assert p.returncode == 0 and "identical copy" in p.stdout, p.stdout + p.stderr
+    # link mode restores a missing exclude entry on re-run
+    (target / ".git" / "info" / "exclude").write_text("")
+    p = subprocess.run(["bash", str(script), "--skill", "hunt", str(target)], capture_output=True, text=True,
+                       check=False, env=GIT_ENV)
+    assert p.returncode == 0 and "/.claude/skills/hunt" in (target / ".git" / "info" / "exclude").read_text()
+
+
+def test_install_skill_reports_failures_instead_of_success(tmp_path):
+    target = tmp_path / "target"
+    (target / ".claude").mkdir(parents=True)
+    _git(target, "init", "-q")
+    (target / ".claude" / "skills").write_text("not a directory")
+    script = ROOT / "scripts" / "install-skill.sh"
+    for args in ([str(target)], ["--copy", str(target)]):
+        p = subprocess.run(["bash", str(script), *args], capture_output=True, text=True, check=False, env=GIT_ENV)
+        assert p.returncode == 1 and "install failed" in p.stderr and "start Claude Code" not in p.stdout, p.stdout
 
 
 @needs_playwright
@@ -598,7 +645,7 @@ def test_frozen_spec_reuses_the_api_login_with_only_a_token(tmp_path, ui_server)
     code, out = verify(tmp_path, plan, "--freeze", "frozen.spec.ts", auth="password")
     assert code == 0, out
     spec = (tmp_path / "frozen.spec.ts").read_text()
-    assert "async function apiLogin(context, base, env)" in spec and "await apiLogin(page.context(), BASE, process.env)" in spec
+    assert "async function apiLogin(context, base, env)" in spec and "await apiLogin(context, BASE, process.env)" in spec
     assert "getByLabel(" not in spec and ".fill(" not in spec  # no login form steps
     (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
     cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
@@ -666,7 +713,7 @@ def test_place_writes_nothing_when_any_path_is_rejected(tmp_path):
 def test_verify_never_passes_on_server_errors_or_unsettled_requests(tmp_path, ui_server):
     code, out = verify(tmp_path, {"base_url": ui_server, "steps": [],
                                   "expect": [{"api": {"path": "/api/v4/broken", "status": 500}}]})
-    assert code == 2 and "expects a server error" in out, out
+    assert code == 2 and "a server error always fails" in out, out
     code, out = verify(tmp_path, {"base_url": ui_server, "steps": [],
                                   "expect": [{"api": {"path": "/api/v4/broken", "status": 200}}]})
     assert code == 1 and "returned 500; a server error never satisfies" in out, out
@@ -783,3 +830,235 @@ def test_mutant_that_only_breaks_package_teardown_is_killed(tmp_path):
     (hdir / "M2" / "response.json").unlink()
     v = run.cmd_mutants(hdir, state, "A")
     assert v[0]["verdict"] == "KILLED" and v[0]["killers"] == ["calc::(package failed)"], v
+
+
+
+def test_lessons_only_edit_does_not_block_the_trust_gate(tmp_path, monkeypatch):
+    monkeypatch.delenv("HUNT_TRUSTED_REF", raising=False)
+    repo, skill = _skill_repo(tmp_path)
+    _git(repo, "checkout", "-q", "main")
+    with (skill / "lessons.jsonl").open("a") as fh:  # what `lessons.py add` does
+        fh.write(json.dumps({"pattern": "new"}) + "\n")
+    assert "trusted ref" in trusted.check(skill)
+    assert '"new"' not in trusted.read("lessons.jsonl", skill)  # hunters still get the base copy
+
+
+# ------------------------------------------------------------------ runner robustness (self-review)
+
+def test_go_panic_before_any_result_line_is_a_failure_not_infra(tmp_path):
+    hdir, state = make_hunt(tmp_path, "clean")
+    panics = ("package calc\n\nimport \"testing\"\n\nfunc TestHuntB_Boom(t *testing.T) {\n"
+              "\tdone := make(chan bool)\n\tgo func() { panic(\"boom\") }()\n\t<-done\n}\n")
+    (hdir / "B").mkdir()
+    (hdir / "B" / "response.json").write_text(json.dumps({"files": [{"path": "calc/hunt_huntb_test.go", "content": panics}]}))
+    assert run.cmd_run(hdir, state, "B", runs=1) == {"calc::(package failed)": "FAIL_3_OF_3"}
+
+
+def test_runner_refuses_a_dirty_worktree_and_prepare_cleans_it(tmp_path):
+    hdir, state = make_hunt(tmp_path, "clean")
+    wt = Path(state["wt"])
+    (wt / "calc" / "percent.go").write_text("package calc\n")  # an interrupted mutant
+    with pytest.raises(run.InfraError, match="leftover changes"):
+        run.cmd_run(hdir, state, "A", runs=1)
+    prepare.worktrees(Path(state["repo"]), "feature", "master", wt, Path(state["wt_base"]))
+    assert "return part * 100 / total" in (wt / "calc" / "percent.go").read_text()
+    assert set(run.cmd_run(hdir, state, "A", runs=1).values()) == {"PASS"}
+
+
+def test_empty_hunter_response_and_pr_without_tests_are_not_infra_errors(tmp_path):
+    hdir, state = make_hunt(tmp_path, "clean")
+    (hdir / "B").mkdir()
+    (hdir / "B" / "response.json").write_text(json.dumps({"files": []}))
+    assert run.cmd_run(hdir, state, "B") == {}
+    state["own_tests"] = {"go": [], "go_by_dir": {}, "jest": []}
+    v = run.cmd_mutants(hdir, state, "PR")
+    assert {m["verdict"] for m in v} == {"SURVIVED"} and v[0]["detail"] == "no tests to score"
+
+
+def test_base_verdicts_only_for_head_failures_and_missing_symbols():
+    head = {"x::T1": "FAIL_3_OF_3", "x::T2": "PASS", "x::T3": "FAIL_3_OF_3", "x::T4": "FAIL_3_OF_3"}
+    msgs = {"x::T3": "Error: expect(received).toBe(expected)", "x::T4": "Error: boom"}
+    assert run.base_verdict("x::T1", "PASS", head, msgs, "") == "NEW_PR_BUG"
+    assert run.base_verdict("x::T2", "PASS", head, msgs, "") == "NOT_A_HEAD_FAILURE"
+    assert run.base_verdict("x::T3", "FAIL", head, msgs, "TypeError: (0 , _x.newHelper) is not a function") == "BASE_UNCOMPILABLE"
+    assert run.base_verdict("x::T3", "FAIL", head, msgs, msgs["x::T3"]) == "PRE_EXISTING"
+    assert run.base_verdict("x::T4", "FAIL", head, msgs, "Error: other") == "BASE_FAILS_DIFFERENTLY"
+    assert run.classify(["SKIP"] * 3) == "SKIP"
+
+
+def test_a_second_runner_on_the_same_pr_is_refused(tmp_path, monkeypatch):
+    import fcntl
+    hdir = tmp_path / "hunt1"
+    hdir.mkdir()
+    (hdir / "state.json").write_text("{}")
+    monkeypatch.setattr(run, "hunt_dir", lambda pr: hdir)
+    with (hdir / ".lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert run.main(["run.py", "run", "1", "A"]) == 2
+
+
+def test_load_json_repairs_lone_backslashes_but_keeps_valid_escapes(tmp_path):
+    p = tmp_path / "r.json"
+    p.write_text(r'{"a": "x\d y\\s \n \u00e9"}')
+    assert hunt_common.load_json(p) == {"a": "x\\d y\\s \n é"}
+
+
+def test_go_test_selection_handles_one_line_bodies_and_any_testing_qualifier():
+    head = ("package calc\n\nfunc TestA(t *testing.T) {}\n\nfunc helper() {\n\tx := 1\n}\n\n"
+            "func TestB(*testing.T) {\n\ty := 1\n}\n\nfunc TestC(t *tt.T) {\n\tz := 1\n}\n")
+    helper_edit = "@@ -6,1 +6,1 @@\n-\tx := 0\n+\tx := 1\n"
+    assert ctx.changed_go_tests(helper_edit, head) == []  # the one-line TestA does not swallow helper()
+    body_edits = "@@ -10,1 +10,1 @@\n-\ty := 0\n+\ty := 1\n@@ -14,1 +14,1 @@\n-\tz := 0\n+\tz := 1\n"
+    assert ctx.changed_go_tests(body_edits, head) == ["TestB", "TestC"]
+
+
+def test_non_ascii_paths_are_not_quoted(tmp_path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "café.go").write_text("package x\n")
+    _git(repo, "add", "-A")
+    assert hunt_common.git(repo, "diff", "--cached", "--name-only") == "café.go"
+
+
+def test_regen_and_repair_requests(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    hdir, state = make_hunt(tmp_path, "clean")
+    monkeypatch.setattr(build_requests, "hunt_dir", lambda pr: hdir)
+    run.cmd_mutants(hdir, state, "A")  # writes mutants_A.json, where M2 does not compile
+    build_requests.main("1", "regen", "M2")
+    req = json.loads((hdir / "R_M2" / "request.json").read_text())
+    assert "totl" in req["user"]
+    (hdir / "compile_A.log").write_text("calc/hunt_hunta_test.go:3: undefined: Nope")
+    build_requests.main("1", "repair", "A")
+    rep = json.loads((hdir / "A" / "request.repair.json").read_text())
+    assert rep["response_path"].endswith("A/response.json") and "undefined: Nope" in rep["user"]
+    assert (hdir / "A" / "response.prev.json").exists()
+
+
+
+# ------------------------------------------------------------------ /verify hardening (self-review)
+
+def _module(expr: str) -> str:
+    """Evaluate an expression against verify_ui.mjs's exports in a fresh node (no browser)."""
+    code = f"import(process.env.VERIFY_UI_MODULE).then((m) => console.log(JSON.stringify({expr})))"
+    p = subprocess.run(["node", "-e", code], env={**_node_env("none"), "VERIFY_UI_MODULE": str(VERIFY_UI)},
+                       capture_output=True, text=True, check=True)
+    return p.stdout.strip()
+
+
+@needs_playwright
+def test_verify_strict_plan_validation_exits_2(tmp_path, ui_server):
+    bad = [
+        ({"steps": [None], "expect": [{"visible": {"role": "main"}}]}, "step 1 must be an object"),
+        ({"base_url": "localhost:18765", "steps": [], "expect": [{"visible": {"role": "main"}}]}, "must be http or https"),
+        ({"steps": [], "allow_origins": ["cdn.example.com"], "expect": [{"visible": {"role": "main"}}]}, "not an absolute URL"),
+        ({"steps": [], "expect": [{"visible": {"rol": "button"}}]}, "locator needs exactly one of"),
+        ({"steps": [], "expect": [{"visible": {"role": "button", "nmae": "Save"}}]}, "unknown locator key(s) nmae"),
+        ({"steps": [], "expect": [{"visible": {"role": ""}}]}, "role must be a non-empty string"),
+        ({"steps": [{"goto": "/ok", "click": {"role": "button"}}], "expect": [{"visible": {"role": "main"}}]}, "needs exactly one of"),
+        ({"steps": [], "expect": [{"text": {"role": "main"}}]}, 'needs a non-empty "contains"'),
+        ({"steps": [], "expect": [{"count": {"role": "button"}, "min": 0}]}, "min must be an integer >= 1"),
+        ({"steps": [], "expect": [{"visible": {"role": "main", "nth": "1"}}]}, "nth must be an integer"),
+        ({"steps": [{"goto": "javascript:alert(1)"}], "expect": [{"visible": {"role": "main"}}]}, "leaves"),
+        ({"steps": [{"goto": "//evil.example/x"}], "expect": [{"visible": {"role": "main"}}]}, "leaves"),
+        ({"steps": [], "expect": [{"visible": {"role": "main"}}], "extra": 1}, "unknown plan key(s) extra"),
+    ]
+    for plan, msg in bad:
+        code, out = verify(tmp_path, {"base_url": ui_server, **plan} if "base_url" not in plan else plan, auth="none")
+        assert code == 2 and "INVALID_PLAN" in out and msg in out, (plan, out)
+
+
+@needs_playwright
+def test_verify_credentials_only_go_to_the_configured_server(tmp_path, ui_server):
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [], "expect": [{"visible": {"role": "main"}}]},
+                       env={"VERIFY_BASE_URL": "http://127.0.0.1:9"})
+    assert code == 2 and "credentials only go to VERIFY_BASE_URL" in out, out
+
+
+@needs_playwright
+def test_verify_infra_errors_exit_2(tmp_path, ui_server):
+    plan = {"base_url": ui_server, "steps": [{"goto": "/ok"}], "expect": [{"visible": {"role": "main"}}]}
+    code, out = verify(tmp_path, plan, auth="none", env={"VERIFY_SETTLE_MS": "abc"})
+    assert code == 2 and "VERIFY_SETTLE_MS must be a positive number" in out, out
+    code, out = verify(tmp_path, plan, "--freeze", "/nonexistent/dir/x.spec.ts", auth="none")
+    assert code == 2 and "INFRA_ERROR cannot write /nonexistent/dir/x.spec.ts" in out and "VERDICT: PASS" not in out, out
+
+
+@needs_playwright
+def test_verify_fails_on_events_after_the_last_check(tmp_path, ui_server):
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/late500"}],
+                                  "expect": [{"text": {"css": "#s"}, "contains": "done"}]}, auth="none")
+    assert code == 1 and "after the checks: HTTP 500 from GET /api/v4/slow500" in out, out
+
+
+@needs_playwright
+def test_verify_fails_when_a_redirect_leaves_the_allowed_origins(tmp_path, ui_server):
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/off"}],
+                                  "expect": [{"visible": {"role": "main"}}]}, auth="none")
+    assert code == 1 and "redirected to a non-allowed origin" in out, out
+
+
+@needs_playwright
+def test_verify_blocked_origins_are_logged_on_fail_too(tmp_path, ui_server):
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/external"}],
+                                  "expect": [{"text": {"role": "main"}, "contains": "nope"}]}, auth="none")
+    assert code == 1 and "blocked other origins: http://blocked.invalid" in out, out
+
+
+@needs_playwright
+def test_token_route_survives_a_dropped_connection_without_leaking_the_token(tmp_path, ui_server):
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/droppage"}],
+                                  "expect": [{"visible": {"role": "main"}}]}, auth="token")
+    assert "VERDICT:" in out and TOKEN not in out and code in (0, 1), out
+
+
+@needs_playwright
+def test_frozen_spec_keeps_errors_free_of_the_token(tmp_path, ui_server):
+    plan = {"base_url": ui_server, "login": True, "steps": [{"goto": "/whoami"}],
+            "expect": [{"api": {"path": "/api/v4/users/me", "json_has": {"username": "tester"}}}]}
+    code, out = verify(tmp_path, plan, "--freeze", "frozen.spec.ts", auth="token")
+    assert code == 0, out
+    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
+    cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
+    env = {**_node_env("token"), "VERIFY_BASE_URL": "http://127.0.0.1:9"}  # nothing listens there
+    p = subprocess.run(["node", str(cli), "test", "frozen.spec.ts", "--reporter=line"], cwd=tmp_path, env=env,
+                       capture_output=True, text=True, timeout=180, check=False)
+    assert p.returncode != 0 and "ECONNREFUSED" in p.stdout + p.stderr and TOKEN not in p.stdout + p.stderr
+
+
+@needs_playwright
+def test_frozen_spec_type_checks_strictly(tmp_path, ui_server):
+    plan = {"name": "typed", "base_url": ui_server, "login": True, "allow_origins": [ui_server.replace("127.0.0.1", "localhost")],
+            "steps": [{"goto": "/ok"}, {"click": {"role": "button", "name": "Save"}}],
+            "expect": [{"visible": {"text": "saved", "nth": 0}}, {"text": {"role": "list"}, "contains": "saved"},
+                       {"count": {"role": "listitem"}, "min": 1},
+                       {"api": {"path": "/api/v4/users/me", "status": 200, "json_has": {"username": "tester"}}}]}
+    code, out = verify(tmp_path, plan, "--freeze", "typed.spec.ts", auth="token")
+    assert code == 0, out
+    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
+    (tmp_path / "tsconfig.json").write_text(json.dumps({"compilerOptions": {
+        "strict": True, "noEmit": True, "target": "es2022", "module": "esnext", "moduleResolution": "bundler",
+        "types": ["node"], "skipLibCheck": True}, "files": ["typed.spec.ts"]}))
+    p = subprocess.run(["node", str(VERIFY_DEPS / "typescript" / "bin" / "tsc"), "-p", "."], cwd=tmp_path,
+                       env=_node_env("none"), capture_output=True, text=True, timeout=180, check=False)
+    assert p.returncode == 0, p.stdout + p.stderr
+
+
+def test_json_has_matches_like_to_match_object():
+    assert _module("[m.subset({roles: ['a']}, {roles: ['a', 'b']}), m.subset({a: {b: 1}}, {a: {b: 1, c: 2}}),"
+                   " m.subset({x: [1]}, {x: [1]}), m.subset({x: null}, {x: null}), m.subset({x: 1}, {x: '1'})]") == \
+        "[false,true,true,true,false]"
+
+
+
+@needs_playwright
+def test_token_is_not_added_to_api_calls_on_other_allowed_origins(tmp_path, ui_server):
+    SEEN.clear()
+    other = ui_server.replace("127.0.0.1", "localhost")  # allowed, same server, different origin
+    code, out = verify(tmp_path, {"base_url": ui_server, "allow_origins": [other], "steps": [{"goto": "/xfetch"}],
+                                  "expect": [{"visible": {"role": "main"}}]}, auth="token")
+    assert code == 0, out
+    cross = [a for host, path, a in SEEN if host.startswith("localhost") and path == "/api/v4/users/me"]
+    same = [a for host, path, a in SEEN if host.startswith("127.0.0.1") and path == "/api/v4/users/me"]
+    assert cross == [None] and same and all(a == f"Bearer {TOKEN}" for a in same), SEEN

@@ -10,6 +10,7 @@ environment failure.
 """
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -32,9 +33,10 @@ def worktrees(repo: Path, head_ref: str, base_ref: str, wt: Path, wt_base: Path)
     mb = git(repo, "merge-base", head_ref, base_ref)
     for path, ref in ((wt, head_ref), (wt_base, mb)):
         if path.exists():
-            git(path, "checkout", "-q", "--detach", ref)
+            # Discard leftovers (an interrupted mutant, hunt files) before switching, or checkout refuses.
             git(path, "reset", "-q", "--hard")
             git(path, "clean", "-qfd", "-e", "node_modules", "-e", "go.work*")
+            git(path, "checkout", "-q", "-f", "--detach", ref)
         else:
             git(repo, "worktree", "add", "-q", "--detach", str(path), ref)
     return mb
@@ -76,10 +78,12 @@ def link_node_modules(mm: Path, wts: list[Path]) -> None:
 def main(pr: str) -> None:
     mm = mm_clone()
     ensure_clone(mm)
-    git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", "+master:refs/remotes/origin/master")
+    # The PR's own base branch (release-* cherry-picks are common), not always master.
+    base = json.loads(sh(["gh", "api", f"repos/{REPO}/pulls/{pr}"], Path(".")).stdout)["base"]["ref"]
+    git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", f"+{base}:refs/remotes/origin/{base}")
     wt, wt_base = scratch() / f"wt{pr}", scratch() / f"wt{pr}.base"
-    mb = worktrees(mm, f"pr-{pr}", "origin/master", wt, wt_base)
-    changed = git(mm, "diff", "--name-only", mb, f"pr-{pr}").splitlines()
+    mb = worktrees(mm, f"pr-{pr}", f"origin/{base}", wt, wt_base)
+    changed = git(mm, "diff", "--name-only", "--no-renames", mb, f"pr-{pr}").splitlines()
     go_changed = any(f.startswith("server/") and f.endswith(".go") for f in changed)
     web_changed = any(f.startswith("webapp/") for f in changed)
     if go_changed:
@@ -90,8 +94,9 @@ def main(pr: str) -> None:
     if web_changed:
         link_node_modules(mm, [wt, wt_base])
     write_json(hunt_dir(pr) / "prepare.json", {"pr": pr, "repo": str(mm), "wt": str(wt), "wt_base": str(wt_base),
-                                              "head": git(mm, "rev-parse", f"pr-{pr}"), "merge_base": mb})
-    print(f"ready: head {wt}  base {wt_base}  merge-base {mb[:10]}  go={go_changed} webapp={web_changed}")
+                                              "head": git(mm, "rev-parse", f"pr-{pr}"), "merge_base": mb,
+                                              "base_ref": base})
+    print(f"ready: head {wt}  base {wt_base} ({base} @ {mb[:10]})  go={go_changed} webapp={web_changed}")
 
 
 if __name__ == "__main__":

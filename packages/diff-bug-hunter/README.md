@@ -60,25 +60,30 @@ locally, `scripts/start_pg.sh` starts a throwaway cluster.
 
 ## /verify
 
-`scripts/verify_ui.mjs` runs a JSON plan against `MM_URL` (default `http://localhost:8065`). Claude writes the plan;
-plain Node decides the verdict.
+`scripts/verify_ui.mjs` runs a JSON plan against the plan's `base_url`, else `VERIFY_BASE_URL`, else `MM_URL`, else
+`http://localhost:8065`. With credentials set, a plan's `base_url` must match `VERIFY_BASE_URL` / `MM_URL`, so
+credentials never go to a host the plan chose. Claude writes the plan; plain Node decides the verdict. Plans are
+validated strictly (one action per step, one locator kind, known keys only) before a browser starts.
 
 - **Bounded:**
   - At most `MAX_STEPS = 10` steps of `goto`/`click`/`fill`/`press`/`select`/`check`/`wait_for`/`snapshot`.
   - Locators by role and accessible name first.
-  - Same-origin only: other hosts are blocked and logged, and a `goto` that leaves the server is refused.
+  - Allowed origins only (`base_url` plus `allow_origins`): other hosts are blocked and logged, a `goto` that leaves
+    the server is refused, and a redirect, navigation or websocket that reaches another host fails the run.
 - **API login:** `VERIFY_TOKEN`, or `VERIFY_USER` + `VERIFY_PASSWORD`, logs in through `/api/v4/` before the first step
   (password: the server's `MMAUTHTOKEN` / `MMUSERID` / `MMCSRF` cookies; token: a same-origin Bearer header, no cookie
   session, so no CSRF and no realtime websocket), so all 10 steps test the feature. Frozen specs embed the same login.
 - **Text, not pixels:** `snapshot` prints a scoped `locator.ariaSnapshot()` (default `#app-content`). Menus, dialogs
   and listboxes rendered in React portals outside the scope are appended, so they are never hidden. The runner never
   takes screenshots.
-- **Automatic failures:** any `pageerror`, or any `/api/v4/` response >= 500, fails the run. Each step waits until
-  in-flight requests settle, so a late 500 is not missed.
+- **Automatic failures:** any `pageerror`, any `/api/v4/` response >= 500, or a request still running at the settle
+  deadline (`VERIFY_SETTLE_MS`, default 10 s) fails the run. Every step and the end of the run wait until in-flight
+  requests settle, so a late 500 is not missed. Exit codes: 0 PASS, 1 FAIL, 2 INVALID_PLAN / INFRA_ERROR.
 - **Deterministic oracle:** `expect` must hold at least one DOM check (`visible`, `text` + `contains`,
   `count` + `min`) or an `/api/v4/` read (`status`, `json_has`).
-- **Freeze:** `--freeze out.spec.ts` turns a passing plan into a `@playwright/test` spec with the same oracle, so the
-  check reruns in CI with no model.
+- **Freeze:** `--freeze out.spec.ts` turns a passing plan into a `@playwright/test` spec with the same oracle (allowed
+  origins, settling, viewport, timeouts, `json_has` matching), so the check reruns in CI with no model. It reads
+  `VERIFY_BASE_URL` / `MM_URL` first, so one frozen spec can target another server, and it passes `tsc --strict`.
 
 ```bash
 VERIFY_USER=sysadmin VERIFY_PASSWORD=... node .claude/skills/verify/scripts/verify_ui.mjs plan.json --freeze save.spec.ts
@@ -96,6 +101,7 @@ Run it where `require("playwright")` resolves (e.g. `mattermost/e2e-tests/playwr
   ```bash
   cd e2e-tests/playwright && npm run tc:up      # SERVER_IMAGE=mattermostdevelopment/mattermost-enterprise-edition:<tag> for a PR/release build
   export VERIFY_BASE_URL=http://localhost:8055  # tc:up publishes Mattermost on the fixed host port 8055
+  export VERIFY_PASSWORD='choose-a-strong-one'
   # tc:up starts a fresh server with no users; on a fresh server the first user created becomes system admin:
   curl -sf -X POST "$VERIFY_BASE_URL/api/v4/users" -H 'Content-Type: application/json' \
     -d '{"email":"admin@example.com","username":"sysadmin","password":"'"$VERIFY_PASSWORD"'"}'
@@ -129,8 +135,17 @@ Webapp PRs need `npm ci` once in `$HUNT_MM/webapp`; the skill links that `node_m
 
 ## CI integration
 
-Package self-test (runs in this repository's `.github/workflows/diff-bug-hunter.yml` when `packages/diff-bug-hunter/` changes; it needs a Chromium
-from `npx playwright install chromium`):
+Package self-test (runs in this repository's `.github/workflows/diff-bug-hunter.yml` when `packages/diff-bug-hunter/`
+changes). The /verify tests need the Chromium build that matches the pinned Playwright, installed from the fixture
+directory:
+
+```bash
+make -C packages/diff-bug-hunter jest-deps verify-deps
+```
+
+```bash
+cd packages/diff-bug-hunter/tests/verify_fixtures && npx playwright install chromium
+```
 
 ```bash
 make -C packages/diff-bug-hunter self-test lint

@@ -19,13 +19,13 @@ import os
 import sys
 from pathlib import Path
 
-from hunt_common import SKILL_DIR, InfraError, sh
+from hunt_common import SKILL_DIR, InfraError, git_cmd, sh
 
 WORKTREE = "worktree"
 
 
 def _git(root: Path, *args: str, check: bool = True) -> tuple[int, str]:
-    p = sh(["git", *args], root, check=check)
+    p = sh(git_cmd(*args), root, check=check)
     return p.returncode, p.stdout.strip()
 
 
@@ -68,7 +68,7 @@ def read(name: str, skill_dir: Path = SKILL_DIR) -> str:
     code, _ = _git(root, "cat-file", "-e", f"{ref}:{rel}", check=False)
     if code != 0:
         raise InfraError(f"{rel} is not on the trusted ref {ref[:12]}; rules must land on the base branch first")
-    return sh(["git", "show", f"{ref}:{rel}"], root).stdout
+    return sh(git_cmd("show", f"{ref}:{rel}"), root).stdout
 
 
 def check(skill_dir: Path = SKILL_DIR) -> str:
@@ -84,7 +84,10 @@ def check(skill_dir: Path = SKILL_DIR) -> str:
     ref = trusted_ref(root)
     code, changed = _git(root, "diff", "--name-only", ref, "--", rel, check=False)
     _, untracked = _git(root, "ls-files", "--others", "--exclude-standard", "--", rel, check=False)
-    dirty = [f for f in (changed.splitlines() + untracked.splitlines()) if f and "__pycache__" not in f]
+    # lessons.jsonl may hold lessons added since the base (lessons.py add appends there); read() takes the trusted
+    # copy anyway, so an edited working copy cannot change what hunters see and must not block hunting.
+    dirty = [f for f in (changed.splitlines() + untracked.splitlines())
+             if f and "__pycache__" not in f and not f.endswith("/lessons.jsonl")]
     if code != 0:
         raise InfraError(f"{rel} is not on the trusted ref {ref[:12]}; the skill must land on the base branch first")
     if dirty:
