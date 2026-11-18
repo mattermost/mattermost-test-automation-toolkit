@@ -61,6 +61,15 @@ test("the red reason still reads the wording a status written before the labels 
   assert.equal(redReason(undefined), "still red");
 });
 
+test("a run with no PR names what is broken on main, and the rest it did not cause against the commit, not a PR", () => {
+  assert.equal(redReason("(1 broken on main) 85.7% passed (6 passed, 1 failed, 1 skipped)", false, false), "1 broken on main");
+  assert.equal(redReason("(2 broken on main, 3 flaky) 50.0% passed (5 passed, 5 failed, 0 skipped)", false, false), "2 broken on main, 3 not caused by this commit");
+  assert.equal(redReason("(2 broken on main, 3 flaky) 50.0% passed (5 passed, 5 failed, 0 skipped)"), "5 not caused by PR", "a PR's broken on main is cleared with the rest");
+  const lane = (context: string, state: string, description: string) => ({ context, status: { state, description } as never });
+  assert.deepEqual(laneSummary([lane("e2e-test/maestro-ios", "failure", "(1 broken on main) 85.7% passed (6 passed, 1 failed, 1 skipped)")], [], false, false),
+    { state: "failure", description: "maestro-ios: 1 broken on main" });
+});
+
 test("a lane summary reads red lanes by their labels and old wording alike, and names the lanes cleared by triage", () => {
   assert.deepEqual(lanes({
     "e2e-test/detox-ios": st("failure", "(2 flaky, 5 needs investigation) 88% passed (590 passed, 7 failed, 41 skipped)"),
