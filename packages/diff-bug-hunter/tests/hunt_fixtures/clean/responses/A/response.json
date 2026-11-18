@@ -1,0 +1,10 @@
+{
+ "_note": "SELF-TEST FIXTURE: hand-written stand-in for a hunter response, never used as hunt output.",
+ "files": [
+  {
+   "path": "calc/hunt_hunta_test.go",
+   "content": "package calc\n\nimport (\n\t\"math/rand\"\n\t\"testing\"\n)\n\nfunc TestHuntA_PercentZeroTotal(t *testing.T) {\n\tfor _, part := range []int{0, 1, 7} {\n\t\tif got := Percent(part, 0); got != 0 {\n\t\t\tt.Fatalf(\"Percent(%d, 0) = %d, want 0\", part, got)\n\t\t}\n\t}\n}\n\nfunc TestHuntA_PercentWithinRange(t *testing.T) {\n\tr := rand.New(rand.NewSource(7))\n\tfor i := 0; i < 500; i++ {\n\t\ttotal := 1 + r.Intn(1000)\n\t\tpart := r.Intn(total + 1)\n\t\tgot := Percent(part, total)\n\t\tif got < 0 || got > 100 || (part == total && got != 100) || (part == 0 && got != 0) {\n\t\t\tt.Fatalf(\"Percent(%d, %d) = %d\", part, total, got)\n\t\t}\n\t}\n}\n"
+  }
+ ],
+ "tests": []
+}
