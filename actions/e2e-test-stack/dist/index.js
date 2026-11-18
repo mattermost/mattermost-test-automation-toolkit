@@ -29962,15 +29962,33 @@ var instancesFrom = (leases, sites, opened) => leases.map((lease, i7) => {
 var cell = (s3) => String(s3 ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
 var DOWNLOAD_TIMEOUT_MS = 12e4;
 var MAX_LOG_BYTES = 256 << 20;
-var downloadLog = async (url) => {
+async function fetchLog(url, max) {
   const res = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`answered ${res.status}`);
+  if (!res.ok) {
+    await res.body?.cancel();
+    throw new Error(`answered ${res.status}`);
+  }
   const length = Number(res.headers.get("content-length") ?? 0);
-  if (length > MAX_LOG_BYTES) throw new Error(`${length} bytes, more than ${MAX_LOG_BYTES}`);
-  const body = Buffer.from(await res.arrayBuffer());
-  if (body.length > MAX_LOG_BYTES) throw new Error(`${body.length} bytes, more than ${MAX_LOG_BYTES}`);
-  return body.toString("utf8");
-};
+  if (length > max) {
+    await res.body?.cancel();
+    throw new Error(`${length} bytes, more than ${max}`);
+  }
+  const chunks = [];
+  let read = 0;
+  if (res.body) {
+    const reader = res.body.getReader();
+    for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+      read += chunk.value.byteLength;
+      if (read > max) {
+        await reader.cancel();
+        throw new Error(`more than ${max} bytes`);
+      }
+      chunks.push(chunk.value);
+    }
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+var downloadLog = (url) => fetchLog(url, MAX_LOG_BYTES);
 async function run({ env: env2, connect, download = downloadLog, log = console.log }) {
   const inputs = readInputs(env2);
   const { operation: operation2 } = inputs;
@@ -30192,7 +30210,18 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
             const message = scrub(String(e6?.message ?? e6)).split("\n")[0];
             throw unsaved(`the download failed: ${name}: ${message.slice(0, 200)}`, e6);
           }
-          outputs.logs_path = writeFile2(path, scrub(full));
+          const partial = `${(0, import_node_path7.resolve)(path)}.partial`;
+          try {
+            writeFile2(partial, scrub(full));
+            (0, import_node_fs5.renameSync)(partial, (0, import_node_path7.resolve)(path));
+          } catch (e6) {
+            try {
+              (0, import_node_fs5.rmSync)(partial, { force: true });
+            } catch {
+            }
+            throw unsaved(`it could not be written: ${invokeError(e6)}`, e6);
+          }
+          outputs.logs_path = (0, import_node_path7.resolve)(path);
           outputs.logs_full = "true";
         } else if (logs.truncated) {
           throw unsaved("the control plane returned no URL for it, and the tail is truncated");

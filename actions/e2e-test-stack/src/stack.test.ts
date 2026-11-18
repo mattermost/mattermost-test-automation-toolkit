@@ -1,7 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -13,7 +13,7 @@ import sodium from "libsodium-wrappers";
 import { readInputs } from "./inputs.ts";
 import { lambdaClientConfig, lambdaInvoke, THROTTLE_ATTEMPTS } from "./lambda.ts";
 import { openSealed, SealedError } from "./sealed.ts";
-import { buildRequest, downloadLog, MAX_LOG_BYTES, run, writeOutputs } from "./stack.ts";
+import { buildRequest, downloadLog, fetchLog, MAX_LOG_BYTES, run, writeOutputs } from "./stack.ts";
 import type { Download, InvokeInput, InvokeOutput } from "./stack.ts";
 
 await sodium.ready;
@@ -545,7 +545,37 @@ test("a truncated tail with no URL for the full log fails the step, with the con
   assert.equal(out.logs_full, "false");
 });
 
-test("the full log download refuses a redirect, an error status and a log over the limit", async () => {
+test("a full log that cannot be written leaves the tail where it was and fails the step", async () => {
+  const logsPath = file("kept.log");
+  // A directory where the partial file would go, so its write fails.
+  mkdirSync(`${logsPath}.partial`);
+  const h = harness(
+    {
+      STACK_OPERATION: "logs",
+      STACK_CALLER_KEY: "mobile",
+      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_BATCH_ID: "pr-1234-abc",
+      STACK_BATCH_TOKEN: "batch-token-1",
+      STACK_LOGS_PATH: logsPath,
+    },
+    ok({
+      batch_id: "pr-1234-abc",
+      logs: {
+        index: 0,
+        truncated: true,
+        secrets: seal({ url: "https://bucket/x?sig", content_gzip: gzipSync("the tail\n").toString("base64") }),
+      },
+    }),
+    () => Promise.resolve("the whole log\n"),
+  );
+  await assert.rejects(h.go(), /was not saved: it could not be written: .*logs-path holds the tail\./);
+  const out = readOutputs(h.output);
+  assert.equal(out.logs_path, logsPath);
+  assert.equal(readFileSync(logsPath, "utf8"), "the tail\n");
+  assert.equal(out.logs_full, "false");
+});
+
+test("the full log download refuses a redirect, an error status and a log over the limit, sized or not", async () => {
   const server = createServer();
   const sockets = new Set<Socket>();
   server.on("connection", (s) => {
@@ -558,6 +588,8 @@ test("the full log download refuses a redirect, an error status and a log over t
         "/redirect": "HTTP/1.1 302 Found\r\nLocation: /ok\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "/denied": "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "/big": `HTTP/1.1 200 OK\r\nContent-Length: ${MAX_LOG_BYTES + 1}\r\nConnection: close\r\n\r\n`,
+        // No Content-Length: the body ends when the connection closes.
+        "/unsized": "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n0123456789abcdef",
       };
       s.end(reply[path] ?? reply["/denied"]);
     });
@@ -570,6 +602,8 @@ test("the full log download refuses a redirect, an error status and a log over t
     await assert.rejects(downloadLog(`${base}/redirect`));
     await assert.rejects(downloadLog(`${base}/denied`), /answered 403/);
     await assert.rejects(downloadLog(`${base}/big`), /more than/);
+    assert.equal(await fetchLog(`${base}/unsized`, 16), "0123456789abcdef");
+    await assert.rejects(fetchLog(`${base}/unsized`, 15), /more than 15 bytes/);
   } finally {
     for (const s of sockets) s.destroy();
     await new Promise<void>((r) => server.close(() => r()));

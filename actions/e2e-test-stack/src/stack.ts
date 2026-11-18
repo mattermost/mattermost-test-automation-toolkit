@@ -1,7 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
@@ -194,16 +194,39 @@ export const DOWNLOAD_TIMEOUT_MS = 120_000;
 /** The largest full log read into memory. */
 export const MAX_LOG_BYTES = 256 << 20;
 
-/** Downloads a presigned log URL, following no redirect, within DOWNLOAD_TIMEOUT_MS and MAX_LOG_BYTES. */
-export const downloadLog: Download = async (url) => {
+/**
+ * Downloads a URL, following no redirect, within DOWNLOAD_TIMEOUT_MS, reading no more than max bytes: a declared
+ * length over it is refused before the body is read, and a body that grows past it is cancelled.
+ */
+export async function fetchLog(url: string, max: number): Promise<string> {
   const res = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`answered ${res.status}`);
+  if (!res.ok) {
+    await res.body?.cancel();
+    throw new Error(`answered ${res.status}`);
+  }
   const length = Number(res.headers.get("content-length") ?? 0);
-  if (length > MAX_LOG_BYTES) throw new Error(`${length} bytes, more than ${MAX_LOG_BYTES}`);
-  const body = Buffer.from(await res.arrayBuffer());
-  if (body.length > MAX_LOG_BYTES) throw new Error(`${body.length} bytes, more than ${MAX_LOG_BYTES}`);
-  return body.toString("utf8");
-};
+  if (length > max) {
+    await res.body?.cancel();
+    throw new Error(`${length} bytes, more than ${max}`);
+  }
+  const chunks: Uint8Array[] = [];
+  let read = 0;
+  if (res.body) {
+    const reader = res.body.getReader();
+    for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+      read += chunk.value.byteLength;
+      if (read > max) {
+        await reader.cancel();
+        throw new Error(`more than ${max} bytes`);
+      }
+      chunks.push(chunk.value);
+    }
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/** Downloads a presigned log URL with fetchLog, up to MAX_LOG_BYTES. */
+export const downloadLog: Download = (url) => fetchLog(url, MAX_LOG_BYTES);
 
 export interface RunOptions {
   env: Env;
@@ -473,7 +496,20 @@ export async function run({ env, connect, download = downloadLog, log = console.
             const message = scrub(String((e as { message?: string })?.message ?? e)).split("\n")[0];
             throw unsaved(`the download failed: ${name}: ${message.slice(0, 200)}`, e);
           }
-          outputs.logs_path = writeFile(path, scrub(full));
+          // Written beside the tail and moved over it whole, so a failed write leaves the tail as it was.
+          const partial = `${resolve(path)}.partial`;
+          try {
+            writeFile(partial, scrub(full));
+            renameSync(partial, resolve(path));
+          } catch (e) {
+            try {
+              rmSync(partial, { force: true });
+            } catch {
+              // The tail is what matters; a partial file left behind is reported by the error below.
+            }
+            throw unsaved(`it could not be written: ${invokeError(e)}`, e);
+          }
+          outputs.logs_path = resolve(path);
           outputs.logs_full = "true";
         } else if (logs.truncated) {
           throw unsaved("the control plane returned no URL for it, and the tail is truncated");
