@@ -186,10 +186,31 @@ const cell = (s: string | number | null | undefined): string =>
     .replace(/\|/g, "\\|")
     .replace(/\n/g, " ");
 
+/** Reads the whole object at a presigned log URL. */
+export type Download = (url: string) => Promise<string>;
+
+/** How long the full log may take to download. */
+export const DOWNLOAD_TIMEOUT_MS = 120_000;
+/** The largest full log read into memory. */
+export const MAX_LOG_BYTES = 256 << 20;
+
+/** Downloads a presigned log URL, following no redirect, within DOWNLOAD_TIMEOUT_MS and MAX_LOG_BYTES. */
+export const downloadLog: Download = async (url) => {
+  const res = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`answered ${res.status}`);
+  const length = Number(res.headers.get("content-length") ?? 0);
+  if (length > MAX_LOG_BYTES) throw new Error(`${length} bytes, more than ${MAX_LOG_BYTES}`);
+  const body = Buffer.from(await res.arrayBuffer());
+  if (body.length > MAX_LOG_BYTES) throw new Error(`${body.length} bytes, more than ${MAX_LOG_BYTES}`);
+  return body.toString("utf8");
+};
+
 export interface RunOptions {
   env: Env;
   /** The invoke for the checked region. */
   connect: (region: string) => Invoke;
+  /** Reads the full log at its presigned URL; downloadLog in the action. */
+  download?: Download;
   /** Takes progress and workflow commands (::add-mask::); stdout in the action. */
   log?: (message: string) => void;
 }
@@ -199,7 +220,7 @@ export interface RunOptions {
  * sealed secrets, masks every secret, and sets outputs and the job summary. A refused call, a failed open or a response
  * error fails it, after the outputs that were read are set, so a partial create still hands back its batch.
  */
-export async function run({ env, connect, log = console.log }: RunOptions): Promise<void> {
+export async function run({ env, connect, download = downloadLog, log = console.log }: RunOptions): Promise<void> {
   const inputs = readInputs(env);
   const { operation } = inputs;
   const outputs: Record<string, string> = {};
@@ -216,6 +237,11 @@ export async function run({ env, connect, log = console.log }: RunOptions): Prom
       log(`::add-mask::${escapeData(quoted)}`);
     }
   };
+
+  // Every masked value replaced with ***, longest first so one inside another goes whole, then ARNs and account ids:
+  // what the job log would show of the same text.
+  const scrub = (text: string): string =>
+    redact([...masked].sort((a, b) => b.length - a.length).reduce((t, v) => t.split(v).join("***"), text));
 
   const maskBatch = (secrets: BatchSecrets): void => {
     mask(secrets.batch_token);
@@ -304,7 +330,8 @@ export async function run({ env, connect, log = console.log }: RunOptions): Prom
         throw new Error(
           `e2e-test-stack: ${inputs.createResponse} holds no batch token; only a create response carries one`,
         );
-      mask(secrets.batch_token);
+      // Every credential the batch holds, so a logs tail that prints one has it taken out too.
+      maskBatch(secrets);
       batchId = created.batch_id;
       batchToken = secrets.batch_token;
     }
@@ -412,19 +439,47 @@ export async function run({ env, connect, log = console.log }: RunOptions): Prom
       );
       if (logs.secrets) {
         const secrets = (await openSealed(logs.secrets, inputs.privateKey!)) as LogsSecrets;
+        // Used only to download the log here: masked in case an error quotes it, and never an output.
         mask(secrets.url);
-        outputs.logs_url = secrets.url ?? "";
+        const index = logs.index ?? inputs.index ?? 0;
+        const path =
+          inputs.logsPath ||
+          // The reply's batch id names the file only in the shape a batch id takes.
+          join(
+            env.RUNNER_TEMP || tmpdir(),
+            `e2e-test-stack-${BATCH_ID.test(outputs.batch_id) ? outputs.batch_id : "batch"}-${index}.log`,
+          );
+        // The tail first, so a failed download still leaves it at logs-path.
         if (secrets.content_gzip) {
-          const index = logs.index ?? inputs.index ?? 0;
-          const path =
-            inputs.logsPath ||
-            // The reply's batch id names the file only in the shape a batch id takes.
-            join(
-              env.RUNNER_TEMP || tmpdir(),
-              `e2e-test-stack-${BATCH_ID.test(outputs.batch_id) ? outputs.batch_id : "batch"}-${index}.log`,
-            );
-          outputs.logs_path = writeFile(path, gunzipSync(Buffer.from(secrets.content_gzip, "base64")));
+          const tail = gunzipSync(Buffer.from(secrets.content_gzip, "base64")).toString("utf8");
+          outputs.logs_path = writeFile(path, scrub(tail));
+          outputs.logs_full = String(!logs.truncated);
         }
+        // A failure here reports the control plane's own error with it, and quotes nothing of the URL.
+        const unsaved = (reason: string, cause?: unknown): Error => {
+          summary.push(`| Saved | ${outputs.logs_path ? "the tail; not the full log" : "nothing"} |`);
+          const also = responseError ? ` The logs call also reported: ${responseError}.` : "";
+          return new Error(
+            `e2e-test-stack: the full log of instance ${index} was not saved: ${reason}.${outputs.logs_path ? " logs-path holds the tail." : ""}${also}`,
+            { cause },
+          );
+        };
+        if (secrets.url) {
+          let full: string;
+          try {
+            full = await download(secrets.url);
+          } catch (e) {
+            const name = (e as { name?: string })?.name || "Error";
+            const message = scrub(String((e as { message?: string })?.message ?? e)).split("\n")[0];
+            throw unsaved(`the download failed: ${name}: ${message.slice(0, 200)}`, e);
+          }
+          outputs.logs_path = writeFile(path, scrub(full));
+          outputs.logs_full = "true";
+        } else if (logs.truncated) {
+          throw unsaved("the control plane returned no URL for it, and the tail is truncated");
+        }
+        if (outputs.logs_path)
+          summary.push(`| Saved | ${outputs.logs_full === "true" ? "the full log" : "the tail, truncated"} |`);
       }
     }
 

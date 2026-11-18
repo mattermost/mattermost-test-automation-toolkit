@@ -13,8 +13,8 @@ import sodium from "libsodium-wrappers";
 import { readInputs } from "./inputs.ts";
 import { lambdaClientConfig, lambdaInvoke, THROTTLE_ATTEMPTS } from "./lambda.ts";
 import { openSealed, SealedError } from "./sealed.ts";
-import { buildRequest, run, writeOutputs } from "./stack.ts";
-import type { InvokeInput, InvokeOutput } from "./stack.ts";
+import { buildRequest, downloadLog, MAX_LOG_BYTES, run, writeOutputs } from "./stack.ts";
+import type { Download, InvokeInput, InvokeOutput } from "./stack.ts";
 
 await sodium.ready;
 const keys = sodium.crypto_box_keypair();
@@ -91,6 +91,7 @@ interface Harness {
 const harness = (
   env: Record<string, string>,
   reply: InvokeOutput | ((input: InvokeInput) => InvokeOutput),
+  download: Download = () => Promise.reject(new Error("this test downloads nothing")),
 ): Harness => {
   const h: Harness = {
     calls: [],
@@ -114,6 +115,7 @@ const harness = (
             return typeof reply === "function" ? reply(input) : reply;
           };
         },
+        download,
         log: (m) => h.logged.push(m),
       }),
   };
@@ -388,9 +390,11 @@ test("fetch masks and returns the instances it asked for, holes kept", async () 
   assert.deepEqual(masks(h).sort(), [...SECRET_VALUES].sort());
 });
 
-test("logs masks the URL, writes the decoded tail, and summarizes without either", async () => {
+test("logs masks the URL, writes the full log it downloads, and summarizes without either", async () => {
   const tail = 'server  | {"level":"info","msg":"Server is listening"}\n';
+  const full = `===== server =====\n${tail}`;
   const url = "https://bucket.s3.amazonaws.com/logs/x?X-Amz-Signature=abc";
+  const downloaded: string[] = [];
   const h = harness(
     {
       STACK_OPERATION: "logs",
@@ -410,20 +414,166 @@ test("logs masks the URL, writes the decoded tail, and summarizes without either
         containers: ["server"],
         lines: 1,
         bytes: 60,
-        truncated: false,
+        truncated: true,
         secrets: seal({ url, content_gzip: gzipSync(tail).toString("base64") }),
       },
     }),
+    (u) => {
+      downloaded.push(u);
+      return Promise.resolve(full);
+    },
   );
   await h.go();
   const out = readOutputs(h.output);
-  assert.equal(out.logs_url, url);
+  assert.deepEqual(downloaded, [url]);
+  assert.equal(out.logs_url, undefined);
+  assert.ok(!readFileSync(h.output, "utf8").includes("X-Amz-Signature"));
   assert.equal(out.logs_path, join(dir, "e2e-test-stack-pr-1234-abc-0.log"));
-  assert.equal(readFileSync(out.logs_path, "utf8"), tail);
+  assert.equal(readFileSync(out.logs_path, "utf8"), full);
+  assert.equal(out.logs_full, "true");
   assert.deepEqual(masks(h).sort(), ["batch-token-1", url].sort());
   const summary = readFileSync(h.summary, "utf8");
-  assert.match(summary, /\| Tail \| 1 lines, 60 bytes \|/);
+  assert.match(summary, /\| Tail \| 1 lines, 60 bytes, truncated \|/);
+  assert.match(summary, /\| Saved \| the full log \|/);
   assert.ok(!summary.includes("X-Amz-Signature") && !summary.includes("Server is listening"));
+});
+
+test("logs with a create response takes every batch credential, ARNs and account ids out of the log", async () => {
+  const responsePath = file("create.json");
+  writeFileSync(responsePath, JSON.stringify(createResponse()));
+  const tail = [
+    "server  | login as sysadmin with admin-pw-0",
+    "server  | pulled 123456789012.dkr.ecr.us-east-1.amazonaws.com/mattermost:master",
+    "server  | role arn:aws:iam::123456789012:role/x refused",
+    'postgres| password "pg-pw-0" for mmuser on mattermost',
+    "inbucket| token mail-0, batch batch-token-1, ldap ldap-pw-0, minio minio-0",
+    "",
+  ].join("\n");
+  const h = harness(
+    {
+      STACK_OPERATION: "logs",
+      STACK_CALLER_KEY: "mobile",
+      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_CREATE_RESPONSE: responsePath,
+      STACK_INDEX: "0",
+      STACK_LOGS_PATH: file("tail.log"),
+    },
+    ok({
+      batch_id: "pr-1234-abc",
+      logs: {
+        instance_id: "pr-1234-abc-00",
+        index: 0,
+        lines: 5,
+        bytes: tail.length,
+        secrets: seal({ url: "https://bucket/x?sig", content_gzip: gzipSync("tail\n").toString("base64") }),
+      },
+    }),
+    () => Promise.resolve(tail),
+  );
+  await h.go();
+  assert.equal(
+    readFileSync(readOutputs(h.output).logs_path, "utf8"),
+    [
+      "server  | login as sysadmin with ***",
+      "server  | pulled [account].dkr.ecr.us-east-1.amazonaws.com/mattermost:master",
+      "server  | role [arn] refused",
+      'postgres| password "***" for mmuser on mattermost',
+      "inbucket| token ***, batch ***, ldap ***, minio ***",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("a full log that does not download leaves the scrubbed tail and fails the step", async () => {
+  const h = harness(
+    {
+      STACK_OPERATION: "logs",
+      STACK_CALLER_KEY: "mobile",
+      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_BATCH_ID: "pr-1234-abc",
+      STACK_BATCH_TOKEN: "batch-token-1",
+      STACK_INDEX: "1",
+    },
+    ok({
+      batch_id: "pr-1234-abc",
+      logs: {
+        instance_id: "pr-1234-abc-01",
+        index: 1,
+        truncated: true,
+        secrets: seal({
+          url: "https://bucket/x?sig",
+          content_gzip: gzipSync("token batch-token-1\n").toString("base64"),
+        }),
+      },
+    }),
+    () => Promise.reject(new TypeError("Failed to parse URL from https://bucket/x?sig")),
+  );
+  await assert.rejects(h.go(), (e: Error) => {
+    assert.equal(
+      e.message,
+      "e2e-test-stack: the full log of instance 1 was not saved: the download failed: TypeError: Failed to parse URL from ***. logs-path holds the tail.",
+    );
+    return true;
+  });
+  const out = readOutputs(h.output);
+  assert.equal(readFileSync(out.logs_path, "utf8"), "token ***\n");
+  assert.equal(out.logs_full, "false");
+  assert.match(readFileSync(h.summary, "utf8"), /\| Saved \| the tail; not the full log \|/);
+});
+
+test("a truncated tail with no URL for the full log fails the step, with the control plane's error", async () => {
+  const h = harness(
+    {
+      STACK_OPERATION: "logs",
+      STACK_CALLER_KEY: "mobile",
+      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_BATCH_ID: "pr-1234-abc",
+      STACK_BATCH_TOKEN: "batch-token-1",
+    },
+    ok({
+      batch_id: "pr-1234-abc",
+      error: "url unavailable",
+      logs: { index: 0, truncated: true, secrets: seal({ content_gzip: gzipSync("end\n").toString("base64") }) },
+    }),
+  );
+  await assert.rejects(
+    h.go(),
+    /no URL for it, and the tail is truncated\. logs-path holds the tail\. The logs call also reported: url unavailable\./,
+  );
+  const out = readOutputs(h.output);
+  assert.equal(readFileSync(out.logs_path, "utf8"), "end\n");
+  assert.equal(out.logs_full, "false");
+});
+
+test("the full log download refuses a redirect, an error status and a log over the limit", async () => {
+  const server = createServer();
+  const sockets = new Set<Socket>();
+  server.on("connection", (s) => {
+    sockets.add(s);
+    s.on("close", () => sockets.delete(s));
+    s.once("data", (d) => {
+      const path = d.toString().split(" ")[1];
+      const reply: Record<string, string> = {
+        "/ok": "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        "/redirect": "HTTP/1.1 302 Found\r\nLocation: /ok\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "/denied": "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "/big": `HTTP/1.1 200 OK\r\nContent-Length: ${MAX_LOG_BYTES + 1}\r\nConnection: close\r\n\r\n`,
+      };
+      s.end(reply[path] ?? reply["/denied"]);
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address() as { port: number };
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    assert.equal(await downloadLog(`${base}/ok`), "hello");
+    await assert.rejects(downloadLog(`${base}/redirect`));
+    await assert.rejects(downloadLog(`${base}/denied`), /answered 403/);
+    await assert.rejects(downloadLog(`${base}/big`), /more than/);
+  } finally {
+    for (const s of sockets) s.destroy();
+    await new Promise<void>((r) => server.close(() => r()));
+  }
 });
 
 test("a response-path that cannot be written fails the create after its batch id and token are set", async () => {
@@ -672,7 +822,7 @@ test("destroy reads the batch and its sealed token from a create response, and f
   );
   await done.go();
   assert.equal(done.calls[0].Payload, '{"action":"destroy","batch_id":"pr-1234-abc","batch_token":"batch-token-1"}');
-  assert.deepEqual(masks(done), ["batch-token-1"]);
+  assert.deepEqual(masks(done).sort(), [...SECRET_VALUES].sort());
   assert.equal(readOutputs(done.output).state, "destroyed");
 
   const partial = harness(

@@ -29960,7 +29960,18 @@ var instancesFrom = (leases, sites, opened) => leases.map((lease, i7) => {
   };
 });
 var cell = (s3) => String(s3 ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
-async function run({ env: env2, connect, log = console.log }) {
+var DOWNLOAD_TIMEOUT_MS = 12e4;
+var MAX_LOG_BYTES = 256 << 20;
+var downloadLog = async (url) => {
+  const res = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`answered ${res.status}`);
+  const length = Number(res.headers.get("content-length") ?? 0);
+  if (length > MAX_LOG_BYTES) throw new Error(`${length} bytes, more than ${MAX_LOG_BYTES}`);
+  const body = Buffer.from(await res.arrayBuffer());
+  if (body.length > MAX_LOG_BYTES) throw new Error(`${body.length} bytes, more than ${MAX_LOG_BYTES}`);
+  return body.toString("utf8");
+};
+async function run({ env: env2, connect, download = downloadLog, log = console.log }) {
   const inputs = readInputs(env2);
   const { operation: operation2 } = inputs;
   const outputs = {};
@@ -29976,6 +29987,7 @@ async function run({ env: env2, connect, log = console.log }) {
       log(`::add-mask::${escapeData(quoted)}`);
     }
   };
+  const scrub = (text) => redact([...masked].sort((a7, b7) => b7.length - a7.length).reduce((t2, v2) => t2.split(v2).join("***"), text));
   const maskBatch = (secrets) => {
     mask(secrets.batch_token);
     for (const s3 of secrets.instances ?? []) {
@@ -30053,7 +30065,7 @@ async function run({ env: env2, connect, log = console.log }) {
         throw new Error(
           `e2e-test-stack: ${inputs.createResponse} holds no batch token; only a create response carries one`
         );
-      mask(secrets.batch_token);
+      maskBatch(secrets);
       batchId = created.batch_id;
       batchToken = secrets.batch_token;
     }
@@ -30152,16 +30164,41 @@ async function run({ env: env2, connect, log = console.log }) {
       if (logs.secrets) {
         const secrets = await openSealed(logs.secrets, inputs.privateKey);
         mask(secrets.url);
-        outputs.logs_url = secrets.url ?? "";
+        const index = logs.index ?? inputs.index ?? 0;
+        const path = inputs.logsPath || // The reply's batch id names the file only in the shape a batch id takes.
+        (0, import_node_path7.join)(
+          env2.RUNNER_TEMP || (0, import_node_os4.tmpdir)(),
+          `e2e-test-stack-${BATCH_ID.test(outputs.batch_id) ? outputs.batch_id : "batch"}-${index}.log`
+        );
         if (secrets.content_gzip) {
-          const index = logs.index ?? inputs.index ?? 0;
-          const path = inputs.logsPath || // The reply's batch id names the file only in the shape a batch id takes.
-          (0, import_node_path7.join)(
-            env2.RUNNER_TEMP || (0, import_node_os4.tmpdir)(),
-            `e2e-test-stack-${BATCH_ID.test(outputs.batch_id) ? outputs.batch_id : "batch"}-${index}.log`
-          );
-          outputs.logs_path = writeFile2(path, (0, import_node_zlib.gunzipSync)(Buffer.from(secrets.content_gzip, "base64")));
+          const tail = (0, import_node_zlib.gunzipSync)(Buffer.from(secrets.content_gzip, "base64")).toString("utf8");
+          outputs.logs_path = writeFile2(path, scrub(tail));
+          outputs.logs_full = String(!logs.truncated);
         }
+        const unsaved = (reason, cause) => {
+          summary.push(`| Saved | ${outputs.logs_path ? "the tail; not the full log" : "nothing"} |`);
+          const also = responseError ? ` The logs call also reported: ${responseError}.` : "";
+          return new Error(
+            `e2e-test-stack: the full log of instance ${index} was not saved: ${reason}.${outputs.logs_path ? " logs-path holds the tail." : ""}${also}`,
+            { cause }
+          );
+        };
+        if (secrets.url) {
+          let full;
+          try {
+            full = await download(secrets.url);
+          } catch (e6) {
+            const name = e6?.name || "Error";
+            const message = scrub(String(e6?.message ?? e6)).split("\n")[0];
+            throw unsaved(`the download failed: ${name}: ${message.slice(0, 200)}`, e6);
+          }
+          outputs.logs_path = writeFile2(path, scrub(full));
+          outputs.logs_full = "true";
+        } else if (logs.truncated) {
+          throw unsaved("the control plane returned no URL for it, and the tail is truncated");
+        }
+        if (outputs.logs_path)
+          summary.push(`| Saved | ${outputs.logs_full === "true" ? "the full log" : "the tail, truncated"} |`);
       }
     }
     if (sites.length) {
