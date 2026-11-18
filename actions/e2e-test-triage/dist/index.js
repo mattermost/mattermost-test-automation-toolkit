@@ -68,7 +68,9 @@ function releaseFromDescriptions(descriptions) {
   if (ds.some((d) => /\b\d+ out of date\b/.test(d))) return true;
   return void 0;
 }
-function redReason(description = "", release = false, pr = true, compact = false) {
+var CLEARED_WORDINGS = ["full", "short", "none"];
+var STATUS_LIMIT = 140;
+function redReason(description = "", release = false, pr = true, wording = "full") {
   const d = String(description);
   const lane = /^\((machine failure, [^)]+|broken on main, not your change|broken on main|fixed on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
   if (lane) return lane.replace(/^out of date/, "fixed on main").replace(/^needs investigation$/, "machine failure, re-run");
@@ -79,7 +81,8 @@ function redReason(description = "", release = false, pr = true, compact = false
   const brokenMain = pr ? 0 : brokenOnMain;
   const notYours = cleared - brokenMain + (release ? 0 : fixed);
   if (brokenMain) parts.push(`${brokenMain} broken on main`);
-  if (notYours) parts.push(compact ? `${notYours} cleared` : `${notYours} not caused by ${pr ? "PR" : "this commit"}`);
+  const clearedAt = parts.length;
+  if (notYours) parts.push(wording === "full" ? `${notYours} not caused by ${pr ? "PR" : "this commit"}` : `${notYours} cleared`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
   const fixedHere = (release ? fixed : 0) + outdated;
@@ -100,6 +103,7 @@ function redReason(description = "", release = false, pr = true, compact = false
   if (/environment errors, re-run/.test(d)) parts.push("environment errors, re-run");
   else if (/investigation required|many failures in one run/.test(d)) parts.push("many failures in one run");
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
+  if (wording === "none" && notYours && parts.length > 1) parts.splice(clearedAt, 1);
   return parts.length ? parts.join(", ") : "still red";
 }
 function laneSummary(lanes, untriaged = [], release, pr = true) {
@@ -107,21 +111,29 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
   const redOthers = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending");
   const judgedOther = (l) => /^\([^)]+\) /.test(String(l.status?.description ?? ""));
   const otherRed = redOthers.filter((l) => !judgedOther(l)).map((l) => laneName(l.context));
-  const otherJudged = redOthers.filter(judgedOther).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false, pr)}`);
-  const otherText = [
-    ...otherJudged.slice(0, 2),
-    otherJudged.length > 2 ? `+${otherJudged.length - 2} triaged red` : "",
+  const judged = redOthers.filter(judgedOther);
+  const otherNamed = (wording) => [
+    ...judged.slice(0, 2).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false, pr, wording)}`),
+    judged.length > 2 ? `+${judged.length - 2} triaged red` : "",
     otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : ""
   ].filter(Boolean).join(" \xB7 ");
-  const withOther = (text) => {
-    if (!otherText) return text;
-    if (`${text} \xB7 ${otherText}`.length <= 140) return `${text} \xB7 ${otherText}`;
-    const count2 = otherJudged.length ? `${otherJudged.length + otherRed.length} other E2E check(s) red` : `not triaged: ${otherRed.length} red`;
-    const room = 140 - count2.length - 3;
-    return `${text.length > room ? `${text.slice(0, room - 1)}\u2026` : text} \xB7 ${count2}`;
+  const otherCount = judged.length ? `${judged.length + otherRed.length} other E2E check(s) red` : `not triaged: ${otherRed.length} red`;
+  const fit = (textAt) => {
+    const join2 = (text2, other) => [text2, other].filter(Boolean).join(" \xB7 ");
+    const others = redOthers.length ? [otherNamed, () => otherCount] : [() => ""];
+    for (const other of others) {
+      for (const wording of CLEARED_WORDINGS) {
+        const text2 = join2(textAt(wording), other(wording));
+        if (text2.length <= STATUS_LIMIT) return text2;
+      }
+    }
+    const text = textAt("none");
+    if (!redOthers.length) return text;
+    const room = STATUS_LIMIT - otherCount.length - 3;
+    return `${text.length > room ? `${text.slice(0, room - 1)}\u2026` : text} \xB7 ${otherCount}`;
   };
   const waiting = seen.filter((l) => l.status.state === "pending");
-  if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
+  if (waiting.length) return { state: "pending", description: fit(() => `Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
   const red = seen.filter((l) => l.status.state !== "success");
   const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
   const cleared = seen.filter((l) => {
@@ -130,12 +142,12 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
   });
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
   if (red.length) {
-    const redText = (compact) => [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease, pr, compact)}`), clearedText].filter(Boolean).join(" \xB7 ");
-    const full = redText(false);
-    const fits = (otherText ? `${full} \xB7 ${otherText}` : full).length <= 140;
-    return { state: "failure", description: withOther(fits ? full : redText(true)) };
+    return {
+      state: "failure",
+      description: fit((wording) => [...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease, pr, wording)}`), clearedText].filter(Boolean).join(" \xB7 "))
+    };
   }
-  if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" \xB7 ")) };
+  if (redOthers.length) return { state: "success", description: fit(() => [clearedText, "triaged lanes green"].filter(Boolean).join(" \xB7 ")) };
   return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
 }
 

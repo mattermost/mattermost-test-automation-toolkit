@@ -82,6 +82,28 @@ test("a summary that would pass 140 characters names what triage cleared in one 
     state: "failure",
     description: "maestro-ios: 1 not caused by PR, 1 machine failure, re-run · cypress-full/enterprise: 1 not caused by PR, re-run the failed jobs",
   }, "the full wording stays when it fits");
+  const mixed = [
+    lane("e2e-test/maestro-ios", "(1 broken on main, 1 flaky, 1 app bug, 1 machine failure) 50.0% passed (1 passed, 4 failed, 0 skipped)"),
+    lane("e2e-test/cypress-full/enterprise", "(1 broken on main, 1 flaky; re-run the failed jobs) 50.0% passed (2 passed, 2 failed, 0 skipped)"),
+  ];
+  assert.deepEqual(laneSummary(mixed, [], false, false), {
+    state: "failure",
+    description: "maestro-ios: 1 broken on main, 1 app bug, 1 machine failure, re-run · cypress-full/enterprise: 1 broken on main, re-run the failed jobs",
+  }, "what triage cleared is left out when one word is still too long");
+  assert.equal(redReason("(2 flaky) 50.0% passed (2 passed, 2 failed, 0 skipped)", false, true, "none"), "2 cleared", "a lane red for nothing else keeps its cleared count");
+});
+
+test("a summary keeps the names of other red checks, shortening wording first, and keeps full wording when only a count would fit anyway", () => {
+  const lane = (context: string, state: string, description: string) => ({ context, status: { state, description } as never });
+  const upgrade = lane("e2e-test/playwright-full/enterprise/upgrade-from-release-11.11", "failure", "(1 flaky, 2 machine failure, 1 app bug) 50.0% passed (1 passed, 4 failed, 0 skipped)");
+  assert.deepEqual(laneSummary([lane("e2e-test/maestro-ios", "success", "(0 flaky) 100% passed (6 passed, 0 failed, 0 skipped)")], [upgrade], false, false), {
+    state: "success",
+    description: "triaged lanes green · playwright-full/enterprise/upgrade-from-release-11.11: 1 cleared, 1 app bug, 2 machine failures, re-run",
+  });
+  const long = (v: string) => lane(`e2e-test/playwright-full/enterprise/upgrade-from-release-${v}-to-the-current-head-of-master`, "failure",
+    "(1 flaky, 2 machine failure) 50.0% passed (1 passed, 3 failed, 0 skipped)");
+  assert.deepEqual(laneSummary([lane("e2e-test/maestro-ios", "failure", "(1 flaky) 50.0% passed (1 passed, 1 failed, 0 skipped)")], [long("11.11"), long("11.10")], false, true),
+    { state: "failure", description: "maestro-ios: 1 not caused by PR · 2 other E2E check(s) red" });
 });
 
 test("a lane summary reads red lanes by their labels and old wording alike, and names the lanes cleared by triage", () => {
