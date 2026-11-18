@@ -88,6 +88,9 @@ export function validatePlan(plan) {
         if (kind === 'api' && !String(e.api?.path ?? '').startsWith('/api/v4/')) {
             throw new PlanError(`expect ${i + 1}: api.path must start with /api/v4/`);
         }
+        if (kind === 'api' && (e.api.status ?? 200) >= 500) {
+            throw new PlanError(`expect ${i + 1}: api.status ${e.api.status} expects a server error, which always fails`);
+        }
     });
     return steps;
 }
@@ -206,10 +209,11 @@ async function runStep(page, base, step) {
     await settle(page);
 }
 
-// Waits until no request has been in flight for QUIET_MS (bounded by SETTLE_MS). page.waitForLoadState('networkidle')
+// Waits until no request has been in flight for QUIET_MS (bounded by SETTLE_MS; a request still running at the
+// deadline is reported as a problem, so a slow response can never be skipped into a PASS). page.waitForLoadState('networkidle')
 // cannot do this: it returns at once on a page that already reached that state, missing requests a click starts.
 const QUIET_MS = 300;
-const SETTLE_MS = 5000;
+const SETTLE_MS = Number(process.env.VERIFY_SETTLE_MS ?? 10000); // tests lower it
 async function settle(page) {
     const start = Date.now();
     let quietSince = page.inflight.size ? 0 : Date.now();
@@ -222,6 +226,10 @@ async function settle(page) {
         } else if (Date.now() - quietSince >= QUIET_MS) {
             return;
         }
+    }
+    if (page.inflight.size) {
+        const urls = [...page.inflight].map((r) => `${r.method()} ${new URL(r.url()).pathname}`).slice(0, 5);
+        throw new Error(`${page.inflight.size} request(s) still in flight after ${SETTLE_MS}ms: ${urls.join(', ')}`);
     }
 }
 
@@ -239,6 +247,9 @@ async function checkExpect(page, base, e) {
         return n >= (e.min ?? 1) ? null : `count of ${JSON.stringify(e.count)} is ${n}, want >= ${e.min ?? 1}`;
     }
     const res = await page.request.get(new URL(e.api.path, base).toString(), {headers: {'X-Requested-With': 'XMLHttpRequest'}});
+    if (res.status() >= 500) {
+        return `GET ${e.api.path} returned ${res.status()}; a server error never satisfies an expectation`;
+    }
     const status = e.api.status ?? 200;
     if (res.status() !== status) {
         return `GET ${e.api.path} returned ${res.status()}, want ${status}`;
@@ -397,7 +408,7 @@ export function freeze(plan, base, authed = false) {
             lines.push(`await expect.poll(() => ${locatorCode(e.count)}.count()).toBeGreaterThanOrEqual(${e.min ?? 1});`);
         } else {
             lines.push(`{`, `  const res = await page.request.get(new URL(${q(e.api.path)}, BASE).toString(), {headers: {'X-Requested-With': 'XMLHttpRequest'}});`,
-                `  expect(res.status()).toBe(${e.api.status ?? 200});`);
+                '  expect(res.status(), \'no server error\').toBeLessThan(500);', `  expect(res.status()).toBe(${e.api.status ?? 200});`);
             if (e.api.json_has) {
                 lines.push(`  expect(await res.json()).toMatchObject(${q(e.api.json_has)});`);
             }
@@ -434,6 +445,7 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async ({page}) => {
       }
       await page.waitForTimeout(50);
     }
+    expect(inflight.size, 'requests still in flight at the settle deadline').toBe(0);
     expect(problems).toEqual([]); // fail fast after every step, like verify_ui.mjs
   };
   page.on('pageerror', (err) => problems.push(\`pageerror: \${err.message}\`));

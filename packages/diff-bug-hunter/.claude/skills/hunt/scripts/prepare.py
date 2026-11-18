@@ -76,7 +76,7 @@ def link_node_modules(mm: Path, wts: list[Path]) -> None:
 def main(pr: str) -> None:
     mm = mm_clone()
     ensure_clone(mm)
-    git(mm, "fetch", "-q", "origin", f"pull/{pr}/head:pr-{pr}", "master:refs/remotes/origin/master")
+    git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", "+master:refs/remotes/origin/master")
     wt, wt_base = scratch() / f"wt{pr}", scratch() / f"wt{pr}.base"
     mb = worktrees(mm, f"pr-{pr}", "origin/master", wt, wt_base)
     changed = git(mm, "diff", "--name-only", mb, f"pr-{pr}").splitlines()

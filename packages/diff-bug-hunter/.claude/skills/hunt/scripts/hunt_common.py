@@ -47,9 +47,22 @@ def node_env() -> dict[str, str]:
     return env
 
 
+# Variables that point git at a different repository than `cwd`. An inherited GIT_DIR / GIT_WORK_TREE (from a hook or
+# an outer git process) would otherwise make `reset --hard` or `clean` run against the caller's checkout.
+GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
+
+
+def git_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    return {k: v for k, v in (os.environ if env is None else env).items() if k not in GIT_LOCATION_VARS}
+
+
 def sh(args: list[str], cwd: Path, *, check: bool = True, timeout: int = 1800,
        env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    """Run a command and capture text output. check=True raises InfraError with the tail of the output."""
+    """Run a command and capture text output. check=True raises InfraError with the tail of the output.
+    git always runs with repository-location variables removed, so `cwd` alone selects the repository."""
+    if args[:1] == ["git"]:
+        env = git_env(env)
     try:
         p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env, check=False)
     except FileNotFoundError as e:

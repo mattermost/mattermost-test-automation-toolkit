@@ -109,11 +109,16 @@ def go_run(wt: Path, dirs: list[str], pattern: str, race: bool) -> tuple[dict[st
         args = ["go", "test", "-count=1", "-v", "-run", pattern] + (["-race"] if race else []) + [pkg]
         p = sh(args, root, check=False, timeout=1800)
         out = p.stdout + p.stderr
-        got = {m.group(2): m.group(1) for m in RESULT_GO.finditer(out) if "/" not in m.group(2)}
+        # Identities are package-qualified ("<dir>::<Test>") so equal test names in two packages never overwrite.
+        got = {f"{d}::{m.group(2)}": m.group(1) for m in RESULT_GO.finditer(out) if "/" not in m.group(2)}
         if not got:
             if "[build failed]" in out or "[setup failed]" in out:
                 raise CompileError(f"{pkg}:\n{out[-2500:]}")
             raise InfraError(f"0 tests executed in {pkg} (exit {p.returncode}):\n{out[-2500:]}")
+        if p.returncode != 0 and "FAIL" not in got.values():
+            # e.g. TestMain teardown, a race report or a panic after the last test: the package failed even though no
+            # test line says so. Record it instead of reporting PASS.
+            got[f"{d}::(package failed)"] = "FAIL"
         res.update(got)
         outs.append(out)
     return res, "\n".join(outs)
@@ -156,7 +161,9 @@ def jest_run(wt: Path, files: list[str], prefix: str) -> tuple[dict[str, str], s
                 raise InfraError(f"0 tests executed in {rel}")
             for a in f["assertionResults"]:
                 if not prefix or a["title"].startswith(prefix):
-                    res[a["title"]] = {"passed": "PASS", "failed": "FAIL"}.get(a["status"], "SKIP")
+                    # file + full name: equal titles in two describe blocks or files never overwrite each other
+                    key = f"{rel}::{a.get('fullName') or a['title']}"
+                    res[key] = {"passed": "PASS", "failed": "FAIL"}.get(a["status"], "SKIP")
                     msgs += a.get("failureMessages") or []
     if files and not res:
         raise InfraError(f"0 tests matching {prefix!r} executed in {files}")

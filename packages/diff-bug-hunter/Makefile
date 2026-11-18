@@ -1,7 +1,7 @@
 # Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 # See LICENSE.txt for license information.
 
-# NODE_BIN: optional Node >= 20 bin dir for the Jest fixture (default: `node` on PATH).
+# NODE_BIN: optional Node bin dir (^22.18 or >= 24.11, required by the fixture's Babel 8; default: `node` on PATH).
 NODE_BIN ?=
 export PATH := $(if $(NODE_BIN),$(NODE_BIN):,)$(PATH)
 JESTDEPS := tests/hunt_fixtures/jestdeps

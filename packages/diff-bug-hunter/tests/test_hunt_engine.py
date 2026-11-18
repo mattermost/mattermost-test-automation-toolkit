@@ -29,6 +29,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import build_requests  # noqa: E402
 import ctx  # noqa: E402
+import hunt_common  # noqa: E402
 import lessons  # noqa: E402
 import prefilter  # noqa: E402
 import prepare  # noqa: E402
@@ -36,7 +37,7 @@ import reliability  # noqa: E402
 import run  # noqa: E402
 import trusted  # noqa: E402
 
-GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+GIT_ENV = {**hunt_common.git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
            "GIT_COMMITTER_EMAIL": "t@t"}
 
 
@@ -97,8 +98,8 @@ def test_worktrees_pin_head_and_merge_base(tmp_path):
 
 def test_go_bug_fails_3_of_3_and_is_new_in_pr(tmp_path):
     hdir, state = make_hunt(tmp_path, "go_bug")
-    assert run.cmd_run(hdir, state, "A") == {"TestHuntA_ClampRangeAndIdentity": "FAIL_3_OF_3"}
-    assert run.cmd_base(hdir, state, "A") == {"TestHuntA_ClampRangeAndIdentity": "NEW_PR_BUG"}
+    assert run.cmd_run(hdir, state, "A") == {"calc::TestHuntA_ClampRangeAndIdentity": "FAIL_3_OF_3"}
+    assert run.cmd_base(hdir, state, "A") == {"calc::TestHuntA_ClampRangeAndIdentity": "NEW_PR_BUG"}
     assert not list(Path(state["wt"]).rglob("hunt_*")) and not list(Path(state["wt_base"]).rglob("hunt_*"))
 
 
@@ -108,8 +109,8 @@ def test_go_bug_fails_3_of_3_and_is_new_in_pr(tmp_path):
 def test_react_bug_fails_3_of_3_and_is_new_in_pr(tmp_path):
     hdir, state = make_hunt(tmp_path, "react_bug")
     assert state["targets"] == [{"lang": "jest", "dir": "web/src", "path": "web/src/hunt_<mode>.test.tsx"}]
-    assert run.cmd_run(hdir, state, "A", runs=3) == {"HuntA_neverExceedsMax": "FAIL_3_OF_3"}
-    assert run.cmd_base(hdir, state, "A") == {"HuntA_neverExceedsMax": "NEW_PR_BUG"}
+    assert run.cmd_run(hdir, state, "A", runs=3) == {"web/src/hunt_a.test.tsx::HuntA HuntA_neverExceedsMax": "FAIL_3_OF_3"}
+    assert run.cmd_base(hdir, state, "A") == {"web/src/hunt_a.test.tsx::HuntA HuntA_neverExceedsMax": "NEW_PR_BUG"}
 
 
 @pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(), reason="run `make jest-deps` first")
@@ -127,7 +128,7 @@ def test_clean_control_has_no_findings_and_mutants_are_scored(tmp_path):
     hdir, state = make_hunt(tmp_path, "clean")
     assert set(run.cmd_run(hdir, state, "A").values()) == {"PASS"}
     v = {m["id"]: m for m in run.cmd_mutants(hdir, state, "A")}
-    assert v["M1"]["verdict"] == "KILLED" and v["M1"]["killers"] == ["TestHuntA_PercentZeroTotal"]
+    assert v["M1"]["verdict"] == "KILLED" and v["M1"]["killers"] == ["calc::TestHuntA_PercentZeroTotal"]
     assert v["M2"]["verdict"] == "NEEDS_REGENERATION" and "totl" in v["M2"]["detail"]
     assert v["M3"]["verdict"] == "SURVIVED"
     assert v["M4"]["verdict"] == "KILLED" and v["M4"]["held_back"]
@@ -172,7 +173,7 @@ def test_pr_own_tests_score_mutants(tmp_path):
     (hdir / "M" / "response.json").write_text(json.dumps({"mutants": [
         {"id": "M1", "file": "calc/calc.go", "old": "return v\n", "new": "return v + 1\n", "what_breaks": "shifts values"}]}))
     v = run.cmd_mutants(hdir, state, "PR")
-    assert v[0]["verdict"] == "KILLED" and v[0]["killers"] == ["TestClampMiddle"]
+    assert v[0]["verdict"] == "KILLED" and v[0]["killers"] == ["calc::TestClampMiddle"]
 
 
 # ------------------------------------------------------------------ large-diff guard
@@ -335,6 +336,7 @@ async function save() { const r = await fetch('/api/v4/things', {method: 'POST'}
   document.getElementById('l').appendChild(li); }</script></body></html>""",
     "/boom": """<html><body><main><button onclick="throw new Error('kaboom')">Boom</button></main></body></html>""",
     "/fail500": """<html><body><main><button onclick="fetch('/api/v4/broken')">Break</button></main></body></html>""",
+    "/slow": """<html><body><main><button onclick="fetch('/api/v4/slow')">Slow</button></main></body></html>""",
     "/external": """<html><body><main><p>ok</p><script src="http://blocked.invalid/x.js"></script></main></body></html>""",
     # the browser's own credentials (cookies or the Bearer header), as the Mattermost webapp would send them
     "/whoami": """<html><body><main><p id="who">loading</p></main><script>
@@ -378,6 +380,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                        json.dumps({"id": USER_ID, "username": "tester"} if authed else {"id": "unauthorized"}))
         elif self.path == "/api/v4/broken":
             self._send(500, '{"id": "boom"}')
+        elif self.path == "/api/v4/slow":
+            import time
+            time.sleep(2)
+            self._send(200, "{}")
         else:
             self._send(404, "{}")
 
@@ -424,7 +430,10 @@ def _node_env(auth: str = "password") -> dict[str, str]:
 
 
 def _playwright_available() -> bool:
-    p = subprocess.run(["node", "-e", "require('playwright')"], env=_node_env(), capture_output=True, check=False)
+    try:
+        p = subprocess.run(["node", "-e", "require('playwright')"], env=_node_env(), capture_output=True, check=False)
+    except FileNotFoundError:  # no node at all: optional /verify tests skip (HUNT_REQUIRE_DEPS makes them fail)
+        return False
     return p.returncode == 0
 
 
@@ -433,9 +442,10 @@ REQUIRE_DEPS = bool(os.environ.get("HUNT_REQUIRE_DEPS"))
 needs_playwright = pytest.mark.skipif(not REQUIRE_DEPS and not _playwright_available(), reason="run `make verify-deps` first")
 
 
-def verify(tmp: Path, plan: dict, *extra: str, auth: str = "password") -> tuple[int, str]:
+def verify(tmp: Path, plan: dict, *extra: str, auth: str = "password", env: dict | None = None) -> tuple[int, str]:
     (tmp / "plan.json").write_text(json.dumps(plan))
-    p = subprocess.run(["node", str(VERIFY_UI), "plan.json", *extra], cwd=tmp, env=_node_env(auth), capture_output=True,
+    p = subprocess.run(["node", str(VERIFY_UI), "plan.json", *extra], cwd=tmp, env={**_node_env(auth), **(env or {})},
+                       capture_output=True,
                        text=True, timeout=120, check=False)
     assert not list(tmp.rglob("*.png")), "verify_ui must never write screenshots"
     return p.returncode, p.stdout + p.stderr
@@ -625,3 +635,50 @@ def test_place_writes_nothing_when_any_path_is_rejected(tmp_path):
     with pytest.raises(ValueError):
         run.place(wt, files, {"calc"})
     assert not list(wt.rglob("*.go"))
+
+
+@needs_playwright
+def test_verify_never_passes_on_server_errors_or_unsettled_requests(tmp_path, ui_server):
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [],
+                                  "expect": [{"api": {"path": "/api/v4/broken", "status": 500}}]})
+    assert code == 2 and "expects a server error" in out, out
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [],
+                                  "expect": [{"api": {"path": "/api/v4/broken", "status": 200}}]})
+    assert code == 1 and "returned 500; a server error never satisfies" in out, out
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [
+        {"goto": "/slow"}, {"click": {"role": "button", "name": "Slow"}}], "expect": [{"visible": {"role": "main"}}]},
+        env={"VERIFY_SETTLE_MS": "800"})
+    assert code == 1 and "still in flight after 800ms: GET /api/v4/slow" in out, out
+
+
+# ------------------------------------------------------------------ CodeRabbit regressions
+
+def test_changed_go_tests_include_edited_bodies_not_only_new_declarations():
+    head = "package calc\n\nfunc helper() int { return 1 }\n\nfunc TestA(t *testing.T) {\n\tx := 2\n}\n\nfunc TestB(t *testing.T) {\n}\n"
+    patch = "@@ -5,3 +5,3 @@\n func TestA(t *testing.T) {\n-\tx := 1\n+\tx := 2\n }\n"
+    assert ctx.changed_go_tests(patch, head) == ["TestA"]
+    helper_only = "@@ -3,1 +3,1 @@\n-func helper() int { return 0 }\n+func helper() int { return 1 }\n"
+    assert ctx.changed_go_tests(helper_only, head) == []
+
+
+def test_go_package_exit_after_passing_tests_is_a_failure(tmp_path):
+    hdir, state = make_hunt(tmp_path, "clean")
+    exits = ("package calc\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\n"
+             "func TestMain(m *testing.M) {\n\tm.Run()\n\tos.Exit(3) // teardown failure after the tests\n}\n\n"
+             "func TestHuntB_Fine(t *testing.T) {}\n")
+    (hdir / "B").mkdir()
+    (hdir / "B" / "response.json").write_text(json.dumps({"files": [{"path": "calc/hunt_huntb_test.go", "content": exits}]}))
+    table = run.cmd_run(hdir, state, "B", runs=1)
+    assert table == {"calc::TestHuntB_Fine": "PASS", "calc::(package failed)": "FAIL_3_OF_3"}
+
+
+def test_git_commands_ignore_inherited_repository_variables(tmp_path, monkeypatch):
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    _git(outer, "init", "-q")
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    _git(inner, "init", "-q")
+    monkeypatch.setenv("GIT_DIR", str(outer / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(outer))
+    assert hunt_common.git(inner, "rev-parse", "--show-toplevel") == str(inner.resolve())

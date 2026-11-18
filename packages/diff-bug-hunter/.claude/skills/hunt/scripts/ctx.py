@@ -136,6 +136,34 @@ def test_targets(wt: Path, files: list[str]) -> list[dict[str, str]]:
     return out
 
 
+def changed_go_tests(patch: str, head_src: str) -> list[str]:
+    """Top-level Test functions that contain an added or removed line (new tests and edited bodies alike)."""
+    lines = head_src.split("\n")
+    decls = []  # (first line, last line, name); gofmt puts a top-level closing brace alone in column 0
+    for i, line in enumerate(lines, 1):
+        m = re.match(r"func (?:\([^)]*\) )?(\w+)\(", line)
+        if m:
+            end = next((j for j in range(i, len(lines) + 1) if lines[j - 1].startswith("}")), len(lines))
+            decls.append((i, end, m.group(1)))
+    touched: set[int] = set()
+    ln = 0
+    for line in patch.splitlines():
+        m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if m:
+            ln = int(m.group(1))
+        elif line.startswith("+") and not line.startswith("+++"):
+            touched.add(ln)
+            ln += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            touched.add(ln)  # a removed line sits just before head line `ln`
+        elif not line.startswith("\\"):
+            ln += 1
+    names = set()
+    for t in touched:
+        names |= {name for start, end, name in decls if start <= t <= end and re.match(r"Test[A-Z_0-9]", name)}
+    return sorted(names)
+
+
 def own_tests(repo: Path, mb: str, head: str, dirs: set[str]) -> dict[str, list[str]]:
     """Tests the PR itself adds or changes in the hunted dirs: Go test names, Jest file paths."""
     names: list[str] = []
@@ -145,7 +173,7 @@ def own_tests(repo: Path, mb: str, head: str, dirs: set[str]) -> dict[str, list[
             continue
         if f.endswith("_test.go"):
             patch = git(repo, "diff", mb, head, "--", f)
-            names += re.findall(r"^\+func (Test\w+)\(t \*testing\.T\)", patch, re.M)
+            names += changed_go_tests(patch, git(repo, "show", f"{head}:{f}"))
         elif re.search(r"\.test\.[jt]sx?$", f):
             jest.append(f)
     return {"go": sorted(set(names)), "jest": sorted(jest)}
