@@ -54,6 +54,10 @@ interface Lease {
   service_seconds?: Record<string, number>;
   image_pull_seconds?: number;
   critical_path?: { chain?: string[]; seconds?: number };
+  /** "<container> <image>", one per container. */
+  containers?: string[];
+  server_image?: { ref?: string; digest?: string; created_at?: string; age?: string; source?: string };
+  ami_name?: string;
   /** From destroy. */
   cost?: Cost;
   metrics?: { cpu_average?: number; cpu_peak?: number };
@@ -495,6 +499,18 @@ export async function run({ env, connect, download = downloadLog, log = console.
       summary.push(
         `| Duration | ${seconds(batchTiming)}, ${state === "ready" ? "request to every server ready" : "request to failure"} |`,
       );
+    if (operation === "create") {
+      const first = present.find((l) => l.server_image || l.ami_name);
+      const si = first?.server_image;
+      if (si?.ref || si?.digest) {
+        // The pull-through cache's host is not part of the image's name.
+        const ref = (si.ref ?? "").replace(/^.*?\/dockerhub\//, "");
+        const built = si.created_at ? `built ${si.created_at}${si.age ? ` (${si.age})` : ""}` : "";
+        const parts = [ref && `\`${ref}\``, si.digest && `\`${si.digest}\``, built, si.source && `from ${si.source}`];
+        summary.push(`| Server image | ${cell(parts.filter(Boolean).join(", "))} |`);
+      }
+      if (first?.ami_name) summary.push(`| Host image | \`${cell(first.ami_name)}\` |`);
+    }
     if (operation === "destroy" && batchCost) {
       const hours = typeof batchCost.hours === "number" ? `, ${batchCost.hours.toFixed(2)} instance-hours` : "";
       const part = priced === present.length ? "" : `; ${priced} of ${present.length} servers priced`;
@@ -649,6 +665,23 @@ export async function run({ env, connect, download = downloadLog, log = console.
         ];
         summary.push(`| ${cells.map(cell).join(" | ")} |`);
       });
+    }
+
+    // Each container's image, across the batch; a container on images that differ lists each.
+    if (operation === "create") {
+      const images = new Map<string, Set<string>>();
+      for (const l of present)
+        for (const entry of l.containers ?? []) {
+          const [name, ...rest] = entry.split(" ");
+          if (!name) continue;
+          if (!images.has(name)) images.set(name, new Set());
+          images.get(name)!.add(rest.join(" "));
+        }
+      if (images.size) {
+        summary.push("", "| Container | Image |", "|---|---|");
+        for (const [name, set] of [...images].sort(([a], [b]) => a.localeCompare(b)))
+          summary.push(`| ${cell(name)} | ${[...set].map((i) => (i ? `\`${cell(i)}\`` : "")).join(", ")} |`);
+      }
     }
 
     const teardown =

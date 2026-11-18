@@ -30164,6 +30164,17 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
       summary.push(
         `| Duration | ${seconds(batchTiming)}, ${state2 === "ready" ? "request to every server ready" : "request to failure"} |`
       );
+    if (operation2 === "create") {
+      const first = present.find((l4) => l4.server_image || l4.ami_name);
+      const si = first?.server_image;
+      if (si?.ref || si?.digest) {
+        const ref = (si.ref ?? "").replace(/^.*?\/dockerhub\//, "");
+        const built = si.created_at ? `built ${si.created_at}${si.age ? ` (${si.age})` : ""}` : "";
+        const parts = [ref && `\`${ref}\``, si.digest && `\`${si.digest}\``, built, si.source && `from ${si.source}`];
+        summary.push(`| Server image | ${cell(parts.filter(Boolean).join(", "))} |`);
+      }
+      if (first?.ami_name) summary.push(`| Host image | \`${cell(first.ami_name)}\` |`);
+    }
     if (operation2 === "destroy" && batchCost) {
       const hours = typeof batchCost.hours === "number" ? `, ${batchCost.hours.toFixed(2)} instance-hours` : "";
       const part = priced === present.length ? "" : `; ${priced} of ${present.length} servers priced`;
@@ -30292,6 +30303,21 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
         ];
         summary.push(`| ${cells.map(cell).join(" | ")} |`);
       });
+    }
+    if (operation2 === "create") {
+      const images = /* @__PURE__ */ new Map();
+      for (const l4 of present)
+        for (const entry of l4.containers ?? []) {
+          const [name, ...rest] = entry.split(" ");
+          if (!name) continue;
+          if (!images.has(name)) images.set(name, /* @__PURE__ */ new Set());
+          images.get(name).add(rest.join(" "));
+        }
+      if (images.size) {
+        summary.push("", "| Container | Image |", "|---|---|");
+        for (const [name, set] of [...images].sort(([a7], [b7]) => a7.localeCompare(b7)))
+          summary.push(`| ${cell(name)} | ${[...set].map((i7) => i7 ? `\`${cell(i7)}\`` : "").join(", ")} |`);
+      }
     }
     const teardown = operation2 === "create" && outputs.batch_id ? ` Batch ${outputs.batch_id} was created; destroy it.` : "";
     if (responseError) throw new Error(`e2e-test-stack: ${operation2} reported: ${responseError}.${teardown}`);

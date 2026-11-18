@@ -618,6 +618,19 @@ test("create reports its duration, and each server's type, time to ready, slowes
     service_seconds: { keycloak: 123.39, postgres: 127.9, server: 21.3 },
     image_pull_seconds: 27.401,
     critical_path: { chain: ["postgres", "pull server image", "server"], seconds: 176.64 },
+    containers: [
+      "e2e-postgres postgres:16",
+      "e2e-keycloak keycloak:23.0.7",
+      "e2e-mattermost mattermost-enterprise-edition@sha256:20b2",
+    ],
+    server_image: {
+      ref: "*.ecr.*/dockerhub/mattermostdevelopment/mattermost-enterprise-edition:master",
+      digest: "sha256:20b2",
+      created_at: "2026-11-18T03:19:55Z",
+      age: "53 minutes ago",
+      source: "ecr-cache",
+    },
+    ami_name: "e2e-test-stack-ubuntu-24-04-2026-11-16T04-10-53.840Z",
   };
   const body = createResponse({
     error: null,
@@ -636,6 +649,15 @@ test("create reports its duration, and each server's type, time to ready, slowes
   assert.match(
     summary,
     /\| 0 \| ready \| https:\/\/pr-1234-abc-00\.test\.example \| c7i\.large \| 202\.7 s \| 27\.4 s \| postgres 127\.9 s \| postgres → pull server image → server, 176\.6 s \|/,
+  );
+  assert.match(
+    summary,
+    /\| Server image \| `mattermostdevelopment\/mattermost-enterprise-edition:master`, `sha256:20b2`, built 2026-11-18T03:19:55Z \(53 minutes ago\), from ecr-cache \|/,
+  );
+  assert.match(summary, /\| Host image \| `e2e-test-stack-ubuntu-24-04-2026-11-16T04-10-53\.840Z` \|/);
+  assert.match(
+    summary,
+    /\| Container \| Image \|\n\|---\|---\|\n\| e2e-keycloak \| `keycloak:23\.0\.7` \|\n\| e2e-mattermost \| `mattermost-enterprise-edition@sha256:20b2` \|\n\| e2e-postgres \| `postgres:16` \|/,
   );
 });
 
