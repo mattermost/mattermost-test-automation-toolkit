@@ -89,6 +89,7 @@ function redReason(description = "", release = false, pr = true, wording = "full
   if (fixedHere) parts.push(`${fixedHere} fixed on main`);
   else if (pull) parts.push("fixed on main");
   if (brokenBranch) parts.push(`${brokenBranch} broken on branch`);
+  const actionAt = parts.length;
   if (machine + check) parts.push(`${machine + check} machine failure${machine + check === 1 ? "" : "s"}, re-run`);
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";
@@ -103,21 +104,25 @@ function redReason(description = "", release = false, pr = true, wording = "full
   if (/environment errors, re-run/.test(d)) parts.push("environment errors, re-run");
   else if (/investigation required|many failures in one run/.test(d)) parts.push("many failures in one run");
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
-  if (wording === "none" && notYours && parts.length > 1) parts.splice(clearedAt, 1);
+  if (wording === "action" && parts.length > actionAt) parts.splice(0, actionAt);
+  else if ((wording === "none" || wording === "action") && notYours && parts.length > 1) parts.splice(clearedAt, 1);
   return parts.length ? parts.join(", ") : "still red";
 }
 function laneSummary(lanes, untriaged = [], release, pr = true) {
   const seen = lanes.filter((l) => Boolean(l.status));
+  const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
+  const rerunNote = (reasons) => reasons.some((r) => /(?<!not )\bre-run\b/.test(r)) ? ", re-run" : "";
   const redOthers = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending");
   const judgedOther = (l) => /^\([^)]+\) /.test(String(l.status?.description ?? ""));
   const otherRed = redOthers.filter((l) => !judgedOther(l)).map((l) => laneName(l.context));
   const judged = redOthers.filter(judgedOther);
+  const otherReason = (l, wording) => redReason(l.status?.description, isRelease, pr, wording);
   const otherNamed = (wording, names) => [
-    ...judged.slice(0, names).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false, pr, wording)}`),
-    judged.length > names ? `+${judged.length - names} triaged red` : "",
+    ...judged.slice(0, names).map((l) => `${laneName(l.context)}: ${otherReason(l, wording)}`),
+    judged.length > names ? `+${judged.length - names} triaged red${rerunNote(judged.slice(names).map((l) => otherReason(l, "none")))}` : "",
     otherRed.length ? `not triaged: ${otherRed.slice(0, names).join(", ")}${otherRed.length > names ? ` +${otherRed.length - names}` : ""} red` : ""
   ].filter(Boolean).join(" \xB7 ");
-  const otherCount = judged.length ? `${judged.length + otherRed.length} other E2E check(s) red` : `not triaged: ${otherRed.length} red`;
+  const otherCount = judged.length ? `${judged.length + otherRed.length} other E2E check(s) red${rerunNote(judged.map((l) => otherReason(l, "none")))}` : `not triaged: ${otherRed.length} red`;
   const join2 = (...parts) => parts.filter(Boolean).join(" \xB7 ");
   const fit = (texts, fewer = []) => {
     const fits = (text) => text.length <= STATUS_LIMIT;
@@ -141,29 +146,42 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
     const room = STATUS_LIMIT - (other ? other.length + 3 : 0);
     return join2(`${(all[all.length - 1] ?? "").slice(0, room - 1)}\u2026`, other);
   };
-  const waiting = seen.filter((l) => l.status.state === "pending");
-  if (waiting.length) return { state: "pending", description: fit([`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`]) };
+  const waiting = seen.filter((l) => l.status.state === "pending").map((l) => laneName(l.context));
+  if (waiting.length) {
+    const waitingFor = (shown) => shown ? `Triage is checking: waiting for ${waiting.slice(0, shown).join(", ")}${shown < waiting.length ? ` +${waiting.length - shown} more` : ""}` : `Triage is checking: waiting for ${waiting.length} lane(s)`;
+    return { state: "pending", description: fit([waitingFor(waiting.length)], waiting.map((_, i) => waitingFor(waiting.length - 1 - i))) };
+  }
   const red = seen.filter((l) => l.status.state !== "success");
-  const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
   const cleared = seen.filter((l) => {
     const n = namedIn(l.status.description);
     return l.status.state === "success" && n.cleared + (isRelease ? 0 : n.fixed) > 0;
   });
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
+  const clearedCount = cleared.length ? `${cleared.length} lane(s) cleared by triage` : "";
   if (red.length) {
-    const verdicts = (wording) => red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease, pr, wording)}`);
-    const texts = [...CLEARED_WORDINGS.map((wording) => join2(...verdicts(wording), clearedText)), join2(...verdicts("none"))];
-    const terse = verdicts("none");
+    const reasons = (wording) => red.map((l) => ({ name: laneName(l.context), reason: redReason(l.status.description, isRelease, pr, wording) }));
+    const named = (wording, shown) => {
+      const rs = reasons(wording);
+      const rest = rs.slice(shown).map((r) => r.reason);
+      const counted = rest.length ? `${shown ? "+" : ""}${rest.length}${shown ? " more" : ""} lane(s) red${rerunNote(rest)}` : "";
+      return join2(...rs.slice(0, shown).map((r) => `${r.name}: ${r.reason}`), counted);
+    };
+    const texts = [
+      ...CLEARED_WORDINGS.map((wording) => join2(named(wording, red.length), clearedText)),
+      join2(named("none", red.length), clearedCount),
+      named("none", red.length)
+    ];
     const fewer = [];
-    for (let shown = terse.length - 1; shown > 0; shown--) {
-      const rest = terse.slice(shown);
-      const rerun = rest.some((v) => /(?<!not )\bre-run\b/.test(v)) ? ", re-run" : "";
-      fewer.push(join2(...terse.slice(0, shown), `+${rest.length} more lane(s) red${rerun}`));
+    for (const wording of ["none", "action"]) {
+      for (let shown = red.length; shown > 0; shown--) fewer.push(named(wording, shown));
     }
+    fewer.push(named("action", 0));
     return { state: "failure", description: fit(texts, fewer) };
   }
-  if (redOthers.length) return { state: "success", description: fit([join2(clearedText, "triaged lanes green"), "triaged lanes green"]) };
-  if (clearedText) return { state: "success", description: fit([`${clearedText} \xB7 all lanes green`, `${cleared.length} lane(s) cleared by triage \xB7 all lanes green`]) };
+  if (redOthers.length) {
+    return { state: "success", description: fit([join2(clearedText, "triaged lanes green"), join2(clearedCount, "triaged lanes green"), "triaged lanes green"]) };
+  }
+  if (clearedText) return { state: "success", description: fit([`${clearedText} \xB7 all lanes green`, `${clearedCount} \xB7 all lanes green`]) };
   return { state: "success", description: "All lanes green" };
 }
 

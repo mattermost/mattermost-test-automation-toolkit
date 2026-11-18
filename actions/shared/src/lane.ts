@@ -72,9 +72,11 @@ export function releaseFromDescriptions(descriptions: readonly (string | null | 
 
 /**
  * How a red reason names what triage cleared: in full ("N not caused by PR"), in one word ("N cleared"), or not at all
- * beside anything else named. The shorter forms are for a summary that would not fit GitHub's 140 characters otherwise.
+ * beside anything else named. "action" goes further: only what a person has to do (a re-run, and the run-level flags),
+ * when the lane names any; the lane's own check still names the rest. The shorter forms are for a summary that would
+ * not fit GitHub's 140 characters otherwise.
  */
-export type ClearedWording = "full" | "short" | "none";
+export type ClearedWording = "full" | "short" | "none" | "action";
 const CLEARED_WORDINGS: readonly ClearedWording[] = ["full", "short", "none"];
 
 /** GitHub cuts a commit status description at this length. */
@@ -109,6 +111,8 @@ export function redReason(description: string | null | undefined = "", release =
   if (fixedHere) parts.push(`${fixedHere} fixed on main`);
   else if (pull) parts.push("fixed on main");
   if (brokenBranch) parts.push(`${brokenBranch} broken on branch`);
+  // From here on, what a person has to do and the run-level flags.
+  const actionAt = parts.length;
   if (machine + check) parts.push(`${machine + check} machine failure${machine + check === 1 ? "" : "s"}, re-run`);
   // Triage asked for the re-run itself, held it for a fix, or a person has to.
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
@@ -127,7 +131,8 @@ export function redReason(description: string | null | undefined = "", release =
   else if (/investigation required|many failures in one run/.test(d)) parts.push("many failures in one run");
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
   // Left out only beside something else, so a lane red for nothing but cleared failures still says so.
-  if (wording === "none" && notYours && parts.length > 1) parts.splice(clearedAt, 1);
+  if (wording === "action" && parts.length > actionAt) parts.splice(0, actionAt);
+  else if ((wording === "none" || wording === "action") && notYours && parts.length > 1) parts.splice(clearedAt, 1);
   return parts.length ? parts.join(", ") : "still red";
 }
 
@@ -139,24 +144,32 @@ export function redReason(description: string | null | undefined = "", release =
  */
 export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], release?: boolean, pr = true): LaneSummary {
   const seen = lanes.filter((l): l is { context: string; status: CommitStatus } => Boolean(l.status));
+  // Unset release is read from the lanes' text (see releaseFromDescriptions); nothing saying so is a PR's wording.
+  const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
+  // A verdict that asks a person to re-run; "re-running" is triage's own re-run, "not re-run: ..." a held one. A count
+  // that stands for checks keeps the instruction any of them carries.
+  const rerunNote = (reasons: readonly string[]): string => (reasons.some((r) => /(?<!not )\bre-run\b/.test(r)) ? ", re-run" : "");
   // A red check outside the aggregate's lanes (an upgrade lane) keeps "all lanes green" from being said; its own state
   // still gates the PR. One its own triage judged (its text starts with a label) is named with that verdict.
   const redOthers = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending");
   const judgedOther = (l: LaneStatus): boolean => /^\([^)]+\) /.test(String(l.status?.description ?? ""));
   const otherRed = redOthers.filter((l) => !judgedOther(l)).map((l) => laneName(l.context));
   const judged = redOthers.filter(judgedOther);
+  const otherReason = (l: LaneStatus, wording: ClearedWording): string => redReason(l.status?.description, isRelease, pr, wording);
   const otherNamed = (wording: ClearedWording, names: number): string => [
-    ...judged.slice(0, names).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false, pr, wording)}`),
-    judged.length > names ? `+${judged.length - names} triaged red` : "",
+    ...judged.slice(0, names).map((l) => `${laneName(l.context)}: ${otherReason(l, wording)}`),
+    judged.length > names ? `+${judged.length - names} triaged red${rerunNote(judged.slice(names).map((l) => otherReason(l, "none")))}` : "",
     otherRed.length ? `not triaged: ${otherRed.slice(0, names).join(", ")}${otherRed.length > names ? ` +${otherRed.length - names}` : ""} red` : "",
   ].filter(Boolean).join(" · ");
-  const otherCount = judged.length ? `${judged.length + otherRed.length} other E2E check(s) red` : `not triaged: ${otherRed.length} red`;
+  const otherCount = judged.length
+    ? `${judged.length + otherRed.length} other E2E check(s) red${rerunNote(judged.map((l) => otherReason(l, "none")))}`
+    : `not triaged: ${otherRed.length} red`;
   const join = (...parts: string[]): string => parts.filter(Boolean).join(" · ");
   // GitHub cuts the status at 140 characters, so the most detailed text that fits is written. `texts` is the text before
-  // the warning about other checks, most detailed first; `fewer` is what it gives way to when none fits. A check's name
-  // goes last: the other checks' cleared wording is shortened, then left out, then the text's own, then two other checks
-  // are named, then one, then they are only counted. Then the text gives way to `fewer`, and only when that does not fit
-  // either is it cut; the warning still fits whole.
+  // the warning about other checks, most detailed first; `fewer` is what it gives way to when none fits. Another check's
+  // name goes last: its cleared wording is shortened, then left out, then the text's own detail gives way, then two
+  // other checks are named, then one, then they are only counted (keeping a re-run any of them asks for). Then the text
+  // gives way to `fewer`, and only when that does not fit either is it cut; the warning still fits whole.
   const fit = (texts: readonly string[], fewer: readonly string[] = []): string => {
     const fits = (text: string): boolean => text.length <= STATUS_LIMIT;
     const own = [...new Set(texts)];
@@ -179,33 +192,49 @@ export function laneSummary(lanes: LaneStatus[], untriaged: LaneStatus[] = [], r
     const room = STATUS_LIMIT - (other ? other.length + 3 : 0);
     return join(`${(all[all.length - 1] ?? "").slice(0, room - 1)}…`, other);
   };
-  const waiting = seen.filter((l) => l.status.state === "pending");
-  if (waiting.length) return { state: "pending", description: fit([`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`]) };
+  const waiting = seen.filter((l) => l.status.state === "pending").map((l) => laneName(l.context));
+  if (waiting.length) {
+    // The last lanes it waits for are counted when their names do not fit.
+    const waitingFor = (shown: number): string => shown
+      ? `Triage is checking: waiting for ${waiting.slice(0, shown).join(", ")}${shown < waiting.length ? ` +${waiting.length - shown} more` : ""}`
+      : `Triage is checking: waiting for ${waiting.length} lane(s)`;
+    return { state: "pending", description: fit([waitingFor(waiting.length)], waiting.map((_, i) => waitingFor(waiting.length - 1 - i))) };
+  }
   const red = seen.filter((l) => l.status.state !== "success");
-  // Unset release is read from the lanes' text (see releaseFromDescriptions); nothing saying so is a PR's wording.
-  const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
   // A PR's fixed on main is cleared too; a release run's never is.
   const cleared = seen.filter((l) => {
     const n = namedIn(l.status.description);
     return l.status.state === "success" && n.cleared + (isRelease ? 0 : n.fixed) > 0;
   });
+  // The lanes triage cleared are named, then counted, before they are left out.
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
+  const clearedCount = cleared.length ? `${cleared.length} lane(s) cleared by triage` : "";
   if (red.length) {
-    const verdicts = (wording: ClearedWording): string[] => red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease, pr, wording)}`);
-    // What triage cleared on the red lanes, then the lanes it cleared whole, give way before a lane does.
-    const texts = [...CLEARED_WORDINGS.map((wording) => join(...verdicts(wording), clearedText)), join(...verdicts("none"))];
-    // Then the last lanes are counted, keeping a re-run any of them asks a person for.
-    const terse = verdicts("none");
+    const reasons = (wording: ClearedWording) => red.map((l) => ({ name: laneName(l.context), reason: redReason(l.status.description, isRelease, pr, wording) }));
+    // The first `shown` red lanes by name, the rest counted with any re-run they ask for.
+    const named = (wording: ClearedWording, shown: number): string => {
+      const rs = reasons(wording);
+      const rest = rs.slice(shown).map((r) => r.reason);
+      const counted = rest.length ? `${shown ? "+" : ""}${rest.length}${shown ? " more" : ""} lane(s) red${rerunNote(rest)}` : "";
+      return join(...rs.slice(0, shown).map((r) => `${r.name}: ${r.reason}`), counted);
+    };
+    // What triage cleared on the red lanes, then the lanes it cleared whole, give way before a red lane does.
+    const texts = [
+      ...CLEARED_WORDINGS.map((wording) => join(named(wording, red.length), clearedText)),
+      join(named("none", red.length), clearedCount),
+      named("none", red.length),
+    ];
+    // Then the last red lanes are counted; then each lane says only what a person has to do; last, every lane is counted.
     const fewer: string[] = [];
-    for (let shown = terse.length - 1; shown > 0; shown--) {
-      const rest = terse.slice(shown);
-      const rerun = rest.some((v) => /(?<!not )\bre-run\b/.test(v)) ? ", re-run" : "";
-      fewer.push(join(...terse.slice(0, shown), `+${rest.length} more lane(s) red${rerun}`));
+    for (const wording of ["none", "action"] as const) {
+      for (let shown = red.length; shown > 0; shown--) fewer.push(named(wording, shown));
     }
+    fewer.push(named("action", 0));
     return { state: "failure", description: fit(texts, fewer) };
   }
-  if (redOthers.length) return { state: "success", description: fit([join(clearedText, "triaged lanes green"), "triaged lanes green"]) };
-  // Many cleared lanes are counted, not named, so "all lanes green" is never cut.
-  if (clearedText) return { state: "success", description: fit([`${clearedText} · all lanes green`, `${cleared.length} lane(s) cleared by triage · all lanes green`]) };
+  if (redOthers.length) {
+    return { state: "success", description: fit([join(clearedText, "triaged lanes green"), join(clearedCount, "triaged lanes green"), "triaged lanes green"]) };
+  }
+  if (clearedText) return { state: "success", description: fit([`${clearedText} · all lanes green`, `${clearedCount} · all lanes green`]) };
   return { state: "success", description: "All lanes green" };
 }
