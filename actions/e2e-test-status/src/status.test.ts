@@ -311,8 +311,10 @@ test("release workflows read old out of date labels as fixed on main across refr
     fetchImpl: f.fetchImpl,
   });
   assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 2 fixed on main");
-  // Explicit RELEASE: "false" overrides inference for non-release callers: a PR's fixed on main is not blocking, and the
-  // legacy "out of date" keeps its old pull guidance.
+  // Explicit RELEASE: "false" overrides inference for non-release callers: fixed on main is not blocking, and the
+  // legacy "out of date" keeps its old pull guidance. With no PR (a main run) the failure is the commit's, not a PR's.
   await publish({ env: { ...baseEnv, RELEASE: "false", OPERATION: "refresh" }, fetchImpl: f.fetchImpl });
+  assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 1 not caused by this commit, 1 fixed on main");
+  await publish({ env: { ...baseEnv, COMPOSITE_IDENTITY: JSON.stringify({ ...id, gh_pr_number: 7 }), OPERATION: "refresh" }, fetchImpl: f.fetchImpl });
   assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 1 not caused by PR, 1 fixed on main");
 });
