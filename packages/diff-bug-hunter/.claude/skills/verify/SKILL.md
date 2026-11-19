@@ -8,8 +8,8 @@ Verify: $ARGUMENTS. The runner is `scripts/verify_ui.mjs` next to this file. It 
 Its output is text only: step results, scoped `ariaSnapshot()` YAML, and a final `VERDICT:` line. Never take,
 request or read screenshots.
 
-1. **Server and auth:** check that `VERIFY_BASE_URL` (or `MM_URL`, default `http://localhost:8065`) answers
-   `GET /api/v4/system/ping`. If it doesn't, stop and report `INFRA_ERROR`; do not start or reconfigure servers unasked.
+1. **Server and auth:** check that the target answers `GET /api/v4/system/ping`: the `base_url` the user gave, else
+   `VERIFY_BASE_URL`, else `MM_URL`, else `http://localhost:8065`. If it doesn't, stop and report `INFRA_ERROR`; do not start or reconfigure servers unasked.
    - Logged-in pages: the runner authenticates through the API before the first step, so no step goes to the login
      form. Put `"login": true` in the plan so missing credentials fail as `INFRA_ERROR`.
    - `VERIFY_USER` + `VERIFY_PASSWORD`: `POST /api/v4/users/login`. The server sets `MMAUTHTOKEN`, `MMUSERID` and
@@ -36,8 +36,14 @@ request or read screenshots.
    - Exit 1 `FAIL`: an assertion failed, the page threw (`pageerror`), an `/api/v4/` call returned >= 500, a request
      was still running at the settle deadline, or the page left the allowed origins. Each one fails automatically.
    - Exit 2: `INVALID_PLAN` (fix the plan) or `INFRA_ERROR` (fix the environment; never report it as a finding).
-   - Add `--freeze <name>.spec.ts` once the plan passes. It writes a plain `@playwright/test` spec with the same
-     oracle, which reruns in CI with no model and no tokens. Offer it to the user; do not commit it unasked.
+   - Add `--freeze <dir>/<name>.spec.ts` once the plan passes. It writes a plain `@playwright/test` spec with the
+     same oracle, which reruns in CI with no model and no tokens. Offer it to the user; do not commit it unasked.
+   - Freeze into a dedicated folder (e.g. `e2e-tests/playwright/specs/verify/`), never `/tmp`, and rerun it from
+     there: with no config, Playwright collects tests from every file under the current folder. The spec checks the
+     server this run checked; `VERIFY_REPLAY_BASE_URL` points it at another one.
+   - If a click times out, the reason from Playwright's call log is appended (e.g. an onboarding overlay that
+     "intercepts pointer events"). If an open menu or modal hides the app, the snapshot says so: press Escape before
+     checking app content.
 4. **Iterate:** on `FAIL`, read the failure snapshot and fix the plan only when the plan was wrong (wrong name, wrong
    region). Never relax an `expect` to make it pass. Stop after 3 runs.
 5. **Report in chat:** the plan, the verdict line, the snapshot lines that prove it, and the frozen spec path if any. A `FAIL` caused by the app is a

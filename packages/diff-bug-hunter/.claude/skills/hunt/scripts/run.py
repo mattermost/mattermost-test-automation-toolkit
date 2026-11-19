@@ -6,9 +6,11 @@
 usage: run.py run <pr> <A|B|A2>        3 runs on unmodified PR head (Go with -race); writes run_<tag>.json
        run.py base <pr> <A|B|A2>       the same tests once on the merge-base worktree; writes base_<tag>.json
        run.py mutants <pr> <A|A2|PR>   compile-check then score every mutant (M, then held-back M2); writes mutants_<tag>.json
-Run these one at a time (they share the PR worktrees; a lock enforces it). Long runs belong in the background.
-Exit codes: 0 ok, 2 INFRA_ERROR (0 tests executed, dirty worktree, dead DB, missing tool),
-3 COMPILE_ERROR in hunter tests (repair round).
+Run these one at a time, and not while prepare.py or ctx.py runs for the same PR (they share the worktrees and hunt dir;
+a lock enforces it). Long runs belong in the background.
+Exit codes: 0 ok, 2 INFRA_ERROR (0 tests executed, dirty worktree, dead DB, missing tool, another step holds the lock),
+3 COMPILE_ERROR in hunter tests (does not compile, wrong path, or a file with no TestHunt<mode>_ / Hunt<mode>_ test:
+the repair round fixes it).
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ if not _sys.pycache_prefix:
     _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
     _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
 
-import fcntl
+import hashlib
 import json
 import os
 import re
@@ -34,7 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from hunt_common import InfraError, git, hunt_dir, load_json, node_env, read_state, sh, under, write_json
+from hunt_common import InfraError, git, hunt_dir, hunt_lock, load_json, node_env, read_state, sh, under, write_json
 
 HUNT_FILE = re.compile(r"^(hunt_hunt[a-z0-9]+_test\.go|hunt_[a-z0-9]+\.test\.tsx?)$")
 RESULT_GO = re.compile(r"^\s*--- (PASS|FAIL|SKIP): (\S+)", re.M)
@@ -63,12 +65,14 @@ class Suite:
 class Outcome:
     results: dict[str, str] = field(default_factory=dict)   # identity -> PASS | FAIL | SKIP
     messages: dict[str, str] = field(default_factory=dict)  # identity -> normalized failure text
+    packages: dict[str, str] = field(default_factory=dict)  # Go package dir -> PASS | FAIL, as its `go test` exited
     log: str = ""
 
 
 def normalize_failure(text: str, wt: Path) -> str:
     """Failure text with what differs between two runs of the same failure removed: worktree paths, stack frames,
-    durations, addresses and goroutine ids. Two failures compare equal only if they say the same thing."""
+    durations, memory addresses and goroutine ids. Two failures compare equal only if they say the same thing, so
+    values written in hex (got 0x02, want 0x01) are kept; only frame offsets and 64-bit addresses are redacted."""
     text = text.replace(str(wt.resolve()), "<wt>").replace(str(wt), "<wt>")
     keep = [line for line in text.splitlines()
             if not re.match(r"\s+at |\s*created by |\t\S+\.go:\d+(?: \+0x[0-9a-fA-F]+)?$", line)]  # JS and Go frames
@@ -76,7 +80,13 @@ def normalize_failure(text: str, wt: Path) -> str:
     text = re.sub(r"(?i)goroutine \d+", "goroutine N", text)
     text = re.sub(r"\(\d+(?:\.\d+)?m?s\)", "", text)
     text = re.sub(r"\b\d+(?:\.\d+)?m?s$", "", text, flags=re.M)
-    text = re.sub(r"0x[0-9a-fA-F]+", "0x?", text)
+    text = re.sub(r"\+0x[0-9a-fA-F]+\b", "+0x?", text)  # frame offsets
+    text = re.sub(r"\b(pc|sp|fp|lr|addr)=0x[0-9a-fA-F]+", r"\1=0x?", text)  # registers in a signal line
+    # A traceback call's arguments ("pkg.f({0x54fe40, 0x6a08a0})", "testing.tRunner(0xc0001, 0x5843?)") are pointers
+    # into the binary, which move whenever the code does; a list of nothing but hex words is never assertion text.
+    text = re.sub(r"(?<=[\w)\]])\((?:[\s{},.?]|0x[0-9a-fA-F]+)*0x[0-9a-fA-F]+(?:[\s{},.?]|0x[0-9a-fA-F]+)*\)", "(...)",
+                  text)
+    text = re.sub(r"\b0x[0-9a-fA-F]{9,}\b", "0x?", text)  # heap, stack and mmap addresses (wider than 32 bits)
     text = re.sub(r"[ \t]+", " ", text).strip()
     return text[:4000]
 
@@ -114,8 +124,9 @@ def ensure_clean(wt: Path) -> None:
 
 def place(wt: Path, files: list[dict[str, str]], target_dirs: set[str]) -> list[Path]:
     """Write hunter files into wt, all or nothing. Model output picks the paths, so every path is validated before
-    anything is written (only hunt_* test files inside a target dir pass), and a failed write removes what was written."""
-    targets = []
+    anything is written (only new hunt_* test files inside a target dir pass), and a failed write removes what was
+    written."""
+    targets: list[tuple[Path, str]] = []
     for f in files:
         rel = str(f.get("path", ""))
         if not HUNT_FILE.match(Path(rel).name) or str(Path(rel).parent) not in target_dirs:
@@ -127,6 +138,9 @@ def place(wt: Path, files: list[dict[str, str]], target_dirs: set[str]) -> list[
             raise CompileError(str(e)) from e
         if not p.parent.is_dir():
             raise CompileError(f"{p.parent} does not exist in this worktree")
+        if p.exists() or p.is_symlink() or any(p == t for t, _ in targets):
+            # Never overwrite (and later delete) a file the repository already has, or write one path twice.
+            raise CompileError(f"refusing to write {rel!r}: the path is already taken; choose another hunt_* file name")
         targets.append((p, str(f.get("content", ""))))
     placed: list[Path] = []
     try:
@@ -158,6 +172,9 @@ def suite_for(tag: str, state: dict[str, Any], placed: list[Path], wt: Path) -> 
     for p in placed:
         rel = str(p.relative_to(wt))
         if rel.endswith(".go"):
+            # One -run pattern per package: another file's match would hide a file whose tests are misnamed.
+            if not re.search(rf"^func TestHunt{mode}_\w*\(", p.read_text(), re.M):
+                raise CompileError(f"{rel}: no test named TestHunt{mode}_<Name>(t *testing.T); rename the tests")
             s.go_patterns[str(Path(rel).parent)] = f"^TestHunt{mode}_"
         else:
             s.jest_files.append(rel)
@@ -199,6 +216,7 @@ def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome) -> Non
             # test line says so. Record it instead of reporting PASS.
             got[f"{d}::{PACKAGE_FAILED}"] = "FAIL"
         into.results.update(got)
+        into.packages[d] = "PASS" if p.returncode == 0 else "FAIL"
         for name, block in go_test_output(out).items():
             if got.get(f"{d}::{name}") == "FAIL":
                 into.messages[f"{d}::{name}"] = normalize_failure(block, wt)
@@ -226,8 +244,8 @@ def jest_root(wt: Path, rel: str) -> Path:
 
 
 def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
-    found = 0
     for rel in files:
+        found = 0
         root = jest_root(wt, rel)
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "out.json"
@@ -254,8 +272,9 @@ def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
                 if failures:
                     into.messages[key] = normalize_failure("\n".join(failures), wt)
                     into.log += "\n".join(failures) + "\n"
-    if files and not found:
-        raise InfraError(f"0 tests matching {prefix!r} executed in {files}")
+        if not found:
+            # Checked per file: a passing file must not hide one whose tests were all filtered out.
+            raise CompileError(f"{rel}: no test title starts with {prefix!r}; rename the tests")
 
 
 def jest_compiles(wt: Path, file: str) -> str | None:
@@ -292,12 +311,19 @@ def classify(statuses: list[str]) -> str:
     return "FLAKY"
 
 
+def fingerprint(files: list[dict[str, str]]) -> str:
+    return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+
+
 def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[str, Any]:
     wt = Path(state["wt"])
     ensure_clean(wt)
     files = load_json(hdir / tag / "response.json")["files"]
+    # `base` vets these exact files: a redispatched response must be run on head again first.
+    (hdir / f"run_{tag}.response.sha256").unlink(missing_ok=True)
     if not files:  # e.g. a Mode B hunter for a PR whose description promises nothing testable
         write_json(hdir / f"run_{tag}.json", {})
+        (hdir / f"run_{tag}.response.sha256").write_text(fingerprint(files))
         return {}
     placed: list[Path] = []
     outcomes = []
@@ -312,6 +338,7 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
     write_json(hdir / f"run_{tag}.json", table)
     write_json(hdir / f"run_{tag}.messages.json", outcomes[0].messages)
     (hdir / f"run_{tag}.log").write_text("\n\n=== run ===\n".join(o.log for o in outcomes))
+    (hdir / f"run_{tag}.response.sha256").write_text(fingerprint(files))
     return table
 
 
@@ -336,9 +363,15 @@ def base_table(head: dict[str, str], head_msgs: dict[str, str], o: Outcome) -> d
     out = {n: base_verdict(n, s, head, head_msgs, o.messages.get(n, "")) for n, s in o.results.items()}
     for n, status in head.items():
         if status == "FAIL_3_OF_3" and n not in o.results:
-            # No result line for it on base: its package died (panic, timeout) or the test is absent there.
-            pkg_failed = o.results.get(n.rsplit("::", 1)[0] + f"::{PACKAGE_FAILED}") == "FAIL"
-            out[n] = "BASE_FAILS_DIFFERENTLY" if pkg_failed else "NOT_RUN_ON_BASE"
+            # No result line for it on base. A package-level failure (teardown, a late race or panic) on head is new
+            # if the same package exited cleanly on base; otherwise the package died on base or the test is absent.
+            pkg = o.packages.get(n.split("::", 1)[0])
+            if n.endswith(f"::{PACKAGE_FAILED}") and pkg == "PASS":
+                out[n] = "NEW_PR_BUG"
+            elif pkg == "FAIL" or o.results.get(n.split("::", 1)[0] + f"::{PACKAGE_FAILED}") == "FAIL":
+                out[n] = "BASE_FAILS_DIFFERENTLY"
+            else:
+                out[n] = "NOT_RUN_ON_BASE"
     return out
 
 
@@ -351,6 +384,10 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, str]:
     files = load_json(hdir / tag / "response.json")["files"]
     if not (hdir / f"run_{tag}.json").exists():
         raise InfraError(f"run_{tag}.json missing: run `run.py run <pr> {tag}` before `base`")
+    sha = hdir / f"run_{tag}.response.sha256"
+    if not sha.exists() or sha.read_text().strip() != fingerprint(files):
+        raise InfraError(f"{tag}/response.json changed since run_{tag}.json was written; run `run.py run <pr> {tag}` "
+                         "again so base vets the tests that produced the head verdicts")
     head = load_json(hdir / f"run_{tag}.json")
     head_msgs = (load_json(hdir / f"run_{tag}.messages.json")
                  if (hdir / f"run_{tag}.messages.json").exists() else {})
@@ -379,14 +416,16 @@ def all_mutants(hdir: Path) -> list[dict[str, Any]]:
     return ms
 
 
-def is_kill(name: str, status: str, base: dict[str, str]) -> bool:
-    # A "(package failed)" key exists only when a package failed; its absence in the baseline means the package
-    # passed there, so a mutant that newly breaks teardown still counts as a kill.
-    default = "PASS" if name.endswith(f"::{PACKAGE_FAILED}") else None
-    return status == "FAIL" and base.get(name, default) == "PASS"
+def is_kill(name: str, status: str, base: Outcome) -> bool:
+    if status != "FAIL":
+        return False
+    if name.endswith(f"::{PACKAGE_FAILED}"):
+        # A package-level failure kills only if the baseline run of that package was observed to exit cleanly.
+        return base.packages.get(name.split("::", 1)[0]) == "PASS"
+    return base.results.get(name) == "PASS"
 
 
-def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: dict[str, str],
+def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: Outcome,
                  m: dict[str, Any]) -> dict[str, Any]:
     v: dict[str, Any] = {"id": m["id"], "held_back": m["held_back"], "file": m["file"],
                          "what_breaks": m["what_breaks"], "killers": [], "mutant": m}
@@ -400,14 +439,14 @@ def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: dict[str, 
                 "detail": f"`old` occurs {orig.count(m['old'])} times in {m['file']}; it must occur exactly once"}
     try:
         path.write_text(orig.replace(m["old"], m["new"], 1))
-        err = compiles(wt, m["file"])
-        if err:
-            return {**v, "verdict": "NEEDS_REGENERATION", "detail": err}
         try:
+            err = compiles(wt, m["file"])
+            if err:
+                return {**v, "verdict": "NEEDS_REGENERATION", "detail": err}
             r = run_suite(wt, suite, race=False).results
         except CompileError as e:
             return {**v, "verdict": "NEEDS_REGENERATION", "detail": str(e)[-1500:]}
-        except InfraError as e:  # one mutant's environment failure must not lose every other verdict
+        except InfraError as e:  # one mutant's environment failure (a compile-check timeout too) loses no other verdict
             return {**v, "verdict": "ERROR", "detail": str(e)[-1500:]}
         killers = sorted(n for n, s in r.items() if is_kill(n, s, base))
         return {**v, "verdict": "KILLED" if killers else "SURVIVED", "killers": killers}
@@ -429,7 +468,7 @@ def cmd_mutants(hdir: Path, state: dict[str, Any], tag: str) -> list[dict[str, A
                          "killers": [], "mutant": m, "verdict": "SURVIVED", "detail": "no tests to score"}
                         for m in all_mutants(hdir)]
         else:
-            base = run_suite(wt, suite, race=False).results
+            base = run_suite(wt, suite, race=False)
             verdicts = [score_mutant(wt, state, suite, base, m) for m in all_mutants(hdir)]
     finally:
         unplace(placed)
@@ -452,12 +491,8 @@ def main(argv: list[str]) -> int:
         signal.signal(sig, _terminate)
     hdir = hunt_dir(pr)
     try:
-        state = read_state(hdir)
-        with (hdir / ".lock").open("w") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as e:
-                raise InfraError(f"another run.py is using the worktrees of PR {pr}; run them one at a time") from e
+        with hunt_lock(hdir, pr):
+            state = read_state(hdir)  # inside the lock: ctx.py may be rewriting it
             if cmd == "run":
                 table = cmd_run(hdir, state, tag)
                 for n, c in table.items():

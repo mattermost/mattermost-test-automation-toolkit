@@ -7,11 +7,14 @@ else the skill needs lives inside the skill directory, so it works symlinked or 
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import subprocess
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +40,20 @@ def hunt_dir(pr: str | int) -> Path:
 
 class InfraError(RuntimeError):
     """The environment, not the code under test, failed. Printed as INFRA_ERROR and exit code 2."""
+
+
+@contextmanager
+def hunt_lock(hdir: Path, pr: str | int) -> Iterator[None]:
+    """One step at a time per PR: prepare.py resets the worktrees, ctx.py rewrites the hunt dir and run.py places
+    tests in the worktrees, so any two of them running together would corrupt each other's results."""
+    hdir.mkdir(parents=True, exist_ok=True)
+    with (hdir / ".lock").open("w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise InfraError(f"another hunt step (prepare.py, ctx.py or run.py) is using PR {pr}; "
+                             "run them one at a time") from e
+        yield
 
 
 def node_env() -> dict[str, str]:

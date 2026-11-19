@@ -73,8 +73,10 @@ validated strictly (one action per step, one locator kind, known keys only) befo
 - **Bounded:**
   - At most `MAX_STEPS = 10` steps of `goto`/`click`/`fill`/`press`/`select`/`check`/`wait_for`/`snapshot`.
   - Locators by role and accessible name first.
-  - Allowed origins only (`base_url` plus `allow_origins`): other hosts are blocked and logged, a `goto` that leaves
-    the server is refused, and a redirect, navigation or websocket that reaches another host fails the run.
+  - Allowed origins only (`base_url` plus `allow_origins`): other hosts are blocked and logged, a `goto` or
+    `api.path` that resolves off the server (or out of `/api/v4/`) is refused, and a redirect, navigation or
+    websocket toward another host fails the run. Chromium connects only through a local proxy that refuses other
+    origins, so even a redirect hop never reaches them.
 - **API login:** `VERIFY_TOKEN`, or `VERIFY_USER` + `VERIFY_PASSWORD`, logs in through `/api/v4/` before the first step
   (password: the server's `MMAUTHTOKEN` / `MMUSERID` / `MMCSRF` cookies; token: a Bearer header on same-origin
   fetch/XHR only, no cookie session, so no CSRF, and no authenticated websocket, images or downloads), so all 10 steps
@@ -87,12 +89,16 @@ validated strictly (one action per step, one locator kind, known keys only) befo
   requests settle, so a late 500 is not missed. Exit codes: 0 PASS, 1 FAIL, 2 INVALID_PLAN / INFRA_ERROR.
 - **Deterministic oracle:** `expect` must hold at least one DOM check (`visible`, `text` + `contains`,
   `count` + `min`) or an `/api/v4/` read (`status`, `json_has`).
-- **Freeze:** `--freeze out.spec.ts` turns a passing plan into a `@playwright/test` spec with the same oracle (allowed
-  origins, settling, viewport, timeouts, `json_has` matching), so the check reruns in CI with no model. It reads
-  `VERIFY_BASE_URL` / `MM_URL` first, so one frozen spec can target another server, and it passes `tsc --strict`.
+- **Freeze:** `--freeze specs/verify/<name>.spec.ts` turns a passing plan into a `@playwright/test` spec with the same oracle (allowed
+  origins and the same proxy, settling, viewport, timeouts, `json_has` matching), so the check reruns in CI with no
+  model, and it passes `tsc --strict`. It checks the server the run checked; set `VERIFY_REPLAY_BASE_URL` to point it
+  at another one. A spec frozen from an anonymous plan never sends `VERIFY_TOKEN`.
+- **Where frozen specs go:** a dedicated folder, e.g. `e2e-tests/playwright/specs/verify/`, never `/tmp`. Run them from
+  that folder: with no config, Playwright collects tests from every file under the current folder (a 7 s spec took
+  52 s from a busy `/tmp`).
 
 ```bash
-VERIFY_USER=sysadmin VERIFY_PASSWORD=... node .claude/skills/verify/scripts/verify_ui.mjs plan.json --freeze save.spec.ts
+VERIFY_USER=sysadmin VERIFY_PASSWORD=... node .claude/skills/verify/scripts/verify_ui.mjs plan.json --freeze specs/verify/save.spec.ts
 ```
 
 Run it where `require("playwright")` resolves (e.g. `mattermost/e2e-tests/playwright`), or set `NODE_PATH`.
@@ -120,7 +126,8 @@ Run it where `require("playwright")` resolves (e.g. `mattermost/e2e-tests/playwr
   `http://localhost:8065`.
 - **Cursor Automation (PR or release check):** start the stack as above, install the skill
   (`install-skill.sh --copy`), let the agent run `/verify <behaviour>` with the `VERIFY_*` secrets set, and keep
-  `--freeze` output as the artifact. The frozen spec uses the same API login and needs no model on reruns.
+  `--freeze` output as the artifact. The frozen spec uses the same API login and needs no model on reruns; replay it
+  against another server with `VERIFY_REPLAY_BASE_URL`.
 
 ## Install and run locally
 
@@ -152,7 +159,7 @@ make -C packages/diff-bug-hunter jest-deps verify-deps
 ```
 
 ```bash
-cd packages/diff-bug-hunter/tests/verify_fixtures && npx playwright install --with-deps chromium
+(cd packages/diff-bug-hunter/tests/verify_fixtures && npx playwright install --with-deps chromium)
 ```
 
 ```bash

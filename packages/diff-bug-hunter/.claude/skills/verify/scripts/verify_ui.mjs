@@ -6,23 +6,26 @@
 //
 // usage: verify_ui.mjs <plan.json> [--freeze <out.spec.ts>]
 // Exit codes: 0 PASS, 1 FAIL (an expectation, a page error, a >= 500 /api/v4/ response, a request still running at the
-// settle deadline, or leaving the allowed origins), 2 INVALID_PLAN or INFRA_ERROR. Errors print only their first line.
+// settle deadline, or leaving the allowed origins), 2 INVALID_PLAN or INFRA_ERROR. Errors print only their first line
+// (plus, for an action that timed out, the reason from Playwright's call log, e.g. an overlay that intercepts clicks).
 // Bounded by design: at most MAX_STEPS steps, allowed origins only (base_url plus allow_origins; other hosts are
-// blocked, and a redirect, navigation or websocket to them fails the run), every step and the final check wait for
+// blocked, and a redirect, navigation or websocket to them fails the run; Chromium connects only through a local proxy
+// that refuses other origins, so not even a redirect hop reaches them), every step and the final check wait for
 // in-flight requests to settle, and success is a deterministic DOM or /api/v4/ check, never a model's judgement.
 // --freeze writes a passing plan as a @playwright/test spec with the same oracle, so the check reruns with no model.
 //
 // Target (a server root, http or https, no user:password): plan.base_url, else $VERIFY_BASE_URL, else $MM_URL, else
 // http://localhost:8065; a malformed environment value is INFRA_ERROR. With credentials set, a
 // plan.base_url must have the same origin as $VERIFY_BASE_URL / $MM_URL / the default, so credentials never go to a
-// host the plan chose. Frozen specs read $VERIFY_BASE_URL / $MM_URL first and fall back to the frozen target.
+// host the plan chose. Frozen specs check the server the run checked; only $VERIFY_REPLAY_BASE_URL retargets them.
 //
 // Auth (API, before the first step, so no step is spent on the login form):
 //   VERIFY_TOKEN                   session or personal access token: a Bearer header on same-origin fetch/XHR only
 //                                  (fetched without following redirects) + the MMUSERID cookie; no cookie session, so
 //                                  no CSRF; the webapp's websocket, images and downloads stay unauthenticated
 //   VERIFY_USER + VERIFY_PASSWORD  POST /api/v4/users/login; the server sets MMAUTHTOKEN, MMUSERID and MMCSRF
-// Frozen specs embed the same apiLogin() and read the same variables. VERIFY_SETTLE_MS (default 10000) bounds settling.
+// Frozen specs embed the same apiLogin() and read the same variables; a spec frozen from an anonymous run never sends
+// VERIFY_TOKEN. VERIFY_SETTLE_MS (default 10000) bounds settling.
 //
 // Plan (unknown keys are rejected):
 // {
@@ -41,10 +44,14 @@
 //     {"api": {"path": "/api/v4/users/me", "status"?: 200, "json_has"?: {"username": "sysadmin"}}} ]
 // }
 // LOC: exactly one of {"role": "button", "name"?: "Save", "exact"?: true} | {"testid"} | {"label"} | {"placeholder"} |
-//      {"text"} | {"css"}, plus an optional integer "nth".
+//      {"text"} | {"css"}, plus an optional integer "nth" (not in "count", which counts every match).
+// "goto" and "api.path" are checked after URL resolution: they must stay on the server, and api.path under /api/v4/.
 
 import {createRequire} from 'node:module';
-import {readFileSync, writeFileSync} from 'node:fs';
+import {readFileSync, realpathSync, writeFileSync} from 'node:fs';
+import * as http from 'node:http';
+import * as net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 
 const MAX_STEPS = 10;
@@ -63,6 +70,14 @@ class PlanError extends Error {}
 class InfraError extends Error {}
 
 const firstLine = (err) => String(err instanceof Error ? err.message : err).split('\n')[0];
+
+// Why an action timed out, from Playwright's call log (e.g. an overlay that "intercepts pointer events"). The call log
+// is otherwise never printed: it can list request headers.
+function actionHint(err) {
+    const lines = String(err instanceof Error ? err.message : err).split('\n').map((l) => l.replace(/\x1b\[[0-9;]*m/g, '').trim());
+    const why = lines.reverse().find((l) => /intercepts pointer events|is not visible|is not enabled|outside of the viewport|not stable/.test(l));
+    return why ? ` (${why.replace(/^- /, '').slice(0, 240)})` : '';
+}
 
 function loadPlaywright() {
     // The caller's project first (e.g. mattermost/e2e-tests), then this script's location and NODE_PATH.
@@ -99,6 +114,16 @@ function httpOrigin(url, what) {
         throw new PlanError(`${what} must be a server root such as https://host:8065 (got path ${u.pathname})`);
     }
     return u.origin;
+}
+
+// A plan path resolves the way the browser will resolve it (tabs and newlines dropped, dot segments applied) and must
+// stay on the server under test.
+function staysOn(p, origin) {
+    try {
+        return new URL(p, origin).origin === origin;
+    } catch {
+        return false;
+    }
 }
 
 function checkLocator(loc, where) {
@@ -198,7 +223,8 @@ export function validatePlan(plan, env = process.env) {
         if (action === 'goto') {
             // A path on the server under test ("/team/channels/x"), never a URL: a frozen spec must be able to target
             // another server, and plans never leave this one.
-            if (!nonEmpty(s.goto) || !s.goto.startsWith('/') || s.goto.startsWith('//') || s.goto.includes('\\')) {
+            if (!nonEmpty(s.goto) || !s.goto.startsWith('/') || s.goto.startsWith('//') || s.goto.includes('\\') ||
+                !staysOn(s.goto, origin)) {
                 throw new PlanError(`${where}: goto must be a path starting with "/" (got ${JSON.stringify(s.goto)}); plans stay on the server under test`);
             }
         } else if (action === 'press') {
@@ -230,8 +256,10 @@ export function validatePlan(plan, env = process.env) {
             if (!isObj(api) || Object.keys(api).some((k) => !['path', 'status', 'json_has'].includes(k))) {
                 throw new PlanError(`${where}: api takes only path, status and json_has`);
             }
-            if (!nonEmpty(api.path) || !api.path.startsWith('/api/v4/')) {
-                throw new PlanError(`${where}: api.path must start with /api/v4/`);
+            // Checked after URL resolution too: "/api/v4/../../x" or a stray tab must not reach a non-API handler.
+            if (!nonEmpty(api.path) || !api.path.startsWith('/api/v4/') || !staysOn(api.path, origin) ||
+                !new URL(api.path, origin).pathname.startsWith('/api/v4/')) {
+                throw new PlanError(`${where}: api.path must be a path under /api/v4/ (got ${JSON.stringify(api.path)})`);
             }
             if ('status' in api && !(Number.isInteger(api.status) && api.status >= 100 && api.status < 500)) {
                 throw new PlanError(`${where}: api.status must be an integer from 100 to 499 (a server error always fails)`);
@@ -244,6 +272,9 @@ export function validatePlan(plan, env = process.env) {
         checkLocator(e[kind], where);
         if (kind === 'text' && !nonEmpty(e.contains)) {
             throw new PlanError(`${where}: text needs a non-empty "contains"`);
+        }
+        if (kind === 'count' && 'nth' in e.count) {
+            throw new PlanError(`${where}: count counts every match; nth is not allowed here`);
         }
         if (kind === 'count' && 'min' in e && !(Number.isInteger(e.min) && e.min >= 1)) {
             throw new PlanError(`${where}: min must be an integer >= 1 (0 would always pass)`);
@@ -311,6 +342,10 @@ async function snapshot(page, loc) {
         if (outsideAndTopLevel) {
             parts.push(`portal [role=${await portal.getAttribute('role')}]:\n${cap(await portal.ariaSnapshot())}`);
         }
+    }
+    if (!parts[0].trim() && parts.length > 1) {
+        // Mattermost's menus and modals set aria-hidden on the rest of the app while they are open.
+        parts[0] = '(the scope is hidden from the accessibility tree while the portal below is open; close it, e.g. press Escape, to check app content)';
     }
     return parts.join('\n');
 }
@@ -394,8 +429,129 @@ export function subset(want, got) {
         return got !== null && typeof got === 'object' && !Array.isArray(got) &&
             Object.entries(want).every(([k, v]) => subset(v, got[k]));
     }
-    return Object.is(want, got);
+    return want === got; // JSON numbers: -0 equals 0, as in the response's own JSON
 }
+
+// Self-contained (--freeze copies it): a forward proxy on 127.0.0.1 that Chromium sends every connection through.
+// Playwright's route() never sees redirect hops, so this is what keeps a redirect from even contacting an origin
+// outside `allowed`: plain-http requests are checked by their absolute URL, CONNECT tunnels (https, ws, wss) by the
+// host and port they name, and the tunnel goes to exactly that host and port. Refused targets get a 403 and are
+// reported through onBlocked. An unreachable allowed server closes the client connection (no 502 page), so Chromium
+// reports net::ERR_* and the runner can tell an infrastructure problem from an app failure. close() ends every
+// connection it still holds, upstream sockets included.
+export function startOriginGuard(httpMod, netMod, allowed, onBlocked) {
+    // hop-by-hop headers belong to one connection and are never forwarded (RFC 9110, section 7.6.1)
+    const hopByHop = ['connection', 'keep-alive', 'proxy-connection', 'proxy-authorization', 'proxy-authenticate', 'te',
+        'trailer', 'transfer-encoding', 'upgrade'];
+    const strip = (h) => {
+        const out = {...h};
+        const named = String(h.connection ?? '').split(',').map((v) => v.trim().toLowerCase()).filter(Boolean);
+        for (const k of [...hopByHop, ...named]) {
+            delete out[k];
+        }
+        return out;
+    };
+    const closers = [() => {}];
+    const server = httpMod.createServer((req, res) => {
+        let target = null;
+        try {
+            target = new URL(req.url ?? '');
+        } catch {
+            target = null;
+        }
+        if (!target || target.protocol !== 'http:') {
+            res.writeHead(400);
+            res.end();
+            return;
+        }
+        if (!allowed.has(target.origin)) {
+            onBlocked(target.origin);
+            res.writeHead(403);
+            res.end();
+            return;
+        }
+        const upstream = httpMod.request({host: target.hostname.replace(/^\[|\]$/g, ''), port: Number(target.port || 80),
+            method: req.method, path: target.pathname + target.search, headers: strip(req.headers)}, (up) => {
+            res.writeHead(up.statusCode ?? 502, strip(up.headers));
+            up.pipe(res);
+        });
+        upstream.on('error', () => res.destroy());
+        res.on('close', () => upstream.destroy()); // the browser hung up or closed: never keep the upstream open
+        req.pipe(upstream);
+    });
+    server.on('connection', (sock) => sock.on('error', () => sock.destroy()));
+    server.on('connect', (req, client, head) => {
+        // CONNECT names host:port exactly; anything else is refused, and the checked port is the one connected to.
+        const m = /^(\[[0-9a-fA-F:.]+\]|[^\s:/?#@[\]]+):(\d{1,5})$/.exec(req.url ?? '');
+        const port = m ? Number(m[2]) : 0;
+        if (!m || port < 1 || port > 65535) {
+            client.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+            return;
+        }
+        const origins = (() => {
+            try {
+                return [`https://${m[1]}:${port}`, `http://${m[1]}:${port}`].map((o) => new URL(o).origin);
+            } catch {
+                return [];
+            }
+        })();
+        if (!origins.length || !origins.some((o) => allowed.has(o))) {
+            if (origins.length) {
+                onBlocked(origins[0]);
+            }
+            client.end('HTTP/1.1 403 Forbidden\r\n\r\n');
+            return;
+        }
+        const up = (() => {
+            try {
+                return netMod.connect(port, m[1].replace(/^\[|\]$/g, ''));
+            } catch {
+                return null;
+            }
+        })();
+        if (!up) {
+            client.destroy();
+            return;
+        }
+        up.once('connect', () => {
+            client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+            if (head.length) {
+                up.write(head);
+            }
+            up.pipe(client);
+            client.pipe(up);
+        });
+        const end = () => {
+            up.destroy();
+            client.destroy();
+        };
+        up.on('error', end);
+        up.on('close', end);
+        client.on('error', end);
+        client.on('close', end);
+        closers.push(end);
+    });
+    return new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', () => {
+            const addr = server.address();
+            resolve({
+                port: typeof addr === 'object' && addr ? addr.port : 0,
+                close: () => {
+                    for (const close of closers) {
+                        close();
+                    }
+                    server.closeAllConnections();
+                    server.close();
+                },
+            });
+        });
+    });
+}
+
+// Chromium switches, not Playwright's proxy option: the APIRequestContext (login, API checks) stays a direct
+// connection with maxRedirects: 0, and '<-loopback>' sends localhost through the proxy too.
+const guardArgs = (port) => [`--proxy-server=http://127.0.0.1:${port}`, '--proxy-bypass-list=<-loopback>'];
 
 const hasCredentials = (env) => Boolean(env.VERIFY_TOKEN || (env.VERIFY_USER && env.VERIFY_PASSWORD));
 
@@ -526,14 +682,16 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
     const allowedSet = new Set(allowed);
     const scope = plan.scope ?? null;
     const {chromium} = loadPlaywright();
-    let browser;
-    try {
-        browser = await chromium.launch();
-    } catch (err) {
-        throw new InfraError(`cannot start Chromium: ${firstLine(err)}`);
-    }
     const problems = [];
     const blocked = new Set();
+    const guard = await startOriginGuard(http, net, allowedSet, (origin) => blocked.add(origin));
+    let browser;
+    try {
+        browser = await chromium.launch({args: guardArgs(guard.port)});
+    } catch (err) {
+        guard.close();
+        throw new InfraError(`cannot start Chromium: ${firstLine(err)}`);
+    }
     const finish = (code, reason = '', snap = '') => {
         if (blocked.size) {
             log(`blocked other origins: ${[...blocked].join(', ')} (add to allow_origins if the app needs them)`);
@@ -636,7 +794,7 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                     throw new InfraError(`server unreachable at ${base}: ${msg}`);
                 }
                 const snap = await snapshot(page, scope).catch(() => '(no snapshot)');
-                return finish(1, `${label} failed: ${problems.length ? `${problems.join('; ')}; ` : ''}${msg}`, snap);
+                return finish(1, `${label} failed: ${problems.length ? `${problems.join('; ')}; ` : ''}${msg}${actionHint(err)}`, snap);
             }
             if (problems.length) {
                 return finish(1, `${label}: ${problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
@@ -673,11 +831,24 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
             } catch (err) {
                 throw new InfraError(`cannot write ${freezeTo}: ${firstLine(err)}`);
             }
-            log(`frozen to ${freezeTo}: rerun with \`npx playwright test ${path.basename(freezeTo)}\` (no model needed)`);
+            const dir = path.dirname(path.resolve(freezeTo));
+            log(`frozen to ${freezeTo}: rerun with \`cd ${JSON.stringify(dir)} && npx playwright test ${JSON.stringify(path.basename(freezeTo))}\` (no model needed)`);
+            const real = (d) => {
+                try {
+                    return realpathSync(d);
+                } catch {
+                    return d;
+                }
+            };
+            if ([os.tmpdir(), '/tmp'].map(real).includes(real(dir))) {
+                // With no config Playwright collects tests from the whole current folder: /tmp can take a minute.
+                log(`note: keep frozen specs in a dedicated folder (e.g. e2e-tests/playwright/specs/verify/), not ${dir}`);
+            }
         }
         return finish(0);
     } finally {
         await browser.close().catch(() => {});
+        guard.close();
     }
 }
 
@@ -705,6 +876,16 @@ function locatorCode(loc) {
 }
 
 const one = (loc) => `${locatorCode(loc)}.${loc.nth === undefined ? 'first()' : `nth(${Number(loc.nth)})`}`;
+
+// The spec gets the runner's own startOriginGuard(); its one helper with an untyped parameter gets a type.
+function typedGuard() {
+    const src = startOriginGuard.toString();
+    const typed = src.replace('const strip = (h) => {', 'const strip = (h: Record<string, string | string[] | undefined>) => {');
+    if (typed === src) {
+        throw new Error('startOriginGuard() changed; update typedGuard()');
+    }
+    return typed;
+}
 
 // The spec gets the runner's own subset(), with TypeScript types added to its signature (it is recursive, so a typed
 // const cannot infer them).
@@ -775,11 +956,13 @@ const apiLogin: (context: BrowserContext, base: string, env: NodeJS.ProcessEnv) 
 
 // Frozen by verify_ui.mjs from a passing plan, with the same oracle: allowed origins only, every step settles, and page
 // errors, >= 500 /api/v4/ responses, requests still running at the deadline, or leaving the allowed origins fail.
-import {expect, test, type BrowserContext, type Page, type Request} from '@playwright/test';
+// It checks the server the run checked; set VERIFY_REPLAY_BASE_URL to point it at another one.
+import {chromium, expect, test, type Browser, type BrowserContext, type Page, type Request} from '@playwright/test';
+import * as http from 'node:http';
+import * as net from 'node:net';
 
-test.use({viewport: {width: 1280, height: 800}});
-
-const BASE = process.env.VERIFY_BASE_URL || process.env.MM_URL || ${q(base)};
+const BASE = process.env.VERIFY_REPLAY_BASE_URL || ${q(base)};
+const AUTHED = ${needsLogin ? 'true' : 'false'}; // an anonymous plan stays anonymous even where VERIFY_TOKEN is set
 const ALLOWED = new Set([new URL(BASE).origin, ...${q(allowOrigins)}.map((o: string) => new URL(o).origin)]);
 const SETTLE_MS = Number(process.env.VERIFY_SETTLE_MS ?? ${DEFAULT_SETTLE_MS});
 const QUIET_MS = ${QUIET_MS};
@@ -788,9 +971,11 @@ const TIMEOUT = ${ACTION_TIMEOUT_MS};
 const originOf: (url: string) => string | null = ${originOf.toString()};
 ${typedSubset()}
 
-// API reads carry the token when there is one; errors keep only their first line (the full one lists headers).
+// API reads of a signed-in plan carry the token when there is one; errors keep only their first line (the full one
+// lists headers).
 async function apiGet(page: Page, path: string) {
-  const auth: Record<string, string> = process.env.VERIFY_TOKEN ? {Authorization: \`Bearer \${process.env.VERIFY_TOKEN}\`} : {};
+  const token = AUTHED ? process.env.VERIFY_TOKEN : undefined;
+  const auth: Record<string, string> = token ? {Authorization: \`Bearer \${token}\`} : {};
   try {
     return await page.request.get(new URL(path, BASE).toString(),
       {headers: {'X-Requested-With': 'XMLHttpRequest', ...auth}, maxRedirects: 0});
@@ -799,10 +984,31 @@ async function apiGet(page: Page, path: string) {
   }
 }
 ${loginFn}
-test(${q(plan.name ?? 'frozen /verify plan')}, async ({page, context}) => {
+// Same origin guard as verify_ui.mjs (copied from its startOriginGuard): Chromium connects only through this local
+// proxy, so a redirect hop never reaches an origin outside ALLOWED.
+const startOriginGuard: (httpMod: typeof http, netMod: typeof net, allowed: Set<string>, onBlocked: (origin: string) => void) =>
+  Promise<{port: number, close: () => void}> = ${typedGuard()};
+
+let browser: Browser | undefined;
+let guard: {port: number, close: () => void} | undefined;
+test.afterEach(async () => {
+  try {
+    await browser?.close();
+  } finally {
+    guard?.close();
+    browser = undefined;
+    guard = undefined;
+  }
+});
+
+test(${q(plan.name ?? 'frozen /verify plan')}, async () => {
   expect(Number.isFinite(SETTLE_MS) && SETTLE_MS > 0, 'VERIFY_SETTLE_MS must be a positive number').toBe(true);
   // As long as the runner may take: login, every step and expectation at their limits, and the final settle.
   test.setTimeout(60000 + ${steps} * (TIMEOUT + SETTLE_MS) + ${expects} * TIMEOUT + SETTLE_MS);
+  guard = await startOriginGuard(http, net, ALLOWED, () => {});
+  browser = await chromium.launch({args: [\`--proxy-server=http://127.0.0.1:\${guard.port}\`, '--proxy-bypass-list=<-loopback>']});
+  const context = await browser.newContext({viewport: {width: 1280, height: 800}});
+  const page = await context.newPage();
   const problems: string[] = [];
   const inflight = new Set<Request>();
   await context.route('**/*', (route) => {
@@ -899,5 +1105,6 @@ if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith
         console.log(`VERDICT: INFRA_ERROR ${firstLine(err)}`);
         process.exit(2);
     });
-    process.exitCode = await main();
+    // Exit explicitly: the verdict is final, and nothing still open (a stalled upstream socket) may keep it waiting.
+    process.exit(await main());
 }

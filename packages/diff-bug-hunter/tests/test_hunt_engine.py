@@ -158,7 +158,7 @@ def test_zero_tests_is_infra_error_and_bad_test_is_compile_error(tmp_path):
     no_tests = "package calc\n\nimport \"testing\"\n\nfunc TestSomethingElse(t *testing.T) {}\n"
     (hdir / "B").mkdir()
     (hdir / "B" / "response.json").write_text(json.dumps({"files": [{"path": "calc/hunt_huntb_test.go", "content": no_tests}]}))
-    with pytest.raises(run.InfraError, match="0 tests executed"):
+    with pytest.raises(run.CompileError, match="no test named TestHuntB_"):  # a naming mistake goes to repair
         run.cmd_run(hdir, state, "B", runs=1)
     (hdir / "B" / "response.json").write_text(json.dumps({"files": [{"path": "calc/hunt_huntb_test.go",
                                                                       "content": "package calc\nfunc TestHuntB_X(t *T) {}\n"}]}))
@@ -291,7 +291,9 @@ def test_trusted_rules_fail_closed_and_local_installs_read_disk(tmp_path, monkey
     with pytest.raises(trusted.InfraError, match="not on the trusted ref"):
         trusted.read("NEW_RULES.md", skill)
     (skill / "LOCAL.md").write_text("untracked local file")
-    assert trusted.read("LOCAL.md", skill) == "untracked local file"
+    with pytest.raises(trusted.InfraError, match="LOCAL.md"):
+        trusted.read("LOCAL.md", skill)  # an untracked file in a tracked skill is never read, nor silently dropped
+    assert trusted.read("NOT_ANYWHERE.md", skill) == ""
     _git(repo, "update-ref", "-d", "refs/remotes/origin/main")
     with pytest.raises(trusted.InfraError, match="no base branch"):
         trusted.read("lessons.jsonl", skill)
@@ -560,7 +562,7 @@ def test_verify_rejects_bad_plans(tmp_path, ui_server):
     for plan, msg in [({"steps": eleven, "expect": [{"visible": {"role": "main"}}]}, "MAX_STEPS is 10"),
                       ({"steps": [{"screenshot": "x.png"}], "expect": [{"visible": {"role": "main"}}]}, "needs exactly one of goto"),
                       ({"steps": [{"goto": "/ok"}]}, "at least one deterministic"),
-                      ({"steps": [], "expect": [{"api": {"path": "/etc/passwd"}}]}, "must start with /api/v4/")]:
+                      ({"steps": [], "expect": [{"api": {"path": "/etc/passwd"}}]}, "must be a path under /api/v4/")]:
         code, out = verify(tmp_path, {"base_url": ui_server, **plan})
         assert code == 2 and "INVALID_PLAN" in out and msg in out, (msg, out)
     code, out = verify(tmp_path, {"base_url": "http://127.0.0.1:9", "steps": [{"goto": "/"}],
@@ -719,6 +721,8 @@ def test_context_skips_deleted_and_renamed_files(tmp_path):
     assert sorted(state["changed"]) == ["calc/percent.go", "calc/renamed.go"]
     log = (hdir / "skipped.log").read_text()
     assert "calc/old.go\tdeleted" in log and "calc/moved.go\tdeleted" in log
+    # deleted paths still reach path-triggered rules
+    assert {"calc/old.go", "calc/moved.go"} <= set(json.loads((hdir / "ctx.json").read_text())["all_changed_files"])
 
 
 def test_place_writes_nothing_when_any_path_is_rejected(tmp_path):
@@ -864,6 +868,20 @@ def test_lessons_only_edit_does_not_block_the_trust_gate(tmp_path, monkeypatch):
     assert '"new"' not in trusted.read("lessons.jsonl", skill)  # hunters still get the base copy
 
 
+def test_deleted_and_recreated_lessons_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.delenv("HUNT_TRUSTED_REF", raising=False)
+    repo, skill = _skill_repo(tmp_path)
+    _git(repo, "rm", "-q", str(skill / "lessons.jsonl"))
+    _git(repo, "commit", "-qm", "PR deletes the lessons")
+    (skill / "lessons.jsonl").write_text(json.dumps({"pattern": "planted"}) + "\n")  # untracked replacement
+    _git(repo, "checkout", "-q", "main", "--", str(skill / "RELIABILITY.md"))  # only the lessons differ now
+    _git(repo, "commit", "-qam", "restore the rules")
+    with pytest.raises(trusted.InfraError, match="lessons.jsonl"):
+        trusted.check(skill)
+    text = trusted.read("lessons.jsonl", skill)
+    assert "planted" not in text and "Setup(t) stale client config" in text  # the base copy, never the disk
+
+
 # ------------------------------------------------------------------ runner robustness (self-review)
 
 def test_go_panic_before_any_result_line_is_a_failure_not_infra(tmp_path):
@@ -947,7 +965,7 @@ def test_regen_and_repair_requests(tmp_path, monkeypatch):
     hdir, state = make_hunt(tmp_path, "clean")
     monkeypatch.setattr(build_requests, "hunt_dir", lambda pr: hdir)
     run.cmd_mutants(hdir, state, "A")  # writes mutants_A.json, where M2 does not compile
-    build_requests.main("1", "regen", "M2")
+    build_requests.main("1", "regen", "M2", "A")
     req = json.loads((hdir / "R_M2" / "request.json").read_text())
     assert "totl" in req["user"]
     (hdir / "compile_A.log").write_text("calc/hunt_hunta_test.go:3: undefined: Nope")
@@ -1047,7 +1065,7 @@ def test_frozen_spec_keeps_errors_free_of_the_token(tmp_path, ui_server):
     assert code == 0, out
     (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
     cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
-    env = {**_node_env("token"), "VERIFY_BASE_URL": "http://127.0.0.1:9"}  # nothing listens there
+    env = {**_node_env("token"), "VERIFY_REPLAY_BASE_URL": "http://127.0.0.1:9"}  # nothing listens there
     p = subprocess.run(["node", str(cli), "test", "frozen.spec.ts", "--reporter=line"], cwd=tmp_path, env=env,
                        capture_output=True, text=True, timeout=180, check=False)
     assert p.returncode != 0 and "ECONNREFUSED" in p.stdout + p.stderr and TOKEN not in p.stdout + p.stderr
@@ -1110,16 +1128,23 @@ def test_base_vetting_compares_whole_failures_and_covers_missing_tests(tmp_path)
     out = "=== RUN   TestX\n    x_test.go:9: got 3, want 5\n--- FAIL: TestX (0.01s)\n=== RUN   TestY\n--- PASS: TestY (0.00s)\n"
     assert "got 3, want 5" in run.go_test_output(out)["TestX"]
     wt = tmp_path / "wt"
-    a = run.normalize_failure(f"{wt}/a.go:9: got 3 (0.01s) 0xc000123 \n    at foo ({wt}/x.js:1:2)", wt)
-    b = run.normalize_failure(f"{wt}/a.go:9: got 3 (0.20s) 0xc000999 \n    at bar ({wt}/y.js:3:4)", wt)
+    a = run.normalize_failure(f"{wt}/a.go:9: got 3 (0.01s) (*T)(0xc000123456) \n    at foo ({wt}/x.js:1:2)", wt)
+    b = run.normalize_failure(f"{wt}/a.go:9: got 3 (0.20s) (*T)(0xc000999999) \n    at bar ({wt}/y.js:3:4)", wt)
     assert a == b and "<wt>/a.go:9: got 3" in a
+    # values written in hex are assertion text, not addresses: different values must not compare equal
+    assert run.normalize_failure("got 0x02, want 0x01", wt) != run.normalize_failure("got 0x04, want 0x01", wt)
     head = {"d::TestX": "FAIL_3_OF_3", "d::TestZ": "FAIL_3_OF_3", "e::TestW": "FAIL_3_OF_3"}
     msgs = {"d::TestX": "got 3, want 5"}
-    o = run.Outcome(results={"d::TestX": "FAIL", "d::(package failed)": "FAIL"}, messages={"d::TestX": "got 7, want 5"})
+    o = run.Outcome(results={"d::TestX": "FAIL", "d::(package failed)": "FAIL"}, messages={"d::TestX": "got 7, want 5"},
+                    packages={"d": "FAIL", "e": "PASS"})
     table = run.base_table(head, msgs, o)
     assert table["d::TestX"] == "BASE_FAILS_DIFFERENTLY"  # fails on base, but not the same way
     assert table["d::TestZ"] == "BASE_FAILS_DIFFERENTLY"  # no line on base, its package died
     assert table["e::TestW"] == "NOT_RUN_ON_BASE"
+    # a teardown failure on head whose package exits cleanly on base is new in the PR
+    head = {"e::(package failed)": "FAIL_3_OF_3", "f::(package failed)": "FAIL_3_OF_3"}
+    table = run.base_table(head, {}, run.Outcome(results={"e::TestW": "PASS"}, packages={"e": "PASS"}))
+    assert table["e::(package failed)"] == "NEW_PR_BUG" and table["f::(package failed)"] == "NOT_RUN_ON_BASE"
 
 
 def test_wrong_test_path_from_a_model_is_a_repairable_compile_error(tmp_path, monkeypatch):
@@ -1316,7 +1341,7 @@ def test_unapplicable_mutant_goes_back_for_regeneration(tmp_path, monkeypatch):
     v = run.cmd_mutants(hdir, state, "A")
     assert v[0]["verdict"] == "NEEDS_REGENERATION" and "occurs 0 times" in v[0]["detail"]
     monkeypatch.setattr(build_requests, "hunt_dir", lambda pr: hdir)
-    build_requests.main("1", "regen", "M1")
+    build_requests.main("1", "regen", "M1", "A")
     assert (hdir / "R_M1" / "request.json").exists()
 
 
@@ -1403,14 +1428,13 @@ def test_path_triggered_rules_see_files_that_are_not_hunted(monkeypatch):
 
 def test_scripts_leave_no_bytecode_dirs_behind(tmp_path):
     import glob
-    import tempfile
-    pattern = os.path.join(tempfile.gettempdir(), "hunt-pyc-*")
-    before = set(glob.glob(pattern))
+    tmp = tmp_path / "t"  # a private TMPDIR: other processes' hunt-pyc-* dirs never show up here
+    tmp.mkdir()
     ctx_file = tmp_path / "c.json"
     ctx_file.write_text(json.dumps({"changed_files_head_source": [], "diff_production_code": ""}))
     subprocess.run([sys.executable, str(SCRIPTS / "lessons.py"), "match", str(ctx_file)], check=True, capture_output=True,
-                   env={**os.environ, "HUNT_TRUSTED_REF": trusted.WORKTREE, "PYTHONPYCACHEPREFIX": ""})
-    assert set(glob.glob(pattern)) - before == set()
+                   env={**os.environ, "HUNT_TRUSTED_REF": trusted.WORKTREE, "PYTHONPYCACHEPREFIX": "", "TMPDIR": str(tmp)})
+    assert glob.glob(os.path.join(tmp, "hunt-pyc-*")) == []
 
 
 @needs_playwright
@@ -1454,3 +1478,209 @@ def test_base_worktree_with_its_own_install_follows_its_lockfile(tmp_path, monke
     (base_wt / "webapp" / "package-lock.json").write_text("{}")
     prepare.webapp_deps(repo, base_wt, mb, mb)
     assert str(base_wt / "webapp") in log.read_text().splitlines()
+
+
+# ------------------------------------------------------------------ fourth CodeRabbit round
+
+def test_place_never_overwrites_an_existing_file_or_writes_a_path_twice(tmp_path):
+    wt = tmp_path / "wt"
+    (wt / "calc").mkdir(parents=True)
+    tracked = wt / "calc" / "hunt_hunta_test.go"
+    tracked.write_text("package calc // tracked by the repository")
+    with pytest.raises(run.CompileError, match="already taken"):
+        run.place(wt, [{"path": "calc/hunt_hunta_test.go", "content": "x"}], {"calc"})
+    assert tracked.read_text() == "package calc // tracked by the repository"
+    twice = [{"path": "calc/hunt_huntb_test.go", "content": "a"}, {"path": "calc/hunt_huntb_test.go", "content": "b"}]
+    with pytest.raises(run.CompileError, match="already taken"):
+        run.place(wt, twice, {"calc"})
+    assert not (wt / "calc" / "hunt_huntb_test.go").exists()
+
+
+def test_each_go_hunter_file_needs_its_own_matching_test(tmp_path):
+    hdir, state = make_hunt(tmp_path, "clean")
+    good = "package calc\n\nimport \"testing\"\n\nfunc TestHuntA_Zero(t *testing.T) {\n\tif Percent(0, 0) != 0 {\n\t\tt.Fatal()\n\t}\n}\n"
+    misnamed = "package calc\n\nimport \"testing\"\n\nfunc TestOther(t *testing.T) {\n\tt.Fatal(\"never run\")\n}\n"
+    (hdir / "A" / "response.json").write_text(json.dumps({"files": [
+        {"path": "calc/hunt_hunta_test.go", "content": good}, {"path": "calc/hunt_hunta2_test.go", "content": misnamed}]}))
+    with pytest.raises(run.CompileError, match="hunt_hunta2_test.go: no test named TestHuntA_"):
+        run.cmd_run(hdir, state, "A", runs=1)
+    assert not list(Path(state["wt"]).rglob("hunt_*"))
+
+
+def test_base_refuses_a_response_changed_after_the_head_run(tmp_path):
+    hdir, state = make_hunt(tmp_path, "go_bug")
+    run.cmd_run(hdir, state, "A", runs=1)
+    resp = json.loads((hdir / "A" / "response.json").read_text())
+    resp["files"][0]["content"] += "\n// redispatched\n"
+    (hdir / "A" / "response.json").write_text(json.dumps(resp))
+    with pytest.raises(run.InfraError, match="changed since run_A.json"):
+        run.cmd_base(hdir, state, "A")
+
+
+def test_package_kill_needs_an_observed_passing_baseline():
+    passed = run.Outcome(results={"calc::TestX": "PASS"}, packages={"calc": "PASS"})
+    failed = run.Outcome(results={"calc::TestX": "FAIL"}, packages={"calc": "FAIL"})
+    assert run.is_kill("calc::(package failed)", "FAIL", passed)
+    assert not run.is_kill("calc::(package failed)", "FAIL", failed)  # nothing passed at baseline
+    assert not run.is_kill("calc::(package failed)", "FAIL", run.Outcome())  # not observed at all
+    assert run.is_kill("calc::TestX", "FAIL", passed) and not run.is_kill("calc::TestX", "FAIL", failed)
+
+
+def test_a_compile_check_timeout_only_errors_that_mutant(tmp_path, monkeypatch):
+    hdir, state = make_hunt(tmp_path, "clean")
+    (hdir / "M" / "response.json").write_text(json.dumps({"mutants": [
+        {"id": f"M{i}", "file": "calc/percent.go", "old": "\t\treturn 0\n", "new": f"\t\treturn {i}\n", "what_breaks": "zero"}
+        for i in (1, 2, 3)]}))
+    (hdir / "M2" / "response.json").unlink()
+    real = run.compiles
+
+    def flaky_toolchain(wt, file):
+        if "return 2" in (Path(wt) / file).read_text():
+            raise run.InfraError("timed out after 900s: go test -c")
+        return real(wt, file)
+
+    monkeypatch.setattr(run, "compiles", flaky_toolchain)
+    v = {m["id"]: m["verdict"] for m in run.cmd_mutants(hdir, state, "A")}
+    assert v["M2"] == "ERROR" and v["M1"] in ("KILLED", "SURVIVED") and v["M3"] in ("KILLED", "SURVIVED"), v
+
+
+def test_prepare_and_ctx_refuse_while_another_hunt_step_runs(tmp_path, monkeypatch):
+    import fcntl
+    hdir = tmp_path / "hunt7"
+    monkeypatch.setattr(prepare, "hunt_dir", lambda pr: hdir)
+    monkeypatch.setattr(ctx, "hunt_dir", lambda pr: hdir)
+    monkeypatch.setattr(prepare, "prepare", lambda pr: pytest.fail("prepared while a run held the lock"))
+    monkeypatch.setattr(ctx, "build", lambda *a: pytest.fail("rebuilt the context while a run held the lock"))
+    monkeypatch.setattr(sys, "argv", ["ctx.py", "7"])
+    hdir.mkdir()
+    with (hdir / ".lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(hunt_common.InfraError, match="one at a time"):
+            prepare.main("7")
+        with pytest.raises(hunt_common.InfraError, match="one at a time"):
+            ctx.main()  # before it reads prepare.json or calls GitHub
+
+
+def test_go_test_ranges_survive_trailing_comments():
+    src = ("package p\n\nfunc TestA(t *testing.T) {\n\tx := 1\n} // TestA\n\n"
+           "func TestB(t *testing.T) {\n\ty := 2\n}\n\nfunc TestC(t *testing.T) {} // empty\n")
+    patch = "@@ -8,0 +8,1 @@\n+\ty := 2\n"
+    assert ctx.changed_go_tests(patch, src) == ["TestB"]
+    quoted = 'package p\n\nfunc TestA(t *testing.T) {} // see "x" and `y`\n\nfunc TestB(t *testing.T) {\n\ty := "//"\n}\n'
+    assert ctx.changed_go_tests("@@ -6,0 +6,1 @@\n+\ty := \"//\"\n", quoted) == ["TestB"]
+    assert ctx.go_code('\tu := "http://x" // c') == '\tu := "http://x"' and ctx.go_code("} // TestA") == "}"
+
+
+def test_regen_reads_only_the_requested_score(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    hdir, _ = make_hunt(tmp_path, "clean")
+    monkeypatch.setattr(build_requests, "hunt_dir", lambda pr: hdir)
+    row = {"id": "M2", "verdict": "NEEDS_REGENERATION", "file": "calc/percent.go", "what_breaks": "w"}
+    (hdir / "mutants_A.json").write_text(json.dumps([{**row, "mutant": {"old": "A-attempt"}, "detail": "A error"}]))
+    (hdir / "mutants_PR.json").write_text(json.dumps([{**row, "mutant": {"old": "PR-attempt"}, "detail": "PR error"}]))
+    build_requests.main("1", "regen", "M2", "PR")
+    user = json.loads((hdir / "R_M2" / "request.json").read_text())["user"]
+    assert "PR-attempt" in user and "PR error" in user and "A-attempt" not in user
+
+
+@pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(), reason="run `make jest-deps` first")
+def test_each_jest_hunter_file_needs_its_own_matching_test(tmp_path):
+    hdir, state = make_hunt(tmp_path, "react_bug")
+    resp = json.loads((hdir / "A" / "response.json").read_text())
+    misnamed = "test('unrelated name', () => { expect(1).toBe(2); });\n"
+    resp["files"].append({"path": "web/src/hunt_a2.test.tsx", "content": misnamed})
+    (hdir / "A" / "response.json").write_text(json.dumps(resp))
+    with pytest.raises(run.CompileError, match="hunt_a2.test.tsx: no test title starts with 'HuntA_'"):
+        run.cmd_run(hdir, state, "A", runs=1)
+
+
+@needs_playwright
+def test_a_redirect_hop_never_reaches_a_non_allowed_origin(tmp_path, ui_server):
+    SEEN.clear()
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/off"}],
+                                  "expect": [{"visible": {"role": "main"}}]}, auth="none")
+    assert code == 1 and "redirected to a non-allowed origin" in out, out
+    assert [h for h, path, _ in SEEN if path == "/landing"] == [], SEEN  # blocked before any connection to it
+
+
+@needs_playwright
+def test_verify_rejects_paths_that_resolve_off_the_server_or_the_api(tmp_path, ui_server):
+    for plan, msg in [({"steps": [{"goto": "/\t/example.com/"}]}, "goto must be a path"),
+                      ({"steps": [{"goto": "/\n/example.com/"}]}, "goto must be a path"),
+                      ({"expect": [{"api": {"path": "/api/v4/../../ok"}}]}, "under /api/v4/"),
+                      ({"expect": [{"api": {"path": "/api/v4/%2e%2e/%2e%2e/ok"}}]}, "under /api/v4/"),
+                      ({"expect": [{"count": {"role": "button", "nth": 2}}]}, "nth is not allowed")]:
+        full = {"base_url": ui_server, "steps": [], "expect": [{"visible": {"role": "main"}}], **plan}
+        code, out = verify(tmp_path, full, auth="none")
+        assert code == 2 and "INVALID_PLAN" in out and msg in out, (plan, out)
+    assert _module("m.subset({delta: -0}, {delta: 0}) && m.subset([0], [-0])") == "true"  # JSON numbers: -0 == 0
+
+
+@needs_playwright
+def test_frozen_spec_keeps_the_verified_target_anonymity_and_origin_guard(tmp_path, ui_server):
+    plan = {"name": "anonymous", "base_url": ui_server, "steps": [{"goto": "/ok"}],
+            "expect": [{"api": {"path": "/api/v4/users/me", "status": 401}}]}
+    code, out = verify(tmp_path, plan, "--freeze", "anon.spec.ts", auth="none")
+    assert code == 0 and f'cd "{tmp_path}" && npx playwright test "anon.spec.ts"' in out, out
+    spec = (tmp_path / "anon.spec.ts").read_text()
+    assert "const AUTHED = false;" in spec and "apiLogin" not in spec
+    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
+    cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
+
+    def run_spec(name: str, **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["node", str(cli), "test", name, "--reporter=line"], cwd=tmp_path,
+                              env={**_node_env("token"), **env}, capture_output=True, text=True, timeout=180, check=False)
+
+    # a shared CI VERIFY_TOKEN neither signs the anonymous check in nor retargets it: VERIFY_BASE_URL is ignored
+    p = run_spec("anon.spec.ts", VERIFY_BASE_URL="http://127.0.0.1:9")
+    assert p.returncode == 0 and "1 passed" in p.stdout, p.stdout + p.stderr
+    # the frozen spec has the same origin guard: a redirect hop off the allowed origins never connects
+    (tmp_path / "off.spec.ts").write_text(spec.replace('"/ok"', '"/off"'))
+    SEEN.clear()
+    p = run_spec("off.spec.ts")
+    assert p.returncode != 0 and "allowed origins" in p.stdout + p.stderr, p.stdout + p.stderr
+    assert [h for h, path, _ in SEEN if path == "/landing"] == [], SEEN
+
+
+def test_identical_go_panics_compare_equal_despite_moved_code_addresses(tmp_path):
+    # real `go test` panic output from two builds of the same bug: only binary addresses differ
+    def panic(pc: str, a: str, b: str, c: str) -> str:
+        return (f"--- FAIL: TestHuntA_Nil (0.00s)\npanic: runtime error: invalid memory address or nil pointer dereference [recovered]\n"
+                f"[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc={pc}]\n\ngoroutine 7 [running]:\n"
+                f"testing.tRunner.func1.2({{{a}, {b}}})\n\t/usr/local/go/src/testing/testing.go:1632 +0x230\n"
+                f"testing.tRunner(0xc000102b60, {c})\n\t/usr/local/go/src/testing/testing.go:1742 +0x123\n")
+    wt = tmp_path / "wt"
+    head = run.normalize_failure(panic("0x51f9a2", "0x54fe40", "0x6a08a0", "0x584368"), wt)
+    base = run.normalize_failure(panic("0x51fa12", "0x5501c0", "0x6a0960", "0x5843f0"), wt)
+    assert head == base and "nil pointer dereference" in head and "code=0x1" in head
+    assert run.normalize_failure("got (0x02), want (0x01)", wt) != run.normalize_failure("got (0x04), want (0x01)", wt)
+
+
+@needs_playwright
+def test_origin_guard_tunnels_only_the_named_allowed_port_and_survives_bad_connects():
+    script = r"""
+const http = await import('node:http'); const net = await import('node:net');
+const {startOriginGuard} = await import(process.env.VERIFY_UI_MODULE);
+const echo = net.createServer((s) => s.pipe(s)); await new Promise((r) => echo.listen(0, '127.0.0.1', r));
+const port = echo.address().port; const blocked = [];
+const guard = await startOriginGuard(http, net, new Set([`https://127.0.0.1:${port}`]), (o) => blocked.push(o));
+const CRLF2 = '\r\n\r\n';
+const send = (line, body = '') => new Promise((resolve) => {
+  const s = net.connect(guard.port, '127.0.0.1', () => s.write(line + CRLF2 + body)); let got = '';
+  s.on('data', (d) => { got += d; if (got.includes(CRLF2) && (!body || got.endsWith(body))) { s.destroy(); } });
+  s.on('close', () => resolve(got.split(CRLF2)[0] + (body && got.endsWith(body) ? ' +echo' : '')));
+  setTimeout(() => s.destroy(), 2000);
+});
+const out = [await send(`CONNECT 127.0.0.1:${port} HTTP/1.1`, 'ping'), await send('CONNECT 127.0.0.1:80 HTTP/1.1'),
+  await send(`CONNECT 127.0.0.1:${port}?:80 HTTP/1.1`), await send('CONNECT [::1] HTTP/1.1'), await send('CONNECT 127.0.0.1:0 HTTP/1.1')];
+guard.close(); echo.close();
+console.log(JSON.stringify({out, blocked}));
+"""
+    p = subprocess.run(["node", "--input-type=module", "-e", script], env={**_node_env("none"), "VERIFY_UI_MODULE": str(VERIFY_UI)},
+                       capture_output=True, text=True, timeout=30, check=False)
+    assert p.returncode == 0, p.stdout + p.stderr
+    res = json.loads(p.stdout)
+    assert res["out"][0] == "HTTP/1.1 200 Connection Established +echo", res  # the allowed port tunnels, early bytes too
+    assert res["out"][1].startswith("HTTP/1.1 403"), res  # another port on an allowed host is another origin
+    assert [o.split(" ")[1] for o in res["out"][2:]] == ["400", "400", "400"], res  # malformed: refused, no crash
+    assert res["blocked"] == ["https://127.0.0.1:80"], res

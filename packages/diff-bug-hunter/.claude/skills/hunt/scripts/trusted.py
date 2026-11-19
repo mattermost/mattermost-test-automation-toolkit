@@ -8,8 +8,10 @@ ref, never from the checked-out head:
   - HUNT_TRUSTED_REF unset: merge-base(HEAD, origin/HEAD | origin/main | origin/master) of the repo holding the skill.
   - HUNT_TRUSTED_REF=<ref>: that ref.
   - HUNT_TRUSTED_REF=worktree: the files on disk (only for people editing the rules themselves).
-A file that is not tracked at HEAD (a local, uncommitted or symlinked install outside any PR) is read from disk.
-A tracked file that is missing at the trusted ref fails closed: rules must land on the base branch before they apply.
+A skill that is not tracked in its repository (a local, uncommitted or symlinked install outside any PR) is read from
+disk. In a tracked skill, a file the trusted ref has always comes from the ref, even if HEAD deleted it and the disk
+holds a new copy; a file that is on disk or tracked at HEAD but missing at the trusted ref fails closed (rules must
+land on the base branch before they apply).
 
 usage: trusted.py check    print the trusted ref and fail (exit 2) if any skill file differs from it
 """
@@ -66,20 +68,28 @@ def _tracked_at_head(root: Path, rel: str) -> bool:
     return _git(root, "cat-file", "-e", f"HEAD:{rel}", check=False)[0] == 0
 
 
+def _skill_tracked(root: Path, skill_dir: Path) -> bool:
+    rel = skill_dir.resolve().relative_to(root.resolve()).as_posix()
+    return _git(root, "ls-files", "--error-unmatch", rel, check=False)[0] == 0
+
+
 def read(name: str, skill_dir: Path = SKILL_DIR) -> str:
     """Content of <skill_dir>/<name> as the trusted ref has it (see module doc)."""
     path = (skill_dir / name).resolve()
     root = repo_root(skill_dir)
     if root is None or os.environ.get("HUNT_TRUSTED_REF") == WORKTREE:
         return path.read_text() if path.exists() else ""
-    rel = path.relative_to(root.resolve()).as_posix()
-    if not _tracked_at_head(root, rel):
+    if not _skill_tracked(root, skill_dir):
         return path.read_text() if path.exists() else ""
+    rel = path.relative_to(root.resolve()).as_posix()
     ref = trusted_ref(root)
-    code, _ = _git(root, "cat-file", "-e", f"{ref}:{rel}", check=False)
-    if code != 0:
+    # The trusted ref is checked first: a file the PR deleted and the working copy recreated is still read from it.
+    if _git(root, "cat-file", "-e", f"{ref}:{rel}", check=False)[0] == 0:
+        return sh(git_cmd("show", f"{ref}:{rel}"), root).stdout
+    if _tracked_at_head(root, rel) or path.exists():
+        # On disk or in the PR but not on the base: never read it, and never silently drop it either.
         raise InfraError(f"{rel} is not on the trusted ref {ref[:12]}; rules must land on the base branch first")
-    return sh(git_cmd("show", f"{ref}:{rel}"), root).stdout
+    return ""  # nowhere at all (e.g. an optional rules file this checkout does not have)
 
 
 def check(skill_dir: Path = SKILL_DIR) -> str:
@@ -98,13 +108,15 @@ def check(skill_dir: Path = SKILL_DIR) -> str:
         raise InfraError(f"compiled bytecode is committed in the skill ({', '.join(bytecode[:3])}); Python could run it "
                          "instead of the reviewed source. Remove it from git.")
     ref = trusted_ref(root)
-    code, changed = _git(root, "diff", "--name-only", ref, "--", rel, check=False)
+    code, changed = _git(root, "diff", "--name-status", "--no-renames", ref, "--", rel, check=False)
     _, untracked = _git(root, "ls-files", "--others", "--exclude-standard", "--", rel, check=False)
     # lessons.jsonl may hold lessons added since the base (lessons.py add appends there); read() takes the trusted
-    # copy anyway, so an edited working copy cannot change what hunters see and must not block hunting.
+    # copy anyway, so an edited working copy cannot change what hunters see and must not block hunting. Only an
+    # in-place edit is exempt: a deleted, added or untracked lessons file is reported like any other change.
     # Locally generated caches are untracked noise; anything tracked was already refused above.
-    dirty = [f for f in changed.splitlines() + [u for u in untracked.splitlines() if "__pycache__" not in u]
-             if f and not f.endswith("/lessons.jsonl")]
+    entries = [line.split("\t", 1) for line in changed.splitlines() if "\t" in line]
+    dirty = [f for st, f in entries if not (st == "M" and f.endswith("/lessons.jsonl"))]
+    dirty += [u for u in untracked.splitlines() if u and "__pycache__" not in u]
     if code != 0:
         raise InfraError(f"{rel} is not on the trusted ref {ref[:12]}; the skill must land on the base branch first")
     if dirty:

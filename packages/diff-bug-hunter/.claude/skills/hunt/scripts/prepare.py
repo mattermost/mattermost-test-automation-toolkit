@@ -27,7 +27,20 @@ import shutil
 import sys
 from pathlib import Path
 
-from hunt_common import REPO, SKILL_DIR, InfraError, git, git_cmd, hunt_dir, mm_clone, node_env, scratch, sh, write_json
+from hunt_common import (
+    REPO,
+    SKILL_DIR,
+    InfraError,
+    git,
+    git_cmd,
+    hunt_dir,
+    hunt_lock,
+    mm_clone,
+    node_env,
+    scratch,
+    sh,
+    write_json,
+)
 
 STATEFUL = ("server/channels/api4/", "server/channels/app/", "server/channels/store/", "server/channels/web/",
             "server/channels/wsapi/")
@@ -109,6 +122,12 @@ def webapp_deps(wt: Path, wt_base: Path, mb: str, head: str) -> None:
 
 
 def main(pr: str) -> None:
+    # Held from the fetch to prepare.json: a run.py still using these worktrees must finish first.
+    with hunt_lock(hunt_dir(pr), pr):
+        prepare(pr)
+
+
+def prepare(pr: str) -> None:
     mm = mm_clone()
     ensure_clone(mm)
     # The PR's own base branch (release-* cherry-picks are common), not always master.

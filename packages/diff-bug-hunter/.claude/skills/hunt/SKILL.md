@@ -8,8 +8,10 @@ Hunt PR #$ARGUMENTS. Scripts are in `scripts/` next to this file; run them with 
 `HUNT_SCRATCH` (default `<tmp>/hunt`) holds clones, worktrees and `hunt<pr>/`. Model output, hunter tests and mutants
 are written only by `scripts/` (and by the agents they dispatch); you never edit them. The one file you write is a
 throwaway diagnostic test in step 5, deleted before the next script runs. Nothing is posted to GitHub and nothing is
-committed. Run `run.py` commands one at a time (they share the worktrees; a lock enforces it), in the background when
-a suite is slow, and never kill one: an interrupted run is cleaned up by `prepare.py <pr>`.
+committed. Run one script at a time per PR: `prepare.py`, `ctx.py` and every `run.py` command share the worktrees
+and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the first is running (wait for a background
+`run.py` to finish first). Run slow suites in the background and never kill one: an interrupted run is cleaned up by
+`prepare.py <pr>`.
 
 0. **Trust gate:** `trusted.py check`. Rules (`SKILL.md`, `lessons.jsonl`, `RELIABILITY.md`, `prompts/`) come from
    the base branch, never the PR head. If the check fails, stop: a change to this skill cannot take part in its own hunt.
@@ -36,7 +38,7 @@ a suite is slow, and never kill one: an interrupted run is cleaned up by `prepar
    - Planting: `build_requests.py <pr> mutants`, dispatch it, then `build_requests.py <pr> heldout`, dispatch it.
      Never show M or M2 to a hunter.
    - Score: `run.py mutants <pr> A`.
-   - `NEEDS_REGENERATION`: `build_requests.py <pr> regen <id>`, dispatch it once, then rescore. Still broken = dropped.
+   - `NEEDS_REGENERATION`: `build_requests.py <pr> regen <id> <tag>` (the score that reported it), dispatch it once, then rescore. Still broken = dropped.
      `ERROR` = that mutant hit an environment failure; rerun once, then report it as unscored.
    - Any of M1-M3 `SURVIVED`: `build_requests.py <pr> strengthen M1,..`, dispatch it, then `run.py run <pr> A2` and `run.py mutants <pr> A2`.
    - Always also run `run.py mutants <pr> PR` (a PR without tests in the hunted packages scores every mutant `SURVIVED`).

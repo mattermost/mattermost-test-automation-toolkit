@@ -7,7 +7,8 @@ usage: build_requests.py <pr> hunters            -> A/, B/
        build_requests.py <pr> mutants            -> M/ (3 visible faults)
        build_requests.py <pr> heldout            -> M2/ (2 held-back faults; needs M/response.json)
        build_requests.py <pr> strengthen <ids>   -> A2/ (needs A/response.json; ids = surviving mutants, e.g. M1,M3)
-       build_requests.py <pr> regen <id>         -> R_<id>/ (one mutant that did not compile, with the compiler error)
+       build_requests.py <pr> regen <id> <tag>   -> R_<id>/ (one mutant that mutants_<tag>.json marked
+                                                   NEEDS_REGENERATION, with that score's compiler error)
        build_requests.py <pr> repair <tag>       -> <tag>/request.repair.json (hunter files that did not compile, with
                                                    compile_<tag>.log; the old response is kept as response.prev.json)
 Each request is {tier, system, user, schema, response_path}; dispatch it with ../dispatch.md, one fresh agent each.
@@ -80,7 +81,7 @@ def mutant_system(state: dict[str, Any], count: int, ids: str, avoid: str = "") 
             .replace("{lang_name}", lang_name).replace("{avoid}", avoid))
 
 
-def main(pr: str, what: str, arg: str = "") -> None:
+def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
     hdir = hunt_dir(pr)
     state = read_state(hdir)
     ctx = json.loads((hdir / "ctx.json").read_text())
@@ -101,10 +102,14 @@ def main(pr: str, what: str, arg: str = "") -> None:
                 "surviving_faults": [m["what_breaks"] for m in planted if m["id"] in survivors]}
         print(write(hdir, "A2", hunter_system("A", state, ctx) + prompt("strengthen"), user, HUNTER_SCHEMA))
     elif what == "regen":
-        bad = next((v for f in sorted(hdir.glob("mutants_*.json")) for v in json.loads(f.read_text())
+        # Only the score that asked for it: mutants_A.json and mutants_PR.json can hold different attempts and errors.
+        scores = hdir / f"mutants_{tag}.json"
+        if not tag or not scores.exists():
+            sys.exit(f"usage: build_requests.py {pr} regen <id> <tag>, where mutants_<tag>.json exists in {hdir}")
+        bad = next((v for v in json.loads(scores.read_text())
                     if v["id"] == arg and v["verdict"] == "NEEDS_REGENERATION"), None)
         if bad is None:
-            sys.exit(f"no NEEDS_REGENERATION verdict for {arg} in {hdir}/mutants_*.json")
+            sys.exit(f"no NEEDS_REGENERATION verdict for {arg} in {scores}")
         user = {**mutant_user(ctx), "previous_attempt": bad["mutant"], "compiler_error": bad["detail"]}
         system = mutant_system(state, 1, arg, " Fix the previous attempt so it compiles and keeps its intent.")
         print(write(hdir, f"R_{arg}", system, user, MUTANT_SCHEMA))
@@ -128,4 +133,4 @@ def main(pr: str, what: str, arg: str = "") -> None:
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:4])
+    main(*sys.argv[1:5])

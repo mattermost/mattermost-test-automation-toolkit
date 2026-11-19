@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import prefilter
-from hunt_common import REPO, InfraError, git, hunt_dir, sh, write_json
+from hunt_common import REPO, InfraError, git, hunt_dir, hunt_lock, sh, write_json
 
 MAX_SOURCE_LINES = 1500     # bigger changed files are shown as windows around the hunks
 MAX_SIBLING_LINES = 3000    # total sibling test lines per batch
@@ -148,16 +148,36 @@ def test_targets(wt: Path, files: list[str]) -> list[dict[str, str]]:
     return out
 
 
+def go_code(line: str) -> str:
+    """One Go line without its trailing // comment (string, raw-string and rune literals respected), right-stripped."""
+    quote = ""
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == "\\" and quote != "`":
+                i += 1
+            elif c == quote:
+                quote = ""
+        elif c in "\"`'":
+            quote = c
+        elif line.startswith("//", i):
+            return line[:i].rstrip()
+        i += 1
+    return line.rstrip()
+
+
 def changed_go_tests(patch: str, head_src: str) -> list[str]:
     """Top-level Test functions that contain an added or removed line (new tests and edited bodies alike)."""
     lines = head_src.split("\n")
-    decls = []  # (first line, last line, name); gofmt puts a top-level closing brace alone in column 0
+    decls = []  # (first line, last line, name); gofmt puts a top-level closing brace in column 0
     for i, line in enumerate(lines, 1):
         if line.startswith("func "):
-            if line.rstrip().endswith("}"):  # one-line body, e.g. func TestA(t *testing.T) {}
+            # A trailing comment (`} // TestA`) does not hide the brace; `//` inside a literal is not a comment.
+            if go_code(line).endswith("}"):  # one-line body: func TestA(t *testing.T) {}
                 end = i
             else:
-                end = next((j for j in range(i + 1, len(lines) + 1) if lines[j - 1].rstrip() == "}"), len(lines))
+                end = next((j for j in range(i + 1, len(lines) + 1) if go_code(lines[j - 1]) == "}"), len(lines))
             # Only what `go test -run` executes: top-level func TestX(t *testing.T), with the parameter name optional
             # and any package qualifier (aliased or dot-imported testing). Not TestMain, benchmarks, helpers, or
             # methods whose names happen to start with Test.
@@ -260,8 +280,8 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> di
         "sibling_tests_and_helpers": sibling_tests(wt, files, syms),
         "callers": callers(wt, files, syms),
         "your_test_files": targets,
-        # every changed path, hunted or not, so path-triggered rules (e.g. SQL migrations) still apply
-        "all_changed_files": sorted(f.path for f in diffs),
+        # every changed path, hunted, skipped or deleted, so path-triggered rules (e.g. SQL migrations) still apply
+        "all_changed_files": sorted({f.path for f in diffs} | set(deleted)),
     }
     state = {"pr": pr, "batch": batch, "batches": len(plan.batches), "repo": str(repo), "wt": str(wt),
              "wt_base": prep["wt_base"], "merge_base": mb, "head": head, "changed": files, "targets": targets,
@@ -276,11 +296,12 @@ def main() -> None:
     ap.add_argument("pr")
     ap.add_argument("--batch", type=int, default=1)
     a = ap.parse_args()
-    prep = json.loads((hunt_dir(a.pr) / "prepare.json").read_text())
-    meta = json.loads(sh(["gh", "api", f"repos/{REPO}/pulls/{a.pr}"], Path(".")).stdout)
-    if meta.get("draft"):
-        print(f"note: PR #{a.pr} is a draft")
-    st = build(a.pr, a.batch, prep, meta)
+    with hunt_lock(hunt_dir(a.pr), a.pr):  # never rewrite state.json under a running run.py, nor read a half-made prep
+        prep = json.loads((hunt_dir(a.pr) / "prepare.json").read_text())
+        meta = json.loads(sh(["gh", "api", f"repos/{REPO}/pulls/{a.pr}"], Path(".")).stdout)
+        if meta.get("draft"):
+            print(f"note: PR #{a.pr} is a draft")
+        st = build(a.pr, a.batch, prep, meta)
     ctx = json.loads((hunt_dir(a.pr) / "ctx.json").read_text())
     print(f"batch {st['batch']}/{st['batches']}: {len(st['changed'])} files, {len(ctx['callers'])} caller excerpts, "
           f"{len(ctx['sibling_tests_and_helpers'])} sibling test files; skipped.log has the rest")
