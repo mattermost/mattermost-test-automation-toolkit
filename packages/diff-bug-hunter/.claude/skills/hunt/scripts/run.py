@@ -36,7 +36,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from hunt_common import InfraError, git, hunt_dir, hunt_lock, load_json, node_env, read_state, sh, under, write_json
+from hunt_common import (
+    InfraError,
+    git,
+    hunt_dir,
+    hunt_lock,
+    load_json,
+    node_env,
+    read_state,
+    require_disk,
+    scratch,
+    sh,
+    under,
+    write_json,
+)
 
 HUNT_FILE = re.compile(r"^(hunt_hunt[a-z0-9]+_test\.go|hunt_[a-z0-9]+\.test\.tsx?)$")
 RESULT_GO = re.compile(r"^\s*--- (PASS|FAIL|SKIP): (\S+)", re.M)
@@ -147,7 +160,7 @@ def place(wt: Path, files: list[dict[str, str]], target_dirs: set[str]) -> list[
         for p, content in targets:
             placed.append(p)  # before writing: a write that fails halfway must be rolled back too
             p.write_text(content)
-    except OSError:
+    except BaseException:  # an OSError, or SIGTERM's SystemExit before the caller holds the list to clean up
         unplace(placed)
         raise
     return placed
@@ -194,6 +207,8 @@ def go_root(wt: Path, d: str) -> Path:
 
 
 def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome) -> None:
+    if race:
+        require_disk(scratch())  # before the -race build starts, not after it fails for lack of space
     for d, pattern in sorted(patterns.items()):
         root = go_root(wt, d)
         pkg = "./" + os.path.relpath(wt / d, root)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,9 +44,10 @@ GIT_ENV = {**hunt_common.git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": 
 
 
 @pytest.fixture(autouse=True)
-def _no_user_git_config(monkeypatch):
+def _no_user_git_config(monkeypatch, tmp_path):
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))  # logs and caches never leave the test's own dir
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -1684,3 +1686,323 @@ console.log(JSON.stringify({out, blocked}));
     assert res["out"][1].startswith("HTTP/1.1 403"), res  # another port on an allowed host is another origin
     assert [o.split(" ")[1] for o in res["out"][2:]] == ["400", "400", "400"], res  # malformed: refused, no crash
     assert res["blocked"] == ["https://127.0.0.1:80"], res
+
+
+# ------------------------------------------------------------------ Phase 2: resource discipline
+
+def test_low_disk_is_infra_error_before_any_work(tmp_path, monkeypatch):
+    import collections
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(hunt_common.shutil, "disk_usage", lambda p: usage(10 * 1024**3, 9 * 1024**3, 1024**3))
+    with pytest.raises(hunt_common.InfraError, match="only 1.0 GiB free"):
+        hunt_common.require_disk(tmp_path / "not" / "created" / "yet")
+    monkeypatch.setattr(prepare, "mm_clone", lambda: pytest.fail("cloned with no disk space"))
+    with pytest.raises(hunt_common.InfraError, match="GiB free"):
+        prepare.prepare("1")
+    with pytest.raises(hunt_common.InfraError, match="GiB free"):  # before the -race build starts
+        run.go_run(tmp_path, {"calc": "^TestX$"}, True, run.Outcome())
+    monkeypatch.setattr(hunt_common.shutil, "disk_usage", lambda p: usage(10 * 1024**3, 0, 3 * 1024**3))
+    hunt_common.require_disk(tmp_path)  # 3 GiB is enough
+
+
+def test_runner_never_sleeps_or_retries_tests():
+    # flaky tests are reported (FLAKY, 3 runs), never retried into a pass or slept around
+    for name in ("run.py", "prepare.py", "eval_reverts.py"):
+        src = (SCRIPTS / name).read_text()
+        assert not re.search(r"\bsleep\(|--retries|retryTimes|-count=[2-9]", src), name
+
+
+# ------------------------------------------------------------------ Phase 2: lessons prune and the hit log
+
+def test_lessons_prune_is_deterministic_and_append_only(tmp_path):
+    def lesson(i: str, globs: list[str]) -> dict:
+        return {"id": i, "pattern": i, "applies_to": {"path_globs": globs}, "keywords": ["k"], "symptom": "s",
+                "check": "c", "source_pr": "1"}
+    lessons_ = [lesson("L001", ["server/channels/app/*"]), lesson("L002", ["webapp/*"]), lesson("L003", ["server/x/*"])]
+    log = [{"run": f"{n}/1", "matched": ["L001"]} for n in range(29)]
+    assert lessons.prune(lessons_, log, window=30) == [{"retire": "L002", "reason": "over-broad path glob(s) ['webapp/*']"}]
+    log.append({"run": "29/1", "matched": []})  # 30 hunts now: L003 never matched in any of them
+    log.append({"run": "0/1", "matched": []})  # a re-run of hunt 0 counts once, with its latest result
+    out = lessons.prune(lessons_, log, window=30)
+    assert [r["retire"] for r in out] == ["L002", "L003"] and "no match in the last 30" in out[1]["reason"]
+    assert [lessons.overbroad(g) for g in ("*", "**", "server/*", "webapp/**/*.ts", "server/channels/*")] == [True] * 4 + [False]
+    # retirements are append-only lines: load() drops the retired lesson, ids are never reused
+    f = tmp_path / "lessons.jsonl"
+    f.write_text("".join(json.dumps(x) + "\n" for x in lessons_) + json.dumps(out[0]) + "\n")
+    assert [x["id"] for x in lessons.load(f)] == ["L001", "L003"]
+    added = lessons.add({**lesson("x", ["server/y/*"]), "pattern": "new"}, f)
+    assert added["id"] == "L004"
+
+
+def test_hunters_log_which_lessons_they_were_shown(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    hdir, _ = make_hunt(tmp_path, "clean")
+    monkeypatch.setattr(build_requests, "hunt_dir", lambda pr: hdir)
+    build_requests.main("1", "hunters")
+    lines = [json.loads(x) for x in lessons.hits_log().read_text().splitlines()]
+    assert lines == [{"run": "1/1", "matched": lines[0]["matched"]}] and isinstance(lines[0]["matched"], list)
+
+
+# ------------------------------------------------------------------ Phase 2: revert-to-rule miner
+
+def _revert_history(tmp: Path) -> Path:
+    repo = tmp / "reverts"
+    (repo / "server" / "channels" / "app" / "platform").mkdir(parents=True)
+    (repo / "webapp" / "channels" / "src").mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "master")
+    web_conn = repo / "server" / "channels" / "app" / "platform" / "web_conn.go"
+    web_conn.write_text("package platform\n")
+    (repo / "webapp" / "channels" / "src" / "a.ts").write_text("export const a = 1;\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    for i, body in enumerate(["func (wc *WebConn) BroadcastHook() { wc.sendQueue <- nil }",
+                              "func (wc *WebConn) suppressTyping() { BroadcastHook(); wc.sendQueue <- nil }"]):
+        web_conn.write_text(f"package platform\n\n{body}\n")
+        _git(repo, "commit", "-qam", f"change {i}")
+        _git(repo, "revert", "--no-edit", "HEAD")
+    (repo / "webapp" / "channels" / "src" / "a.ts").write_text("export const a = 2;\n")
+    _git(repo, "commit", "-qam", "web change")
+    _git(repo, "revert", "--no-edit", "HEAD")
+    (repo / "webapp" / "channels" / "src" / "a.ts").write_text("export const a = 3; // Revert \"not a revert\"\n")
+    _git(repo, "commit", "-qam", "a change whose body says\n\nRevert \"something\" happened inside this PR")
+    return repo
+
+
+def test_mine_rules_proposes_parseable_candidates_and_writes_nothing(tmp_path, capsys):
+    import mine_rules
+    repo = _revert_history(tmp_path)
+    rules = SKILL / "RELIABILITY.md"
+    before = rules.read_text()
+    assert mine_rules.main(["mine_rules.py", str(repo), "-n", "30"]) == 0
+    out = capsys.readouterr().out
+    assert rules.read_text() == before  # never edits the rules
+    parsed = reliability.parse(out)
+    assert [r.id for r in parsed] == ["R11"]  # numbered after R10; the webapp glob was reverted only once
+    assert parsed[0].paths == ["server/channels/app/platform/*"]
+    assert parsed[0].diff.search("+ BroadcastHook()") and parsed[0].diff.search("+ sendQueue")
+    assert "Reverted 2 times" in out and 'Revert "change 0"' in out and "CANDIDATE" in parsed[0].invariant
+    assert "not a revert" not in out  # a message that only mentions a revert is not a revert
+
+
+# ------------------------------------------------------------------ Phase 2: revert benchmark
+
+def _bug_fix_history(tmp: Path) -> tuple[Path, str, str]:
+    """base -> bug (the go_bug fixture's head) -> fix (git revert of the bug)."""
+    repo = tmp / "bugrepo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "master")
+    _overlay(FIX / "go_bug" / "base", repo)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    _overlay(FIX / "go_bug" / "head", repo)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "Make Clamp faster\n\nAvoid a comparison in the hot path.")
+    bug = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "revert", "--no-edit", "HEAD")
+    return repo, bug, _git(repo, "rev-parse", "HEAD")
+
+
+def _control_history(tmp: Path) -> tuple[Path, str]:
+    repo = tmp / "cleanrepo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "master")
+    _overlay(FIX / "clean" / "base", repo)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    _overlay(FIX / "clean" / "head", repo)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "Handle a zero total in Percent")
+    return repo, _git(repo, "rev-parse", "HEAD")
+
+
+def _eval_manifest(tmp: Path, **thresholds: float) -> tuple[Path, str]:
+    tmp.mkdir(parents=True, exist_ok=True)
+    bug_repo, bug, fix = _bug_fix_history(tmp)
+    ctl_repo, ctl = _control_history(tmp)
+    truth = "Clamp returns values above max for some inputs."
+    manifest = {"thresholds": thresholds,
+                "cases": [{"id": "clamp", "repo": str(bug_repo), "bug_sha": bug, "fix_sha": fix, "area": "calc",
+                           "bug": truth, "source": "self-test fixture", "responses": str(FIX / "go_bug" / "responses")}],
+                "controls": [{"id": "percent", "repo": str(ctl_repo), "sha": ctl, "area": "calc",
+                              "responses": str(FIX / "clean" / "responses")}]}
+    path = tmp / "manifest.json"
+    path.write_text(json.dumps(manifest))
+    return path, truth
+
+
+def test_eval_reverts_scores_a_real_bug_and_a_clean_control(tmp_path, monkeypatch, capsys):
+    import eval_reverts
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    path, _ = _eval_manifest(tmp_path, raw_recall_min=1.0, vetted_recall_min=1.0, fp_rate_max=0.0)
+    code = eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out")])
+    out = capsys.readouterr().out
+    assert code == 0 and "VERDICT: PASS" in out, out
+    card = json.loads((tmp_path / "out" / "scorecard.json").read_text())
+    assert card["metrics"] == {"raw_recall": 1.0, "vetted_recall": 1.0, "fp_rate": 0.0, "raw_fp_rate": 0.0}
+    # the same responses always give the same scorecard
+    assert eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out2")]) == 0
+    assert json.loads((tmp_path / "out2" / "scorecard.json").read_text()) == card
+    # a threshold the run misses fails the benchmark
+    path2, _ = _eval_manifest(tmp_path / "strict", fp_rate_max=-1.0)
+    assert eval_reverts.main(["eval_reverts.py", str(path2), "--out", str(tmp_path / "out3")]) == 1
+
+
+def test_eval_reverts_refuses_a_manifest_whose_fix_is_not_the_revert(tmp_path, capsys):
+    import eval_reverts
+    path, _ = _eval_manifest(tmp_path)
+    m = json.loads(path.read_text())
+    m["cases"][0]["fix_sha"] = m["cases"][0]["bug_sha"]  # a commit cannot revert itself
+    path.write_text(json.dumps(m))
+    assert eval_reverts.main(["eval_reverts.py", str(path)]) == 2
+    assert "does not say it reverts" in capsys.readouterr().out
+
+
+def test_eval_reverts_dispatch_never_shows_the_ground_truth(tmp_path, monkeypatch, capsys):
+    import eval_reverts
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    path, truth = _eval_manifest(tmp_path)
+    m = json.loads(path.read_text())
+    for e in m["cases"] + m["controls"]:
+        e.pop("responses")  # hunters come from the dispatch command instead
+    path.write_text(json.dumps(m))
+    seen = tmp_path / "seen.txt"
+    dispatcher = tmp_path / "dispatch.py"
+    dispatcher.write_text(
+        "import json, shutil, sys\n"
+        f"req = json.load(open(sys.argv[1])); open({str(seen)!r}, 'a').write(req['system'] + req['user'])\n"
+        "out = {'files': [], 'tests': []}\n"
+        f"if '/A/' in req['response_path'] and 'Clamp' in req['user']:\n"
+        f"    out = json.load(open({str(FIX / 'go_bug' / 'responses' / 'A' / 'response.json')!r}))\n"
+        "json.dump(out, open(req['response_path'], 'w'))\n")
+    code = eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out"),
+                              "--dispatch", f"{sys.executable} {dispatcher}"])
+    out = capsys.readouterr().out
+    assert code == 0 and "clamp" in out and "VERDICT: PASS" in out, out
+    text = seen.read_text()
+    assert "Make Clamp faster" in text and truth not in text  # the commit message, never the ground truth
+
+
+# ------------------------------------------------------------------ Phase 2: /verify failure screenshot and feature map
+
+@needs_playwright
+def test_failure_screenshot_is_opt_in_and_only_on_fail(tmp_path, ui_server):
+    def run_plan(name: str, contains: str, *flags: str) -> tuple[int, list[Path], str]:
+        d = tmp_path / name
+        d.mkdir()
+        (d / "plan.json").write_text(json.dumps({"base_url": ui_server, "steps": [{"goto": "/ok"}],
+                                                 "expect": [{"text": {"role": "main"}, "contains": contains}]}))
+        p = subprocess.run(["node", str(VERIFY_UI), "plan.json", *flags], cwd=d, capture_output=True, text=True,
+                           env={**_node_env("none"), "VERIFY_BASE_URL": ui_server}, timeout=120, check=False)
+        return p.returncode, sorted(d.rglob("*.png")), p.stdout
+    code, pngs, out = run_plan("fail_flag", "not on the page", "--screenshot-on-fail")
+    assert code == 1 and [p.name for p in pngs] == ["failure.png"], out
+    assert pngs[0].read_bytes()[:8] == b"\x89PNG\r\n\x1a\n" and "not read by the agent" in out
+    assert "VERDICT: FAIL" in out and "scope snapshot at failure" in out  # the text record is unchanged
+    code, pngs, out = run_plan("pass_flag", "Fixture", "--screenshot-on-fail")
+    assert code == 0 and pngs == [], out  # passing runs never write one
+    code, pngs, out = run_plan("fail_noflag", "not on the page")
+    assert code == 1 and pngs == [], out  # without the flag, never
+
+
+@needs_playwright
+def test_feature_map_prints_only_the_matching_route_sections(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".claude" / "skills" / "verify").mkdir(parents=True)
+    (repo / ".claude" / "skills" / "verify" / "FEATURE_MAP.md").write_text(
+        "# Feature map\n\n## Channel header\nroute: /<team>/channels/<channel>\n- button \"town square channel menu\"\n\n"
+        "## Drafts\nroute: /<team>/drafts\n- testid drafts-list\n")
+    (repo / "e2e").mkdir()
+
+    def feature_map(*args: str, cwd: Path = repo / "e2e", **env: str) -> tuple[int, str]:
+        p = subprocess.run(["node", str(VERIFY_UI), "--feature-map", *args], cwd=cwd, capture_output=True, text=True,
+                           env={**_node_env("none"), **env}, timeout=30, check=False)
+        return p.returncode, p.stdout
+    code, out = feature_map("/channels/")
+    assert code == 0 and "## Channel header" in out and "town square channel menu" in out and "Drafts" not in out, out
+    code, out = feature_map("DRAFTS")
+    assert code == 0 and "testid drafts-list" in out and "Channel header" not in out, out
+    code, out = feature_map("emoji picker")
+    assert code == 0 and "no section" in out and "Channel header | Drafts" in out, out
+    code, out = feature_map("drafts", cwd=tmp_path)  # no map above this directory
+    assert code == 0 and "no FEATURE_MAP.md" in out, out
+    code, out = feature_map("drafts", cwd=tmp_path, VERIFY_FEATURE_MAP=str(repo / ".claude/skills/verify/FEATURE_MAP.md"))
+    assert code == 0 and "drafts-list" in out, out
+
+
+# ------------------------------------------------------------------ sixth CodeRabbit round (review of 8770fdc)
+
+def test_unstaging_the_skill_does_not_make_it_a_local_install(tmp_path, monkeypatch):
+    monkeypatch.delenv("HUNT_TRUSTED_REF", raising=False)
+    repo, skill = _skill_repo(tmp_path)
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "rm", "-r", "-q", "--cached", str(skill))  # still committed at HEAD, gone from the index
+    (skill / "RELIABILITY.md").write_text("# weakened on disk\n")
+    with pytest.raises(trusted.InfraError):
+        trusted.check(skill)
+    assert len(reliability.parse(trusted.read("RELIABILITY.md", skill))) == 10  # the base copy, never the disk
+
+
+def test_place_cleans_up_when_terminated_mid_write(tmp_path, monkeypatch):
+    wt = tmp_path / "wt"
+    (wt / "calc").mkdir(parents=True)
+    real = Path.write_text
+    calls = []
+
+    def write(self, data, *a, **kw):
+        calls.append(self)
+        if len(calls) == 2:
+            raise SystemExit(143)  # SIGTERM arrives while the second file is written
+        return real(self, data, *a, **kw)
+
+    monkeypatch.setattr(Path, "write_text", write)
+    files = [{"path": "calc/hunt_hunta_test.go", "content": "a"}, {"path": "calc/hunt_huntb_test.go", "content": "b"}]
+    with pytest.raises(SystemExit):
+        run.place(wt, files, {"calc"})
+    assert not list((wt / "calc").iterdir())
+
+
+def test_prepare_drops_the_previous_context_and_verdicts_first(tmp_path, monkeypatch):
+    hdir = tmp_path / "hunt9"
+    hdir.mkdir()
+    for name in ("state.json", "ctx.json", "run_A.json", "run_A.response.sha256", "base_A.json", "prepare.json"):
+        (hdir / name).write_text("{}")
+    (hdir / "A").mkdir()
+    monkeypatch.setattr(prepare, "hunt_dir", lambda pr: hdir)
+    monkeypatch.setattr(prepare, "mm_clone", lambda: (_ for _ in ()).throw(hunt_common.InfraError("stop here")))
+    with pytest.raises(hunt_common.InfraError, match="stop here"):
+        prepare.prepare("9")
+    assert sorted(p.name for p in hdir.iterdir()) == []  # nothing from the old head survives a new preparation
+
+
+@needs_playwright
+def test_frozen_replay_rechecks_the_cookie_rule_for_its_new_target(tmp_path, ui_server):
+    plan = {"name": "whoami", "base_url": ui_server, "login": True, "allow_origins": ["http://localhost:1"],
+            "steps": [{"goto": "/whoami"}], "expect": [{"text": {"css": "#who"}, "contains": "signed in as tester"}]}
+    code, out = verify(tmp_path, plan, "--freeze", "frozen.spec.ts", auth="password")
+    assert code == 0, out  # 127.0.0.1 and localhost are different hosts for cookies
+    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
+    cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
+    retarget = ui_server.replace("127.0.0.1", "localhost")  # now BASE shares its host with http://localhost:1
+    p = subprocess.run(["node", str(cli), "test", "frozen.spec.ts", "--reporter=line"], cwd=tmp_path,
+                       env={**_node_env("password"), "VERIFY_REPLAY_BASE_URL": retarget},
+                       capture_output=True, text=True, timeout=180, check=False)
+    assert p.returncode != 0 and "share the host of" in p.stdout + p.stderr, p.stdout + p.stderr
+    p = subprocess.run(["node", str(cli), "test", "frozen.spec.ts", "--reporter=line"], cwd=tmp_path,
+                       env={**_node_env("token"), "VERIFY_REPLAY_BASE_URL": retarget},
+                       capture_output=True, text=True, timeout=180, check=False)
+    assert p.returncode == 0, p.stdout + p.stderr  # token mode sets no session cookie
+
+
+def test_shipped_revert_manifest_is_well_formed():
+    import eval_reverts
+    m = json.loads((ROOT / "eval" / "revert_cases.json").read_text())
+    ids = [e["id"] for e in m["cases"] + m["controls"]]
+    assert len(ids) == len(set(ids)) and len(m["cases"]) == len(m["controls"]) == 5
+    for e in m["cases"]:
+        assert all(str(e.get(k, "")).strip() for k in eval_reverts.CASE_KEYS), e
+        assert re.fullmatch(r"[0-9a-f]{40}", e["bug_sha"]) and re.fullmatch(r"[0-9a-f]{40}", e["fix_sha"]), e
+        assert e["source"].startswith("https://github.com/mattermost/mattermost/pull/"), e
+    case_ids = {e["id"] for e in m["cases"]}
+    for e in m["controls"]:
+        assert re.fullmatch(r"[0-9a-f]{40}", e["sha"]) and e["matches"] in case_ids, e
+    assert set(m["thresholds"]) == set(eval_reverts.DEFAULT_THRESHOLDS)

@@ -16,7 +16,8 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
 0. **Trust gate:** `trusted.py check`. Rules (`SKILL.md`, `lessons.jsonl`, `RELIABILITY.md`, `prompts/`) come from
    the base branch, never the PR head. If the check fails, stop: a change to this skill cannot take part in its own hunt.
 1. **Prepare:** `prepare.py <pr>` (worktrees at the PR head and its merge-base with the PR's own base branch).
-   `INFRA_ERROR` = stop and report it.
+   `INFRA_ERROR` = stop and report it; that includes less than 2 GiB free under `HUNT_SCRATCH`, which `prepare.py`
+   and every Go `-race` run check first.
 2. **Context:** `ctx.py <pr> [--batch N]`. Quote its batch line. `skipped.log` lists every file not hunted; mention the
    deferred batches in the report and hunt them only if the user asks.
 3. **Hunters:** `build_requests.py <pr> hunters`, then dispatch `A/request.json` and `B/request.json` in parallel.
@@ -26,6 +27,7 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
    - `COMPILE_ERROR` (exit 3): one repair round. `build_requests.py <pr> repair <tag>`, dispatch
      `<tag>/request.repair.json` to a fresh agent, rerun. Still broken = report the hunter as failed.
    - `INFRA_ERROR` (exit 2): fix the environment and rerun. Never report it as "no findings".
+   - A `FLAKY` test is reported as flaky. Never retry it, add sleeps, or raise `-count` to make it pass.
 5. **Vet every `FAIL_3_OF_3`:**
    - Root-cause it with a throwaway diagnostic test, then delete it (`run.py` refuses to run on a dirty worktree).
    - `lessons.py match <scratch>/hunt<pr>/ctx.json` lists known false positives. If it is one, drop it.

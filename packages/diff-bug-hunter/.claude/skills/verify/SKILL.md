@@ -5,8 +5,9 @@ argument-hint: <what to verify> [base_url]
 ---
 
 Verify: $ARGUMENTS. The runner is `scripts/verify_ui.mjs` next to this file. It reads a JSON plan and drives Chromium.
-Its output is text only: step results, scoped `ariaSnapshot()` YAML, and a final `VERDICT:` line. Never take,
-request or read screenshots.
+Its output is text: step results, scoped `ariaSnapshot()` YAML, and a final `VERDICT:` line. Never take, request or
+read screenshots. The one exception: when the user asks for visual proof, add `--screenshot-on-fail`, which writes a
+single `failure.png` only if the run FAILs. Hand its path to the user and never read it yourself.
 
 1. **Server and auth:** check that the target answers `GET /api/v4/system/ping`: the `base_url` the user gave, else
    `VERIFY_BASE_URL`, else `MM_URL`, else `http://localhost:8065`. If it doesn't, stop and report `INFRA_ERROR`; do not start or reconfigure servers unasked.
@@ -21,6 +22,10 @@ request or read screenshots.
    - Never write credentials into the plan.
 2. **Plan:** write a plan of at most 10 steps (`MAX_STEPS`). The format is in the header of `verify_ui.mjs`. `goto`
    takes a path (`/team/channels/town-square`), never a URL.
+   - First run `node <this dir>/scripts/verify_ui.mjs --feature-map <route or feature>` from the repository. If the
+     repository has a `.claude/skills/verify/FEATURE_MAP.md` (or `$VERIFY_FEATURE_MAP`), it prints the matching
+     sections: use their routes and stable `data-testid` / ARIA names instead of guessing. Without a map, plan from
+     snapshots.
    - Locate by role and accessible name first; use `testid`/`css` only when there is no accessible name.
    - Add a `snapshot` step scoped to the region you need (e.g. `{"role": "dialog"}`), not the whole page. The default
      scope is `#app-content`. Open menus, dialogs and listboxes render in React portals outside it and are always

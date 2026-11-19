@@ -5,7 +5,12 @@
 
 usage: lessons.py add '<json>'          append one lesson (validated; existing lines are never rewritten)
        lessons.py match <ctx.json>      print the top 5 lessons for this context
-Only add a lesson after a failure was root-caused to the pattern with a diagnostic run.
+       lessons.py prune [--window 30] [--write]
+                                        list lessons to retire: no match in the last 30 logged hunts, or globs so broad
+                                        they match whole top-level trees; --write appends a retirement line for each
+Only add a lesson after a failure was root-caused to the pattern with a diagnostic run. Retirements are append-only
+lines too ({"retire": "L002", "reason": ...}); like any lesson change they apply once they land on the base branch.
+build_requests.py appends one line per hunt to $HUNT_SCRATCH/lessons_hits.jsonl ({"run", "matched"}), which prune reads.
 """
 from __future__ import annotations
 
@@ -20,23 +25,37 @@ if not _sys.pycache_prefix:
     _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
     _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
 
+import argparse
 import fnmatch
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 import trusted
-from hunt_common import LESSONS_FILE
+from hunt_common import LESSONS_FILE, scratch
 
 REQUIRED = ("pattern", "applies_to", "keywords", "symptom", "check", "source_pr")
 TOP = 5
+PRUNE_WINDOW = 30
 
 
-def load(path: Path | None = None) -> list[dict[str, Any]]:
-    """Lessons from the trusted base ref by default; from `path` when given (adding a lesson, tests)."""
+def hits_log() -> Path:
+    return scratch() / "lessons_hits.jsonl"
+
+
+def _records(path: Path | None) -> list[dict[str, Any]]:
     text = trusted.read(LESSONS_FILE.name) if path is None else (path.read_text() if path.exists() else "")
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def load(path: Path | None = None, include_retired: bool = False) -> list[dict[str, Any]]:
+    """Lessons from the trusted base ref by default; from `path` when given (adding a lesson, tests). Retired lessons
+    are left out unless include_retired."""
+    records = _records(path)
+    retired = {r["retire"] for r in records if "retire" in r}
+    return [r for r in records if "retire" not in r and (include_retired or r.get("id") not in retired)]
 
 
 def add(lesson: dict[str, Any], path: Path = LESSONS_FILE) -> dict[str, Any]:
@@ -45,7 +64,7 @@ def add(lesson: dict[str, Any], path: Path = LESSONS_FILE) -> dict[str, Any]:
         raise ValueError(f"lesson missing {missing}")
     if not isinstance(lesson["applies_to"].get("path_globs"), list):
         raise TypeError("applies_to.path_globs must be a list")
-    existing = load(path)  # the working copy being appended to
+    existing = load(path, include_retired=True)  # the working copy being appended to; ids are never reused
     if any(e["pattern"] == lesson["pattern"] for e in existing):
         raise ValueError(f"duplicate pattern: {lesson['pattern']}")
     lesson = {"id": f"L{len(existing) + 1:03d}", **{k: v for k, v in lesson.items() if k != "id"}}
@@ -81,11 +100,68 @@ def render(matched: list[dict[str, Any]]) -> str:
             + rows + "\n")
 
 
-if __name__ == "__main__":
-    if sys.argv[1] == "add":
-        print(json.dumps(add(json.loads(sys.argv[2]))))
-    elif sys.argv[1] == "match":
-        for m in match(json.loads(Path(sys.argv[2]).read_text())):
+def log_hits(run: str, matched: list[dict[str, Any]], log: Path | None = None) -> None:
+    """One line per hunt: which lessons its hunters were shown. prune reads this."""
+    log = log or hits_log()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a") as fh:
+        fh.write(json.dumps({"run": run, "matched": [m["id"] for m in matched]}) + "\n")
+
+
+def overbroad(glob: str) -> bool:
+    """A glob that covers a whole top-level tree (or everything): '*', '**', 'server/*', 'webapp/**/*.ts'."""
+    prefix = []
+    for seg in glob.split("/"):
+        if re.search(r"[*?\[]", seg):
+            break
+        prefix.append(seg)
+    return len(prefix) < 2  # fewer than two fixed directories before the first wildcard
+
+
+def prune(lessons: list[dict[str, Any]], log_lines: list[dict[str, Any]], window: int = PRUNE_WINDOW) -> list[dict[str, Any]]:
+    """Deterministic retirements: over-broad globs always; no match in the last `window` hunts only once the log holds
+    at least `window` hunts (fewer is not evidence). A re-run of the same hunt counts once, with its latest result."""
+    runs: dict[str, list[str]] = {}
+    for line in log_lines:
+        runs.pop(line["run"], None)  # move a re-run to the end
+        runs[line["run"]] = line["matched"]
+    recent = list(runs.values())[-window:]
+    out = []
+    for lsn in lessons:
+        broad = [g for g in lsn["applies_to"].get("path_globs", []) if overbroad(g)]
+        if broad:
+            out.append({"retire": lsn["id"], "reason": f"over-broad path glob(s) {broad}"})
+        elif len(recent) >= window and not any(lsn["id"] in m for m in recent):
+            out.append({"retire": lsn["id"], "reason": f"no match in the last {window} logged hunts"})
+    return out
+
+
+def main(argv: list[str]) -> None:
+    if argv[1:2] == ["add"]:
+        print(json.dumps(add(json.loads(argv[2]))))
+    elif argv[1:2] == ["match"]:
+        for m in match(json.loads(Path(argv[2]).read_text())):
             print(json.dumps(m))
+    elif argv[1:2] == ["prune"]:
+        ap = argparse.ArgumentParser(prog="lessons.py prune")
+        ap.add_argument("--window", type=int, default=PRUNE_WINDOW)
+        ap.add_argument("--write", action="store_true", help="append the retirements to the working copy of lessons.jsonl")
+        a = ap.parse_args(argv[2:])
+        log = hits_log()
+        lines = [json.loads(x) for x in log.read_text().splitlines() if x.strip()] if log.exists() else []
+        retire = prune(load(), lines, a.window)  # judged against the trusted lessons
+        for r in retire:
+            print(json.dumps(r))
+        if a.write and retire:
+            already = {r["retire"] for r in _records(LESSONS_FILE) if "retire" in r}
+            with LESSONS_FILE.open("a") as fh:
+                for r in retire:
+                    if r["retire"] not in already:
+                        fh.write(json.dumps(r) + "\n")
+        print(f"{len(retire)} to retire; {len({k for x in lines for k in [x['run']]})} hunts logged in {log}")
     else:
         sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

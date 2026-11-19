@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterator
@@ -28,6 +29,20 @@ REPO = os.environ.get("HUNT_REPO", "mattermost/mattermost")
 
 def scratch() -> Path:
     return Path(os.environ.get("HUNT_SCRATCH") or Path(tempfile.gettempdir()) / "hunt")
+
+
+MIN_FREE_BYTES = 2 * 1024**3  # a Go -race build of a Mattermost package plus worktrees needs about this much
+
+
+def require_disk(path: Path, min_free: int = MIN_FREE_BYTES) -> None:
+    """Fail fast with INFRA_ERROR instead of letting a build die halfway with a misleading compile error."""
+    p = path
+    while not p.exists() and p != p.parent:  # the scratch dir may not exist yet: measure the disk it will live on
+        p = p.parent
+    free = shutil.disk_usage(p).free
+    if free < min_free:
+        raise InfraError(f"only {free / 1024**3:.1f} GiB free under {path}; /hunt needs {min_free / 1024**3:.0f} GiB "
+                         "for worktrees and Go -race builds: free space or point HUNT_SCRATCH at a larger disk")
 
 
 def mm_clone() -> Path:

@@ -69,8 +69,13 @@ def _tracked_at_head(root: Path, rel: str) -> bool:
 
 
 def _skill_tracked(root: Path, skill_dir: Path) -> bool:
+    """Tracked in the index or committed at HEAD: unstaging the skill (`git rm --cached -r`) does not make it a local
+    install whose files would be read from disk."""
     rel = skill_dir.resolve().relative_to(root.resolve()).as_posix()
-    return _git(root, "ls-files", "--error-unmatch", rel, check=False)[0] == 0
+    if _git(root, "ls-files", "--error-unmatch", rel, check=False)[0] == 0:
+        return True
+    code, listed = _git(root, "ls-tree", "-r", "--name-only", "HEAD", "--", rel, check=False)
+    return code == 0 and bool(listed)
 
 
 def read(name: str, skill_dir: Path = SKILL_DIR) -> str:
@@ -100,7 +105,7 @@ def check(skill_dir: Path = SKILL_DIR) -> str:
     if os.environ.get("HUNT_TRUSTED_REF") == WORKTREE:
         return "HUNT_TRUSTED_REF=worktree: rules read from disk (rule-editing mode)"
     rel = skill_dir.resolve().relative_to(root.resolve()).as_posix()
-    if _git(root, "ls-files", "--error-unmatch", rel, check=False)[0] != 0:
+    if not _skill_tracked(root, skill_dir):
         return f"{rel} is not tracked: local install, read from disk"
     _, tracked = _git(root, "ls-files", "--", rel, check=False)
     bytecode = [f for f in tracked.splitlines() if "__pycache__/" in f or f.endswith((".pyc", ".pyo"))]

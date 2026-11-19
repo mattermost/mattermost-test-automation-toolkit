@@ -27,6 +27,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from ctx import reset_hunt_dir
 from hunt_common import (
     REPO,
     SKILL_DIR,
@@ -37,6 +38,7 @@ from hunt_common import (
     hunt_lock,
     mm_clone,
     node_env,
+    require_disk,
     scratch,
     sh,
     write_json,
@@ -121,21 +123,10 @@ def webapp_deps(wt: Path, wt_base: Path, mb: str, head: str) -> None:
             dst.symlink_to(src)
 
 
-def main(pr: str) -> None:
-    # Held from the fetch to prepare.json: a run.py still using these worktrees must finish first.
-    with hunt_lock(hunt_dir(pr), pr):
-        prepare(pr)
-
-
-def prepare(pr: str) -> None:
-    mm = mm_clone()
-    ensure_clone(mm)
-    # The PR's own base branch (release-* cherry-picks are common), not always master.
-    base = json.loads(sh(["gh", "api", f"repos/{REPO}/pulls/{pr}"], Path(".")).stdout)["base"]["ref"]
-    git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", f"+{base}:refs/remotes/origin/{base}")
-    wt, wt_base = scratch() / f"wt{pr}", scratch() / f"wt{pr}.base"
-    mb = worktrees(mm, f"pr-{pr}", f"origin/{base}", wt, wt_base)
-    changed = git(mm, "diff", "--name-only", "--no-renames", mb, f"pr-{pr}").splitlines()
+def deps(repo: Path, wt: Path, wt_base: Path, mb: str, head_ref: str) -> tuple[bool, bool]:
+    """What the changed files need: go.work for Go, Postgres and Redis for stateful server code, npm ci for the webapp.
+    Returns (go_changed, web_changed). Shared with eval_reverts.py, which hunts historical commits instead of PRs."""
+    changed = git(repo, "diff", "--name-only", "--no-renames", mb, head_ref).splitlines()
     go_changed = any(f.startswith("server/") and f.endswith(".go") for f in changed)
     web_changed = any(f.startswith("webapp/") for f in changed)
     if go_changed:
@@ -144,7 +135,30 @@ def prepare(pr: str) -> None:
     if any(f.startswith(STATEFUL) or "/app/platform/" in f for f in changed):
         services_up()
     if web_changed:
-        webapp_deps(wt, wt_base, mb, git(mm, "rev-parse", f"pr-{pr}"))
+        webapp_deps(wt, wt_base, mb, git(repo, "rev-parse", head_ref))
+    return go_changed, web_changed
+
+
+def main(pr: str) -> None:
+    # Held from the fetch to prepare.json: a run.py still using these worktrees must finish first.
+    with hunt_lock(hunt_dir(pr), pr):
+        prepare(pr)
+
+
+def prepare(pr: str) -> None:
+    require_disk(scratch())  # worktrees, node_modules and Go builds: refuse early rather than half-prepare
+    # The worktrees are about to move: context, responses and verdicts from the previous preparation no longer apply.
+    hdir = hunt_dir(pr)
+    reset_hunt_dir(hdir)
+    (hdir / "prepare.json").unlink(missing_ok=True)
+    mm = mm_clone()
+    ensure_clone(mm)
+    # The PR's own base branch (release-* cherry-picks are common), not always master.
+    base = json.loads(sh(["gh", "api", f"repos/{REPO}/pulls/{pr}"], Path(".")).stdout)["base"]["ref"]
+    git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", f"+{base}:refs/remotes/origin/{base}")
+    wt, wt_base = scratch() / f"wt{pr}", scratch() / f"wt{pr}.base"
+    mb = worktrees(mm, f"pr-{pr}", f"origin/{base}", wt, wt_base)
+    go_changed, web_changed = deps(mm, wt, wt_base, mb, f"pr-{pr}")
     write_json(hunt_dir(pr) / "prepare.json", {"pr": pr, "repo": str(mm), "wt": str(wt), "wt_base": str(wt_base),
                                               "head": git(mm, "rev-parse", f"pr-{pr}"), "merge_base": mb,
                                               "base_ref": base})

@@ -1,0 +1,38 @@
+{
+ "_about": "Real mattermost/mattermost commits that were later reverted (cases) and size-matched clean commits from the same directory (controls). Run with: scripts/eval_reverts.py eval/revert_cases.json --repo <clone of mattermost/mattermost with history back to 2023-06> --dispatch '<cmd>'. Each `bug` is quoted from the revert PR named in `source`; hunters never see it. Controls: the non-merge commit within 90 days of the case, in the same directory, with 0.5x-2x its non-test source files and changed lines (closest match), never reverted, and sharing no MM- ticket with the case. The thresholds are starting targets, not measurements: calibrate them after the first full run.",
+ "thresholds": {"raw_recall_min": 0.4, "vetted_recall_min": 0.2, "fp_rate_max": 0.2},
+ "cases": [
+  {"id": "user-patch-remote-id", "area": "server/channels/api4",
+   "bug_sha": "fc9d3be3689d7218f9bd5dd8699e74b33c440911", "fix_sha": "d1ca297721b75700b212370e339ed37ae1b1d6b1",
+   "bug": "`TestCreateDirectChannelWithRemoteUser` fails consistently across all shards and retries.",
+   "source": "https://github.com/mattermost/mattermost/pull/35996"},
+  {"id": "plugin-settings-sanitize", "area": "server/public/model",
+   "bug_sha": "832d0337857b03c35a3d43db58a5fccd71f694b7", "fix_sha": "82b9c3738b4b05a76d0def66eee58d33c693b77d",
+   "bug": "The commit inverted the sanitization logic.",
+   "source": "https://github.com/mattermost/mattermost/pull/34197"},
+  {"id": "status-store-select", "area": "server/channels/store/sqlstore",
+   "bug_sha": "84a83a1e0f4d2dbd7aa28766acd1e0049cc14094", "fix_sha": "d345e92136ef968fc22b7d2416b993a5654c9113",
+   "bug": "after an spike in errors on Community: \"converting NULL to int64 is unsupported\"",
+   "source": "https://github.com/mattermost/mattermost/pull/29985"},
+  {"id": "license-recursive-load", "area": "server/channels/app",
+   "bug_sha": "dd73c2af0f5ee8a5a2cfa201bcf44e8b08a124c1", "fix_sha": "acdfefe456eeb54b98409d618e03ec3493a240fa",
+   "bug": "The PR missed testing in HA scenarios and introduced a regression.",
+   "source": "https://github.com/mattermost/mattermost/pull/24498"},
+  {"id": "typing-emoji-suppression", "area": "server/channels/app/platform",
+   "bug_sha": "f5ee5463e4967b412c0cc402c56cb17d2d694f2b", "fix_sha": "6808a1c7339c55dc7dd895d732c35dd503ab690e",
+   "bug": "Bad merge introduced an already removed feature flag.",
+   "source": "https://github.com/mattermost/mattermost/pull/26281"}
+ ],
+ "controls": [
+  {"id": "control-login-rate-limit", "area": "server/channels/api4", "sha": "aab258a9f0a23839a3b10726f6a8318bf952bbb0",
+   "matches": "user-patch-remote-id"},
+  {"id": "control-marshal-data-wrapper", "area": "server/public/model", "sha": "c877807e71bdd22af10b11e562ae1c319b868afa",
+   "matches": "plugin-settings-sanitize"},
+  {"id": "control-token-store-select", "area": "server/channels/store/sqlstore", "sha": "eb851684e945bb82b68c86fa2c6b533ce76b8d4e",
+   "matches": "status-store-select"},
+  {"id": "control-file-extraction-logging", "area": "server/channels/app", "sha": "e864f9cfee66f4359d59413e5bc0701cbd28af86",
+   "matches": "license-recursive-load"},
+  {"id": "control-go121-features", "area": "server/channels/app/platform", "sha": "1e0de8f5597f3b37b9ae2ad8a2f8f2d2b40bde90",
+   "matches": "typing-emoji-suppression"}
+ ]
+}

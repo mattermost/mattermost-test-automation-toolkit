@@ -2,9 +2,11 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-// Text-only UI smoke check against a running Mattermost server. Never takes screenshots.
+// Text-only UI smoke check against a running Mattermost server. Takes no screenshot unless --screenshot-on-fail is
+// given, and then exactly one, failure.png, only when the run FAILs, for a person to look at; the agent never reads it.
 //
-// usage: verify_ui.mjs <plan.json> [--freeze <out.spec.ts>]
+// usage: verify_ui.mjs <plan.json> [--freeze <dir>/<name>.spec.ts] [--screenshot-on-fail]
+//        verify_ui.mjs --feature-map <route or feature> [FEATURE_MAP.md]
 // Exit codes: 0 PASS, 1 FAIL (an expectation, a page error, a >= 500 /api/v4/ response, a request still running at the
 // settle deadline, or leaving the allowed origins), 2 INVALID_PLAN or INFRA_ERROR. Errors print only their first line
 // (plus, for an action that timed out, the reason from Playwright's call log, e.g. an overlay that intercepts clicks).
@@ -672,7 +674,7 @@ async function reachable(context, base) {
     }
 }
 
-export async function verify(plan, log = console.log, freezeTo = null, env = process.env) {
+export async function verify(plan, log = console.log, freezeTo = null, env = process.env, {screenshotOnFail = null} = {}) {
     const {steps, base, allowed} = validatePlan(plan, env);
     const limit = settleMs(env);
     const authed = hasCredentials(env);
@@ -692,9 +694,20 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
         guard.close();
         throw new InfraError(`cannot start Chromium: ${firstLine(err)}`);
     }
-    const finish = (code, reason = '', snap = '') => {
+    let page = null;
+    const finish = async (code, reason = '', snap = '') => {
         if (blocked.size) {
             log(`blocked other origins: ${[...blocked].join(', ')} (add to allow_origins if the app needs them)`);
+        }
+        if (code === 1 && screenshotOnFail && page) {
+            // Opt-in, failures only, exactly one file: visual proof for a person (an overlay, broken CSS). The agent
+            // never reads it; the verdict and the text snapshot below stay the record.
+            try {
+                await page.screenshot({path: screenshotOnFail});
+                log(`failure screenshot for people (not read by the agent): ${screenshotOnFail}`);
+            } catch (err) {
+                log(`failure screenshot not written: ${firstLine(err)}`);
+            }
         }
         log(code === 0 ? 'VERDICT: PASS' : `VERDICT: FAIL ${reason}`);
         if (snap) {
@@ -712,7 +725,7 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
             blocked.add(origin);
             return route.abort('blockedbyclient');
         });
-        const page = await context.newPage();
+        page = await context.newPage();
         page.inflight = new Set();
         const loading = new Set();  // frames with a navigation request in progress
         page.on('request', (r) => {
@@ -794,10 +807,10 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                     throw new InfraError(`server unreachable at ${base}: ${msg}`);
                 }
                 const snap = await snapshot(page, scope).catch(() => '(no snapshot)');
-                return finish(1, `${label} failed: ${problems.length ? `${problems.join('; ')}; ` : ''}${msg}${actionHint(err)}`, snap);
+                return await finish(1, `${label} failed: ${problems.length ? `${problems.join('; ')}; ` : ''}${msg}${actionHint(err)}`, snap);
             }
             if (problems.length) {
-                return finish(1, `${label}: ${problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
+                return await finish(1, `${label}: ${problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
             }
             log(`${label} ok`);
         }
@@ -816,14 +829,14 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                 why = msg;
             }
             if (why || problems.length) {
-                return finish(1, `expect ${i + 1}: ${why ?? problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
+                return await finish(1, `expect ${i + 1}: ${why ?? problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
             }
             log(`expect ${i + 1} ok ${JSON.stringify(e)}`);
         }
         // Late events (a 500 or page error after the last check) count too.
         await afterStep();
         if (problems.length) {
-            return finish(1, `after the checks: ${problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
+            return await finish(1, `after the checks: ${problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
         }
         if (freezeTo) {
             try {
@@ -845,7 +858,7 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                 log(`note: keep frozen specs in a dedicated folder (e.g. e2e-tests/playwright/specs/verify/), not ${dir}`);
             }
         }
-        return finish(0);
+        return await finish(0);
     } finally {
         await browser.close().catch(() => {});
         guard.close();
@@ -945,6 +958,12 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
     const login = needsLogin ? `
   expect(Boolean(process.env.VERIFY_TOKEN || (process.env.VERIFY_USER && process.env.VERIFY_PASSWORD)),
     'set VERIFY_TOKEN or VERIFY_USER + VERIFY_PASSWORD').toBe(true);
+  // The runner's cookie rule, checked again for the replay target: cookies ignore the port, so with password login an
+  // allowed origin on BASE's host would receive the session cookie.
+  const host = new URL(BASE).hostname;
+  const sameHost = [...ALLOWED].filter((o) => o !== new URL(BASE).origin && new URL(o).hostname === host);
+  expect(Boolean(process.env.VERIFY_TOKEN) || sameHost.length === 0,
+    \`allowed origins \${sameHost.join(', ')} share the host of \${BASE}; with password login the session cookie would be sent there\`).toBe(true);
   await apiLogin(context, BASE, process.env);` : '';
     // Contextual typing gives the copied functions typed parameters, so the spec passes `tsc --strict`.
     const loginFn = needsLogin ? `
@@ -1074,14 +1093,79 @@ ${lines.map((l) => `  ${l}`).join('\n')}
 `;
 }
 
+// ---------------------------------------------------------------- FEATURE_MAP.md
+
+// A target repository can describe its UI for plan writers in .claude/skills/verify/FEATURE_MAP.md: one `## ` section per
+// feature with its route, keyboard shortcuts and stable data-testid / ARIA names. --feature-map prints the sections whose
+// heading or text mentions the query (case-insensitive), so plans use names the app really has instead of guesses.
+export function featureSections(text, query) {
+    const q = query.toLowerCase();
+    const sections = text.split(/^(?=## )/m).filter((sec) => sec.startsWith('## '));
+    return sections.filter((sec) => sec.toLowerCase().includes(q)).map((sec) => sec.trimEnd());
+}
+
+export function findFeatureMap(start = process.cwd(), env = process.env) {
+    if (env.VERIFY_FEATURE_MAP) {
+        return env.VERIFY_FEATURE_MAP;
+    }
+    for (let dir = path.resolve(start); ; dir = path.dirname(dir)) {
+        const candidate = path.join(dir, '.claude', 'skills', 'verify', 'FEATURE_MAP.md');
+        try {
+            readFileSync(candidate);
+            return candidate;
+        } catch {
+            // keep walking up to the filesystem root
+        }
+        if (path.dirname(dir) === dir) {
+            return null;
+        }
+    }
+}
+
+function featureMapCli(query, file) {
+    const map = file ?? findFeatureMap();
+    if (!map) {
+        console.log('no FEATURE_MAP.md (looked for .claude/skills/verify/FEATURE_MAP.md above the current directory and '
+            + '$VERIFY_FEATURE_MAP); write the plan from snapshots');
+        return 0;
+    }
+    let text;
+    try {
+        text = readFileSync(map, 'utf8');
+    } catch (err) {
+        console.log(`cannot read ${map}: ${firstLine(err)}`);
+        return 2;
+    }
+    const found = featureSections(text, query);
+    if (!found.length) {
+        const headings = text.split('\n').filter((l) => l.startsWith('## ')).map((l) => l.slice(3));
+        console.log(`no section of ${map} mentions ${JSON.stringify(query)}; sections: ${headings.join(' | ') || '(none)'}`);
+        return 0;
+    }
+    console.log(`from ${map}:\n\n${found.join('\n\n')}`);
+    return 0;
+}
+
 // ---------------------------------------------------------------- CLI
+
+const USAGE = 'usage: verify_ui.mjs <plan.json> [--freeze <dir>/<name>.spec.ts] [--screenshot-on-fail]\n' +
+    '       verify_ui.mjs --feature-map <route or feature> [FEATURE_MAP.md]';
 
 async function main() {
     const args = process.argv.slice(2);
+    if (args[0] === '--feature-map') {
+        if (args.length < 2 || args.length > 3) {
+            console.error(USAGE);
+            return 2;
+        }
+        return featureMapCli(args[1], args[2]);
+    }
+    const si = args.indexOf('--screenshot-on-fail');
+    const screenshotOnFail = si >= 0 ? (args.splice(si, 1), 'failure.png') : null;
     const fi = args.indexOf('--freeze');
     const freezeTo = fi >= 0 ? args.splice(fi, 2)[1] : null;
     if (args.length !== 1 || (fi >= 0 && !freezeTo)) {
-        console.error('usage: verify_ui.mjs <plan.json> [--freeze <out.spec.ts>]');
+        console.error(USAGE);
         return 2;
     }
     try {
@@ -1091,7 +1175,7 @@ async function main() {
         } catch (err) {
             throw new PlanError(`cannot read ${args[0]}: ${firstLine(err)}`);
         }
-        return await verify(plan, console.log, freezeTo);
+        return await verify(plan, console.log, freezeTo, process.env, {screenshotOnFail});
     } catch (err) {
         // Anything unexpected is an infrastructure problem, never a FAIL, and only its first line is printed.
         const kind = err instanceof PlanError ? 'INVALID_PLAN' : 'INFRA_ERROR';
@@ -1105,6 +1189,9 @@ if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith
         console.log(`VERDICT: INFRA_ERROR ${firstLine(err)}`);
         process.exit(2);
     });
-    // Exit explicitly: the verdict is final, and nothing still open (a stalled upstream socket) may keep it waiting.
-    process.exit(await main());
+    // Exit naturally so piped output drains; if something still holds the event loop (a stalled upstream socket), the
+    // unref'd timer ends the process anyway.
+    const code = await main();
+    process.exitCode = code;
+    setTimeout(() => process.exit(code), 5000).unref();
 }

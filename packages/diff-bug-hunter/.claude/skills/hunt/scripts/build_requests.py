@@ -86,6 +86,7 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
     state = read_state(hdir)
     ctx = json.loads((hdir / "ctx.json").read_text())
     if what == "hunters":
+        lessons.log_hits(f"{pr}/{state['batch']}", lessons.match(ctx))  # input for `lessons.py prune`
         for mode in ("A", "B"):
             print(write(hdir, mode, hunter_system(mode, state, ctx), hunter_user(mode, ctx), HUNTER_SCHEMA))
     elif what == "mutants":

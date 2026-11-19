@@ -24,6 +24,32 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
   the change reach Mode A.
 - **Large-diff guard:** lockfiles, generated code, snapshots, i18n and existing tests are skipped. The rest is
   ranked by risk and hunted in batches of at most 5 files / 800 diff lines; `skipped.log` lists the rest.
+- **Resource discipline:** `prepare.py` and every Go `-race` run stop with `INFRA_ERROR` when less than 2 GiB is free
+  under `HUNT_SCRATCH`. Flaky tests are reported as `FLAKY` (3 runs), never retried or slept around.
+
+### Measuring /hunt on real reverts
+
+`scripts/eval_reverts.py eval/revert_cases.json --repo <full mattermost clone> --dispatch '<cmd>'` hunts commits that
+Mattermost later reverted, plus size-matched clean commits from the same area, exactly as it hunts a PR (head = the
+commit, base = its parent, every batch, Mode A and B, 3/3 runs and base vetting). Hunters see only the commit's own
+message; the ground-truth `bug` sentence, quoted from the revert PR, is never shown to them. `--dispatch` runs
+`<cmd> <request.json>` for each hunter request (a headless Claude Code call that follows `dispatch.md`); an entry may
+instead name recorded `responses`. The scorecard reports raw recall (any test fails 3/3), post-vetting recall
+(`NEW_PR_BUG`) and the false-positive rate on controls, and the run fails below the manifest's thresholds. The
+manifest is refused unless each `fix_sha` says it reverts its `bug_sha`. `make self-test` runs the scorer on two
+local git histories (a bug with its revert, and a clean change).
+
+### Growing the rules from reverts
+
+- `scripts/mine_rules.py <repo> [-n 30]` reads the last 30 reverts (subjects starting `Revert "`), groups their
+  changed source files by directory, and prints a candidate `RELIABILITY.md` rule for every directory reverted at least
+  twice, with the identifiers those reverts share as its diff trigger. It never edits a rules file: a person writes
+  the invariant and probe and lands the rule on the base branch.
+- `scripts/lessons.py prune [--write]` lists lessons to retire: over-broad path globs (fewer than two fixed
+  directories, such as `server/*`), and lessons with no match in the last 30 hunts logged in
+  `$HUNT_SCRATCH/lessons_hits.jsonl` (written by `build_requests.py hunters`; fewer than 30 logged hunts retire
+  nothing for lack of matches). `--write` appends `{"retire": ...}` lines; like any lesson change they apply once
+  merged.
 
 Hunters and mutant planters only ever see a request file built by `scripts/`; deterministic logic lives in tested
 Python, not in prose. Results are reported in chat. Nothing is posted to GitHub.
@@ -82,8 +108,14 @@ validated strictly (one action per step, one locator kind, known keys only) befo
   fetch/XHR only, no cookie session, so no CSRF, and no authenticated websocket, images or downloads), so all 10 steps
   test the feature. Neither login follows redirects. Frozen specs embed the same login.
 - **Text, not pixels:** `snapshot` prints a scoped `locator.ariaSnapshot()` (default `#app-content`). Menus, dialogs
-  and listboxes rendered in React portals outside the scope are appended, so they are never hidden. The runner never
-  takes screenshots.
+  and listboxes rendered in React portals outside the scope are appended, so they are never hidden. Passing runs never
+  take a screenshot. `--screenshot-on-fail` writes exactly one `failure.png` when a run FAILs, as visual proof for a
+  person (an overlay, broken CSS); the agent never reads it.
+- **Feature map:** a repository can describe its UI in `.claude/skills/verify/FEATURE_MAP.md`, one `## ` section per
+  feature with its route, shortcuts and stable `data-testid` / ARIA names. `verify_ui.mjs --feature-map <route or
+  feature>` prints the matching sections (from the nearest map above the current directory, or
+  `$VERIFY_FEATURE_MAP`), so plans use names the app has. With a symlinked install, that path points into this toolkit
+  checkout: use `--copy` or `VERIFY_FEATURE_MAP` for a repository's own map.
 - **Automatic failures:** any `pageerror`, any `/api/v4/` response >= 500, or a request still running at the settle
   deadline (`VERIFY_SETTLE_MS`, default 10 s) fails the run. Every step and the end of the run wait until in-flight
   requests settle, so a late 500 is not missed. Exit codes: 0 PASS, 1 FAIL, 2 INVALID_PLAN / INFRA_ERROR.
@@ -98,7 +130,8 @@ validated strictly (one action per step, one locator kind, known keys only) befo
   52 s from a busy `/tmp`).
 
 ```bash
-VERIFY_USER=sysadmin VERIFY_PASSWORD=... node .claude/skills/verify/scripts/verify_ui.mjs plan.json --freeze specs/verify/save.spec.ts
+cd e2e-tests/playwright  # where require("playwright") resolves; the skill is installed at the repository root
+VERIFY_USER=sysadmin VERIFY_PASSWORD=... node ../../.claude/skills/verify/scripts/verify_ui.mjs plan.json --freeze specs/verify/save.spec.ts
 ```
 
 Run it where `require("playwright")` resolves (e.g. `mattermost/e2e-tests/playwright`), or set `NODE_PATH`.
@@ -214,13 +247,15 @@ jobs:
   lessons.jsonl      append-only vetted false-positive patterns (top 5 injected into hunter prompts)
   prompts/           generic Mode A/B, language rules, mutant and strengthen prompts
   scripts/           trusted.py, prepare.py, ctx.py (+ prefilter.py), build_requests.py, reliability.py, run.py,
-                     lessons.py, start_pg.sh
+                     lessons.py, mine_rules.py, eval_reverts.py, start_pg.sh
 .claude/skills/verify/
   SKILL.md           plan, run, iterate (at most 3 runs), report
   scripts/verify_ui.mjs
 scripts/install-skill.sh
+eval/revert_cases.json  real Mattermost reverts (bug_sha, fix_sha, area, quoted reason) and size-matched controls
 tests/               self-test: /hunt fixtures (Go bug, React bug, clean control), trusted rules, RELIABILITY
-                     triggers, prefilter, lessons, installer, and verify_ui.mjs against a local fixture server
+                     triggers, prefilter, lessons, rule mining, the revert benchmark, installer, and verify_ui.mjs
+                     against a local fixture server
 ```
 
 Record a lesson only after a diagnostic run proves the false positive:
