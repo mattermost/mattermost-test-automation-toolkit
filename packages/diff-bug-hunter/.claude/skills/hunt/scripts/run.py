@@ -12,6 +12,8 @@ Exit codes: 0 ok, 2 INFRA_ERROR (0 tests executed, dirty worktree, dead DB, miss
 """
 from __future__ import annotations
 
+import atexit as _atexit
+import shutil as _shutil
 import sys as _sys
 import tempfile as _tempfile
 
@@ -19,6 +21,7 @@ import tempfile as _tempfile
 # code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
 if not _sys.pycache_prefix:
     _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
+    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
 
 import fcntl
 import json
@@ -67,8 +70,10 @@ def normalize_failure(text: str, wt: Path) -> str:
     """Failure text with what differs between two runs of the same failure removed: worktree paths, stack frames,
     durations, addresses and goroutine ids. Two failures compare equal only if they say the same thing."""
     text = text.replace(str(wt.resolve()), "<wt>").replace(str(wt), "<wt>")
-    keep = [line for line in text.splitlines() if not re.match(r"\s+at |\s*goroutine \d+|\s*created by ", line)]
+    keep = [line for line in text.splitlines()
+            if not re.match(r"\s+at |\s*created by |\t\S+\.go:\d+(?: \+0x[0-9a-fA-F]+)?$", line)]  # JS and Go frames
     text = "\n".join(keep)
+    text = re.sub(r"(?i)goroutine \d+", "goroutine N", text)
     text = re.sub(r"\(\d+(?:\.\d+)?m?s\)", "", text)
     text = re.sub(r"\b\d+(?:\.\d+)?m?s$", "", text, flags=re.M)
     text = re.sub(r"0x[0-9a-fA-F]+", "0x?", text)
@@ -183,7 +188,7 @@ def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome) -> Non
         if not got:
             if "[build failed]" in out or "[setup failed]" in out:
                 raise CompileError(f"{pkg}:\n{out[-2500:]}")
-            if p.returncode != 0 and ("=== RUN" in out or "panic:" in out or "test timed out" in out):
+            if p.returncode != 0 and "=== RUN" in out:
                 # A test started and the binary died before any result line (panic in a goroutine, timeout):
                 # that is a test failure, not an environment problem.
                 got = {f"{d}::{PACKAGE_FAILED}": "FAIL"}
@@ -226,7 +231,9 @@ def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
         root = jest_root(wt, rel)
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "out.json"
-            p = sh(["npx", "jest", os.path.relpath(wt / rel, root), "--watchAll=false", "--json", f"--outputFile={out}"],
+            # --runTestsByPath: a bare path is a regex and would also run e.g. src/packages/.../actions/hunt_a.test.tsx
+            p = sh(["npx", "jest", "--runTestsByPath", os.path.relpath(wt / rel, root), "--watchAll=false", "--json",
+                    f"--outputFile={out}"],
                    root, check=False, timeout=1200, env=node_env())
             if not out.exists():
                 raise InfraError(f"jest wrote no results for {rel}:\n{(p.stdout + p.stderr)[-2500:]}")
@@ -316,12 +323,12 @@ def base_verdict(name: str, base_status: str, head: dict[str, str], head_msgs: d
         return "NEW_PR_BUG"
     if base_status != "FAIL":
         return base_status
+    if name in head_msgs and head_msgs[name] == base_msg:
+        return "PRE_EXISTING"
     if MISSING_ON_BASE.search(base_msg):
         # Jest (Babel, no type check) loads a test of a function the PR adds; on base it fails as "not a function".
         return "BASE_UNCOMPILABLE"
-    if head_msgs.get(name, "") != base_msg:
-        return "BASE_FAILS_DIFFERENTLY"  # decide from the diff, as for BASE_UNCOMPILABLE
-    return "PRE_EXISTING"
+    return "BASE_FAILS_DIFFERENTLY"  # decide from the diff, as for BASE_UNCOMPILABLE
 
 
 def base_table(head: dict[str, str], head_msgs: dict[str, str], o: Outcome) -> dict[str, str]:

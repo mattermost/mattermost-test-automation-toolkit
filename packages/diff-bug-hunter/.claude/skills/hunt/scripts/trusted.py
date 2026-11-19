@@ -15,6 +15,8 @@ usage: trusted.py check    print the trusted ref and fail (exit 2) if any skill 
 """
 from __future__ import annotations
 
+import atexit as _atexit
+import shutil as _shutil
 import sys as _sys
 import tempfile as _tempfile
 
@@ -22,6 +24,7 @@ import tempfile as _tempfile
 # code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
 if not _sys.pycache_prefix:
     _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
+    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
 
 import os
 import sys

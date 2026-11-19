@@ -355,6 +355,10 @@ fetch('http://localhost:' + location.port + '/api/v4/users/me').catch(() => {});
     "/redirpage": """<html><body><main><p id="o">r</p></main><script>
 fetch('/redir').then((r) => { document.getElementById('o').textContent = 'redirected:' + r.redirected; },
                      () => { document.getElementById('o').textContent = 'fetch failed'; });</script></body></html>""",
+    "/spa3": """<html><body><main><p id="s">start</p><button onclick="go()">Go</button></main><script>
+function go() { fetch('/api/v4/slow500');
+  setTimeout(() => { history.pushState({}, '', '/moved'); document.getElementById('s').textContent = 'moved'; }, 100); }
+</script></body></html>""",
     "/cancel": """<html><body><main><button onclick="fetch('/api/v4/slow'); location.href = '/ok';">Go</button></main></body></html>""",
     "/slow": """<html><body><main><button onclick="fetch('/api/v4/slow')">Slow</button></main></body></html>""",
     "/external": """<html><body><main><p>ok</p><script src="http://blocked.invalid/x.js"></script></main></body></html>""",
@@ -1364,3 +1368,89 @@ def test_verify_environment_and_target_problems_are_classified(tmp_path, ui_serv
     code, out = verify(tmp_path, {"steps": [], "expect": [{"visible": {"role": "main"}}]}, auth="none",
                        env={"VERIFY_BASE_URL": "localhost:18772"})
     assert code == 2 and "INFRA_ERROR VERIFY_BASE_URL / MM_URL" in out, out
+
+
+
+# ------------------------------------------------------------------ fourth review round
+
+def test_go_binary_dying_before_any_test_is_infra(tmp_path):
+    hdir, state = make_hunt(tmp_path, "clean")
+    dies = ('package calc\n\nimport "testing"\n\nfunc TestMain(m *testing.M) {\n\tpanic("cannot reach the database")\n}\n\n'
+            "func TestHuntB_X(t *testing.T) {}\n")
+    (hdir / "B").mkdir()
+    (hdir / "B" / "response.json").write_text(json.dumps({"files": [{"path": "calc/hunt_huntb_test.go", "content": dies}]}))
+    with pytest.raises(run.InfraError, match="0 tests executed"):
+        run.cmd_run(hdir, state, "B", runs=1)
+
+
+def test_failure_comparison_ignores_frames_and_goroutine_ids(tmp_path):
+    wt = tmp_path / "wt"
+    a = run.normalize_failure(f"panic: boom\n\ngoroutine 7 [running]:\ncalc.Add(...)\n\t{wt}/calc/calc.go:6 +0x1d\n", wt)
+    b = run.normalize_failure(f"panic: boom\n\ngoroutine 9 [running]:\ncalc.Add(...)\n\t{wt}/calc/calc.go:5 +0x2e\n", wt)
+    assert a == b and "panic: boom" in a
+    kept = run.normalize_failure("    add_test.go:7: Add(2, 2) = 5\n", wt)
+    assert "add_test.go:7: Add(2, 2) = 5" in kept  # t.Errorf lines are the failure itself, not a frame
+    m = "TypeError: Cannot read properties of undefined (reading 'id')"
+    assert run.base_verdict("f::T", "FAIL", {"f::T": "FAIL_3_OF_3"}, {"f::T": m}, m) == "PRE_EXISTING"
+
+
+def test_path_triggered_rules_see_files_that_are_not_hunted(monkeypatch):
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    c = {**_ctx(["server/channels/app/x.go"], "+\tx := 1"),
+         "all_changed_files": ["server/channels/app/x.go", "server/channels/db/migrations/postgres/000150_add_col.up.sql"]}
+    assert [r.id for r in reliability.match(c)] == ["R07"]
+
+
+def test_scripts_leave_no_bytecode_dirs_behind(tmp_path):
+    import glob
+    import tempfile
+    pattern = os.path.join(tempfile.gettempdir(), "hunt-pyc-*")
+    before = set(glob.glob(pattern))
+    ctx_file = tmp_path / "c.json"
+    ctx_file.write_text(json.dumps({"changed_files_head_source": [], "diff_production_code": ""}))
+    subprocess.run([sys.executable, str(SCRIPTS / "lessons.py"), "match", str(ctx_file)], check=True, capture_output=True,
+                   env={**os.environ, "HUNT_TRUSTED_REF": trusted.WORKTREE, "PYTHONPYCACHEPREFIX": ""})
+    assert set(glob.glob(pattern)) - before == set()
+
+
+@needs_playwright
+def test_verify_keeps_tracking_requests_across_in_page_url_changes(tmp_path, ui_server):
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/spa3"}, {"click": {"role": "button", "name": "Go"}}],
+                                  "expect": [{"text": {"css": "#s"}, "contains": "moved"}]}, auth="none")
+    assert code == 1 and "HTTP 500 from GET /api/v4/slow500" in out, out
+
+
+@needs_playwright
+def test_verify_plan_rules_for_cookies_and_builtin_keys(tmp_path, ui_server):
+    other_port = ui_server.rsplit(":", 1)[0] + ":1"
+    code, out = verify(tmp_path, {"base_url": ui_server, "allow_origins": [other_port], "steps": [],
+                                  "expect": [{"visible": {"role": "main"}}]}, auth="password")
+    assert code == 2 and "session cookie would be sent there" in out, out
+    for plan in ({"steps": [{"constructor": {"role": "button"}}], "expect": [{"visible": {"role": "main"}}]},
+                 {"steps": [], "expect": [{"toString": {"css": "main"}}]}):
+        code, out = verify(tmp_path, {"base_url": ui_server, **plan}, auth="none")
+        assert code == 2 and "INVALID_PLAN" in out and "needs exactly one of" in out, (plan, out)
+
+
+def test_base_worktree_with_its_own_install_follows_its_lockfile(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "npm.log"
+    (bin_dir / "npm").write_text(f'#!/bin/sh\npwd >> "{log}"\nmkdir -p node_modules\n')
+    (bin_dir / "node").write_text("#!/bin/sh\nexit 0\n")
+    for f in ("npm", "node"):
+        (bin_dir / f).chmod(0o755)
+    monkeypatch.setenv("HUNT_NODE_BIN", str(bin_dir))
+    repo = tmp_path / "repo"
+    (repo / "webapp").mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "webapp" / "package-lock.json").write_text("{}")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    mb = _git(repo, "rev-parse", "HEAD")
+    base_wt = tmp_path / "base"
+    (base_wt / "webapp" / "node_modules").mkdir(parents=True)  # its own install from an earlier run...
+    (base_wt / "webapp" / "node_modules" / ".hunt-lock-sha256").write_text("stale")  # ...from another lockfile
+    (base_wt / "webapp" / "package-lock.json").write_text("{}")
+    prepare.webapp_deps(repo, base_wt, mb, mb)
+    assert str(base_wt / "webapp") in log.read_text().splitlines()

@@ -10,6 +10,8 @@ Nothing here is summarised or chosen by a model.
 """
 from __future__ import annotations
 
+import atexit as _atexit
+import shutil as _shutil
 import sys as _sys
 import tempfile as _tempfile
 
@@ -17,6 +19,7 @@ import tempfile as _tempfile
 # code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
 if not _sys.pycache_prefix:
     _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
+    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
 
 import argparse
 import json
@@ -257,6 +260,8 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> di
         "sibling_tests_and_helpers": sibling_tests(wt, files, syms),
         "callers": callers(wt, files, syms),
         "your_test_files": targets,
+        # every changed path, hunted or not, so path-triggered rules (e.g. SQL migrations) still apply
+        "all_changed_files": sorted(f.path for f in diffs),
     }
     state = {"pr": pr, "batch": batch, "batches": len(plan.batches), "repo": str(repo), "wt": str(wt),
              "wt_base": prep["wt_base"], "merge_base": mb, "head": head, "changed": files, "targets": targets,

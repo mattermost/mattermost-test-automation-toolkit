@@ -10,6 +10,8 @@ environment failure.
 """
 from __future__ import annotations
 
+import atexit as _atexit
+import shutil as _shutil
 import sys as _sys
 import tempfile as _tempfile
 
@@ -17,6 +19,7 @@ import tempfile as _tempfile
 # code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
 if not _sys.pycache_prefix:
     _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
+    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
 
 import hashlib
 import json
@@ -89,13 +92,17 @@ def webapp_deps(wt: Path, wt_base: Path, mb: str, head: str) -> None:
         raise InfraError("node not on PATH (set HUNT_NODE_BIN)")
     npm_ci_for_lock(wt / "webapp")
     lock_changed = sh(git_cmd("diff", "--quiet", mb, head, "--", "webapp/package-lock.json"), wt, check=False).returncode != 0
+    shared = ("webapp/node_modules", "webapp/channels/node_modules")
     if lock_changed:
-        base_modules = wt_base / "webapp" / "node_modules"
-        if base_modules.is_symlink():  # shared from an earlier run when the lockfiles still matched
-            base_modules.unlink()
+        for sub in shared:  # links from an earlier run, when the lockfiles still matched
+            if (wt_base / sub).is_symlink():
+                (wt_base / sub).unlink()
         npm_ci_for_lock(wt_base / "webapp")
         return
-    for sub in ("webapp/node_modules", "webapp/channels/node_modules"):
+    if (wt_base / "webapp" / "node_modules").is_dir() and not (wt_base / "webapp" / "node_modules").is_symlink():
+        npm_ci_for_lock(wt_base / "webapp")  # its own install from an earlier run: keep it matching its lockfile
+        return
+    for sub in shared:
         src, dst = wt / sub, wt_base / sub
         if src.is_dir() and not (dst.exists() or dst.is_symlink()):
             dst.symlink_to(src)

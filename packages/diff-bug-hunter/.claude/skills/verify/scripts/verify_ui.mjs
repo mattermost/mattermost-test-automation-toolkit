@@ -132,7 +132,7 @@ function exactlyOne(obj, table, where) {
     if (!isObj(obj)) {
         throw new PlanError(`${where} must be an object`);
     }
-    const kinds = Object.keys(obj).filter((k) => k in table);
+    const kinds = Object.keys(obj).filter((k) => Object.hasOwn(table, k));
     if (kinds.length !== 1) {
         throw new PlanError(`${where} needs exactly one of ${Object.keys(table).join(', ')} (got ${JSON.stringify(Object.keys(obj))})`);
     }
@@ -177,6 +177,14 @@ export function validatePlan(plan, env = process.env) {
         throw new PlanError('allow_origins must be an array');
     }
     const allowed = [origin, ...allowOrigins.map((o, i) => httpOrigin(o, `allow_origins[${i}]`))];
+    if (!env.VERIFY_TOKEN && env.VERIFY_USER && env.VERIFY_PASSWORD) {
+        // Cookies ignore the port: the session cookie would also go to another origin on the same host.
+        const host = new URL(origin).hostname;
+        const sameHost = allowed.slice(1).filter((o) => new URL(o).hostname === host);
+        if (sameHost.length) {
+            throw new PlanError(`allow_origins ${sameHost.join(', ')} is on the same host as ${origin}; with password login the session cookie would be sent there`);
+        }
+    }
     const steps = plan.steps ?? [];
     if (!Array.isArray(steps)) {
         throw new PlanError('steps must be an array');
@@ -548,8 +556,12 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
         });
         const page = await context.newPage();
         page.inflight = new Set();
+        const loading = new Set();  // frames with a navigation request in progress
         page.on('request', (r) => {
             page.inflight.add(r);
+            if (r.isNavigationRequest()) {
+                loading.add(r.frame());
+            }
             // Redirect hops are not routed, so the route above cannot block them: check every request here.
             const origin = originOf(r.url());
             if (origin !== null && !allowedSet.has(origin)) {
@@ -563,8 +575,12 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
         });
         page.on('requestfinished', (r) => page.inflight.delete(r));
         page.on('requestfailed', (r) => page.inflight.delete(r));
-        // A request the page cancels by navigating away never gets requestfinished/requestfailed; forget it then.
+        // A request the page cancels by loading another document never gets requestfinished/requestfailed; forget it
+        // then. Only a real load counts: an in-page URL change (history.pushState) cancels nothing.
         page.on('framenavigated', (frame) => {
+            if (!loading.delete(frame)) {
+                return;
+            }
             for (const r of page.inflight) {
                 if (r.frame() === frame && !r.isNavigationRequest()) {
                     page.inflight.delete(r);
@@ -793,8 +809,12 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async ({page, context}) => {
     const origin = originOf(route.request().url());
     return origin === null || ALLOWED.has(origin) ? route.continue() : route.abort('blockedbyclient');
   });
+  const loading = new Set<unknown>();
   page.on('request', (r) => {
     inflight.add(r);
+    if (r.isNavigationRequest()) {
+      loading.add(r.frame());
+    }
     const origin = originOf(r.url());
     if (origin !== null && !ALLOWED.has(origin) && r.redirectedFrom()) {
       problems.push(\`redirected to a non-allowed origin: \${r.method()} \${origin}\`);
@@ -805,6 +825,9 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async ({page, context}) => {
   page.on('requestfinished', (r) => inflight.delete(r));
   page.on('requestfailed', (r) => inflight.delete(r));
   page.on('framenavigated', (frame) => {
+    if (!loading.delete(frame)) {
+      return; // an in-page URL change (history.pushState) cancels nothing
+    }
     for (const r of inflight) {
       if (r.frame() === frame && !r.isNavigationRequest()) {
         inflight.delete(r);

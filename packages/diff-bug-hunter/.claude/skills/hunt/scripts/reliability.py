@@ -7,6 +7,8 @@ usage: reliability.py match <ctx.json>   print the rules this context triggers
 """
 from __future__ import annotations
 
+import atexit as _atexit
+import shutil as _shutil
 import sys as _sys
 import tempfile as _tempfile
 
@@ -14,6 +16,7 @@ import tempfile as _tempfile
 # code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
 if not _sys.pycache_prefix:
     _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
+    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
 
 import fnmatch
 import json
@@ -81,7 +84,7 @@ def _glob(path: str, pattern: str) -> bool:
 
 def match(ctx: dict[str, Any], rules: list[Rule] | None = None) -> list[Rule]:
     rules = load() if rules is None else rules
-    files = [c["file"] for c in ctx.get("changed_files_head_source", [])]
+    files = [c["file"] for c in ctx.get("changed_files_head_source", [])] + list(ctx.get("all_changed_files", []))
     lines = changed_lines(ctx.get("diff_production_code", ""))
     return [r for r in rules if any(_glob(f, g) for f in files for g in r.paths) or r.diff.search(lines)]
 
