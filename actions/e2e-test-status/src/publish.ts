@@ -68,6 +68,15 @@ export async function publish({ env, fetchImpl = fetch, log = console.error, wai
       }
     }
     written = await publisher.write({ state, description, target_url: env.TARGET_URL }, operation);
+    // A green lane skips triage, so nothing else replaces the verdict an earlier red attempt left on its triage check.
+    if (written && operation === "finish" && state === "success") {
+      const context = `${env.STATUS_CONTEXT}/triage`;
+      try {
+        await publisher.settle({ context, state: "success", description: "Superseded: the lane passed on a later run or attempt", target_url: env.TARGET_URL });
+      } catch (e) {
+        log(`${context} not settled: ${String(e).slice(0, 200)}`);
+      }
+    }
   }
   const lanes = String(env.TRIAGE_LANES || "").split(",").map((s) => s.trim()).filter(Boolean);
   // This is a factual projection of required statuses, also in report-only

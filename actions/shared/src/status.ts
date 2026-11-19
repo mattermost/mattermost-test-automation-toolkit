@@ -51,6 +51,7 @@ export interface StatusPublisher {
   summarize(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean): Promise<void>;
   write(row: StatusRow, operation?: string): Promise<boolean>;
   info(row: StatusRow): Promise<boolean>;
+  settle(row: StatusRow): Promise<boolean>;
   refresh(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean): Promise<void>;
 }
 
@@ -202,6 +203,16 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     },
     async info(row) {
       if (!await allowed("triage")) return false;
+      await post(row);
+      return true;
+    },
+    // Overwrites an existing, not green check only when a strictly older run or attempt owns it; never creates one.
+    async settle(row) {
+      const rows = await readStatuses(api, id);
+      const check = rows.find((r) => r.context === row.context);
+      const current = statusOwner(check?.target_url, id.repository);
+      if (!check || check.state === "success" || !current || compareOwners(owner(), current) <= 0 ||
+        !mayPublish(rows, id, check.context, owner(), "claim")) return false;
       await post(row);
       return true;
     },
