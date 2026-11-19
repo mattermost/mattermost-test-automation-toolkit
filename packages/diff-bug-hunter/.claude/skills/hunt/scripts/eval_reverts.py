@@ -53,7 +53,7 @@ import build_requests
 import ctx
 import prepare
 import run
-from hunt_common import InfraError, git, write_json
+from hunt_common import InfraError, git, require_disk, write_json
 
 CASE_KEYS = ("id", "bug_sha", "fix_sha", "area", "bug", "source")
 CONTROL_KEYS = ("id", "sha", "area")
@@ -62,6 +62,11 @@ DEFAULT_THRESHOLDS = {"raw_recall_min": 0.0, "vetted_recall_min": 0.0, "fp_rate_
 
 class ManifestError(ValueError):
     pass
+
+
+# What one entry can fail with: our own InfraError, a dispatch that timed out or exited (SubprocessError), a missing or
+# unreadable file (OSError), and a hunter response that is not valid JSON or lacks "files" (ValueError, KeyError).
+ENTRY_FAILURES = (InfraError, OSError, subprocess.SubprocessError, KeyError, ValueError)
 
 
 def load_manifest(path: Path, repo_override: Path | None) -> dict[str, Any]:
@@ -103,6 +108,8 @@ def load_manifest(path: Path, repo_override: Path | None) -> dict[str, Any]:
     for e in cases + ctrls:
         if e.get("responses"):
             e["responses"] = (path.parent / e["responses"]).resolve()
+            if not e["responses"].is_dir():
+                raise ManifestError(f"{e['id']}: responses directory {e['responses']} does not exist")
     return {"cases": cases, "controls": ctrls, "thresholds": thresholds}
 
 
@@ -120,6 +127,7 @@ def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None)
     base = git(repo, "rev-parse", f"{head}^1")
     message = git(repo, "log", "-1", "--format=%s%x00%b", head).split("\x00", 1)
     meta = {"title": message[0], "body": message[1].strip() if len(message) > 1 else ""}  # never the ground truth
+    require_disk(out)  # same gate as prepare.py: no worktrees or npm ci on a nearly full disk
     wt, wt_base, hdir = out / f"wt{num}", out / f"wt{num}.base", out / f"hunt{num}"
     mb = prepare.worktrees(repo, head, base, wt, wt_base)
     prepare.deps(repo, wt, wt_base, mb, head)
@@ -225,8 +233,9 @@ def main(argv: list[str]) -> int:
     for num, e in enumerate(manifest["cases"] + manifest["controls"], 1):
         try:
             hunted[e["id"]] = hunt_entry(e, num, out, a.dispatch)
-        except InfraError as err:
-            hunted[e["id"]] = {"error": str(err).splitlines()[0]}
+        except ENTRY_FAILURES as err:
+            # an ERROR verdict (exit 2): the entry could not run, which is not the same as a miss or a clean result
+            hunted[e["id"]] = {"error": f"{type(err).__name__}: {str(err).splitlines()[0] if str(err) else 'no detail'}"}
     card = scorecard(manifest, hunted)
     write_json(out / "scorecard.json", card)
     print(render(card))

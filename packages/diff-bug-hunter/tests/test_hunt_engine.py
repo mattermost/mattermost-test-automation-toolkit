@@ -2006,3 +2006,49 @@ def test_shipped_revert_manifest_is_well_formed():
     for e in m["controls"]:
         assert re.fullmatch(r"[0-9a-f]{40}", e["sha"]) and e["matches"] in case_ids, e
     assert set(m["thresholds"]) == set(eval_reverts.DEFAULT_THRESHOLDS)
+
+
+# ------------------------------------------------------------------ revert benchmark: the disk gate and per-entry failures
+
+def test_eval_checks_disk_before_creating_any_worktree(tmp_path, monkeypatch, capsys):
+    import collections
+
+    import eval_reverts
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(hunt_common.shutil, "disk_usage", lambda p: usage(10 * 1024**3, 9 * 1024**3, 1024**3))
+    path, _ = _eval_manifest(tmp_path)
+    out = tmp_path / "out"
+    assert eval_reverts.main(["eval_reverts.py", str(path), "--out", str(out)]) == 2
+    text = capsys.readouterr().out
+    assert "VERDICT: ERROR" in text and "GiB free" in text, text
+    assert not (out / "wt1").exists() and not (out / "wt1.base").exists()  # nothing was checked out
+
+
+def test_eval_records_a_broken_entry_and_still_hunts_the_rest(tmp_path, monkeypatch, capsys):
+    import eval_reverts
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    path, _ = _eval_manifest(tmp_path)
+    broken = tmp_path / "broken_responses" / "A"
+    broken.mkdir(parents=True)
+    (broken / "response.json").write_text("{ not json")  # a hunter response that cannot be read
+    m = json.loads(path.read_text())
+    m["cases"][0]["responses"] = str(broken.parent)
+    path.write_text(json.dumps(m))
+    code = eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out")])
+    text = capsys.readouterr().out
+    assert code == 2 and "VERDICT: ERROR" in text, text
+    card = json.loads((tmp_path / "out" / "scorecard.json").read_text())
+    rows = {r["id"]: r for r in card["rows"]}
+    assert rows["clamp"]["error"] and "JSONDecodeError" in rows["clamp"]["error"]
+    assert rows["percent"]["error"] is None and rows["percent"]["responses"] is True  # the control still ran
+
+
+def test_eval_refuses_a_responses_directory_that_does_not_exist(tmp_path, capsys):
+    import eval_reverts
+    path, _ = _eval_manifest(tmp_path)
+    m = json.loads(path.read_text())
+    m["cases"][0]["responses"] = str(tmp_path / "no_such_dir")
+    path.write_text(json.dumps(m))
+    assert eval_reverts.main(["eval_reverts.py", str(path)]) == 2
+    assert "responses directory" in capsys.readouterr().out
