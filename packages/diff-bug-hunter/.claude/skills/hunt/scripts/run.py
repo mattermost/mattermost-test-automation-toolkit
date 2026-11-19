@@ -472,6 +472,9 @@ def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: Outcome,
 def cmd_mutants(hdir: Path, state: dict[str, Any], tag: str) -> list[dict[str, Any]]:
     wt = Path(state["wt"])
     ensure_clean(wt)
+    # Mutant builds skip -race, so go_run's check never runs for them; without this, a full disk would surface as
+    # linker failures that read as NEEDS_REGENERATION.
+    require_disk(scratch())
     files = [] if tag == "PR" else load_json(hdir / tag / "response.json")["files"]
     placed: list[Path] = []
     verdicts = []

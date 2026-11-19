@@ -2052,3 +2052,14 @@ def test_eval_refuses_a_responses_directory_that_does_not_exist(tmp_path, capsys
     path.write_text(json.dumps(m))
     assert eval_reverts.main(["eval_reverts.py", str(path)]) == 2
     assert "responses directory" in capsys.readouterr().out
+
+
+def test_mutant_scoring_stops_on_low_disk_before_placing_anything(tmp_path, monkeypatch):
+    import collections
+    hdir, state = make_hunt(tmp_path, "clean")
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(hunt_common.shutil, "disk_usage", lambda p: usage(10 * 1024**3, 9 * 1024**3, 1024**3))
+    with pytest.raises(run.InfraError, match="GiB free"):
+        run.cmd_mutants(hdir, state, "A")
+    assert not list(Path(state["wt"]).rglob("hunt_*"))  # no hunter file was placed, nothing was built
+    assert not (hdir / "mutants_A.json").exists()
