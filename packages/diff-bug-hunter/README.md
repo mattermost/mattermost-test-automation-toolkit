@@ -65,7 +65,8 @@ locally, `scripts/start_pg.sh` starts a throwaway cluster.
 ## /verify
 
 `scripts/verify_ui.mjs` runs a JSON plan against the plan's `base_url`, else `VERIFY_BASE_URL`, else `MM_URL`, else
-`http://localhost:8065`. With credentials set, a plan's `base_url` must match `VERIFY_BASE_URL` / `MM_URL`, so
+`http://localhost:8065`; it must be a server root (a subpath site URL is not supported). With credentials set, a
+plan's `base_url` must match `VERIFY_BASE_URL` / `MM_URL`, so
 credentials never go to a host the plan chose. Claude writes the plan; plain Node decides the verdict. Plans are
 validated strictly (one action per step, one locator kind, known keys only) before a browser starts.
 

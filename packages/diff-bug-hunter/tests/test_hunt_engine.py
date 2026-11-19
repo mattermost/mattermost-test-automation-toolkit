@@ -139,7 +139,7 @@ def test_clean_control_has_no_findings_and_mutants_are_scored(tmp_path):
     assert v["M2"]["verdict"] == "NEEDS_REGENERATION" and "totl" in v["M2"]["detail"]
     assert v["M3"]["verdict"] == "SURVIVED"
     assert v["M4"]["verdict"] == "KILLED" and v["M4"]["held_back"]
-    assert v["M5"]["verdict"] == "INVALID"
+    assert v["M5"]["verdict"] == "NEEDS_REGENERATION" and "not one of the hunted files" in v["M5"]["detail"]
     assert "return part * 100 / total" in (Path(state["wt"]) / "calc/percent.go").read_text()  # restored
 
 
@@ -352,7 +352,10 @@ setTimeout(() => { document.getElementById('s').textContent = 'done'; fetch('/ap
     "/xfetch": """<html><body><main><p>x</p></main><script>
 fetch('http://localhost:' + location.port + '/api/v4/users/me').catch(() => {});</script></body></html>""",
     "/link": """<html><body><main><a href="http://localhost:PORT/x">away</a></main></body></html>""",
-    "/redirpage": """<html><body><main><p>r</p></main><script>fetch('/redir').catch(() => {});</script></body></html>""",
+    "/redirpage": """<html><body><main><p id="o">r</p></main><script>
+fetch('/redir').then((r) => { document.getElementById('o').textContent = 'redirected:' + r.redirected; },
+                     () => { document.getElementById('o').textContent = 'fetch failed'; });</script></body></html>""",
+    "/cancel": """<html><body><main><button onclick="fetch('/api/v4/slow'); location.href = '/ok';">Go</button></main></body></html>""",
     "/slow": """<html><body><main><button onclick="fetch('/api/v4/slow')">Slow</button></main></body></html>""",
     "/external": """<html><body><main><p>ok</p><script src="http://blocked.invalid/x.js"></script></main></body></html>""",
     # the browser's own credentials (cookies or the Bearer header), as the Mattermost webapp would send them
@@ -420,7 +423,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             port = self.server.server_address[1]
             self._send(302, "", "text/plain", headers={"Location": f"http://localhost:{port}/asset.js"})
         elif self.path == "/asset.js":
-            self._send(200, "document.title = 'asset loaded';", "application/javascript")
+            self._send(200, "document.title = 'asset loaded';", "application/javascript",
+                       headers={"Access-Control-Allow-Origin": "*"})
         elif self.path == "/link":
             port = str(self.server.server_address[1])
             self._send(200, PAGES["/link"].replace("PORT", port), "text/html")
@@ -819,8 +823,8 @@ def test_token_never_follows_a_redirect_to_another_origin(tmp_path, ui_server):
     SEEN.clear()
     other = ui_server.replace("127.0.0.1", "localhost")
     code, out = verify(tmp_path, {"base_url": ui_server, "allow_origins": [other], "steps": [{"goto": "/redirpage"}],
-                                  "expect": [{"text": {"role": "main"}, "contains": "r"}]}, auth="token")
-    assert code == 0, out
+                                  "expect": [{"text": {"css": "#o"}, "contains": "redirected:true"}]}, auth="token")
+    assert code == 0, out  # the page saw the 302 itself: the token route did not follow it with the token attached
     redirect = [a for host, path, a in SEEN if path == "/redir"]
     asset = [a for host, path, a in SEEN if path == "/asset.js"]
     assert redirect == [f"Bearer {TOKEN}"] and asset == [None], SEEN
@@ -981,7 +985,9 @@ def test_verify_strict_plan_validation_exits_2(tmp_path, ui_server):
         ({"steps": [], "expect": [{"visible": {"role": "main"}}], "extra": 1}, "unknown plan key(s) extra"),
     ]
     for plan, msg in bad:
-        code, out = verify(tmp_path, {"base_url": ui_server, **plan} if "base_url" not in plan else plan, auth="none")
+        # the environment points at the real server, so only the plan's own mistakes can be reported
+        code, out = verify(tmp_path, {"base_url": ui_server, **plan} if "base_url" not in plan else plan, auth="none",
+                           env={"VERIFY_BASE_URL": ui_server})
         assert code == 2 and "INVALID_PLAN" in out and msg in out, (plan, out)
 
 
@@ -1264,3 +1270,97 @@ def test_verify_library_call_uses_the_env_it_is_given(tmp_path, ui_server):
     env = {**_node_env("none"), "VERIFY_UI_MODULE": str(VERIFY_UI), "PLAN": json.dumps(plan), "T": TOKEN, "B": ui_server}
     p = subprocess.run(["node", "-e", code], env=env, capture_output=True, text=True, timeout=120, check=False)
     assert "code=0" in p.stdout, p.stdout + p.stderr
+
+
+
+# ------------------------------------------------------------------ third review round
+
+def test_identical_go_failures_on_head_and_base_are_pre_existing(tmp_path):
+    def run_output(secs: str) -> str:
+        return (f"=== RUN   TestHuntA_Add\n    add_test.go:7: Add(2, 2) = 5\n--- FAIL: TestHuntA_Add ({secs}s)\n"
+                f"FAIL\nFAIL\texample.com/m/calc\t{secs}s\nFAIL\n")
+    wt = tmp_path / "wt"
+    head = run.normalize_failure(run.go_test_output(run_output("0.013"))["TestHuntA_Add"], wt)
+    base = run.normalize_failure(run.go_test_output(run_output("0.012"))["TestHuntA_Add"], wt)
+    assert head == base and "Add(2, 2) = 5" in head
+    assert run.base_verdict("d::TestHuntA_Add", "FAIL", {"d::TestHuntA_Add": "FAIL_3_OF_3"},
+                            {"d::TestHuntA_Add": head}, base) == "PRE_EXISTING"
+
+
+def test_round3_prefilter_ctx_and_runner_guards(tmp_path):
+    assert prefilter.excluded("e2e-tests/playwright/specs/functional/channels/foo.spec.ts") == "e2e suite"
+    assert prefilter.excluded("webapp/channels/src/x.spec.tsx") == "existing test"
+    raw = ('package p\n\nfunc TestParse(t *testing.T) {\n\tjs := `{\n"a": 1\n}`\n\tif Parse(js) != 1 {\n'
+           '\t\tt.Fatal("x")\n\t}\n}\n')
+    patch = "@@ -7,0 +7,3 @@\n+\tif Parse(js) != 1 {\n+\t\tt.Fatal(\"x\")\n+\t}\n"
+    assert ctx.changed_go_tests(patch, raw) == ["TestParse"]  # a raw string ending "}`" in column 0 is not the end
+    hdir, state = make_hunt(tmp_path, "clean")
+    with pytest.raises(run.InfraError, match="run_A.json missing"):
+        run.cmd_base(hdir, state, "A")
+    prep = {"repo": state["repo"], "wt": state["wt"], "wt_base": state["wt_base"], "merge_base": state["merge_base"],
+            "head": state["head"], "hunt_dir": str(tmp_path / "h2")}
+    with pytest.raises(run.InfraError, match="batches are 1..1"):
+        ctx.build("1", 0, prep, {"title": "t", "body": ""})
+
+
+def test_unapplicable_mutant_goes_back_for_regeneration(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    hdir, state = make_hunt(tmp_path, "clean")
+    (hdir / "M" / "response.json").write_text(json.dumps({"mutants": [
+        {"id": "M1", "file": "calc/percent.go", "old": "    return 0", "new": "    return 1", "what_breaks": "spaces"}]}))
+    (hdir / "M2" / "response.json").unlink()
+    v = run.cmd_mutants(hdir, state, "A")
+    assert v[0]["verdict"] == "NEEDS_REGENERATION" and "occurs 0 times" in v[0]["detail"]
+    monkeypatch.setattr(build_requests, "hunt_dir", lambda pr: hdir)
+    build_requests.main("1", "regen", "M1")
+    assert (hdir / "R_M1" / "request.json").exists()
+
+
+def test_webapp_deps_follow_lockfile_changes_across_reruns(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "npm.log"
+    (bin_dir / "npm").write_text(f'#!/bin/sh\npwd >> "{log}"\nmkdir -p node_modules\n')
+    (bin_dir / "node").write_text("#!/bin/sh\nexit 0\n")
+    for f in ("npm", "node"):
+        (bin_dir / f).chmod(0o755)
+    monkeypatch.setenv("HUNT_NODE_BIN", str(bin_dir))
+    repo = tmp_path / "repo"
+    (repo / "webapp").mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "webapp" / "package-lock.json").write_text("{}")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    mb = _git(repo, "rev-parse", "HEAD")
+    base_wt = tmp_path / "base"
+    (base_wt / "webapp").mkdir(parents=True)
+    (base_wt / "webapp" / "package-lock.json").write_text("{}")
+    prepare.webapp_deps(repo, base_wt, mb, mb)
+    assert (base_wt / "webapp" / "node_modules").is_symlink() and len(log.read_text().splitlines()) == 1
+    (repo / "webapp" / "package-lock.json").write_text('{"v": 2}')  # the PR is pushed again with a new lockfile
+    _git(repo, "commit", "-qam", "lock")
+    prepare.webapp_deps(repo, base_wt, mb, _git(repo, "rev-parse", "HEAD"))
+    calls = log.read_text().splitlines()
+    assert calls[1:] == [str(repo / "webapp"), str(base_wt / "webapp")], calls  # head reinstalls, base gets its own
+    assert not (base_wt / "webapp" / "node_modules").is_symlink()
+
+
+@needs_playwright
+def test_verify_forgets_requests_cancelled_by_a_navigation(tmp_path, ui_server):
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/cancel"}, {"click": {"role": "button", "name": "Go"}}],
+                                  "expect": [{"visible": {"role": "button", "name": "Save"}}]},
+                       auth="none", env={"VERIFY_SETTLE_MS": "3000"})
+    assert code == 0, out
+
+
+@needs_playwright
+def test_verify_environment_and_target_problems_are_classified(tmp_path, ui_server):
+    code, out = verify(tmp_path, {"base_url": "http://127.0.0.1:9", "steps": [], "expect": [{"api": {"path": "/api/v4/system/ping"}}]},
+                       auth="none")
+    assert code == 2 and "INFRA_ERROR server unreachable" in out, out
+    code, out = verify(tmp_path, {"base_url": ui_server + "/mm", "steps": [], "expect": [{"visible": {"role": "main"}}]},
+                       auth="none")
+    assert code == 2 and "must be a server root" in out, out
+    code, out = verify(tmp_path, {"steps": [], "expect": [{"visible": {"role": "main"}}]}, auth="none",
+                       env={"VERIFY_BASE_URL": "localhost:18772"})
+    assert code == 2 and "INFRA_ERROR VERIFY_BASE_URL / MM_URL" in out, out

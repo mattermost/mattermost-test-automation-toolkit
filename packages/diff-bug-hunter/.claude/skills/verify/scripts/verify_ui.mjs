@@ -12,7 +12,8 @@
 // in-flight requests to settle, and success is a deterministic DOM or /api/v4/ check, never a model's judgement.
 // --freeze writes a passing plan as a @playwright/test spec with the same oracle, so the check reruns with no model.
 //
-// Target: plan.base_url, else $VERIFY_BASE_URL, else $MM_URL, else http://localhost:8065. With credentials set, a
+// Target (a server root, http or https, no user:password): plan.base_url, else $VERIFY_BASE_URL, else $MM_URL, else
+// http://localhost:8065; a malformed environment value is INFRA_ERROR. With credentials set, a
 // plan.base_url must have the same origin as $VERIFY_BASE_URL / $MM_URL / the default, so credentials never go to a
 // host the plan chose. Frozen specs read $VERIFY_BASE_URL / $MM_URL first and fall back to the frozen target.
 //
@@ -93,6 +94,10 @@ function httpOrigin(url, what) {
     if (u.username || u.password) {
         throw new PlanError(`${what} must not contain user:password (it would be logged and frozen into specs)`);
     }
+    if (u.pathname !== '/' || u.search || u.hash) {
+        // Plans use server-root paths (/api/v4/..., /team/channels/...); a subpath site URL is not supported.
+        throw new PlanError(`${what} must be a server root such as https://host:8065 (got path ${u.pathname})`);
+    }
     return u.origin;
 }
 
@@ -153,9 +158,15 @@ export function validatePlan(plan, env = process.env) {
         throw new PlanError('login must be true or false');
     }
     const envBase = env.VERIFY_BASE_URL || env.MM_URL || DEFAULT_BASE;
+    let envOrigin;
+    try {
+        envOrigin = httpOrigin(envBase, 'VERIFY_BASE_URL / MM_URL');
+    } catch (err) {
+        throw new InfraError(firstLine(err));  // the environment is wrong, not the plan
+    }
     const base = plan.base_url ?? envBase;
-    const origin = httpOrigin(base, 'base_url');
-    if (hasCredentials(env) && origin !== httpOrigin(envBase, 'VERIFY_BASE_URL / MM_URL')) {
+    const origin = plan.base_url === undefined ? envOrigin : httpOrigin(base, 'base_url');
+    if (hasCredentials(env) && origin !== envOrigin) {
         throw new PlanError(`base_url ${origin} differs from ${new URL(envBase).origin}; credentials only go to VERIFY_BASE_URL / MM_URL`);
     }
     if ('scope' in plan) {
@@ -552,6 +563,14 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
         });
         page.on('requestfinished', (r) => page.inflight.delete(r));
         page.on('requestfailed', (r) => page.inflight.delete(r));
+        // A request the page cancels by navigating away never gets requestfinished/requestfailed; forget it then.
+        page.on('framenavigated', (frame) => {
+            for (const r of page.inflight) {
+                if (r.frame() === frame && !r.isNavigationRequest()) {
+                    page.inflight.delete(r);
+                }
+            }
+        });
         page.on('websocket', (ws) => {
             const origin = originOf(ws.url());
             if (origin !== null && !allowedSet.has(origin)) {
@@ -609,12 +628,19 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
             log(`${label} ok`);
         }
         for (const [i, e] of plan.expect.entries()) {
-            const why = await checkExpect(page, base, e, env).catch((err) => {
+            let why;
+            try {
+                why = await checkExpect(page, base, e, env);
+            } catch (err) {
+                const msg = firstLine(err);
                 if (planMistake(err)) {
-                    throw new PlanError(`expect ${i + 1}: ${firstLine(err)}`);
+                    throw new PlanError(`expect ${i + 1}: ${msg}`);
                 }
-                return firstLine(err);
-            });
+                if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|net::ERR_/.test(msg) && !(await reachable(context, base))) {
+                    throw new InfraError(`server unreachable at ${base}: ${msg}`);
+                }
+                why = msg;
+            }
             if (why || problems.length) {
                 return finish(1, `expect ${i + 1}: ${why ?? problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
             }
@@ -733,7 +759,7 @@ const apiLogin: (context: BrowserContext, base: string, env: NodeJS.ProcessEnv) 
 
 // Frozen by verify_ui.mjs from a passing plan, with the same oracle: allowed origins only, every step settles, and page
 // errors, >= 500 /api/v4/ responses, requests still running at the deadline, or leaving the allowed origins fail.
-import {expect, test, type BrowserContext, type Page} from '@playwright/test';
+import {expect, test, type BrowserContext, type Page, type Request} from '@playwright/test';
 
 test.use({viewport: {width: 1280, height: 800}});
 
@@ -762,7 +788,7 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async ({page, context}) => {
   // As long as the runner may take: login, every step and expectation at their limits, and the final settle.
   test.setTimeout(60000 + ${steps} * (TIMEOUT + SETTLE_MS) + ${expects} * TIMEOUT + SETTLE_MS);
   const problems: string[] = [];
-  const inflight = new Set<unknown>();
+  const inflight = new Set<Request>();
   await context.route('**/*', (route) => {
     const origin = originOf(route.request().url());
     return origin === null || ALLOWED.has(origin) ? route.continue() : route.abort('blockedbyclient');
@@ -778,6 +804,13 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async ({page, context}) => {
   });
   page.on('requestfinished', (r) => inflight.delete(r));
   page.on('requestfailed', (r) => inflight.delete(r));
+  page.on('framenavigated', (frame) => {
+    for (const r of inflight) {
+      if (r.frame() === frame && !r.isNavigationRequest()) {
+        inflight.delete(r);
+      }
+    }
+  });
   page.on('websocket', (ws) => {
     const origin = originOf(ws.url());
     if (origin !== null && !ALLOWED.has(origin)) {

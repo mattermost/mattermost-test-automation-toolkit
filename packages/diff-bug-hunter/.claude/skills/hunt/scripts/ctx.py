@@ -154,7 +154,7 @@ def changed_go_tests(patch: str, head_src: str) -> list[str]:
             if line.rstrip().endswith("}"):  # one-line body, e.g. func TestA(t *testing.T) {}
                 end = i
             else:
-                end = next((j for j in range(i + 1, len(lines) + 1) if lines[j - 1].startswith("}")), len(lines))
+                end = next((j for j in range(i + 1, len(lines) + 1) if lines[j - 1].rstrip() == "}"), len(lines))
             # Only what `go test -run` executes: top-level func TestX(t *testing.T), with the parameter name optional
             # and any package qualifier (aliased or dot-imported testing). Not TestMain, benchmarks, helpers, or
             # methods whose names happen to start with Test.
@@ -241,8 +241,8 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> di
     (hdir / "skipped.log").write_text("\n".join(prefilter.describe(plan, batch)) + "\n")
     if not plan.batches:
         raise InfraError("prefilter left no source files to hunt (see skipped.log)")
-    if batch > len(plan.batches):
-        raise InfraError(f"batch {batch} requested, only {len(plan.batches)} exist")
+    if not 1 <= batch <= len(plan.batches):
+        raise InfraError(f"batch {batch} requested; batches are 1..{len(plan.batches)}")
     chosen = plan.batches[batch - 1]
     files = [f.path for f in chosen]
     patches = {f.path: "\n".join(f.patch.splitlines()[:prefilter.MAX_LINES + 20]) for f in chosen}

@@ -70,6 +70,7 @@ def normalize_failure(text: str, wt: Path) -> str:
     keep = [line for line in text.splitlines() if not re.match(r"\s+at |\s*goroutine \d+|\s*created by ", line)]
     text = "\n".join(keep)
     text = re.sub(r"\(\d+(?:\.\d+)?m?s\)", "", text)
+    text = re.sub(r"\b\d+(?:\.\d+)?m?s$", "", text, flags=re.M)
     text = re.sub(r"0x[0-9a-fA-F]+", "0x?", text)
     text = re.sub(r"[ \t]+", " ", text).strip()
     return text[:4000]
@@ -87,6 +88,9 @@ def go_test_output(out: str) -> dict[str, str]:
         m = re.match(r"\s*--- (?:PASS|FAIL|SKIP): (\S+)", line)
         if m:
             current = m.group(1).split("/")[0]
+            continue
+        if re.match(r"(?:ok|FAIL|PASS)(?:\s|$)", line):  # package summary ("FAIL\tpkg\t0.01s", "PASS"): no test's output
+            current = None
             continue
         if current:
             blocks.setdefault(current, []).append(line)
@@ -306,7 +310,7 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
 
 def base_verdict(name: str, base_status: str, head: dict[str, str], head_msgs: dict[str, str], base_msg: str) -> str:
     """Only a test that failed 3/3 on head gets a bug verdict; anything else is labelled as not a failure."""
-    if head and head.get(name) != "FAIL_3_OF_3":
+    if head.get(name) != "FAIL_3_OF_3":
         return "NOT_A_HEAD_FAILURE"
     if base_status == "PASS":
         return "NEW_PR_BUG"
@@ -338,7 +342,9 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, str]:
     wt = Path(state["wt_base"])
     ensure_clean(wt)
     files = load_json(hdir / tag / "response.json")["files"]
-    head = load_json(hdir / f"run_{tag}.json") if (hdir / f"run_{tag}.json").exists() else {}
+    if not (hdir / f"run_{tag}.json").exists():
+        raise InfraError(f"run_{tag}.json missing: run `run.py run <pr> {tag}` before `base`")
+    head = load_json(hdir / f"run_{tag}.json")
     head_msgs = (load_json(hdir / f"run_{tag}.messages.json")
                  if (hdir / f"run_{tag}.messages.json").exists() else {})
     out: dict[str, str] = {}
@@ -377,12 +383,14 @@ def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: dict[str, 
                  m: dict[str, Any]) -> dict[str, Any]:
     v: dict[str, Any] = {"id": m["id"], "held_back": m["held_back"], "file": m["file"],
                          "what_breaks": m["what_breaks"], "killers": [], "mutant": m}
+    # A mutant that cannot be applied as written goes back to a planter (regen), like one that does not compile.
     if m["file"] not in state["changed"]:
-        return {**v, "verdict": "INVALID", "detail": "file is not a hunted production file"}
+        return {**v, "verdict": "NEEDS_REGENERATION", "detail": f"{m['file']} is not one of the hunted files {state['changed']}"}
     path = under(wt, m["file"])
     orig = path.read_text()
     if orig.count(m["old"]) != 1:
-        return {**v, "verdict": "INVALID", "detail": f"`old` occurs {orig.count(m['old'])} times"}
+        return {**v, "verdict": "NEEDS_REGENERATION",
+                "detail": f"`old` occurs {orig.count(m['old'])} times in {m['file']}; it must occur exactly once"}
     try:
         path.write_text(orig.replace(m["old"], m["new"], 1))
         err = compiles(wt, m["file"])

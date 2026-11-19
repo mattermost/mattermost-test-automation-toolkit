@@ -18,6 +18,7 @@ import tempfile as _tempfile
 if not _sys.pycache_prefix:
     _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
 
+import hashlib
 import json
 import shutil
 import sys
@@ -69,17 +70,30 @@ def services_up() -> None:
         sh(["redis-cli", "ping"], Path("."))
 
 
+def npm_ci_for_lock(webapp: Path) -> None:
+    """`npm ci` unless node_modules was installed from this exact package-lock.json (a stamp records its hash)."""
+    lock = webapp / "package-lock.json"
+    digest = hashlib.sha256(lock.read_bytes()).hexdigest() if lock.exists() else "no-lock"
+    stamp = webapp / "node_modules" / ".hunt-lock-sha256"
+    if stamp.exists() and stamp.read_text().strip() == digest:
+        return
+    sh(["npm", "ci", "--no-audit", "--no-fund"], webapp, timeout=3600, env=node_env())
+    stamp.parent.mkdir(exist_ok=True)
+    stamp.write_text(digest)
+
+
 def webapp_deps(wt: Path, wt_base: Path, mb: str, head: str) -> None:
     """`npm ci` in the head worktree's webapp/ (the shared clone has no checkout). The merge-base worktree reuses those
     node_modules when package-lock.json is unchanged, and installs its own otherwise."""
     if not shutil.which("node", path=node_env().get("PATH")):
         raise InfraError("node not on PATH (set HUNT_NODE_BIN)")
-    if not (wt / "webapp" / "node_modules").is_dir():
-        sh(["npm", "ci", "--no-audit", "--no-fund"], wt / "webapp", timeout=3600, env=node_env())
+    npm_ci_for_lock(wt / "webapp")
     lock_changed = sh(git_cmd("diff", "--quiet", mb, head, "--", "webapp/package-lock.json"), wt, check=False).returncode != 0
     if lock_changed:
-        if not (wt_base / "webapp" / "node_modules").is_dir():
-            sh(["npm", "ci", "--no-audit", "--no-fund"], wt_base / "webapp", timeout=3600, env=node_env())
+        base_modules = wt_base / "webapp" / "node_modules"
+        if base_modules.is_symlink():  # shared from an earlier run when the lockfiles still matched
+            base_modules.unlink()
+        npm_ci_for_lock(wt_base / "webapp")
         return
     for sub in ("webapp/node_modules", "webapp/channels/node_modules"):
         src, dst = wt / sub, wt_base / sub
