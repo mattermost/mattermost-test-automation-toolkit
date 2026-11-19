@@ -323,6 +323,15 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
       await post(row);
       return true;
     },
+    // Overwrites an existing, not green check only when a strictly older run or attempt owns it; never creates one.
+    async settle(row) {
+      const rows = await readStatuses(api, id);
+      const check = rows.find((r) => r.context === row.context);
+      const current = statusOwner(check?.target_url, id.repository);
+      if (!check || check.state === "success" || !current || compareOwners(owner(), current) <= 0 || !mayPublish(rows, id, check.context, owner(), "claim")) return false;
+      await post(row);
+      return true;
+    },
     async refresh(lanes, summaryContext, summarizeLanes, release = defaultRelease) {
       if (!summaryContext || !lanes.includes(context) || !await allowed("finish")) return;
       await summarize(lanes, summaryContext, summarizeLanes, release);
@@ -567,6 +576,14 @@ async function publish({ env, fetchImpl = fetch, log = console.error, wait, retr
       }
     }
     written = await publisher.write({ state, description, target_url: env.TARGET_URL }, operation);
+    if (written && operation === "finish" && state === "success") {
+      const context = `${env.STATUS_CONTEXT}/triage`;
+      try {
+        await publisher.settle({ context, state: "success", description: "Superseded: the lane passed on a later run or attempt", target_url: env.TARGET_URL });
+      } catch (e) {
+        log(`${context} not settled: ${String(e).slice(0, 200)}`);
+      }
+    }
   }
   const lanes = String(env.TRIAGE_LANES || "").split(",").map((s) => s.trim()).filter(Boolean);
   if (operation === "summarize") await publisher.summarize(lanes, env.TRIAGE_CONTEXT, laneSummary, release);

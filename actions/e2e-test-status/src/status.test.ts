@@ -318,3 +318,34 @@ test("release workflows read old out of date labels as fixed on main across refr
   await publish({ env: { ...baseEnv, COMPOSITE_IDENTITY: JSON.stringify({ ...id, gh_pr_number: 7 }), OPERATION: "refresh" }, fetchImpl: f.fetchImpl });
   assert.equal((f.posts.at(-1) as CommitStatus).description, "playwright-full/enterprise: 1 not caused by PR, 1 fixed on main");
 });
+
+const triage = `${lane}/triage`;
+const finish = (f: ReturnType<typeof fixture>, state: string) => publish({ env: {
+  COMPOSITE_IDENTITY: JSON.stringify({ ...id, gh_run_attempt: "2" }), GITHUB_RUN_ID: "20", GITHUB_RUN_ATTEMPT: "2",
+  GITHUB_TOKEN: "fake", STATUS_CONTEXT: lane, OPERATION: "finish", STATUS_STATE: state,
+}, fetchImpl: f.fetchImpl });
+const latest = (f: ReturnType<typeof fixture>, context: string) => f.rows.find((r) => r.context === context);
+test("a green finish turns an older attempt's red triage check green", async () => {
+  const f = fixture([status("20", "2"), status("20", "1", "failure", triage), status("20", "1", "failure")]);
+  assert.equal(await finish(f, "success"), true);
+  assert.equal(latest(f, triage)?.state, "success");
+  assert.deepEqual(statusOwner(latest(f, triage)?.target_url, "o/r"), { run: "20", attempt: "2" });
+});
+test("a green finish creates no triage check", async () => {
+  const f = fixture([status("20", "2")]);
+  assert.equal(await finish(f, "success"), true);
+  assert.equal(latest(f, triage), undefined);
+});
+test("a green finish leaves a newer or unknown owner's triage check alone", async () => {
+  for (const check of [status("30", "1", "failure", triage), { ...status("20", "1", "failure", triage), target_url: "https://example.test/manual" }]) {
+    const f = fixture([status("20", "2"), check]);
+    assert.equal(await finish(f, "success"), true);
+    assert.equal(latest(f, triage), check);
+  }
+});
+test("a red finish leaves the triage check for its own triage", async () => {
+  const check = status("20", "1", "failure", triage);
+  const f = fixture([status("20", "2"), check]);
+  assert.equal(await finish(f, "failure"), true);
+  assert.equal(latest(f, triage), check);
+});

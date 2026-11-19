@@ -79,6 +79,10 @@ Report-only job reruns may reuse attempt 1's report identity. Publication uses
 the report URL's `gh_run_attempt`. Thus attempt 2 can finish its own run while
 still linking the original diagnostics. Older attempts cannot overwrite it.
 
+A green `finish` skips triage, so it also turns the lane's `<status-context>/triage`
+check green when an older run or attempt left it red or pending. It never creates
+that check and never overwrites a newer or unknown owner's.
+
 When configured, `triage-status-context` is also refreshed after pending, skip,
 raw result and triage writes, inside the same lock. This is a factual summary
 of the required statuses, including when AI triage is report-only or disabled
