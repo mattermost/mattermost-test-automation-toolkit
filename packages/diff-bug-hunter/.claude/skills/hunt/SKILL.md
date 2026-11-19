@@ -21,6 +21,10 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
 2. **Context:** `ctx.py <pr> [--batch N]`. Quote its batch line. `skipped.log` lists every file not hunted; mention the
    deferred batches in the report and hunt them only if the user asks.
 3. **Hunters:** `build_requests.py <pr> hunters`, then dispatch `A/request.json` and `B/request.json` in parallel.
+   Both also get `prompts/strategy_x.md` (Mode A: S1 sibling guards, S2 adversarial callers and props; Mode B: S3
+   merge-base differential) and the context it reads: `neighbors_same_file` (unchanged functions near the change, from
+   the same file, topped up from the same directory) and `changed_functions_base_source`. Strengthen and repair rounds
+   get the context but not `strategy_x.md`; mutant planters get neither.
    Mode A also gets the `RELIABILITY.md` rules this diff triggers; Mode B and mutant planters never do. Each goes
    to a fresh Agent with no messaging/MCP tools, prompted with `dispatch.md` (next to this file) and `{REQ}` = the path.
 4. **Run:** `run.py run <pr> A` and `run.py run <pr> B`.

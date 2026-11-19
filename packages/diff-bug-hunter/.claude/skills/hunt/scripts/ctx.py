@@ -22,20 +22,26 @@ if not _sys.pycache_prefix:
     _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
 
 import argparse
+import itertools
 import json
 import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import prefilter
-from hunt_common import REPO, InfraError, git, hunt_dir, hunt_lock, sh, write_json
+from hunt_common import REPO, InfraError, git, git_cmd, hunt_dir, hunt_lock, sh, write_json
 
 MAX_SOURCE_LINES = 1500     # bigger changed files are shown as windows around the hunks
 MAX_SIBLING_LINES = 3000    # total sibling test lines per batch
 MAX_CALLERS = 40
 CALLER_PAD = 6
+MAX_BLOCK_LINES = 90        # one neighbour or merge-base function, clipped
+MAX_LINE_CHARS = 300        # longer lines (generated literals) are cut, so one file cannot flood the context
+MAX_NEIGHBOURS = 2          # unchanged functions shown per changed file
+MAX_NEIGHBOUR_LINES = 1000  # neighbour lines per batch, shared evenly between its files
+MAX_BASE_LINES = 2000       # merge-base function lines per batch, shared evenly between its files
 
 
 def numbered(lines: list[str], a: int, b: int) -> str:
@@ -183,19 +189,7 @@ def changed_go_tests(patch: str, head_src: str) -> list[str]:
             # methods whose names happen to start with Test.
             m = re.match(r"func (Test(?:[A-Z_0-9]\w*)?)\((?:\w+ )?\*(?:\w+\.)?T\)", line)
             decls.append((i, end, m.group(1) if m else ""))
-    touched: set[int] = set()
-    ln = 0
-    for line in patch.splitlines():
-        m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-        if m:
-            ln = int(m.group(1))
-        elif line.startswith("+") and not line.startswith("+++"):
-            touched.add(ln)
-            ln += 1
-        elif line.startswith("-") and not line.startswith("---"):
-            touched.add(ln)  # a removed line sits just before head line `ln`
-        elif not line.startswith("\\"):
-            ln += 1
+    touched = changed_lines(patch)
     names = set()
     for t in touched:
         names |= {name for start, end, name in decls if name and start <= t <= end}
@@ -250,6 +244,326 @@ def reset_hunt_dir(hdir: Path) -> None:
                 p.unlink(missing_ok=True)
 
 
+# ------------------------------------------------------------------ neighbours and merge-base versions
+# Hunters compare the PR's code with unchanged functions next to it (guards the new code may lack) and with the
+# merge-base version of each function it changed or removed (behaviour that should survive outside the PR's scope).
+
+GO_FUNC = re.compile(r"^func\s+(?:\(\s*(?:\w+\s+)?\*?\s*(\w+)[^)]*\)\s*)?([A-Za-z_]\w*)")
+TS_FUNC = re.compile(r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\*?\s*([A-Za-z_$][\w$]*)?\s*[<(]"
+                     r"|^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*[:=]")
+SOURCE_SUFFIXES = {"go": (".go",), "jest": (".ts", ".tsx", ".js", ".jsx")}
+NOT_NEIGHBOUR = re.compile(r"(^hunt_|_test\.go$|\.(test|spec|stories)\.|\.d\.ts$|\.pb\.go$|[._]gen(erated)?[._]|^mock_)")
+
+
+class PatchLines(NamedTuple):
+    added: set[int]      # head lines the patch adds
+    anchors: set[int]    # head line just after each removal
+    removed: set[int]    # base lines the patch removes
+    inserted: set[int]   # base line just after each addition
+
+
+def patch_lines(patch: str) -> PatchLines:
+    """Line numbers a patch touches on each side. `+++`/`---` are headers only before the first hunk, so content
+    lines like `++count;` still count; no-newline markers are skipped."""
+    out = PatchLines(set(), set(), set(), set())
+    new = old = 0
+    in_hunk = False
+    for line in patch.splitlines():
+        m = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if m:
+            old, new, in_hunk = int(m.group(1)), int(m.group(2)), True
+        elif not in_hunk or line.startswith("\\"):
+            continue
+        elif line.startswith("+"):
+            out.added.add(new)
+            out.inserted.add(old)
+            new += 1
+        elif line.startswith("-"):
+            out.anchors.add(new)
+            out.removed.add(old)
+            old += 1
+        else:
+            new += 1
+            old += 1
+    return out
+
+
+def changed_lines(patch: str) -> set[int]:
+    """Head-side line numbers the patch adds, plus the head position of each removal (context lines excluded)."""
+    pl = patch_lines(patch)
+    return pl.added | pl.anchors
+
+
+REGEX_BEFORE = re.compile(r"(^|[(,=:\[!&|?{};]|\breturn)\s*$")
+
+
+def code_only(line: str, lang: str, open_quote: str = "") -> tuple[str, str]:
+    """(code, quote still open at the end) for one Go or JS/TS line: string, rune, template-literal and JS regex
+    contents and any `//` comment removed, so braces and `//` inside them don't count as code. `open_quote` carries a
+    Go raw string or JS template literal across lines. Go raw strings have no escapes; JS template literals do. JSX
+    text containing an apostrophe is not recognised (rare: only matters when a `{...}` then spans lines)."""
+    out: list[str] = []
+    quote = open_quote
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == "\\" and not (quote == "`" and lang == "go"):
+                i += 1
+            elif c == quote:
+                quote = ""
+                out.append(c)
+        elif c in "\"'`":
+            quote = c
+            out.append(c)
+        elif line.startswith("//", i):
+            break
+        elif c == "/" and lang != "go" and REGEX_BEFORE.search("".join(out)):
+            in_class = False
+            i += 1
+            while i < len(line) and (line[i] != "/" or in_class):
+                if line[i] == "\\":
+                    i += 1
+                elif line[i] == "[":
+                    in_class = True
+                elif line[i] == "]":
+                    in_class = False
+                i += 1
+            out.append('""')
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out), quote
+
+
+def code_lines(lines: list[str], lang: str) -> list[str]:
+    """code_only over consecutive lines, carrying multi-line raw strings and template literals."""
+    out, quote = [], ""
+    for line in lines:
+        code, quote = code_only(line, lang, quote)
+        out.append(code)
+    return out
+
+
+def block_end(lines: list[str], a: int, limit: int, lang: str) -> tuple[int, bool]:
+    """(last line, has a body) of the declaration starting at line a, 1-based. The body is the first `{` outside any
+    parentheses (so an inline object type in a parameter list doesn't count); the block ends where that brace closes.
+    A declaration with no body ends at its first line ending in `;` with nothing left open. Bounded by `limit`."""
+    braces = parens = 0
+    body = False
+    for j, code in enumerate(code_lines(lines[a - 1:limit], lang), start=a - 1):
+        for c in code:
+            if c in "([":
+                parens += 1
+            elif c in ")]":
+                parens = max(0, parens - 1)
+            elif c == "{":
+                body = body or (parens == 0 and braces == 0)
+                braces += 1
+            elif c == "}":
+                braces = max(0, braces - 1)
+        if body and braces == 0:
+            return j + 1, True
+        if not body and braces == 0 and parens == 0 and code.rstrip().endswith(";"):
+            return j + 1, False
+    return limit, body
+
+
+def balanced(text: str, i: int) -> int:
+    """Index just past the bracket group opening at text[i] (`(` or `<`), or -1 when it never closes."""
+    pairs = {"(": ")", "<": ">"}
+    stack = [pairs[text[i]]]
+    for k in range(i + 1, len(text)):
+        if text[k] in pairs and (text[k] == "(" or stack[-1] == ">"):
+            stack.append(pairs[text[k]])
+        elif text[k] == stack[-1] and not (text[k] == ">" and text[k - 1] == "="):
+            stack.pop()
+            if not stack:
+                return k + 1
+    return -1
+
+
+def ts_holds_function(decl: str) -> bool:
+    """Whether a `const`/`let`/`var` declaration's value is a function: an arrow, `function`, or a call whose argument
+    list contains one (React.memo, forwardRef, useCallback, createSelector). `decl` is the code-only declaration."""
+    m = re.search(r"(?<![=!<>])=(?![=>])", decl)
+    if not m:
+        return False
+    rhs = decl[m.end():].lstrip()
+    rhs = re.sub(r"^async\s+", "", rhs)
+    if re.match(r"function\b|[A-Za-z_$][\w$]*\s*=>", rhs):
+        return True
+    if rhs.startswith("<"):  # generic arrow: <T,>(x: T) => x
+        k = balanced(rhs, 0)
+        rhs = rhs[k:].lstrip() if k > 0 else ""
+        if not rhs.startswith("("):
+            return False
+    if rhs.startswith("("):
+        k = balanced(rhs, 0)
+        return k > 0 and re.match(r"\s*(?::[^=;{]+?)?=>", rhs[k:]) is not None
+    call = re.match(r"[\w$.]+\s*(?:<[^;]*?>)?\s*\(", rhs)
+    if call:
+        k = balanced(rhs, call.end() - 1)
+        args = rhs[call.end():k] if k > 0 else rhs[call.end():]
+        return re.search(r"=>|\bfunction\b", args) is not None
+    return False
+
+
+def top_blocks(lines: list[str], lang: str) -> list[tuple[str, int, int]]:
+    """Top-level functions as (symbol, first, last), 1-based. Go methods are Recv.Name, an anonymous default export is
+    `default`, and a repeated name (several `init`) gets `#2`, `#3`. TS body-less overload signatures and declarations
+    whose value is not a function are skipped."""
+    rx = GO_FUNC if lang == "go" else TS_FUNC
+    cands: list[tuple[int, str, bool]] = []  # (0-based line, name, is a `func`/`function` declaration)
+    for i, line in enumerate(lines):
+        m = rx.match(line)
+        if not m:
+            continue
+        if lang == "go":
+            cands.append((i, f"{m.group(1)}.{m.group(2)}" if m.group(1) else m.group(2), True))
+        elif m.group(2) is None:
+            cands.append((i, m.group(1) or "default", True))
+        else:
+            cands.append((i, m.group(2), False))
+    out: list[tuple[str, int, int]] = []
+    seen: dict[str, int] = {}
+    for k, (i, name, is_fn) in enumerate(cands):
+        limit = cands[k + 1][0] if k + 1 < len(cands) else len(lines)
+        b, has_body = block_end(lines, i + 1, limit, lang)
+        decl = code_lines(lines[i:b], lang)
+        if lang != "go" and is_fn and (not has_body or decl[-1].rstrip().endswith(";")):
+            continue  # overload signature: function f(a: {x: string}): {y: number};
+        if lang != "go" and not is_fn and not ts_holds_function(" ".join(decl)):
+            continue  # export const LIMIT = 5;
+        seen[name] = seen.get(name, 0) + 1
+        out.append((name if seen[name] == 1 else f"{name}#{seen[name]}", i + 1, b))
+    return out
+
+
+def clipped(lines: list[str], a: int, b: int, budget: int, focus: int | None = None) -> tuple[str, int]:
+    """Numbered source of lines a..b, at most min(MAX_BLOCK_LINES, budget) of them, each cut at MAX_LINE_CHARS;
+    the window starts a little before `focus` when given, so a long function still shows its changed part."""
+    room = max(1, min(MAX_BLOCK_LINES, budget))
+    first = a if focus is None else max(a, min(focus - 10, b - room + 1))
+    last = min(b, first + room - 1)
+    cut = [ln if len(ln) <= MAX_LINE_CHARS else ln[:MAX_LINE_CHARS] + " …" for ln in lines]
+    text = ("   ...\n" if first > a else "") + numbered(cut, first, last) + ("\n   ...(truncated)" if last < b else "")
+    return text, last - first + 1
+
+
+def read_source(path: Path, root: Path, max_lines: int | None = None) -> list[str] | None:
+    """Lines of a regular file inside root (the first max_lines when given); None for symlinks, anything outside root,
+    or a file that cannot be read."""
+    try:
+        if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(root.resolve()):
+            return None
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            return [line.rstrip("\r\n") for line in itertools.islice(fh, max_lines)]
+    except OSError:
+        return None
+
+
+def is_generated(lines: list[str]) -> bool:
+    """A `Code generated` / `@generated` marker anywhere in the leading comments (Mattermost puts its license header
+    first); stops at the first line of code."""
+    in_block = False
+    for line in lines:
+        s = line.strip()
+        if "Code generated" in s or "@generated" in s:
+            return True
+        if in_block or s.startswith("/*"):
+            in_block = "*/" not in s
+        elif s and not s.startswith(("//", "#!")):
+            return False
+    return False
+
+
+def nearest_first(blocks: list[tuple[str, int, int]], targets: list[tuple[int, int]]) -> list[tuple[str, int, int]]:
+    """Blocks ordered by line distance to the nearest target range, then by position."""
+    def key(blk: tuple[str, int, int]) -> tuple[int, int]:
+        gap = min((max(0, blk[1] - hi, lo - blk[2]) for lo, hi in targets), default=0)
+        return gap, blk[1]
+    return sorted(blocks, key=key)
+
+
+def tracked_siblings(wt: Path, f: str) -> list[str]:
+    """Git-tracked files next to f (same directory, not recursive), sorted."""
+    d = str(Path(f).parent)
+    out = sh(git_cmd("ls-files", "-z", "--", "." if d == "." else d), wt).stdout
+    return sorted(p for p in out.split("\0") if p and str(Path(p).parent) == d)
+
+
+def neighbours_and_base(wt: Path, wt_base: Path, files: list[str], patches: dict[str, str],
+                        all_changed: set[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Per changed file: up to MAX_NEIGHBOURS unchanged functions nearest the change, topped up from other tracked,
+    hand-written source files in the same directory when the file has too few (a new file, or a component whose
+    logic is nested); and the merge-base version of every function the patch changes or removes. A sibling function
+    is listed once, with every changed file it was picked for in `near`. Deterministic: files and blocks in order.
+    Each file gets an even share of the line budgets."""
+    neigh: list[dict[str, Any]] = []
+    shown: dict[tuple[str, str], dict[str, Any]] = {}
+    base: list[dict[str, Any]] = []
+    n_share = MAX_NEIGHBOUR_LINES // max(1, len(files))
+    b_share = MAX_BASE_LINES // max(1, len(files))
+
+    def entry(f: str, sym: str, a: int, b: int, text: str, **extra: Any) -> dict[str, Any]:
+        return {"file": f, "symbol": sym, "lines": f"{a}-{b}", **extra, "source": text}
+
+    for f in files:
+        lang = lang_of(f)
+        lines = read_source(wt / f, wt)
+        if lines is None:
+            continue
+        pl = patch_lines(patches[f])
+        blocks = top_blocks(lines, lang)
+        changed = [blk for blk in blocks
+                   if any(blk[1] <= n <= blk[2] for n in pl.added) or any(blk[1] < n <= blk[2] for n in pl.anchors)]
+        unchanged = [blk for blk in blocks if blk not in changed]
+        targets = [(c[1], c[2]) for c in changed] or [(n, n) for n in sorted(pl.added | pl.anchors)]
+        budget, picked = n_share, 0
+        for sym, a, b in nearest_first(unchanged, targets)[:MAX_NEIGHBOURS]:
+            text, used = clipped(lines, a, b, budget)
+            neigh.append(entry(f, sym, a, b, text, scope="same_file", near=[f]))
+            budget, picked = budget - used, picked + 1
+        for rel in tracked_siblings(wt, f) if picked < MAX_NEIGHBOURS else []:
+            if picked == MAX_NEIGHBOURS or budget <= 0:
+                break
+            if (rel in all_changed or not rel.endswith(SOURCE_SUFFIXES[lang]) or prefilter.excluded(rel)
+                    or NOT_NEIGHBOUR.search(Path(rel).name)):
+                continue
+            plines = read_source(wt / rel, wt, MAX_SOURCE_LINES)
+            if plines is None or is_generated(plines):
+                continue
+            for sym, a, b in top_blocks(plines, lang)[:MAX_NEIGHBOURS - picked]:
+                if (rel, sym) in shown:  # already listed for another changed file in this directory
+                    shown[(rel, sym)]["near"].append(f)
+                    picked += 1
+                    continue
+                if budget <= 0:
+                    break
+                text, used = clipped(plines, a, b, budget)
+                shown[(rel, sym)] = entry(rel, sym, a, b, text, scope="same_dir", near=[f])
+                neigh.append(shown[(rel, sym)])
+                budget, picked = budget - used, picked + 1
+
+        blines = read_source(wt_base / f, wt_base)
+        if blines is None:
+            continue  # new in this PR: no merge-base version to compare with
+        bblocks = top_blocks(blines, lang)
+        repeated = {s.split("#")[0] for s, _, _ in blocks + bblocks if "#" in s}  # ordinals can't pair head with base
+        names = {sym for sym, _, _ in changed}
+        budget = b_share
+        for sym, a, b in bblocks:
+            if sym.split("#")[0] in repeated or budget <= 0:
+                continue
+            hit = sorted(n for n in pl.removed | pl.inserted if a <= n <= b)
+            if sym in names or any(a <= n <= b for n in pl.removed):
+                text, used = clipped(blines, a, b, budget, hit[0] if hit else None)
+                base.append(entry(f, sym, a, b, text))
+                budget -= used
+    return neigh, base
+
+
 def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
     repo, wt, mb, head = Path(prep["repo"]), Path(prep["wt"]), prep["merge_base"], prep["head"]
     diffs = file_diffs(repo, mb, head)
@@ -273,7 +587,8 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> di
     for f in chosen:
         syms |= changed_symbols(f.patch, lang_of(f.path))
     targets = test_targets(wt, files)
-    ctx = {
+    all_changed = sorted({f.path for f in diffs} | set(deleted))
+    ctx: dict[str, Any] = {
         "pr": {"number": int(pr), "title": meta.get("title", ""), "description": meta.get("body") or ""},
         "diff_production_code": "\n".join(patches[f] for f in files),
         "changed_files_head_source": [{"file": f, "source": source_view(wt, f, patches[f])} for f in files],
@@ -281,8 +596,10 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> di
         "callers": callers(wt, files, syms),
         "your_test_files": targets,
         # every changed path, hunted, skipped or deleted, so path-triggered rules (e.g. SQL migrations) still apply
-        "all_changed_files": sorted({f.path for f in diffs} | set(deleted)),
+        "all_changed_files": all_changed,
     }
+    ctx["neighbors_same_file"], ctx["changed_functions_base_source"] = neighbours_and_base(
+        wt, Path(prep["wt_base"]), files, {f.path: f.patch for f in chosen}, set(all_changed))
     state = {"pr": pr, "batch": batch, "batches": len(plan.batches), "repo": str(repo), "wt": str(wt),
              "wt_base": prep["wt_base"], "merge_base": mb, "head": head, "changed": files, "targets": targets,
              "own_tests": own_tests(repo, mb, head, {t["dir"] for t in targets})}
@@ -304,7 +621,8 @@ def main() -> None:
         st = build(a.pr, a.batch, prep, meta)
     ctx = json.loads((hunt_dir(a.pr) / "ctx.json").read_text())
     print(f"batch {st['batch']}/{st['batches']}: {len(st['changed'])} files, {len(ctx['callers'])} caller excerpts, "
-          f"{len(ctx['sibling_tests_and_helpers'])} sibling test files; skipped.log has the rest")
+          f"{len(ctx['sibling_tests_and_helpers'])} sibling test files, {len(ctx['neighbors_same_file'])} neighbour and "
+          f"{len(ctx['changed_functions_base_source'])} merge-base functions; skipped.log has the rest")
 
 
 if __name__ == "__main__":

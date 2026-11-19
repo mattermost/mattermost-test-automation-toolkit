@@ -56,11 +56,14 @@ def write(hdir: Path, tag: str, system: str, user: dict[str, Any], schema: dict[
     return hdir / tag / "request.json"
 
 
-def hunter_system(mode: str, state: dict[str, Any], ctx: dict[str, Any]) -> str:
+def hunter_system(mode: str, state: dict[str, Any], ctx: dict[str, Any], strategies: bool = False) -> str:
+    """System prompt for a hunter. `strategies` adds prompts/strategy_x.md: only first-pass hunters get it, so
+    strengthen and repair rounds stay focused on their one job."""
     lang_rules = "".join(prompt(f"lang_{lang}") for lang in langs(state))
     common = prompt("common").replace("{lang_rules}", lang_rules).replace("{lessons}", lessons.render(lessons.match(ctx)))
     rules = reliability.render(reliability.match(ctx)) if mode.startswith("A") else ""
-    return prompt(f"mode_{mode.lower()}") + rules + common
+    extra = prompt("strategy_x") if strategies else ""
+    return prompt(f"mode_{mode.lower()}") + rules + extra + common
 
 
 def hunter_user(mode: str, ctx: dict[str, Any]) -> dict[str, Any]:
@@ -88,7 +91,8 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
     if what == "hunters":
         lessons.log_hits(f"{pr}/{state['batch']}", lessons.match(ctx))  # input for `lessons.py prune`
         for mode in ("A", "B"):
-            print(write(hdir, mode, hunter_system(mode, state, ctx), hunter_user(mode, ctx), HUNTER_SCHEMA))
+            print(write(hdir, mode, hunter_system(mode, state, ctx, strategies=True), hunter_user(mode, ctx),
+                        HUNTER_SCHEMA))
     elif what == "mutants":
         print(write(hdir, "M", mutant_system(state, 3, "M1, M2, M3"), mutant_user(ctx), MUTANT_SCHEMA))
     elif what == "heldout":

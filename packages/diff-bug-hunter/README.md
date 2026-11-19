@@ -10,8 +10,15 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
 ## /hunt
 
 - **Mode A (caller invariants):** blind subagents infer what callers rely on and write property tests.
-  Every invariant must be backed by at least 3 caller `file:line` references. Go tests run with `-race`.
+  Every invariant must be backed by at least 3 `file:line` references: callers, or neighbours that apply the same guard
+  (S1 below). Go tests run with `-race`.
 - **Mode B (PR-promise falsifier):** tests that try to break each claim in the PR description.
+- **Strategies** (`prompts/strategy_x.md`, first-pass hunters only):
+  - **S1 sibling guards (Mode A):** checks that unchanged nearby functions apply but the new code skips. Neighbours
+    come from the same file, topped up from tracked files in the same directory.
+  - **S2 adversarial callers (Mode A):** every role and session type for Go; omitted optional props, or required ones
+    an untyped caller can skip, for React.
+  - **S3 differential (Mode B):** inputs that reach no changed line must behave as the merge-base version did.
 - **Vetting:** each failure must reproduce 3/3. It is root-caused against `lessons.jsonl` (known false positives),
   run on the merge-base (**New PR Bug** vs **Pre-Existing Bug**), and checked for caller reachability.
 - **Mutation gate:**
@@ -183,7 +190,7 @@ those `node_modules` unless the PR changes `package-lock.json`.
 
 ## CI integration
 
-Package self-test: 119 tests (pytest), run by this repository's `.github/workflows/diff-bug-hunter.yml` when
+Package self-test: 136 tests (pytest), run by this repository's `.github/workflows/diff-bug-hunter.yml` when
 `packages/diff-bug-hunter/` changes. The /verify tests need the Chromium build that matches the pinned Playwright, installed from the fixture
 directory:
 
