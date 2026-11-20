@@ -3503,7 +3503,7 @@ var init_getInstanceMetadataRegion = __esm({
     };
     imdsRequest = async (options) => {
       const { request } = await import("http");
-      return new Promise((resolve2, reject) => {
+      return new Promise((resolve3, reject) => {
         const req = request({
           hostname: options.hostname,
           port: options.port,
@@ -3531,7 +3531,7 @@ var init_getInstanceMetadataRegion = __esm({
           const chunks = [];
           res.on("data", (chunk) => chunks.push(chunk));
           res.on("end", () => {
-            resolve2(Buffer.concat(chunks));
+            resolve3(Buffer.concat(chunks));
             req.destroy();
           });
         });
@@ -5030,7 +5030,7 @@ var init_stream_collector = __esm({
       if (isReadableStream(stream)) {
         return collectReadableStream(stream);
       }
-      return new Promise((resolve2, reject) => {
+      return new Promise((resolve3, reject) => {
         const collector = new Collector();
         const nodeStream = stream;
         nodeStream.pipe(collector);
@@ -5041,7 +5041,7 @@ var init_stream_collector = __esm({
         collector.on("error", reject);
         collector.on("finish", function() {
           const bytes = concatBytes(this.bufferedBytes);
-          resolve2(bytes);
+          resolve3(bytes);
         });
       });
     };
@@ -6433,7 +6433,7 @@ async function* readableToIterable(readStream) {
     streamEnded = true;
   });
   while (!generationEnded) {
-    const value = await new Promise((resolve2) => setTimeout(() => resolve2(records.shift()), 0));
+    const value = await new Promise((resolve3) => setTimeout(() => resolve3(records.shift()), 0));
     if (value) {
       yield value;
     }
@@ -10327,7 +10327,7 @@ function bindRetryMiddleware(isStreamingPayload2) {
           const delay = retryToken.getRetryDelay();
           totalRetryDelay += (retryToken?.$retryLog?.acquisitionDelay ?? 0) + delay;
           if (delay > 0) {
-            await race(new Promise((resolve2) => setTimeout(resolve2, delay)), abortSignal);
+            await race(new Promise((resolve3) => setTimeout(resolve3, delay)), abortSignal);
           }
         }
       }
@@ -10462,7 +10462,7 @@ var init_DefaultRateLimiter = __esm({
         this.refillTokenBucket();
         while (amount > this.availableTokens) {
           const delay = (amount - this.availableTokens) / this.fillRate * 1e3;
-          await new Promise((resolve2) => _DefaultRateLimiter.setTimeoutFn(resolve2, delay));
+          await new Promise((resolve3) => _DefaultRateLimiter.setTimeoutFn(resolve3, delay));
           this.refillTokenBucket();
         }
         this.availableTokens = this.availableTokens - amount;
@@ -12473,7 +12473,7 @@ var init_node_http = __esm({
 
 // ../../node_modules/@smithy/credential-provider-imds/dist-es/remoteProvider/httpRequest.js
 function httpRequest(options) {
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve3, reject) => {
     const req = import_node_http.default.request({
       method: "GET",
       ...options,
@@ -12498,7 +12498,7 @@ function httpRequest(options) {
         chunks.push(chunk);
       });
       res.on("end", () => {
-        resolve2(Buffer.concat(chunks));
+        resolve3(Buffer.concat(chunks));
         req.destroy();
       });
     });
@@ -13165,21 +13165,21 @@ async function writeRequestBody(httpRequest2, request, maxContinueTimeoutMs = MI
   let sendBody = true;
   if (!externalAgent && expect === "100-continue") {
     sendBody = await Promise.race([
-      new Promise((resolve2) => {
-        timeoutId = Number(timing.setTimeout(() => resolve2(true), Math.max(MIN_WAIT_TIME, maxContinueTimeoutMs)));
+      new Promise((resolve3) => {
+        timeoutId = Number(timing.setTimeout(() => resolve3(true), Math.max(MIN_WAIT_TIME, maxContinueTimeoutMs)));
       }),
-      new Promise((resolve2) => {
+      new Promise((resolve3) => {
         httpRequest2.on("continue", () => {
           timing.clearTimeout(timeoutId);
-          resolve2(true);
+          resolve3(true);
         });
         httpRequest2.on("response", () => {
           timing.clearTimeout(timeoutId);
-          resolve2(false);
+          resolve3(false);
         });
         httpRequest2.on("error", () => {
           timing.clearTimeout(timeoutId);
-          resolve2(false);
+          resolve3(false);
         });
       })
     ]);
@@ -13283,13 +13283,13 @@ or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler conf
         return socketWarningTimestamp;
       }
       constructor(options) {
-        this.configProvider = new Promise((resolve2, reject) => {
+        this.configProvider = new Promise((resolve3, reject) => {
           if (typeof options === "function") {
             options().then((_options) => {
-              resolve2(this.resolveDefaultConfig(_options));
+              resolve3(this.resolveDefaultConfig(_options));
             }).catch(reject);
           } else {
-            resolve2(this.resolveDefaultConfig(options));
+            resolve3(this.resolveDefaultConfig(options));
           }
         });
       }
@@ -13319,7 +13319,7 @@ or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler conf
             timing.clearTimeout(requestTimeoutId);
             timing.clearTimeout(keepAliveTimeoutId);
           };
-          const resolve2 = async (arg) => {
+          const resolve3 = async (arg) => {
             await writeRequestBodyPromise;
             clearTimeouts();
             _resolve(arg);
@@ -13383,7 +13383,7 @@ or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler conf
               headers: getTransformedHeaders(res.headers),
               body: res
             });
-            resolve2({ response: httpResponse });
+            resolve3({ response: httpResponse });
           });
           req.on("error", (err) => {
             if (NODEJS_TIMEOUT_ERROR_CODES2.includes(err.code)) {
@@ -13600,7 +13600,7 @@ var init_retry_wrapper = __esm({
           try {
             return await toRetry();
           } catch (e6) {
-            await new Promise((resolve2) => setTimeout(resolve2, delayMs));
+            await new Promise((resolve3) => setTimeout(resolve3, delayMs));
           }
         }
         return await toRetry();
@@ -14303,11 +14303,11 @@ var init_xml_parser = __esm({
               childTags.push(p4.parseTag());
             }
           } else {
-            let text = "";
+            let text2 = "";
             while (p4.i < p4.z && p4.x[p4.i] !== "<") {
-              text += p4.x[p4.i++];
+              text2 += p4.x[p4.i++];
             }
-            textParts.push(p4.decodeEntities(text));
+            textParts.push(p4.decodeEntities(text2));
           }
         }
         if (!p4.isNext("</")) {
@@ -14322,18 +14322,18 @@ var init_xml_parser = __esm({
           return { tag, value: "" };
         }
         if (!hasAttrs && !hasElementChild) {
-          const text = textParts.length === 1 ? textParts[0] : textParts.join("");
-          if (text.trim() === "" && text.includes("\n")) {
+          const text2 = textParts.length === 1 ? textParts[0] : textParts.join("");
+          if (text2.trim() === "" && text2.includes("\n")) {
             return { tag, value: "" };
           }
-          return { tag, value: text };
+          return { tag, value: text2 };
         }
         const obj = {};
-        for (const text of textParts) {
-          if (text.trim() === "" && text.includes("\n")) {
+        for (const text2 of textParts) {
+          if (text2.trim() === "" && text2.includes("\n")) {
             continue;
           }
-          obj["#text"] = "#text" in obj ? obj["#text"] + text : text;
+          obj["#text"] = "#text" in obj ? obj["#text"] + text2 : text2;
         }
         for (const child of childTags) {
           if (child.tag === "__proto__") {
@@ -26201,7 +26201,7 @@ var InvokeCommand = class extends command5(_ep05, _mw05, "Invoke", Invoke$) {
 // src/lambda.ts
 var REQUEST_TIMEOUT_MS = 96e4;
 var THROTTLE_ATTEMPTS = 5;
-var sleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
+var sleep = (ms) => new Promise((resolve3) => setTimeout(resolve3, ms));
 function lambdaClientConfig(region, requestTimeout = REQUEST_TIMEOUT_MS) {
   return {
     region,
@@ -26243,12 +26243,79 @@ function lambdaInvoke(client, wait = sleep, log = console.log) {
 
 // src/stack.ts
 var import_node_crypto5 = require("crypto");
-var import_node_fs5 = require("fs");
+var import_node_fs7 = require("fs");
 var import_node_os4 = require("os");
+var import_node_path8 = require("path");
+var import_node_zlib2 = require("zlib");
+
+// ../shared/src/github.ts
+var sleep2 = (ms) => new Promise((resolve3) => setTimeout(resolve3, ms));
+var RETRY_DELAYS_MS = Object.freeze([1e3, 3e3]);
+var networkError = (e6) => e6 instanceof TypeError && (e6.message === "fetch failed" || e6.message === "terminated") || e6 instanceof DOMException && (e6.name === "TimeoutError" || e6.name === "AbortError");
+
+// src/body.ts
+var BodyTooLarge = class extends Error {
+};
+async function readBody(res, max, { truncate = false } = {}) {
+  const length = Number(res.headers.get("content-length") ?? 0);
+  if (!truncate && length > max) {
+    await res.body?.cancel().catch(() => {
+    });
+    throw new BodyTooLarge(`${length} bytes, more than ${max}`);
+  }
+  if (!res.body) return Buffer.alloc(0);
+  const reader = res.body.getReader();
+  const chunks = [];
+  let read = 0;
+  let done = false;
+  try {
+    while (!truncate || read < max) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        done = true;
+        break;
+      }
+      read += chunk.value.byteLength;
+      if (!truncate && read > max) throw new BodyTooLarge(`more than ${max} bytes`);
+      chunks.push(chunk.value);
+    }
+  } finally {
+    if (!done) await reader.cancel().catch(() => {
+    });
+  }
+  return Buffer.concat(chunks).subarray(0, max);
+}
+
+// src/check-run.ts
+async function checkRun(inputs, github, log) {
+  const run2 = await github.json(`/repos/${inputs.repository}/actions/runs/${inputs.runId}`);
+  const path = run2?.path ?? "";
+  const branch = run2?.head_branch ?? "";
+  const event = run2?.event ?? "";
+  const repo = run2?.head_repository?.full_name ?? "";
+  const allowed = inputs.workflows.includes(path) && inputs.branches.test(branch) && inputs.events.includes(event) && repo === inputs.repository;
+  const described = `${path || "no workflow"} on ${branch || "no branch"} (${event || "no event"}) from ${repo || "no repository"}`;
+  if (!allowed) throw new Error(`e2e-test-stack: run ${inputs.runId} is not an allowed run: ${described}`);
+  log(`e2e-test-stack: run ${inputs.runId} is allowed: ${described}`);
+}
+
+// src/earlier.ts
+var import_node_fs5 = require("fs");
 var import_node_path7 = require("path");
-var import_node_zlib = require("zlib");
 
 // src/inputs.ts
+var OPERATIONS = [
+  "create",
+  "fetch",
+  "logs",
+  "destroy",
+  "open",
+  "role",
+  "server-image",
+  "check-run",
+  "earlier-response"
+];
+var NO_STACK = ["role", "server-image", "check-run", "earlier-response"];
 var InputError = class extends Error {
 };
 var refuse = (message) => {
@@ -26265,6 +26332,15 @@ var LICENSE = /^[A-Za-z0-9._-]+$/;
 var INSTANCE_TYPE = /^[a-z0-9-]+\.[a-z0-9-]+$/;
 var SERVER_SETTING = /^MM_[A-Z0-9_]+$/;
 var BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
+var GONE_WINDOW_SECONDS = 180;
+var BATCH_PREFIX = /^[a-z0-9][a-z0-9-]{0,60}-$/;
+var MAX_GONE_WINDOW_SECONDS = 1800;
+var REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+var RUN_ID = /^\d+$/;
+var WORKFLOW_PATH = /^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/;
+var EVENT = /^[a-z_]+$/;
+var ARTIFACT_NAME = /^[A-Za-z0-9._-]+$/;
+var MEMBER = /^(?!\.{1,2}(\/|$))[A-Za-z0-9._-]+(\/(?!\.{1,2}(\/|$))[A-Za-z0-9._-]+)*$/;
 var CREATE_ONLY = [
   ["instance-key", "STACK_INSTANCE_KEY"],
   ["server-image", "STACK_SERVER_IMAGE"],
@@ -26280,6 +26356,25 @@ var CREATE_ONLY = [
   ["shared-admin-password", "STACK_SHARED_ADMIN_PASSWORD"],
   ["wait-for-migrations", "STACK_WAIT_FOR_MIGRATIONS"]
 ];
+var OWN_INPUTS = [
+  ["account", "STACK_ACCOUNT", ["role"]],
+  ["account-file", "STACK_ACCOUNT_FILE", ["role"]],
+  ["role-arn-prod", "STACK_ROLE_ARN_PROD", ["role"]],
+  ["role-arn-dev", "STACK_ROLE_ARN_DEV", ["role"]],
+  ["server", "STACK_SERVER", ["server-image"]],
+  ["run-id", "STACK_RUN_ID", ["check-run", "earlier-response"]],
+  ["allowed-workflows", "STACK_ALLOWED_WORKFLOWS", ["check-run"]],
+  ["allowed-branches", "STACK_ALLOWED_BRANCHES", ["check-run"]],
+  ["allowed-events", "STACK_ALLOWED_EVENTS", ["check-run"]],
+  ["artifact-name", "STACK_ARTIFACT_NAME", ["earlier-response"]],
+  ["response-member", "STACK_RESPONSE_MEMBER", ["earlier-response"]],
+  ["account-path", "STACK_ACCOUNT_PATH", ["earlier-response"]],
+  ["verify-gone", "STACK_VERIFY_GONE", ["destroy"]],
+  ["gone-window", "STACK_GONE_WINDOW", ["destroy"]],
+  ["expect-batch-prefix", "STACK_EXPECT_BATCH_PREFIX", ["fetch", "logs", "destroy", "open"]]
+];
+var and = (items, conjunction = "and") => items.length < 2 ? items.join("") : `${items.slice(0, -1).join(", ")} ${conjunction} ${items[items.length - 1]}`;
+var article = (word) => /^[aeio]/.test(word) ? "an" : "a";
 var integer = (name, value, min) => {
   if (!/^-?\d+$/.test(value)) refuse(`${name} must be a whole number, got ${JSON.stringify(value)}`);
   const n4 = Number(value);
@@ -26336,13 +26431,13 @@ var createFields = (env2) => {
   const callerRunId = get("STACK_CALLER_RUN_ID");
   if (!/^\d+$/.test(callerRunId))
     refuse(`caller-run-id must be a workflow run id (digits), got ${JSON.stringify(callerRunId)}`);
-  const serverImage = get("STACK_SERVER_IMAGE");
-  if (!serverImage)
+  const serverImage2 = get("STACK_SERVER_IMAGE");
+  if (!serverImage2)
     refuse(
       "server-image is required for create; name the image under test, e.g. mattermostdevelopment/mattermost-enterprise-edition:master"
     );
-  if (/\s/.test(serverImage)) refuse(`server-image must be one image reference, got ${JSON.stringify(serverImage)}`);
-  const fields = { instance_key: instanceKey, caller_run_id: callerRunId, server_image: serverImage };
+  if (/\s/.test(serverImage2)) refuse(`server-image must be one image reference, got ${JSON.stringify(serverImage2)}`);
+  const fields = { instance_key: instanceKey, caller_run_id: callerRunId, server_image: serverImage2 };
   if (get("STACK_COUNT")) fields.count = integer("count", get("STACK_COUNT"), 1);
   const services = list(get("STACK_SERVICES"));
   for (const s3 of services) matching("each of services", s3, SERVICE, "a service name such as minio or keycloak");
@@ -26371,14 +26466,110 @@ var createFields = (env2) => {
   if (wait !== void 0) fields.wait_for_migrations = wait;
   return fields;
 };
+var batchPrefix = (value) => matching(
+  "expect-batch-prefix",
+  value,
+  BATCH_PREFIX,
+  'lowercase letters, digits and hyphens, ending with a hyphen, 62 or fewer, e.g. "mobile-1234-"'
+);
+var checkRunInputs = (env2, repository) => {
+  const get = (k7) => (env2[k7] ?? "").trim();
+  const runId = get("STACK_RUN_ID");
+  if (!RUN_ID.test(runId)) refuse(`run-id must be a workflow run id (digits), got ${JSON.stringify(runId)}`);
+  const workflows = list(get("STACK_ALLOWED_WORKFLOWS"));
+  if (!workflows.length)
+    refuse("allowed-workflows is required for check-run: the workflow files whose runs may be read");
+  for (const w2 of workflows)
+    matching("each of allowed-workflows", w2, WORKFLOW_PATH, 'a workflow file such as ".github/workflows/e2e.yml"');
+  const pattern = get("STACK_ALLOWED_BRANCHES");
+  if (!pattern) refuse("allowed-branches is required for check-run: a regular expression the whole branch matches");
+  let branches;
+  try {
+    new RegExp(pattern);
+    branches = new RegExp(`^(?:${pattern})$`);
+  } catch (e6) {
+    return refuse(`allowed-branches must be a JavaScript regular expression: ${e6.message}`);
+  }
+  const events = list(get("STACK_ALLOWED_EVENTS"));
+  if (!events.length) refuse("allowed-events is required for check-run: the events whose runs may be read");
+  for (const e6 of events) matching("each of allowed-events", e6, EVENT, 'an event name such as "push"');
+  return { repository, runId, workflows, branches, events };
+};
+var noStackInputs = (env2, inputs) => {
+  const get = (k7) => (env2[k7] ?? "").trim();
+  const op = inputs.operation;
+  for (const name of ["private-key", "batch-id", "batch-token", "create-response"])
+    if (get(`STACK_${name.replace(/-/g, "_").toUpperCase()}`))
+      refuse(`${name} is not ${article(op)} ${op} input; ${op} calls no control plane`);
+  if (op !== "earlier-response" && inputs.responsePath)
+    refuse(`response-path is not ${article(op)} ${op} input; ${op} calls no control plane`);
+  const githubToken = get("STACK_GITHUB_TOKEN");
+  const repository = () => {
+    const repo = get("GITHUB_REPOSITORY");
+    if (!REPOSITORY.test(repo))
+      refuse(`GITHUB_REPOSITORY must name the repository as owner/name, got ${JSON.stringify(repo)}`);
+    return repo;
+  };
+  const needToken = () => {
+    if (!githubToken) refuse(`github-token is required for ${op}: it reads this repository's workflow runs`);
+    inputs.githubToken = githubToken;
+  };
+  if (op === "role") {
+    const account = get("STACK_ACCOUNT");
+    if (!["", "prod", "dev", "recorded"].includes(account))
+      refuse(`account must be prod, dev or recorded, got ${JSON.stringify(account)}`);
+    inputs.role = {
+      account,
+      roleArnProd: get("STACK_ROLE_ARN_PROD"),
+      roleArnDev: get("STACK_ROLE_ARN_DEV")
+    };
+    if (get("STACK_ACCOUNT_FILE")) inputs.role.accountFile = get("STACK_ACCOUNT_FILE");
+  } else if (op === "server-image") {
+    const server = get("STACK_SERVER") || "master";
+    if (server !== "master" && server !== "latest" && server !== "esr")
+      refuse(`server must be master, latest or esr, got ${JSON.stringify(server)}`);
+    inputs.server = server;
+    if (githubToken) inputs.githubToken = githubToken;
+  } else if (op === "check-run") {
+    needToken();
+    inputs.checkRun = checkRunInputs(env2, repository());
+  } else {
+    needToken();
+    const runId = get("STACK_RUN_ID") || get("GITHUB_RUN_ID");
+    if (!RUN_ID.test(runId)) refuse(`run-id must be a workflow run id (digits), got ${JSON.stringify(runId)}`);
+    const artifactName = matching(
+      "artifact-name",
+      get("STACK_ARTIFACT_NAME"),
+      ARTIFACT_NAME,
+      "letters, digits, dots, hyphens and underscores"
+    ) ?? "e2e-test-stack-create";
+    if (!inputs.responsePath)
+      refuse("response-path is required for earlier-response: where to write the create response it finds");
+    const responseMember = matching(
+      "response-member",
+      get("STACK_RESPONSE_MEMBER"),
+      MEMBER,
+      "a file name in the artifact, such as e2e-test-stack-create.json"
+    ) ?? "e2e-test-stack-create.json";
+    inputs.earlier = {
+      repository: repository(),
+      runId,
+      artifactName,
+      responseMember,
+      responsePath: inputs.responsePath
+    };
+    if (get("STACK_ACCOUNT_PATH")) inputs.earlier.accountPath = get("STACK_ACCOUNT_PATH");
+  }
+  return inputs;
+};
 function readInputs(env2) {
   const get = (k7) => (env2[k7] ?? "").trim();
   const operation2 = get("STACK_OPERATION");
-  if (!["create", "fetch", "logs", "destroy", "open"].includes(operation2))
-    refuse(`operation must be create, fetch, logs, destroy or open, got ${JSON.stringify(operation2)}`);
+  if (!OPERATIONS.includes(operation2))
+    refuse(`operation must be ${and(OPERATIONS, "or")}, got ${JSON.stringify(operation2)}`);
   const op = operation2;
   const callerKey = get("STACK_CALLER_KEY");
-  if (!callerKey && op !== "open")
+  if (!callerKey && op !== "open" && !NO_STACK.includes(op))
     refuse("caller-key is required: the repository's key in the control plane's callers, e.g. mobile");
   if (callerKey)
     matching("caller-key", callerKey, LABEL, "the repository's key: lowercase letters, digits and hyphens");
@@ -26396,6 +26587,10 @@ function readInputs(env2) {
     refuse(`index is a logs and open input; ${op} does not take it`);
   if (op !== "logs" && get("STACK_LOGS_PATH")) refuse(`logs-path is a logs input; ${op} does not take it`);
   if (op !== "fetch" && get("STACK_INDEXES")) refuse(`indexes is a fetch input; ${op} does not take it`);
+  for (const [name, key, ops] of OWN_INPUTS)
+    if (!ops.includes(op) && get(key))
+      refuse(`${name} is ${article(ops[0])} ${and(ops)} input; ${op} does not take it`);
+  if (NO_STACK.includes(op)) return noStackInputs(env2, inputs);
   const privateKey = get("STACK_PRIVATE_KEY");
   if (privateKey) inputs.privateKey = privateKeyFrom(privateKey);
   if (op === "open") {
@@ -26407,6 +26602,8 @@ function readInputs(env2) {
     if (!inputs.privateKey) refuse("private-key is required for open: the create response's secrets are sealed to it");
     inputs.createResponse = createResponse2;
     if (get("STACK_INDEX")) inputs.index = integer("index", get("STACK_INDEX"), 0);
+    const prefix2 = batchPrefix(get("STACK_EXPECT_BATCH_PREFIX"));
+    if (prefix2) inputs.expectBatchPrefix = prefix2;
     return inputs;
   }
   if (op === "create") {
@@ -26438,6 +26635,21 @@ function readInputs(env2) {
   }
   if (batchId)
     inputs.batchId = matching("batch-id", batchId, BATCH_ID, "lowercase letters, digits and hyphens, 63 or fewer");
+  const prefix = batchPrefix(get("STACK_EXPECT_BATCH_PREFIX"));
+  if (prefix) {
+    if (!createResponse) refuse("expect-batch-prefix checks the batch in create-response; give create-response");
+    inputs.expectBatchPrefix = prefix;
+  }
+  if (op === "destroy") {
+    const window2 = get("STACK_GONE_WINDOW");
+    if (boolean("verify-gone", get("STACK_VERIFY_GONE"))) {
+      if (!createResponse) refuse("verify-gone needs create-response: the hosts it probes are read from it");
+      inputs.verifyGone = true;
+      inputs.goneWindowSeconds = window2 ? integer("gone-window", window2, 1) : GONE_WINDOW_SECONDS;
+      if (inputs.goneWindowSeconds > MAX_GONE_WINDOW_SECONDS)
+        refuse(`gone-window must be ${MAX_GONE_WINDOW_SECONDS} or less, got ${window2}`);
+    } else if (window2) refuse('gone-window is used only with verify-gone: "true"');
+  }
   if (op !== "destroy" && !inputs.privateKey)
     refuse(`private-key is required for ${op}: its secrets come back sealed to it`);
   if (op === "logs") {
@@ -26449,6 +26661,360 @@ function readInputs(env2) {
     if (indexes.length) inputs.indexes = indexes;
   }
   return inputs;
+}
+
+// src/zip.ts
+var import_node_zlib = require("zlib");
+var ZipError = class extends Error {
+};
+var EOCD = 101010256;
+var CENTRAL = 33639248;
+var LOCAL = 67324752;
+var EOCD_SEARCH = 22 + 65535;
+function readZipMember(zip, name, max) {
+  let end = -1;
+  for (let i7 = zip.length - 22; i7 >= Math.max(0, zip.length - EOCD_SEARCH); i7--)
+    if (zip.readUInt32LE(i7) === EOCD) {
+      end = i7;
+      break;
+    }
+  if (end < 0) throw new ZipError("not a ZIP archive: no end of central directory");
+  const entries = zip.readUInt16LE(end + 10);
+  const offset = zip.readUInt32LE(end + 16);
+  if (entries === 65535 || offset === 4294967295) throw new ZipError("a ZIP64 archive, which is not read");
+  let p4 = offset;
+  for (let i7 = 0; i7 < entries; i7++) {
+    if (p4 + 46 > zip.length || zip.readUInt32LE(p4) !== CENTRAL) throw new ZipError("a malformed central directory");
+    const flags = zip.readUInt16LE(p4 + 8);
+    const method = zip.readUInt16LE(p4 + 10);
+    const crc = zip.readUInt32LE(p4 + 16);
+    const compressed = zip.readUInt32LE(p4 + 20);
+    const size = zip.readUInt32LE(p4 + 24);
+    const nameLength = zip.readUInt16LE(p4 + 28);
+    const extraLength = zip.readUInt16LE(p4 + 30);
+    const commentLength = zip.readUInt16LE(p4 + 32);
+    const local = zip.readUInt32LE(p4 + 42);
+    const entryName = zip.subarray(p4 + 46, p4 + 46 + nameLength).toString("utf8");
+    p4 += 46 + nameLength + extraLength + commentLength;
+    if (entryName !== name) continue;
+    if (flags & 1) throw new ZipError(`${name} is encrypted`);
+    if (compressed === 4294967295 || size === 4294967295 || local === 4294967295)
+      throw new ZipError(`${name} is a ZIP64 member, which is not read`);
+    if (size > max) throw new ZipError(`${name} is ${size} bytes, more than ${max}`);
+    if (local + 30 > zip.length || zip.readUInt32LE(local) !== LOCAL)
+      throw new ZipError(`${name} has no local header where the directory says`);
+    const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
+    if (start + compressed > zip.length) throw new ZipError(`${name} runs past the end of the archive`);
+    const raw = zip.subarray(start, start + compressed);
+    let data;
+    if (method === 0) data = Buffer.from(raw);
+    else if (method === 8) {
+      try {
+        data = (0, import_node_zlib.inflateRawSync)(raw, { maxOutputLength: Math.max(1, max) });
+      } catch (e6) {
+        throw new ZipError(`${name} does not inflate: ${e6.message}`);
+      }
+    } else throw new ZipError(`${name} uses compression method ${method}, which is not read`);
+    if (data.length !== size || (0, import_node_zlib.crc32)(data) !== crc)
+      throw new ZipError(`${name} does not match its size and CRC-32 in the archive`);
+    return data;
+  }
+  return void 0;
+}
+
+// src/earlier.ts
+var ACCOUNT_MEMBER = "e2e-test-stack-account";
+var MAX_ARTIFACT_BYTES = 64 << 20;
+var MAX_MEMBER_BYTES = 16 << 20;
+var MAX_ACCOUNT_BYTES = 64;
+var PER_PAGE = 100;
+var PAGES = 10;
+async function earlierResponse(inputs, github, log) {
+  (0, import_node_fs5.rmSync)((0, import_node_path7.resolve)(inputs.responsePath), { force: true });
+  if (inputs.accountPath) (0, import_node_fs5.rmSync)((0, import_node_path7.resolve)(inputs.accountPath), { force: true });
+  const name = encodeURIComponent(inputs.artifactName);
+  const found = [];
+  for (let page = 1; page <= PAGES; page++) {
+    const got = await github.json(
+      `/repos/${inputs.repository}/actions/runs/${inputs.runId}/artifacts?name=${name}&per_page=${PER_PAGE}&page=${page}`
+    );
+    const artifacts = Array.isArray(got?.artifacts) ? got.artifacts : [];
+    found.push(...artifacts.filter((a7) => a7.name === inputs.artifactName));
+    if (artifacts.length < PER_PAGE) break;
+  }
+  if (!found.length) {
+    log(`e2e-test-stack: run ${inputs.runId} has no artifact ${inputs.artifactName}`);
+    return void 0;
+  }
+  const artifact = found.sort(
+    (a7, b7) => (b7.created_at ?? "").localeCompare(a7.created_at ?? "") || (b7.id ?? 0) - (a7.id ?? 0)
+  )[0];
+  const what = `run ${inputs.runId}'s artifact ${inputs.artifactName}`;
+  if (artifact.expired)
+    throw new Error(
+      `e2e-test-stack: ${what} has expired, so the batch it names cannot be read; not going on without it`
+    );
+  if (!Number.isSafeInteger(artifact.id)) throw new Error(`e2e-test-stack: ${what} has no id`);
+  let zip;
+  try {
+    zip = await github.download(`/repos/${inputs.repository}/actions/artifacts/${artifact.id}/zip`, MAX_ARTIFACT_BYTES);
+  } catch (e6) {
+    throw new Error(
+      `e2e-test-stack: ${what} exists but could not be downloaded: ${e6.message.replace(/^e2e-test-stack: /, "")}`,
+      { cause: e6 }
+    );
+  }
+  const member2 = inputs.responseMember;
+  let response;
+  try {
+    response = readZipMember(zip, member2, MAX_MEMBER_BYTES);
+  } catch (e6) {
+    if (!(e6 instanceof ZipError)) throw e6;
+    throw new Error(`e2e-test-stack: ${what} could not be read: ${e6.message}`, { cause: e6 });
+  }
+  if (!response) throw new Error(`e2e-test-stack: ${what} holds no ${member2}`);
+  let batchId;
+  if (response.length) {
+    let parsed;
+    try {
+      parsed = JSON.parse(response.toString("utf8"));
+    } catch {
+      throw new Error(
+        `e2e-test-stack: ${what} holds a ${member2} that is not JSON, so the batch it may name is unknown`
+      );
+    }
+    batchId = parsed?.batch_id;
+    if (batchId !== void 0 && batchId !== null && batchId !== "" && typeof batchId !== "string")
+      throw new Error(`e2e-test-stack: ${what} holds a ${member2} whose batch_id is not a string`);
+  }
+  if (typeof batchId !== "string" || !batchId) {
+    log(`::warning::${what}: the earlier attempt's response names no batch, so there is none to release`);
+    return void 0;
+  }
+  const path = (0, import_node_path7.resolve)(inputs.responsePath);
+  (0, import_node_fs5.mkdirSync)((0, import_node_path7.dirname)(path), { recursive: true });
+  (0, import_node_fs5.writeFileSync)(path, response);
+  if (inputs.accountPath) {
+    let account;
+    let reason = "it holds no " + ACCOUNT_MEMBER;
+    try {
+      account = readZipMember(zip, ACCOUNT_MEMBER, MAX_ACCOUNT_BYTES);
+    } catch (e6) {
+      if (!(e6 instanceof ZipError)) throw e6;
+      reason = e6.message;
+    }
+    if (account) {
+      const accountPath = (0, import_node_path7.resolve)(inputs.accountPath);
+      (0, import_node_fs5.mkdirSync)((0, import_node_path7.dirname)(accountPath), { recursive: true });
+      (0, import_node_fs5.writeFileSync)(accountPath, account);
+    } else log(`::warning::${what}: no recorded account was written to account-path: ${reason}`);
+  }
+  log(`e2e-test-stack: ${what} holds ${BATCH_ID.test(batchId) ? `batch ${batchId}` : "a create response"}`);
+  return path;
+}
+
+// src/github.ts
+var GITHUB_API = "https://api.github.com";
+var GITHUB_ATTEMPTS = 4;
+var GITHUB_ATTEMPT_MS = 6e4;
+var GITHUB_RETRY_MS = Object.freeze([1e4, 2e4, 3e4]);
+var GITHUB_THROTTLE_MS = 6e4;
+var MAX_JSON_BYTES = 8 << 20;
+var MAX_ERROR_BYTES = 4 << 10;
+var AttemptError = class extends Error {
+  kind;
+  constructor(message, kind) {
+    super(message);
+    this.kind = kind;
+  }
+};
+var GitHubError = class extends Error {
+};
+var describe = (e6) => {
+  if (e6 instanceof DOMException && (e6.name === "TimeoutError" || e6.name === "AbortError"))
+    return `did not answer within ${GITHUB_ATTEMPT_MS / 1e3} seconds`;
+  const err = e6;
+  const cause = err?.cause?.code || err?.cause?.message;
+  return `${err?.name || "Error"}: ${String(err?.message ?? e6)}${cause ? ` (${cause})` : ""}`.split("\n")[0];
+};
+var statusError = async (res) => {
+  const body = (await readBody(res, MAX_ERROR_BYTES, { truncate: true }).catch(() => Buffer.alloc(0))).toString("utf8").replace(/\s+/g, " ").trim();
+  const text2 = body.slice(0, 200);
+  const message = `HTTP ${res.status}${text2 ? ` ${text2}` : ""}`;
+  if (res.status >= 500) return new AttemptError(message, "transient");
+  const secondary = /secondary rate limit/i.test(body);
+  const primary = !secondary && res.headers.get("x-ratelimit-remaining") === "0";
+  if (secondary || res.status === 429 && !primary) return new AttemptError(message, "throttled");
+  return new AttemptError(message, "final");
+};
+var readBounded = async (res, max) => {
+  try {
+    return await readBody(res, max);
+  } catch (e6) {
+    if (e6 instanceof BodyTooLarge) throw new AttemptError(e6.message, "final");
+    throw e6;
+  }
+};
+function githubClient(token, fetchImpl = fetch, wait = sleep2, log = console.log) {
+  const headers = () => ({
+    accept: "application/vnd.github+json",
+    "user-agent": "mattermost-e2e-test-stack",
+    "x-github-api-version": "2022-11-28",
+    ...token ? { authorization: `Bearer ${token}` } : {}
+  });
+  const retried = async (path, attempt) => {
+    const errors = [];
+    for (let n4 = 1; ; n4++) {
+      let kind;
+      try {
+        return await attempt(AbortSignal.timeout(GITHUB_ATTEMPT_MS));
+      } catch (e6) {
+        if (e6 instanceof AttemptError) kind = e6.kind;
+        else kind = networkError(e6) ? "transient" : "final";
+        errors.push(`attempt ${n4}: ${e6 instanceof AttemptError ? e6.message : describe(e6)}`);
+      }
+      if (kind === "final" || n4 >= GITHUB_ATTEMPTS)
+        throw new GitHubError(`e2e-test-stack: GitHub GET ${path} failed: ${errors.join("; ")}`);
+      const ms = kind === "throttled" ? GITHUB_THROTTLE_MS : GITHUB_RETRY_MS[n4 - 1];
+      log(
+        `e2e-test-stack: GitHub GET ${path}: ${errors[errors.length - 1]}; trying again in ${ms / 1e3} s (attempt ${n4 + 1} of ${GITHUB_ATTEMPTS})`
+      );
+      await wait(ms);
+    }
+  };
+  return {
+    json: (path) => retried(path, async (signal) => {
+      const res = await fetchImpl(`${GITHUB_API}${path}`, { headers: headers(), signal });
+      if (!res.ok) throw await statusError(res);
+      const text2 = (await readBounded(res, MAX_JSON_BYTES)).toString("utf8");
+      try {
+        return JSON.parse(text2);
+      } catch {
+        throw new AttemptError(`HTTP ${res.status} with a body that is not JSON`, "final");
+      }
+    }),
+    // The API answers with a redirect to a short-lived storage URL, followed here without the token.
+    download: (path, max) => retried(path, async (signal) => {
+      const res = await fetchImpl(`${GITHUB_API}${path}`, { headers: headers(), redirect: "manual", signal });
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get("location");
+        await res.body?.cancel();
+        if (!location) throw new AttemptError(`HTTP ${res.status} with no location`, "final");
+        const blob = await fetchImpl(location, { redirect: "error", signal });
+        if (!blob.ok) {
+          await blob.body?.cancel();
+          const kind = blob.status >= 500 ? "transient" : blob.status === 429 ? "throttled" : "final";
+          throw new AttemptError(`the download answered HTTP ${blob.status}`, kind);
+        }
+        return await readBounded(blob, max);
+      }
+      if (!res.ok) throw await statusError(res);
+      return await readBounded(res, max);
+    })
+  };
+}
+
+// src/probe.ts
+var GONE = "No test server for this hostname";
+var PROBE_INTERVAL_MS = 5e3;
+var PROBE_REQUEST_MS = 15e3;
+var MAX_BODY = 64 << 10;
+function goneUrls(sites, ssoHosts) {
+  const urls = [];
+  const protocols = [];
+  for (const [i7, site] of sites.entries()) {
+    if (!site) continue;
+    if (/[\u0000-\u001f\u007f]/.test(site))
+      throw new Error(`e2e-test-stack: the create response's site ${JSON.stringify(site)} holds a control character`);
+    let url;
+    try {
+      url = new URL(site);
+    } catch {
+      throw new Error(`e2e-test-stack: the create response's site ${JSON.stringify(site)} is not a URL`);
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:")
+      throw new Error(`e2e-test-stack: the create response's site ${JSON.stringify(site)} is not an http(s) URL`);
+    urls.push(`${url.href.replace(/\/+$/, "")}/api/v4/system/ping`, `${url.protocol}//mail-${url.host}/`);
+    protocols[i7] = url.protocol;
+  }
+  for (const [i7, host] of ssoHosts.entries()) {
+    if (!host) continue;
+    if (!/^[a-z0-9.-]+(:\d+)?$/i.test(host))
+      throw new Error(`e2e-test-stack: the create response's sso host ${JSON.stringify(host)} is not a hostname`);
+    urls.push(`${protocols[i7] ?? "https:"}//${host}/`);
+  }
+  return urls;
+}
+var head = async (res) => (await readBody(res, MAX_BODY, { truncate: true })).toString("utf8");
+var noAnswer = (e6) => {
+  if (e6 instanceof DOMException && (e6.name === "TimeoutError" || e6.name === "AbortError")) return "000 timed out";
+  const err = e6;
+  return `000 ${err?.cause?.code || String(err?.message ?? e6)}`.split("\n")[0];
+};
+async function probeGone(urls, windowMs, o4) {
+  const start = o4.now();
+  const elapsed = () => Math.round((o4.now() - start) / 1e3);
+  const probe = async (url) => {
+    let attempts = 0;
+    let last = "no attempt";
+    for (; ; ) {
+      const left = windowMs - (o4.now() - start);
+      if (left <= 0) break;
+      attempts++;
+      try {
+        const res = await o4.fetch(url, {
+          redirect: "manual",
+          signal: AbortSignal.timeout(Math.min(left, PROBE_REQUEST_MS))
+        });
+        const body = await head(res);
+        if (res.status === 404 && body.includes(GONE)) {
+          o4.log(`  gone  ${url} (after ${attempts} attempt(s), ${elapsed()}s)`);
+          return void 0;
+        }
+        last = `${res.status} ${body.replace(/\s+/g, " ").trim().slice(0, 200)}`.trim();
+      } catch (e6) {
+        last = noAnswer(e6);
+      }
+      const rest = windowMs - (o4.now() - start);
+      if (rest <= 0) break;
+      await o4.sleep(Math.min(rest, PROBE_INTERVAL_MS));
+    }
+    return `${url} is still served after ${elapsed()}s (${attempts} attempt(s)): last answer ${last}`;
+  };
+  const failed = (await Promise.all(urls.map(probe))).filter((f7) => !!f7);
+  if (failed.length)
+    throw new Error(
+      `e2e-test-stack: ${failed.length} of ${urls.length} host(s) still served after the destroy:
+${failed.map((f7) => `  ${f7}`).join("\n")}`
+    );
+}
+
+// src/role.ts
+var import_node_fs6 = require("fs");
+var isFile = (path) => {
+  try {
+    return (0, import_node_fs6.statSync)(path).isFile();
+  } catch {
+    return false;
+  }
+};
+function chooseRole(inputs) {
+  let account = inputs.account === "recorded" ? "" : inputs.account;
+  if (inputs.accountFile && isFile(inputs.accountFile)) {
+    const recorded = (0, import_node_fs6.readFileSync)(inputs.accountFile, "utf8").replace(/\n+$/, "");
+    if (recorded !== "prod" && recorded !== "dev")
+      throw new Error("e2e-test-stack: the recorded account is not prod or dev");
+    if (account && account !== recorded)
+      throw new Error(`e2e-test-stack: the run recorded account ${recorded}; account ${account} was asked for`);
+    account = recorded;
+  }
+  if (account !== "prod" && account !== "dev")
+    throw new Error(
+      !account && inputs.accountFile ? "e2e-test-stack: the run recorded no account: set account to prod or dev" : "e2e-test-stack: account must be prod or dev"
+    );
+  const roleArn = account === "prod" ? inputs.roleArnProd : inputs.roleArnDev;
+  if (!roleArn) throw new Error(`e2e-test-stack: role-arn-${account} is not set`);
+  return { account, roleArn };
 }
 
 // ../../node_modules/libsodium/dist/modules-esm/libsodium.mjs
@@ -29899,6 +30465,57 @@ async function openSealed(sealed, privateKey) {
   }
 }
 
+// src/server-image.ts
+var MASTER_IMAGE = "mattermostdevelopment/mattermost-enterprise-edition:master";
+var RELEASE_IMAGE = "mattermost/mattermost-enterprise-edition";
+var RELEASES_PER_PAGE = 100;
+var RELEASE_PAGES = 10;
+var STABLE = /^v?(\d+)\.(\d+)\.(\d+)$/;
+var ESR_NOTE = "extended support release";
+var newer = (a7, b7) => a7.major !== b7.major ? a7.major > b7.major : a7.minor !== b7.minor ? a7.minor > b7.minor : a7.patch > b7.patch;
+var text = (v2) => `${v2.major}.${v2.minor}.${v2.patch}`;
+async function releases(github) {
+  const all = [];
+  for (let page = 1; page <= RELEASE_PAGES; page++) {
+    const got = await github.json(`/repos/mattermost/mattermost/releases?per_page=${RELEASES_PER_PAGE}&page=${page}`);
+    if (!Array.isArray(got)) throw new Error("e2e-test-stack: GitHub's releases list is not an array");
+    all.push(...got);
+    if (got.length < RELEASES_PER_PAGE) break;
+  }
+  return all;
+}
+function classify(list2) {
+  const newestPerMinor = /* @__PURE__ */ new Map();
+  const esrMinors = /* @__PURE__ */ new Set();
+  for (const r7 of list2) {
+    if (r7.draft || r7.prerelease) continue;
+    const m4 = STABLE.exec((r7.tag_name ?? "").trim());
+    if (!m4) continue;
+    const v2 = { major: Number(m4[1]), minor: Number(m4[2]), patch: Number(m4[3]) };
+    const minor = `${v2.major}.${v2.minor}`;
+    const current = newestPerMinor.get(minor);
+    if (!current || newer(v2, current)) newestPerMinor.set(minor, v2);
+    if ((r7.body ?? "").toLowerCase().includes(ESR_NOTE)) esrMinors.add(minor);
+  }
+  let latest;
+  let esr;
+  for (const [minor, v2] of newestPerMinor) {
+    if (!latest || newer(v2, latest)) latest = v2;
+    if (esrMinors.has(minor) && (!esr || newer(v2, esr))) esr = v2;
+  }
+  return { latest: latest && text(latest), esr: esr && text(esr) };
+}
+async function serverImage(server, github) {
+  if (server === "master") return { image: MASTER_IMAGE, version: "master" };
+  const list2 = await releases(github);
+  const version = classify(list2)[server];
+  if (!version)
+    throw new Error(
+      `e2e-test-stack: no ${server === "esr" ? "ESR" : "stable"} release among the ${list2.length} releases of mattermost/mattermost`
+    );
+  return { image: `${RELEASE_IMAGE}:${version}`, version };
+}
+
 // src/stack.ts
 var NOT_SECRET = /* @__PURE__ */ new Set(["postgres.user", "postgres.database"]);
 var SECRET_FACT = /(password|secret|token|_key)$/;
@@ -29915,30 +30532,30 @@ function buildRequest(inputs, batchId, batchToken) {
 var escapeData = (s3) => s3.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
 function writeOutputs(path, outputs) {
   if (!path) return;
-  let text = "";
+  let text2 = "";
   for (const [k7, v2] of Object.entries(outputs)) {
     const delimiter = `ghadelimiter_${(0, import_node_crypto5.randomUUID)()}`;
-    text += `${k7}<<${delimiter}
+    text2 += `${k7}<<${delimiter}
 ${v2}
 ${delimiter}
 `;
   }
-  (0, import_node_fs5.appendFileSync)(path, text);
+  (0, import_node_fs7.appendFileSync)(path, text2);
 }
 var writeFile2 = (path, content) => {
-  const full = (0, import_node_path7.resolve)(path);
-  (0, import_node_fs5.mkdirSync)((0, import_node_path7.dirname)(full), { recursive: true });
-  (0, import_node_fs5.writeFileSync)(full, content);
+  const full = (0, import_node_path8.resolve)(path);
+  (0, import_node_fs7.mkdirSync)((0, import_node_path8.dirname)(full), { recursive: true });
+  (0, import_node_fs7.writeFileSync)(full, content);
   return full;
 };
-var redact = (text) => text.replace(/arn:aws[a-z-]*:[^\s"',]*/g, "[arn]").replace(/(?<![\w-])\d{12}(?![\w-])/g, "[account]");
-var handlerError = (text) => {
+var redact = (text2) => text2.replace(/arn:aws[a-z-]*:[^\s"',]*/g, "[arn]").replace(/(?<![\w-])\d{12}(?![\w-])/g, "[account]");
+var handlerError = (text2) => {
   try {
-    const parsed = JSON.parse(text);
+    const parsed = JSON.parse(text2);
     if (typeof parsed?.errorMessage === "string") return redact(parsed.errorMessage);
   } catch {
   }
-  return redact(text.trim()).slice(0, 500) || "no reason given";
+  return redact(text2.trim()).slice(0, 500) || "no reason given";
 };
 var invokeError = (e6) => {
   const name = e6?.name || "Error";
@@ -29975,28 +30592,18 @@ async function fetchLog(url, max) {
     await res.body?.cancel();
     throw new Error(`answered ${res.status}`);
   }
-  const length = Number(res.headers.get("content-length") ?? 0);
-  if (length > max) {
-    await res.body?.cancel();
-    throw new Error(`${length} bytes, more than ${max}`);
-  }
-  const chunks = [];
-  let read = 0;
-  if (res.body) {
-    const reader = res.body.getReader();
-    for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
-      read += chunk.value.byteLength;
-      if (read > max) {
-        await reader.cancel();
-        throw new Error(`more than ${max} bytes`);
-      }
-      chunks.push(chunk.value);
-    }
-  }
-  return Buffer.concat(chunks).toString("utf8");
+  return (await readBody(res, max)).toString("utf8");
 }
 var downloadLog = (url) => fetchLog(url, MAX_LOG_BYTES);
-async function run({ env: env2, connect, download = downloadLog, log = console.log }) {
+async function run({
+  env: env2,
+  connect,
+  download = downloadLog,
+  log = console.log,
+  fetch: fetchImpl = fetch,
+  sleep: sleep3 = sleep2,
+  now = () => performance.now()
+}) {
   const inputs = readInputs(env2);
   const { operation: operation2 } = inputs;
   const outputs = {};
@@ -30012,7 +30619,7 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
       log(`::add-mask::${escapeData(quoted)}`);
     }
   };
-  const scrub = (text) => redact([...masked].sort((a7, b7) => b7.length - a7.length).reduce((t2, v2) => t2.split(v2).join("***"), text));
+  const scrub = (text2) => redact([...masked].sort((a7, b7) => b7.length - a7.length).reduce((t2, v2) => t2.split(v2).join("***"), text2));
   const maskBatch = (secrets) => {
     mask(secrets.batch_token);
     for (const s3 of secrets.instances ?? []) {
@@ -30028,7 +30635,7 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
   const readCreateResponse = async (path) => {
     let created;
     try {
-      created = JSON.parse((0, import_node_fs5.readFileSync)(path, "utf8"));
+      created = JSON.parse((0, import_node_fs7.readFileSync)(path, "utf8"));
     } catch (e6) {
       throw new Error(`e2e-test-stack: create-response ${path} could not be read as JSON: ${invokeError(e6)}`, {
         cause: e6
@@ -30036,6 +30643,11 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
     }
     if (!created.batch_id || !created.batch?.secrets)
       throw new Error(`e2e-test-stack: ${path} is not a create response with a batch: no batch_id or batch.secrets`);
+    const prefix = inputs.expectBatchPrefix;
+    if (prefix && (typeof created.batch_id !== "string" || !created.batch_id.startsWith(prefix)))
+      throw new Error(
+        `e2e-test-stack: the batch in ${path}, ${JSON.stringify(String(created.batch_id).slice(0, 80))}, does not start with expect-batch-prefix ${prefix}; is it another run's create response?`
+      );
     try {
       return { created, secrets: await openSealed(created.batch.secrets, inputs.privateKey) };
     } catch (e6) {
@@ -30072,16 +30684,41 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
       mail_token: one.mail_token
     });
   };
+  const github = () => githubClient(inputs.githubToken ?? "", fetchImpl, sleep3, log);
   try {
     if (operation2 === "open") {
       await openCreateResponse();
       return;
     }
+    if (operation2 === "role") {
+      const { account, roleArn } = chooseRole(inputs.role);
+      log(`e2e-test-stack: account ${account}`);
+      Object.assign(outputs, { account, role_arn: roleArn });
+      return;
+    }
+    if (operation2 === "server-image") {
+      const { image, version } = await serverImage(inputs.server, github());
+      log(`e2e-test-stack: server ${inputs.server}: ${image}`);
+      Object.assign(outputs, { server_image: image, server_version: version });
+      return;
+    }
+    if (operation2 === "check-run") {
+      await checkRun(inputs.checkRun, github(), log);
+      return;
+    }
+    if (operation2 === "earlier-response") {
+      const path = await earlierResponse(inputs.earlier, github(), log);
+      outputs.found = String(!!path);
+      if (path) outputs.response_path = path;
+      return;
+    }
     let batchId = inputs.batchId;
     let batchToken = inputs.batchToken;
+    let createdResponse;
     mask(batchToken);
     if (inputs.createResponse) {
       const { created, secrets } = await readCreateResponse(inputs.createResponse);
+      createdResponse = created;
       if (batchId && batchId !== created.batch_id)
         throw new Error(
           `e2e-test-stack: batch-id ${batchId} is not the batch in create-response (${created.batch_id})`
@@ -30112,23 +30749,23 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
         { cause: e6 }
       );
     }
-    const text = Buffer.from(reply.Payload ?? new Uint8Array()).toString("utf8");
+    const text2 = Buffer.from(reply.Payload ?? new Uint8Array()).toString("utf8");
     if (inputs.responsePath) {
       try {
-        outputs.response_path = writeFile2(inputs.responsePath, text);
+        outputs.response_path = writeFile2(inputs.responsePath, text2);
       } catch (e6) {
         responseWriteError = e6;
       }
     }
     if (reply.FunctionError)
-      throw new Error(`e2e-test-stack: the control plane refused the ${operation2}: ${handlerError(text)}.${mayExist}`);
+      throw new Error(`e2e-test-stack: the control plane refused the ${operation2}: ${handlerError(text2)}.${mayExist}`);
     if (reply.StatusCode !== 200)
-      throw new Error(`e2e-test-stack: the invoke answered ${reply.StatusCode}: ${handlerError(text)}`);
+      throw new Error(`e2e-test-stack: the invoke answered ${reply.StatusCode}: ${handlerError(text2)}`);
     let response;
     try {
-      response = JSON.parse(text);
+      response = JSON.parse(text2);
     } catch {
-      throw new Error(`e2e-test-stack: the control plane's reply is not JSON: ${redact(text).slice(0, 200)}`);
+      throw new Error(`e2e-test-stack: the control plane's reply is not JSON: ${redact(text2).slice(0, 200)}`);
     }
     const rawError = response.error;
     const responseError = rawError === void 0 || rawError === null || rawError === "" ? "" : redact(typeof rawError === "string" ? rawError : JSON.stringify(rawError));
@@ -30226,12 +30863,12 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
         mask(secrets.url);
         const index = logs.index ?? inputs.index ?? 0;
         const path = inputs.logsPath || // The reply's batch id names the file only in the shape a batch id takes.
-        (0, import_node_path7.join)(
+        (0, import_node_path8.join)(
           env2.RUNNER_TEMP || (0, import_node_os4.tmpdir)(),
           `e2e-test-stack-${BATCH_ID.test(outputs.batch_id) ? outputs.batch_id : "batch"}-${index}.log`
         );
         if (secrets.content_gzip) {
-          const tail = (0, import_node_zlib.gunzipSync)(Buffer.from(secrets.content_gzip, "base64")).toString("utf8");
+          const tail = (0, import_node_zlib2.gunzipSync)(Buffer.from(secrets.content_gzip, "base64")).toString("utf8");
           outputs.logs_path = writeFile2(path, scrub(tail));
           outputs.logs_full = String(!logs.truncated);
         }
@@ -30252,24 +30889,51 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
             const message = scrub(String(e6?.message ?? e6)).split("\n")[0];
             throw unsaved(`the download failed: ${name}: ${message.slice(0, 200)}`, e6);
           }
-          const partial = `${(0, import_node_path7.resolve)(path)}.partial`;
+          const partial = `${(0, import_node_path8.resolve)(path)}.partial`;
           try {
             writeFile2(partial, scrub(full));
-            (0, import_node_fs5.renameSync)(partial, (0, import_node_path7.resolve)(path));
+            (0, import_node_fs7.renameSync)(partial, (0, import_node_path8.resolve)(path));
           } catch (e6) {
             try {
-              (0, import_node_fs5.rmSync)(partial, { force: true });
+              (0, import_node_fs7.rmSync)(partial, { force: true });
             } catch {
             }
             throw unsaved(`it could not be written: ${invokeError(e6)}`, e6);
           }
-          outputs.logs_path = (0, import_node_path7.resolve)(path);
+          outputs.logs_path = (0, import_node_path8.resolve)(path);
           outputs.logs_full = "true";
         } else if (logs.truncated) {
           throw unsaved("the control plane returned no URL for it, and the tail is truncated");
         }
         if (outputs.logs_path)
           summary.push(`| Saved | ${outputs.logs_full === "true" ? "the full log" : "the tail, truncated"} |`);
+      }
+    }
+    let goneFailure;
+    if (operation2 === "destroy" && inputs.verifyGone && !responseError) {
+      try {
+        if (state2 !== "destroyed" && state2 !== "not found")
+          throw new Error(`e2e-test-stack: the batch is ${state2 || "in no state"}, not destroyed; no host was probed`);
+        const urls = goneUrls(
+          createdResponse?.sites ?? [],
+          (createdResponse?.batch?.instances ?? []).map((l4) => typeof l4?.sso_host === "string" ? l4.sso_host : "")
+        );
+        if (urls.length) {
+          log(
+            `e2e-test-stack: verify-gone: probing ${urls.length} host(s) for the router's 404, within ${inputs.goneWindowSeconds} s`
+          );
+          await probeGone(urls, inputs.goneWindowSeconds * 1e3, { fetch: fetchImpl, sleep: sleep3, now, log });
+        } else log("e2e-test-stack: verify-gone: no instance of the batch launched, so no host is probed");
+        summary.push(
+          `| Gone | ${urls.length ? `all ${urls.length} site, mail and SSO hosts answer the router's 404` : "no host to probe"} |`
+        );
+      } catch (e6) {
+        goneFailure = e6;
+        summary.push(
+          `| Gone | ${cell(
+            goneFailure.message.split("\n")[0].replace(/^e2e-test-stack: /, "").replace(/:$/, "")
+          )} |`
+        );
       }
     }
     if (sites.length) {
@@ -30291,8 +30955,8 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
           (l4) => l4.metrics?.cpu_average === void 0 && l4.metrics?.cpu_peak === void 0 ? "" : `${percent(l4.metrics.cpu_average) || "\u2013"} / ${percent(l4.metrics.cpu_peak) || "\u2013"}`
         ]
       ] : [];
-      const head = ["Index", "State", "Site", ...extra.map(([name]) => name)];
-      summary.push("", `| ${head.join(" | ")} |`, `|${head.map(() => "---|").join("")}`);
+      const head2 = ["Index", "State", "Site", ...extra.map(([name]) => name)];
+      summary.push("", `| ${head2.join(" | ")} |`, `|${head2.map(() => "---|").join("")}`);
       sites.forEach((site, i7) => {
         const lease = leases[i7];
         const cells = [
@@ -30319,6 +30983,7 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
           summary.push(`| ${cell(name)} | ${[...set].map((i7) => i7 ? `\`${cell(i7)}\`` : "").join(", ")} |`);
       }
     }
+    if (goneFailure) throw goneFailure;
     const teardown = operation2 === "create" && outputs.batch_id ? ` Batch ${outputs.batch_id} was created; destroy it.` : "";
     if (responseError) throw new Error(`e2e-test-stack: ${operation2} reported: ${responseError}.${teardown}`);
     if (responseWriteError)
@@ -30331,7 +30996,7 @@ async function run({ env: env2, connect, download = downloadLog, log = console.l
   } finally {
     writeOutputs(env2.GITHUB_OUTPUT, outputs);
     if (summary.length && env2.GITHUB_STEP_SUMMARY)
-      (0, import_node_fs5.appendFileSync)(env2.GITHUB_STEP_SUMMARY, redact(summary.join("\n")) + "\n");
+      (0, import_node_fs7.appendFileSync)(env2.GITHUB_STEP_SUMMARY, redact(summary.join("\n")) + "\n");
   }
 }
 

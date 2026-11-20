@@ -1122,3 +1122,235 @@ test("the Lambda client is sent a synchronous Invoke, and only a throttle is tri
   await assert.rejects(throttled({ FunctionName: "f", Qualifier: "q", Payload: "{}" }), /Rate exceeded/);
   assert.equal(calls, THROTTLE_ATTEMPTS);
 });
+
+/** Runs one operation with a fetch that answers by URL, counting control-plane invokes. */
+const runWith = async (
+  env: Record<string, string>,
+  answer: (url: string) => Response | Promise<Response>,
+  reply: InvokeOutput = ok({}),
+) => {
+  const h = {
+    output: file("output"),
+    summary: file("summary"),
+    invokes: 0,
+    fetched: [] as string[],
+    logged: [] as string[],
+  };
+  let t = 0;
+  const go = run({
+    env: {
+      GITHUB_OUTPUT: h.output,
+      GITHUB_STEP_SUMMARY: h.summary,
+      RUNNER_TEMP: dir,
+      STACK_CALLER_RUN_ID: "1",
+      ...env,
+    },
+    connect: () => async () => {
+      h.invokes++;
+      return reply;
+    },
+    log: (m) => h.logged.push(m),
+    fetch: async (url) => {
+      h.fetched.push(url);
+      return answer(url);
+    },
+    sleep: async (ms) => void (t += ms),
+    now: () => t,
+  });
+  return { ...h, go };
+};
+const noFetch = (url: string): Response => {
+  throw new Error(`this test fetches nothing: ${url}`);
+};
+
+test("role sets the account and its role ARN as outputs, and calls nothing", async () => {
+  const accountFile = file("e2e-test-stack-account");
+  writeFileSync(accountFile, "dev\n");
+  const r = await runWith(
+    {
+      STACK_OPERATION: "role",
+      STACK_ACCOUNT: "recorded",
+      STACK_ACCOUNT_FILE: accountFile,
+      STACK_ROLE_ARN_PROD: "arn:aws:iam::111111111111:role/p",
+      STACK_ROLE_ARN_DEV: "arn:aws:iam::222222222222:role/d",
+    },
+    noFetch,
+  );
+  await r.go;
+  assert.deepEqual(readOutputs(r.output), { account: "dev", role_arn: "arn:aws:iam::222222222222:role/d" });
+  assert.deepEqual([r.invokes, r.fetched.length], [0, 0]);
+  assert.ok(!r.logged.join("\n").includes("arn:"));
+});
+
+test("server-image sets the image and version; master reads no release", async () => {
+  const latest = await runWith(
+    { STACK_OPERATION: "server-image", STACK_SERVER: "latest", STACK_GITHUB_TOKEN: "t" },
+    () => Response.json([{ tag_name: "v11.1.2", draft: false, prerelease: false, body: "" }]),
+  );
+  await latest.go;
+  assert.deepEqual(readOutputs(latest.output), {
+    server_image: "mattermost/mattermost-enterprise-edition:11.1.2",
+    server_version: "11.1.2",
+  });
+  assert.deepEqual(latest.fetched, ["https://api.github.com/repos/mattermost/mattermost/releases?per_page=100&page=1"]);
+
+  const master = await runWith({ STACK_OPERATION: "server-image" }, noFetch);
+  await master.go;
+  assert.deepEqual(readOutputs(master.output), {
+    server_image: "mattermostdevelopment/mattermost-enterprise-edition:master",
+    server_version: "master",
+  });
+});
+
+test("check-run fails a run that is not allowed, and earlier-response outputs found=false when there is none", async () => {
+  const check = await runWith(
+    {
+      STACK_OPERATION: "check-run",
+      STACK_RUN_ID: "42",
+      STACK_ALLOWED_WORKFLOWS: ".github/workflows/run.yml",
+      STACK_ALLOWED_BRANCHES: "master",
+      STACK_ALLOWED_EVENTS: "push",
+      STACK_GITHUB_TOKEN: "t",
+      GITHUB_REPOSITORY: "mattermost/tpp",
+    },
+    () =>
+      Response.json({
+        path: ".github/workflows/run.yml",
+        head_branch: "feature",
+        event: "push",
+        head_repository: { full_name: "mattermost/tpp" },
+      }),
+  );
+  await assert.rejects(
+    check.go,
+    /run 42 is not an allowed run: \.github\/workflows\/run\.yml on feature \(push\) from mattermost\/tpp/,
+  );
+
+  const earlier = await runWith(
+    {
+      STACK_OPERATION: "earlier-response",
+      STACK_RESPONSE_PATH: file("earlier.json"),
+      STACK_GITHUB_TOKEN: "t",
+      GITHUB_REPOSITORY: "mattermost/tpp",
+      GITHUB_RUN_ID: "77",
+    },
+    () => Response.json({ total_count: 0, artifacts: [] }),
+  );
+  await earlier.go;
+  assert.deepEqual(readOutputs(earlier.output), { found: "false" });
+  assert.match(
+    earlier.fetched[0],
+    /\/repos\/mattermost\/tpp\/actions\/runs\/77\/artifacts\?name=e2e-test-stack-create&/,
+  );
+});
+
+test("expect-batch-prefix refuses another run's create response before opening it or calling anything", async () => {
+  const created = file("created.json");
+  // Sealed to another key: had it been opened, the error would say so.
+  writeFileSync(created, JSON.stringify(createResponse({ batch: { secrets: seal(SECRETS, other.publicKey) } })));
+  for (const operation of ["destroy", "fetch", "open"]) {
+    const r = await runWith(
+      {
+        STACK_OPERATION: operation,
+        STACK_CALLER_KEY: "test-public-project",
+        STACK_PRIVATE_KEY: PRIVATE_KEY,
+        STACK_CREATE_RESPONSE: created,
+        STACK_EXPECT_BATCH_PREFIX: "pr-99-",
+      },
+      noFetch,
+    );
+    await assert.rejects(
+      r.go,
+      /the batch in .*created\.json, "pr-1234-abc", does not start with expect-batch-prefix pr-99-; is it another run's create response\?/,
+    );
+    assert.equal(r.invokes, 0);
+  }
+  const matching = await runWith(
+    {
+      STACK_OPERATION: "open",
+      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_CREATE_RESPONSE: (() => {
+        const path = file("created.json");
+        writeFileSync(path, JSON.stringify(createResponse()));
+        return path;
+      })(),
+      STACK_EXPECT_BATCH_PREFIX: "pr-1234-",
+    },
+    noFetch,
+  );
+  await matching.go;
+  assert.equal(readOutputs(matching.output).batch_id, "pr-1234-abc");
+
+  // A prefix ends with a hyphen, so run 123's does not accept run 1234's batch.
+  const run1234 = file("created.json");
+  writeFileSync(run1234, JSON.stringify(createResponse({ batch_id: "mobile-1234-abc" })));
+  const shorter = await runWith(
+    {
+      STACK_OPERATION: "open",
+      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_CREATE_RESPONSE: run1234,
+      STACK_EXPECT_BATCH_PREFIX: "mobile-123-",
+    },
+    noFetch,
+  );
+  await assert.rejects(shorter.go, /"mobile-1234-abc", does not start with expect-batch-prefix mobile-123-/);
+});
+
+const GONE_BODY = "No test server for this hostname";
+const destroyWithProbe = (over: Record<string, string> = {}) => {
+  const created = file("created.json");
+  const response = createResponse();
+  response.batch.instances = [
+    { ...lease(0), sso_host: "sso-pr-1234-abc-00.test.example" } as ReturnType<typeof lease>,
+    null,
+  ];
+  writeFileSync(created, JSON.stringify(response));
+  return {
+    STACK_OPERATION: "destroy",
+    STACK_CALLER_KEY: "test-public-project",
+    STACK_PRIVATE_KEY: PRIVATE_KEY,
+    STACK_CREATE_RESPONSE: created,
+    STACK_VERIFY_GONE: "true",
+    ...over,
+  };
+};
+const destroyed = (state = "destroyed") =>
+  ok({ batch_id: "pr-1234-abc", sites: ["https://pr-1234-abc-00.test.example", ""], batch: { state, instances: [] } });
+
+test("verify-gone probes every site, mail and sso host of the create response after the destroy", async () => {
+  for (const state of ["destroyed", "not found"]) {
+    const r = await runWith(destroyWithProbe(), () => new Response(GONE_BODY, { status: 404 }), destroyed(state));
+    await r.go;
+    assert.deepEqual(r.fetched.sort(), [
+      "https://mail-pr-1234-abc-00.test.example/",
+      "https://pr-1234-abc-00.test.example/api/v4/system/ping",
+      "https://sso-pr-1234-abc-00.test.example/",
+    ]);
+    assert.equal(readOutputs(r.output).state, state);
+    assert.match(
+      readFileSync(r.summary, "utf8"),
+      /\| Gone \| all 3 site, mail and SSO hosts answer the router's 404 \|/,
+    );
+  }
+});
+
+test("verify-gone fails naming each host still served, after the outputs are set; a partial destroy probes nothing", async () => {
+  const r = await runWith(
+    destroyWithProbe({ STACK_GONE_WINDOW: "20" }),
+    (url) =>
+      url.startsWith("https://mail-")
+        ? new Response("Bad Gateway", { status: 502 })
+        : new Response(GONE_BODY, { status: 404 }),
+    destroyed(),
+  );
+  await assert.rejects(
+    r.go,
+    /1 of 3 host\(s\) still served after the destroy:\n {2}https:\/\/mail-pr-1234-abc-00\.test\.example\/ is still served after 20s \(\d+ attempt\(s\)\): last answer 502 Bad Gateway$/,
+  );
+  assert.equal(readOutputs(r.output).state, "destroyed");
+  assert.match(readFileSync(r.summary, "utf8"), /\| Gone \| 1 of 3 host\(s\) still served after the destroy \|/);
+
+  const partial = await runWith(destroyWithProbe(), noFetch, destroyed("partially_destroyed"));
+  await assert.rejects(partial.go, /the batch is partially_destroyed, not destroyed; no host was probed/);
+  assert.equal(partial.fetched.length, 0);
+});

@@ -7,6 +7,11 @@ access: one AWS Lambda function per channel, `<project>-v1` (the promoted build)
 optional services) reachable over HTTPS; a batch is reaped at its `ttl` (1h by default, 4h at most) if nothing
 destroys it.
 
+Four more operations call no control plane and need no AWS credentials or private key; they do what a stack workflow
+does around its calls ([Workflow operations](#workflow-operations)): `role` picks the AWS account and its CI role,
+`server-image` names the server image to test, `check-run` checks a workflow run before its artifacts are read, and
+`earlier-response` finds an earlier attempt's create response in a re-run.
+
 ## Keys and aliases
 
 A repository is registered in the control plane's `callers` with a short **key** (for example `mobile`) and the
@@ -64,35 +69,51 @@ the action uses it only for the download, and no output, file or summary carries
 
 ## Inputs
 
-| Input                   | Operations                 | Description                                                                                                                                                    |
-| ----------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `operation`             | all                        | `create`, `fetch`, `logs` or `destroy`, which call the control plane, or `open`, which calls nothing. Required                                                 |
-| `caller-key`            | all but open               | The repository's key in the control plane's `callers`. Required                                                                                                |
-| `channel`               | all                        | `v1` (default) or `edge`. Use the channel the batch was created on                                                                                             |
-| `project`               | all                        | The control plane's project, the prefix of its function names. Default `e2e-test-stack`                                                                        |
-| `region`                | all                        | Default `us-east-1`                                                                                                                                            |
-| `private-key`           | create, fetch, logs, open  | `${{ secrets.E2E_STACK_PRIVATE_KEY }}`. Also for destroy with `create-response`                                                                                |
-| `response-path`         | all but open               | Write the raw response JSON here. Its secrets are sealed, so it is safe to upload as an artifact                                                               |
-| `instance-key`          | create                     | Names the stack and prefixes its hostnames, e.g. `pr-1234`. Required                                                                                           |
-| `server-image`          | create                     | The server image under test, by tag. Required                                                                                                                  |
-| `count`                 | create                     | Instances in the batch; default 1, at most 40                                                                                                                  |
-| `services`              | create                     | Comma-separated: `minio` or `azurite`, `elasticsearch` or `opensearch`, `keycloak`, `openldap`                                                                 |
-| `ttl`                   | create                     | A duration such as `90m`; default `1h`, at most `4h`                                                                                                           |
-| `os`                    | create                     | OS variant, e.g. `ubuntu-24.04`                                                                                                                                |
-| `postgres`              | create                     | Postgres version, e.g. `16`                                                                                                                                    |
-| `license`               | create                     | Licence SKU, e.g. `enterprise-advanced`; empty runs unlicensed                                                                                                 |
-| `instance-type`         | create                     | EC2 instance type; empty is sized by the control plane                                                                                                         |
-| `server-env`            | create                     | Server settings as a JSON object of strings, e.g. `{"MM_FEATUREFLAGS_TESTFEATURE":"true"}`; no credentials                                                     |
-| `retries`               | create                     | Attempts per failed instance; default 1, a negative number none, at most 3                                                                                     |
-| `shared-admin-password` | create                     | `true` gives every instance the same admin password                                                                                                            |
-| `wait-for-migrations`   | create                     | `true` waits for the server's migrations before an instance is ready                                                                                           |
-| `caller-run-id`         | create                     | Tagged on the batch for attribution. Default `github.run_id`                                                                                                   |
-| `batch-id`              | fetch, logs, destroy       | The batch, from create's `batch-id` output                                                                                                                     |
-| `batch-token`           | fetch, logs, destroy       | The batch's token, from create's `batch-token` output                                                                                                          |
-| `create-response`       | fetch, logs, destroy, open | Instead of `batch-id` and `batch-token`: a create response written by `response-path`; the token is opened from it with `private-key`. Required for open       |
-| `indexes`               | fetch                      | Comma-separated instance indexes; empty fetches the whole batch                                                                                                |
-| `index`                 | logs, open                 | logs: the instance whose logs to collect, default 0. open: the instance whose fields to set as `site-url`, `admin-username`, `admin-password` and `mail-token` |
-| `logs-path`             | logs                       | Where to write the full log ([Secrets at rest](#secrets-at-rest)); default a file under `RUNNER_TEMP`                                                          |
+| Input                   | Operations                                | Description                                                                                                                                                     |
+| ----------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `operation`             | all                                       | `create`, `fetch`, `logs` or `destroy`, which call the control plane; `open`, `role`, `server-image`, `check-run` or `earlier-response`, which do not. Required |
+| `caller-key`            | create, fetch, logs, destroy              | The repository's key in the control plane's `callers`. Required                                                                                                 |
+| `channel`               | all                                       | `v1` (default) or `edge`. Use the channel the batch was created on                                                                                              |
+| `project`               | all                                       | The control plane's project, the prefix of its function names. Default `e2e-test-stack`                                                                         |
+| `region`                | all                                       | Default `us-east-1`                                                                                                                                             |
+| `private-key`           | create, fetch, logs, open                 | `${{ secrets.E2E_STACK_PRIVATE_KEY }}`. Also for destroy with `create-response`                                                                                 |
+| `response-path`         | all but open                              | Write the raw response JSON here. Its secrets are sealed, so it is safe to upload as an artifact                                                                |
+| `instance-key`          | create                                    | Names the stack and prefixes its hostnames, e.g. `pr-1234`. Required                                                                                            |
+| `server-image`          | create                                    | The server image under test, by tag. Required                                                                                                                   |
+| `count`                 | create                                    | Instances in the batch; default 1, at most 40                                                                                                                   |
+| `services`              | create                                    | Comma-separated: `minio` or `azurite`, `elasticsearch` or `opensearch`, `keycloak`, `openldap`                                                                  |
+| `ttl`                   | create                                    | A duration such as `90m`; default `1h`, at most `4h`                                                                                                            |
+| `os`                    | create                                    | OS variant, e.g. `ubuntu-24.04`                                                                                                                                 |
+| `postgres`              | create                                    | Postgres version, e.g. `16`                                                                                                                                     |
+| `license`               | create                                    | Licence SKU, e.g. `enterprise-advanced`; empty runs unlicensed                                                                                                  |
+| `instance-type`         | create                                    | EC2 instance type; empty is sized by the control plane                                                                                                          |
+| `server-env`            | create                                    | Server settings as a JSON object of strings, e.g. `{"MM_FEATUREFLAGS_TESTFEATURE":"true"}`; no credentials                                                      |
+| `retries`               | create                                    | Attempts per failed instance; default 1, a negative number none, at most 3                                                                                      |
+| `shared-admin-password` | create                                    | `true` gives every instance the same admin password                                                                                                             |
+| `wait-for-migrations`   | create                                    | `true` waits for the server's migrations before an instance is ready                                                                                            |
+| `caller-run-id`         | create                                    | Tagged on the batch for attribution. Default `github.run_id`                                                                                                    |
+| `batch-id`              | fetch, logs, destroy                      | The batch, from create's `batch-id` output                                                                                                                      |
+| `batch-token`           | fetch, logs, destroy                      | The batch's token, from create's `batch-token` output                                                                                                           |
+| `create-response`       | fetch, logs, destroy, open                | Instead of `batch-id` and `batch-token`: a create response written by `response-path`; the token is opened from it with `private-key`. Required for open        |
+| `indexes`               | fetch                                     | Comma-separated instance indexes; empty fetches the whole batch                                                                                                 |
+| `index`                 | logs, open                                | logs: the instance whose logs to collect, default 0. open: the instance whose fields to set as `site-url`, `admin-username`, `admin-password` and `mail-token`  |
+| `logs-path`             | logs                                      | Where to write the full log ([Secrets at rest](#secrets-at-rest)); default a file under `RUNNER_TEMP`                                                           |
+| `expect-batch-prefix`   | fetch, logs, destroy, open                | With `create-response`: its batch id must start with this, e.g. `mobile-<run id>-`, or it is refused before anything is opened or called. Ends with a hyphen    |
+| `verify-gone`           | destroy                                   | With `create-response`: `true` checks every host of the batch stops being served ([verify-gone](#verify-gone))                                                  |
+| `gone-window`           | destroy                                   | With `verify-gone`: seconds each host has to stop being served; default 180, at most 1800                                                                       |
+| `account`               | role                                      | `prod` or `dev`; empty or `recorded` takes only the account in `account-file`                                                                                   |
+| `account-file`          | role                                      | The account a run's create recorded beside its response; used when the file exists                                                                              |
+| `role-arn-prod`         | role                                      | The prod account's CI role ARN                                                                                                                                  |
+| `role-arn-dev`          | role                                      | The dev account's CI role ARN                                                                                                                                   |
+| `server`                | server-image                              | `master` (default), `latest` or `esr`                                                                                                                           |
+| `github-token`          | server-image, check-run, earlier-response | Token for api.github.com. Default `github.token`; check-run and earlier-response need `actions: read`                                                           |
+| `run-id`                | check-run, earlier-response               | check-run: the run to check. Required. earlier-response: the run to read; default this run                                                                      |
+| `allowed-workflows`     | check-run                                 | Comma- or newline-separated workflow files the run may be of, e.g. `.github/workflows/e2e.yml`                                                                  |
+| `allowed-branches`      | check-run                                 | A JavaScript regular expression the run's whole head branch must match, e.g. `master\|release-.*`                                                               |
+| `allowed-events`        | check-run                                 | Comma-separated events the run may be for, e.g. `push, workflow_dispatch`                                                                                       |
+| `artifact-name`         | earlier-response                          | The artifact holding the create response; default `e2e-test-stack-create`                                                                                       |
+| `response-member`       | earlier-response                          | The artifact's file holding the create response; default `e2e-test-stack-create.json`                                                                           |
+| `account-path`          | earlier-response                          | Where to write the account the artifact records; empty writes none                                                                                              |
 
 An input that belongs to another operation is refused, as is any malformed value, before the control plane is called.
 
@@ -116,7 +137,12 @@ An input that belongs to another operation is refused, as is any malformed value
 | `cost-usd`           | From destroy. The batch's estimated cost in USD; empty unless every server was destroyed and priced at a known rate                                                                                                                                                                                                                                |
 | `logs-path`          | From logs. The full log, or the tail if it did not download; empty when there was none                                                                                                                                                                                                                                                             |
 | `logs-full`          | From logs. `true` when `logs-path` holds the whole log, `false` when only a truncated tail                                                                                                                                                                                                                                                         |
-| `response-path`      | Where `response-path` was written                                                                                                                                                                                                                                                                                                                  |
+| `response-path`      | Where `response-path` was written; from earlier-response, only when found                                                                                                                                                                                                                                                                          |
+| `account`            | From role. `prod` or `dev`                                                                                                                                                                                                                                                                                                                         |
+| `role-arn`           | From role. That account's CI role ARN                                                                                                                                                                                                                                                                                                              |
+| `server-image`       | From server-image. The image, e.g. `mattermost/mattermost-enterprise-edition:11.1.2`                                                                                                                                                                                                                                                               |
+| `server-version`     | From server-image. The release, `X.Y.Z`, or `master`                                                                                                                                                                                                                                                                                               |
+| `found`              | From earlier-response. `true` when the run holds the artifact and its response was written, `false` when it holds none or its response names no batch                                                                                                                                                                                              |
 
 Masked values are redacted from the job's logs. GitHub does not pass a job output that holds a masked value to
 another job, so `batch-token`, `instances` and the fields `open` sets are for steps of the same job. To reach a later
@@ -135,6 +161,59 @@ open.
 
 Cancelling the job while a create is waiting leaves the batch running until its TTL: the action never received its
 batch id, so nothing can destroy it.
+
+## Workflow operations
+
+These call no control plane, open no secret and need no AWS credentials.
+
+**`role`** picks the account a job runs in and its CI role, and sets `account` and `role-arn` for
+`aws-actions/configure-aws-credentials`. The account is the one recorded in `account-file` when that file exists (a
+create records it beside its response), otherwise `account`. A recorded account that is not `prod` or `dev` fails
+without quoting the file; a recorded account and a `prod` or `dev` input that differ fail; with neither, the step fails
+asking for `account`. An empty `role-arn-<account>` fails rather than fall back to the other account's role.
+
+**`server-image`** sets `server-image` and `server-version`. `master` is
+`mattermostdevelopment/mattermost-enterprise-edition:master` and reads nothing. `latest` is
+`mattermost/mattermost-enterprise-edition:<X.Y.Z>`, the highest stable release of `mattermost/mattermost`: not a draft
+or prerelease, and a tag with no suffix such as `-rc1`. `esr` is the newest patch of the newest minor whose stable
+releases' notes say "extended support release", in any case, as Matterwick decides it.
+
+**`check-run`** reads `run-id` in this repository and fails unless it ran one of `allowed-workflows`, on a head branch
+`allowed-branches` matches whole, for one of `allowed-events`, from this repository rather than a fork:
+`run 42 is not an allowed run: <path> on <branch> (<event>) from <repository>`. Run it before reading another run's
+artifacts, so a pull request's artifact of the same name is never read. `head_branch` is what GitHub reports for the
+run, so a tag named like an allowed branch matches too; callers rely on their CI role trusting only branch refs, and on
+`expect-batch-prefix`.
+
+**`earlier-response`** is for a re-run of a create job, whose earlier attempt's batch would otherwise be left running
+and its response overwritten. It looks for this run's (or `run-id`'s) artifact `artifact-name`; with none, `found` is
+`false`. Any file already at `response-path` or `account-path` is removed first, so a later step never reads a stale
+one. With an artifact, it downloads it, writes its `response-member` to `response-path`, and sets `found` to `true`. With
+`account-path`, it also writes the account the artifact records (`e2e-test-stack-account`) there; an account that is
+missing or cannot be read is skipped with a warning, and `role` then decides the account from its own inputs. A
+response that names no batch, as a refused create leaves, has nothing to release: `found` is `false`, with a warning.
+An artifact that exists but cannot be downloaded or read, has expired, has no `response-member`, or holds a response
+that is not JSON, fails the step, so a caller never loses an earlier batch by creating another.
+
+Their GitHub calls are tried up to four times, each attempt within 60 seconds: again after 10, 20 and 30 seconds on a
+server error, a timeout or a network error, and after 60 seconds on a 429 or a secondary rate limit. Any other failure,
+such as a 404, an auth error or the primary rate limit, is final. A step that gives up lists every attempt's error.
+
+### verify-gone
+
+`destroy` with `create-response` and `verify-gone: true` checks that the batch has stopped serving, once it is
+`destroyed` or `not found`: each site's `/api/v4/system/ping`, its `mail-` host, and the `sso-` host of each instance
+created with Keycloak, all read from the create response and probed with the site's protocol. Only the router's 404 for an unknown test server ("No test
+server for this hostname") passes. Anything else, a 502 (the instance is still known), a 503 (the lookup could not run),
+a refused or timed-out request, is tried again every 5 seconds until `gone-window` seconds have passed; every host is
+probed at once. The step fails listing each host still served with its last answer, after the outputs are set. A batch
+with no launched instance has no host to probe, and passes; any other state fails without probing.
+
+### expect-batch-prefix
+
+A workflow that reads a create response from an artifact passes `expect-batch-prefix` with what its own create named
+the batch with, such as `mobile-${{ github.run_id }}-`. A response whose batch id does not start with it, one copied
+in from another run, is refused before its secrets are opened or the control plane is called.
 
 ## Examples
 

@@ -5,10 +5,18 @@ import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileS
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
-import type { Env } from "../../shared/src/github.ts";
+import { sleep as realSleep } from "../../shared/src/github.ts";
+import type { Env, FetchImpl, Sleep } from "../../shared/src/github.ts";
+import { readBody } from "./body.ts";
+import { checkRun } from "./check-run.ts";
+import { earlierResponse } from "./earlier.ts";
+import { githubClient } from "./github.ts";
 import { BATCH_ID, readInputs } from "./inputs.ts";
 import type { Inputs } from "./inputs.ts";
+import { goneUrls, probeGone } from "./probe.ts";
+import { chooseRole } from "./role.ts";
 import { openSealed, SealedError } from "./sealed.ts";
+import { serverImage } from "./server-image.ts";
 
 /** One Lambda Invoke call, as the action makes it. */
 export interface InvokeInput {
@@ -58,6 +66,8 @@ interface Lease {
   containers?: string[];
   server_image?: { ref?: string; digest?: string; created_at?: string; age?: string; source?: string };
   ami_name?: string;
+  /** Keycloak's sso- host, for an instance created with it. */
+  sso_host?: string;
   /** From destroy. */
   cost?: Cost;
   metrics?: { cpu_average?: number; cpu_peak?: number };
@@ -261,25 +271,7 @@ export async function fetchLog(url: string, max: number): Promise<string> {
     await res.body?.cancel();
     throw new Error(`answered ${res.status}`);
   }
-  const length = Number(res.headers.get("content-length") ?? 0);
-  if (length > max) {
-    await res.body?.cancel();
-    throw new Error(`${length} bytes, more than ${max}`);
-  }
-  const chunks: Uint8Array[] = [];
-  let read = 0;
-  if (res.body) {
-    const reader = res.body.getReader();
-    for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
-      read += chunk.value.byteLength;
-      if (read > max) {
-        await reader.cancel();
-        throw new Error(`more than ${max} bytes`);
-      }
-      chunks.push(chunk.value);
-    }
-  }
-  return Buffer.concat(chunks).toString("utf8");
+  return (await readBody(res, max)).toString("utf8");
 }
 
 /** Downloads a presigned log URL with fetchLog, up to MAX_LOG_BYTES. */
@@ -293,6 +285,12 @@ export interface RunOptions {
   download?: Download;
   /** Takes progress and workflow commands (::add-mask::); stdout in the action. */
   log?: (message: string) => void;
+  /** Calls GitHub and probes hosts; the global fetch in the action. */
+  fetch?: FetchImpl;
+  /** Waits between attempts. */
+  sleep?: Sleep;
+  /** Milliseconds on a steady clock, for verify-gone's window. */
+  now?: () => number;
 }
 
 /**
@@ -300,7 +298,15 @@ export interface RunOptions {
  * sealed secrets, masks every secret, and sets outputs and the job summary. A refused call, a failed open or a response
  * error fails it, after the outputs that were read are set, so a partial create still hands back its batch.
  */
-export async function run({ env, connect, download = downloadLog, log = console.log }: RunOptions): Promise<void> {
+export async function run({
+  env,
+  connect,
+  download = downloadLog,
+  log = console.log,
+  fetch: fetchImpl = fetch,
+  sleep = realSleep,
+  now = () => performance.now(),
+}: RunOptions): Promise<void> {
   const inputs = readInputs(env);
   const { operation } = inputs;
   const outputs: Record<string, string> = {};
@@ -352,6 +358,12 @@ export async function run({ env, connect, download = downloadLog, log = console.
     }
     if (!created.batch_id || !created.batch?.secrets)
       throw new Error(`e2e-test-stack: ${path} is not a create response with a batch: no batch_id or batch.secrets`);
+    // Before any secret is opened or call made: a response copied in from another run is refused.
+    const prefix = inputs.expectBatchPrefix;
+    if (prefix && (typeof created.batch_id !== "string" || !created.batch_id.startsWith(prefix)))
+      throw new Error(
+        `e2e-test-stack: the batch in ${path}, ${JSON.stringify(String(created.batch_id).slice(0, 80))}, does not start with expect-batch-prefix ${prefix}; is it another run's create response?`,
+      );
     try {
       return { created, secrets: (await openSealed(created.batch.secrets, inputs.privateKey!)) as BatchSecrets };
     } catch (e) {
@@ -392,16 +404,43 @@ export async function run({ env, connect, download = downloadLog, log = console.
     });
   };
 
+  const github = () => githubClient(inputs.githubToken ?? "", fetchImpl, sleep, log);
+
   try {
     if (operation === "open") {
       await openCreateResponse();
       return;
     }
+    if (operation === "role") {
+      const { account, roleArn } = chooseRole(inputs.role!);
+      log(`e2e-test-stack: account ${account}`);
+      Object.assign(outputs, { account, role_arn: roleArn });
+      return;
+    }
+    if (operation === "server-image") {
+      const { image, version } = await serverImage(inputs.server!, github());
+      log(`e2e-test-stack: server ${inputs.server}: ${image}`);
+      Object.assign(outputs, { server_image: image, server_version: version });
+      return;
+    }
+    if (operation === "check-run") {
+      await checkRun(inputs.checkRun!, github(), log);
+      return;
+    }
+    if (operation === "earlier-response") {
+      const path = await earlierResponse(inputs.earlier!, github(), log);
+      outputs.found = String(!!path);
+      if (path) outputs.response_path = path;
+      return;
+    }
     let batchId = inputs.batchId;
     let batchToken = inputs.batchToken;
+    // The create response a destroy reads, for verify-gone's hosts.
+    let createdResponse: StackResponse | undefined;
     mask(batchToken);
     if (inputs.createResponse) {
       const { created, secrets } = await readCreateResponse(inputs.createResponse);
+      createdResponse = created;
       if (batchId && batchId !== created.batch_id)
         throw new Error(
           `e2e-test-stack: batch-id ${batchId} is not the batch in create-response (${created.batch_id})`,
@@ -622,6 +661,38 @@ export async function run({ env, connect, download = downloadLog, log = console.
       }
     }
 
+    // Probed before the per-server table is drawn, so its row joins the batch's; a failure is thrown after it.
+    let goneFailure: Error | undefined;
+    if (operation === "destroy" && inputs.verifyGone && !responseError) {
+      try {
+        if (state !== "destroyed" && state !== "not found")
+          throw new Error(`e2e-test-stack: the batch is ${state || "in no state"}, not destroyed; no host was probed`);
+        const urls = goneUrls(
+          createdResponse?.sites ?? [],
+          (createdResponse?.batch?.instances ?? []).map((l) => (typeof l?.sso_host === "string" ? l.sso_host : "")),
+        );
+        if (urls.length) {
+          log(
+            `e2e-test-stack: verify-gone: probing ${urls.length} host(s) for the router's 404, within ${inputs.goneWindowSeconds} s`,
+          );
+          await probeGone(urls, inputs.goneWindowSeconds! * 1000, { fetch: fetchImpl, sleep, now, log });
+        } else log("e2e-test-stack: verify-gone: no instance of the batch launched, so no host is probed");
+        summary.push(
+          `| Gone | ${urls.length ? `all ${urls.length} site, mail and SSO hosts answer the router's 404` : "no host to probe"} |`,
+        );
+      } catch (e) {
+        goneFailure = e as Error;
+        summary.push(
+          `| Gone | ${cell(
+            goneFailure.message
+              .split("\n")[0]
+              .replace(/^e2e-test-stack: /, "")
+              .replace(/:$/, ""),
+          )} |`,
+        );
+      }
+    }
+
     if (sites.length) {
       // Per server: what create measured, or what destroy charged.
       const extra: [string, (l: Lease) => string][] =
@@ -684,6 +755,7 @@ export async function run({ env, connect, download = downloadLog, log = console.
       }
     }
 
+    if (goneFailure) throw goneFailure;
     const teardown =
       operation === "create" && outputs.batch_id ? ` Batch ${outputs.batch_id} was created; destroy it.` : "";
     if (responseError) throw new Error(`e2e-test-stack: ${operation} reported: ${responseError}.${teardown}`);

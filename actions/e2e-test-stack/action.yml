@@ -3,16 +3,18 @@ name: E2E test stack
 description: >-
   Create, fetch, collect logs of and destroy remote Mattermost test servers through the e2e-test-stack control plane.
   Uses the AWS credentials the job holds: run aws-actions/configure-aws-credentials with the repository's CI role first.
+  Also picks that role, the server image, and checks and reads the workflow runs a stack workflow relies on.
 inputs:
   operation:
     description: >-
-      create, fetch, logs or destroy, which call the control plane; or open, which opens a create response's secrets
-      with private-key and calls nothing, for a test job that has no AWS credentials
+      create, fetch, logs or destroy, which call the control plane; open, which opens a create response's secrets
+      with private-key and calls nothing, for a test job that has no AWS credentials; or role, server-image, check-run
+      or earlier-response, which call no control plane and need no AWS credentials or private key
     required: true
   caller-key:
     description: >-
       The repository's key in the control plane's callers (e.g. mobile); the action invokes only the alias
-      <caller-key>-<channel>. Required for every operation but open
+      <caller-key>-<channel>. Required for create, fetch, logs and destroy
     default: ""
   channel:
     description: v1 (the promoted build) or edge (main's newest build). fetch, logs and destroy use the channel the batch was created on
@@ -99,7 +101,68 @@ inputs:
   response-path:
     description: >-
       Where to write the control plane's raw response JSON. Its secrets are sealed to the repository's key, so it is
-      safe to upload as an artifact; create-response reads it back
+      safe to upload as an artifact; create-response reads it back. For earlier-response, where to write the create
+      response it finds, removing any file already there first; required
+    default: ""
+  expect-batch-prefix:
+    description: >-
+      For fetch, logs, destroy and open with create-response. The batch id must start with it, a prefix ending with a
+      hyphen (e.g. mobile-<run id>-), or the response is refused before its secrets are opened or anything is called
+    default: ""
+  verify-gone:
+    description: >-
+      For destroy with create-response. true probes, once the batch is destroyed or not found, each site, its mail-
+      host and any sso- host until each answers the router's 404 for an unknown server, and fails for any still served
+    default: ""
+  gone-window:
+    description: For destroy with verify-gone. Seconds each host has to stop being served; empty is 180, at most 1800
+    default: ""
+  account:
+    description: >-
+      For role. prod or dev; empty or recorded takes only the account recorded in account-file. A recorded account
+      that differs fails
+    default: ""
+  account-file:
+    description: For role. The file a run's create recorded its account in, beside its response; used when it exists
+    default: ""
+  role-arn-prod:
+    description: For role. The prod account's CI role ARN
+    default: ""
+  role-arn-dev:
+    description: For role. The dev account's CI role ARN
+    default: ""
+  server:
+    description: >-
+      For server-image. master (the default), latest (the newest stable release of mattermost/mattermost) or esr
+      (the newest patch of the newest Extended Support Release line)
+    default: ""
+  github-token:
+    description: >-
+      For server-image, check-run and earlier-response. The token for api.github.com; check-run and earlier-response
+      need actions: read
+    default: ${{ github.token }}
+  run-id:
+    description: For check-run, the run to check (required). For earlier-response, the run whose artifact to read; empty is this run
+    default: ""
+  allowed-workflows:
+    description: For check-run. Comma- or newline-separated workflow files (.github/workflows/<file>) the run may be of
+    default: ""
+  allowed-branches:
+    description: For check-run. A JavaScript regular expression the run's whole head branch must match (e.g. master|release-.*)
+    default: ""
+  allowed-events:
+    description: For check-run. Comma-separated events the run may be for (e.g. push, workflow_dispatch)
+    default: ""
+  artifact-name:
+    description: For earlier-response. The artifact holding a create response; empty is e2e-test-stack-create
+    default: ""
+  response-member:
+    description: For earlier-response. The artifact's file holding the create response; empty is e2e-test-stack-create.json
+    default: ""
+  account-path:
+    description: >-
+      For earlier-response. Where to write the account the artifact records (its e2e-test-stack-account); empty
+      writes none. An account that cannot be read is skipped with a warning. A file already there is removed first
     default: ""
 outputs:
   batch-id:
@@ -156,8 +219,25 @@ outputs:
     description: From logs. true when logs-path holds the whole log, false when only a truncated tail
     value: ${{ steps.stack.outputs.logs_full }}
   response-path:
-    description: The file response-path was written to
+    description: The file response-path was written to; from earlier-response, only when found
     value: ${{ steps.stack.outputs.response_path }}
+  account:
+    description: From role. prod or dev
+    value: ${{ steps.stack.outputs.account }}
+  role-arn:
+    description: From role. The account's CI role ARN
+    value: ${{ steps.stack.outputs.role_arn }}
+  server-image:
+    description: From server-image. The image, e.g. mattermost/mattermost-enterprise-edition:11.1.2
+    value: ${{ steps.stack.outputs.server_image }}
+  server-version:
+    description: From server-image. The release, X.Y.Z, or master
+    value: ${{ steps.stack.outputs.server_version }}
+  found:
+    description: >-
+      From earlier-response. true when the run holds the artifact and its response was written; false when it holds
+      none, or its response names no batch
+    value: ${{ steps.stack.outputs.found }}
 runs:
   using: composite
   steps:
@@ -191,6 +271,22 @@ runs:
         STACK_INDEX: ${{ inputs.index }}
         STACK_LOGS_PATH: ${{ inputs.logs-path }}
         STACK_RESPONSE_PATH: ${{ inputs.response-path }}
+        STACK_EXPECT_BATCH_PREFIX: ${{ inputs.expect-batch-prefix }}
+        STACK_VERIFY_GONE: ${{ inputs.verify-gone }}
+        STACK_GONE_WINDOW: ${{ inputs.gone-window }}
+        STACK_ACCOUNT: ${{ inputs.account }}
+        STACK_ACCOUNT_FILE: ${{ inputs.account-file }}
+        STACK_ROLE_ARN_PROD: ${{ inputs.role-arn-prod }}
+        STACK_ROLE_ARN_DEV: ${{ inputs.role-arn-dev }}
+        STACK_SERVER: ${{ inputs.server }}
+        STACK_GITHUB_TOKEN: ${{ inputs.github-token }}
+        STACK_RUN_ID: ${{ inputs.run-id }}
+        STACK_ALLOWED_WORKFLOWS: ${{ inputs.allowed-workflows }}
+        STACK_ALLOWED_BRANCHES: ${{ inputs.allowed-branches }}
+        STACK_ALLOWED_EVENTS: ${{ inputs.allowed-events }}
+        STACK_ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        STACK_RESPONSE_MEMBER: ${{ inputs.response-member }}
+        STACK_ACCOUNT_PATH: ${{ inputs.account-path }}
       # Checked before the bundle is loaded: it is built for Node 26 and may not parse on an older one.
       run: |
         major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
