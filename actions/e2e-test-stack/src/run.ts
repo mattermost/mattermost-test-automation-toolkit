@@ -92,13 +92,14 @@ export function failureLines(e: unknown): string[] {
 function reportLines(e: unknown): string[] {
   const lines = [`::error::${commandText(`e2e-test-stack: ${describe(e)}`)}`];
   // Only the frames: the stack's first lines repeat the message, which is already in the annotation. The stack is
-  // split on every line break the runner reads, a lone \r included, and each frame is escaped too.
+  // split on every line break the runner reads, a lone \r included, and each frame is escaped too. The runner reads a
+  // legacy ##[command] anywhere in a plain line, so ##[ is broken up.
   if (!(e instanceof ActionError) && isError(e) && typeof e.stack === "string")
     lines.push(
       ...e.stack
         .split(/\r\n|\r|\n/)
         .filter((l) => /^\s+at /.test(l))
-        .map(commandText),
+        .map((l) => commandText(l).replaceAll("##[", "## [")),
     );
   return lines;
 }

@@ -57,7 +57,7 @@ function reportLines(e) {
   const lines = [`::error::${commandText(`e2e-test-stack: ${describe(e)}`)}`];
   if (!(e instanceof ActionError) && isError(e) && typeof e.stack === "string")
     lines.push(
-      ...e.stack.split(/\r\n|\r|\n/).filter((l) => /^\s+at /.test(l)).map(commandText)
+      ...e.stack.split(/\r\n|\r|\n/).filter((l) => /^\s+at /.test(l)).map((l) => commandText(l).replaceAll("##[", "## ["))
     );
   return lines;
 }
