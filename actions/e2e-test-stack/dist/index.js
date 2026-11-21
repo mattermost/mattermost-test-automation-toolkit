@@ -31845,6 +31845,13 @@ function batchAttempt(batchId, owner) {
   const attempt = Number(m5[1]);
   return Number.isSafeInteger(attempt) && attempt <= owner.attempt ? attempt : void 0;
 }
+function batchIdParts(batchId, callerKey) {
+  const batch = BATCH.source.replace(/^\^|\$$/g, "").replace(/\((?!\?)/g, "(?:");
+  const m5 = new RegExp(`^${escape2(callerKey)}-([1-9][0-9]{0,19})-(${batch})-([1-9][0-9]{0,5})-[a-z0-9]+$`).exec(
+    batchId
+  );
+  return m5 ? { runId: m5[1], batch: m5[2], attempt: Number(m5[3]) } : void 0;
+}
 
 // src/core/probe.ts
 var GONE = "No test server for this hostname";
@@ -31858,15 +31865,15 @@ function goneUrls(sites, ssoHosts) {
     if (site === "" || site === null || site === void 0) continue;
     const quoted = JSON.stringify(typeof site === "string" ? site.slice(0, 200) : typeof site);
     if (typeof site !== "string" || /[\u0000-\u001f\u007f]/.test(site))
-      throw new ActionError(`the create response's site ${quoted} is not a URL`);
+      throw new ActionError(`the site ${quoted} is not a URL`);
     let url;
     try {
       url = new URL(site);
     } catch {
-      throw new ActionError(`the create response's site ${quoted} is not a URL`);
+      throw new ActionError(`the site ${quoted} is not a URL`);
     }
     if (url.protocol !== "https:" && url.protocol !== "http:")
-      throw new ActionError(`the create response's site ${quoted} is not an http(s) URL`);
+      throw new ActionError(`the site ${quoted} is not an http(s) URL`);
     urls.push(`${url.href.replace(/\/+$/, "")}/api/v4/system/ping`, `${url.protocol}//mail-${url.host}/`);
     protocols[i8] = url.protocol;
   }
@@ -31874,7 +31881,7 @@ function goneUrls(sites, ssoHosts) {
     if (host === "" || host === null || host === void 0) continue;
     if (typeof host !== "string" || !/^[a-z0-9.-]+(:\d+)?$/i.test(host))
       throw new ActionError(
-        `the create response's sso host ${JSON.stringify(typeof host === "string" ? host.slice(0, 200) : typeof host)} is not a hostname`
+        `the sso host ${JSON.stringify(typeof host === "string" ? host.slice(0, 200) : typeof host)} is not a hostname`
       );
     urls.push(`${protocols[i8] ?? "https:"}//${host}/`);
   }
@@ -31923,60 +31930,76 @@ async function probeGone(urls, windowMs, o5) {
 
 // src/core/run-check.ts
 var text2 = (v2) => typeof v2 === "string" ? v2 : "";
-async function checkRun(github, repository, runId, allowed, log) {
+async function checkRun(github, repository, byHand, log) {
+  const { runId, attempt, actor } = byHand;
   const run2 = await github.json(`/repos/${repository}/actions/runs/${runId}`);
-  const path = text2(run2?.path);
-  const branch = text2(run2?.head_branch);
-  const event = text2(run2?.event);
   const from = text2(run2?.head_repository?.full_name);
+  const event = text2(run2?.event);
   const described = JSON.stringify(
-    `${path || "no workflow"} on ${branch || "no branch"} (${event || "no event"}) from ${from || "no repository"}`
+    `${text2(run2?.path) || "no workflow"} on ${text2(run2?.head_branch) || "no branch"} (${event || "no event"}) from ${from || "no repository"}`
   );
-  if (!allowed.workflows.includes(path) || !allowed.branches.test(branch) || !allowed.events.includes(event) || from !== repository)
-    throw new ActionError(`run ${runId} is not one this action may act on: it is ${described}`);
+  if (from !== repository)
+    throw new ActionError(`run ${runId} is not one of this repository's own: it is ${described}`);
+  if (event !== "workflow_dispatch")
+    throw new ActionError(
+      `run ${runId} was not started by hand: it is ${described}. Its own destroy releases its batches, or the reaper at their ttl`
+    );
   const status = text2(run2?.status);
   if (status !== "completed")
     throw new ActionError(
-      `run ${runId} is ${JSON.stringify(status || "in no state")}, not completed: destroy its batches once it completes`
+      `run ${runId} is ${JSON.stringify(status || "in no state")}, not completed: act on its batches once it completes`
     );
-  const attempt = run2?.run_attempt;
-  if (typeof attempt !== "number" || !Number.isSafeInteger(attempt) || attempt < 1)
+  const latest = run2?.run_attempt;
+  if (typeof latest !== "number" || !Number.isSafeInteger(latest) || latest < 1)
     throw new ActionError(`run ${runId} has no attempt number`);
-  log(`e2e-test-stack: run ${runId} is allowed: ${described}, attempt ${attempt}`);
-  return attempt;
+  if (attempt > latest) throw new ActionError(`run ${runId} has ${latest} attempt(s), not ${attempt}`);
+  const made = await github.json(
+    `/repos/${repository}/actions/runs/${runId}/attempts/${attempt}`
+  );
+  const by = text2(made?.triggering_actor?.login);
+  if (text2(made?.triggering_actor?.type) !== "User")
+    throw new ActionError(
+      `attempt ${attempt} of run ${runId} was started by ${JSON.stringify(by || "nobody named")}, not a person: no one may act on its batches by hand`
+    );
+  if (!by || by !== actor)
+    throw new ActionError(
+      `attempt ${attempt} of run ${runId} was started by ${JSON.stringify(by || "nobody named")}, not by ${JSON.stringify(actor)}: only they may act on its batches by hand`
+    );
+  log(`e2e-test-stack: run ${runId} is ${described}; attempt ${attempt} was started by ${by}, as this job was`);
+  return latest;
 }
 
 // src/destroy.ts
 var DEFAULT_GONE_WINDOW = 180;
 var MAX_GONE_WINDOW = 1800;
 var NOT_FOUND = "not found";
-var RUN_ID = /^[1-9]\d{0,19}$/;
 function readDestroyInputs(env2) {
   const common = stackInputs(env2);
-  const batch = batchFrom(env2);
   const own = runFrom(env2);
   const repository = repositoryFrom(env2);
-  const runIdInput = input(env2, "run-id");
-  if (runIdInput && !RUN_ID.test(runIdInput))
-    refuse(`run-id must be a workflow run's id, got ${JSON.stringify(runIdInput)}`);
-  const runId = runIdInput || own.runId;
-  let allowance;
-  if (runId !== own.runId) {
-    const workflows = list(input(env2, "allowed-workflows"));
-    const events = list(input(env2, "allowed-events"));
-    const branches = input(env2, "allowed-branches");
-    if (!workflows.length || !events.length || !branches)
-      refuse(
-        "run-id names another run, so allowed-workflows, allowed-branches and allowed-events are required: the run must match all three"
-      );
-    let pattern;
-    try {
-      pattern = new RegExp(`^(?:${branches})$`);
-    } catch {
-      return refuse("allowed-branches is not a regular expression");
+  const batchId = input(env2, "batch-id");
+  let batch;
+  let runId = own.runId;
+  let only;
+  let actor = "";
+  if (batchId) {
+    const parts = batchIdParts(batchId, common.callerKey) ?? refuse(
+      `batch-id must be a batch of caller-key ${common.callerKey}, <caller-key>-<run id>-<batch>-<attempt>-<suffix>, got ${JSON.stringify(batchId.slice(0, 100))}`
+    );
+    batch = parts.batch;
+    const given = input(env2, "batch");
+    if (given && given !== batch) refuse(`batch-id names batch ${batch}, not ${given}; give one or the other`);
+    runId = parts.runId;
+    only = { batchId, attempt: parts.attempt };
+    if (runId !== own.runId) {
+      if ((env2.GITHUB_EVENT_NAME ?? "") !== "workflow_dispatch")
+        refuse(
+          "batch-id names another run's batch, which is destroyed only by a job started by hand (workflow_dispatch)"
+        );
+      actor = (env2.GITHUB_TRIGGERING_ACTOR ?? "").trim();
+      if (!actor) refuse("GITHUB_TRIGGERING_ACTOR must be set, as it is in a GitHub Actions job");
     }
-    allowance = { workflows, branches: pattern, events };
-  }
+  } else batch = batchFrom(env2);
   const goneWindowSeconds = integer("gone-window", input(env2, "gone-window") || String(DEFAULT_GONE_WINDOW), 1);
   if (goneWindowSeconds > MAX_GONE_WINDOW)
     refuse(`gone-window must be ${MAX_GONE_WINDOW} or less, got ${goneWindowSeconds}`);
@@ -31994,7 +32017,9 @@ function readDestroyInputs(env2) {
     repository,
     own,
     runId,
-    allowance,
+    other: runId !== own.runId,
+    actor,
+    only,
     goneWindowSeconds
   };
 }
@@ -32032,14 +32057,18 @@ async function findTargets(github, run2, inputs, latest, label, log) {
   const byAttempt = /* @__PURE__ */ new Map();
   const unread = /* @__PURE__ */ new Map();
   const accounted = /* @__PURE__ */ new Set();
-  const attemptNumbers = Array.from({ length: latest }, (_2, i8) => i8 + 1);
+  const only = inputs.only;
+  const attemptNumbers = only ? [only.attempt] : Array.from({ length: latest }, (_2, i8) => i8 + 1);
   const newestName = createArtifact(inputs.batch);
-  const [own, newestFound] = await Promise.all([
+  const [own, newestFound] = only ? await (async () => {
+    const mine = await lookUp(responseArtifact(inputs.batch, only.attempt));
+    return [[mine], mine?.response ? void 0 : await lookUp(newestName)];
+  })() : await Promise.all([
     Promise.all(attemptNumbers.map((n5) => lookUp(responseArtifact(inputs.batch, n5)))),
     lookUp(newestName)
   ]);
   for (const [i8, found] of own.entries()) {
-    const n5 = i8 + 1;
+    const n5 = attemptNumbers[i8];
     if (!found) continue;
     if (!found.response) {
       unread.set(n5, found.failure);
@@ -32051,9 +32080,9 @@ async function findTargets(github, run2, inputs, latest, label, log) {
       log(`e2e-test-stack: attempt ${n5} made no batch: its create response names none`);
       continue;
     }
-    if (batchAttempt(batchId, owner) !== n5) {
+    if (batchAttempt(batchId, owner) !== n5 || only && batchId !== only.batchId) {
       failures.push(
-        `attempt ${n5}: ${responseArtifact(inputs.batch, n5)} names batch ${named(batchId)}, which attempt ${n5} of ${label} did not create`
+        `attempt ${n5}: ${responseArtifact(inputs.batch, n5)} names batch ${named(batchId)}, ${only ? `not ${only.batchId}` : `which attempt ${n5} of ${label} did not create`}`
       );
       continue;
     }
@@ -32063,9 +32092,21 @@ async function findTargets(github, run2, inputs, latest, label, log) {
     const { response, failure } = newestFound;
     const batchId = typeof response?.batch_id === "string" ? response.batch_id : "";
     if (!response) {
-      if (accounted.size + unread.size === latest)
+      if (accounted.size + unread.size === attemptNumbers.length)
         log(`e2e-test-stack: ${failure}; each attempt's own response is reported instead`);
       else failures.push(`${failure}; a batch only it names is not destroyed, and is reaped at its ttl`);
+    } else if (only) {
+      if (inputs.other)
+        log(
+          `e2e-test-stack: ${newestName} is not used for another run's batch: only attempt ${only.attempt}'s own response is`
+        );
+      else if (batchId === only.batchId && !accounted.has(only.attempt)) {
+        log(
+          `e2e-test-stack: attempt ${only.attempt}'s own response is ${unread.has(only.attempt) ? "unreadable" : "missing"}; batch ${only.batchId} is taken from ${newestName}`
+        );
+        unread.delete(only.attempt);
+        byAttempt.set(only.attempt, { attempt: only.attempt, batchId, response, from: newestName });
+      }
     } else if (batchId) {
       const n5 = batchAttempt(batchId, owner);
       const later = batchAttempt(batchId, { ...owner, attempt: Number.MAX_SAFE_INTEGER });
@@ -32086,6 +32127,10 @@ async function findTargets(github, run2, inputs, latest, label, log) {
   }
   for (const [n5, failure] of unread)
     failures.push(`attempt ${n5}: ${failure}; its batch, if any, is not destroyed, and is reaped at its ttl`);
+  if (only && !byAttempt.size && !failures.length)
+    failures.push(
+      `no create response of ${label} names batch ${only.batchId}, so it cannot be destroyed; it is reaped at its ttl`
+    );
   return { targets: [...byAttempt.values()].sort((a8, b8) => a8.attempt - b8.attempt), failures };
 }
 var money = (c8) => !c8 ? "" : c8.start_unknown ? "unknown start" : c8.estimated === false ? "no known rate" : `${(typeof c8.total === "number" ? c8.total : 0).toFixed(2)} ${c8.currency || "USD"}`;
@@ -32123,10 +32168,22 @@ async function destroyBatches(env2, deps) {
   try {
     const inputs = readDestroyInputs(env2);
     const run2 = { repository: inputs.repository, runId: inputs.runId };
-    const label = inputs.allowance ? `run ${inputs.runId}` : "this run";
+    const label = inputs.other ? `run ${inputs.runId}` : "this run";
     const github = githubClient(inputs.githubToken, deps.fetch, deps.sleep, log);
-    const latest = inputs.allowance ? await checkRun(github, inputs.repository, inputs.runId, inputs.allowance, log) : inputs.own.attempt;
-    summary.push(`Batch \`${cell(inputs.batch)}\` of ${label}, attempts 1 to ${latest}.`, "");
+    const latest = inputs.other && inputs.only ? await checkRun(
+      github,
+      inputs.repository,
+      { runId: inputs.runId, attempt: inputs.only.attempt, actor: inputs.actor },
+      log
+    ) : inputs.own.attempt;
+    if (inputs.only && inputs.only.attempt > latest)
+      throw new ActionError(
+        `batch ${inputs.only.batchId} is from attempt ${inputs.only.attempt}, but ${label} has ${latest}`
+      );
+    summary.push(
+      inputs.only ? `Batch \`${cell(inputs.only.batchId)}\` of ${label}.` : `Batch \`${cell(inputs.batch)}\` of ${label}, attempts 1 to ${latest}.`,
+      ""
+    );
     const found = await findTargets(github, run2, inputs, latest, label, log);
     failures.push(...found.failures);
     let invoke;
@@ -32149,7 +32206,7 @@ async function destroyBatches(env2, deps) {
       }
     if (invoke) {
       const target = alias(PROJECT, inputs.channel, inputs.callerKey);
-      const current = inputs.allowance ? void 0 : inputs.own.attempt;
+      const current = inputs.other ? void 0 : inputs.own.attempt;
       const settled = await Promise.all(
         found.targets.map((t2) => destroyOne(t2, target, invoke, secrets, inputs, current, deps, notes))
       );
@@ -32163,7 +32220,8 @@ async function destroyBatches(env2, deps) {
     const destroyed = results.filter((r8) => r8.state === "destroyed");
     if (destroyed.length && destroyed.every((r8) => r8.cost_usd !== ""))
       outputs.cost_usd = destroyed.reduce((sum, r8) => sum + Number(r8.cost_usd), 0).toFixed(2);
-    if (failures.length) throw new ActionError(`destroy failed for batch ${inputs.batch}: ${failures.join("; ")}`);
+    if (failures.length)
+      throw new ActionError(`destroy failed for batch ${inputs.only?.batchId ?? inputs.batch}: ${failures.join("; ")}`);
   } catch (e7) {
     failure = e7;
   }
@@ -32257,16 +32315,34 @@ async function destroySteps(t2, result, target, invoke, secrets, inputs, current
       `Batch ${t2.batchId}: sustained CPU ${percent(sizing.sustained_cpu) || "unknown"} on ${sizing.instance_type || "its instance type"}${alternative}${sizing.note ? `. ${sizing.note}` : ""}`
     );
   }
-  let urls;
-  try {
-    const leases = Array.isArray(t2.response.batch?.instances) ? t2.response.batch.instances : [];
-    urls = goneUrls(
-      Array.isArray(t2.response.sites) ? t2.response.sites : [],
-      leases.map((l5) => isObject(l5) ? l5.sso_host : void 0)
-    );
-  } catch (e7) {
-    return `batch ${t2.batchId}'s hosts could not be checked: ${reason(e7)}`;
-  }
+  const sitesOf = (r8) => Array.isArray(r8.sites) ? r8.sites : [];
+  const ssoOf = (r8) => (Array.isArray(r8.batch?.instances) ? r8.batch.instances : []).map((l5) => isObject(l5) ? l5.sso_host : void 0);
+  const responseSites = sitesOf(t2.response);
+  const replySites = sitesOf(first);
+  const lists = [
+    ["the create response's", () => goneUrls(responseSites, ssoOf(t2.response))],
+    [
+      "the destroy reply's",
+      () => goneUrls(
+        Array.from(
+          { length: Math.max(replySites.length, responseSites.length) },
+          (_2, i8) => replySites[i8] || responseSites[i8]
+        ),
+        ssoOf(first)
+      )
+    ]
+  ];
+  const urls = [];
+  const unread = [];
+  for (const [whose, read] of lists)
+    try {
+      urls.push(...read());
+    } catch (e7) {
+      unread.push(`${whose} hosts could not be read: ${reason(e7)}`);
+    }
+  if (unread.length === lists.length) return `batch ${t2.batchId}: ${unread.join("; ")}`;
+  urls.splice(0, urls.length, ...new Set(urls));
+  for (const u2 of unread) notes.push(`Batch ${t2.batchId}: ${u2}; the others were checked.`);
   if (urls.length) {
     deps.log(
       `e2e-test-stack: probing ${urls.length} host(s) of batch ${t2.batchId} for the router's 404, within ${inputs.goneWindowSeconds} s`

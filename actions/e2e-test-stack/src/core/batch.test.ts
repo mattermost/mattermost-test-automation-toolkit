@@ -2,7 +2,7 @@
 // See LICENSE.txt for license information.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { batchAttempt } from "./batch.ts";
+import { batchAttempt, batchIdParts } from "./batch.ts";
 
 const owner = { callerKey: "mobile", runId: "42", batch: "ios", attempt: 2 };
 
@@ -34,4 +34,18 @@ test("a batch id of a later attempt, another caller, run or batch, or another sh
 test("a batch whose name extends another's never matches the shorter one", () => {
   assert.equal(batchAttempt("mobile-42-ios-1-2-abc", owner), undefined);
   assert.equal(batchAttempt("mobile-42-ios-1-2-abc", { ...owner, batch: "ios-1" }), 2);
+});
+
+test("a batch id splits into its run, batch and attempt for its caller key, one way only", () => {
+  assert.deepEqual(batchIdParts("mobile-42-ios-2-abc", "mobile"), { runId: "42", batch: "ios", attempt: 2 });
+  assert.deepEqual(batchIdParts("mobile-42-ios-2-1-abc", "mobile"), { runId: "42", batch: "ios-2", attempt: 1 });
+  for (const id of [
+    "tpp-42-ios-2-abc",
+    "mobile-42-ios-abc",
+    "mobile-x-ios-2-abc",
+    "mobile-42-ios-0-abc",
+    "mobile-42-IOS-2-abc",
+    "",
+  ])
+    assert.equal(batchIdParts(id, "mobile"), undefined, id);
 });

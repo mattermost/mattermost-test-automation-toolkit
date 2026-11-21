@@ -16,7 +16,7 @@ Each action is a folder here with its own `action.yml` and README. They share th
 - [`open`](open/README.md): opens one server of this run's batch from its create response, and sets its site and admin
   credentials as masked outputs. Calls only GitHub, never AWS. Uses:
   `mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack/open@main`.
-- [`destroy`](destroy/README.md): destroys every attempt's batch of a run, this run's or another's, checks that every
+- [`destroy`](destroy/README.md): destroys every attempt's batch of this run, or one batch by its id, checks that every
   host is gone and that a second destroy finds nothing. Uses:
   `mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack/destroy@main`.
 

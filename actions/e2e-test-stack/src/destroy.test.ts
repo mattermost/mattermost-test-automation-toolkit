@@ -53,11 +53,21 @@ const createResponse = (id: string, over: Record<string, unknown> = {}) => ({
   },
   ...over,
 });
+/** A destroy's reply, naming the batch's site and sso- host from its leases. */
 const destroyed = (id: string) => ({
   batch_id: id,
+  sites: [site(id)],
   batch: {
     state: "destroyed",
-    instances: [{ instance_id: `${id}-00`, state: "terminated", cost: { total: 0.05, hours: 0.5 } }],
+    instances: [
+      {
+        instance_id: `${id}-00`,
+        state: "terminated",
+        site_url: site(id),
+        sso_host: `sso-${id}-00.test.example`,
+        cost: { total: 0.05, hours: 0.5 },
+      },
+    ],
     cost: { total: 0.05, hours: 0.5, currency: "USD" },
   },
 });
@@ -106,7 +116,9 @@ const harness = (
   env: Record<string, string> = {},
   replies: Record<string, (InvokeOutput | Error)[]> = {},
   probe: (url: string) => Response = () => new Response(`<p>${GONE}</p>`, { status: 404 }),
-  run: { id: number; attempt?: number; path?: string; status?: string } | undefined = undefined,
+  run:
+    | { id: number; attempt?: number; path?: string; status?: string; fork?: boolean; event?: string; by?: string }
+    | undefined = undefined,
   deps: { clock?: () => number; log?: (m: string) => void } = {},
   failListing: string[] = [],
 ): Harness => {
@@ -148,11 +160,13 @@ const harness = (
             return Response.json({
               path: run.path ?? ".github/workflows/e2e.yml",
               head_branch: "main",
-              event: "workflow_dispatch",
+              event: run.event ?? "workflow_dispatch",
               run_attempt: run.attempt ?? 1,
               status: run.status ?? "completed",
-              head_repository: { full_name: "mattermost/mobile" },
+              head_repository: { full_name: run.fork ? "someone/mobile" : "mattermost/mobile" },
             });
+          if (run && url.startsWith(`https://api.github.com/repos/mattermost/mobile/actions/runs/${run.id}/attempts/`))
+            return Response.json({ triggering_actor: { login: run.by ?? "alice", type: "User" } });
           const m = /\/artifacts\/(\d+)\/zip$/.exec(url);
           if (m) return new Response(null, { status: 302, headers: { location: `https://blob.example/${m[1]}` } });
           const b = /^https:\/\/blob\.example\/(\d+)$/.exec(url);
@@ -194,6 +208,8 @@ const harness = (
         GITHUB_REPOSITORY: "mattermost/mobile",
         GITHUB_RUN_ID: "42",
         GITHUB_RUN_ATTEMPT: "2",
+        GITHUB_EVENT_NAME: "workflow_dispatch",
+        GITHUB_TRIGGERING_ACTOR: "alice",
         ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.actions.example/id?api-version=2.0",
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: "request-token-1",
         STACK_CALLER_KEY: "mobile",
@@ -425,19 +441,14 @@ test("secrets that do not open, or hold no batch token, fail that attempt withou
   assert.equal(h.destroys.length, 0);
 });
 
-test("another run's batches are destroyed once that run is checked, up to its latest attempt", async () => {
+test("batch-id destroys that one batch of another run, once the run is checked", async () => {
   const run = { id: 77, attempt: 3 };
   const h = harness(
     [
+      { name: responseArtifact("ios", 2), body: createResponse(batchId(2, 77)) },
       { name: responseArtifact("ios", 3), body: createResponse(batchId(3, 77)) },
-      { name: responseArtifact("ios", 4), body: createResponse(batchId(4, 77)) },
     ],
-    {
-      STACK_RUN_ID: "77",
-      STACK_ALLOWED_WORKFLOWS: ".github/workflows/e2e.yml",
-      STACK_ALLOWED_BRANCHES: "main|release-.*",
-      STACK_ALLOWED_EVENTS: "workflow_dispatch",
-    },
+    { STACK_BATCH: "", STACK_BATCH_ID: batchId(3, 77) },
     {},
     undefined,
     run,
@@ -446,28 +457,40 @@ test("another run's batches are destroyed once that run is checked, up to its la
   assert.deepEqual(
     attempts(h).map((a) => a.batch_id),
     [batchId(3, 77)],
-    "attempt 4 is later than the run's latest",
+    "only the batch named, not attempt 2's",
   );
+  assert.match(readFileSync(h.summary, "utf8"), /Batch `mobile-77-ios-3-abc` of run 77\./);
 
-  const wrong = harness(
-    [],
-    {
-      STACK_RUN_ID: "77",
-      STACK_ALLOWED_WORKFLOWS: ".github/workflows/other.yml",
-      STACK_ALLOWED_BRANCHES: "main",
-      STACK_ALLOWED_EVENTS: "workflow_dispatch",
-    },
-    {},
-    undefined,
-    run,
-  );
-  await assert.rejects(
-    wrong.go(),
-    /run 77 is not one this action may act on: it is "\.github\/workflows\/e2e\.yml on main/,
-  );
-  assert.equal(wrong.stsCalls, 0);
+  const later = harness([], { STACK_BATCH: "", STACK_BATCH_ID: batchId(4, 77) }, {}, undefined, run);
+  await assert.rejects(later.go(), /run 77 has 3 attempt\(s\), not 4/);
+
+  const fork = harness([], { STACK_BATCH_ID: batchId(1, 77) }, {}, undefined, { ...run, fork: true });
+  await assert.rejects(fork.go(), /run 77 is not one of this repository's own/);
+  assert.equal(fork.stsCalls, 0);
 });
 
+test("batch-id of this run destroys that one batch, from its own response or the newest", async () => {
+  const h = harness(
+    [
+      { name: responseArtifact("ios", 1), body: createResponse(batchId(1)) },
+      { name: createArtifact("ios"), body: createResponse(batchId(2)) },
+    ],
+    { STACK_BATCH_ID: batchId(2) },
+  );
+  await h.go();
+  assert.deepEqual(
+    attempts(h).map((a) => a.batch_id),
+    [batchId(2)],
+  );
+
+  const missing = harness([{ name: responseArtifact("ios", 1), body: createResponse(batchId(1)) }], {
+    STACK_BATCH_ID: "mobile-42-ios-1-zzz",
+  });
+  await assert.rejects(missing.go(), /names batch "mobile-42-ios-1-abc", not mobile-42-ios-1-zzz/);
+
+  const none = harness([], { STACK_BATCH_ID: batchId(1) });
+  await assert.rejects(none.go(), /no create response of this run names batch mobile-42-ios-1-abc/);
+});
 test("destroy refuses a missing or malformed input before anything is called", () => {
   const env = {
     GITHUB_REPOSITORY: "mattermost/mobile",
@@ -478,38 +501,47 @@ test("destroy refuses a missing or malformed input before anything is called", (
     STACK_ROLE_ARN: ROLE_ARN,
     STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
     STACK_GITHUB_TOKEN: "t",
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_TRIGGERING_ACTOR: "alice",
   };
   const read = readDestroyInputs(env);
-  assert.deepEqual([read.runId, read.allowance, read.goneWindowSeconds, read.channel], ["42", undefined, 180, "v1"]);
+  assert.deepEqual(
+    [read.runId, read.other, read.only, read.goneWindowSeconds, read.channel],
+    ["42", false, undefined, 180, "v1"],
+  );
+  const byId = readDestroyInputs({ ...env, STACK_BATCH: "", STACK_BATCH_ID: "mobile-77-ios-2-1-abc" });
+  assert.deepEqual(
+    [byId.runId, byId.other, byId.batch, byId.only],
+    ["77", true, "ios-2", { batchId: "mobile-77-ios-2-1-abc", attempt: 1 }],
+  );
   assert.equal(
-    readDestroyInputs({ ...env, STACK_RUN_ID: "42" }).allowance,
-    undefined,
-    "this run's own id needs no check",
+    readDestroyInputs({ ...env, STACK_BATCH_ID: "mobile-42-ios-1-abc" }).other,
+    false,
+    "this run's own batch",
   );
   const refused = (over: Record<string, string>, message: RegExp) =>
     assert.throws(() => readDestroyInputs({ ...env, ...over }), message);
   refused({ STACK_ROLE_ARN: "" }, /role-arn is required/);
   refused({ STACK_BATCH: "" }, /batch is required/);
-  refused({ STACK_RUN_ID: "abc" }, /run-id must be a workflow run's id/);
-  refused({ STACK_RUN_ID: "77" }, /allowed-workflows, allowed-branches and allowed-events are required/);
+  refused({ STACK_BATCH_ID: "tpp-77-ios-1-abc" }, /batch-id must be a batch of caller-key mobile/);
+  refused({ STACK_BATCH_ID: "mobile-77-android-1-abc" }, /batch-id names batch android, not ios/);
   refused(
-    { STACK_RUN_ID: "77", STACK_ALLOWED_WORKFLOWS: "w", STACK_ALLOWED_EVENTS: "push", STACK_ALLOWED_BRANCHES: "(" },
-    /allowed-branches is not a regular expression/,
+    { STACK_BATCH_ID: "mobile-77-ios-1-abc", GITHUB_EVENT_NAME: "push" },
+    /another run's batch, which is destroyed only by a job started by hand/,
+  );
+  refused(
+    { STACK_BATCH_ID: "mobile-77-ios-1-abc", GITHUB_TRIGGERING_ACTOR: "", GITHUB_ACTOR: "alice" },
+    /GITHUB_TRIGGERING_ACTOR must be set/,
+  );
+  assert.equal(
+    readDestroyInputs({ ...env, STACK_BATCH_ID: "mobile-42-ios-1-abc", GITHUB_EVENT_NAME: "push" }).other,
+    false,
+    "this run's own batch needs no hand",
   );
   refused({ STACK_GONE_WINDOW: "1801" }, /gone-window must be 1800 or less/);
   refused({ STACK_GONE_WINDOW: "0" }, /gone-window/);
   refused({ STACK_CHANNEL: "beta" }, /channel must be v1 or edge/);
-  const other = readDestroyInputs({
-    ...env,
-    STACK_RUN_ID: "77",
-    STACK_ALLOWED_WORKFLOWS: "a.yml, b.yml",
-    STACK_ALLOWED_EVENTS: "push",
-    STACK_ALLOWED_BRANCHES: "main|release-.*",
-  });
-  assert.ok(other.allowance?.branches.test("release-11.1"));
-  assert.ok(!other.allowance?.branches.test("feature-main"), "the whole branch must match");
 });
-
 test("destroy writes every output it declares, and action.yml reads exactly those", async () => {
   const yml = readFileSync(new URL("../destroy/action.yml", import.meta.url), "utf8");
   const read = new Set([...yml.matchAll(/steps\.destroy\.outputs\.([\w-]+)/g)].map((m) => m[1]));
@@ -608,18 +640,35 @@ test("this attempt's batch not found is accepted once past its expiry, as the re
 test("another run still in progress is refused before anything is destroyed", async () => {
   const h = harness(
     [{ name: responseArtifact("ios", 1), body: createResponse(batchId(1, 77)) }],
-    {
-      STACK_RUN_ID: "77",
-      STACK_ALLOWED_WORKFLOWS: ".github/workflows/e2e.yml",
-      STACK_ALLOWED_BRANCHES: "main",
-      STACK_ALLOWED_EVENTS: "workflow_dispatch",
-    },
+    { STACK_BATCH_ID: batchId(1, 77) },
     {},
     undefined,
     { id: 77, status: "in_progress" },
   );
-  await assert.rejects(h.go(), /run 77 is "in_progress", not completed: destroy its batches once it completes/);
+  await assert.rejects(h.go(), /run 77 is "in_progress", not completed: act on its batches once it completes/);
   assert.deepEqual([h.destroys.length, h.stsCalls], [0, 0]);
+});
+
+test("the hosts probed are the create response's and the destroy reply's together, each once", async () => {
+  const extra = createResponse(batchId(1), { sites: ["https://extra.test.example"] });
+  const h = harness([{ name: responseArtifact("ios", 1), body: extra }]);
+  await h.go();
+  assert.equal(new Set(h.probed).size, h.probed.length, "each host once");
+  assert.ok(h.probed.includes(`${site(batchId(1))}/api/v4/system/ping`), "the reply's site");
+
+  // Destroyed now: the reply's hosts and the response's are both checked, so a lease the reply could not read is too.
+  assert.ok(h.probed.some((u) => u.includes("extra.test.example")));
+});
+
+test("a batch of this run already gone has its own response's hosts checked, so one up in another account is caught", async () => {
+  const h = harness(
+    [{ name: responseArtifact("ios", 1), body: createResponse(batchId(1)) }],
+    { STACK_GONE_WINDOW: "5" },
+    { [batchId(1)]: [ok(notFound(batchId(1))), ok(notFound(batchId(1)))] },
+    () => new Response("bad gateway", { status: 502 }),
+  );
+  await assert.rejects(h.go(), /3 of 3 host\(s\) of batch mobile-42-ios-1-abc are still served/);
+  assert.equal(h.probed[0], `${site(batchId(1))}/api/v4/system/ping`);
 });
 
 test("an artifact of another batch never counts, however many the run has", async () => {
@@ -721,4 +770,65 @@ test("an unreadable newest fails the step when an attempt's own response is miss
   );
   assert.match(error, /attempt 2: .*its batch, if any, is not destroyed/);
   assert.doesNotMatch(error, /a batch only it names/);
+});
+
+test("another run's batch made by someone else, or by an automated run, is refused: its own destroy or the reaper releases it", async () => {
+  const someoneElse = harness([], { STACK_BATCH_ID: batchId(1, 77) }, {}, undefined, { id: 77, by: "bob" });
+  await assert.rejects(someoneElse.go(), /attempt 1 of run 77 was started by "bob", not by "alice"/);
+  const automated = harness([], { STACK_BATCH_ID: batchId(1, 77) }, {}, undefined, { id: 77, event: "push" });
+  await assert.rejects(automated.go(), /run 77 was not started by hand/);
+  assert.deepEqual([someoneElse.stsCalls, automated.stsCalls], [0, 0]);
+});
+
+test("another run's batch already gone has its own response's hosts checked, so one up in another account is caught", async () => {
+  const run = { id: 77, attempt: 1 };
+  const h = harness(
+    [{ name: responseArtifact("ios", 1), body: createResponse(batchId(1, 77)) }],
+    { STACK_BATCH_ID: batchId(1, 77), STACK_GONE_WINDOW: "5" },
+    { [batchId(1, 77)]: [ok(notFound(batchId(1, 77))), ok(notFound(batchId(1, 77)))] },
+    () => new Response("bad gateway", { status: 502 }),
+    run,
+  );
+  await assert.rejects(h.go(), /3 of 3 host\(s\) of batch mobile-77-ios-1-abc are still served/);
+});
+
+test("another run's batch is read only from its attempt's own response, never the newest a later attempt may have uploaded", async () => {
+  const run = { id: 77, attempt: 2 };
+  const h = harness(
+    [{ name: createArtifact("ios"), body: createResponse(batchId(1, 77)) }],
+    { STACK_BATCH_ID: batchId(1, 77) },
+    {},
+    undefined,
+    run,
+  );
+  await assert.rejects(h.go(), /no create response of run 77 names batch mobile-77-ios-1-abc/);
+  assert.equal(h.destroys.length, 0);
+});
+
+test("one malformed host list leaves the other probed, and the reply's sso host takes its site's scheme", async () => {
+  const id = batchId(1);
+  const httpSite = `http://${id}-00.test.example`;
+  const response = createResponse(id, { sites: [httpSite] });
+  const reply = {
+    batch_id: id,
+    batch: { state: "destroyed", instances: [{ instance_id: `${id}-00`, sso_host: `sso-${id}-00.test.example` }] },
+  };
+  const h = harness(
+    [{ name: responseArtifact("ios", 1), body: response }],
+    {},
+    { [id]: [ok(reply), ok(notFound(id))] },
+  );
+  await h.go();
+  assert.ok(h.probed.includes(`http://sso-${id}-00.test.example/`));
+  assert.ok(!h.probed.includes(`https://sso-${id}-00.test.example/`), "not probed again under another scheme");
+
+  const bad = { ...reply, sites: ["not a url"] };
+  const m = harness(
+    [{ name: responseArtifact("ios", 1), body: createResponse(id) }],
+    {},
+    { [id]: [ok(bad), ok(notFound(id))] },
+  );
+  await m.go();
+  assert.ok(m.probed.includes(`${site(id)}/api/v4/system/ping`), "the response's hosts are still probed");
+  assert.match(readFileSync(m.summary, "utf8"), /the destroy reply's hosts could not be read/);
 });

@@ -1,5 +1,6 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
+import { BATCH } from "./inputs.ts";
 
 /** What names a batch: the caller, the run, the batch within it, and the run's latest attempt. */
 export interface BatchOwner {
@@ -23,4 +24,24 @@ export function batchAttempt(batchId: string, owner: BatchOwner): number | undef
   if (!m) return undefined;
   const attempt = Number(m[1]);
   return Number.isSafeInteger(attempt) && attempt <= owner.attempt ? attempt : undefined;
+}
+
+/** A batch id's parts: the run, the batch within it, and the attempt that created it. */
+export interface BatchIdParts {
+  runId: string;
+  batch: string;
+  attempt: number;
+}
+
+/**
+ * The parts of a batch id, <caller-key>-<run id>-<batch>-<attempt>-<suffix>, for this caller key; undefined when it is
+ * not that shape. The suffix holds no hyphen and the attempt and run are digits, so it splits one way only.
+ */
+export function batchIdParts(batchId: string, callerKey: string): BatchIdParts | undefined {
+  // The batch-name pattern unanchored, its groups not capturing, so the match's groups stay the run, batch and attempt.
+  const batch = BATCH.source.replace(/^\^|\$$/g, "").replace(/\((?!\?)/g, "(?:");
+  const m = new RegExp(`^${escape(callerKey)}-([1-9][0-9]{0,19})-(${batch})-([1-9][0-9]{0,5})-[a-z0-9]+$`).exec(
+    batchId,
+  );
+  return m ? { runId: m[1], batch: m[2], attempt: Number(m[3]) } : undefined;
 }
