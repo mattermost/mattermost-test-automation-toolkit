@@ -16,6 +16,8 @@ import {
   LABEL,
   list,
   matching,
+  PROJECT,
+  REGION,
   refuse,
   stackInputs,
 } from "./core/inputs.ts";
@@ -27,8 +29,8 @@ import { appendSummary, cell, masker, writeFile, writeOutputs } from "./core/out
 import { errorText, handlerError, redact } from "./core/redact.ts";
 import { maskBatchSecrets, responseError } from "./core/response.ts";
 import type { BatchSecrets, Lease, StackResponse } from "./core/response.ts";
-import { ACCOUNT_FILE, assumeRole, chooseRole, stsClient } from "./core/role.ts";
-import type { Account, Credentials, StsSend } from "./core/role.ts";
+import { assumeRole, roleArnFrom, stsClient } from "./core/role.ts";
+import type { Credentials, StsSend } from "./core/role.ts";
 import { openSealed, SealedError } from "./core/sealed.ts";
 import { isServer, serverImage } from "./core/server-image.ts";
 
@@ -39,7 +41,6 @@ export const RESPONSE_FILE = "e2e-test-stack-create.json";
 
 /** Every output the create step writes; action.yml reads only these. */
 export const CREATE_OUTPUTS = [
-  "account_path",
   "batch_id",
   "duration_seconds",
   "indexes",
@@ -54,26 +55,80 @@ type CreateOutputs = { [K in (typeof CREATE_OUTPUTS)[number]]?: string };
 const BATCH = /^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$/;
 const RUN_ID = /^\d+$/;
 const SERVICE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
-// A Go duration: "90m", "1h30m", "4h".
-const DURATION = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
-const OS_VARIANT = /^[a-z][a-z0-9]*-[0-9]+[.][0-9]+$/;
-const POSTGRES = /^[0-9]+(\.[0-9]+)*$/;
-const LICENSE = /^[A-Za-z0-9._-]+$/;
-const INSTANCE_TYPE = /^[a-z0-9-]+\.[a-z0-9-]+$/;
+// One part of a Go duration ("90m", "1h30m", "4h"), and a whole one.
+const DURATION_PART = /(\d+)(?:\.(\d+))?(ns|us|µs|ms|s|m|h)/g;
+const DURATION = new RegExp(`^(?:${DURATION_PART.source})+$`);
+const UNIT_NS: Record<string, bigint> = {
+  ns: 1n,
+  us: 1_000n,
+  µs: 1_000n,
+  ms: 1_000_000n,
+  s: 1_000_000_000n,
+  m: 60_000_000_000n,
+  h: 3_600_000_000_000n,
+};
 const SERVER_SETTING = /^MM_[A-Z0-9_]+$/;
+
+/** The OS variants the deployment builds images for, and the default. */
+export const OS_VARIANTS = ["ubuntu-24.04", "ubuntu-26.04"] as const;
+export const DEFAULT_OS = "ubuntu-24.04";
+/** The Postgres major versions the deployment mirrors, and the default. */
+export const POSTGRES_VERSIONS = ["14", "15", "16", "17", "18"] as const;
+export const DEFAULT_POSTGRES = "16";
+/** The licence SKUs the deployment holds, and the default. Empty runs unlicensed. */
+export const LICENSES = ["enterprise-advanced"] as const;
+export const DEFAULT_LICENSE = "enterprise-advanced";
+/** The ttl when none is given. */
+export const DEFAULT_TTL = "2h";
+/** The control plane's longest ttl. */
+export const MAX_TTL = "4h";
+
+/**
+ * A Go duration in nanoseconds, as time.ParseDuration reads it: each part's fraction is truncated to whole
+ * nanoseconds. Takes a value that matches DURATION.
+ */
+export const durationNs = (value: string): bigint => {
+  let ns = 0n;
+  for (const [, whole, fraction = "", unit] of value.matchAll(DURATION_PART)) {
+    const per = UNIT_NS[unit];
+    ns += BigInt(whole) * per + (BigInt(fraction || "0") * per) / 10n ** BigInt(fraction.length);
+  }
+  return ns;
+};
+const MAX_TTL_NS = durationNs(MAX_TTL);
+
+/** One of the allowed values, or fallback when empty; anything else is refused, naming them. */
+const oneOf = (name: string, value: string, allowed: readonly string[], fallback: string): string => {
+  if (value === "") return fallback;
+  if (!allowed.includes(value))
+    refuse(
+      `${name} must be ${allowed.slice(0, -1).join(", ")}${allowed.length > 1 ? " or " : ""}${allowed.at(-1)}, got ${JSON.stringify(value)}`,
+    );
+  return value;
+};
+
+/** A Go duration greater than zero and no longer than MAX_TTL; DEFAULT_TTL when empty. */
+const ttlFrom = (value: string): string => {
+  const ttl = value || DEFAULT_TTL;
+  matching("ttl", ttl, DURATION, 'a duration such as "90m" or "2h"');
+  const ns = durationNs(ttl);
+  if (ns <= 0n) refuse(`ttl must be longer than 0, got ${JSON.stringify(ttl)}`);
+  if (ns > MAX_TTL_NS)
+    refuse(`ttl must be ${MAX_TTL} or less, the control plane's ceiling, got ${JSON.stringify(ttl)}`);
+  return ttl;
+};
 
 /** The create request's fields, as the control plane names them; absent ones take its defaults. */
 export interface CreateFields {
   instance_key: string;
   caller_run_id: string;
   server_image: string;
+  ttl: string;
+  os: string;
+  postgres: string;
   count?: number;
   services?: string[];
-  ttl?: string;
-  os?: string;
-  postgres?: string;
   license?: string;
-  instance_type?: string;
   server_env?: Record<string, string>;
   retries?: number;
   shared_admin_password?: boolean;
@@ -82,7 +137,6 @@ export interface CreateFields {
 
 export interface CreateInputs extends StackInputs {
   batch: string;
-  account: Account;
   roleArn: string;
   /** The repository's credentials key, which opens the sealed secrets: an X25519 private key, 32 bytes. */
   credentialsKey: Uint8Array;
@@ -141,11 +195,7 @@ export function readCreateInputs(env: Env): CreateInputs {
   // Holds for any caller key and batch that passed; checked so no other shape reaches the control plane.
   matching("the instance key", instanceKey, LABEL, "a lowercase DNS label");
 
-  const { account, roleArn } = chooseRole({
-    account: get("account"),
-    roleArnProd: get("role-arn-prod"),
-    roleArnDev: get("role-arn-dev"),
-  });
+  const roleArn = roleArnFrom(get("role-arn"), common.callerKey);
   const credentialsKey = credentialsKeyFrom(get("credentials-key"));
 
   const image = get("server-image");
@@ -155,26 +205,21 @@ export function readCreateInputs(env: Env): CreateInputs {
     );
   if (/\s/.test(image)) refuse(`server-image must be one image reference, got ${JSON.stringify(image)}`);
 
-  const fields: CreateFields = { instance_key: instanceKey, caller_run_id: runId, server_image: "" };
+  const fields: CreateFields = {
+    instance_key: instanceKey,
+    caller_run_id: runId,
+    server_image: "",
+    ttl: ttlFrom(get("ttl")),
+    os: oneOf("os", get("os"), OS_VARIANTS, DEFAULT_OS),
+    postgres: oneOf("postgres", get("postgres"), POSTGRES_VERSIONS, DEFAULT_POSTGRES),
+  };
   if (get("count")) fields.count = integer("count", get("count"), 1);
   const services = list(get("services"));
   for (const s of services) matching("each of services", s, SERVICE, "a service name such as minio or keycloak");
   if (services.length) fields.services = services;
-  const ttl = matching("ttl", get("ttl"), DURATION, 'a duration such as "90m" or "4h"');
-  if (ttl) fields.ttl = ttl;
-  const os = matching("os", get("os"), OS_VARIANT, 'an OS variant such as "ubuntu-24.04"');
-  if (os) fields.os = os;
-  const postgres = matching("postgres", get("postgres"), POSTGRES, 'a version such as "16" or "16.4"');
-  if (postgres) fields.postgres = postgres;
-  const license = matching("license", get("license"), LICENSE, 'a licence SKU such as "enterprise-advanced"');
-  if (license) fields.license = license;
-  const instanceType = matching(
-    "instance-type",
-    get("instance-type"),
-    INSTANCE_TYPE,
-    'an EC2 instance type such as "m7i.xlarge"',
-  );
-  if (instanceType) fields.instance_type = instanceType;
+  // Unset takes the default, as action.yml's default does; set empty, it runs unlicensed.
+  const license = env.STACK_LICENSE === undefined ? DEFAULT_LICENSE : get("license");
+  if (license) fields.license = oneOf("license", license, LICENSES, DEFAULT_LICENSE);
   const settings = serverEnv(get("server-env"));
   if (settings) fields.server_env = settings;
   // Any negative number asks for no retries.
@@ -187,7 +232,6 @@ export function readCreateInputs(env: Env): CreateInputs {
   return {
     ...common,
     batch,
-    account,
     roleArn,
     credentialsKey,
     serverImage: image,
@@ -285,7 +329,7 @@ function serverRows(sites: string[], leases: (Lease | null)[]): string[] {
 const payloadText = (reply: InvokeOutput): string => Buffer.from(reply.Payload ?? new Uint8Array()).toString("utf8");
 
 /**
- * Creates a batch: resolves the server image, records the account, assumes the CI role through GitHub OIDC, invokes
+ * Creates a batch: resolves the server image, assumes the CI role through GitHub OIDC, invokes
  * the caller's alias, writes the raw response, opens and masks its sealed secrets, and checks with a fetch that every
  * server is ready. Outputs and the summary are written whatever happens; a batch that was created but fails a check
  * still hands back its batch id and response.
@@ -314,7 +358,7 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
   let serverTable: string[] = [];
   const secrets = masker(log);
   let failure: unknown;
-  const target = alias(inputs.project, inputs.channel, inputs.callerKey);
+  const target = alias(PROJECT, inputs.channel, inputs.callerKey);
   const named = `${target.FunctionName}:${target.Qualifier}`;
   const mayExist = " A batch may have been created; it is reaped at its ttl.";
   // Set once the reply names a batch: every later failure says what becomes of it.
@@ -335,27 +379,23 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
     outputs.server_image = image;
     const fields: CreateFields = { ...inputs.fields, server_image: image };
 
-    // The account is recorded before the create, so a response is never uploaded without it. Files left by an
-    // earlier create of the same batch in this job are removed first.
-    const dir = join(env.RUNNER_TEMP || tmpdir(), `e2e-test-stack-create-${inputs.batch}`);
-    const responseFile = join(dir, RESPONSE_FILE);
+    // A response left by an earlier create of the same batch in this job is removed first.
+    const responseFile = join(env.RUNNER_TEMP || tmpdir(), `e2e-test-stack-create-${inputs.batch}`, RESPONSE_FILE);
     rmSync(responseFile, { force: true });
-    outputs.account_path = writeFile(join(dir, ACCOUNT_FILE), `${inputs.account}\n`);
 
     const token = await requestIdToken(env, deps.fetch, deps.sleep, log);
     secrets.mask(token);
-    const credentials = await assumeRole(deps.sts(inputs.region), {
+    const credentials = await assumeRole(deps.sts(REGION), {
       roleArn: inputs.roleArn,
       sessionName: `e2e-test-stack-create-${inputs.runId}`,
       token,
-      account: inputs.account,
     });
     secrets.mask(credentials.accessKeyId);
     secrets.mask(credentials.secretAccessKey);
     secrets.mask(credentials.sessionToken);
-    const invoke = deps.connect(inputs.region, credentials);
+    const invoke = deps.connect(REGION, credentials);
 
-    log(`e2e-test-stack: create through ${named} in account ${inputs.account}, instance key ${fields.instance_key}`);
+    log(`e2e-test-stack: create through ${named}, instance key ${fields.instance_key}`);
     let reply: InvokeOutput;
     try {
       reply = await invoke({ ...target, Payload: JSON.stringify({ action: "create", ...fields }) });
@@ -397,7 +437,6 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
     summary.push("### E2E test stack: create", "", "| | |", "|---|---|");
     summary.push(`| Batch | \`${cell(batchId || "none")}\` |`, `| State | ${cell(state || "unknown")} |`);
     summary.push(`| Ready | ${ready} of ${leases.length} |`);
-    summary.push(`| Account | ${inputs.account} |`);
     if (response.batch?.expires_at) summary.push(`| Expires | ${cell(response.batch.expires_at)} |`);
     if (response.deployment)
       summary.push(

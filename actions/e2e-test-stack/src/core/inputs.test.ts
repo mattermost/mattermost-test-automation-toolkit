@@ -13,25 +13,18 @@ test("an input is read from its STACK_ variable, trimmed", () => {
   assert.equal(input({}, "caller-key"), "");
 });
 
-test("the common inputs take their defaults", () => {
-  assert.deepEqual(stackInputs({ STACK_CALLER_KEY: "mobile" }), {
-    callerKey: "mobile",
-    channel: "v1",
-    project: "e2e-test-stack",
-    region: "us-east-1",
+test("the common inputs are the caller key and the channel, v1 unless set", () => {
+  assert.deepEqual(stackInputs({ STACK_CALLER_KEY: "mobile" }), { callerKey: "mobile", channel: "v1" });
+  assert.deepEqual(stackInputs({ STACK_CALLER_KEY: "tpp", STACK_CHANNEL: "edge" }), {
+    callerKey: "tpp",
+    channel: "edge",
   });
-  assert.deepEqual(
-    stackInputs({ STACK_CALLER_KEY: "tpp", STACK_CHANNEL: "edge", STACK_PROJECT: "other", STACK_REGION: "eu-west-1" }),
-    { callerKey: "tpp", channel: "edge", project: "other", region: "eu-west-1" },
-  );
 });
 
 test("the common inputs are refused when missing or malformed", () => {
   refused(() => stackInputs({}), /caller-key is required/);
   refused(() => stackInputs({ STACK_CALLER_KEY: "Mobile" }), /caller-key must be/);
   refused(() => stackInputs({ STACK_CALLER_KEY: "m", STACK_CHANNEL: "edge-v1" }), /channel must be v1 or edge/);
-  refused(() => stackInputs({ STACK_CALLER_KEY: "m", STACK_PROJECT: "-x" }), /project must be/);
-  refused(() => stackInputs({ STACK_CALLER_KEY: "m", STACK_REGION: "useast1" }), /region must be/);
 });
 
 test("numbers, booleans, patterns and lists are checked, naming the input", () => {

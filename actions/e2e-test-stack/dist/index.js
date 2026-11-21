@@ -20214,8 +20214,9 @@ function githubClient(token, fetchImpl = fetch, wait = sleep, log = console.log)
 var refuse = (message) => {
   throw new ActionError(message);
 };
+var PROJECT = "e2e-test-stack";
+var REGION = "us-east-1";
 var LABEL = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
-var REGION = /^[a-z]{2}(-[a-z]+)+-\d+$/;
 var BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 var input = (env2, name) => (env2[`STACK_${name.replace(/-/g, "_").toUpperCase()}`] ?? "").trim();
 var integer = (name, value, min) => {
@@ -20250,11 +20251,7 @@ function stackInputs(env2) {
   matching("caller-key", callerKey, LABEL, "the repository's key: lowercase letters, digits and hyphens");
   const channel = input(env2, "channel") || "v1";
   if (channel !== "edge" && channel !== "v1") refuse(`channel must be v1 or edge, got ${JSON.stringify(channel)}`);
-  const project = input(env2, "project") || "e2e-test-stack";
-  matching("project", project, LABEL, "lowercase letters, digits and hyphens");
-  const region = input(env2, "region") || "us-east-1";
-  matching("region", region, REGION, 'an AWS region such as "us-east-1"');
-  return { callerKey, channel, project, region };
+  return { callerKey, channel };
 }
 
 // src/core/lambda.ts
@@ -27693,21 +27690,21 @@ var AssumeRoleWithWebIdentityCommand2 = class extends command6(_ep06, _mw06, "As
 };
 
 // src/core/role.ts
-var ACCOUNT_FILE = "e2e-test-stack-account";
 var SESSION_SECONDS = 3600;
 var ROLE_ARN = /^arn:aws[a-z-]*:iam::\d{12}:role\/[\w+=,.@/-]{1,512}$/;
-function chooseRole(inputs) {
-  const { account } = inputs;
-  if (account !== "prod" && account !== "dev")
-    throw new ActionError(`account must be prod or dev, got ${JSON.stringify(account.slice(0, 40))}`);
-  const roleArn = account === "prod" ? inputs.roleArnProd : inputs.roleArnDev;
-  if (!roleArn)
+function roleArnFrom(value, callerKey) {
+  if (!value)
     throw new ActionError(
-      `role-arn-${account} is required for account ${account}: the ARN of the repository's CI role in that account`
+      "role-arn is required: the ARN of the repository's CI role in the account to use, arn:aws:iam::<account id>:role/e2e-test-stack-ci-<caller-key>"
     );
-  if (!ROLE_ARN.test(roleArn))
-    throw new ActionError(`role-arn-${account} must be an IAM role ARN, arn:aws:iam::<account id>:role/<name>`);
-  return { account, roleArn };
+  if (!ROLE_ARN.test(value))
+    throw new ActionError("role-arn must be an IAM role ARN, arn:aws:iam::<account id>:role/<name>");
+  const name = `${PROJECT}-ci-${callerKey}`;
+  if (value.slice(value.lastIndexOf("/") + 1) !== name)
+    throw new ActionError(
+      `role-arn names another role: this repository's CI role is ${name}, for caller-key ${callerKey}`
+    );
+  return value;
 }
 var stsClient = (region) => new STSClient2({ region });
 async function assumeRole(sts, inputs) {
@@ -27723,13 +27720,13 @@ async function assumeRole(sts, inputs) {
     );
   } catch (e7) {
     throw new ActionError(
-      `could not assume role-arn-${inputs.account} with this job's GitHub OIDC token: ${errorText(e7)}. The role trusts only jobs in the workflow files and on the branches registered for this repository.`,
+      `could not assume role-arn with this job's GitHub OIDC token: ${errorText(e7)}. The role trusts only jobs in the workflow files and on the branches registered for this repository.`,
       { cause: e7 }
     );
   }
   const c8 = reply.Credentials;
   if (!c8?.AccessKeyId || !c8.SecretAccessKey || !c8.SessionToken)
-    throw new ActionError(`assuming role-arn-${inputs.account} returned no credentials`);
+    throw new ActionError("assuming role-arn returned no credentials");
   return {
     accessKeyId: c8.AccessKeyId,
     secretAccessKey: c8.SecretAccessKey,
@@ -31248,12 +31245,52 @@ var RESPONSE_FILE = "e2e-test-stack-create.json";
 var BATCH = /^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$/;
 var RUN_ID = /^\d+$/;
 var SERVICE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
-var DURATION = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
-var OS_VARIANT = /^[a-z][a-z0-9]*-[0-9]+[.][0-9]+$/;
-var POSTGRES = /^[0-9]+(\.[0-9]+)*$/;
-var LICENSE = /^[A-Za-z0-9._-]+$/;
-var INSTANCE_TYPE = /^[a-z0-9-]+\.[a-z0-9-]+$/;
+var DURATION_PART = /(\d+)(?:\.(\d+))?(ns|us|µs|ms|s|m|h)/g;
+var DURATION = new RegExp(`^(?:${DURATION_PART.source})+$`);
+var UNIT_NS = {
+  ns: 1n,
+  us: 1000n,
+  \u00B5s: 1000n,
+  ms: 1000000n,
+  s: 1000000000n,
+  m: 60000000000n,
+  h: 3600000000000n
+};
 var SERVER_SETTING = /^MM_[A-Z0-9_]+$/;
+var OS_VARIANTS = ["ubuntu-24.04", "ubuntu-26.04"];
+var DEFAULT_OS = "ubuntu-24.04";
+var POSTGRES_VERSIONS = ["14", "15", "16", "17", "18"];
+var DEFAULT_POSTGRES = "16";
+var LICENSES = ["enterprise-advanced"];
+var DEFAULT_LICENSE = "enterprise-advanced";
+var DEFAULT_TTL = "2h";
+var MAX_TTL = "4h";
+var durationNs = (value) => {
+  let ns = 0n;
+  for (const [, whole, fraction = "", unit] of value.matchAll(DURATION_PART)) {
+    const per = UNIT_NS[unit];
+    ns += BigInt(whole) * per + BigInt(fraction || "0") * per / 10n ** BigInt(fraction.length);
+  }
+  return ns;
+};
+var MAX_TTL_NS = durationNs(MAX_TTL);
+var oneOf = (name, value, allowed, fallback) => {
+  if (value === "") return fallback;
+  if (!allowed.includes(value))
+    refuse(
+      `${name} must be ${allowed.slice(0, -1).join(", ")}${allowed.length > 1 ? " or " : ""}${allowed.at(-1)}, got ${JSON.stringify(value)}`
+    );
+  return value;
+};
+var ttlFrom = (value) => {
+  const ttl = value || DEFAULT_TTL;
+  matching("ttl", ttl, DURATION, 'a duration such as "90m" or "2h"');
+  const ns = durationNs(ttl);
+  if (ns <= 0n) refuse(`ttl must be longer than 0, got ${JSON.stringify(ttl)}`);
+  if (ns > MAX_TTL_NS)
+    refuse(`ttl must be ${MAX_TTL} or less, the control plane's ceiling, got ${JSON.stringify(ttl)}`);
+  return ttl;
+};
 var serverEnv = (value) => {
   if (value === "") return void 0;
   const shape = 'server-env must be a JSON object, e.g. {"MM_FEATUREFLAGS_TESTFEATURE":"true"}';
@@ -31295,11 +31332,7 @@ function readCreateInputs(env2) {
       `the instance key ${instanceKey}, <caller-key>-<run id>-<batch>-<run attempt>, is ${instanceKey.length} characters; the control plane takes at most ${MAX_INSTANCE_KEY}. Shorten batch`
     );
   matching("the instance key", instanceKey, LABEL, "a lowercase DNS label");
-  const { account, roleArn } = chooseRole({
-    account: get("account"),
-    roleArnProd: get("role-arn-prod"),
-    roleArnDev: get("role-arn-dev")
-  });
+  const roleArn = roleArnFrom(get("role-arn"), common.callerKey);
   const credentialsKey = credentialsKeyFrom(get("credentials-key"));
   const image = get("server-image");
   if (!image)
@@ -31307,26 +31340,20 @@ function readCreateInputs(env2) {
       "server-image is required: master, latest, esr, or the image under test by tag, e.g. mattermostdevelopment/mattermost-enterprise-edition:master"
     );
   if (/\s/.test(image)) refuse(`server-image must be one image reference, got ${JSON.stringify(image)}`);
-  const fields = { instance_key: instanceKey, caller_run_id: runId, server_image: "" };
+  const fields = {
+    instance_key: instanceKey,
+    caller_run_id: runId,
+    server_image: "",
+    ttl: ttlFrom(get("ttl")),
+    os: oneOf("os", get("os"), OS_VARIANTS, DEFAULT_OS),
+    postgres: oneOf("postgres", get("postgres"), POSTGRES_VERSIONS, DEFAULT_POSTGRES)
+  };
   if (get("count")) fields.count = integer("count", get("count"), 1);
   const services = list(get("services"));
   for (const s3 of services) matching("each of services", s3, SERVICE, "a service name such as minio or keycloak");
   if (services.length) fields.services = services;
-  const ttl = matching("ttl", get("ttl"), DURATION, 'a duration such as "90m" or "4h"');
-  if (ttl) fields.ttl = ttl;
-  const os = matching("os", get("os"), OS_VARIANT, 'an OS variant such as "ubuntu-24.04"');
-  if (os) fields.os = os;
-  const postgres = matching("postgres", get("postgres"), POSTGRES, 'a version such as "16" or "16.4"');
-  if (postgres) fields.postgres = postgres;
-  const license = matching("license", get("license"), LICENSE, 'a licence SKU such as "enterprise-advanced"');
-  if (license) fields.license = license;
-  const instanceType = matching(
-    "instance-type",
-    get("instance-type"),
-    INSTANCE_TYPE,
-    'an EC2 instance type such as "m7i.xlarge"'
-  );
-  if (instanceType) fields.instance_type = instanceType;
+  const license = env2.STACK_LICENSE === void 0 ? DEFAULT_LICENSE : get("license");
+  if (license) fields.license = oneOf("license", license, LICENSES, DEFAULT_LICENSE);
   const settings = serverEnv(get("server-env"));
   if (settings) fields.server_env = settings;
   if (get("retries")) fields.retries = integer("retries", get("retries"), -Infinity);
@@ -31337,7 +31364,6 @@ function readCreateInputs(env2) {
   return {
     ...common,
     batch,
-    account,
     roleArn,
     credentialsKey,
     serverImage: image,
@@ -31424,7 +31450,7 @@ async function createBatch(env2, deps) {
   let serverTable = [];
   const secrets = masker(log);
   let failure;
-  const target = alias(inputs.project, inputs.channel, inputs.callerKey);
+  const target = alias(PROJECT, inputs.channel, inputs.callerKey);
   const named = `${target.FunctionName}:${target.Qualifier}`;
   const mayExist = " A batch may have been created; it is reaped at its ttl.";
   let teardown = "";
@@ -31439,24 +31465,20 @@ async function createBatch(env2, deps) {
     }
     outputs.server_image = image;
     const fields = { ...inputs.fields, server_image: image };
-    const dir = (0, import_node_path8.join)(env2.RUNNER_TEMP || (0, import_node_os4.tmpdir)(), `e2e-test-stack-create-${inputs.batch}`);
-    const responseFile = (0, import_node_path8.join)(dir, RESPONSE_FILE);
+    const responseFile = (0, import_node_path8.join)(env2.RUNNER_TEMP || (0, import_node_os4.tmpdir)(), `e2e-test-stack-create-${inputs.batch}`, RESPONSE_FILE);
     (0, import_node_fs6.rmSync)(responseFile, { force: true });
-    outputs.account_path = writeFile2((0, import_node_path8.join)(dir, ACCOUNT_FILE), `${inputs.account}
-`);
     const token = await requestIdToken(env2, deps.fetch, deps.sleep, log);
     secrets.mask(token);
-    const credentials = await assumeRole(deps.sts(inputs.region), {
+    const credentials = await assumeRole(deps.sts(REGION), {
       roleArn: inputs.roleArn,
       sessionName: `e2e-test-stack-create-${inputs.runId}`,
-      token,
-      account: inputs.account
+      token
     });
     secrets.mask(credentials.accessKeyId);
     secrets.mask(credentials.secretAccessKey);
     secrets.mask(credentials.sessionToken);
-    const invoke = deps.connect(inputs.region, credentials);
-    log(`e2e-test-stack: create through ${named} in account ${inputs.account}, instance key ${fields.instance_key}`);
+    const invoke = deps.connect(REGION, credentials);
+    log(`e2e-test-stack: create through ${named}, instance key ${fields.instance_key}`);
     let reply;
     try {
       reply = await invoke({ ...target, Payload: JSON.stringify({ action: "create", ...fields }) });
@@ -31495,7 +31517,6 @@ async function createBatch(env2, deps) {
     summary.push("### E2E test stack: create", "", "| | |", "|---|---|");
     summary.push(`| Batch | \`${cell(batchId || "none")}\` |`, `| State | ${cell(state2 || "unknown")} |`);
     summary.push(`| Ready | ${ready} of ${leases.length} |`);
-    summary.push(`| Account | ${inputs.account} |`);
     if (response.batch?.expires_at) summary.push(`| Expires | ${cell(response.batch.expires_at)} |`);
     if (response.deployment)
       summary.push(

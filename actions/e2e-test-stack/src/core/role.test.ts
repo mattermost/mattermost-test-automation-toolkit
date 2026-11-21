@@ -6,44 +6,46 @@ import type { IncomingMessage } from "node:http";
 import { test } from "node:test";
 import { AssumeRoleWithWebIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import { ActionError } from "./errors.ts";
-import { assumeRole, chooseRole, SESSION_SECONDS } from "./role.ts";
+import { assumeRole, roleArnFrom, SESSION_SECONDS } from "./role.ts";
 import type { StsSend } from "./role.ts";
 
-const ARNS = {
-  roleArnProd: "arn:aws:iam::111111111111:role/e2e-test-stack-ci-mobile",
-  roleArnDev: "arn:aws:iam::222222222222:role/e2e-test-stack-ci-mobile",
-};
+const ROLE_ARN = "arn:aws:iam::111111111111:role/e2e-test-stack-ci-mobile";
 
-test("the account picks its own role ARN", () => {
-  assert.deepEqual(chooseRole({ account: "prod", ...ARNS }), { account: "prod", roleArn: ARNS.roleArnProd });
-  assert.deepEqual(chooseRole({ account: "dev", ...ARNS }), { account: "dev", roleArn: ARNS.roleArnDev });
+test("the role ARN is taken as given, in whichever account it names", () => {
+  assert.equal(roleArnFrom(ROLE_ARN, "mobile"), ROLE_ARN);
+  assert.equal(
+    roleArnFrom("arn:aws-us-gov:iam::222222222222:role/path/e2e-test-stack-ci-mobile", "mobile"),
+    "arn:aws-us-gov:iam::222222222222:role/path/e2e-test-stack-ci-mobile",
+  );
 });
 
-test("an account that is not prod or dev, or a role ARN unset or malformed, fails without quoting an ARN", () => {
-  assert.throws(
-    () => chooseRole({ account: "staging", ...ARNS }),
-    /^ActionError: account must be prod or dev, got "staging"$/,
-  );
-  assert.throws(() => chooseRole({ account: "", ...ARNS }), /account must be prod or dev/);
-  assert.throws(
-    () => chooseRole({ account: "prod", roleArnProd: "", roleArnDev: ARNS.roleArnDev }),
-    /role-arn-prod is required for account prod/,
-  );
-  for (const bad of ["arn:aws:iam::111111111111:user/x", "arn:aws:iam::1111:role/x", "role/x", `${ARNS.roleArnDev} x`])
+test("a role not named for the caller key is refused before anything is called, without quoting the ARN", () => {
+  for (const other of [
+    "arn:aws:iam::111111111111:role/e2e-test-stack-ci-tpp",
+    "arn:aws:iam::111111111111:role/e2e-test-stack-ci-mobile-x",
+    "arn:aws:iam::111111111111:role/admin",
+  ])
     assert.throws(
-      () => chooseRole({ account: "dev", roleArnProd: ARNS.roleArnProd, roleArnDev: bad }),
+      () => roleArnFrom(other, "mobile"),
       (e: unknown) =>
         e instanceof ActionError &&
-        e.message === "role-arn-dev must be an IAM role ARN, arn:aws:iam::<account id>:role/<name>",
+        e.message ===
+          "role-arn names another role: this repository's CI role is e2e-test-stack-ci-mobile, for caller-key mobile",
     );
 });
 
-const ASSUME = {
-  roleArn: ARNS.roleArnProd,
-  sessionName: "e2e-test-stack-create-42",
-  token: "id-token",
-  account: "prod" as const,
-};
+test("a role ARN unset or malformed fails without quoting it", () => {
+  assert.throws(() => roleArnFrom("", "mobile"), /^ActionError: role-arn is required: /);
+  for (const bad of ["arn:aws:iam::111111111111:user/x", "arn:aws:iam::1111:role/x", "role/x", `${ROLE_ARN} x`])
+    assert.throws(
+      () => roleArnFrom(bad, "mobile"),
+      (e: unknown) =>
+        e instanceof ActionError &&
+        e.message === "role-arn must be an IAM role ARN, arn:aws:iam::<account id>:role/<name>",
+    );
+});
+
+const ASSUME = { roleArn: ROLE_ARN, sessionName: "e2e-test-stack-create-42", token: "id-token" };
 
 test("the role is assumed with the ID token for an hour, and its credentials returned", async () => {
   const sent: AssumeRoleWithWebIdentityCommand[] = [];
@@ -61,7 +63,7 @@ test("the role is assumed with the ID token for an hour, and its credentials ret
     expiration,
   });
   assert.deepEqual(sent[0].input, {
-    RoleArn: ARNS.roleArnProd,
+    RoleArn: ROLE_ARN,
     RoleSessionName: "e2e-test-stack-create-42",
     WebIdentityToken: "id-token",
     DurationSeconds: SESSION_SECONDS,
@@ -72,7 +74,7 @@ test("a refusal names the role's input and the trust it checks, with ARNs and ac
   const sts: StsSend = {
     send: async () => {
       throw Object.assign(
-        new Error(`Not authorized to perform sts:AssumeRoleWithWebIdentity on ${ARNS.roleArnProd} in 111111111111`),
+        new Error(`Not authorized to perform sts:AssumeRoleWithWebIdentity on ${ROLE_ARN} in 111111111111`),
         { name: "AccessDenied" },
       );
     },
@@ -81,12 +83,12 @@ test("a refusal names the role's input and the trust it checks, with ARNs and ac
     assert.ok(e instanceof ActionError);
     assert.equal(
       e.message,
-      "could not assume role-arn-prod with this job's GitHub OIDC token: AccessDenied: Not authorized to perform sts:AssumeRoleWithWebIdentity on [arn] in [account]. The role trusts only jobs in the workflow files and on the branches registered for this repository.",
+      "could not assume role-arn with this job's GitHub OIDC token: AccessDenied: Not authorized to perform sts:AssumeRoleWithWebIdentity on [arn] in [account]. The role trusts only jobs in the workflow files and on the branches registered for this repository.",
     );
     return true;
   });
   const empty: StsSend = { send: async () => ({ Credentials: { AccessKeyId: "AK" } }) };
-  await assert.rejects(assumeRole(empty, ASSUME), /^ActionError: assuming role-arn-prod returned no credentials$/);
+  await assert.rejects(assumeRole(empty, ASSUME), /^ActionError: assuming role-arn returned no credentials$/);
 });
 
 test("the STS client sends an unsigned AssumeRoleWithWebIdentity, needing no credentials", async () => {
@@ -118,7 +120,7 @@ test("the STS client sends an unsigned AssumeRoleWithWebIdentity, needing no cre
     assert.equal(requests[0].headers.authorization, undefined);
     const form = new URLSearchParams(requests[0].body);
     assert.equal(form.get("Action"), "AssumeRoleWithWebIdentity");
-    assert.equal(form.get("RoleArn"), ARNS.roleArnProd);
+    assert.equal(form.get("RoleArn"), ROLE_ARN);
     assert.equal(form.get("WebIdentityToken"), "id-token");
     assert.equal(form.get("DurationSeconds"), "3600");
   } finally {

@@ -1,7 +1,16 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -40,8 +49,7 @@ const readOutputs = (path: string): Record<string, string> => {
   return out;
 };
 
-const ROLE_PROD = "arn:aws:iam::111111111111:role/e2e-test-stack-ci-tpp";
-const ROLE_DEV = "arn:aws:iam::222222222222:role/e2e-test-stack-ci-tpp";
+const ROLE_ARN = "arn:aws:iam::111111111111:role/e2e-test-stack-ci-tpp";
 const ID_TOKEN = "id-token-1";
 const STS_CREDENTIALS = { AccessKeyId: "ASIAEXAMPLE", SecretAccessKey: "sts-secret-1", SessionToken: "sts-session-1" };
 
@@ -199,9 +207,7 @@ const harness = (
 const createEnv = (over: Record<string, string> = {}): Record<string, string> => ({
   STACK_CALLER_KEY: "tpp",
   STACK_BATCH: "ios",
-  STACK_ACCOUNT: "prod",
-  STACK_ROLE_ARN_PROD: ROLE_PROD,
-  STACK_ROLE_ARN_DEV: ROLE_DEV,
+  STACK_ROLE_ARN: ROLE_ARN,
   STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
   STACK_SERVER_IMAGE: "mattermostdevelopment/mattermost-enterprise-edition:master",
   STACK_GITHUB_TOKEN: "gh-token",
@@ -223,16 +229,60 @@ test("create is the bundle's create action", () => {
   assert.equal(typeof ACTIONS.create, "function");
 });
 
-test("the instance key is derived from the caller key, run, batch and attempt, with only the fields given", () => {
+test("the instance key is derived from the caller key, run, batch and attempt; ttl, os, postgres and license take their defaults", () => {
   const inputs = read({});
   assert.equal(inputs.channel, "v1");
-  assert.equal(inputs.project, "e2e-test-stack");
-  assert.equal(inputs.region, "us-east-1");
-  assert.equal(inputs.account, "prod");
-  assert.equal(inputs.roleArn, ROLE_PROD);
+  assert.equal(inputs.roleArn, ROLE_ARN);
   assert.deepEqual(inputs.credentialsKey, keys.privateKey);
-  assert.deepEqual(inputs.fields, { instance_key: "tpp-42-ios-1", caller_run_id: "42", server_image: "" });
-  assert.equal(read({ STACK_ACCOUNT: "dev" }).roleArn, ROLE_DEV);
+  assert.deepEqual(inputs.fields, {
+    instance_key: "tpp-42-ios-1",
+    caller_run_id: "42",
+    server_image: "",
+    ttl: "2h",
+    os: "ubuntu-24.04",
+    postgres: "16",
+    license: "enterprise-advanced",
+  });
+  const other = "arn:aws:iam::222222222222:role/e2e-test-stack-ci-tpp";
+  assert.equal(read({ STACK_ROLE_ARN: other }).roleArn, other, "the role ARN is used as given, whatever its account");
+});
+
+test("license runs unlicensed when set empty, and is enterprise-advanced when unset or given", () => {
+  assert.equal(read({ STACK_LICENSE: "" }).fields.license, undefined);
+  assert.equal(read({}).fields.license, "enterprise-advanced");
+  assert.equal(read({ STACK_LICENSE: "enterprise-advanced" }).fields.license, "enterprise-advanced");
+  const yml = readFileSync(new URL("../create/action.yml", import.meta.url), "utf8");
+  assert.match(yml, /\n {2}license:\n {4}description: [^\n]+\n {4}default: enterprise-advanced\n/);
+});
+
+test("os, postgres and ttl accept only what the deployment offers, naming it when refused", () => {
+  assert.equal(read({ STACK_OS: "ubuntu-26.04" }).fields.os, "ubuntu-26.04");
+  for (const v of ["14", "15", "16", "17", "18"]) assert.equal(read({ STACK_POSTGRES: v }).fields.postgres, v);
+  for (const v of ["90m", "1h30m", "4h", "240m"]) assert.equal(read({ STACK_TTL: v }).fields.ttl, v);
+  refused({ STACK_OS: "ubuntu-22.04" }, /^os must be ubuntu-24\.04 or ubuntu-26\.04, got "ubuntu-22\.04"$/);
+  refused({ STACK_POSTGRES: "16.4" }, /^postgres must be 14, 15, 16, 17 or 18, got "16\.4"$/);
+  refused({ STACK_POSTGRES: "13" }, /^postgres must be 14, 15, 16, 17 or 18, got "13"$/);
+  refused({ STACK_LICENSE: "professional" }, /^license must be enterprise-advanced, got "professional"$/);
+  refused({ STACK_TTL: "4h1s" }, /^ttl must be 4h or less, the control plane's ceiling, got "4h1s"$/);
+  refused({ STACK_TTL: "5h" }, /ttl must be 4h or less/);
+  refused({ STACK_TTL: "0s" }, /^ttl must be longer than 0, got "0s"$/);
+  // As Go reads them: a fraction of a nanosecond is truncated.
+  refused({ STACK_TTL: "0.5ns" }, /^ttl must be longer than 0, got "0\.5ns"$/);
+  assert.equal(read({ STACK_TTL: "4h0.5ns" }).fields.ttl, "4h0.5ns");
+  assert.equal(read({ STACK_TTL: "14400.0000000001s" }).fields.ttl, "14400.0000000001s");
+});
+
+test("the action's defaults for os, postgres and ttl are the ones create applies to an empty input", () => {
+  const yml = readFileSync(new URL("../create/action.yml", import.meta.url), "utf8");
+  const fields = read({}).fields;
+  for (const [name, value] of [
+    ["os", fields.os],
+    ["postgres", fields.postgres],
+    ["ttl", fields.ttl],
+  ])
+    assert.match(yml, new RegExp(`\\n  ${name}:\\n    description: [^\\n]+\\n    default: "?${value}"?\\n`), name);
+  for (const gone of ["account", "role-arn-prod", "role-arn-dev", "project", "region", "instance-type"])
+    assert.ok(!new RegExp(`\\n  ${gone}:\\n`).test(yml), `action.yml has no ${gone} input`);
 });
 
 test("create carries every field it exposes, typed as the control plane reads them", () => {
@@ -241,10 +291,9 @@ test("create carries every field it exposes, typed as the control plane reads th
     STACK_COUNT: "3",
     STACK_SERVICES: "minio, keycloak,\nopenldap",
     STACK_TTL: "1h30m",
-    STACK_OS: "ubuntu-24.04",
-    STACK_POSTGRES: "16",
+    STACK_OS: "ubuntu-26.04",
+    STACK_POSTGRES: "17",
     STACK_LICENSE: "enterprise-advanced",
-    STACK_INSTANCE_TYPE: "m7i.xlarge",
     STACK_SERVER_ENV: '{"MM_FEATUREFLAGS_TESTFEATURE":"true"}',
     STACK_RETRIES: "-5",
     STACK_SHARED_ADMIN_PASSWORD: "true",
@@ -255,13 +304,12 @@ test("create carries every field it exposes, typed as the control plane reads th
     instance_key: "tpp-42-ios-1",
     caller_run_id: "42",
     server_image: "",
+    ttl: "1h30m",
+    os: "ubuntu-26.04",
+    postgres: "17",
     count: 3,
     services: ["minio", "keycloak", "openldap"],
-    ttl: "1h30m",
-    os: "ubuntu-24.04",
-    postgres: "16",
     license: "enterprise-advanced",
-    instance_type: "m7i.xlarge",
     server_env: { MM_FEATUREFLAGS_TESTFEATURE: "true" },
     retries: -5,
     shared_admin_password: true,
@@ -273,9 +321,12 @@ test("create refuses a missing or malformed input, naming it", () => {
   refused({ STACK_BATCH: "" }, /batch is required/);
   for (const bad of ["iOS", "-ios", "ios-", "a".repeat(21), "ios_1"])
     refused({ STACK_BATCH: bad }, /^batch must be 1 to 20/);
-  refused({ STACK_ACCOUNT: "" }, /account must be prod or dev/);
-  refused({ STACK_ACCOUNT: "dev", STACK_ROLE_ARN_DEV: "" }, /role-arn-dev is required for account dev/);
-  refused({ STACK_ROLE_ARN_PROD: "not-an-arn" }, /role-arn-prod must be an IAM role ARN/);
+  refused({ STACK_ROLE_ARN: "" }, /role-arn is required/);
+  refused({ STACK_ROLE_ARN: "not-an-arn" }, /role-arn must be an IAM role ARN/);
+  refused(
+    { STACK_ROLE_ARN: "arn:aws:iam::111111111111:role/e2e-test-stack-ci-mobile" },
+    /^role-arn names another role: this repository's CI role is e2e-test-stack-ci-tpp, for caller-key tpp$/,
+  );
   refused({ STACK_CREDENTIALS_KEY: "" }, /credentials-key is required/);
   refused({ STACK_CREDENTIALS_KEY: Buffer.alloc(31).toString("base64") }, /credentials-key must be .* 32 bytes/);
   refused({ STACK_SERVER_IMAGE: "" }, /server-image is required/);
@@ -286,10 +337,9 @@ test("create refuses a missing or malformed input, naming it", () => {
   refused({ STACK_COUNT: "two" }, /count must be a whole number/);
   refused({ STACK_RETRIES: "1.5" }, /retries must be a whole number/);
   refused({ STACK_TTL: "1 hour" }, /ttl must be a duration/);
-  refused({ STACK_OS: "ubuntu" }, /os must be an OS variant/);
-  refused({ STACK_POSTGRES: "latest" }, /postgres must be a version/);
-  refused({ STACK_LICENSE: "a b" }, /license must be a licence SKU/);
-  refused({ STACK_INSTANCE_TYPE: "large" }, /instance-type must be/);
+  refused({ STACK_OS: "ubuntu" }, /os must be ubuntu-24\.04 or ubuntu-26\.04/);
+  refused({ STACK_POSTGRES: "latest" }, /postgres must be 14, 15, 16, 17 or 18/);
+  refused({ STACK_LICENSE: "a b" }, /license must be enterprise-advanced/);
   refused({ STACK_SERVICES: "minio,Keycloak" }, /each of services must be/);
   refused({ STACK_SERVER_ENV: "MM_X=1" }, /server-env must be a JSON object/);
   refused({ STACK_SERVER_ENV: '["MM_X"]' }, /server-env must be a JSON object/);
@@ -313,21 +363,21 @@ test("an instance key over the control plane's 44 characters is refused, naming 
   assert.throws(() => readCreateInputs(createEnv()), /GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT must be set/);
 });
 
-test("a create that came up whole assumes the role, sets every output, masks every secret first, and records the account", async () => {
+test("a create that came up whole assumes the role, sets every output, and masks every secret first", async () => {
   const raw = JSON.stringify(readyResponse());
-  const h = harness({ STACK_REGION: "us-west-2", STACK_ACCOUNT: "dev" }, ok(raw));
+  const h = harness({}, ok(raw));
   await h.go();
 
-  // The ID token for STS, then the role for the account, then the alias with those credentials.
+  // The ID token for STS, then the role, then the alias with those credentials, all in the control plane's region.
   assert.deepEqual(h.fetched, ["https://token.actions.example/id?api-version=2.0&audience=sts.amazonaws.com"]);
   assert.equal(h.sts.length, 1);
   assert.deepEqual(h.sts[0].input, {
-    RoleArn: ROLE_DEV,
+    RoleArn: ROLE_ARN,
     RoleSessionName: "e2e-test-stack-create-42",
     WebIdentityToken: ID_TOKEN,
     DurationSeconds: 3600,
   });
-  assert.deepEqual(h.regions, ["us-west-2", "us-west-2"]);
+  assert.deepEqual(h.regions, ["us-east-1", "us-east-1"]);
   assert.deepEqual(h.credentials, [
     { accessKeyId: "ASIAEXAMPLE", secretAccessKey: "sts-secret-1", sessionToken: "sts-session-1" },
   ]);
@@ -340,17 +390,15 @@ test("a create that came up whole assumes the role, sets every output, masks eve
   );
   assert.equal(
     h.calls[0].Payload,
-    '{"action":"create","instance_key":"tpp-42-ios-1","caller_run_id":"42","server_image":"mattermostdevelopment/mattermost-enterprise-edition:master"}',
+    '{"action":"create","instance_key":"tpp-42-ios-1","caller_run_id":"42","server_image":"mattermostdevelopment/mattermost-enterprise-edition:master","ttl":"2h","os":"ubuntu-24.04","postgres":"16","license":"enterprise-advanced"}',
   );
   assert.deepEqual(payloads(h)[1], { action: "fetch", batch_id: BATCH_ID, batch_token: "batch-token-1" });
 
   const responsePath = join(responseDir(h), "e2e-test-stack-create.json");
-  const accountPath = join(responseDir(h), "e2e-test-stack-account");
   assert.equal(readFileSync(responsePath, "utf8"), raw);
-  assert.equal(readFileSync(accountPath, "utf8"), "dev\n");
+  assert.deepEqual(readdirSync(responseDir(h)), ["e2e-test-stack-create.json"], "the response is the only file");
   assert.deepEqual(readOutputs(h.output), {
     server_image: "mattermostdevelopment/mattermost-enterprise-edition:master",
-    account_path: accountPath,
     response_path: responsePath,
     batch_id: BATCH_ID,
     sites: `["https://${BATCH_ID}-00.test.example"]`,
@@ -363,7 +411,7 @@ test("a create that came up whole assumes the role, sets every output, masks eve
   const summary = readFileSync(h.summary, "utf8");
   assert.match(summary, /### E2E test stack: create/);
   assert.match(summary, /\| Ready \| 1 of 1 \|/);
-  assert.match(summary, /\| Account \| dev \|/);
+  assert.doesNotMatch(summary, /Account/);
   assert.match(summary, /\| Fetched \| found, 1 of 1 ready \|/);
   const output = readFileSync(h.output, "utf8");
   for (const secret of [...AUTH_VALUES, ...SECRET_VALUES, "request-token-1"]) {
@@ -372,7 +420,7 @@ test("a create that came up whole assumes the role, sets every output, masks eve
     assert.ok(!h.logged.some((l) => !l.startsWith("::add-mask::") && l.includes(secret)), `log carries ${secret}`);
   }
   for (const text of [summary, output, h.logged.join("\n")])
-    assert.ok(!text.includes("111111111111") && !text.includes("222222222222"), "no account id is written");
+    assert.ok(!text.includes("111111111111"), "no account id is written");
 });
 
 test("every mask is written before any output or summary line", async () => {
@@ -455,7 +503,7 @@ test("a job without id-token: write fails before anything is created, asking for
     createWith({ log: () => {}, connect: () => async () => ok(readyResponse()) })(env),
     /id-token: write/,
   );
-  // The account is recorded, but no response: nothing is uploaded.
+  // No response: nothing is uploaded.
   assert.equal(readOutputs(h.output).response_path, undefined);
 });
 
@@ -468,7 +516,7 @@ test("a role that refuses this job fails before the create, with no ARN or accou
       fetch: async () => Response.json({ value: ID_TOKEN }),
       sts: () => ({
         send: async () => {
-          throw Object.assign(new Error(`Not authorized to perform sts:AssumeRoleWithWebIdentity on ${ROLE_PROD}`), {
+          throw Object.assign(new Error(`Not authorized to perform sts:AssumeRoleWithWebIdentity on ${ROLE_ARN}`), {
             name: "AccessDenied",
           });
         },
@@ -486,10 +534,7 @@ test("a role that refuses this job fails before the create, with no ARN or accou
     }),
     (e: unknown) => {
       const m = (e as Error).message;
-      assert.match(
-        m,
-        /^could not assume role-arn-prod with this job's GitHub OIDC token: AccessDenied: .* on \[arn\]\./,
-      );
+      assert.match(m, /^could not assume role-arn with this job's GitHub OIDC token: AccessDenied: .* on \[arn\]\./);
       return !m.includes("111111111111");
     },
   );
@@ -511,13 +556,12 @@ test("a partial create still sets its outputs and writes the response, then fail
   assert.equal(out.indexes, undefined);
   assert.equal(out.response_path, join(responseDir(h), "e2e-test-stack-create.json"));
   assert.ok(existsSync(out.response_path));
-  assert.ok(existsSync(out.account_path));
   assert.match(readFileSync(h.summary, "utf8"), /\| 1 \| failed \| {2}\|/);
   assert.deepEqual(masks(h).sort(), [...AUTH_VALUES, ...SECRET_VALUES].sort());
   assert.equal(h.calls.length, 1, "a partial batch is not fetched");
 });
 
-test("a handler error fails with the control plane's message, and writes nothing but the response and account", async () => {
+test("a handler error fails with the control plane's message, and writes nothing but the response", async () => {
   const h = harness(
     {},
     {
@@ -532,7 +576,7 @@ test("a handler error fails with the control plane's message, and writes nothing
     h.go(),
     /^ActionError: the control plane refused the create: ttl 5h0m0s is above the ceiling of 4h0m0s\. A batch may have been created; it is reaped at its ttl\.$/,
   );
-  assert.deepEqual(Object.keys(readOutputs(h.output)).sort(), ["account_path", "response_path", "server_image"]);
+  assert.deepEqual(Object.keys(readOutputs(h.output)).sort(), ["response_path", "server_image"]);
 });
 
 test("a create reply with an error and no sealed secrets fails with the control plane's error", async () => {
@@ -752,10 +796,9 @@ test("a failed create reports its time to failure, with no duration output and n
 });
 
 test("a response that cannot be written fails the create after its batch id is set, and with any other failure", async () => {
-  // The account file is in place and the directory read-only: the account is recorded, the response cannot be.
+  // The response's directory exists and is read-only, so the response cannot be written.
   const blocked = (h: Harness) => {
     mkdirSync(responseDir(h));
-    writeFileSync(join(responseDir(h), "e2e-test-stack-account"), "");
     chmodSync(responseDir(h), 0o555);
     after(() => chmodSync(responseDir(h), 0o755));
   };

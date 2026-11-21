@@ -10,9 +10,13 @@ export const refuse = (message: string): never => {
   throw new ActionError(message);
 };
 
-/** A lowercase DNS label: the shape of the caller key, the project and the instance key. */
+/** The control plane's project, the prefix of its function names. */
+export const PROJECT = "e2e-test-stack";
+/** The region the control plane is deployed in. */
+export const REGION = "us-east-1";
+
+/** A lowercase DNS label: the shape of the caller key and the instance key. */
 export const LABEL = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
-const REGION = /^[a-z]{2}(-[a-z]+)+-\d+$/;
 const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 
 /** An input as the composite step passes it, STACK_<NAME>, trimmed; empty when unset. */
@@ -63,20 +67,14 @@ export function credentialsKeyFrom(value: string): Uint8Array {
 export interface StackInputs {
   callerKey: string;
   channel: Channel;
-  project: string;
-  region: string;
 }
 
-/** Reads and checks caller-key, channel, project and region, with their defaults. */
+/** Reads and checks caller-key and channel, v1 unless set. */
 export function stackInputs(env: Env): StackInputs {
   const callerKey = input(env, "caller-key");
   if (!callerKey) refuse("caller-key is required: the repository's key in the control plane's callers, e.g. mobile");
   matching("caller-key", callerKey, LABEL, "the repository's key: lowercase letters, digits and hyphens");
   const channel = input(env, "channel") || "v1";
   if (channel !== "edge" && channel !== "v1") refuse(`channel must be v1 or edge, got ${JSON.stringify(channel)}`);
-  const project = input(env, "project") || "e2e-test-stack";
-  matching("project", project, LABEL, "lowercase letters, digits and hyphens");
-  const region = input(env, "region") || "us-east-1";
-  matching("region", region, REGION, 'an AWS region such as "us-east-1"');
-  return { callerKey, channel: channel as Channel, project, region };
+  return { callerKey, channel: channel as Channel };
 }

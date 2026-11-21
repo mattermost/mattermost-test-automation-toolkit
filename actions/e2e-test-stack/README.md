@@ -1,7 +1,8 @@
 # E2E test stack
 
 Composite actions for a repository's CI to use remote Mattermost test servers from the e2e-test-stack control plane:
-one AWS Lambda function per channel, `<project>-v1` (the promoted build) and `<project>-edge` (`main`'s newest build).
+one AWS Lambda function per channel in `us-east-1`, `e2e-test-stack-v1` (the promoted build) and `e2e-test-stack-edge`
+(`main`'s newest build).
 Each server is a short-lived stack (Mattermost, Postgres, Inbucket and any optional services) reachable over HTTPS; a
 batch of servers is reaped at its TTL if nothing destroys it.
 
@@ -17,7 +18,7 @@ Each action is a folder here with its own `action.yml` and README. They share th
 
 A repository is registered in the control plane's `callers` with a short **caller key** (for example `mobile`) and
 the X25519 public key its secrets are sealed to, its `recipient_public_key`. The actions invoke only that repository's
-own alias, `<project>-<channel>:<caller-key>-<channel>` (for example `e2e-test-stack-v1:mobile-v1`). The alias decides
+own alias, `e2e-test-stack-<channel>:<caller-key>-<channel>` (for example `e2e-test-stack-v1:mobile-v1`). The alias decides
 which repository a call acts for; the request never names one. The plain `v1` and `edge` aliases are refused, and the
 repository's CI role may invoke only its own aliases.
 
@@ -31,7 +32,8 @@ them with the repository's credentials key and mask every secret before writing 
    registered as its `recipient_public_key`. Store it as a plain repository Actions secret,
    `E2E_TEST_STACK_CREDENTIALS_KEY`, not an environment secret: a job that names an environment gets an OIDC subject
    of `environment:<name>`, and the CI role trusts only branch subjects.
-2. **The CI role.** `arn:aws:iam::<account>:role/e2e-test-stack-ci-<caller-key>`, one per account. It trusts only
+2. **The CI role.** `arn:aws:iam::<account id>:role/e2e-test-stack-ci-<caller-key>`, one per repository in each
+   account. The caller passes the one to use as `role-arn`, and the batch is in that role's account. It trusts only
    jobs on the branches registered for the repository, in the workflow files registered for it, so `pull_request`
    runs are refused. The actions assume it themselves with the job's GitHub OIDC token, so a job that uses them
    grants `id-token: write`.

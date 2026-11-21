@@ -14,24 +14,14 @@ inputs:
       Names the batch within the run (e.g. ios): 1-20 lowercase letters, digits and hyphens, starting and ending with a
       letter or digit. The instance key is <caller-key>-<run id>-<batch>-<run attempt>, 44 characters at most
     required: true
-  account:
-    description: The AWS account to create in, prod or dev
+  role-arn:
+    description: >-
+      The repository's CI role ARN in the account to create in (arn:aws:iam::<account id>:role/e2e-test-stack-ci-<caller-key>).
+      The batch is created in that role's account
     required: true
-  role-arn-prod:
-    description: The repository's CI role ARN in the prod account; required for account prod
-    default: ""
-  role-arn-dev:
-    description: The repository's CI role ARN in the dev account; required for account dev
-    default: ""
   channel:
-    description: v1 (the promoted build) or edge (main's newest build)
+    description: v1 (the promoted build, the default) or edge (main's newest build)
     default: v1
-  project:
-    description: The control plane's project, the prefix of its function names
-    default: e2e-test-stack
-  region:
-    description: AWS region of the control plane
-    default: us-east-1
   credentials-key:
     description: >-
       The repository's credentials key, a base64 X25519 private key (the E2E_TEST_STACK_CREDENTIALS_KEY secret), which
@@ -47,25 +37,22 @@ inputs:
     description: Servers in the batch; empty is 1. The control plane's ceiling is 40
     default: ""
   ttl:
-    description: How long the batch lives before it is reaped, as a duration (90m, 4h); empty is 1h, the ceiling 4h
-    default: ""
+    description: How long the batch lives before it is reaped, as a duration (90m, 2h); 2h is the default, 4h the ceiling
+    default: 2h
   services:
     description: >-
       Comma-separated optional services: minio or azurite, elasticsearch or opensearch, keycloak, openldap. Empty runs
       Postgres, Inbucket and the server alone
     default: ""
   os:
-    description: The OS variant the servers run (e.g. ubuntu-24.04); empty is the control plane's default
-    default: ""
+    description: "The servers' OS: ubuntu-24.04 (the default) or ubuntu-26.04"
+    default: ubuntu-24.04
   postgres:
-    description: Postgres version (e.g. 16); empty is the control plane's default
-    default: ""
+    description: "Postgres major version: 14, 15, 16 (the default), 17 or 18"
+    default: "16"
   license:
-    description: Licence SKU to apply (e.g. enterprise-advanced); empty runs unlicensed
-    default: ""
-  instance-type:
-    description: EC2 instance type (e.g. m7i.xlarge); empty is sized by the control plane
-    default: ""
+    description: "Licence SKU: enterprise-advanced (the default), or empty to run unlicensed"
+    default: enterprise-advanced
   server-env:
     description: >-
       Server settings as a JSON object of strings, e.g. {"MM_FEATUREFLAGS_TESTFEATURE":"true"}. Holds no credential:
@@ -105,9 +92,6 @@ outputs:
   response-path:
     description: The create response file; its secrets are sealed. Empty when the control plane was not reached
     value: ${{ steps.create.outputs.response_path }}
-  account-path:
-    description: The file beside the response that records the account, prod or dev
-    value: ${{ steps.create.outputs.account_path }}
 runs:
   using: composite
   steps:
@@ -116,12 +100,8 @@ runs:
       env:
         STACK_CALLER_KEY: ${{ inputs.caller-key }}
         STACK_BATCH: ${{ inputs.batch }}
-        STACK_ACCOUNT: ${{ inputs.account }}
-        STACK_ROLE_ARN_PROD: ${{ inputs.role-arn-prod }}
-        STACK_ROLE_ARN_DEV: ${{ inputs.role-arn-dev }}
+        STACK_ROLE_ARN: ${{ inputs.role-arn }}
         STACK_CHANNEL: ${{ inputs.channel }}
-        STACK_PROJECT: ${{ inputs.project }}
-        STACK_REGION: ${{ inputs.region }}
         STACK_CREDENTIALS_KEY: ${{ inputs.credentials-key }}
         STACK_SERVER_IMAGE: ${{ inputs.server-image }}
         STACK_COUNT: ${{ inputs.count }}
@@ -130,31 +110,26 @@ runs:
         STACK_OS: ${{ inputs.os }}
         STACK_POSTGRES: ${{ inputs.postgres }}
         STACK_LICENSE: ${{ inputs.license }}
-        STACK_INSTANCE_TYPE: ${{ inputs.instance-type }}
         STACK_SERVER_ENV: ${{ inputs.server-env }}
         STACK_RETRIES: ${{ inputs.retries }}
         STACK_SHARED_ADMIN_PASSWORD: ${{ inputs.shared-admin-password }}
         STACK_WAIT_FOR_MIGRATIONS: ${{ inputs.wait-for-migrations }}
         STACK_GITHUB_TOKEN: ${{ inputs.github-token }}
       run: bash "${{ github.action_path }}/../run.sh" create
-    # This attempt's own response, with the account it was created in. Every secret in it is sealed.
+    # This attempt's own response. Every secret in it is sealed.
     - if: always() && steps.create.outputs.response_path != ''
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
       with:
         name: e2e-test-stack-response-${{ inputs.batch }}-${{ github.run_attempt }}
-        path: |
-          ${{ steps.create.outputs.response_path }}
-          ${{ steps.create.outputs.account_path }}
+        path: ${{ steps.create.outputs.response_path }}
         if-no-files-found: error
         # A second create of the batch in the same attempt replaces the first's.
         overwrite: true
     # The newest response for the batch, replacing an earlier attempt's.
     - if: always() && steps.create.outputs.response_path != ''
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
       with:
         name: e2e-test-stack-create-${{ inputs.batch }}
-        path: |
-          ${{ steps.create.outputs.response_path }}
-          ${{ steps.create.outputs.account_path }}
+        path: ${{ steps.create.outputs.response_path }}
         if-no-files-found: error
         overwrite: true

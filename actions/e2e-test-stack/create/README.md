@@ -13,15 +13,15 @@ In order, the action:
    `mattermost/mattermost-enterprise-edition:<X.Y.Z>`, the highest stable release of `mattermost/mattermost` (not a
    draft or prerelease, and a tag with no suffix such as `-rc1`); `esr` is the newest patch of the newest minor whose
    stable releases' notes say "extended support release". Any other value is passed through as the image.
-3. Records the account (`prod` or `dev`) in `e2e-test-stack-account`, beside where the response goes.
-4. Requests the job's GitHub OIDC token for `sts.amazonaws.com` and assumes `role-arn-<account>` with it for one hour.
-   No `aws-actions/configure-aws-credentials` step is needed, and the action uses no AWS credentials the job holds.
-5. Invokes `<project>-<channel>:<caller-key>-<channel>` with `action: create` and waits for the reply (usually two to
-   four minutes, at most 15), then writes the raw reply to `e2e-test-stack-create.json`.
-6. Opens the sealed secrets with `credentials-key` and masks every one (the batch token, each server's admin password,
+3. Requests the job's GitHub OIDC token for `sts.amazonaws.com` and assumes `role-arn` with it for one hour, in
+   `us-east-1`. No `aws-actions/configure-aws-credentials` step is needed, and the action uses no AWS credentials the
+   job holds.
+4. Invokes `e2e-test-stack-<channel>:<caller-key>-<channel>` with `action: create` and waits for the reply (usually two
+   to four minutes, at most 15), then writes the raw reply to `e2e-test-stack-create.json`.
+5. Opens the sealed secrets with `credentials-key` and masks every one (the batch token, each server's admin password,
    mail token and service credentials) before writing any output.
-7. Fetches the batch with its token and requires the control plane to find it with every server ready.
-8. Uploads the response and the account file as artifacts.
+6. Fetches the batch with its token and requires the control plane to find it with every server ready.
+7. Uploads the response as artifacts.
 
 A throttled invoke (the channel's reserved concurrency is in use) is tried again up to five times; no other failure is
 retried, so a create is never made twice. The client waits up to 960 seconds for the reply.
@@ -37,28 +37,45 @@ The job needs `id-token: write`, to request the OIDC token the CI role trusts. R
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `caller-key`            | The repository's key in the control plane's `callers`, e.g. `mobile`. Required                                                               |
 | `batch`                 | Names the batch within the run, e.g. `ios`: 1-20 lowercase letters, digits and hyphens, starting and ending with a letter or digit. Required |
-| `account`               | `prod` or `dev`. Required                                                                                                                    |
-| `role-arn-prod`         | The repository's CI role ARN in prod, e.g. `${{ vars.E2E_TEST_STACK_ROLE_ARN_PROD }}`. Required for `account: prod`                          |
-| `role-arn-dev`          | The repository's CI role ARN in dev, e.g. `${{ vars.E2E_TEST_STACK_ROLE_ARN_DEV }}`. Required for `account: dev`                             |
+| `role-arn`              | The repository's CI role ARN in the account to create in; the batch is created in that role's account. Required                              |
 | `channel`               | `v1` (default, the promoted build) or `edge` (`main`'s newest build)                                                                         |
-| `project`               | The control plane's project, the prefix of its function names. Default `e2e-test-stack`                                                      |
-| `region`                | Default `us-east-1`                                                                                                                          |
 | `credentials-key`       | `${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}`. Required                                                                                    |
 | `server-image`          | `master`, `latest`, `esr`, or the image under test by tag. Required                                                                          |
 | `count`                 | Servers in the batch; default 1, at most 40                                                                                                  |
-| `ttl`                   | A duration such as `90m`; default `1h`, at most `4h`                                                                                         |
+| `ttl`                   | A duration such as `90m`; default `2h`, at most `4h`                                                                                         |
 | `services`              | Comma-separated: `minio` or `azurite`, `elasticsearch` or `opensearch`, `keycloak`, `openldap`                                               |
-| `os`                    | OS variant, e.g. `ubuntu-24.04`                                                                                                              |
-| `postgres`              | Postgres version, e.g. `16`                                                                                                                  |
-| `license`               | Licence SKU, e.g. `enterprise-advanced`; empty runs unlicensed                                                                               |
-| `instance-type`         | EC2 instance type; empty is sized by the control plane                                                                                       |
+| `os`                    | `ubuntu-24.04` (default) or `ubuntu-26.04`                                                                                                   |
+| `postgres`              | Postgres major version: `14`, `15`, `16` (default), `17` or `18`                                                                             |
+| `license`               | `enterprise-advanced` (default), or empty to run unlicensed                                                                                  |
 | `server-env`            | Server settings as a JSON object of strings, e.g. `{"MM_FEATUREFLAGS_TESTFEATURE":"true"}`; no credentials                                   |
 | `retries`               | Attempts per failed server; default 1, a negative number none, at most 3                                                                     |
 | `shared-admin-password` | `true` gives every server the same admin password                                                                                            |
 | `wait-for-migrations`   | `true` waits for the server's migrations before a server is ready                                                                            |
 | `github-token`          | Token for api.github.com, to read `mattermost/mattermost`'s releases for `latest` and `esr`. Default `github.token`                          |
 
-A malformed input, or an instance key over 44 characters, is refused before anything is called.
+A malformed input, or an instance key over 44 characters, is refused before anything is called, as is an `os`,
+`postgres` or `license` the deployment does not offer, or a `ttl` over `4h`. The control plane sizes each server from
+its services.
+
+### Choosing the account
+
+The action takes one role and never an account: the repository has a CI role in each account, and the caller passes
+the one to use. With the ARNs in repository variables:
+
+```yaml
+role-arn: ${{ inputs.account == 'dev' && vars.E2E_TEST_STACK_ROLE_ARN_DEV || inputs.account == 'prod' && vars.E2E_TEST_STACK_ROLE_ARN_PROD || '' }}
+```
+
+Each account is named on its own, so an unset variable gives an empty `role-arn`, which the action refuses, rather than
+falling through to the other account's role. The shorter `a && x || y` form would use `y` whenever `x` is empty.
+
+The batch is created in whichever account the role is in, so a dev role creates in dev whatever else the workflow
+says. A later `destroy` or `logs` of the batch passes the same role.
+
+### An empty licence
+
+`license` defaults to `enterprise-advanced` only when the input is left out. An empty value runs unlicensed, and so does
+an expression that comes out empty, such as an unset variable.
 
 ## Outputs
 
@@ -71,20 +88,19 @@ A malformed input, or an instance key over 44 characters, is refused before anyt
 | `state`            | The batch's state as create reported it: `ready` or `failed`                                                 |
 | `duration-seconds` | Seconds from the request to every server ready, as the control plane measured it; empty when a server failed |
 | `response-path`    | The create response file. Empty when the control plane was not reached                                       |
-| `account-path`     | The file beside it that records the account                                                                  |
 
 No output carries the batch token or any other secret. A later job reads them from the uploaded response with the
 credentials key.
 
 ## Artifacts
 
-Whenever `response-path` is set, even when the step fails, the response and the account file are uploaded twice:
+Whenever `response-path` is set, even when the step fails, the response is uploaded twice:
 
 - `e2e-test-stack-create-<batch>`: the newest, replacing an earlier attempt's.
 - `e2e-test-stack-response-<batch>-<run attempt>`: this attempt's own. Its prefix differs, so a pattern for one name
   never matches the other.
 
-Each holds `e2e-test-stack-create.json` and `e2e-test-stack-account`. The response is safe to upload, from a public
+Each holds `e2e-test-stack-create.json` alone. The response is safe to upload, from a public
 repository too: every secret in it is sealed to the repository's key.
 
 ## Re-runs
@@ -119,9 +135,7 @@ jobs:
         with:
           caller-key: mobile
           batch: ios
-          account: prod
-          role-arn-prod: ${{ vars.E2E_TEST_STACK_ROLE_ARN_PROD }}
-          role-arn-dev: ${{ vars.E2E_TEST_STACK_ROLE_ARN_DEV }}
+          role-arn: ${{ vars.E2E_TEST_STACK_ROLE_ARN_PROD }}
           credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
           server-image: master
           count: "3"
@@ -133,7 +147,8 @@ The job's workflow file and branch must be registered for the repository, or the
 
 The step fails, with the reason, on:
 
-- an invalid input, or an instance key over 44 characters;
+- an invalid input, an `os`, `postgres`, `license` or `ttl` the deployment does not offer, or an instance key over 44
+  characters;
 - a `latest` or `esr` that cannot be resolved;
 - a job without `id-token: write`, or a CI role that refuses the job's token;
 - an invoke that fails, or a create the control plane refuses: "A batch may have been created; it is reaped at its
