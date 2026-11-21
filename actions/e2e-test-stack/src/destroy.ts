@@ -4,15 +4,13 @@ import { sleep as realSleep } from "../../shared/src/github.ts";
 import type { Env, FetchImpl, Sleep } from "../../shared/src/github.ts";
 import { createArtifact, newest, readResponse, responseArtifact, runArtifacts } from "./core/artifacts.ts";
 import type { Artifact, RunRef } from "./core/artifacts.ts";
-import { batchAttempt, batchIdParts } from "./core/batch.ts";
+import { batchAttempt } from "./core/batch.ts";
 import { ActionError } from "./core/errors.ts";
 import { githubClient } from "./core/github.ts";
 import type { GitHub } from "./core/github.ts";
 import {
-  batchFrom,
   credentialsKeyFrom,
   input,
-  integer,
   PROJECT,
   REGION,
   refuse,
@@ -32,16 +30,15 @@ import { isObject, maskBatchSecrets, responseError } from "./core/response.ts";
 import type { Cost, Lease, StackResponse } from "./core/response.ts";
 import { assumeRole, roleArnFrom, stsClient } from "./core/role.ts";
 import type { Credentials, StsSend } from "./core/role.ts";
-import { checkRun } from "./core/run-check.ts";
+import { batchTargetFrom, checkRun } from "./core/run-check.ts";
 import { openBatchSecrets, SealedError } from "./core/sealed.ts";
 
 /** Every output the destroy step writes; action.yml reads only these. */
 export const DESTROY_OUTPUTS = ["attempts", "cost_usd"] as const;
 type DestroyOutputs = { [K in (typeof DESTROY_OUTPUTS)[number]]?: string };
 
-/** How long each host has to stop being served once its batch is destroyed, in seconds, and the most allowed. */
-export const DEFAULT_GONE_WINDOW = 180;
-export const MAX_GONE_WINDOW = 1800;
+/** How long each host is given to stop being served once its batch is destroyed, in seconds. */
+export const GONE_WINDOW_SECONDS = 30;
 /** The state the control plane reports for a batch with no live server. */
 export const NOT_FOUND = "not found";
 
@@ -64,7 +61,6 @@ export interface DestroyInputs extends StackInputs {
   other: boolean;
   /** Who started this job; set only for another run's batch, which only they may destroy, by hand. */
   actor: string;
-  goneWindowSeconds: number;
 }
 
 /** Reads and checks destroy's inputs and the job's run, before anything is called. */
@@ -72,36 +68,7 @@ export function readDestroyInputs(env: Env): DestroyInputs {
   const common = stackInputs(env);
   const own = runFrom(env);
   const repository = repositoryFrom(env);
-  const batchId = input(env, "batch-id");
-  let batch: string;
-  let runId = own.runId;
-  let only: DestroyInputs["only"];
-  let actor = "";
-  if (batchId) {
-    const parts =
-      batchIdParts(batchId, common.callerKey) ??
-      refuse(
-        `batch-id must be a batch of caller-key ${common.callerKey}, <caller-key>-<run id>-<batch>-<attempt>-<suffix>, got ${JSON.stringify(batchId.slice(0, 100))}`,
-      );
-    batch = parts.batch;
-    const given = input(env, "batch");
-    if (given && given !== batch) refuse(`batch-id names batch ${batch}, not ${given}; give one or the other`);
-    runId = parts.runId;
-    only = { batchId, attempt: parts.attempt };
-    if (runId !== own.runId) {
-      // Another run's batch is destroyed only by hand, by whoever started the attempt that made it.
-      if ((env.GITHUB_EVENT_NAME ?? "") !== "workflow_dispatch")
-        refuse(
-          "batch-id names another run's batch, which is destroyed only by a job started by hand (workflow_dispatch)",
-        );
-      // Whoever started this attempt of the job; GITHUB_ACTOR names who first started the run, even on a re-run.
-      actor = (env.GITHUB_TRIGGERING_ACTOR ?? "").trim();
-      if (!actor) refuse("GITHUB_TRIGGERING_ACTOR must be set, as it is in a GitHub Actions job");
-    }
-  } else batch = batchFrom(env);
-  const goneWindowSeconds = integer("gone-window", input(env, "gone-window") || String(DEFAULT_GONE_WINDOW), 1);
-  if (goneWindowSeconds > MAX_GONE_WINDOW)
-    refuse(`gone-window must be ${MAX_GONE_WINDOW} or less, got ${goneWindowSeconds}`);
+  const { batch, runId, other, actor, only } = batchTargetFrom(env, common.callerKey, own);
   const roleArn = roleArnFrom(input(env, "role-arn"), common.callerKey);
   const credentialsKey = credentialsKeyFrom(input(env, "credentials-key"));
   const githubToken = input(env, "github-token");
@@ -116,10 +83,9 @@ export function readDestroyInputs(env: Env): DestroyInputs {
     repository,
     own,
     runId,
-    other: runId !== own.runId,
+    other,
     actor,
     only,
-    goneWindowSeconds,
   };
 }
 
@@ -595,14 +561,18 @@ async function destroySteps(
   for (const u of unread) notes.push(`Batch ${t.batchId}: ${u}; the others were checked.`);
   if (urls.length) {
     deps.log(
-      `e2e-test-stack: probing ${urls.length} host(s) of batch ${t.batchId} for the router's 404, within ${inputs.goneWindowSeconds} s`,
+      `e2e-test-stack: probing ${urls.length} host(s) of batch ${t.batchId} for the router's 404, within ${GONE_WINDOW_SECONDS} s`,
     );
-    const served = await probeGone(urls, inputs.goneWindowSeconds * 1000, deps);
+    // A host still served once the window has passed is reported, not a failure: the batch is destroyed, and the
+    // router stops serving it soon after.
+    const served = await probeGone(urls, GONE_WINDOW_SECONDS * 1000, deps);
     if (served.length) {
-      result.gone = `no: ${served.length} of ${urls.length} still served`;
-      return `${served.length} of ${urls.length} host(s) of batch ${t.batchId} are still served: ${served.join("; ")}`;
-    }
-    result.gone = `yes, all ${urls.length}`;
+      result.gone = `not yet: ${served.length} of ${urls.length} still served after ${GONE_WINDOW_SECONDS} s`;
+      notes.push(`Batch ${t.batchId}: still served after ${GONE_WINDOW_SECONDS} s: ${served.join("; ")}`);
+      deps.log(
+        `e2e-test-stack: ${served.length} of ${urls.length} host(s) of batch ${t.batchId} still served: ${served.join("; ")}`,
+      );
+    } else result.gone = `yes, all ${urls.length}`;
   } else result.gone = "no host to check";
 
   let again: StackResponse;

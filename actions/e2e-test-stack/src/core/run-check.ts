@@ -1,7 +1,11 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
+import type { Env } from "../../../shared/src/github.ts";
+import { batchIdParts } from "./batch.ts";
 import { ActionError } from "./errors.ts";
 import type { GitHub } from "./github.ts";
+import { batchFrom, input, refuse } from "./inputs.ts";
+import type { Run } from "./inputs.ts";
 
 /** What the action reads of a workflow run, or of one attempt of it. */
 interface WorkflowRun {
@@ -74,4 +78,50 @@ export async function checkRun(
     );
   log(`e2e-test-stack: run ${runId} is ${described}; attempt ${attempt} was started by ${by}, as this job was`);
   return latest;
+}
+
+/** The batch an action acts on: every attempt's of this run, from batch, or the one batch-id names. */
+export interface BatchTarget {
+  /** The batch within the run. */
+  batch: string;
+  /** The run: this one, or the one batch-id names. */
+  runId: string;
+  /** True when that run is another than this job's. */
+  other: boolean;
+  /** Who started this job; set only for another run's batch, which only they may act on, by hand. */
+  actor: string;
+  /** The one batch, from batch-id; undefined for every attempt's batch of this run. */
+  only?: { batchId: string; attempt: number };
+}
+
+/**
+ * Reads batch or batch-id, exactly one of them: batch in the run that created the batch, batch-id by hand. With
+ * batch-id, the run, batch and attempt are its parts, and another run's batch is acted on only by a job started by
+ * hand (workflow_dispatch), whose triggering actor checkRun then compares.
+ */
+export function batchTargetFrom(env: Env, callerKey: string, own: Run): BatchTarget {
+  const batchId = input(env, "batch-id");
+  const given = input(env, "batch");
+  if (batchId && given)
+    refuse("give batch or batch-id, not both: batch in the run that created the batch, batch-id to name one by hand");
+  if (!batchId) {
+    if (!given)
+      refuse(
+        "batch or batch-id is required: batch (e.g. ios) in the run that created the batch, batch-id to name one by hand",
+      );
+    return { batch: batchFrom(env), runId: own.runId, other: false, actor: "" };
+  }
+  const parts =
+    batchIdParts(batchId, callerKey) ??
+    refuse(
+      `batch-id must be a batch of caller-key ${callerKey}, <caller-key>-<run id>-<batch>-<attempt>-<suffix>, got ${JSON.stringify(batchId.slice(0, 100))}`,
+    );
+  const only = { batchId, attempt: parts.attempt };
+  if (parts.runId === own.runId) return { batch: parts.batch, runId: own.runId, other: false, actor: "", only };
+  if ((env.GITHUB_EVENT_NAME ?? "") !== "workflow_dispatch")
+    refuse("batch-id names another run's batch, which is acted on only by a job started by hand (workflow_dispatch)");
+  // Whoever started this attempt of the job; GITHUB_ACTOR names who first started the run, even on a re-run.
+  const actor = (env.GITHUB_TRIGGERING_ACTOR ?? "").trim();
+  if (!actor) refuse("GITHUB_TRIGGERING_ACTOR must be set, as it is in a GitHub Actions job");
+  return { batch: parts.batch, runId: parts.runId, other: true, actor, only };
 }

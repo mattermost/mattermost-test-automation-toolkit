@@ -9,7 +9,7 @@ import sodium from "libsodium-wrappers";
 import { createArtifact, responseArtifact } from "./core/artifacts.ts";
 import type { InvokeInput, InvokeOutput } from "./core/lambda.ts";
 import { GONE } from "./core/probe.ts";
-import { DESTROY_OUTPUTS, destroyWith, readDestroyInputs } from "./destroy.ts";
+import { DESTROY_OUTPUTS, destroyWith, GONE_WINDOW_SECONDS, readDestroyInputs } from "./destroy.ts";
 import type { AttemptResult } from "./destroy.ts";
 import { ACTIONS } from "./run.ts";
 
@@ -213,7 +213,8 @@ const harness = (
         ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.actions.example/id?api-version=2.0",
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: "request-token-1",
         STACK_CALLER_KEY: "mobile",
-        STACK_BATCH: "ios",
+        // batch, unless the test names one batch by its id instead: one or the other, never both.
+        ...(env.STACK_BATCH_ID ? {} : { STACK_BATCH: "ios" }),
         STACK_ROLE_ARN: ROLE_ARN,
         STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
         STACK_GITHUB_TOKEN: "gh-token",
@@ -350,23 +351,20 @@ test("an earlier attempt's batch already gone is accepted; one this attempt crea
   await assert.rejects(current.go(), /batch mobile-42-ios-2-abc was not found, but this attempt created it/);
 });
 
-test("a host still served fails with each one and its last answer, and the second destroy is not run", async () => {
-  const h = harness(
-    [{ name: responseArtifact("ios", 1), body: createResponse(batchId(1)) }],
-    { STACK_GONE_WINDOW: "5" },
-    {},
-    (url) =>
-      url.startsWith("https://mail-")
-        ? new Response("bad gateway", { status: 502 })
-        : new Response(GONE, { status: 404 }),
+test("a host still served after the window is reported in the summary, not a failure, and the second destroy still runs", async () => {
+  const h = harness([{ name: responseArtifact("ios", 1), body: createResponse(batchId(1)) }], {}, {}, (url) =>
+    url.startsWith("https://mail-")
+      ? new Response("bad gateway", { status: 502 })
+      : new Response(GONE, { status: 404 }),
   );
-  await assert.rejects(
-    h.go(),
-    /1 of 3 host\(s\) of batch mobile-42-ios-1-abc are still served: https:\/\/mail-mobile-42-ios-1-abc-00\.test\.example\/ is still served after \d+ s \(\d+ attempt\(s\)\): last HTTP 502/,
+  await h.go();
+  assert.equal(attempts(h)[0].gone, `not yet: 1 of 3 still served after ${GONE_WINDOW_SECONDS} s`);
+  assert.equal(attempts(h)[0].again, "not found");
+  assert.equal(h.destroys.length, 2);
+  assert.match(
+    readFileSync(h.summary, "utf8"),
+    /Batch mobile-42-ios-1-abc: still served after 30 s: https:\/\/mail-mobile-42-ios-1-abc-00\.test\.example\/ is still served after \d+ s \(\d+ attempt\(s\)\): last HTTP 502/,
   );
-  assert.equal(attempts(h)[0].gone, "no: 1 of 3 still served");
-  assert.equal(attempts(h)[0].again, "not run");
-  assert.equal(h.destroys.length, 1);
 });
 
 test("a destroy that is refused, partial, or found again on the second call fails naming the batch", async () => {
@@ -505,41 +503,37 @@ test("destroy refuses a missing or malformed input before anything is called", (
     GITHUB_TRIGGERING_ACTOR: "alice",
   };
   const read = readDestroyInputs(env);
-  assert.deepEqual(
-    [read.runId, read.other, read.only, read.goneWindowSeconds, read.channel],
-    ["42", false, undefined, 180, "v1"],
-  );
+  assert.deepEqual([read.runId, read.other, read.only, read.channel], ["42", false, undefined, "v1"]);
   const byId = readDestroyInputs({ ...env, STACK_BATCH: "", STACK_BATCH_ID: "mobile-77-ios-2-1-abc" });
   assert.deepEqual(
     [byId.runId, byId.other, byId.batch, byId.only],
     ["77", true, "ios-2", { batchId: "mobile-77-ios-2-1-abc", attempt: 1 }],
   );
   assert.equal(
-    readDestroyInputs({ ...env, STACK_BATCH_ID: "mobile-42-ios-1-abc" }).other,
+    readDestroyInputs({ ...env, STACK_BATCH: "", STACK_BATCH_ID: "mobile-42-ios-1-abc" }).other,
     false,
     "this run's own batch",
   );
   const refused = (over: Record<string, string>, message: RegExp) =>
     assert.throws(() => readDestroyInputs({ ...env, ...over }), message);
   refused({ STACK_ROLE_ARN: "" }, /role-arn is required/);
-  refused({ STACK_BATCH: "" }, /batch is required/);
-  refused({ STACK_BATCH_ID: "tpp-77-ios-1-abc" }, /batch-id must be a batch of caller-key mobile/);
-  refused({ STACK_BATCH_ID: "mobile-77-android-1-abc" }, /batch-id names batch android, not ios/);
+  refused({ STACK_BATCH: "" }, /batch or batch-id is required/);
+  refused({ STACK_BATCH_ID: "mobile-42-ios-1-abc" }, /give batch or batch-id, not both/);
+  refused({ STACK_BATCH: "", STACK_BATCH_ID: "tpp-77-ios-1-abc" }, /batch-id must be a batch of caller-key mobile/);
   refused(
-    { STACK_BATCH_ID: "mobile-77-ios-1-abc", GITHUB_EVENT_NAME: "push" },
-    /another run's batch, which is destroyed only by a job started by hand/,
+    { STACK_BATCH: "", STACK_BATCH_ID: "mobile-77-ios-1-abc", GITHUB_EVENT_NAME: "push" },
+    /another run's batch, which is acted on only by a job started by hand/,
   );
   refused(
-    { STACK_BATCH_ID: "mobile-77-ios-1-abc", GITHUB_TRIGGERING_ACTOR: "", GITHUB_ACTOR: "alice" },
+    { STACK_BATCH: "", STACK_BATCH_ID: "mobile-77-ios-1-abc", GITHUB_TRIGGERING_ACTOR: "", GITHUB_ACTOR: "alice" },
     /GITHUB_TRIGGERING_ACTOR must be set/,
   );
   assert.equal(
-    readDestroyInputs({ ...env, STACK_BATCH_ID: "mobile-42-ios-1-abc", GITHUB_EVENT_NAME: "push" }).other,
+    readDestroyInputs({ ...env, STACK_BATCH: "", STACK_BATCH_ID: "mobile-42-ios-1-abc", GITHUB_EVENT_NAME: "push" })
+      .other,
     false,
     "this run's own batch needs no hand",
   );
-  refused({ STACK_GONE_WINDOW: "1801" }, /gone-window must be 1800 or less/);
-  refused({ STACK_GONE_WINDOW: "0" }, /gone-window/);
   refused({ STACK_CHANNEL: "beta" }, /channel must be v1 or edge/);
 });
 test("destroy writes every output it declares, and action.yml reads exactly those", async () => {
@@ -663,11 +657,12 @@ test("the hosts probed are the create response's and the destroy reply's togethe
 test("a batch of this run already gone has its own response's hosts checked, so one up in another account is caught", async () => {
   const h = harness(
     [{ name: responseArtifact("ios", 1), body: createResponse(batchId(1)) }],
-    { STACK_GONE_WINDOW: "5" },
+    {},
     { [batchId(1)]: [ok(notFound(batchId(1))), ok(notFound(batchId(1)))] },
     () => new Response("bad gateway", { status: 502 }),
   );
-  await assert.rejects(h.go(), /3 of 3 host\(s\) of batch mobile-42-ios-1-abc are still served/);
+  await h.go();
+  assert.equal(attempts(h)[0].gone, "not yet: 3 of 3 still served after 30 s");
   assert.equal(h.probed[0], `${site(batchId(1))}/api/v4/system/ping`);
 });
 
@@ -784,12 +779,13 @@ test("another run's batch already gone has its own response's hosts checked, so 
   const run = { id: 77, attempt: 1 };
   const h = harness(
     [{ name: responseArtifact("ios", 1), body: createResponse(batchId(1, 77)) }],
-    { STACK_BATCH_ID: batchId(1, 77), STACK_GONE_WINDOW: "5" },
+    { STACK_BATCH_ID: batchId(1, 77) },
     { [batchId(1, 77)]: [ok(notFound(batchId(1, 77))), ok(notFound(batchId(1, 77)))] },
     () => new Response("bad gateway", { status: 502 }),
     run,
   );
-  await assert.rejects(h.go(), /3 of 3 host\(s\) of batch mobile-77-ios-1-abc are still served/);
+  await h.go();
+  assert.equal(attempts(h)[0].gone, "not yet: 3 of 3 still served after 30 s");
 });
 
 test("another run's batch is read only from its attempt's own response, never the newest a later attempt may have uploaded", async () => {

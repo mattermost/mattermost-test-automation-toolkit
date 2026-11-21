@@ -31968,41 +31968,38 @@ async function checkRun(github, repository, byHand, log) {
   log(`e2e-test-stack: run ${runId} is ${described}; attempt ${attempt} was started by ${by}, as this job was`);
   return latest;
 }
+function batchTargetFrom(env2, callerKey, own) {
+  const batchId = input(env2, "batch-id");
+  const given = input(env2, "batch");
+  if (batchId && given)
+    refuse("give batch or batch-id, not both: batch in the run that created the batch, batch-id to name one by hand");
+  if (!batchId) {
+    if (!given)
+      refuse(
+        "batch or batch-id is required: batch (e.g. ios) in the run that created the batch, batch-id to name one by hand"
+      );
+    return { batch: batchFrom(env2), runId: own.runId, other: false, actor: "" };
+  }
+  const parts = batchIdParts(batchId, callerKey) ?? refuse(
+    `batch-id must be a batch of caller-key ${callerKey}, <caller-key>-<run id>-<batch>-<attempt>-<suffix>, got ${JSON.stringify(batchId.slice(0, 100))}`
+  );
+  const only = { batchId, attempt: parts.attempt };
+  if (parts.runId === own.runId) return { batch: parts.batch, runId: own.runId, other: false, actor: "", only };
+  if ((env2.GITHUB_EVENT_NAME ?? "") !== "workflow_dispatch")
+    refuse("batch-id names another run's batch, which is acted on only by a job started by hand (workflow_dispatch)");
+  const actor = (env2.GITHUB_TRIGGERING_ACTOR ?? "").trim();
+  if (!actor) refuse("GITHUB_TRIGGERING_ACTOR must be set, as it is in a GitHub Actions job");
+  return { batch: parts.batch, runId: parts.runId, other: true, actor, only };
+}
 
 // src/destroy.ts
-var DEFAULT_GONE_WINDOW = 180;
-var MAX_GONE_WINDOW = 1800;
+var GONE_WINDOW_SECONDS = 30;
 var NOT_FOUND = "not found";
 function readDestroyInputs(env2) {
   const common = stackInputs(env2);
   const own = runFrom(env2);
   const repository = repositoryFrom(env2);
-  const batchId = input(env2, "batch-id");
-  let batch;
-  let runId = own.runId;
-  let only;
-  let actor = "";
-  if (batchId) {
-    const parts = batchIdParts(batchId, common.callerKey) ?? refuse(
-      `batch-id must be a batch of caller-key ${common.callerKey}, <caller-key>-<run id>-<batch>-<attempt>-<suffix>, got ${JSON.stringify(batchId.slice(0, 100))}`
-    );
-    batch = parts.batch;
-    const given = input(env2, "batch");
-    if (given && given !== batch) refuse(`batch-id names batch ${batch}, not ${given}; give one or the other`);
-    runId = parts.runId;
-    only = { batchId, attempt: parts.attempt };
-    if (runId !== own.runId) {
-      if ((env2.GITHUB_EVENT_NAME ?? "") !== "workflow_dispatch")
-        refuse(
-          "batch-id names another run's batch, which is destroyed only by a job started by hand (workflow_dispatch)"
-        );
-      actor = (env2.GITHUB_TRIGGERING_ACTOR ?? "").trim();
-      if (!actor) refuse("GITHUB_TRIGGERING_ACTOR must be set, as it is in a GitHub Actions job");
-    }
-  } else batch = batchFrom(env2);
-  const goneWindowSeconds = integer("gone-window", input(env2, "gone-window") || String(DEFAULT_GONE_WINDOW), 1);
-  if (goneWindowSeconds > MAX_GONE_WINDOW)
-    refuse(`gone-window must be ${MAX_GONE_WINDOW} or less, got ${goneWindowSeconds}`);
+  const { batch, runId, other, actor, only } = batchTargetFrom(env2, common.callerKey, own);
   const roleArn = roleArnFrom(input(env2, "role-arn"), common.callerKey);
   const credentialsKey = credentialsKeyFrom(input(env2, "credentials-key"));
   const githubToken = input(env2, "github-token");
@@ -32017,10 +32014,9 @@ function readDestroyInputs(env2) {
     repository,
     own,
     runId,
-    other: runId !== own.runId,
+    other,
     actor,
-    only,
-    goneWindowSeconds
+    only
   };
 }
 var parse = (raw) => {
@@ -32345,14 +32341,16 @@ async function destroySteps(t2, result, target, invoke, secrets, inputs, current
   for (const u2 of unread) notes.push(`Batch ${t2.batchId}: ${u2}; the others were checked.`);
   if (urls.length) {
     deps.log(
-      `e2e-test-stack: probing ${urls.length} host(s) of batch ${t2.batchId} for the router's 404, within ${inputs.goneWindowSeconds} s`
+      `e2e-test-stack: probing ${urls.length} host(s) of batch ${t2.batchId} for the router's 404, within ${GONE_WINDOW_SECONDS} s`
     );
-    const served = await probeGone(urls, inputs.goneWindowSeconds * 1e3, deps);
+    const served = await probeGone(urls, GONE_WINDOW_SECONDS * 1e3, deps);
     if (served.length) {
-      result.gone = `no: ${served.length} of ${urls.length} still served`;
-      return `${served.length} of ${urls.length} host(s) of batch ${t2.batchId} are still served: ${served.join("; ")}`;
-    }
-    result.gone = `yes, all ${urls.length}`;
+      result.gone = `not yet: ${served.length} of ${urls.length} still served after ${GONE_WINDOW_SECONDS} s`;
+      notes.push(`Batch ${t2.batchId}: still served after ${GONE_WINDOW_SECONDS} s: ${served.join("; ")}`);
+      deps.log(
+        `e2e-test-stack: ${served.length} of ${urls.length} host(s) of batch ${t2.batchId} still served: ${served.join("; ")}`
+      );
+    } else result.gone = `yes, all ${urls.length}`;
   } else result.gone = "no host to check";
   let again;
   try {
