@@ -47,9 +47,11 @@ export async function requestIdToken(
         again = res.status >= 500 || res.status === 429;
         errors.push(`attempt ${n}: HTTP ${res.status}`);
       } else {
+        // Read outside the parse: a connection dropped mid-body is tried again, only a body that is not JSON is final.
+        const body = await readBody(res, MAX_TOKEN_BYTES);
         let value: unknown;
         try {
-          value = (JSON.parse((await readBody(res, MAX_TOKEN_BYTES)).toString("utf8")) as { value?: unknown })?.value;
+          value = (JSON.parse(body.toString("utf8")) as { value?: unknown })?.value;
         } catch {
           value = undefined;
         }

@@ -77,6 +77,27 @@ test("a 5xx, a 429 or a dropped connection is tried again; the error lists each 
   assert.deepEqual(fails.waits, [5_000, 10_000]);
 });
 
+test("a connection dropped while the token is read is tried again", async () => {
+  let calls = 0;
+  const waits: number[] = [];
+  const token = await requestIdToken(
+    ENV,
+    async () => {
+      if (++calls > 1) return Response.json({ value: "id-token-3" });
+      const body = new ReadableStream<Uint8Array>({
+        start: (c) => c.enqueue(new TextEncoder().encode('{"val')),
+        pull: (c) => c.error(new TypeError("terminated")),
+      });
+      return new Response(body, { status: 200 });
+    },
+    async (ms) => void waits.push(ms),
+    () => {},
+  );
+  assert.equal(token, "id-token-3");
+  assert.equal(calls, 2);
+  assert.deepEqual(waits, [5_000]);
+});
+
 test("a 4xx or a response with no token is final", async () => {
   const denied = go([new Response("", { status: 403 })]);
   await assert.rejects(denied.result, /failed: attempt 1: HTTP 403$/);

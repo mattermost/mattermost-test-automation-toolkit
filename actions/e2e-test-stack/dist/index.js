@@ -26463,9 +26463,10 @@ async function requestIdToken(env2, fetchImpl = fetch, wait = sleep, log = conso
         again = res.status >= 500 || res.status === 429;
         errors.push(`attempt ${n5}: HTTP ${res.status}`);
       } else {
+        const body = await readBody(res, MAX_TOKEN_BYTES);
         let value;
         try {
-          value = JSON.parse((await readBody(res, MAX_TOKEN_BYTES)).toString("utf8"))?.value;
+          value = JSON.parse(body.toString("utf8"))?.value;
         } catch {
           value = void 0;
         }
