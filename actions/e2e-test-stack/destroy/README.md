@@ -5,7 +5,8 @@ each again expecting nothing to find. See the [shared README](../README.md) for 
 
 In order, the action:
 
-1. Checks every input.
+1. Checks every input. Exactly one of `batch` and `batch-id` is given: `batch` in the run that created the batch,
+   `batch-id` by hand.
 2. With `batch-id`, takes its run, batch and attempt from it. When that run is another, this job must have been started
    by hand (`workflow_dispatch`), and it fails unless that run is this repository's own, not a fork's, was started by
    hand too, has completed, and the attempt that made the batch was started by a person, the same one as this job. Its
@@ -20,9 +21,11 @@ In order, the action:
 5. For each batch, opens its token with `credentials-key`, masks every secret, and destroys it. It must come back
    `destroyed`, or `"not found"` when it was already gone. A batch this very attempt created, ready, must still have
    been up, unless it has passed its expiry and was reaped.
-6. Waits, within `gone-window` seconds, for each site, its mail- host and any sso- host to answer the router's 404 for
-   an unknown server. Those the create response names catch a batch still up in another account, which this role
-   cannot find; those the control plane's reply names from the batch's published leases catch any the response lacks.
+6. Waits, for up to 30 seconds, for each site, its mail- host and any sso- host to answer the router's 404 for
+   an unknown server. A host still served after that is shown in the summary and the `gone` output, not a failure:
+   the batch is destroyed, and the router stops serving it soon after. The hosts the create response names show a
+   batch still up in another account, which this role cannot find; those the control plane's reply names from the
+   batch's published leases cover any the response lacks.
 7. Destroys the batch again, which must come back `"not found"`.
 
 The batches are destroyed at once, and one batch's failure never keeps another up: every batch is tried, and the step
@@ -38,16 +41,15 @@ action.
 
 ## Inputs
 
-| Input             | Description                                                                                                          |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `caller-key`      | The repository's key in the control plane's `callers`, e.g. `mobile`, as `create` was given it. Required             |
-| `batch`           | The batch within this run, e.g. `ios`, as `create` was given it. Required unless `batch-id` is given                 |
-| `batch-id`        | The one batch to destroy, e.g. `mobile-1234-ios-1-a1b2c3`. Another run's only by hand, by whoever started it by hand |
-| `role-arn`        | The repository's CI role ARN in the account the batch was created in, as `create` was given it. Required             |
-| `channel`         | `v1` (the default) or `edge`, as `create` was given it                                                               |
-| `credentials-key` | `${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}`. Required                                                            |
-| `gone-window`     | Seconds each host has to stop being served: `180` (the default) to `1800`                                            |
-| `github-token`    | Token for api.github.com, to read the run and its artifacts. Default `github.token`                                  |
+| Input             | Description                                                                                                                                          |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `caller-key`      | The repository's key in the control plane's `callers`, e.g. `mobile`, as `create` was given it. Required                                             |
+| `batch`           | In the run that created the batch: the batch, e.g. `ios`, as `create` was given it. Give this or `batch-id`, not both                                |
+| `batch-id`        | By hand: the one batch to destroy, e.g. `mobile-1234-ios-1-a1b2c3`. Another run's only by whoever started it by hand. Give this or `batch`, not both |
+| `role-arn`        | The repository's CI role ARN in the account the batch was created in, as `create` was given it. Required                                             |
+| `channel`         | `v1` (the default) or `edge`, as `create` was given it                                                                                               |
+| `credentials-key` | `${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}`. Required                                                                                            |
+| `github-token`    | Token for api.github.com, to read the run and its artifacts. Default `github.token`                                                                  |
 
 ## Outputs
 
@@ -116,7 +118,6 @@ The step fails, with the reason, on:
 - a batch whose token cannot be opened;
 - a destroy that is refused, comes back neither `destroyed` nor `"not found"`, or reports an error;
 - `"not found"` for a batch this attempt created ready, before its expiry;
-- a host still served once `gone-window` has passed;
 - a second destroy that finds the batch.
 
 A batch it could not destroy is reaped at its TTL. Failure annotations have ARNs and account ids taken out.

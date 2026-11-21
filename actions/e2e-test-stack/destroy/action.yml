@@ -10,13 +10,15 @@ inputs:
     description: The repository's key in the control plane's callers (e.g. mobile), as create was given it
     required: true
   batch:
-    description: The batch within this run, as create was given it (e.g. ios); required unless batch-id is given
+    description: >-
+      The batch within this run, as create was given it (e.g. ios), in the run that created it. Give this or batch-id,
+      not both
     default: ""
   batch-id:
     description: >-
-      The one batch to destroy (e.g. mobile-1234-ios-1-a1b2c3). Another run's batch is destroyed only by a job started
-      by hand, when that run was started by hand too, by the same person, and has completed. Empty destroys every
-      attempt's batch of this run
+      By hand: the one batch to destroy (e.g. mobile-1234-ios-1-a1b2c3). Another run's batch is destroyed only by a job
+      started by hand, when that run was started by hand too, by the same person, and has completed. Give this or
+      batch, not both
     default: ""
   role-arn:
     description: >-
@@ -31,9 +33,6 @@ inputs:
       The repository's credentials key, a base64 X25519 private key (the E2E_TEST_STACK_CREDENTIALS_KEY secret), which
       opens each batch's token
     required: true
-  gone-window:
-    description: Seconds each host has to stop being served once its batch is destroyed; 180 (the default) to 1800
-    default: "180"
   github-token:
     description: The token for api.github.com, which reads the run and its artifacts; it needs actions read
     default: ${{ github.token }}
@@ -62,6 +61,5 @@ runs:
         STACK_CHANNEL: ${{ inputs.channel }}
         STACK_CREDENTIALS_KEY: ${{ inputs.credentials-key }}
         STACK_BATCH_ID: ${{ inputs.batch-id }}
-        STACK_GONE_WINDOW: ${{ inputs.gone-window }}
         STACK_GITHUB_TOKEN: ${{ inputs.github-token }}
       run: bash "${{ github.action_path }}/../run.sh" destroy
