@@ -1,7 +1,7 @@
 ---
 name: PR Test Analysis Override (Reusable)
 
-"on":
+on:
   workflow_call:
     inputs:
       pr_number:

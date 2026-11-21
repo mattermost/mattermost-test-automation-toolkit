@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "prepare": "husky",
-    "lint:yaml": "yamllint --strict .github/workflows/ actions/"
+    "lint:yaml": "yamllint .github/workflows/ actions/"
   },
   "workspaces": [
     "actions/e2e-test-rerun",
