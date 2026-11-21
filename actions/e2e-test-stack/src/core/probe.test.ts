@@ -11,26 +11,35 @@ test("each site's ping and mail- host, and each sso- host, are probed with the s
       ["https://a.test.example", "", "http://c.test.example:8080/"],
       ["sso-a.test.example", "", "sso-c.test.example"],
     ),
-    [
-      "https://a.test.example/api/v4/system/ping",
-      "https://mail-a.test.example/",
-      "http://c.test.example:8080/api/v4/system/ping",
-      "http://mail-c.test.example:8080/",
-      "https://sso-a.test.example/",
-      "http://sso-c.test.example/",
-    ],
+    {
+      urls: [
+        "https://a.test.example/api/v4/system/ping",
+        "https://mail-a.test.example/",
+        "http://c.test.example:8080/api/v4/system/ping",
+        "http://mail-c.test.example:8080/",
+        "https://sso-a.test.example/",
+        "http://sso-c.test.example/",
+      ],
+      rejected: [],
+    },
   );
-  assert.deepEqual(goneUrls([], ["sso-x.test.example"]), ["https://sso-x.test.example/"], "no site: https");
+  assert.deepEqual(goneUrls([], ["sso-x.test.example"]).urls, ["https://sso-x.test.example/"], "no site: https");
 });
 
-test("a site that is not an http(s) URL, or an sso host that is not a hostname, fails without a line break", () => {
-  for (const site of ["ftp://a", "not a url", "https://a\n.example", 5])
-    assert.throws(
-      () => goneUrls([site], []),
-      (e: unknown) =>
-        /is not (an http\(s\) URL|a URL)/.test((e as Error).message) && !(e as Error).message.includes("\n"),
-    );
-  for (const host of ["a/b", "a b", "x\ny", 7]) assert.throws(() => goneUrls([], [host]), /is not a hostname/);
+test("an entry that is not an http(s) URL or a hostname is named, without a line break, and the others are kept", () => {
+  for (const site of ["ftp://a", "not a url", "https://a\n.example", 5]) {
+    const { urls, rejected } = goneUrls([site, "https://b.test.example"], []);
+    assert.deepEqual(urls, ["https://b.test.example/api/v4/system/ping", "https://mail-b.test.example/"]);
+    assert.equal(rejected.length, 1);
+    assert.match(rejected[0], /^the site .* is not an http\(s\) URL$/);
+    assert.ok(!rejected[0].includes("\n"));
+  }
+  for (const host of ["a/b", "a b", "x\ny", 7]) {
+    const { urls, rejected } = goneUrls(["https://b.test.example"], [host]);
+    assert.equal(urls.length, 2, "the site's hosts are kept");
+    assert.match(rejected[0], /is not a hostname$/);
+    assert.ok(!rejected[0].includes("\n"));
+  }
 });
 
 /** A clock that moves only when the probe sleeps, and a fetch answering from answers by URL, in turn. */
