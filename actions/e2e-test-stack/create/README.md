@@ -94,7 +94,9 @@ credentials key.
 
 ## Artifacts
 
-Whenever `response-path` is set, even when the step fails, the response is uploaded twice:
+Whenever the reply names a batch, even when the step fails, the response is uploaded twice. A reply that names none,
+such as a refusal, is uploaded whole as `e2e-test-stack-unnamed-<batch>-<run attempt>` instead, so it never replaces
+a response that named one, and the other actions never read it.
 
 - `e2e-test-stack-create-<batch>`: the newest, replacing an earlier attempt's.
 - `e2e-test-stack-response-<batch>-<run attempt>`: this attempt's own. Its prefix differs, so a pattern for one name
