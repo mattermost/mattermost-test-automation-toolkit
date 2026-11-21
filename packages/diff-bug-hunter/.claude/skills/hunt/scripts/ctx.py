@@ -216,6 +216,36 @@ def own_tests(repo: Path, mb: str, head: str, dirs: set[str]) -> dict[str, Any]:
             "jest": sorted(jest)}
 
 
+MAX_PR_TEST_LINES = 400
+
+
+def pr_tests_diff(repo: Path, mb: str, head: str, dirs: set[str]) -> list[dict[str, str]]:
+    """What the PR's own tests in the hunted dirs add or change: Mode A lifts their literal examples into properties.
+    Added lines only, with their head line numbers, capped at MAX_PR_TEST_LINES in all."""
+    out = []
+    budget = MAX_PR_TEST_LINES
+    for f in git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head).splitlines():
+        if budget <= 0:
+            break
+        if str(Path(f).parent) not in dirs or not (f.endswith("_test.go") or re.search(r"\.test\.[jt]sx?$", f)):
+            continue
+        if Path(f).name.startswith("hunt_"):
+            continue
+        rows = []
+        new = 0
+        for line in git(repo, "diff", "-U0", mb, head, "--", f).splitlines():
+            m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            if m:
+                new = int(m.group(1))
+            elif line.startswith("+") and not line.startswith("+++"):
+                rows.append(f"{new}: {line[1:]}")
+                new += 1
+        if rows:
+            out.append({"file": f, "added": "\n".join(rows[:budget])})
+            budget -= len(rows)
+    return out
+
+
 def file_diffs(repo: Path, mb: str, head: str) -> list[prefilter.FileDiff]:
     """Added and modified files only. Renames count as delete + add, so every path exists at head."""
     out = []
@@ -597,6 +627,7 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> di
         "your_test_files": targets,
         # every changed path, hunted, skipped or deleted, so path-triggered rules (e.g. SQL migrations) still apply
         "all_changed_files": all_changed,
+        "pr_tests_diff": pr_tests_diff(repo, mb, head, {t["dir"] for t in targets}),
     }
     ctx["neighbors_same_file"], ctx["changed_functions_base_source"] = neighbours_and_base(
         wt, Path(prep["wt_base"]), files, {f.path: f.patch for f in chosen}, set(all_changed))

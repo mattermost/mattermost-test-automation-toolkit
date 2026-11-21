@@ -103,6 +103,32 @@ def test_worktrees_pin_head_and_merge_base(tmp_path):
     assert "EXCLUDED\tcalc/calc_test.go\texisting test" in (hdir / "skipped.log").read_text()
 
 
+def test_pr_tests_diff_shows_the_prs_own_test_additions_with_head_line_numbers(tmp_path, monkeypatch):
+    hdir, state = make_hunt(tmp_path, "go_bug")
+    c = json.loads((hdir / "ctx.json").read_text())
+    assert [d["file"] for d in c["pr_tests_diff"]] == ["calc/calc_test.go"]
+    added = c["pr_tests_diff"][0]["added"]
+    head = (Path(state["wt"]) / "calc/calc_test.go").read_text().split("\n")
+    for row in added.split("\n"):
+        n, text = row.split(": ", 1)
+        assert head[int(n) - 1] == text  # line numbers point at the head file, so hunters can cite file:line
+    assert "Clamp(5, 0, 10)" in added
+    # Planters never see tests; hunters do, and the prompt tells Mode A how to use them.
+    assert "pr_tests_diff" not in build_requests.mutant_user(c)
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    assert "lifted:" in build_requests.hunter_system("A", state, c)
+
+
+def test_pr_tests_diff_is_capped_and_skips_other_dirs(tmp_path, monkeypatch):
+    monkeypatch.setattr(ctx, "MAX_PR_TEST_LINES", 3)
+    body = "package calc\n" + "".join(f"\nfunc TestX{i}(t *testing.T) {{}}\n" for i in range(5))
+    c = _ctx_from(tmp_path, {"go.mod": "module x\n", "calc/calc.go": _go_funcs(["One"]), "other/o_test.go": "package o\n"},
+                  {"calc/calc.go": _go_funcs(["One"], "\treturn 2"), "calc/calc_test.go": body,
+                   "other/o_test.go": "package o\n\n// changed\n"})
+    assert [d["file"] for d in c["pr_tests_diff"]] == ["calc/calc_test.go"]
+    assert len(c["pr_tests_diff"][0]["added"].split("\n")) == 3
+
+
 def _ctx_from(tmp: Path, base: dict[str, str], head: dict[str, str], untracked: dict[str, str] | None = None) -> dict:
     """ctx.json for a two-commit repo (`base` files, then `head` edits); `untracked` files are dropped into the head
     worktree before the context is built."""
