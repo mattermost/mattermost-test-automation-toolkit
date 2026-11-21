@@ -30,6 +30,21 @@ export interface Lease {
   ami_name?: string;
   /** Keycloak's sso- host, for an instance created with it. */
   sso_host?: string;
+  /** From destroy. */
+  cost?: Cost;
+  metrics?: { cpu_average?: number; cpu_peak?: number };
+}
+
+/** What a server or a batch cost, as destroy reports it. */
+export interface Cost {
+  instance_type?: string;
+  hours?: number;
+  total?: number;
+  /** False when the instance type has no known rate: a zero total is then not free. */
+  estimated?: boolean;
+  currency?: string;
+  /** No usable start time, so nothing was computed. */
+  start_unknown?: boolean;
 }
 
 /** The control plane's reply; every secret in it is sealed. */
@@ -45,6 +60,16 @@ export interface StackResponse {
     instances?: (Lease | null)[] | null;
     secrets?: string;
     timing?: Timing;
+    /** From destroy. */
+    cost?: Cost;
+    sizing?: {
+      instance_type?: string;
+      sustained_cpu?: number;
+      alternative?: string;
+      counterfactual?: number;
+      saving?: number;
+      note?: string;
+    };
   };
 }
 
