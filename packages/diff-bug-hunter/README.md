@@ -19,6 +19,12 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
   - **S2 adversarial callers (Mode A):** every role and session type for Go; omitted optional props, or required ones
     an untyped caller can skip, for React.
   - **S3 differential (Mode B):** inputs that reach no changed line must behave as the merge-base version did.
+- **Property shapes (Mode A):** round-trip, idempotence, no-panic, monotonic, and properties lifted from the PR's own
+  example tests (`pr_tests_diff` in `ctx.json`). One of the 3 required citations may be a doc comment or a PR test.
+- **Changed-line coverage:** `run.py cover` runs each Mode A test alone with coverage. A test that reaches none of
+  the changed lines is `VACUOUS`, dropped from the report and from mutant kills; the report shows "X/Y reached".
+- **Go fuzzing (opt-in, `HUNT_FUZZ=1`):** pure `FuzzHuntA_` targets are fuzzed briefly. A failing input is shrunk and
+  frozen into a deterministic `TestHuntA_*_Fuzz<hash>` test that is vetted 3/3 like any other.
 - **Vetting:** each failure must reproduce 3/3. It is root-caused against `lessons.jsonl` (known false positives),
   run on the merge-base (**New PR Bug** vs **Pre-Existing Bug**), and checked for caller reachability.
 - **Mutation gate:**
@@ -94,6 +100,8 @@ locally, `scripts/start_pg.sh` starts a throwaway cluster.
 | `HUNT_REPO` | `mattermost/mattermost` | repository the PR belongs to |
 | `HUNT_NODE_BIN` | node on `PATH` | Node bin dir for Jest runs |
 | `HUNT_TRUSTED_REF` | merge-base with `origin/main` | where rules are read from (`worktree` = disk) |
+| `HUNT_FUZZ` | off | `1` asks Mode A for Go fuzz targets and enables `run.py fuzz` |
+| `HUNT_FUZZ_TIME` | `60s` | `-fuzztime` per fuzz target |
 
 ## /verify
 
