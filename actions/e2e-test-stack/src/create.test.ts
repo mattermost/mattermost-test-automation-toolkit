@@ -1004,3 +1004,20 @@ test("a count or retries beyond a safe integer is refused before anything is cal
   refused({ STACK_COUNT: "99999999999999999999" }, /count is out of range/);
   refused({ STACK_RETRIES: "-999999999999999999999" }, /retries is out of range/);
 });
+
+test("a reply that names a batch is uploaded as the batch's responses; one that names none under a name of its own", () => {
+  const yml = readFileSync(new URL("../create/action.yml", import.meta.url), "utf8");
+  // Each upload step: its condition and the artifact it names.
+  const uploads = [
+    ...yml.matchAll(/- if: (.+)\n\s+uses: actions\/upload-artifact@[^\n]+\n\s+with:\n\s+name: (\S+)/g),
+  ].map((m) => [
+    m[2],
+    m[1].includes("batch_id != ''") ? "named" : m[1].includes("batch_id == ''") ? "unnamed" : "either",
+    m[1].includes("response_path != ''"),
+  ]);
+  assert.deepEqual(uploads, [
+    ["e2e-test-stack-response-${{", "named", true],
+    ["e2e-test-stack-create-${{", "named", true],
+    ["e2e-test-stack-unnamed-${{", "unnamed", true],
+  ]);
+});
