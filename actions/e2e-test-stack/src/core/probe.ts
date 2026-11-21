@@ -34,15 +34,15 @@ export function goneUrls(sites: readonly unknown[], ssoHosts: readonly unknown[]
     // The URL parser drops control characters, which would otherwise reach the probe and its log lines unchecked.
     // eslint-disable-next-line no-control-regex
     if (typeof site !== "string" || /[\u0000-\u001f\u007f]/.test(site))
-      throw new ActionError(`the create response's site ${quoted} is not a URL`);
+      throw new ActionError(`the site ${quoted} is not a URL`);
     let url: URL;
     try {
       url = new URL(site);
     } catch {
-      throw new ActionError(`the create response's site ${quoted} is not a URL`);
+      throw new ActionError(`the site ${quoted} is not a URL`);
     }
     if (url.protocol !== "https:" && url.protocol !== "http:")
-      throw new ActionError(`the create response's site ${quoted} is not an http(s) URL`);
+      throw new ActionError(`the site ${quoted} is not an http(s) URL`);
     urls.push(`${url.href.replace(/\/+$/, "")}/api/v4/system/ping`, `${url.protocol}//mail-${url.host}/`);
     protocols[i] = url.protocol;
   }
@@ -50,7 +50,7 @@ export function goneUrls(sites: readonly unknown[], ssoHosts: readonly unknown[]
     if (host === "" || host === null || host === undefined) continue;
     if (typeof host !== "string" || !/^[a-z0-9.-]+(:\d+)?$/i.test(host))
       throw new ActionError(
-        `the create response's sso host ${JSON.stringify(typeof host === "string" ? host.slice(0, 200) : typeof host)} is not a hostname`,
+        `the sso host ${JSON.stringify(typeof host === "string" ? host.slice(0, 200) : typeof host)} is not a hostname`,
       );
     urls.push(`${protocols[i] ?? "https:"}//${host}/`);
   }

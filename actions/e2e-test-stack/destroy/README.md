@@ -1,25 +1,28 @@
 # E2E test stack: destroy
 
-Destroys every attempt's batch of a run, checks that each one's hosts are gone, and destroys each again expecting
-nothing to find. See the [shared README](../README.md) for the keys and setup every action relies on.
+Destroys every attempt's batch of this run, or one batch by its id, checks that each one's hosts are gone, and destroys
+each again expecting nothing to find. See the [shared README](../README.md) for the keys and setup every action relies on.
 
 In order, the action:
 
 1. Checks every input.
-2. With `run-id` naming another run, reads that run and fails unless it ran one of `allowed-workflows`, on a branch
-   `allowed-branches` matches whole, for one of `allowed-events`, from this repository rather than a fork, and has
-   completed: a run still going may be testing against its batches. That run's latest attempt bounds the attempts
-   read. With no `run-id`, it is this run and its attempt now.
-3. Looks up the run's artifacts by name. Each attempt's own response, `e2e-test-stack-response-<batch>-<attempt>`, names that
-   attempt's batch. The newest, `e2e-test-stack-create-<batch>`, stands in for an attempt whose own is missing or
-   cannot be read. A batch must be exactly `<caller-key>-<run id>-<batch>-<attempt>-<suffix>` for the attempt its
-   response is for.
+2. With `batch-id`, takes its run, batch and attempt from it. When that run is another, this job must have been started
+   by hand (`workflow_dispatch`), and it fails unless that run is this repository's own, not a fork's, was started by
+   hand too, has completed, and the attempt that made the batch was started by a person, the same one as this job. Its
+   own response is read, never the newest, which a later attempt someone else started may have uploaded. A batch
+   anyone else made, or an automated run made, is left to that run's own destroy, or to the reaper at its TTL. Without
+   `batch-id`, it is this run, every attempt up to the one now.
+3. Looks up the run's artifacts by name. Each attempt's own response, `e2e-test-stack-response-<batch>-<attempt>`,
+   names that attempt's batch. The newest, `e2e-test-stack-create-<batch>`, stands in for an attempt whose own is
+   missing or cannot be read. A batch must be exactly `<caller-key>-<run id>-<batch>-<attempt>-<suffix>` for the
+   attempt its response is for, and with `batch-id`, exactly that batch.
 4. Assumes `role-arn` with the job's GitHub OIDC token, once, when there is a batch to destroy.
 5. For each batch, opens its token with `credentials-key`, masks every secret, and destroys it. It must come back
    `destroyed`, or `"not found"` when it was already gone. A batch this very attempt created, ready, must still have
    been up, unless it has passed its expiry and was reaped.
 6. Waits, within `gone-window` seconds, for each site, its mail- host and any sso- host to answer the router's 404 for
-   an unknown server.
+   an unknown server. Those the create response names catch a batch still up in another account, which this role
+   cannot find; those the control plane's reply names from the batch's published leases catch any the response lacks.
 7. Destroys the batch again, which must come back `"not found"`.
 
 The batches are destroyed at once, and one batch's failure never keeps another up: every batch is tried, and the step
@@ -29,24 +32,22 @@ Outputs and the summary are written whatever happens.
 ## Permissions
 
 The job needs `id-token: write`, to assume the role, and `actions: read`, for `github-token` to read the run and its
-artifacts. Run [`actions/setup-node`](https://github.com/actions/setup-node) with `node-version: "26"` before the
+artifacts. The job that runs destroy must be defined in the repository's `e2e-test-stack-destroy.yml`, run on a branch
+registered for it: the CI role trusts no other file. An E2E workflow calls it as a reusable workflow. Run [`actions/setup-node`](https://github.com/actions/setup-node) with `node-version: "26"` before the
 action.
 
 ## Inputs
 
-| Input               | Description                                                                                                     |
-| ------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `caller-key`        | The repository's key in the control plane's `callers`, e.g. `mobile`, as `create` was given it. Required        |
-| `batch`             | The batch within the run, e.g. `ios`, as `create` was given it. Required                                        |
-| `role-arn`          | The repository's CI role ARN in the account the batch was created in, as `create` was given it. Required        |
-| `channel`           | `v1` (the default) or `edge`, as `create` was given it                                                          |
-| `credentials-key`   | `${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}`. Required                                                       |
-| `run-id`            | The run whose batches to destroy. Default: this run                                                             |
-| `allowed-workflows` | For another `run-id`: workflow files it may be of, `.github/workflows/<file>`, comma- or newline-separated      |
-| `allowed-branches`  | For another `run-id`: a JavaScript regular expression its whole head branch must match, e.g. `main\|release-.*` |
-| `allowed-events`    | For another `run-id`: events it may be for, comma-separated, e.g. `workflow_dispatch`                           |
-| `gone-window`       | Seconds each host has to stop being served: `180` (the default) to `1800`                                       |
-| `github-token`      | Token for api.github.com, to read the run and its artifacts. Default `github.token`                             |
+| Input             | Description                                                                                                          |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `caller-key`      | The repository's key in the control plane's `callers`, e.g. `mobile`, as `create` was given it. Required             |
+| `batch`           | The batch within this run, e.g. `ios`, as `create` was given it. Required unless `batch-id` is given                 |
+| `batch-id`        | The one batch to destroy, e.g. `mobile-1234-ios-1-a1b2c3`. Another run's only by hand, by whoever started it by hand |
+| `role-arn`        | The repository's CI role ARN in the account the batch was created in, as `create` was given it. Required             |
+| `channel`         | `v1` (the default) or `edge`, as `create` was given it                                                               |
+| `credentials-key` | `${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}`. Required                                                            |
+| `gone-window`     | Seconds each host has to stop being served: `180` (the default) to `1800`                                            |
+| `github-token`    | Token for api.github.com, to read the run and its artifacts. Default `github.token`                                  |
 
 ## Outputs
 
@@ -57,7 +58,7 @@ action.
 
 ## Examples
 
-After the tests, in the run that created the batch:
+After the tests, in the run that created the batch, as a job of `e2e-test-stack-destroy.yml` the E2E workflow calls:
 
 ```yaml
 destroy:
@@ -80,30 +81,38 @@ destroy:
         credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
 ```
 
-By hand, for another run, from a `workflow_dispatch` workflow:
+## Cleaning up by hand
+
+Re-running the destroy job of the run that created the batch is usually enough: it destroys every attempt's batch
+still up. A batch from a run you started by hand can also be destroyed by its id, which create's summary and outputs
+show, from a `workflow_dispatch` trigger in `e2e-test-stack-destroy.yml` that you start yourself. Nobody can destroy
+by hand a batch someone else started, or one an automated run made: that run's own destroy releases it, or the
+reaper at its TTL.
 
 ```yaml
 - uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack/destroy@main
   with:
     caller-key: mobile
-    batch: ${{ inputs.batch }}
+    batch-id: ${{ inputs.batch_id }}
     role-arn: ${{ vars.E2E_TEST_STACK_ROLE_ARN_PROD }}
     credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
-    run-id: ${{ inputs.run_id }}
-    allowed-workflows: .github/workflows/e2e-detox-pr.yml
-    allowed-branches: main|release-[0-9]+\.[0-9]+
-    allowed-events: workflow_dispatch
 ```
 
-The role decides the account: a batch created in another account is `"not found"` there, and its hosts, still up,
-then fail the check that they are gone.
+The batch's run must still hold its create response, which outlives the batch: an artifact is kept at least a day,
+a batch at most four hours.
+
+The role decides the account: a batch of this run created in another account is `"not found"` there, and its hosts,
+still up, then fail the check that they are gone.
 
 ## Failures
 
 The step fails, with the reason, on:
 
-- an invalid input, or another run that is not allowed or has not completed;
-- a create response that cannot be read, or that names a batch the run's attempt did not create;
+- an invalid input, or another run's `batch-id` in a job not started by hand;
+- another run that is a fork's, was not started by hand, has not completed, or whose attempt that made the batch
+  someone else started;
+- a create response that cannot be read, or that names a batch the run's attempt did not create, or not the
+  `batch-id` given;
 - a batch whose token cannot be opened;
 - a destroy that is refused, comes back neither `destroyed` nor `"not found"`, or reports an error;
 - `"not found"` for a batch this attempt created ready, before its expiry;

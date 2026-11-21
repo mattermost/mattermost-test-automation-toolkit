@@ -4,7 +4,7 @@ import { sleep as realSleep } from "../../shared/src/github.ts";
 import type { Env, FetchImpl, Sleep } from "../../shared/src/github.ts";
 import { createArtifact, newest, readResponse, responseArtifact, runArtifacts } from "./core/artifacts.ts";
 import type { Artifact, RunRef } from "./core/artifacts.ts";
-import { batchAttempt } from "./core/batch.ts";
+import { batchAttempt, batchIdParts } from "./core/batch.ts";
 import { ActionError } from "./core/errors.ts";
 import { githubClient } from "./core/github.ts";
 import type { GitHub } from "./core/github.ts";
@@ -13,7 +13,6 @@ import {
   credentialsKeyFrom,
   input,
   integer,
-  list,
   PROJECT,
   REGION,
   refuse,
@@ -34,7 +33,6 @@ import type { Cost, Lease, StackResponse } from "./core/response.ts";
 import { assumeRole, roleArnFrom, stsClient } from "./core/role.ts";
 import type { Credentials, StsSend } from "./core/role.ts";
 import { checkRun } from "./core/run-check.ts";
-import type { RunAllowance } from "./core/run-check.ts";
 import { openBatchSecrets, SealedError } from "./core/sealed.ts";
 
 /** Every output the destroy step writes; action.yml reads only these. */
@@ -46,10 +44,12 @@ export const DEFAULT_GONE_WINDOW = 180;
 export const MAX_GONE_WINDOW = 1800;
 /** The state the control plane reports for a batch with no live server. */
 export const NOT_FOUND = "not found";
-const RUN_ID = /^[1-9]\d{0,19}$/;
 
 export interface DestroyInputs extends StackInputs {
+  /** The batch within the run. */
   batch: string;
+  /** The one batch to destroy, from batch-id; undefined to destroy every attempt's batch of this run. */
+  only?: { batchId: string; attempt: number };
   roleArn: string;
   /** The repository's credentials key, which opens the sealed secrets: an X25519 private key, 32 bytes. */
   credentialsKey: Uint8Array;
@@ -58,40 +58,47 @@ export interface DestroyInputs extends StackInputs {
   repository: string;
   /** This job's run. */
   own: Run;
-  /** The run whose batches are destroyed: this run, or another named by run-id. */
+  /** The run whose batch is destroyed: this run, or the one batch-id names. */
   runId: string;
-  /** What another run must be; undefined for this run. */
-  allowance?: RunAllowance;
+  /** True when that run is another than this job's. */
+  other: boolean;
+  /** Who started this job; set only for another run's batch, which only they may destroy, by hand. */
+  actor: string;
   goneWindowSeconds: number;
 }
 
 /** Reads and checks destroy's inputs and the job's run, before anything is called. */
 export function readDestroyInputs(env: Env): DestroyInputs {
   const common = stackInputs(env);
-  const batch = batchFrom(env);
   const own = runFrom(env);
   const repository = repositoryFrom(env);
-  const runIdInput = input(env, "run-id");
-  if (runIdInput && !RUN_ID.test(runIdInput))
-    refuse(`run-id must be a workflow run's id, got ${JSON.stringify(runIdInput)}`);
-  const runId = runIdInput || own.runId;
-  let allowance: RunAllowance | undefined;
-  if (runId !== own.runId) {
-    const workflows = list(input(env, "allowed-workflows"));
-    const events = list(input(env, "allowed-events"));
-    const branches = input(env, "allowed-branches");
-    if (!workflows.length || !events.length || !branches)
+  const batchId = input(env, "batch-id");
+  let batch: string;
+  let runId = own.runId;
+  let only: DestroyInputs["only"];
+  let actor = "";
+  if (batchId) {
+    const parts =
+      batchIdParts(batchId, common.callerKey) ??
       refuse(
-        "run-id names another run, so allowed-workflows, allowed-branches and allowed-events are required: the run must match all three",
+        `batch-id must be a batch of caller-key ${common.callerKey}, <caller-key>-<run id>-<batch>-<attempt>-<suffix>, got ${JSON.stringify(batchId.slice(0, 100))}`,
       );
-    let pattern: RegExp;
-    try {
-      pattern = new RegExp(`^(?:${branches})$`);
-    } catch {
-      return refuse("allowed-branches is not a regular expression");
+    batch = parts.batch;
+    const given = input(env, "batch");
+    if (given && given !== batch) refuse(`batch-id names batch ${batch}, not ${given}; give one or the other`);
+    runId = parts.runId;
+    only = { batchId, attempt: parts.attempt };
+    if (runId !== own.runId) {
+      // Another run's batch is destroyed only by hand, by whoever started the attempt that made it.
+      if ((env.GITHUB_EVENT_NAME ?? "") !== "workflow_dispatch")
+        refuse(
+          "batch-id names another run's batch, which is destroyed only by a job started by hand (workflow_dispatch)",
+        );
+      // Whoever started this attempt of the job; GITHUB_ACTOR names who first started the run, even on a re-run.
+      actor = (env.GITHUB_TRIGGERING_ACTOR ?? "").trim();
+      if (!actor) refuse("GITHUB_TRIGGERING_ACTOR must be set, as it is in a GitHub Actions job");
     }
-    allowance = { workflows, branches: pattern, events };
-  }
+  } else batch = batchFrom(env);
   const goneWindowSeconds = integer("gone-window", input(env, "gone-window") || String(DEFAULT_GONE_WINDOW), 1);
   if (goneWindowSeconds > MAX_GONE_WINDOW)
     refuse(`gone-window must be ${MAX_GONE_WINDOW} or less, got ${goneWindowSeconds}`);
@@ -109,7 +116,9 @@ export function readDestroyInputs(env: Env): DestroyInputs {
     repository,
     own,
     runId,
-    allowance,
+    other: runId !== own.runId,
+    actor,
+    only,
     goneWindowSeconds,
   };
 }
@@ -206,15 +215,23 @@ async function findTargets(
   const unread = new Map<number, string>();
   // Attempts whose own response was read: the newest names no batch they do not account for.
   const accounted = new Set<number>();
-  const attemptNumbers = Array.from({ length: latest }, (_, i) => i + 1);
+  // With batch-id, only its attempt; otherwise every attempt of the run.
+  const only = inputs.only;
+  const attemptNumbers = only ? [only.attempt] : Array.from({ length: latest }, (_, i) => i + 1);
   const newestName = createArtifact(inputs.batch);
-  // Every lookup at once; each one's failure is kept for its attempt.
-  const [own, newestFound] = await Promise.all([
-    Promise.all(attemptNumbers.map((n) => lookUp(responseArtifact(inputs.batch, n)))),
-    lookUp(newestName),
-  ]);
+  // Every lookup at once, each one's failure kept for its attempt. With batch-id, the newest is looked up only when
+  // that attempt's own response is missing or unreadable.
+  const [own, newestFound] = only
+    ? await (async () => {
+        const mine = await lookUp(responseArtifact(inputs.batch, only.attempt));
+        return [[mine], mine?.response ? undefined : await lookUp(newestName)] as const;
+      })()
+    : await Promise.all([
+        Promise.all(attemptNumbers.map((n) => lookUp(responseArtifact(inputs.batch, n)))),
+        lookUp(newestName),
+      ]);
   for (const [i, found] of own.entries()) {
-    const n = i + 1;
+    const n = attemptNumbers[i];
     if (!found) continue;
     if (!found.response) {
       unread.set(n, found.failure!);
@@ -226,9 +243,9 @@ async function findTargets(
       log(`e2e-test-stack: attempt ${n} made no batch: its create response names none`);
       continue;
     }
-    if (batchAttempt(batchId, owner) !== n) {
+    if (batchAttempt(batchId, owner) !== n || (only && batchId !== only.batchId)) {
       failures.push(
-        `attempt ${n}: ${responseArtifact(inputs.batch, n)} names batch ${named(batchId)}, which attempt ${n} of ${label} did not create`,
+        `attempt ${n}: ${responseArtifact(inputs.batch, n)} names batch ${named(batchId)}, ${only ? `not ${only.batchId}` : `which attempt ${n} of ${label} did not create`}`,
       );
       continue;
     }
@@ -241,9 +258,23 @@ async function findTargets(
     if (!response) {
       // It may be the only record of an attempt whose own response is missing; an unreadable own one is reported
       // already, and with every own response read the newest repeats one of them.
-      if (accounted.size + unread.size === latest)
+      if (accounted.size + unread.size === attemptNumbers.length)
         log(`e2e-test-stack: ${failure}; each attempt's own response is reported instead`);
       else failures.push(`${failure}; a batch only it names is not destroyed, and is reaped at its ttl`);
+    } else if (only) {
+      // Only the one batch is wanted: the newest stands in when it names exactly that one, and only in this run. In
+      // another, a later attempt someone else started may have uploaded it.
+      if (inputs.other)
+        log(
+          `e2e-test-stack: ${newestName} is not used for another run's batch: only attempt ${only.attempt}'s own response is`,
+        );
+      else if (batchId === only.batchId && !accounted.has(only.attempt)) {
+        log(
+          `e2e-test-stack: attempt ${only.attempt}'s own response is ${unread.has(only.attempt) ? "unreadable" : "missing"}; batch ${only.batchId} is taken from ${newestName}`,
+        );
+        unread.delete(only.attempt);
+        byAttempt.set(only.attempt, { attempt: only.attempt, batchId, response, from: newestName });
+      }
     } else if (batchId) {
       const n = batchAttempt(batchId, owner);
       const later = batchAttempt(batchId, { ...owner, attempt: Number.MAX_SAFE_INTEGER });
@@ -264,6 +295,10 @@ async function findTargets(
   }
   for (const [n, failure] of unread)
     failures.push(`attempt ${n}: ${failure}; its batch, if any, is not destroyed, and is reaped at its ttl`);
+  if (only && !byAttempt.size && !failures.length)
+    failures.push(
+      `no create response of ${label} names batch ${only.batchId}, so it cannot be destroyed; it is reaped at its ttl`,
+    );
   return { targets: [...byAttempt.values()].sort((a, b) => a.attempt - b.attempt), failures };
 }
 
@@ -295,10 +330,10 @@ function wholeCost(response: StackResponse): number | undefined {
 }
 
 /**
- * Destroys every attempt's batch of a run: this run's, or another run's named by run-id once that run is checked.
- * Each batch is named exactly for the run, the batch and its attempt, and read from that attempt's create response or
- * the newest. Once destroyed, every site, mail and SSO host must answer the router's 404, and a second destroy must
- * find nothing. One batch's failure never keeps another up. Outputs and the summary are written whatever happens.
+ * Destroys every attempt's batch of this run, or the one batch-id names, from its own run once that run is checked.
+ * Each batch is named exactly for its run, batch and attempt, and read from that attempt's create response or the
+ * newest. Once destroyed, every site, mail and SSO host must answer the router's 404, and a second destroy must find
+ * nothing. One batch's failure never keeps another up. Outputs and the summary are written whatever happens.
  */
 export function destroyWith(overrides: Partial<DestroyDeps> = {}): (env: Env) => Promise<void> {
   const log = overrides.log ?? console.log;
@@ -329,12 +364,27 @@ async function destroyBatches(env: Env, deps: DestroyDeps): Promise<void> {
   try {
     const inputs = readDestroyInputs(env);
     const run: RunRef = { repository: inputs.repository, runId: inputs.runId };
-    const label = inputs.allowance ? `run ${inputs.runId}` : "this run";
+    const label = inputs.other ? `run ${inputs.runId}` : "this run";
     const github = githubClient(inputs.githubToken, deps.fetch, deps.sleep, log);
-    const latest = inputs.allowance
-      ? await checkRun(github, inputs.repository, inputs.runId, inputs.allowance, log)
-      : inputs.own.attempt;
-    summary.push(`Batch \`${cell(inputs.batch)}\` of ${label}, attempts 1 to ${latest}.`, "");
+    const latest =
+      inputs.other && inputs.only
+        ? await checkRun(
+            github,
+            inputs.repository,
+            { runId: inputs.runId, attempt: inputs.only.attempt, actor: inputs.actor },
+            log,
+          )
+        : inputs.own.attempt;
+    if (inputs.only && inputs.only.attempt > latest)
+      throw new ActionError(
+        `batch ${inputs.only.batchId} is from attempt ${inputs.only.attempt}, but ${label} has ${latest}`,
+      );
+    summary.push(
+      inputs.only
+        ? `Batch \`${cell(inputs.only.batchId)}\` of ${label}.`
+        : `Batch \`${cell(inputs.batch)}\` of ${label}, attempts 1 to ${latest}.`,
+      "",
+    );
 
     const found = await findTargets(github, run, inputs, latest, label, log);
     failures.push(...found.failures);
@@ -359,7 +409,7 @@ async function destroyBatches(env: Env, deps: DestroyDeps): Promise<void> {
     if (invoke) {
       const target = alias(PROJECT, inputs.channel, inputs.callerKey);
       // A batch created in this very attempt must still have been up for this destroy to find.
-      const current = inputs.allowance ? undefined : inputs.own.attempt;
+      const current = inputs.other ? undefined : inputs.own.attempt;
       // Each batch at once, so one slow to go never holds up the others; an error in one is that attempt's failure.
       const settled = await Promise.all(
         found.targets.map((t) => destroyOne(t, target, invoke, secrets, inputs, current, deps, notes)),
@@ -375,7 +425,8 @@ async function destroyBatches(env: Env, deps: DestroyDeps): Promise<void> {
     const destroyed = results.filter((r) => r.state === "destroyed");
     if (destroyed.length && destroyed.every((r) => r.cost_usd !== ""))
       outputs.cost_usd = destroyed.reduce((sum, r) => sum + Number(r.cost_usd), 0).toFixed(2);
-    if (failures.length) throw new ActionError(`destroy failed for batch ${inputs.batch}: ${failures.join("; ")}`);
+    if (failures.length)
+      throw new ActionError(`destroy failed for batch ${inputs.only?.batchId ?? inputs.batch}: ${failures.join("; ")}`);
   } catch (e) {
     failure = e;
   }
@@ -507,17 +558,41 @@ async function destroySteps(
     );
   }
 
-  // The hosts are those the create response named: a destroy's reply describes what it found.
-  let urls: string[];
-  try {
-    const leases = Array.isArray(t.response.batch?.instances) ? t.response.batch.instances : [];
-    urls = goneUrls(
-      Array.isArray(t.response.sites) ? t.response.sites : [],
-      leases.map((l) => (isObject(l) ? l.sso_host : undefined)),
-    );
-  } catch (e) {
-    return `batch ${t.batchId}'s hosts could not be checked: ${reason(e)}`;
-  }
+  // The hosts the create response named catch a batch still up in another account, whose reply there is "not found"
+  // and names none; those the control plane's reply names from the batch's published leases catch any the response
+  // lacks. The response is this run's own, or that of an attempt the same person started by hand. Each list is read on
+  // its own, so one malformed list leaves the other probed; the reply's sso- hosts take the scheme of the site at their
+  // index, from the reply or else the response.
+  const sitesOf = (r: StackResponse): unknown[] => (Array.isArray(r.sites) ? r.sites : []);
+  const ssoOf = (r: StackResponse): unknown[] =>
+    (Array.isArray(r.batch?.instances) ? r.batch.instances : []).map((l) => (isObject(l) ? l.sso_host : undefined));
+  const responseSites = sitesOf(t.response);
+  const replySites = sitesOf(first);
+  const lists: [string, () => string[]][] = [
+    ["the create response's", () => goneUrls(responseSites, ssoOf(t.response))],
+    [
+      "the destroy reply's",
+      () =>
+        goneUrls(
+          Array.from(
+            { length: Math.max(replySites.length, responseSites.length) },
+            (_, i) => replySites[i] || responseSites[i],
+          ),
+          ssoOf(first),
+        ),
+    ],
+  ];
+  const urls: string[] = [];
+  const unread: string[] = [];
+  for (const [whose, read] of lists)
+    try {
+      urls.push(...read());
+    } catch (e) {
+      unread.push(`${whose} hosts could not be read: ${reason(e)}`);
+    }
+  if (unread.length === lists.length) return `batch ${t.batchId}: ${unread.join("; ")}`;
+  urls.splice(0, urls.length, ...new Set(urls));
+  for (const u of unread) notes.push(`Batch ${t.batchId}: ${u}; the others were checked.`);
   if (urls.length) {
     deps.log(
       `e2e-test-stack: probing ${urls.length} host(s) of batch ${t.batchId} for the router's 404, within ${inputs.goneWindowSeconds} s`,
