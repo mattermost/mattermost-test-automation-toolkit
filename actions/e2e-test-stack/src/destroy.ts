@@ -13,7 +13,6 @@ import {
   credentialsKeyFrom,
   input,
   integer,
-  list,
   PROJECT,
   REGION,
   refuse,
@@ -28,12 +27,12 @@ import { requestIdToken } from "./core/oidc.ts";
 import { cell, masker, settle } from "./core/outputs.ts";
 import type { Masker } from "./core/outputs.ts";
 import { goneUrls, probeGone } from "./core/probe.ts";
-import { errorText, handlerError, redact } from "./core/redact.ts";
+import { callControlPlane, parseResponse, reason } from "./core/control-plane.ts";
 import { isObject, maskBatchSecrets, responseError } from "./core/response.ts";
 import type { Cost, Lease, StackResponse } from "./core/response.ts";
 import { assumeRole, roleArnFrom, stsClient } from "./core/role.ts";
 import type { Credentials, StsSend } from "./core/role.ts";
-import { checkRun } from "./core/run-check.ts";
+import { checkRun, runTargetFrom } from "./core/run-check.ts";
 import type { RunAllowance } from "./core/run-check.ts";
 import { openBatchSecrets, SealedError } from "./core/sealed.ts";
 
@@ -46,7 +45,6 @@ export const DEFAULT_GONE_WINDOW = 180;
 export const MAX_GONE_WINDOW = 1800;
 /** The state the control plane reports for a batch with no live server. */
 export const NOT_FOUND = "not found";
-const RUN_ID = /^[1-9]\d{0,19}$/;
 
 export interface DestroyInputs extends StackInputs {
   batch: string;
@@ -71,27 +69,7 @@ export function readDestroyInputs(env: Env): DestroyInputs {
   const batch = batchFrom(env);
   const own = runFrom(env);
   const repository = repositoryFrom(env);
-  const runIdInput = input(env, "run-id");
-  if (runIdInput && !RUN_ID.test(runIdInput))
-    refuse(`run-id must be a workflow run's id, got ${JSON.stringify(runIdInput)}`);
-  const runId = runIdInput || own.runId;
-  let allowance: RunAllowance | undefined;
-  if (runId !== own.runId) {
-    const workflows = list(input(env, "allowed-workflows"));
-    const events = list(input(env, "allowed-events"));
-    const branches = input(env, "allowed-branches");
-    if (!workflows.length || !events.length || !branches)
-      refuse(
-        "run-id names another run, so allowed-workflows, allowed-branches and allowed-events are required: the run must match all three",
-      );
-    let pattern: RegExp;
-    try {
-      pattern = new RegExp(`^(?:${branches})$`);
-    } catch {
-      return refuse("allowed-branches is not a regular expression");
-    }
-    allowance = { workflows, branches: pattern, events };
-  }
+  const { runId, allowance } = runTargetFrom(env, own.runId);
   const goneWindowSeconds = integer("gone-window", input(env, "gone-window") || String(DEFAULT_GONE_WINDOW), 1);
   if (goneWindowSeconds > MAX_GONE_WINDOW)
     refuse(`gone-window must be ${MAX_GONE_WINDOW} or less, got ${goneWindowSeconds}`);
@@ -151,18 +129,6 @@ export interface AttemptResult {
   cost_usd: string;
 }
 
-const parse = (raw: Buffer): StackResponse | undefined => {
-  try {
-    const value: unknown = JSON.parse(raw.toString("utf8"));
-    return isObject(value) ? value : undefined;
-  } catch {
-    return undefined;
-  }
-};
-
-/** An ActionError's own message, already written for the reader; any other error's class and first line. */
-const reason = (e: unknown): string => (e instanceof ActionError ? e.message : errorText(e));
-
 /**
  * The batches of the run to destroy, one per attempt: each attempt's own response, or the newest response when it
  * names that attempt's batch and the attempt's own is missing or unreadable. A response that cannot be read, or that
@@ -194,7 +160,7 @@ async function findTargets(
     try {
       const artifact = await find(name);
       if (!artifact) return undefined;
-      const response = parse(await readResponse(github, run, artifact, what));
+      const response = parseResponse((await readResponse(github, run, artifact, what)).toString("utf8"));
       return response ? { response } : { failure: `${what} is not a JSON object` };
     } catch (e) {
       return { failure: reason(e) };
@@ -388,25 +354,15 @@ async function destroyBatches(env: Env, deps: DestroyDeps): Promise<void> {
   settle(env, "destroy", outputs, summary, failure);
 }
 
-/** Invokes the control plane and reads its reply; a refusal or an unreadable reply is an ActionError. */
-async function call(
+/** A destroy call's response; a refusal is an ActionError. */
+async function destroyCall(
   invoke: Invoke,
   target: Omit<InvokeInput, "Payload">,
   payload: Record<string, unknown>,
 ): Promise<StackResponse> {
-  const named = `${target.FunctionName}:${target.Qualifier}`;
-  let reply;
-  try {
-    reply = await invoke({ ...target, Payload: JSON.stringify(payload) });
-  } catch (e) {
-    throw new ActionError(`the invoke of ${named} failed: ${reason(e)}`);
-  }
-  const text = reply.Payload ? new TextDecoder().decode(reply.Payload) : "";
-  if (reply.FunctionError) throw new ActionError(`the control plane refused the destroy: ${handlerError(text)}`);
-  if (reply.StatusCode !== 200) throw new ActionError(`the invoke answered ${reply.StatusCode}: ${handlerError(text)}`);
-  const response = parse(Buffer.from(text));
-  if (!response) throw new ActionError(`the control plane's reply is not a JSON object: ${redact(text).slice(0, 200)}`);
-  return response;
+  const reply = await callControlPlane(invoke, target, payload);
+  if (reply.refused !== undefined) throw new ActionError(`the control plane refused the destroy: ${reply.refused}`);
+  return reply.response;
 }
 
 /** Destroys one attempt's batch, checks its hosts are gone, and destroys it again expecting nothing to find. */
@@ -470,7 +426,7 @@ async function destroySteps(
   const payload = { action: "destroy", batch_id: t.batchId, batch_token: batchToken };
   let first: StackResponse;
   try {
-    first = await call(invoke, target, payload);
+    first = await destroyCall(invoke, target, payload);
   } catch (e) {
     return `batch ${t.batchId}: ${reason(e)}; ${kept}`;
   }
@@ -525,7 +481,7 @@ async function destroySteps(
   } else result.gone = "no host to check";
 
   try {
-    const again = await call(invoke, target, payload);
+    const again = await destroyCall(invoke, target, payload);
     result.again = typeof again.batch?.state === "string" ? again.batch.state : "unknown";
   } catch (e) {
     result.again = "failed";

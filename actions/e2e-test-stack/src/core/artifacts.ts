@@ -99,11 +99,16 @@ export interface CreateArtifact {
 
 /**
  * Downloads the run's newest artifact for batch and reads its create response; undefined when the run has no such
- * artifact. One that has expired, cannot be downloaded or read, or holds no response fails, naming it.
+ * artifact. One that has expired, cannot be downloaded or read, or holds no response fails, naming it as label's.
  */
-export async function createResponse(github: GitHub, run: RunRef, batch: string): Promise<CreateArtifact | undefined> {
+export async function createResponse(
+  github: GitHub,
+  run: RunRef,
+  batch: string,
+  label = "this run",
+): Promise<CreateArtifact | undefined> {
   const name = createArtifact(batch);
   const artifact = await newestArtifact(github, run, name);
   if (!artifact) return undefined;
-  return { artifact, response: await readResponse(github, run, artifact, `this run's artifact ${name}`) };
+  return { artifact, response: await readResponse(github, run, artifact, `${label}'s artifact ${name}`) };
 }

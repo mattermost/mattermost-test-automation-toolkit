@@ -4,6 +4,7 @@ import { sleep as realSleep } from "../../shared/src/github.ts";
 import type { Env, FetchImpl, Sleep } from "../../shared/src/github.ts";
 import { createArtifact, createResponse } from "./core/artifacts.ts";
 import { batchAttempt } from "./core/batch.ts";
+import { parseResponse } from "./core/control-plane.ts";
 import { ActionError } from "./core/errors.ts";
 import { githubClient } from "./core/github.ts";
 import {
@@ -19,7 +20,7 @@ import {
 import type { Run } from "./core/inputs.ts";
 import { masker, settle } from "./core/outputs.ts";
 import { entries, isObject, maskBatchSecrets, responseError } from "./core/response.ts";
-import type { BatchSecrets, InstanceSecrets, Lease, StackResponse } from "./core/response.ts";
+import type { BatchSecrets, InstanceSecrets, Lease } from "./core/response.ts";
 import { openBatchSecrets, SealedError } from "./core/sealed.ts";
 
 /** Every output the open step writes; action.yml reads only these. */
@@ -144,13 +145,8 @@ async function openServer(env: Env, deps: OpenDeps): Promise<void> {
         `this run has no artifact ${name}: no create step for batch ${inputs.batch} uploaded a response in any of its attempts`,
       );
 
-    let response: StackResponse | null;
-    try {
-      response = JSON.parse(found.response.toString("utf8")) as StackResponse | null;
-    } catch {
-      response = null;
-    }
-    if (!isObject(response)) throw new ActionError(`the create response in ${name} is not a JSON object`);
+    const response = parseResponse(found.response.toString("utf8"));
+    if (!response) throw new ActionError(`the create response in ${name} is not a JSON object`);
     const batchId = typeof response.batch_id === "string" ? response.batch_id : "";
     if (!batchId) {
       const error = responseError(response);

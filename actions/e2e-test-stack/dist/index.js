@@ -3432,7 +3432,7 @@ var init_getInstanceMetadataRegion = __esm({
     };
     imdsRequest = async (options) => {
       const { request } = await import("http");
-      return new Promise((resolve2, reject) => {
+      return new Promise((resolve3, reject) => {
         const req = request({
           hostname: options.hostname,
           port: options.port,
@@ -3460,7 +3460,7 @@ var init_getInstanceMetadataRegion = __esm({
           const chunks = [];
           res.on("data", (chunk) => chunks.push(chunk));
           res.on("end", () => {
-            resolve2(Buffer.concat(chunks));
+            resolve3(Buffer.concat(chunks));
             req.destroy();
           });
         });
@@ -4959,7 +4959,7 @@ var init_stream_collector = __esm({
       if (isReadableStream(stream)) {
         return collectReadableStream(stream);
       }
-      return new Promise((resolve2, reject) => {
+      return new Promise((resolve3, reject) => {
         const collector = new Collector();
         const nodeStream = stream;
         nodeStream.pipe(collector);
@@ -4970,7 +4970,7 @@ var init_stream_collector = __esm({
         collector.on("error", reject);
         collector.on("finish", function() {
           const bytes = concatBytes(this.bufferedBytes);
-          resolve2(bytes);
+          resolve3(bytes);
         });
       });
     };
@@ -6362,7 +6362,7 @@ async function* readableToIterable(readStream) {
     streamEnded = true;
   });
   while (!generationEnded) {
-    const value = await new Promise((resolve2) => setTimeout(() => resolve2(records.shift()), 0));
+    const value = await new Promise((resolve3) => setTimeout(() => resolve3(records.shift()), 0));
     if (value) {
       yield value;
     }
@@ -9247,7 +9247,7 @@ function bindRetryMiddleware(isStreamingPayload2) {
           const delay2 = retryToken.getRetryDelay();
           totalRetryDelay += (retryToken?.$retryLog?.acquisitionDelay ?? 0) + delay2;
           if (delay2 > 0) {
-            await race(new Promise((resolve2) => setTimeout(resolve2, delay2)), abortSignal);
+            await race(new Promise((resolve3) => setTimeout(resolve3, delay2)), abortSignal);
           }
         }
       }
@@ -9382,7 +9382,7 @@ var init_DefaultRateLimiter = __esm({
         this.refillTokenBucket();
         while (amount > this.availableTokens) {
           const delay2 = (amount - this.availableTokens) / this.fillRate * 1e3;
-          await new Promise((resolve2) => _DefaultRateLimiter.setTimeoutFn(resolve2, delay2));
+          await new Promise((resolve3) => _DefaultRateLimiter.setTimeoutFn(resolve3, delay2));
           this.refillTokenBucket();
         }
         this.availableTokens = this.availableTokens - amount;
@@ -12479,7 +12479,7 @@ var init_node_http = __esm({
 
 // ../../node_modules/@smithy/credential-provider-imds/dist-es/remoteProvider/httpRequest.js
 function httpRequest(options) {
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve3, reject) => {
     const req = import_node_http.default.request({
       method: "GET",
       ...options,
@@ -12504,7 +12504,7 @@ function httpRequest(options) {
         chunks.push(chunk);
       });
       res.on("end", () => {
-        resolve2(Buffer.concat(chunks));
+        resolve3(Buffer.concat(chunks));
         req.destroy();
       });
     });
@@ -13171,21 +13171,21 @@ async function writeRequestBody(httpRequest2, request, maxContinueTimeoutMs = MI
   let sendBody = true;
   if (!externalAgent && expect === "100-continue") {
     sendBody = await Promise.race([
-      new Promise((resolve2) => {
-        timeoutId = Number(timing.setTimeout(() => resolve2(true), Math.max(MIN_WAIT_TIME, maxContinueTimeoutMs)));
+      new Promise((resolve3) => {
+        timeoutId = Number(timing.setTimeout(() => resolve3(true), Math.max(MIN_WAIT_TIME, maxContinueTimeoutMs)));
       }),
-      new Promise((resolve2) => {
+      new Promise((resolve3) => {
         httpRequest2.on("continue", () => {
           timing.clearTimeout(timeoutId);
-          resolve2(true);
+          resolve3(true);
         });
         httpRequest2.on("response", () => {
           timing.clearTimeout(timeoutId);
-          resolve2(false);
+          resolve3(false);
         });
         httpRequest2.on("error", () => {
           timing.clearTimeout(timeoutId);
-          resolve2(false);
+          resolve3(false);
         });
       })
     ]);
@@ -13289,13 +13289,13 @@ or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler conf
         return socketWarningTimestamp;
       }
       constructor(options) {
-        this.configProvider = new Promise((resolve2, reject) => {
+        this.configProvider = new Promise((resolve3, reject) => {
           if (typeof options === "function") {
             options().then((_options) => {
-              resolve2(this.resolveDefaultConfig(_options));
+              resolve3(this.resolveDefaultConfig(_options));
             }).catch(reject);
           } else {
-            resolve2(this.resolveDefaultConfig(options));
+            resolve3(this.resolveDefaultConfig(options));
           }
         });
       }
@@ -13325,7 +13325,7 @@ or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler conf
             timing.clearTimeout(requestTimeoutId);
             timing.clearTimeout(keepAliveTimeoutId);
           };
-          const resolve2 = async (arg) => {
+          const resolve3 = async (arg) => {
             await writeRequestBodyPromise;
             clearTimeouts();
             _resolve(arg);
@@ -13389,7 +13389,7 @@ or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler conf
               headers: getTransformedHeaders(res.headers),
               body: res
             });
-            resolve2({ response: httpResponse });
+            resolve3({ response: httpResponse });
           });
           req.on("error", (err) => {
             if (NODEJS_TIMEOUT_ERROR_CODES2.includes(err.code)) {
@@ -13606,7 +13606,7 @@ var init_retry_wrapper = __esm({
           try {
             return await toRetry();
           } catch (e7) {
-            await new Promise((resolve2) => setTimeout(resolve2, delayMs));
+            await new Promise((resolve3) => setTimeout(resolve3, delayMs));
           }
         }
         return await toRetry();
@@ -20084,7 +20084,7 @@ var import_node_path8 = require("path");
 init_retry2();
 
 // ../shared/src/github.ts
-var sleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
+var sleep = (ms) => new Promise((resolve3) => setTimeout(resolve3, ms));
 var RETRY_DELAYS_MS = Object.freeze([1e3, 3e3]);
 var networkError = (e7) => e7 instanceof TypeError && (e7.message === "fetch failed" || e7.message === "terminated") || e7 instanceof DOMException && (e7.name === "TimeoutError" || e7.name === "AbortError");
 
@@ -26470,7 +26470,7 @@ async function abortable(waited, signal) {
   try {
     await Promise.race([
       waited,
-      new Promise((resolve2) => signal.addEventListener("abort", stop = () => resolve2(), { once: true }))
+      new Promise((resolve3) => signal.addEventListener("abort", stop = () => resolve3(), { once: true }))
     ]);
   } finally {
     signal.removeEventListener("abort", stop);
@@ -26559,7 +26559,8 @@ var import_node_fs5 = require("fs");
 var import_node_path7 = require("path");
 
 // src/core/redact.ts
-var redact = (text4) => text4.replace(/arn:aws[a-z-]*:(?:[^\s"';()|`<>[\]{}]*[^\s"',;()|`<>[\]{}.])?/g, "[arn]").replace(/(?<![\w-])\d{12}(?![\w-])/g, "[account]");
+var redact = (text4) => redactArns(text4).replace(/(?<![\w-])\d{12}(?![\w-])/g, "[account]");
+var redactArns = (text4) => text4.replace(/arn:aws[a-z-]*:(?:[^\s"';()|`<>[\]{}]*[^\s"',;()|`<>[\]{}.])?/g, "[arn]");
 var errorText = (e7) => {
   const name = e7?.name || "Error";
   const message = redact(String(e7?.message ?? e7)).split("\n")[0].slice(0, 200);
@@ -31829,11 +31830,11 @@ async function readResponse(github, run2, artifact, what) {
   if (!response) throw new ActionError(`${what} holds no ${RESPONSE_FILE}`);
   return response;
 }
-async function createResponse(github, run2, batch) {
+async function createResponse(github, run2, batch, label = "this run") {
   const name = createArtifact(batch);
   const artifact = await newestArtifact(github, run2, name);
   if (!artifact) return void 0;
-  return { artifact, response: await readResponse(github, run2, artifact, `this run's artifact ${name}`) };
+  return { artifact, response: await readResponse(github, run2, artifact, `${label}'s artifact ${name}`) };
 }
 
 // src/core/batch.ts
@@ -31920,6 +31921,32 @@ async function probeGone(urls, windowMs, o5) {
   return (await Promise.all(urls.map(probe))).filter((f8) => f8 !== void 0);
 }
 
+// src/core/control-plane.ts
+var reason = (e7) => e7 instanceof ActionError ? e7.message : errorText(e7);
+var parseResponse = (text4) => {
+  try {
+    const value = JSON.parse(text4);
+    return isObject(value) ? value : void 0;
+  } catch {
+    return void 0;
+  }
+};
+async function callControlPlane(invoke, target, payload) {
+  const named = `${target.FunctionName}:${target.Qualifier}`;
+  let reply;
+  try {
+    reply = await invoke({ ...target, Payload: JSON.stringify(payload) });
+  } catch (e7) {
+    throw new ActionError(`the invoke of ${named} failed: ${reason(e7)}`);
+  }
+  const text4 = reply.Payload ? new TextDecoder().decode(reply.Payload) : "";
+  if (reply.FunctionError) return { refused: handlerError(text4) };
+  if (reply.StatusCode !== 200) throw new ActionError(`the invoke answered ${reply.StatusCode}: ${handlerError(text4)}`);
+  const response = parseResponse(text4);
+  if (!response) throw new ActionError(`the control plane's reply is not a JSON object: ${redact(text4).slice(0, 200)}`);
+  return { response };
+}
+
 // src/core/run-check.ts
 var text2 = (v2) => typeof v2 === "string" ? v2 : "";
 async function checkRun(github, repository, runId, allowed, log) {
@@ -31936,7 +31963,7 @@ async function checkRun(github, repository, runId, allowed, log) {
   const status = text2(run2?.status);
   if (status !== "completed")
     throw new ActionError(
-      `run ${runId} is ${JSON.stringify(status || "in no state")}, not completed: destroy its batches once it completes`
+      `run ${runId} is ${JSON.stringify(status || "in no state")}, not completed: act on its batches once it completes`
     );
   const attempt = run2?.run_attempt;
   if (typeof attempt !== "number" || !Number.isSafeInteger(attempt) || attempt < 1)
@@ -31944,38 +31971,39 @@ async function checkRun(github, repository, runId, allowed, log) {
   log(`e2e-test-stack: run ${runId} is allowed: ${described}, attempt ${attempt}`);
   return attempt;
 }
+var RUN_ID = /^[1-9]\d{0,19}$/;
+function runTargetFrom(env2, ownRunId) {
+  const runIdInput = input(env2, "run-id");
+  if (runIdInput && !RUN_ID.test(runIdInput))
+    refuse(`run-id must be a workflow run's id, got ${JSON.stringify(runIdInput)}`);
+  const runId = runIdInput || ownRunId;
+  if (runId === ownRunId) return { runId };
+  const workflows = list(input(env2, "allowed-workflows"));
+  const events = list(input(env2, "allowed-events"));
+  const branches = input(env2, "allowed-branches");
+  if (!workflows.length || !events.length || !branches)
+    refuse(
+      "run-id names another run, so allowed-workflows, allowed-branches and allowed-events are required: the run must match all three"
+    );
+  let pattern;
+  try {
+    pattern = new RegExp(`^(?:${branches})$`);
+  } catch {
+    return refuse("allowed-branches is not a regular expression");
+  }
+  return { runId, allowance: { workflows, branches: pattern, events } };
+}
 
 // src/destroy.ts
 var DEFAULT_GONE_WINDOW = 180;
 var MAX_GONE_WINDOW = 1800;
 var NOT_FOUND = "not found";
-var RUN_ID = /^[1-9]\d{0,19}$/;
 function readDestroyInputs(env2) {
   const common = stackInputs(env2);
   const batch = batchFrom(env2);
   const own = runFrom(env2);
   const repository = repositoryFrom(env2);
-  const runIdInput = input(env2, "run-id");
-  if (runIdInput && !RUN_ID.test(runIdInput))
-    refuse(`run-id must be a workflow run's id, got ${JSON.stringify(runIdInput)}`);
-  const runId = runIdInput || own.runId;
-  let allowance;
-  if (runId !== own.runId) {
-    const workflows = list(input(env2, "allowed-workflows"));
-    const events = list(input(env2, "allowed-events"));
-    const branches = input(env2, "allowed-branches");
-    if (!workflows.length || !events.length || !branches)
-      refuse(
-        "run-id names another run, so allowed-workflows, allowed-branches and allowed-events are required: the run must match all three"
-      );
-    let pattern;
-    try {
-      pattern = new RegExp(`^(?:${branches})$`);
-    } catch {
-      return refuse("allowed-branches is not a regular expression");
-    }
-    allowance = { workflows, branches: pattern, events };
-  }
+  const { runId, allowance } = runTargetFrom(env2, own.runId);
   const goneWindowSeconds = integer("gone-window", input(env2, "gone-window") || String(DEFAULT_GONE_WINDOW), 1);
   if (goneWindowSeconds > MAX_GONE_WINDOW)
     refuse(`gone-window must be ${MAX_GONE_WINDOW} or less, got ${goneWindowSeconds}`);
@@ -31997,15 +32025,6 @@ function readDestroyInputs(env2) {
     goneWindowSeconds
   };
 }
-var parse = (raw) => {
-  try {
-    const value = JSON.parse(raw.toString("utf8"));
-    return isObject(value) ? value : void 0;
-  } catch {
-    return void 0;
-  }
-};
-var reason = (e7) => e7 instanceof ActionError ? e7.message : errorText(e7);
 async function findTargets(github, run2, inputs, latest, label, log) {
   const failures = [];
   const owner = { callerKey: inputs.callerKey, runId: run2.runId, batch: inputs.batch, attempt: latest };
@@ -32021,7 +32040,7 @@ async function findTargets(github, run2, inputs, latest, label, log) {
     try {
       const artifact = await find(name);
       if (!artifact) return void 0;
-      const response = parse(await readResponse(github, run2, artifact, what));
+      const response = parseResponse((await readResponse(github, run2, artifact, what)).toString("utf8"));
       return response ? { response } : { failure: `${what} is not a JSON object` };
     } catch (e7) {
       return { failure: reason(e7) };
@@ -32175,20 +32194,10 @@ async function destroyBatches(env2, deps) {
   summary.push(...[...notes].sort().map((n5) => `- ${cell(n5)}`));
   settle(env2, "destroy", outputs, summary, failure);
 }
-async function call(invoke, target, payload) {
-  const named = `${target.FunctionName}:${target.Qualifier}`;
-  let reply;
-  try {
-    reply = await invoke({ ...target, Payload: JSON.stringify(payload) });
-  } catch (e7) {
-    throw new ActionError(`the invoke of ${named} failed: ${reason(e7)}`);
-  }
-  const text4 = reply.Payload ? new TextDecoder().decode(reply.Payload) : "";
-  if (reply.FunctionError) throw new ActionError(`the control plane refused the destroy: ${handlerError(text4)}`);
-  if (reply.StatusCode !== 200) throw new ActionError(`the invoke answered ${reply.StatusCode}: ${handlerError(text4)}`);
-  const response = parse(Buffer.from(text4));
-  if (!response) throw new ActionError(`the control plane's reply is not a JSON object: ${redact(text4).slice(0, 200)}`);
-  return response;
+async function destroyCall(invoke, target, payload) {
+  const reply = await callControlPlane(invoke, target, payload);
+  if (reply.refused !== void 0) throw new ActionError(`the control plane refused the destroy: ${reply.refused}`);
+  return reply.response;
 }
 async function destroyOne(t2, target, invoke, secrets, inputs, current, deps, notes) {
   const result = {
@@ -32226,7 +32235,7 @@ async function destroySteps(t2, result, target, invoke, secrets, inputs, current
   const payload = { action: "destroy", batch_id: t2.batchId, batch_token: batchToken };
   let first;
   try {
-    first = await call(invoke, target, payload);
+    first = await destroyCall(invoke, target, payload);
   } catch (e7) {
     return `batch ${t2.batchId}: ${reason(e7)}; ${kept}`;
   }
@@ -32275,7 +32284,7 @@ async function destroySteps(t2, result, target, invoke, secrets, inputs, current
     result.gone = `yes, all ${urls.length}`;
   } else result.gone = "no host to check";
   try {
-    const again = await call(invoke, target, payload);
+    const again = await destroyCall(invoke, target, payload);
     result.again = typeof again.batch?.state === "string" ? again.batch.state : "unknown";
   } catch (e7) {
     result.again = "failed";
@@ -32286,6 +32295,335 @@ async function destroySteps(t2, result, target, invoke, secrets, inputs, current
   return void 0;
 }
 var destroy = destroyWith();
+
+// src/logs.ts
+var import_node_crypto7 = require("crypto");
+var import_node_fs6 = require("fs");
+var import_promises5 = require("fs/promises");
+var import_node_os5 = require("os");
+var import_node_path9 = require("path");
+var import_node_zlib2 = require("zlib");
+var LOGS_CONCURRENCY = 4;
+var DOWNLOAD_TIMEOUT_MS = 3e5;
+var MAX_LOG_BYTES = 256 << 20;
+var BLOCK_BYTES = 1 << 20;
+var MAX_TAIL_BYTES = 16 << 20;
+var GONE2 = "no live instances tagged";
+var ARTIFACT_PREFIX = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/;
+function readLogsInputs(env2) {
+  const common = stackInputs(env2);
+  const batch = batchFrom(env2);
+  const own = runFrom(env2);
+  const repository = repositoryFrom(env2);
+  const { runId, allowance } = runTargetFrom(env2, own.runId);
+  const artifactPrefix = input(env2, "artifact-prefix") || "e2e-test-stack-logs";
+  if (!ARTIFACT_PREFIX.test(artifactPrefix))
+    refuse("artifact-prefix must be letters, digits, '.', '_' and '-', starting with a letter or digit, at most 100");
+  const roleArn = roleArnFrom(input(env2, "role-arn"), common.callerKey);
+  const credentialsKey = credentialsKeyFrom(input(env2, "credentials-key"));
+  const githubToken = input(env2, "github-token");
+  if (!githubToken)
+    refuse("github-token is required: a token that reads the run's artifacts, such as github.token with actions: read");
+  return { ...common, batch, roleArn, credentialsKey, githubToken, repository, own, runId, allowance, artifactPrefix };
+}
+var scrubber = (secrets, also2) => {
+  const values = [.../* @__PURE__ */ new Set([...secrets.masked, ...also2])].filter(Boolean).sort((a8, b8) => b8.length - a8.length);
+  const pattern = values.length ? new RegExp(values.map((v2) => v2.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g") : void 0;
+  return (text4) => redactArns(pattern ? text4.replace(pattern, "***") : text4);
+};
+async function pool(items, limit, task) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i8 = next++;
+      results[i8] = await task(items[i8]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+function logsWith(overrides = {}) {
+  const log = overrides.log ?? console.log;
+  const deps = {
+    log,
+    fetch: overrides.fetch ?? fetch,
+    sleep: overrides.sleep ?? sleep,
+    sts: overrides.sts ?? stsClient,
+    connect: overrides.connect ?? ((region, credentials) => lambdaInvoke(lambdaClient(region, credentials), overrides.sleep ?? abortableSleep, log))
+  };
+  return (env2) => collectLogs(env2, deps);
+}
+async function collectLogs(env2, deps) {
+  const { log } = deps;
+  const outputs = {};
+  const summary = ["### E2E test stack: logs", ""];
+  const secrets = masker(log);
+  const servers = [];
+  const failures = [];
+  const notes = [];
+  let failure;
+  const steps = async () => {
+    const inputs = readLogsInputs(env2);
+    const label = inputs.allowance ? `run ${inputs.runId}` : "this run";
+    const github = githubClient(inputs.githubToken, deps.fetch, deps.sleep, log);
+    const latest = inputs.allowance ? await checkRun(github, inputs.repository, inputs.runId, inputs.allowance, log) : inputs.own.attempt;
+    const found = await createResponse(
+      github,
+      { repository: inputs.repository, runId: inputs.runId },
+      inputs.batch,
+      label
+    );
+    const response = found ? parseResponse(found.response.toString("utf8")) : void 0;
+    if (found && !response)
+      throw new ActionError(`${label}'s create response for batch ${inputs.batch} is not a JSON object`);
+    const batchId = typeof response?.batch_id === "string" ? response.batch_id : "";
+    if (!response || !batchId) {
+      log(`e2e-test-stack: ${label} created no batch ${inputs.batch}: no logs to collect`);
+      summary.push(`${label} has no batch \`${cell(inputs.batch)}\`: no logs to collect.`);
+      outputs.servers = "[]";
+      return;
+    }
+    const owner = { callerKey: inputs.callerKey, runId: inputs.runId, batch: inputs.batch, attempt: latest };
+    if (batchAttempt(batchId, owner) === void 0)
+      throw new ActionError(
+        `the newest create response names batch ${JSON.stringify(batchId.slice(0, 100))}, which is not ${label}'s batch ${inputs.batch}`
+      );
+    summary.push(`Batch \`${cell(batchId)}\` of ${label}.`, "");
+    const sealed = response.batch?.secrets;
+    if (typeof sealed !== "string" || !sealed) throw new ActionError(`batch ${batchId} has no sealed secrets`);
+    let batchToken;
+    try {
+      const opened = await openBatchSecrets(sealed, inputs.credentialsKey);
+      maskBatchSecrets(secrets, opened);
+      if (typeof opened.batch_token !== "string" || !opened.batch_token)
+        throw new ActionError(`batch ${batchId}'s secrets hold no batch token`);
+      batchToken = opened.batch_token;
+    } catch (e7) {
+      if (!(e7 instanceof SealedError)) throw e7;
+      throw new ActionError(`batch ${batchId}: ${e7.message}`);
+    }
+    const token = await requestIdToken(env2, deps.fetch, deps.sleep, log);
+    secrets.mask(token);
+    const credentials = await assumeRole(deps.sts(REGION), {
+      roleArn: inputs.roleArn,
+      sessionName: `e2e-test-stack-logs-${inputs.own.runId}`,
+      token
+    });
+    secrets.mask(credentials.accessKeyId);
+    secrets.mask(credentials.secretAccessKey);
+    secrets.mask(credentials.sessionToken);
+    const invoke = deps.connect(REGION, credentials);
+    const target = alias(PROJECT, inputs.channel, inputs.callerKey);
+    const fetched = await callControlPlane(invoke, target, {
+      action: "fetch",
+      batch_id: batchId,
+      batch_token: batchToken
+    });
+    if (fetched.refused !== void 0) {
+      if (!fetched.refused.startsWith(GONE2))
+        throw new ActionError(`the fetch of batch ${batchId} was refused: ${fetched.refused}`);
+      log(`e2e-test-stack: batch ${batchId} is gone: no logs to collect`);
+      summary.push("The batch is gone: no logs to collect.");
+      outputs.servers = "[]";
+      return;
+    }
+    const fetchedSecrets = fetched.response.batch?.secrets;
+    if (typeof fetchedSecrets === "string" && fetchedSecrets)
+      try {
+        maskBatchSecrets(secrets, await openBatchSecrets(fetchedSecrets, inputs.credentialsKey));
+      } catch (e7) {
+        if (!(e7 instanceof SealedError)) throw e7;
+        throw new ActionError(`batch ${batchId}'s fetched secrets: ${e7.message}`);
+      }
+    const fetchError = responseError(fetched.response);
+    if (fetchError) throw new ActionError(`the fetch of batch ${batchId} reported: ${fetchError}`);
+    const state2 = fetched.response.batch?.state;
+    if (state2 !== "found")
+      throw new ActionError(
+        `the fetch of batch ${batchId} reported state ${JSON.stringify(state2 ?? "none")}, not found`
+      );
+    const leases = Array.isArray(fetched.response.batch?.instances) ? fetched.response.batch.instances : [];
+    const up = leases.flatMap((l5, i8) => isObject(l5) ? [{ index: i8, ready: l5.state === "ready" }] : []);
+    if (!up.length) {
+      log(`e2e-test-stack: no server of batch ${batchId} is up: no logs to collect`);
+      summary.push("No server of the batch is up: no logs to collect.");
+      outputs.servers = "[]";
+      return;
+    }
+    const dir = (0, import_node_path9.join)(env2.RUNNER_TEMP || (0, import_node_os5.tmpdir)(), `e2e-test-stack-logs-${inputs.batch}-${(0, import_node_crypto7.randomUUID)()}`);
+    const artifactName = `${inputs.artifactPrefix}-${inputs.batch}${inputs.allowance ? `-run-${inputs.runId}` : ""}-${inputs.own.attempt}`;
+    const scrub = scrubber(secrets, [inputs.roleArn.split(":")[4] ?? ""]);
+    log(
+      `e2e-test-stack: collecting the logs of ${up.length} server(s) of batch ${batchId}, ${LOGS_CONCURRENCY} at a time`
+    );
+    const collected = await pool(
+      up,
+      LOGS_CONCURRENCY,
+      ({ index }) => collectOne(index, batchId, batchToken, inputs.credentialsKey, dir, target, invoke, secrets, scrub, deps)
+    );
+    for (const [i8, c8] of collected.entries()) {
+      servers.push(c8.server);
+      if (!c8.failure) continue;
+      if (up[i8].ready) failures.push(c8.failure);
+      else notes.push(`${c8.failure.replace(/\.?$/, ".")} It was not ready.`);
+    }
+    outputs.servers = JSON.stringify(servers);
+    if (servers.some((s3) => s3.path)) {
+      outputs.logs_dir = dir;
+      outputs.artifact_name = artifactName;
+    }
+    if (failures.length) throw new ActionError(`logs of batch ${batchId}: ${failures.join("; ")}`);
+  };
+  try {
+    await steps();
+  } catch (e7) {
+    failure = e7;
+  }
+  {
+    if (servers.length) {
+      summary.push("| Index | Server | Containers | Saved |", "|---|---|---|---|");
+      for (const s3 of servers)
+        summary.push(
+          `| ${s3.index} | \`${cell(s3.instance_id)}\` | ${cell(s3.containers.join(", "))} | ${s3.full ? "the full log" : s3.path ? "the tail, truncated" : "nothing"} |`
+        );
+    } else if (failure) summary.push("No log was collected; the step's error says why.");
+    if (notes.length) summary.push("", ...notes.map((n5) => `- ${cell(n5)}`));
+  }
+  settle(env2, "logs", outputs, summary, failure);
+}
+async function downloadTo(fetchImpl, url, path, scrub) {
+  const res = await fetchImpl(url, { redirect: "error", signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {
+    });
+    throw new ActionError(`the download answered HTTP ${res.status}`);
+  }
+  const tooLarge = (what) => new ActionError(`the full log is too large: ${what}, more than ${MAX_LOG_BYTES}`);
+  const length = Number(res.headers.get("content-length") ?? 0);
+  if (length > MAX_LOG_BYTES) {
+    await res.body?.cancel().catch(() => {
+    });
+    throw tooLarge(`${length} bytes`);
+  }
+  if (!res.body) throw new ActionError("the download has no body");
+  (0, import_node_fs6.mkdirSync)((0, import_node_path9.dirname)(path), { recursive: true });
+  const file = await (0, import_promises5.open)(path, "w");
+  const reader = res.body.getReader();
+  let done = false;
+  try {
+    const decoder = new TextDecoder();
+    let read = 0;
+    let parts = [];
+    let pending = 0;
+    const flush = async (text4) => {
+      if (text4) await file.appendFile(scrub(text4));
+    };
+    while (!done) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        done = true;
+        break;
+      }
+      read += chunk.value.byteLength;
+      if (read > MAX_LOG_BYTES) throw tooLarge("its body");
+      const text4 = decoder.decode(chunk.value, { stream: true });
+      parts.push(text4);
+      pending += text4.length;
+      if (pending < BLOCK_BYTES) continue;
+      const joined = parts.join("");
+      const end = joined.lastIndexOf("\n") + 1;
+      const cut = end > 0 ? end : joined.length;
+      await flush(joined.slice(0, cut));
+      parts = [joined.slice(cut)];
+      pending = parts[0].length;
+    }
+    if (!read) throw new ActionError("the download is empty");
+    await flush(parts.join("") + decoder.decode());
+  } finally {
+    if (!done) await reader.cancel().catch(() => {
+    });
+    await file.close();
+  }
+}
+async function collectOne(index, batchId, batchToken, credentialsKey, dir, target, invoke, secrets, scrub, deps) {
+  const server = { index, instance_id: "", path: "", full: false, containers: [] };
+  try {
+    const failure = await collectSteps(
+      server,
+      batchId,
+      batchToken,
+      credentialsKey,
+      dir,
+      target,
+      invoke,
+      secrets,
+      scrub,
+      deps
+    );
+    return failure ? { server, failure: scrub(failure) } : { server };
+  } catch (e7) {
+    return { server, failure: `server ${index}: ${scrub(reason(e7))}` };
+  }
+}
+async function collectSteps(server, batchId, batchToken, credentialsKey, dir, target, invoke, secrets, scrub, deps) {
+  const { index } = server;
+  const called = await callControlPlane(invoke, target, {
+    action: "logs",
+    batch_id: batchId,
+    batch_token: batchToken,
+    index
+  });
+  if (called.refused !== void 0) return `server ${index}: the logs call was refused: ${called.refused}`;
+  const logs2 = called.response.logs;
+  const error = responseError(called.response);
+  const also2 = error ? ` The logs call also reported: ${error}.` : "";
+  if (!isObject(logs2)) return `server ${index}: the logs call returned no logs.${also2}`;
+  server.instance_id = typeof logs2.instance_id === "string" ? logs2.instance_id : "";
+  server.containers = Array.isArray(logs2.containers) ? logs2.containers.filter((c8) => typeof c8 === "string") : [];
+  if (logs2.no_object) return `server ${index}: no log was found for it.${also2}`;
+  if (typeof logs2.secrets !== "string" || !logs2.secrets)
+    return `server ${index}: the logs call returned nothing sealed.${also2}`;
+  let opened;
+  try {
+    const value = await openSealed(logs2.secrets, credentialsKey);
+    opened = isObject(value) ? value : {};
+  } catch (e7) {
+    if (!(e7 instanceof SealedError)) throw e7;
+    return `server ${index}: ${e7.message}`;
+  }
+  secrets.mask(opened.url);
+  const url = typeof opened.url === "string" ? opened.url : "";
+  const scrubbed = url ? (text4) => scrub(text4.split(url).join("***")) : scrub;
+  const path = (0, import_node_path9.resolve)((0, import_node_path9.join)(dir, `server-${index}.log`));
+  let tailFailure = "";
+  if (typeof opened.content_gzip === "string" && opened.content_gzip)
+    try {
+      const tail = (0, import_node_zlib2.gunzipSync)(Buffer.from(opened.content_gzip, "base64"), { maxOutputLength: MAX_TAIL_BYTES });
+      server.path = writeFile2(path, scrubbed(tail.toString("utf8")));
+      server.full = logs2.truncated === false;
+    } catch (e7) {
+      tailFailure = ` The tail was not saved: ${reason(e7)}.`;
+    }
+  const kept = server.path ? " The tail is saved." : tailFailure;
+  if (server.full) {
+  } else if (url) {
+    const partial = `${path}.partial`;
+    try {
+      await downloadTo(deps.fetch, url, partial, scrubbed);
+      (0, import_node_fs6.renameSync)(partial, path);
+    } catch (e7) {
+      (0, import_node_fs6.rmSync)(partial, { force: true });
+      return `server ${index}: the full log was not saved: ${scrubbed(reason(e7))}.${kept}${also2}`;
+    }
+    server.path = path;
+    server.full = true;
+  } else
+    return `server ${index}: the control plane returned no URL for its full log${server.path ? ", and the tail is truncated" : ""}.${kept}${also2}`;
+  if (error) return `server ${index}: the logs call reported: ${error}`;
+  return void 0;
+}
+var logs = logsWith();
 
 // src/open.ts
 function readOpenInputs(env2) {
@@ -32345,13 +32683,8 @@ async function openServer(env2, deps) {
       throw new ActionError(
         `this run has no artifact ${name}: no create step for batch ${inputs.batch} uploaded a response in any of its attempts`
       );
-    let response;
-    try {
-      response = JSON.parse(found.response.toString("utf8"));
-    } catch {
-      response = null;
-    }
-    if (!isObject(response)) throw new ActionError(`the create response in ${name} is not a JSON object`);
+    const response = parseResponse(found.response.toString("utf8"));
+    if (!response) throw new ActionError(`the create response in ${name} is not a JSON object`);
     const batchId = typeof response.batch_id === "string" ? response.batch_id : "";
     if (!batchId) {
       const error = responseError(response);
@@ -32403,10 +32736,10 @@ async function openServer(env2, deps) {
   }
   settle(env2, "open", outputs, [], failure);
 }
-var open = openWith();
+var open2 = openWith();
 
 // src/run.ts
-var ACTIONS = { create, destroy, open };
+var ACTIONS = { create, destroy, logs, open: open2 };
 async function run(name, env2, actions = ACTIONS) {
   const action = name !== void 0 && Object.hasOwn(actions, name) ? actions[name] : void 0;
   if (!action) {

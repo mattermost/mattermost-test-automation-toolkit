@@ -618,7 +618,7 @@ test("another run still in progress is refused before anything is destroyed", as
     undefined,
     { id: 77, status: "in_progress" },
   );
-  await assert.rejects(h.go(), /run 77 is "in_progress", not completed: destroy its batches once it completes/);
+  await assert.rejects(h.go(), /run 77 is "in_progress", not completed: act on its batches once it completes/);
   assert.deepEqual([h.destroys.length, h.stsCalls], [0, 0]);
 });
 

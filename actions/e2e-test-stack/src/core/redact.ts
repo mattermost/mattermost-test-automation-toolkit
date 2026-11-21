@@ -6,10 +6,11 @@
  * HTML tags, which the summary's Markdown would drop; a 12-digit run inside a hyphenated name, such as a batch id, is
  * kept.
  */
-export const redact = (text: string): string =>
-  text
-    .replace(/arn:aws[a-z-]*:(?:[^\s"';()|`<>[\]{}]*[^\s"',;()|`<>[\]{}.])?/g, "[arn]")
-    .replace(/(?<![\w-])\d{12}(?![\w-])/g, "[account]");
+export const redact = (text: string): string => redactArns(text).replace(/(?<![\w-])\d{12}(?![\w-])/g, "[account]");
+
+/** Takes ARNs alone out of text, leaving other 12-digit numbers as they are, as a server's log may hold them. */
+export const redactArns = (text: string): string =>
+  text.replace(/arn:aws[a-z-]*:(?:[^\s"';()|`<>[\]{}]*[^\s"',;()|`<>[\]{}.])?/g, "[arn]");
 
 /** A thrown value's name and the first line of its message, cut to 200 characters, with ARNs and account ids out. */
 export const errorText = (e: unknown): string => {
