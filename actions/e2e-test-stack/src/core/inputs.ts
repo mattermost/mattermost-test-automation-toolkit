@@ -77,6 +77,15 @@ export function batchFrom(env: Env): string {
   return batch;
 }
 
+const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+/** Reads GITHUB_REPOSITORY, owner/name, which every action that calls GitHub needs. */
+export function repositoryFrom(env: Env): string {
+  const repository = (env.GITHUB_REPOSITORY ?? "").trim();
+  if (!REPOSITORY.test(repository)) refuse("GITHUB_REPOSITORY must be set, as it is in a GitHub Actions job");
+  return repository;
+}
+
 /** This job's workflow run: its id and attempt, as GitHub Actions sets them. */
 export interface Run {
   runId: string;
