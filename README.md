@@ -12,6 +12,7 @@ mattermost-test-automation-toolkit/
 ├── actions/
 │   └── <reusable-composite-action>/
 └── packages/
+    ├── diff-bug-hunter/
     └── mattermost-testcontainers/
 ```
 
@@ -25,3 +26,4 @@ mattermost-test-automation-toolkit/
 2. Reusable workflow [`pr-test-analysis-override.yml`](.github/workflows/pr-test-analysis-override.yml). Documentation: [PR Test Analysis Override](.github/workflows/pr-test-analysis-override.md).
 3. Composite action [`actions/e2e-test-triage`](actions/e2e-test-triage): is a red E2E run the PR's fault? History rules plus a model for what history can't settle; writes the required status in enforce mode and explains each test in the job summary. Documentation: [E2E triage](actions/e2e-test-triage/README.md).
 4. Composite action [`actions/e2e-test-watch`](actions/e2e-test-watch): after a trunk E2E run, outputs a fix request for each repeating failure; the caller sends them to its agent (for example a Cursor automation) and records them with `e2e-test-watch/record`. Documentation: [E2E test watch](actions/e2e-test-watch/README.md).
+5. Package [`packages/diff-bug-hunter`](packages/diff-bug-hunter): the `/hunt <pr_number>` and `/verify` Claude Code skills. Blind subagents write caller-invariant and PR-promise tests; a failure counts only if it reproduces 3/3 on the PR code, and the merge-base run separates new bugs from pre-existing ones. A compile-checked mutation gate measures the tests. `/verify` runs a bounded, screenshot-free Playwright plan against a running server and can freeze a passing plan into a model-free test. `/hunt` reads its rules from the base branch, so a PR cannot weaken its own checks. Install both into any repository with `packages/diff-bug-hunter/scripts/install-skill.sh`. Documentation: [diff-bug-hunter](packages/diff-bug-hunter/README.md).

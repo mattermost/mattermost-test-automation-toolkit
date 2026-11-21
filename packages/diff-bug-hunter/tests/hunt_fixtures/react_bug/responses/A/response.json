@@ -1,0 +1,10 @@
+{
+ "_note": "SELF-TEST FIXTURE: hand-written stand-in for a hunter response, never used as hunt output.",
+ "files": [
+  {
+   "path": "web/src/hunt_a.test.tsx",
+   "content": "import React from 'react';\nimport {render, fireEvent, screen} from '@testing-library/react';\n\nimport {Counter} from './counter';\n\ndescribe('HuntA', () => {\n    it('HuntA_neverExceedsMax', () => {\n        for (let max = 0; max <= 5; max++) {\n            const {unmount} = render(<Counter max={max}/>);\n            const button = screen.getByRole('button');\n            for (let i = 0; i < max + 3; i++) {\n                fireEvent.click(button);\n            }\n            expect(`max=${max} shown=${button.textContent}`).toBe(`max=${max} shown=${max}`);\n            unmount();\n        }\n    });\n});\n"
+  }
+ ],
+ "tests": []
+}

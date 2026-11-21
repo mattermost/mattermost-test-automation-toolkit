@@ -1,0 +1,19 @@
+{
+ "_note": "SELF-TEST FIXTURE: hand-written stand-in for a hunter response, never used as hunt output.",
+ "mutants": [
+  {
+   "id": "M4",
+   "file": "calc/percent.go",
+   "old": "\t\treturn 0\n",
+   "new": "\t\treturn 1\n",
+   "what_breaks": "zero total reports 1"
+  },
+  {
+   "id": "M5",
+   "file": "calc/calc.go",
+   "old": "return lo",
+   "new": "return hi",
+   "what_breaks": "not a hunted file"
+  }
+ ]
+}

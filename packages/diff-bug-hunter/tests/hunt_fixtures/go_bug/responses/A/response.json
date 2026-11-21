@@ -1,0 +1,16 @@
+{
+ "_note": "SELF-TEST FIXTURE: hand-written stand-in for a hunter response, never used as hunt output.",
+ "files": [
+  {
+   "path": "calc/hunt_hunta_test.go",
+   "content": "package calc\n\nimport (\n\t\"math/rand\"\n\t\"testing\"\n)\n\n// Invariant: Clamp(v, lo, hi) stays in [lo, hi] and returns v unchanged when v is already inside.\nfunc TestHuntA_ClampRangeAndIdentity(t *testing.T) {\n\tr := rand.New(rand.NewSource(1))\n\tfor i := 0; i < 500; i++ {\n\t\tlo := r.Intn(50) - 25\n\t\thi := lo + r.Intn(50)\n\t\tfor _, v := range []int{lo - 1, lo, hi, hi + 1, lo + r.Intn(hi-lo+1)} {\n\t\t\tgot := Clamp(v, lo, hi)\n\t\t\tif got < lo || got > hi || (v >= lo && v <= hi && got != v) {\n\t\t\t\tt.Fatalf(\"Clamp(%d, %d, %d) = %d\", v, lo, hi, got)\n\t\t\t}\n\t\t}\n\t}\n}\n"
+  }
+ ],
+ "tests": [
+  {
+   "test_name": "TestHuntA_ClampRangeAndIdentity",
+   "checks": "range + identity",
+   "source": "fixture"
+  }
+ ]
+}

@@ -1,0 +1,26 @@
+{
+ "_note": "SELF-TEST FIXTURE: hand-written stand-in for a hunter response, never used as hunt output.",
+ "mutants": [
+  {
+   "id": "M1",
+   "file": "calc/percent.go",
+   "old": "if total == 0 {",
+   "new": "if total < 0 {",
+   "what_breaks": "zero total divides by zero"
+  },
+  {
+   "id": "M2",
+   "file": "calc/percent.go",
+   "old": "return part * 100 / total",
+   "new": "return part * 100 / totl",
+   "what_breaks": "does not compile"
+  },
+  {
+   "id": "M3",
+   "file": "calc/percent.go",
+   "old": "return 100",
+   "new": "return 101",
+   "what_breaks": "over-total parts report 101 (untested)"
+  }
+ ]
+}
