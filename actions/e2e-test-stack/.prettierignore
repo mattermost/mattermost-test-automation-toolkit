@@ -1,0 +1,3 @@
+dist/
+# YAML is linted by yamllint (npm run lint:yaml at the repository root), whose comment spacing Prettier would undo.
+*.yml

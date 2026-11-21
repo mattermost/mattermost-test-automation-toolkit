@@ -25,3 +25,11 @@ mattermost-test-automation-toolkit/
 2. Reusable workflow [`pr-test-analysis-override.yml`](.github/workflows/pr-test-analysis-override.yml). Documentation: [PR Test Analysis Override](.github/workflows/pr-test-analysis-override.md).
 3. Composite action [`actions/e2e-test-triage`](actions/e2e-test-triage): is a red E2E run the PR's fault? History rules plus a model for what history can't settle; writes the required status in enforce mode and explains each test in the job summary. Documentation: [E2E triage](actions/e2e-test-triage/README.md).
 4. Composite action [`actions/e2e-test-watch`](actions/e2e-test-watch): after a trunk E2E run, outputs a fix request for each repeating failure; the caller sends them to its agent (for example a Cursor automation) and records them with `e2e-test-watch/record`. Documentation: [E2E test watch](actions/e2e-test-watch/README.md).
+
+## Development
+
+`npm install` installs every action's dependencies and a pre-commit hook that runs, for each action that defines
+them, `fmt:check` (Prettier), `lint` (ESLint) and `tsc`. CI runs the same checks, then each action's tests and build.
+
+`npm run lint:yaml` lints the workflows and every `action.yml` with `yamllint --strict`, as CI does: a warning fails it
+too. The hook runs it where `yamllint` is installed.
