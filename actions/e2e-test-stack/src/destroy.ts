@@ -205,8 +205,10 @@ async function findTargets(
     const { response, failure } = newestFound;
     const batchId = typeof response?.batch_id === "string" ? response.batch_id : "";
     if (!response) {
-      // create uploads the newest beside the attempt's own, so with every own response read it repeats one of them.
-      if (!unread.size) log(`e2e-test-stack: ${failure}; each attempt's own response was read instead`);
+      // It may be the only record of an attempt whose own response is missing; an unreadable own one is reported
+      // already, and with every own response read the newest repeats one of them.
+      if (accounted.size + unread.size === latest)
+        log(`e2e-test-stack: ${failure}; each attempt's own response is reported instead`);
       else failures.push(`${failure}; a batch only it names is not destroyed, and is reaped at its ttl`);
     } else if (batchId) {
       const n = batchAttempt(batchId, owner);
@@ -480,13 +482,16 @@ async function destroySteps(
     result.gone = `yes, all ${urls.length}`;
   } else result.gone = "no host to check";
 
+  let again: StackResponse;
   try {
-    const again = await destroyCall(invoke, target, payload);
-    result.again = typeof again.batch?.state === "string" ? again.batch.state : "unknown";
+    again = await destroyCall(invoke, target, payload);
   } catch (e) {
     result.again = "failed";
     return `the second destroy of batch ${t.batchId}: ${reason(e)}`;
   }
+  result.again = typeof again.batch?.state === "string" ? again.batch.state : "unknown";
+  const againError = responseError(again);
+  if (againError) return `the second destroy of batch ${t.batchId} reported ${result.again}: ${againError}`;
   if (result.again !== NOT_FOUND)
     return `a second destroy of batch ${t.batchId} reported ${result.again}, not ${JSON.stringify(NOT_FOUND)}`;
   return undefined;

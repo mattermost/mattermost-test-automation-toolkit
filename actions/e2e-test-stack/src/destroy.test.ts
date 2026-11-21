@@ -32,7 +32,8 @@ const readOutputs = (path: string): Record<string, string> => {
     const m = /^([\w-]+)<<(.+)$/.exec(lines[i]);
     if (!m) continue;
     const value: string[] = [];
-    while (lines[++i] !== m[2]) value.push(lines[i]);
+    while (++i < lines.length && lines[i] !== m[2]) value.push(lines[i]);
+    assert.ok(i < lines.length, `output ${m[1]} has no closing delimiter`);
     out[m[1]] = value.join("\n");
   }
   return out;
@@ -530,20 +531,12 @@ test("a newest response that cannot be read is passed over when every attempt's 
   await h.go();
   assert.equal(attempts(h).length, 2);
 
-  // Attempt 1 ran no create: no own response, so the newest repeats attempt 2's.
-  const skipped = harness([
-    { name: responseArtifact("ios", 2), body: createResponse(batchId(2)) },
-    { name: createArtifact("ios"), body: new Error("forbidden") },
-  ]);
-  await skipped.go();
-  assert.equal(attempts(skipped).length, 1);
-
   const needed = harness([
     { name: responseArtifact("ios", 1), body: new Error("forbidden") },
     { name: responseArtifact("ios", 2), body: createResponse(batchId(2)) },
     { name: createArtifact("ios"), body: new Error("forbidden") },
   ]);
-  await assert.rejects(needed.go(), /a batch only it names is not destroyed/);
+  await assert.rejects(needed.go(), /attempt 1: .*its batch, if any, is not destroyed/);
   assert.equal(attempts(needed).length, 1, "attempt 2's batch is still destroyed");
 });
 
@@ -684,4 +677,41 @@ test("an error after the destroy keeps the batch reported destroyed", async () =
   );
   await assert.rejects(h.go(), /attempt 1: batch mobile-42-ios-1-abc: TypeError: boom/);
   assert.deepEqual([attempts(h)[0].state, attempts(h)[0].cost_usd], ["destroyed", "0.05"]);
+});
+
+test('a second destroy that reports an error fails, even with "not found"', async () => {
+  const h = harness(
+    [{ name: responseArtifact("ios", 1), body: createResponse(batchId(1)) }],
+    {},
+    {
+      [batchId(1)]: [ok(destroyed(batchId(1))), ok({ ...notFound(batchId(1)), error: "lookup failed" })],
+    },
+  );
+  await assert.rejects(h.go(), /the second destroy of batch mobile-42-ios-1-abc reported not found: lookup failed/);
+});
+
+test("an unreadable newest fails the step when an attempt's own response is missing; it may be the only record", async () => {
+  const h = harness([
+    { name: responseArtifact("ios", 2), body: createResponse(batchId(2)) },
+    { name: createArtifact("ios"), body: new Error("forbidden") },
+  ]);
+  await assert.rejects(h.go(), /a batch only it names is not destroyed/);
+  assert.deepEqual(
+    attempts(h).map((a) => [a.attempt, a.batch_id]),
+    [[2, batchId(2)]],
+    "the batch found is still destroyed, and attempt 1 has no target",
+  );
+
+  // An unreadable own response is reported once, not again for the unreadable newest.
+  const both = harness([
+    { name: responseArtifact("ios", 1), body: createResponse(batchId(1)) },
+    { name: responseArtifact("ios", 2), body: new Error("forbidden") },
+    { name: createArtifact("ios"), body: new Error("forbidden") },
+  ]);
+  const error = await both.go().then(
+    () => "",
+    (e: unknown) => (e as Error).message,
+  );
+  assert.match(error, /attempt 2: .*its batch, if any, is not destroyed/);
+  assert.doesNotMatch(error, /a batch only it names/);
 });

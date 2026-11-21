@@ -94,7 +94,9 @@ credentials key.
 
 ## Artifacts
 
-Whenever `response-path` is set, even when the step fails, the response is uploaded twice:
+Whenever the reply names a batch, even when the step fails, the response is uploaded twice. A reply that names none,
+such as a refusal, is uploaded whole as `e2e-test-stack-unnamed-<batch>-<run attempt>` instead, so it never replaces
+a response that named one, and the other actions never read it.
 
 - `e2e-test-stack-create-<batch>`: the newest, replacing an earlier attempt's.
 - `e2e-test-stack-response-<batch>-<run attempt>`: this attempt's own. Its prefix differs, so a pattern for one name
@@ -160,7 +162,9 @@ The step fails, with the reason, on:
 - a response file that cannot be written.
 
 Once the reply names a batch, the outputs, the response file and the artifacts are written before the step fails, and
-the message says the batch was created: a later `destroy` with `if: always()` releases it, or it is reaped at its TTL.
+the message says the batch was created: a later `destroy` with `if: always()` releases it from the uploaded response,
+or it is reaped at its TTL. When the response could not be written, nothing is uploaded, and the batch is reaped at
+its TTL.
 A create that stops before the control plane names a batch still writes a summary that says so. The control plane's
 messages are shown with ARNs and account ids taken out, and every failure annotation is redacted the same way.
 
