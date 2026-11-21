@@ -70,6 +70,11 @@ jobs:
   destroy:
     needs: [create, test]
     if: always() && needs.create.result != 'skipped'
+    # A called workflow can only lower these, so the caller grants all the reusable job asks for.
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     uses: ./.github/workflows/e2e-test-stack-destroy.yml
     with:
       batch: ios
