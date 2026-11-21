@@ -2,7 +2,8 @@
   "name": "mattermost-test-automation-toolkit",
   "private": true,
   "scripts": {
-    "prepare": "husky"
+    "prepare": "husky",
+    "lint:yaml": "yamllint --strict .github/workflows/ actions/"
   },
   "workspaces": [
     "actions/e2e-test-rerun",

@@ -30,3 +30,6 @@ mattermost-test-automation-toolkit/
 
 `npm install` installs every action's dependencies and a pre-commit hook that runs, for each action that defines
 them, `fmt:check` (Prettier), `lint` (ESLint) and `tsc`. CI runs the same checks, then each action's tests and build.
+
+`npm run lint:yaml` lints the workflows and every `action.yml` with `yamllint --strict`, as CI does: a warning fails it
+too. The hook runs it where `yamllint` is installed.

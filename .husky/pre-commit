@@ -2,3 +2,5 @@
 npm run fmt:check --workspaces --if-present
 npm run lint --workspaces --if-present
 npm run tsc --workspaces
+# YAML, as CI lints it, where yamllint is installed.
+if command -v yamllint >/dev/null 2>&1; then npm run lint:yaml; fi
