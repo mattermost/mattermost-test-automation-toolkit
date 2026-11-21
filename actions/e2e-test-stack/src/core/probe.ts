@@ -85,7 +85,8 @@ export async function probeGone(urls: readonly string[], windowMs: number, o: Pr
       try {
         const res = await o.fetch(url, {
           redirect: "manual",
-          signal: AbortSignal.timeout(Math.min(left, PROBE_REQUEST_MS)),
+          // AbortSignal.timeout takes whole milliseconds; the clock gives fractions.
+          signal: AbortSignal.timeout(Math.max(1, Math.floor(Math.min(left, PROBE_REQUEST_MS)))),
         });
         const body = (await readBody(res, MAX_BODY, { truncate: true })).toString("utf8");
         if (res.status === 404 && body.includes(GONE)) {

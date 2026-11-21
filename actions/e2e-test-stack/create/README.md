@@ -160,7 +160,9 @@ The step fails, with the reason, on:
 - a response file that cannot be written.
 
 Once the reply names a batch, the outputs, the response file and the artifacts are written before the step fails, and
-the message says the batch was created: a later `destroy` with `if: always()` releases it, or it is reaped at its TTL.
+the message says the batch was created: a later `destroy` with `if: always()` releases it from the uploaded response,
+or it is reaped at its TTL. When the response could not be written, nothing is uploaded, and the batch is reaped at
+its TTL.
 A create that stops before the control plane names a batch still writes a summary that says so. The control plane's
 messages are shown with ARNs and account ids taken out, and every failure annotation is redacted the same way.
 

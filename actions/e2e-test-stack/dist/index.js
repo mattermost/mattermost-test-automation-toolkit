@@ -31900,7 +31900,8 @@ async function probeGone(urls, windowMs, o5) {
       try {
         const res = await o5.fetch(url, {
           redirect: "manual",
-          signal: AbortSignal.timeout(Math.min(left, PROBE_REQUEST_MS))
+          // AbortSignal.timeout takes whole milliseconds; the clock gives fractions.
+          signal: AbortSignal.timeout(Math.max(1, Math.floor(Math.min(left, PROBE_REQUEST_MS))))
         });
         const body = (await readBody(res, MAX_BODY, { truncate: true })).toString("utf8");
         if (res.status === 404 && body.includes(GONE)) {
@@ -32062,7 +32063,8 @@ async function findTargets(github, run2, inputs, latest, label, log) {
     const { response, failure } = newestFound;
     const batchId = typeof response?.batch_id === "string" ? response.batch_id : "";
     if (!response) {
-      if (!unread.size) log(`e2e-test-stack: ${failure}; each attempt's own response was read instead`);
+      if (accounted.size + unread.size === latest)
+        log(`e2e-test-stack: ${failure}; each attempt's own response is reported instead`);
       else failures.push(`${failure}; a batch only it names is not destroyed, and is reaped at its ttl`);
     } else if (batchId) {
       const n5 = batchAttempt(batchId, owner);
@@ -32274,13 +32276,16 @@ async function destroySteps(t2, result, target, invoke, secrets, inputs, current
     }
     result.gone = `yes, all ${urls.length}`;
   } else result.gone = "no host to check";
+  let again;
   try {
-    const again = await call(invoke, target, payload);
-    result.again = typeof again.batch?.state === "string" ? again.batch.state : "unknown";
+    again = await call(invoke, target, payload);
   } catch (e7) {
     result.again = "failed";
     return `the second destroy of batch ${t2.batchId}: ${reason(e7)}`;
   }
+  result.again = typeof again.batch?.state === "string" ? again.batch.state : "unknown";
+  const againError = responseError(again);
+  if (againError) return `the second destroy of batch ${t2.batchId} reported ${result.again}: ${againError}`;
   if (result.again !== NOT_FOUND)
     return `a second destroy of batch ${t2.batchId} reported ${result.again}, not ${JSON.stringify(NOT_FOUND)}`;
   return void 0;
