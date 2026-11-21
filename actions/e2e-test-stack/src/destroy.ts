@@ -354,6 +354,7 @@ async function destroyBatches(env: Env, deps: DestroyDeps): Promise<void> {
         invoke = deps.connect(REGION, credentials);
       } catch (e) {
         failures.push(`${reason(e)}; no batch was destroyed, and each is reaped at its ttl`);
+        results.push(...found.targets.map(unsent));
       }
     if (invoke) {
       const target = alias(PROJECT, inputs.channel, inputs.callerKey);
@@ -411,6 +412,16 @@ async function call(
   return response;
 }
 
+/** An attempt's batch as it stands before any destroy is sent. */
+const unsent = (t: Target): AttemptResult => ({
+  attempt: t.attempt,
+  batch_id: t.batchId,
+  state: "not destroyed",
+  gone: "not checked",
+  again: "not run",
+  cost_usd: "",
+});
+
 /** Destroys one attempt's batch, checks its hosts are gone, and destroys it again expecting nothing to find. */
 async function destroyOne(
   t: Target,
@@ -422,14 +433,7 @@ async function destroyOne(
   deps: DestroyDeps,
   notes: string[],
 ): Promise<{ result: AttemptResult; failure?: string }> {
-  const result: AttemptResult = {
-    attempt: t.attempt,
-    batch_id: t.batchId,
-    state: "not destroyed",
-    gone: "not checked",
-    again: "not run",
-    cost_usd: "",
-  };
+  const result = unsent(t);
   try {
     const failure = await destroySteps(t, result, target, invoke, secrets, inputs, current, deps, notes);
     return { result, failure };

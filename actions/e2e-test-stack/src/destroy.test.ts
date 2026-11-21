@@ -550,6 +550,13 @@ test("a role that cannot be assumed fails with every failure found before it", a
   );
   await assert.rejects(h.go(), /attempt 1: .*could not be downloaded.*; .*id-token.*no batch was destroyed/s);
   assert.equal(h.destroys.length, 0);
+  assert.deepEqual(attempts(h), [
+    { attempt: 2, batch_id: batchId(2), state: "not destroyed", gone: "not checked", again: "not run", cost_usd: "" },
+  ]);
+  assert.match(
+    readFileSync(h.summary, "utf8"),
+    /\| 2 \| `mobile-42-ios-2-abc` \| not destroyed \| not checked \| not run \|/,
+  );
 });
 
 test("an error inside one batch's destroy is that attempt's failure; the other batches are still destroyed", async () => {

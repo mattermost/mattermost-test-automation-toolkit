@@ -32145,6 +32145,7 @@ async function destroyBatches(env2, deps) {
         invoke = deps.connect(REGION, credentials);
       } catch (e7) {
         failures.push(`${reason(e7)}; no batch was destroyed, and each is reaped at its ttl`);
+        results.push(...found.targets.map(unsent));
       }
     if (invoke) {
       const target = alias(PROJECT, inputs.channel, inputs.callerKey);
@@ -32192,15 +32193,16 @@ async function call(invoke, target, payload) {
   if (!response) throw new ActionError(`the control plane's reply is not a JSON object: ${redact(text4).slice(0, 200)}`);
   return response;
 }
+var unsent = (t2) => ({
+  attempt: t2.attempt,
+  batch_id: t2.batchId,
+  state: "not destroyed",
+  gone: "not checked",
+  again: "not run",
+  cost_usd: ""
+});
 async function destroyOne(t2, target, invoke, secrets, inputs, current, deps, notes) {
-  const result = {
-    attempt: t2.attempt,
-    batch_id: t2.batchId,
-    state: "not destroyed",
-    gone: "not checked",
-    again: "not run",
-    cost_usd: ""
-  };
+  const result = unsent(t2);
   try {
     const failure = await destroySteps(t2, result, target, invoke, secrets, inputs, current, deps, notes);
     return { result, failure };
