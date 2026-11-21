@@ -826,5 +826,27 @@ test("one malformed host list leaves the other probed, and the reply's sso host 
   );
   await m.go();
   assert.ok(m.probed.includes(`${site(id)}/api/v4/system/ping`), "the response's hosts are still probed");
-  assert.match(readFileSync(m.summary, "utf8"), /the destroy reply's hosts could not be read/);
+  assert.match(
+    readFileSync(m.summary, "utf8"),
+    /Batch mobile-42-ios-1-abc: not checked, as not a host: the site "not a url" is not an http\(s\) URL/,
+  );
+  assert.equal(attempts(m)[0].gone, "yes, all 3; 1 entry not a host");
+});
+
+test("a malformed entry in one list does not drop that list's valid hosts", async () => {
+  const id = batchId(1);
+  // The reply names another site B, valid, and a malformed sso host; the response names only A.
+  const reply = {
+    batch_id: id,
+    sites: ["https://b.test.example"],
+    batch: { state: "destroyed", instances: [{ instance_id: `${id}-00`, sso_host: "not a host" }] },
+  };
+  const h = harness(
+    [{ name: responseArtifact("ios", 1), body: createResponse(id) }],
+    {},
+    { [id]: [ok(reply), ok(notFound(id))] },
+  );
+  await h.go();
+  assert.ok(h.probed.includes("https://b.test.example/api/v4/system/ping"), "the reply's valid site is probed");
+  assert.match(attempts(h)[0].gone, /; 1 entry not a host$/);
 });
