@@ -33,11 +33,6 @@ inputs:
       The repository's credentials key, a base64 X25519 private key (the E2E_TEST_STACK_CREDENTIALS_KEY secret), which
       opens the batch's token and each log's URL
     required: true
-  artifact-prefix:
-    description: >-
-      The uploaded artifact is <artifact-prefix>-<batch>-<run attempt>, or <artifact-prefix>_<batch-id>-<run
-      attempt> for a batch named by its id; e2e-test-stack-logs unless set. Letters, digits, '.' and '-'
-    default: e2e-test-stack-logs
   github-token:
     description: The token for api.github.com, which reads the run and its artifacts; it needs actions read
     default: ${{ github.token }}
@@ -65,7 +60,6 @@ runs:
         STACK_CHANNEL: ${{ inputs.channel }}
         STACK_CREDENTIALS_KEY: ${{ inputs.credentials-key }}
         STACK_BATCH_ID: ${{ inputs.batch-id }}
-        STACK_ARTIFACT_PREFIX: ${{ inputs.artifact-prefix }}
         STACK_GITHUB_TOKEN: ${{ inputs.github-token }}
       run: bash "${{ github.action_path }}/../run.sh" logs
     # Whatever was saved, the full log or its tail, even when the step failed.

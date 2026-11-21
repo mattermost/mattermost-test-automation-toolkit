@@ -53,8 +53,8 @@ const BLOCK_BYTES = 1 << 20;
 const MAX_TAIL_BYTES = 16 << 20;
 /** The start of the control plane's answer for a batch with no live server. */
 const GONE = "no live instances tagged";
-// No "_": it separates a batch id from the prefix, so the two forms of a name never meet.
-const ARTIFACT_PREFIX = /^[A-Za-z0-9][A-Za-z0-9.-]{0,99}$/;
+/** Every logs artifact's name starts with it, apart from the create, response and unnamed artifacts' names. */
+export const LOGS_ARTIFACT = "e2e-test-stack-logs";
 
 export interface LogsInputs extends StackInputs {
   batch: string;
@@ -74,8 +74,6 @@ export interface LogsInputs extends StackInputs {
   actor: string;
   /** The one batch, from batch-id; undefined for this run's newest. */
   only?: { batchId: string; attempt: number };
-  /** The uploaded artifact's name starts with it. */
-  artifactPrefix: string;
 }
 
 /** Reads and checks logs' inputs and the job's run, before anything is called. */
@@ -84,9 +82,6 @@ export function readLogsInputs(env: Env): LogsInputs {
   const own = runFrom(env);
   const repository = repositoryFrom(env);
   const { batch, runId, other, actor, only } = batchTargetFrom(env, common.callerKey, own);
-  const artifactPrefix = input(env, "artifact-prefix") || "e2e-test-stack-logs";
-  if (!ARTIFACT_PREFIX.test(artifactPrefix))
-    refuse("artifact-prefix must be letters, digits, '.' and '-', starting with a letter or digit, at most 100");
   const roleArn = roleArnFrom(input(env, "role-arn"), common.callerKey);
   const credentialsKey = credentialsKeyFrom(input(env, "credentials-key"));
   const githubToken = input(env, "github-token");
@@ -104,7 +99,6 @@ export function readLogsInputs(env: Env): LogsInputs {
     other,
     actor,
     only,
-    artifactPrefix,
   };
 }
 
@@ -275,6 +269,13 @@ async function collectLogs(env: Env, deps: LogsDeps): Promise<void> {
       if (mine)
         try {
           found = await readResponse(github, run, mine, `${label}'s artifact ${name}`);
+          // A response that is not a JSON object is as unreadable as one that does not download.
+          if (!parseResponse(found.toString("utf8"))) {
+            found = undefined;
+            unreadable = new ActionError(
+              `${label}'s artifact ${name} holds a create response that is not a JSON object`,
+            );
+          }
         } catch (e) {
           if (!(e instanceof ActionError)) throw e;
           unreadable = e;
@@ -377,8 +378,8 @@ async function collectLogs(env: Env, deps: LogsDeps): Promise<void> {
     // A batch named by its id is uploaded under it after a "_", which no batch name holds, so it never shares a name with
     // a batch collected in its own run.
     const artifactName = only
-      ? `${inputs.artifactPrefix}_${only.batchId}-${inputs.own.attempt}`
-      : `${inputs.artifactPrefix}-${inputs.batch}-${inputs.own.attempt}`;
+      ? `${LOGS_ARTIFACT}_${only.batchId}-${inputs.own.attempt}`
+      : `${LOGS_ARTIFACT}-${inputs.batch}-${inputs.own.attempt}`;
     // The role's account id, from its ARN, is taken out of the logs with the secrets.
     const scrub = scrubber([...secrets.masked, inputs.roleArn.split(":")[4] ?? ""]);
     log(

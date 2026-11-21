@@ -23,9 +23,9 @@ In order, the action:
    the whole log, it streams the full log over it in blocks of about 1 MiB of whole lines, at most 256 MiB within
    300 s. Every known secret, from the create response and the lookup, is taken out of both, with the account's id
    and any ARN.
-7. Uploads the directory as `<artifact-prefix>-<batch>-<run attempt>`, or
-   `<artifact-prefix>_<batch-id>-<run attempt>` for a batch named by its id, even when the step fails. Neither a
-   batch name nor the prefix holds a `_`, so the two never share a name.
+7. Uploads the directory as `e2e-test-stack-logs-<batch>-<run attempt>`, or
+   `e2e-test-stack-logs_<batch-id>-<run attempt>` for a batch named by its id, even when the step fails. No batch
+   name holds a `_`, so the two never share a name, and neither meets `create`'s artifacts.
 
 A server whose full log is not saved keeps its tail, and the step fails naming it. For a server that was not ready,
 which may have no logs to give, that is noted in the summary instead. Outputs and the summary are written
@@ -48,7 +48,6 @@ action.
 | `role-arn`        | The repository's CI role ARN in the account the batch was created in, as `create` was given it. Required                                                        |
 | `channel`         | `v1` (the default) or `edge`, as `create` was given it                                                                                                          |
 | `credentials-key` | `${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}`. Required                                                                                                       |
-| `artifact-prefix` | Starts the artifact's name. Default `e2e-test-stack-logs`; letters, digits, `.` and `-`                                                                         |
 | `github-token`    | Token for api.github.com, to read the run and its artifacts. Default `github.token`                                                                             |
 
 ## Outputs
@@ -63,36 +62,59 @@ The artifact is kept 14 days.
 
 ## Example
 
-After the tests and before the destroy, in the run that created the batch:
+After the tests, in the run that created the batch. The CI role trusts only `e2e-test-stack-create.yml` and
+`e2e-test-stack-destroy.yml`, so the E2E workflow calls the latter as a reusable workflow for cleanup, and grants the
+permissions its jobs ask for, which a called workflow can only lower:
 
 ```yaml
-logs:
-  needs: [create, test]
-  if: always() && needs.create.result != 'skipped'
-  runs-on: ubuntu-24.04
-  permissions:
-    contents: read
-    actions: read
-    id-token: write
-  steps:
-    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-      with:
-        node-version: "26"
-    - uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack/logs@main
-      with:
-        caller-key: mobile
-        batch: ios
-        role-arn: ${{ vars.E2E_TEST_STACK_ROLE_ARN_PROD }}
-        credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
+# The E2E workflow
+jobs:
+  # create, which calls e2e-test-stack-create.yml, and test …
+  cleanup:
+    needs: [create, test]
+    if: always() && needs.create.result != 'skipped'
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/e2e-test-stack-destroy.yml
+    with:
+      batch: ios
+    secrets: inherit
 ```
 
-A `destroy` job then needs `logs`, so the servers are still up while their logs are collected, and runs whatever
-`logs` did, so a failed collection never keeps the batch up:
+The reusable workflow collects the logs while the servers are up, then destroys the batch whatever the collection
+did:
 
 ```yaml
-destroy:
-  needs: [create, logs]
-  if: always() && needs.create.result != 'skipped'
+# .github/workflows/e2e-test-stack-destroy.yml
+on:
+  workflow_call:
+    inputs:
+      batch: { type: string, required: true }
+
+jobs:
+  logs:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+      - uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack/logs@main
+        with:
+          caller-key: mobile
+          batch: ${{ inputs.batch }}
+          role-arn: ${{ vars.E2E_TEST_STACK_ROLE_ARN_PROD }}
+          credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
+
+  destroy:
+    needs: logs
+    if: always()
+    # … the destroy action, as its README shows
 ```
 
 ## Failures

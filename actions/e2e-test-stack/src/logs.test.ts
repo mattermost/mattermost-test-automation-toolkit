@@ -9,7 +9,15 @@ import { gzipSync } from "node:zlib";
 import sodium from "libsodium-wrappers";
 import type { InvokeInput, InvokeOutput } from "./core/lambda.ts";
 import { zip } from "./core/zip.fixture.ts";
-import { downloadTo, LOGS_CONCURRENCY, LOGS_OUTPUTS, logsWith, readLogsInputs, scrubber } from "./logs.ts";
+import {
+  downloadTo,
+  LOGS_ARTIFACT,
+  LOGS_CONCURRENCY,
+  LOGS_OUTPUTS,
+  logsWith,
+  readLogsInputs,
+  scrubber,
+} from "./logs.ts";
 import type { ServerLog } from "./logs.ts";
 import { ACTIONS } from "./run.ts";
 
@@ -457,11 +465,9 @@ test("logs refuses a missing or malformed input before anything is called", () =
     STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
     STACK_GITHUB_TOKEN: "t",
   };
-  assert.equal(readLogsInputs(env).artifactPrefix, "e2e-test-stack-logs");
+  assert.equal(readLogsInputs(env).batch, "ios");
   const refusedInput = (over: Record<string, string>, message: RegExp) =>
     assert.throws(() => readLogsInputs({ ...env, ...over }), message);
-  refusedInput({ STACK_ARTIFACT_PREFIX: "a/b" }, /artifact-prefix must be/);
-  refusedInput({ STACK_ARTIFACT_PREFIX: "a_b" }, /artifact-prefix must be letters, digits, '\.' and '-'/);
   refusedInput({ STACK_ROLE_ARN: "" }, /role-arn is required/);
   refusedInput(
     { STACK_BATCH: "", STACK_BATCH_ID: "tpp-77-ios-1-abc" },
@@ -675,4 +681,33 @@ test("an expired create response for batch-id has no logs, and passes", async ()
   await h.go();
   assert.equal(readOutputs(h.output).servers, "[]");
   assert.match(readFileSync(h.summary, "utf8"), /create response has expired: no logs to collect/);
+});
+
+test("the logs artifact's name is always in the logs namespace, apart from create's artifacts", () => {
+  const yml = readFileSync(new URL("../logs/action.yml", import.meta.url), "utf8");
+  assert.doesNotMatch(yml, /artifact-prefix/, "no input can move it");
+  for (const other of ["e2e-test-stack-create-", "e2e-test-stack-response-", "e2e-test-stack-unnamed-"])
+    assert.ok(!LOGS_ARTIFACT.startsWith(other) && !other.startsWith(`${LOGS_ARTIFACT}-`), other);
+});
+
+test("in this run the newest stands in for the attempt's own response when it is not a JSON object", async () => {
+  const h = harness(
+    { ...createResponse("mobile-42-ios-1-abc") },
+    fetched(["ready"]),
+    {},
+    {},
+    { STACK_BATCH_ID: "mobile-42-ios-1-abc" },
+    [],
+  );
+  await h.go();
+  assert.equal(servers(h).length, 1);
+  const other = harness(
+    { ...createResponse("mobile-77-ios-1-abc") },
+    fetched(["ready"]),
+    {},
+    {},
+    { STACK_BATCH_ID: "mobile-77-ios-1-abc" },
+    [],
+  );
+  await assert.rejects(other.go(), /holds a create response that is not a JSON object/);
 });

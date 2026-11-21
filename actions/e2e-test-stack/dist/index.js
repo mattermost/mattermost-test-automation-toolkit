@@ -32375,15 +32375,12 @@ var MAX_LOG_BYTES = 256 << 20;
 var BLOCK_BYTES = 1 << 20;
 var MAX_TAIL_BYTES = 16 << 20;
 var GONE2 = "no live instances tagged";
-var ARTIFACT_PREFIX = /^[A-Za-z0-9][A-Za-z0-9.-]{0,99}$/;
+var LOGS_ARTIFACT = "e2e-test-stack-logs";
 function readLogsInputs(env2) {
   const common = stackInputs(env2);
   const own = runFrom(env2);
   const repository = repositoryFrom(env2);
   const { batch, runId, other, actor, only } = batchTargetFrom(env2, common.callerKey, own);
-  const artifactPrefix = input(env2, "artifact-prefix") || "e2e-test-stack-logs";
-  if (!ARTIFACT_PREFIX.test(artifactPrefix))
-    refuse("artifact-prefix must be letters, digits, '.' and '-', starting with a letter or digit, at most 100");
   const roleArn = roleArnFrom(input(env2, "role-arn"), common.callerKey);
   const credentialsKey = credentialsKeyFrom(input(env2, "credentials-key"));
   const githubToken = input(env2, "github-token");
@@ -32400,8 +32397,7 @@ function readLogsInputs(env2) {
     runId,
     other,
     actor,
-    only,
-    artifactPrefix
+    only
   };
 }
 var WHITESPACE = /\s/;
@@ -32497,6 +32493,12 @@ async function collectLogs(env2, deps) {
       if (mine)
         try {
           found = await readResponse(github, run2, mine, `${label}'s artifact ${name}`);
+          if (!parseResponse(found.toString("utf8"))) {
+            found = void 0;
+            unreadable = new ActionError(
+              `${label}'s artifact ${name} holds a create response that is not a JSON object`
+            );
+          }
         } catch (e7) {
           if (!(e7 instanceof ActionError)) throw e7;
           unreadable = e7;
@@ -32586,7 +32588,7 @@ async function collectLogs(env2, deps) {
       return;
     }
     const dir = (0, import_node_path9.join)(env2.RUNNER_TEMP || (0, import_node_os5.tmpdir)(), `e2e-test-stack-logs-${inputs.batch}-${(0, import_node_crypto7.randomUUID)()}`);
-    const artifactName = only ? `${inputs.artifactPrefix}_${only.batchId}-${inputs.own.attempt}` : `${inputs.artifactPrefix}-${inputs.batch}-${inputs.own.attempt}`;
+    const artifactName = only ? `${LOGS_ARTIFACT}_${only.batchId}-${inputs.own.attempt}` : `${LOGS_ARTIFACT}-${inputs.batch}-${inputs.own.attempt}`;
     const scrub = scrubber([...secrets.masked, inputs.roleArn.split(":")[4] ?? ""]);
     log(
       `e2e-test-stack: collecting the logs of ${up.length} server(s) of batch ${batchId}, ${LOGS_CONCURRENCY} at a time`
