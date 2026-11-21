@@ -8,6 +8,11 @@ batch of servers is reaped at its TTL if nothing destroys it.
 Each action is a folder here with its own `action.yml` and README. They share this folder's package and one bundle,
 `dist/index.js`, which `run.sh` runs with the action's name.
 
+## Actions
+
+- [`create`](create/README.md): creates a batch of servers, checks that every one is ready, and uploads its sealed
+  create response. Uses: `mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack/create@main`.
+
 ## Keys, aliases and sealed secrets
 
 A repository is registered in the control plane's `callers` with a short **caller key** (for example `mobile`) and
@@ -28,7 +33,8 @@ them with the repository's credentials key and mask every secret before writing 
    of `environment:<name>`, and the CI role trusts only branch subjects.
 2. **The CI role.** `arn:aws:iam::<account>:role/e2e-test-stack-ci-<caller-key>`, one per account. It trusts only
    jobs on the branches registered for the repository, in the workflow files registered for it, so `pull_request`
-   runs are refused.
+   runs are refused. The actions assume it themselves with the job's GitHub OIDC token, so a job that uses them
+   grants `id-token: write`.
 3. **Node.** The actions run on Node 26 or later and fail before doing anything on an older one. The runner's default
    Node is older, so run [`actions/setup-node`](https://github.com/actions/setup-node) with `node-version: "26"`
    first. That switches Node for the rest of the job, so a job that runs its tests on another version sets that

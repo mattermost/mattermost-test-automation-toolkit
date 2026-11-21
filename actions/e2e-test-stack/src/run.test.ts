@@ -138,3 +138,14 @@ test("an AggregateError from another realm lists its errors", async () => {
   const e = runInNewContext('new AggregateError([new Error("a"), new Error("b")])') as Error;
   assert.deepEqual(failureLines(e).slice(0, 1), ["::error::e2e-test-stack: AggregateError (Error: a; Error: b)"]);
 });
+
+test("ARNs and account ids are taken out of the annotation, its causes and its frames", () => {
+  const e = new Error("refused", {
+    cause: new Error("User: arn:aws:sts::123456789012:assumed-role/ci/x is not authorized in 123456789012"),
+  });
+  e.stack = "Error: refused\n    at f (arn:aws:lambda:us-east-1:123456789012:function:x)";
+  assert.deepEqual(failureLines(e), [
+    "::error::e2e-test-stack: Error: refused; caused by Error: User: [arn] is not authorized in [account]",
+    "    at f ([arn])",
+  ]);
+});
