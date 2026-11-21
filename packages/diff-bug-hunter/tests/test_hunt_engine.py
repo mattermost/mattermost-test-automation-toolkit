@@ -2388,7 +2388,9 @@ def test_shipped_revert_manifest_is_well_formed():
     import eval_reverts
     m = json.loads((ROOT / "eval" / "revert_cases.json").read_text())
     ids = [e["id"] for e in m["cases"] + m["controls"]]
-    assert len(ids) == len(set(ids)) and len(m["cases"]) == len(m["controls"]) == 5
+    assert len(ids) == len(set(ids)) and len(m["cases"]) >= 5
+    # exactly one size-matched control per case
+    assert sorted(c["matches"] for c in m["controls"]) == sorted(e["id"] for e in m["cases"])
     for e in m["cases"]:
         assert all(str(e.get(k, "")).strip() for k in eval_reverts.CASE_KEYS), e
         assert re.fullmatch(r"[0-9a-f]{40}", e["bug_sha"]) and re.fullmatch(r"[0-9a-f]{40}", e["fix_sha"]), e
