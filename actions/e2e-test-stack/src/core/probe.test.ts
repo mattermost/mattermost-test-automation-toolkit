@@ -83,3 +83,21 @@ test("the body is never quoted: it may carry anything the server wrote", async (
   const [served] = await probeGone(["https://a/"], 1_000, o);
   assert.ok(!served.includes("secret"));
 });
+
+test("a clock in fractions of a millisecond still probes: each request's timeout is whole milliseconds", async () => {
+  let t = 0.25;
+  const seen: number[] = [];
+  const served = await probeGone(["https://a/"], 12_000, {
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms + 0.25;
+    },
+    log: () => {},
+    // The first answer is not the router's, so the second request runs with a fractional time left.
+    fetch: async () => {
+      seen.push(1);
+      return seen.length === 1 ? new Response("bad gateway", { status: 502 }) : new Response(GONE, { status: 404 });
+    },
+  });
+  assert.deepEqual([served, seen.length], [[], 2]);
+});

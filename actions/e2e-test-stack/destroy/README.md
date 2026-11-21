@@ -50,10 +50,10 @@ action.
 
 ## Outputs
 
-| Output     | Description                                                                                                                                 |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `attempts` | JSON array, one entry per attempt with a batch: `attempt`, `batch_id`, `state`, `gone`, `again` (the second destroy's state) and `cost_usd` |
-| `cost-usd` | The batches' estimated cost in USD; empty unless every batch the step destroyed had every server priced at a known rate                     |
+| Output     | Description                                                                                                                                                                                                                                                                                                                                                                           |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `attempts` | JSON array, one entry per attempt with a batch: `attempt`, `batch_id`, `state` (the destroy's reported state, such as `"destroyed"`, `"not found"` or `"partially_destroyed"`; `"unknown"` when a reply named none; `"not destroyed"` when no destroy answered or none was sent), `gone`, `again` (the second destroy's state, `"unknown"`, `"failed"` or `"not run"`) and `cost_usd` |
+| `cost-usd` | The batches' estimated cost in USD; empty unless every batch the step destroyed had every server priced at a known rate                                                                                                                                                                                                                                                               |
 
 ## Examples
 
