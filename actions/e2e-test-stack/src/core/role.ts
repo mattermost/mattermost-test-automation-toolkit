@@ -8,8 +8,11 @@ import { errorText } from "./redact.ts";
 /** How long the assumed role's session lasts, in seconds. */
 export const SESSION_SECONDS = 3600;
 
-/** An IAM role ARN; the role name allows letters, digits and +=,.@_- and path slashes. */
-const ROLE_ARN = /^arn:aws[a-z-]*:iam::\d{12}:role\/[\w+=,.@/-]{1,512}$/;
+/**
+ * An IAM role ARN in the commercial partition, where the control plane is; the role name allows letters, digits and
+ * +=,.@_- and path slashes.
+ */
+const ROLE_ARN = /^arn:aws:iam::\d{12}:role\/[\w+=,.@/-]{1,512}$/;
 
 /** AWS credentials for one session. */
 export interface Credentials {
@@ -27,6 +30,10 @@ export function roleArnFrom(value: string, callerKey: string): string {
   if (!value)
     throw new ActionError(
       "role-arn is required: the ARN of the repository's CI role in the account to use, arn:aws:iam::<account id>:role/e2e-test-stack-ci-<caller-key>",
+    );
+  if (/^arn:aws-[a-z-]+:/.test(value))
+    throw new ActionError(
+      "role-arn must be in the commercial AWS partition, arn:aws:iam::<account id>:role/<name>, where the control plane is",
     );
   if (!ROLE_ARN.test(value))
     throw new ActionError("role-arn must be an IAM role ARN, arn:aws:iam::<account id>:role/<name>");

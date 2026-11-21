@@ -1,16 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 import assert from "node:assert/strict";
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -21,6 +12,7 @@ import type { InvokeInput, InvokeOutput } from "./core/lambda.ts";
 import type { Credentials } from "./core/role.ts";
 import { MASTER_IMAGE } from "./core/server-image.ts";
 import { CREATE_OUTPUTS, createWith, readCreateInputs } from "./create.ts";
+import type { CreateDeps } from "./create.ts";
 import { ACTIONS } from "./run.ts";
 
 await sodium.ready;
@@ -138,6 +130,8 @@ interface Harness {
   output: string;
   summary: string;
   temp: string;
+  /** Overrides of create's dependencies, applied over the fakes. */
+  deps: Partial<CreateDeps>;
   go: () => Promise<void>;
 }
 
@@ -162,6 +156,7 @@ const harness = (
     output: file("output"),
     summary: file("summary"),
     temp,
+    deps: {},
     go: () =>
       createWith({
         log: (m) => h.logged.push(m),
@@ -191,10 +186,11 @@ const harness = (
           };
         },
         fetchTimeoutMs: 50,
+        ...h.deps,
       })({
         GITHUB_OUTPUT: h.output,
         GITHUB_STEP_SUMMARY: h.summary,
-        RUNNER_TEMP: temp,
+        RUNNER_TEMP: h.temp,
         GITHUB_RUN_ID: "42",
         GITHUB_RUN_ATTEMPT: "1",
         ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.actions.example/id?api-version=2.0",
@@ -215,7 +211,17 @@ const createEnv = (over: Record<string, string> = {}): Record<string, string> =>
 });
 const masks = (h: Harness) =>
   h.logged.filter((l) => l.startsWith("::add-mask::")).map((l) => l.slice("::add-mask::".length));
-const responseDir = (h: Harness, batch = "ios") => join(h.temp, `e2e-test-stack-create-${batch}`);
+/** The response directories create made for batch, one per create that wrote a response. */
+const responseDirs = (h: Harness, batch = "ios") =>
+  readdirSync(h.temp)
+    .filter((n) => new RegExp(`^e2e-test-stack-create-${batch}-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$`).test(n))
+    .map((n) => join(h.temp, n));
+/** The one response directory create made for batch. */
+const responseDir = (h: Harness, batch = "ios") => {
+  const dirs = responseDirs(h, batch);
+  assert.equal(dirs.length, 1, `one response directory for ${batch}`);
+  return dirs[0];
+};
 const payloads = (h: Harness) => h.calls.map((c) => JSON.parse(c.Payload) as Record<string, unknown>);
 const read = (env: Record<string, string>) =>
   readCreateInputs({ GITHUB_RUN_ID: "42", GITHUB_RUN_ATTEMPT: "1", ...createEnv(env) });
@@ -258,7 +264,9 @@ test("license runs unlicensed when set empty, and is enterprise-advanced when un
 test("os, postgres and ttl accept only what the deployment offers, naming it when refused", () => {
   assert.equal(read({ STACK_OS: "ubuntu-26.04" }).fields.os, "ubuntu-26.04");
   for (const v of ["14", "15", "16", "17", "18"]) assert.equal(read({ STACK_POSTGRES: v }).fields.postgres, v);
-  for (const v of ["90m", "1h30m", "4h", "240m"]) assert.equal(read({ STACK_TTL: v }).fields.ttl, v);
+  for (const v of ["90m", "1h30m", "4h", "240m", "0.5h", ".5h", "1.h", "1.5h"])
+    assert.equal(read({ STACK_TTL: v }).fields.ttl, v);
+  for (const v of ["h", ".h", "1.5", "1h.", "-1h", "1d"]) refused({ STACK_TTL: v }, /^ttl must be a duration such as/);
   refused({ STACK_OS: "ubuntu-22.04" }, /^os must be ubuntu-24\.04 or ubuntu-26\.04, got "ubuntu-22\.04"$/);
   refused({ STACK_POSTGRES: "16.4" }, /^postgres must be 14, 15, 16, 17 or 18, got "16\.4"$/);
   refused({ STACK_POSTGRES: "13" }, /^postgres must be 14, 15, 16, 17 or 18, got "13"$/);
@@ -486,7 +494,25 @@ test("an image that cannot be resolved fails before the role is assumed or anyth
   );
   await assert.rejects(h.go(), /^ActionError: no ESR release among the 1 releases of mattermost\/mattermost$/);
   assert.deepEqual([h.sts.length, h.calls.length], [0, 0]);
-  assert.ok(!existsSync(responseDir(h)));
+  assert.deepEqual(responseDirs(h), []);
+});
+
+test("a create stopped before any batch is named still writes a summary saying so, and no batch id", async () => {
+  const refusedInput = harness({ STACK_BATCH: "" }, ok(readyResponse()));
+  await assert.rejects(refusedInput.go(), /batch is required/);
+  assert.match(
+    readFileSync(refusedInput.summary, "utf8"),
+    /\| State \| failed before the create was sent, so no batch was created\. The step's error says why \|/,
+  );
+  assert.deepEqual(readOutputs(refusedInput.output), {});
+
+  const refusedCreate = harness({}, { ...ok({ errorMessage: "capacity" }), FunctionError: "Unhandled" });
+  await assert.rejects(refusedCreate.go(), /the control plane refused the create/);
+  assert.match(
+    readFileSync(refusedCreate.summary, "utf8"),
+    /\| State \| failed, with no batch named; one may have been created, and is reaped at its ttl\. /,
+  );
+  assert.equal(readOutputs(refusedCreate.output).batch_id, undefined);
 });
 
 test("a job without id-token: write fails before anything is created, asking for it", async () => {
@@ -547,7 +573,7 @@ test("a partial create still sets its outputs and writes the response, then fail
     (e: unknown) =>
       e instanceof ActionError &&
       e.message ===
-        `create reported: 1 of 2 instances failed: [1]. Batch ${BATCH_ID} was created; the destroy action releases it, or it is reaped at its ttl.`,
+        `create reported: 1 of 2 instances failed: [1]. Batch ${BATCH_ID} was created; it is reaped at its ttl.`,
   );
   const out = readOutputs(h.output);
   assert.equal(out.batch_id, BATCH_ID);
@@ -639,7 +665,7 @@ test("a ready create is fetched, and fails unless the control plane finds every 
     (e: unknown) =>
       e instanceof ActionError &&
       e.message ===
-        `the fetch of batch ${BATCH_ID} found it not found with 0 of 1 servers ready, 0 listed; every server must be ready. Batch ${BATCH_ID} was created; the destroy action releases it, or it is reaped at its ttl.`,
+        `the fetch of batch ${BATCH_ID} found it not found with 0 of 1 servers ready, 0 listed; every server must be ready. Batch ${BATCH_ID} was created; it is reaped at its ttl.`,
   );
   const out = readOutputs(notFound.output);
   assert.equal(out.batch_id, BATCH_ID);
@@ -796,17 +822,16 @@ test("a failed create reports its time to failure, with no duration output and n
 });
 
 test("a response that cannot be written fails the create after its batch id is set, and with any other failure", async () => {
-  // The response's directory exists and is read-only, so the response cannot be written.
   const blocked = (h: Harness) => {
-    mkdirSync(responseDir(h));
-    chmodSync(responseDir(h), 0o555);
-    after(() => chmodSync(responseDir(h), 0o755));
+    h.deps.writeResponse = () => {
+      throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+    };
   };
   const h = harness({}, ok(readyResponse()));
   blocked(h);
   await assert.rejects(
     h.go(),
-    /^ActionError: the create response could not be written: .*\. Batch tpp-42-ios-1-abc was created; the destroy action releases it, or it is reaped at its ttl\.$/,
+    /^ActionError: the create response could not be written: .*\. Batch tpp-42-ios-1-abc was created; it is reaped at its ttl\.$/,
   );
   const out = readOutputs(h.output);
   assert.equal(out.batch_id, BATCH_ID);
@@ -820,15 +845,28 @@ test("a response that cannot be written fails the create after its batch id is s
   );
 });
 
-test("a stale response from an earlier create of the batch in the job is removed before the create", async () => {
-  const h = harness({}, () => {
-    throw Object.assign(new Error("connect ETIMEDOUT"), { name: "TimeoutError" });
-  });
-  mkdirSync(responseDir(h), { recursive: true });
-  const stale = join(responseDir(h), "e2e-test-stack-create.json");
-  writeFileSync(stale, "{}");
-  await assert.rejects(h.go(), /the invoke of .* failed: TimeoutError/);
-  assert.ok(!existsSync(stale));
+test("a response directory that cannot be made, as the filesystem refuses it, fails after the batch id is set", async () => {
+  const h = harness({}, ok(readyResponse()));
+  // RUNNER_TEMP is a file, so no directory can be made under it, whoever runs the test.
+  h.temp = file("not-a-directory");
+  writeFileSync(h.temp, "");
+  await assert.rejects(
+    h.go(),
+    /the create response could not be written: .*ENOTDIR.* Batch tpp-42-ios-1-abc was created/,
+  );
+  assert.equal(readOutputs(h.output).batch_id, BATCH_ID);
+  assert.equal(readOutputs(h.output).response_path, undefined);
+});
+
+test("each create of the batch in a job writes its own response, leaving one already handed back", async () => {
+  const first = harness({}, ok(readyResponse()));
+  await first.go();
+  const handedBack = readOutputs(first.output).response_path;
+  const second = harness({}, ok(readyResponse()));
+  second.temp = first.temp;
+  await second.go();
+  assert.ok(existsSync(handedBack), "the first response is still there");
+  assert.notEqual(readOutputs(second.output).response_path, handedBack);
 });
 
 test("a response error that is not a string is reported, and the batch is still handed back", async () => {

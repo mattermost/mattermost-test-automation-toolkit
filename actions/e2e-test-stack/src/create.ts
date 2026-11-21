@@ -1,6 +1,6 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
-import { rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isTransientError } from "@smithy/core/retry";
@@ -22,7 +22,7 @@ import {
   stackInputs,
 } from "./core/inputs.ts";
 import type { StackInputs } from "./core/inputs.ts";
-import { alias, lambdaClient, lambdaInvoke } from "./core/lambda.ts";
+import { abortableSleep, alias, lambdaClient, lambdaInvoke } from "./core/lambda.ts";
 import type { Invoke, InvokeOutput } from "./core/lambda.ts";
 import { requestIdToken } from "./core/oidc.ts";
 import { appendSummary, cell, masker, writeFile, writeOutputs } from "./core/outputs.ts";
@@ -55,8 +55,8 @@ type CreateOutputs = { [K in (typeof CREATE_OUTPUTS)[number]]?: string };
 const BATCH = /^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$/;
 const RUN_ID = /^\d+$/;
 const SERVICE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
-// One part of a Go duration ("90m", "1h30m", "4h"), and a whole one.
-const DURATION_PART = /(\d+)(?:\.(\d+))?(ns|us|µs|ms|s|m|h)/g;
+// One part of a Go duration ("90m", "1h30m", ".5h", "1.h": a digit before or after the point), and a whole one.
+const DURATION_PART = /(?=\.?\d)(\d*)(?:\.(\d*))?(ns|us|µs|ms|s|m|h)/g;
 const DURATION = new RegExp(`^(?:${DURATION_PART.source})+$`);
 const UNIT_NS: Record<string, bigint> = {
   ns: 1n,
@@ -91,7 +91,7 @@ export const durationNs = (value: string): bigint => {
   let ns = 0n;
   for (const [, whole, fraction = "", unit] of value.matchAll(DURATION_PART)) {
     const per = UNIT_NS[unit];
-    ns += BigInt(whole) * per + (BigInt(fraction || "0") * per) / 10n ** BigInt(fraction.length);
+    ns += BigInt(whole || "0") * per + (BigInt(fraction || "0") * per) / 10n ** BigInt(fraction.length);
   }
   return ns;
 };
@@ -255,6 +255,8 @@ export interface CreateDeps {
   connect: (region: string, credentials: Credentials) => Invoke;
   /** The longest one fetch waits for its reply. */
   fetchTimeoutMs: number;
+  /** Writes the response file, creating its directory, and returns its path. */
+  writeResponse: (path: string, text: string) => string;
 }
 
 const seconds = (n: number | undefined): string => (typeof n === "number" ? `${n.toFixed(1)} s` : "");
@@ -343,23 +345,25 @@ export function createWith(overrides: Partial<CreateDeps> = {}): (env: Env) => P
     fetch: overrides.fetch ?? fetch,
     sts: overrides.sts ?? stsClient,
     connect:
-      overrides.connect ?? ((region, credentials) => lambdaInvoke(lambdaClient(region, credentials), sleep, log)),
+      overrides.connect ??
+      ((region, credentials) =>
+        lambdaInvoke(lambdaClient(region, credentials), overrides.sleep ?? abortableSleep, log)),
     fetchTimeoutMs: overrides.fetchTimeoutMs ?? FETCH_TIMEOUT_MS,
+    writeResponse: overrides.writeResponse ?? writeFile,
   };
   return (env) => createBatch(env, deps);
 }
 
 async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
   const { log } = deps;
-  const inputs = readCreateInputs(env);
   const outputs: CreateOutputs = {};
   // The batch's rows, then each server's and each container's, written last whatever happens.
   const summary: string[] = [];
   let serverTable: string[] = [];
   const secrets = masker(log);
   let failure: unknown;
-  const target = alias(PROJECT, inputs.channel, inputs.callerKey);
-  const named = `${target.FunctionName}:${target.Qualifier}`;
+  // Set once the invoke is sent: from then on a batch may exist.
+  let invoked = false;
   const mayExist = " A batch may have been created; it is reaped at its ttl.";
   // Set once the reply names a batch: every later failure says what becomes of it.
   let teardown = "";
@@ -369,6 +373,10 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
   const writeFailure = (): string => `the create response could not be written: ${errorText(responseWriteError)}.`;
 
   try {
+    const inputs = readCreateInputs(env);
+    const target = alias(PROJECT, inputs.channel, inputs.callerKey);
+    const named = `${target.FunctionName}:${target.Qualifier}`;
+
     // The image first: a release that cannot be resolved creates nothing.
     let image = inputs.serverImage;
     if (isServer(image)) {
@@ -379,9 +387,12 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
     outputs.server_image = image;
     const fields: CreateFields = { ...inputs.fields, server_image: image };
 
-    // A response left by an earlier create of the same batch in this job is removed first.
-    const responseFile = join(env.RUNNER_TEMP || tmpdir(), `e2e-test-stack-create-${inputs.batch}`, RESPONSE_FILE);
-    rmSync(responseFile, { force: true });
+    // A directory of its own, so another create of the batch in the job never touches a response already handed back.
+    const responseFile = join(
+      env.RUNNER_TEMP || tmpdir(),
+      `e2e-test-stack-create-${inputs.batch}-${randomUUID()}`,
+      RESPONSE_FILE,
+    );
 
     const token = await requestIdToken(env, deps.fetch, deps.sleep, log);
     secrets.mask(token);
@@ -397,6 +408,7 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
 
     log(`e2e-test-stack: create through ${named}, instance key ${fields.instance_key}`);
     let reply: InvokeOutput;
+    invoked = true;
     try {
       reply = await invoke({ ...target, Payload: JSON.stringify({ action: "create", ...fields }) });
     } catch (e) {
@@ -404,7 +416,7 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
     }
     const text = payloadText(reply);
     try {
-      outputs.response_path = writeFile(responseFile, text);
+      outputs.response_path = deps.writeResponse(responseFile, text);
     } catch (e) {
       responseWriteError = e;
     }
@@ -421,8 +433,7 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
     }
     const error = responseError(response);
     const batchId = typeof response.batch_id === "string" ? response.batch_id : "";
-    if (batchId)
-      teardown = ` Batch ${batchId} was created; the destroy action releases it, or it is reaped at its ttl.`;
+    if (batchId) teardown = ` Batch ${batchId} was created; it is reaped at its ttl.`;
     const sites = Array.isArray(response.sites) ? response.sites : [];
     const leases = Array.isArray(response.batch?.instances) ? response.batch.instances : [];
     const state = response.batch?.state ?? "";
@@ -434,7 +445,7 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
     const timing = response.batch?.timing?.total_seconds;
     if (state === "ready" && typeof timing === "number") outputs.duration_seconds = String(timing);
 
-    summary.push("### E2E test stack: create", "", "| | |", "|---|---|");
+    summary.push(...SUMMARY_HEAD);
     summary.push(`| Batch | \`${cell(batchId || "none")}\` |`, `| State | ${cell(state || "unknown")} |`);
     summary.push(`| Ready | ${ready} of ${leases.length} |`);
     if (response.batch?.expires_at) summary.push(`| Expires | ${cell(response.batch.expires_at)} |`);
@@ -494,6 +505,7 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
   } catch (e) {
     const reported = e instanceof Error && e.cause === responseWriteError;
     failure = responseWriteError !== undefined && !reported ? also(e, writeFailure()) : e;
+    if (!summary.length) summary.push(...failedSummary(invoked));
   }
   {
     // Written whatever happened. A sink that cannot be written does not hide the failure being reported; with none, it
@@ -517,6 +529,20 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
     if (unwritten.length) throw new ActionError(`${unwritten.join("; ")}.`);
   }
 }
+
+/** The summary's heading and the batch table's header. */
+const SUMMARY_HEAD = ["### E2E test stack: create", "", "| | |", "|---|---|"] as const;
+
+/**
+ * The summary of a create that stopped before the control plane named a batch; the step's error says why. Once the
+ * invoke was sent, a batch may still have been created.
+ */
+const failedSummary = (invoked: boolean): string[] => [
+  ...SUMMARY_HEAD,
+  invoked
+    ? "| State | failed, with no batch named; one may have been created, and is reaped at its ttl. The step's error says why |"
+    : "| State | failed before the create was sent, so no batch was created. The step's error says why |",
+];
 
 /**
  * A failure with more said about it, as an ActionError: one already gains the text, keeping its cause; any other value

@@ -3,8 +3,7 @@
 import { Agent } from "node:https";
 import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
 import type { LambdaClientConfig } from "@aws-sdk/client-lambda";
-import { sleep } from "../../../shared/src/github.ts";
-import type { Sleep } from "../../../shared/src/github.ts";
+import { setTimeout as delay } from "node:timers/promises";
 import type { Credentials } from "./role.ts";
 
 /** The longest a call waits for the reply: above the function's 900 s timeout, so a create still running is not abandoned. */
@@ -72,13 +71,32 @@ export function lambdaClient(region: string, credentials: Credentials): LambdaCl
   return new LambdaClient(lambdaClientConfig(region, credentials));
 }
 
+/** Waits ms, or until signal aborts; an aborted wait clears its timer, so it never keeps the process up. */
+export type Wait = (ms: number, signal?: AbortSignal) => Promise<void>;
+export const abortableSleep: Wait = (ms, signal) => delay(ms, undefined, { signal }).catch(() => {});
+
+/** Waits for waited, or until signal aborts, whichever is first. */
+async function abortable(waited: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
+  if (!signal) return waited;
+  if (signal.aborted) return;
+  let stop = (): void => {};
+  try {
+    await Promise.race([
+      waited,
+      new Promise<void>((resolve) => signal.addEventListener("abort", (stop = () => resolve()), { once: true })),
+    ]);
+  } finally {
+    signal.removeEventListener("abort", stop);
+  }
+}
+
 /**
  * Invokes synchronously through the client. Only a throttle (the channel's reserved concurrency is in use) is tried
  * again, since the function did not run; every other error is the caller's.
  */
 export function lambdaInvoke(
   client: LambdaSend,
-  wait: Sleep = sleep,
+  wait: Wait = abortableSleep,
   log: (message: string) => void = console.log,
 ): Invoke {
   return async (input, signal) => {
@@ -103,7 +121,8 @@ export function lambdaInvoke(
         log(
           `e2e-test-stack: throttled; trying again in ${ms / 1000} s (attempt ${attempt + 1} of ${THROTTLE_ATTEMPTS})`,
         );
-        await wait(ms);
+        await abortable(wait(ms, signal), signal);
+        if (signal?.aborted) throw e;
       }
     }
   };

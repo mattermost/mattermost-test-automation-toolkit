@@ -1,7 +1,7 @@
 # E2E test stack: create
 
 Creates a batch of remote Mattermost test servers through the e2e-test-stack control plane, checks that every server
-is ready, and uploads the batch's create response for the jobs and runs that use or destroy it. See the
+is ready, and uploads the batch's create response for the jobs and runs that use it. See the
 [shared README](../README.md) for the keys, aliases and setup every action relies on.
 
 In order, the action:
@@ -70,7 +70,7 @@ Each account is named on its own, so an unset variable gives an empty `role-arn`
 falling through to the other account's role. The shorter `a && x || y` form would use `y` whenever `x` is empty.
 
 The batch is created in whichever account the role is in, so a dev role creates in dev whatever else the workflow
-says. A later `destroy` or `logs` of the batch passes the same role.
+says. A later call for the batch passes the same role.
 
 ### An empty licence
 
@@ -106,7 +106,7 @@ repository too: every secret in it is sealed to the repository's key.
 ## Re-runs
 
 A re-run attempt has a new run attempt, so it creates a new batch with a new instance key. The create action never
-destroys an earlier attempt's batch: the `destroy` action releases it, or it is reaped at its TTL.
+destroys an earlier attempt's batch: it is reaped at its TTL.
 
 ## Example
 
@@ -159,9 +159,9 @@ The step fails, with the reason, on:
 - a response file that cannot be written.
 
 Once the reply names a batch, the outputs, the response file and the artifacts are written before the step fails, and
-the message says the batch was created: a later `destroy` with `if: always()` releases it, or it is reaped at its TTL.
-The control plane's messages are shown with ARNs and account ids taken out, and every failure annotation is redacted
-the same way.
+the message says the batch was created: it is reaped at its TTL. A create that stops before the control plane names a
+batch still writes a summary that says so. The control plane's messages are shown with ARNs and account ids taken out,
+and every failure annotation is redacted the same way.
 
 Cancelling the job while a create is waiting leaves the batch running until its TTL: the action never received its
 batch id, so nothing can destroy it.
