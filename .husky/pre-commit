@@ -1,0 +1,4 @@
+# Formatting, lint and types, for every action that defines them.
+npm run fmt:check --workspaces --if-present
+npm run lint --workspaces --if-present
+npm run tsc --workspaces

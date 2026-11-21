@@ -1,0 +1,298 @@
+---
+name: E2E test stack
+description: >-
+  Create, fetch, collect logs of and destroy remote Mattermost test servers through the e2e-test-stack control plane.
+  Uses the AWS credentials the job holds: run aws-actions/configure-aws-credentials with the repository's CI role first.
+  Also picks that role, the server image, and checks and reads the workflow runs a stack workflow relies on.
+inputs:
+  operation:
+    description: >-
+      create, fetch, logs or destroy, which call the control plane; open, which opens a create response's secrets
+      with credentials-key and calls nothing, for a test job that has no AWS credentials; or role, server-image, check-run
+      or earlier-response, which call no control plane and need no AWS credentials or credentials key
+    required: true
+  caller-key:
+    description: >-
+      The repository's key in the control plane's callers (e.g. mobile); the action invokes only the alias
+      <caller-key>-<channel>. Required for create, fetch, logs and destroy
+    default: ""
+  channel:
+    description: v1 (the promoted build) or edge (main's newest build). fetch, logs and destroy use the channel the batch was created on
+    default: v1
+  project:
+    description: The control plane's project, the prefix of its function names
+    default: e2e-test-stack
+  region:
+    description: AWS region of the control plane
+    default: us-east-1
+  credentials-key:
+    description: >-
+      The repository's credentials key, base64 (the E2E_TEST_STACK_CREDENTIALS_KEY secret), which opens the secrets the
+      control plane seals to the repository. Required for create, fetch, logs and open, and for destroy with
+      create-response
+    default: ""
+  batch-id:
+    description: The batch to fetch, read the logs of or destroy (create's batch-id output)
+    default: ""
+  batch-token:
+    description: The batch's token (create's batch-token output), which authorizes fetch, logs and destroy
+    default: ""
+  create-response:
+    description: >-
+      Instead of batch-token: a create response file written by response-path, from which the batch id and its sealed
+      token are read with credentials-key. For a later job or run, through an uploaded artifact. Required for open
+    default: ""
+  instance-key:
+    description: For create. Names the stack and prefixes its hostnames (e.g. pr-1234); lowercase letters, digits and hyphens
+    default: ""
+  server-image:
+    description: For create. The Mattermost server image under test, by tag (e.g. mattermostdevelopment/mattermost-enterprise-edition:master)
+    default: ""
+  count:
+    description: For create. Instances in the batch; empty is 1. The control plane's ceiling is 40
+    default: ""
+  services:
+    description: >-
+      For create. Comma-separated optional services: minio or azurite, elasticsearch or opensearch, keycloak, openldap.
+      Empty runs Postgres, Inbucket and the server alone
+    default: ""
+  ttl:
+    description: For create. How long the batch lives before it is reaped, as a duration (90m, 4h); empty is 1h, the ceiling 4h
+    default: ""
+  os:
+    description: For create. The OS variant the instances run (e.g. ubuntu-24.04); empty is the control plane's default
+    default: ""
+  postgres:
+    description: For create. Postgres version (e.g. 16); empty is the control plane's default
+    default: ""
+  license:
+    description: For create. Licence SKU to apply (e.g. enterprise-advanced); empty runs unlicensed
+    default: ""
+  instance-type:
+    description: For create. EC2 instance type (e.g. m7i.xlarge); empty is sized by the control plane
+    default: ""
+  server-env:
+    description: >-
+      For create. Server settings as a JSON object of strings, e.g. {"MM_FEATUREFLAGS_TESTFEATURE":"true"}. Holds no
+      credential: the control plane refuses one
+    default: ""
+  retries:
+    description: For create. Attempts per failed instance; empty is 1, a negative number none, the ceiling 3
+    default: ""
+  shared-admin-password:
+    description: For create. true gives every instance of the batch the same admin password
+    default: ""
+  wait-for-migrations:
+    description: For create. true waits for the server's migrations before an instance is ready
+    default: ""
+  caller-run-id:
+    description: For create. The workflow run tagged on the batch, for attribution
+    default: ${{ github.run_id }}
+  indexes:
+    description: For fetch. Comma-separated instance indexes; empty fetches the whole batch
+    default: ""
+  index:
+    description: >-
+      For logs, the instance whose logs to collect (empty is 0). For open, the instance whose fields to set as
+      site-url, admin-username, admin-password and mail-token
+    default: ""
+  logs-path:
+    description: For logs. Where to write the full log (the tail if it does not download); empty is a file under RUNNER_TEMP
+    default: ""
+  response-path:
+    description: >-
+      Where to write the control plane's raw response JSON. Its secrets are sealed to the repository's key, so it is
+      safe to upload as an artifact; create-response reads it back. For earlier-response, where to write the create
+      response it finds, removing any file already there first; required
+    default: ""
+  expect-batch-prefix:
+    description: >-
+      For fetch, logs, destroy and open with create-response. The batch id must start with it, a prefix ending with a
+      hyphen (e.g. mobile-<run id>-), or the response is refused before its secrets are opened or anything is called
+    default: ""
+  verify-gone:
+    description: >-
+      For destroy with create-response. true probes, once the batch is destroyed or not found, each site, its mail-
+      host and any sso- host until each answers the router's 404 for an unknown server, and fails for any still served
+    default: ""
+  gone-window:
+    description: For destroy with verify-gone. Seconds each host has to stop being served; empty is 180, at most 1800
+    default: ""
+  account:
+    description: >-
+      For role. prod or dev; empty or recorded takes only the account recorded in account-file. A recorded account
+      that differs fails
+    default: ""
+  account-file:
+    description: For role. The file a run's create recorded its account in, beside its response; used when it exists
+    default: ""
+  role-arn-prod:
+    description: For role. The prod account's CI role ARN
+    default: ""
+  role-arn-dev:
+    description: For role. The dev account's CI role ARN
+    default: ""
+  server:
+    description: >-
+      For server-image. master (the default), latest (the newest stable release of mattermost/mattermost) or esr
+      (the newest patch of the newest Extended Support Release line)
+    default: ""
+  github-token:
+    description: >-
+      For server-image, check-run and earlier-response. The token for api.github.com; check-run and earlier-response
+      need actions: read
+    default: ${{ github.token }}
+  run-id:
+    description: For check-run, the run to check (required). For earlier-response, the run whose artifact to read; empty is this run
+    default: ""
+  allowed-workflows:
+    description: For check-run. Comma- or newline-separated workflow files (.github/workflows/<file>) the run may be of
+    default: ""
+  allowed-branches:
+    description: For check-run. A JavaScript regular expression the run's whole head branch must match (e.g. master|release-.*)
+    default: ""
+  allowed-events:
+    description: For check-run. Comma-separated events the run may be for (e.g. push, workflow_dispatch)
+    default: ""
+  artifact-name:
+    description: For earlier-response. The artifact holding a create response; empty is e2e-test-stack-create
+    default: ""
+  response-member:
+    description: For earlier-response. The artifact's file holding the create response; empty is e2e-test-stack-create.json
+    default: ""
+  account-path:
+    description: >-
+      For earlier-response. Where to write the account the artifact records (its e2e-test-stack-account); empty
+      writes none. An account that cannot be read is skipped with a warning. A file already there is removed first
+    default: ""
+outputs:
+  batch-id:
+    description: The batch's id
+    value: ${{ steps.stack.outputs.batch_id }}
+  batch-token:
+    description: From create. The batch's token, which fetch, logs and destroy need; masked
+    value: ${{ steps.stack.outputs.batch_token }}
+  sites:
+    description: JSON array of site URLs, index-aligned with the batch; "" where an instance failed
+    value: ${{ steps.stack.outputs.sites }}
+  instances:
+    description: >-
+      From create, fetch and open. JSON array, index-aligned, null where an instance failed or was not fetched: site_url,
+      state, admin_username, admin_email, admin_password, mail_token, credentials and facts. Its secrets are masked
+    value: ${{ steps.stack.outputs.instances }}
+  site-url:
+    description: From open with index. That instance's site URL
+    value: ${{ steps.stack.outputs.site_url }}
+  admin-username:
+    description: From open with index. That instance's admin username
+    value: ${{ steps.stack.outputs.admin_username }}
+  admin-password:
+    description: From open with index. That instance's admin password; masked
+    value: ${{ steps.stack.outputs.admin_password }}
+  mail-token:
+    description: From open with index. That instance's Inbucket HTTP Basic password, user inbucket; masked
+    value: ${{ steps.stack.outputs.mail_token }}
+  ready:
+    description: How many instances are ready
+    value: ${{ steps.stack.outputs.ready }}
+  state:
+    description: >-
+      The batch's state: ready or failed from create, and from open as it was created; found from fetch, which rebuilds
+      the batch from its live instances (ready counts those ready); destroyed, partially_destroyed, destroy_failed or
+      "not found" from destroy
+    value: ${{ steps.stack.outputs.state }}
+  error:
+    description: The control plane's error for a call that still returned a batch (a partial create or destroy); empty otherwise
+    value: ${{ steps.stack.outputs.error }}
+  deployment-version:
+    description: The control plane's Lambda version that answered
+    value: ${{ steps.stack.outputs.deployment_version }}
+  duration-seconds:
+    description: From create. Seconds from the request to every server ready, as the control plane measured it; empty when a server failed
+    value: ${{ steps.stack.outputs.duration_seconds }}
+  cost-usd:
+    description: From destroy. The batch's estimated cost in USD; empty unless every server was destroyed and priced at a known rate
+    value: ${{ steps.stack.outputs.cost_usd }}
+  logs-path:
+    description: From logs. The file holding the full log, or the tail; empty when there was none
+    value: ${{ steps.stack.outputs.logs_path }}
+  logs-full:
+    description: From logs. true when logs-path holds the whole log, false when only a truncated tail
+    value: ${{ steps.stack.outputs.logs_full }}
+  response-path:
+    description: The file response-path was written to; from earlier-response, only when found
+    value: ${{ steps.stack.outputs.response_path }}
+  account:
+    description: From role. prod or dev
+    value: ${{ steps.stack.outputs.account }}
+  role-arn:
+    description: From role. The account's CI role ARN
+    value: ${{ steps.stack.outputs.role_arn }}
+  server-image:
+    description: From server-image. The image, e.g. mattermost/mattermost-enterprise-edition:11.1.2
+    value: ${{ steps.stack.outputs.server_image }}
+  server-version:
+    description: From server-image. The release, X.Y.Z, or master
+    value: ${{ steps.stack.outputs.server_version }}
+  found:
+    description: >-
+      From earlier-response. true when the run holds the artifact and its response was written; false when it holds
+      none, or its response names no batch
+    value: ${{ steps.stack.outputs.found }}
+runs:
+  using: composite
+  steps:
+    - id: stack
+      shell: bash
+      env:
+        STACK_OPERATION: ${{ inputs.operation }}
+        STACK_CALLER_KEY: ${{ inputs.caller-key }}
+        STACK_CHANNEL: ${{ inputs.channel }}
+        STACK_PROJECT: ${{ inputs.project }}
+        STACK_REGION: ${{ inputs.region }}
+        STACK_CREDENTIALS_KEY: ${{ inputs.credentials-key }}
+        STACK_BATCH_ID: ${{ inputs.batch-id }}
+        STACK_BATCH_TOKEN: ${{ inputs.batch-token }}
+        STACK_CREATE_RESPONSE: ${{ inputs.create-response }}
+        STACK_INSTANCE_KEY: ${{ inputs.instance-key }}
+        STACK_SERVER_IMAGE: ${{ inputs.server-image }}
+        STACK_COUNT: ${{ inputs.count }}
+        STACK_SERVICES: ${{ inputs.services }}
+        STACK_TTL: ${{ inputs.ttl }}
+        STACK_OS: ${{ inputs.os }}
+        STACK_POSTGRES: ${{ inputs.postgres }}
+        STACK_LICENSE: ${{ inputs.license }}
+        STACK_INSTANCE_TYPE: ${{ inputs.instance-type }}
+        STACK_SERVER_ENV: ${{ inputs.server-env }}
+        STACK_RETRIES: ${{ inputs.retries }}
+        STACK_SHARED_ADMIN_PASSWORD: ${{ inputs.shared-admin-password }}
+        STACK_WAIT_FOR_MIGRATIONS: ${{ inputs.wait-for-migrations }}
+        STACK_CALLER_RUN_ID: ${{ inputs.caller-run-id }}
+        STACK_INDEXES: ${{ inputs.indexes }}
+        STACK_INDEX: ${{ inputs.index }}
+        STACK_LOGS_PATH: ${{ inputs.logs-path }}
+        STACK_RESPONSE_PATH: ${{ inputs.response-path }}
+        STACK_EXPECT_BATCH_PREFIX: ${{ inputs.expect-batch-prefix }}
+        STACK_VERIFY_GONE: ${{ inputs.verify-gone }}
+        STACK_GONE_WINDOW: ${{ inputs.gone-window }}
+        STACK_ACCOUNT: ${{ inputs.account }}
+        STACK_ACCOUNT_FILE: ${{ inputs.account-file }}
+        STACK_ROLE_ARN_PROD: ${{ inputs.role-arn-prod }}
+        STACK_ROLE_ARN_DEV: ${{ inputs.role-arn-dev }}
+        STACK_SERVER: ${{ inputs.server }}
+        STACK_GITHUB_TOKEN: ${{ inputs.github-token }}
+        STACK_RUN_ID: ${{ inputs.run-id }}
+        STACK_ALLOWED_WORKFLOWS: ${{ inputs.allowed-workflows }}
+        STACK_ALLOWED_BRANCHES: ${{ inputs.allowed-branches }}
+        STACK_ALLOWED_EVENTS: ${{ inputs.allowed-events }}
+        STACK_ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        STACK_RESPONSE_MEMBER: ${{ inputs.response-member }}
+        STACK_ACCOUNT_PATH: ${{ inputs.account-path }}
+      # Checked before the bundle is loaded: it is built for Node 26 and may not parse on an older one.
+      run: |
+        major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
+        if ! [[ "$major" =~ ^[0-9]+$ ]] || [ "$major" -lt 26 ]; then
+          echo "::error::e2e-test-stack needs Node 26 or later; found $(node --version 2>/dev/null || echo none). Run actions/setup-node with node-version 26 before it."
+          exit 1
+        fi
+        node "${{ github.action_path }}/dist/index.js"
