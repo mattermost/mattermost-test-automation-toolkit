@@ -105,6 +105,9 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
         planted = load_json(hdir / "M" / "response.json")["mutants"]
         user = {**hunter_user("A", ctx), "your_previous_tests": load_json(hdir / "A" / "response.json")["files"],
                 "surviving_faults": [m["what_breaks"] for m in planted if m["id"] in survivors]}
+        cov = hdir / "run_A.coverage.json"
+        if cov.exists():  # from `run.py cover <pr> A`; context for the survivors, never a target on its own
+            user["unreached_changed_lines"] = load_json(cov)["unreached"]
         print(write(hdir, "A2", hunter_system("A", state, ctx) + prompt("strengthen"), user, HUNTER_SCHEMA))
     elif what == "regen":
         # Only the score that asked for it: mutants_A.json and mutants_PR.json can hold different attempts and errors.

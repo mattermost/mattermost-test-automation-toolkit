@@ -5,6 +5,8 @@
 
 usage: run.py run <pr> <A|B|A2>        3 runs on unmodified PR head (Go with -race); writes run_<tag>.json
        run.py base <pr> <A|B|A2>       the same tests once on the merge-base worktree; writes base_<tag>.json
+       run.py cover <pr> <A|A2>        each test alone with coverage (no -race); writes run_<tag>.coverage.json: which
+                                       changed lines it reaches, VACUOUS if none (then it kills no mutant)
        run.py mutants <pr> <A|A2|PR>   compile-check then score every mutant (M, then held-back M2); writes mutants_<tag>.json
 Run these one at a time, and not while prepare.py or ctx.py runs for the same PR (they share the worktrees and hunt dir;
 a lock enforces it). Long runs belong in the background.
@@ -36,6 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ctx import changed_lines
 from hunt_common import (
     InfraError,
     git,
@@ -441,7 +444,7 @@ def is_kill(name: str, status: str, base: Outcome) -> bool:
 
 
 def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: Outcome,
-                 m: dict[str, Any]) -> dict[str, Any]:
+                 m: dict[str, Any], vacuous: frozenset[str] = frozenset()) -> dict[str, Any]:
     v: dict[str, Any] = {"id": m["id"], "held_back": m["held_back"], "file": m["file"],
                          "what_breaks": m["what_breaks"], "killers": [], "mutant": m}
     # A mutant that cannot be applied as written goes back to a planter (regen), like one that does not compile.
@@ -463,7 +466,7 @@ def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: Outcome,
             return {**v, "verdict": "NEEDS_REGENERATION", "detail": str(e)[-1500:]}
         except InfraError as e:  # one mutant's environment failure (a compile-check timeout too) loses no other verdict
             return {**v, "verdict": "ERROR", "detail": str(e)[-1500:]}
-        killers = sorted(n for n, s in r.items() if is_kill(n, s, base))
+        killers = sorted(n for n, s in r.items() if is_kill(n, s, base) and n not in vacuous)
         return {**v, "verdict": "KILLED" if killers else "SURVIVED", "killers": killers}
     finally:
         path.write_text(orig)
@@ -487,11 +490,166 @@ def cmd_mutants(hdir: Path, state: dict[str, Any], tag: str) -> list[dict[str, A
                         for m in all_mutants(hdir)]
         else:
             base = run_suite(wt, suite, race=False)
-            verdicts = [score_mutant(wt, state, suite, base, m) for m in all_mutants(hdir)]
+            # A test that executes none of the PR's changed lines does not count as a killer (run.py cover).
+            vacuous = frozenset(vacuous_tests(hdir, tag))
+            verdicts = [score_mutant(wt, state, suite, base, m, vacuous) for m in all_mutants(hdir)]
     finally:
         unplace(placed)
     write_json(hdir / f"mutants_{tag}.json", verdicts)
     return verdicts
+
+
+# ---------------------------------------------------------------- changed-line coverage
+
+GO_BLOCK = re.compile(r"^(.+\.go):(\d+)\.\d+,(\d+)\.\d+ \d+ (\d+)$")
+
+
+def changed_lines_by_file(wt: Path, merge_base: str, files: list[str]) -> dict[str, set[int]]:
+    """Head-side lines the PR adds, plus the head line after each removal, per changed file."""
+    out = {}
+    for f in files:
+        out[f] = changed_lines(git(wt, "diff", "-U0", merge_base, "HEAD", "--", f))
+    return out
+
+
+def go_profile_lines(profile: str, rel_to_root: str) -> tuple[set[int], set[int]]:
+    """(lines inside any instrumented block, lines inside a block that ran) for one file of a Go cover profile.
+    Profile entries name the file by import path, so a file matches by its path below the module root."""
+    instrumented: set[int] = set()
+    hit: set[int] = set()
+    for line in profile.splitlines():
+        m = GO_BLOCK.match(line)
+        if not m or not (m.group(1) == rel_to_root or m.group(1).endswith("/" + rel_to_root)):
+            continue
+        span = set(range(int(m.group(2)), int(m.group(3)) + 1))
+        instrumented |= span
+        if int(m.group(4)) > 0:
+            hit |= span
+    return instrumented, hit
+
+
+def jest_profile_lines(cov: dict[str, Any], abs_path: str) -> tuple[set[int], set[int]]:
+    """Same as go_profile_lines, from one entry of Jest's coverage-final.json (statements only)."""
+    entry = cov.get(abs_path) or next((v for k, v in cov.items() if Path(k).resolve() == Path(abs_path).resolve()), None)
+    instrumented: set[int] = set()
+    hit: set[int] = set()
+    if not entry:
+        return instrumented, hit
+    for sid, loc in entry.get("statementMap", {}).items():
+        span = set(range(loc["start"]["line"], loc["end"]["line"] + 1))
+        instrumented |= span
+        if entry.get("s", {}).get(sid, 0) > 0:
+            hit |= span
+    return instrumented, hit
+
+
+def js_regex_escape(s: str) -> str:
+    return re.sub(r"[.*+?^${}()|[\]\\/]", lambda m: "\\" + m.group(0), s)
+
+
+def go_test_coverage(wt: Path, d: str, name: str, changed: dict[str, set[int]]) -> dict[str, tuple[set[int], set[int]]] | None:
+    """Run one Go test alone with coverage of the changed packages in its module; None if no profile was written."""
+    root = go_root(wt, d)
+    go_files = [f for f in changed if f.endswith(".go") and not f.endswith("_test.go")
+                and (wt / f).resolve().is_relative_to(root.resolve())]
+    if not go_files:
+        return {}
+    pkgs = sorted({"./" + os.path.relpath((wt / f).parent, root) for f in go_files})
+    with tempfile.TemporaryDirectory() as td:
+        prof = Path(td) / "cover.out"
+        sh(["go", "test", "-count=1", "-run", f"^{name}$", f"-coverprofile={prof}", "-coverpkg=" + ",".join(pkgs),
+            "./" + os.path.relpath(wt / d, root)], root, check=False, timeout=1800)
+        if not prof.exists():
+            return None
+        text = prof.read_text()
+    return {f: go_profile_lines(text, os.path.relpath(wt / f, root)) for f in go_files}
+
+
+def jest_test_coverage(wt: Path, rel: str, full_name: str,
+                       changed: dict[str, set[int]]) -> dict[str, tuple[set[int], set[int]]] | None:
+    root = jest_root(wt, rel)
+    js_files = [f for f in changed if re.search(r"\.[jt]sx?$", f) and (wt / f).resolve().is_relative_to(root.resolve())]
+    if not js_files:
+        return {}
+    with tempfile.TemporaryDirectory() as td:
+        args = ["npx", "jest", "--runTestsByPath", os.path.relpath(wt / rel, root), "--watchAll=false",
+                "-t", f"^{js_regex_escape(full_name)}$", "--coverage", "--coverageReporters=json",
+                f"--coverageDirectory={td}"]
+        for f in js_files:
+            args.append(f"--collectCoverageFrom={os.path.relpath(wt / f, root)}")
+        sh(args, root, check=False, timeout=1200, env=node_env())
+        final = Path(td) / "coverage-final.json"
+        if not final.exists():
+            return None
+        cov = json.loads(final.read_text())
+    return {f: jest_profile_lines(cov, str(wt / f)) for f in js_files}
+
+
+def cover_table(changed: dict[str, set[int]],
+                per_test: dict[str, dict[str, tuple[set[int], set[int]]] | None]) -> dict[str, Any]:
+    """Verdicts from raw per-test coverage. Only changed lines that some coverage run instrumented count: comments,
+    blank lines and declarations can never be reached, so they are not part of the denominator."""
+    executable: dict[str, set[int]] = {f: set() for f in changed}
+    for cov in per_test.values():
+        for f, (instrumented, _) in (cov or {}).items():
+            executable[f] |= instrumented & changed[f]
+    tests: dict[str, Any] = {}
+    reached: dict[str, set[int]] = {f: set() for f in changed}
+    for name, cov in per_test.items():
+        if cov is None:
+            tests[name] = {"verdict": "UNKNOWN", "hit": {}}  # no profile (a crash): never dropped on missing data
+            continue
+        hit = {f: sorted(h & executable[f]) for f, (_, h) in cov.items() if h & executable[f]}
+        for f, lines in hit.items():
+            reached[f] |= set(lines)
+        tests[name] = {"verdict": "REACHES" if hit else "VACUOUS", "hit": hit}
+    total = sum(len(v) for v in executable.values())
+    return {"tests": tests, "reached": sum(len(v) for v in reached.values()), "executable": total,
+            "unreached": {f: sorted(executable[f] - reached[f]) for f in changed if executable[f] - reached[f]}}
+
+
+def cmd_cover(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
+    """Run each hunter test alone with coverage (no -race, so no verdict depends on it) and record which of the PR's
+    changed lines it executes. Mode A only: Mode B's S3 tests are meant to stay off the changed lines."""
+    if tag not in ("A", "A2"):
+        raise InfraError(f"cover is for Mode A tags (A, A2), not {tag}")
+    wt = Path(state["wt"])
+    ensure_clean(wt)
+    files = load_json(hdir / tag / "response.json")["files"]
+    head = hdir / f"run_{tag}.json"
+    sha = hdir / f"run_{tag}.response.sha256"
+    if not head.exists() or not sha.exists() or sha.read_text().strip() != fingerprint(files):
+        raise InfraError(f"run `run.py run <pr> {tag}` first: cover measures the tests that produced run_{tag}.json")
+    table = load_json(head)
+    changed = changed_lines_by_file(wt, state["merge_base"], state["changed"])
+    per_test: dict[str, dict[str, tuple[set[int], set[int]]] | None] = {}
+    placed: list[Path] = []
+    try:
+        placed = place(wt, files, {t["dir"] for t in state["targets"]})
+        for ident in sorted(table):
+            loc, name = ident.split("::", 1)
+            if name == PACKAGE_FAILED:
+                continue
+            if loc.endswith((".ts", ".tsx", ".js", ".jsx")):
+                per_test[ident] = jest_test_coverage(wt, loc, name, changed)
+            else:
+                per_test[ident] = go_test_coverage(wt, loc, name, changed)
+    finally:
+        unplace(placed)
+    out = cover_table(changed, per_test)
+    for ident, t in out["tests"].items():
+        t["head"] = table.get(ident, "")
+    write_json(hdir / f"run_{tag}.coverage.json", out)
+    return out
+
+
+def vacuous_tests(hdir: Path, tag: str) -> set[str]:
+    """Tests run.py cover found to reach no changed line. A FAIL_3_OF_3 test is never in this set: it can still be a
+    real bug next to the change, and vetting decides that."""
+    p = hdir / f"run_{tag}.coverage.json"
+    if not p.exists():
+        return set()
+    return {n for n, t in load_json(p)["tests"].items() if t["verdict"] == "VACUOUS" and t.get("head") != "FAIL_3_OF_3"}
 
 
 def _terminate(signum: int, _frame: Any) -> None:
@@ -501,7 +659,7 @@ def _terminate(signum: int, _frame: Any) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 4 or argv[1] not in ("run", "base", "mutants"):
+    if len(argv) != 4 or argv[1] not in ("run", "base", "mutants", "cover"):
         print(__doc__)
         return 1
     cmd, pr, tag = argv[1], argv[2], argv[3]
@@ -520,6 +678,11 @@ def main(argv: list[str]) -> int:
             elif cmd == "base":
                 for n, c in cmd_base(hdir, state, tag).items():
                     print(f"[{tag} @merge-base] {n}: {c if n != 'detail' else c[:300]}")
+            elif cmd == "cover":
+                cov = cmd_cover(hdir, state, tag)
+                for n, t in cov["tests"].items():
+                    print(f"[{tag} cover] {n}: {t['verdict']} {sum(len(v) for v in t['hit'].values())} changed lines")
+                print(f"[{tag} cover] changed lines reached: {cov['reached']}/{cov['executable']}")
             else:
                 for v in cmd_mutants(hdir, state, tag):
                     extra = v["killers"] or v.get("detail", "")[:160]

@@ -32,6 +32,10 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      `<tag>/request.repair.json` to a fresh agent, rerun. Still broken = report the hunter as failed.
    - `INFRA_ERROR` (exit 2): fix the environment and rerun. Never report it as "no findings".
    - A `FLAKY` test is reported as flaky. Never retry it, add sleeps, or raise `-count` to make it pass.
+   - Then `run.py cover <pr> A`: each Mode A test runs alone with coverage (no `-race`). A test that reaches none of the
+     PR's changed lines is `VACUOUS`: it is listed as dropped and kills no mutant. A `VACUOUS` test that failed 3/3 is
+     still vetted in step 5. `UNKNOWN` (no profile) is never dropped. Mode B is not covered: its S3 tests stay off the
+     changed lines on purpose.
 5. **Vet every `FAIL_3_OF_3`:**
    - Root-cause it with a throwaway diagnostic test, then delete it (`run.py` refuses to run on a dirty worktree).
    - `lessons.py match <scratch>/hunt<pr>/ctx.json` lists known false positives. If it is one, drop it.
@@ -46,12 +50,15 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
    - Score: `run.py mutants <pr> A`.
    - `NEEDS_REGENERATION`: `build_requests.py <pr> regen <id> <tag>` (the score that reported it), dispatch it once, then rescore. Still broken = dropped.
      `ERROR` = that mutant hit an environment failure; rerun once, then report it as unscored.
-   - Any of M1-M3 `SURVIVED`: `build_requests.py <pr> strengthen M1,..`, dispatch it, then `run.py run <pr> A2` and `run.py mutants <pr> A2`.
+   - Any of M1-M3 `SURVIVED`: `build_requests.py <pr> strengthen M1,..` (it also passes the changed lines `cover`
+     found unreached), dispatch it, then `run.py run <pr> A2`, `run.py cover <pr> A2` and `run.py mutants <pr> A2`.
+     Unreached lines alone never start a strengthen round.
    - Always also run `run.py mutants <pr> PR` (a PR without tests in the hunted packages scores every mutant `SURVIVED`).
 7. **Report in chat only:**
    - **New PR Bug** / **Pre-Existing Bug** / **Caller-unreachable nit**, each with its exact test command,
      counterexample, root cause `file:line` and the caller that reaches it.
    - One line per dropped artifact.
-   - Mutation table M1-M5 × (A, A2, PR).
+   - Mutation table M1-M5 × (A, A2, PR), and under it "changed lines reached: X/Y" for A and A2. That is a floor, not
+     a quality score: never report it as a percentage.
    - If there is a New PR Bug, offer a review-comment draft. Never post it.
    - If nothing failed 3/3, say so plainly.

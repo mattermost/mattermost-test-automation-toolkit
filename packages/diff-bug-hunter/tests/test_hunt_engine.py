@@ -390,6 +390,93 @@ def test_pr_own_tests_score_mutants(tmp_path):
     assert v[0]["verdict"] == "KILLED" and v[0]["killers"] == ["calc::TestClampMiddle"]
 
 
+# ------------------------------------------------------------------ changed-line coverage gate
+
+CLAMP_ONLY = ("\nfunc TestHuntA_ClampOnly(t *testing.T) {\n\tif Clamp(5, 0, 3) != 3 {\n\t\tt.Fatal(\"clamp\")\n\t}\n}\n")
+
+
+def test_cover_marks_a_test_that_never_reaches_the_change_vacuous(tmp_path):
+    hdir, state = make_hunt(tmp_path, "clean")
+    resp = json.loads((hdir / "A" / "response.json").read_text())
+    resp["files"][0]["content"] += CLAMP_ONLY  # Clamp is unchanged base code; the PR only adds percent.go
+    (hdir / "A" / "response.json").write_text(json.dumps(resp))
+    assert set(run.cmd_run(hdir, state, "A", runs=1).values()) == {"PASS"}
+    cov = run.cmd_cover(hdir, state, "A")
+    t = cov["tests"]
+    assert t["calc::TestHuntA_ClampOnly"]["verdict"] == "VACUOUS"
+    assert t["calc::TestHuntA_PercentZeroTotal"]["verdict"] == "REACHES"
+    assert 9 in t["calc::TestHuntA_PercentZeroTotal"]["hit"]["calc/percent.go"]  # `return 0` for a zero total
+    # The fixture hunter draws part <= total only, so the cap branch is a real gap the strengthen round is told about.
+    assert 0 < cov["reached"] < cov["executable"]
+    src = (Path(state["wt"]) / "calc/percent.go").read_text().split("\n")
+    assert any("return 100" in src[n - 1] for n in cov["unreached"]["calc/percent.go"])
+    # comment and signature-only lines are not part of the denominator
+    assert cov["executable"] < len(run.changed_lines_by_file(Path(state["wt"]), state["merge_base"],
+                                                             state["changed"])["calc/percent.go"])
+    assert json.loads((hdir / "run_A.coverage.json").read_text())["tests"] == t
+    assert run.vacuous_tests(hdir, "A") == {"calc::TestHuntA_ClampOnly"}
+    assert not list(Path(state["wt"]).rglob("hunt_*"))  # the coverage pass cleans up after itself
+
+
+def test_strengthen_request_carries_unreached_lines_only_when_cover_ran(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    hdir, _ = make_hunt(tmp_path, "clean")
+    monkeypatch.setattr(build_requests, "hunt_dir", lambda pr: hdir)
+    build_requests.main("1", "strengthen", "M3")
+    user = json.loads(json.loads((hdir / "A2" / "request.json").read_text())["user"])
+    assert "unreached_changed_lines" not in user and user["surviving_faults"]
+    (hdir / "run_A.coverage.json").write_text(json.dumps({"tests": {}, "unreached": {"calc/percent.go": [12]}}))
+    build_requests.main("1", "strengthen", "M3")
+    req = json.loads((hdir / "A2" / "request.json").read_text())
+    assert json.loads(req["user"])["unreached_changed_lines"] == {"calc/percent.go": [12]}
+    assert "Reaching a line is not enough" in req["system"]
+
+
+def test_cover_refuses_mode_b_and_stale_runs(tmp_path):
+    hdir, state = make_hunt(tmp_path, "clean")
+    with pytest.raises(hunt_common.InfraError, match="Mode A"):
+        run.cmd_cover(hdir, state, "B")  # S3 differential tests stay off the changed lines on purpose
+    with pytest.raises(hunt_common.InfraError, match="run `run.py run"):
+        run.cmd_cover(hdir, state, "A")
+
+
+def test_a_vacuous_test_kills_no_mutant_but_a_vacuous_head_failure_is_kept(tmp_path):
+    hdir, state = make_hunt(tmp_path, "clean")
+    run.cmd_run(hdir, state, "A", runs=1)
+    cov = {"tests": {"calc::TestHuntA_PercentZeroTotal": {"verdict": "VACUOUS", "hit": {}, "head": "PASS"}},
+           "reached": 0, "executable": 0, "unreached": {}}
+    (hdir / "run_A.coverage.json").write_text(json.dumps(cov))
+    v = {m["id"]: m for m in run.cmd_mutants(hdir, state, "A")}
+    assert v["M1"]["verdict"] == "SURVIVED"  # its only killer reached no changed line
+    cov["tests"]["calc::TestHuntA_PercentZeroTotal"]["head"] = "FAIL_3_OF_3"
+    (hdir / "run_A.coverage.json").write_text(json.dumps(cov))
+    assert run.vacuous_tests(hdir, "A") == set()
+
+
+def test_cover_table_never_drops_a_test_without_a_profile():
+    changed = {"a.go": {3, 4, 5}}
+    out = run.cover_table(changed, {"p::TestHuntA_Crash": None, "p::TestHuntA_Ok": {"a.go": ({3, 4, 9}, {4, 9})}})
+    assert out["tests"]["p::TestHuntA_Crash"]["verdict"] == "UNKNOWN"
+    assert out["tests"]["p::TestHuntA_Ok"] == {"verdict": "REACHES", "hit": {"a.go": [4]}}
+    assert (out["reached"], out["executable"], out["unreached"]) == (1, 2, {"a.go": [3]})
+
+
+def test_go_profile_lines_match_by_path_below_the_module_root():
+    prof = ("mode: set\nexample.com/fx/calc/percent.go:7.36,8.16 1 1\nexample.com/fx/calc/percent.go:11.2,11.27 1 0\n"
+            "example.com/fx/other/percent.go:7.1,9.2 1 1\n")
+    assert run.go_profile_lines(prof, "calc/percent.go") == ({7, 8, 11}, {7, 8})
+
+
+@pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(), reason="run `make jest-deps` first")
+def test_cover_measures_a_jest_test(tmp_path):
+    hdir, state = make_hunt(tmp_path, "react_bug")
+    run.cmd_run(hdir, state, "A", runs=1)
+    cov = run.cmd_cover(hdir, state, "A")
+    t = cov["tests"]["web/src/hunt_a.test.tsx::HuntA HuntA_neverExceedsMax"]
+    assert t["verdict"] == "REACHES" and t["head"] == "FAIL_3_OF_3"
+    assert cov["executable"] > 0
+
+
 # ------------------------------------------------------------------ large-diff guard
 
 def synthetic_diff() -> list[prefilter.FileDiff]:
