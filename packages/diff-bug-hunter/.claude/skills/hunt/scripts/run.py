@@ -7,6 +7,8 @@ usage: run.py run <pr> <A|B|A2>        3 runs on unmodified PR head (Go with -ra
        run.py base <pr> <A|B|A2>       the same tests once on the merge-base worktree; writes base_<tag>.json
        run.py cover <pr> <A|A2>        each test alone with coverage (no -race); writes run_<tag>.coverage.json: which
                                        changed lines it reaches, VACUOUS if none (then it kills no mutant)
+       run.py fuzz <pr> A              HUNT_FUZZ=1 only: fuzz pure FuzzHuntA_<Name> targets (HUNT_FUZZ_TIME, default 60s);
+                                       a failure is frozen into TestHuntA_<Name>_Fuzz<hash> in A/response.json; writes fuzz_A.json
        run.py mutants <pr> <A|A2|PR>   compile-check then score every mutant (M, then held-back M2); writes mutants_<tag>.json
 Run these one at a time, and not while prepare.py or ctx.py runs for the same PR (they share the worktrees and hunt dir;
 a lock enforces it). Long runs belong in the background.
@@ -38,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ctx import changed_lines
+from ctx import changed_lines, top_blocks
 from hunt_common import (
     InfraError,
     git,
@@ -652,6 +654,123 @@ def vacuous_tests(hdir: Path, tag: str) -> set[str]:
     return {n for n, t in load_json(p)["tests"].items() if t["verdict"] == "VACUOUS" and t.get("head") != "FAIL_3_OF_3"}
 
 
+# ---------------------------------------------------------------- Go fuzzing (discovery only, HUNT_FUZZ=1)
+
+MAX_FUZZ_TARGETS = 5
+FUZZ_TARGET = re.compile(r"^func (FuzzHunt([A-Z])_(\w+))\(\w+ \*testing\.F\)", re.M)
+STATEFUL = re.compile(r"\bSetup(?:WithStoreMock|Config|WithServerOptions)?\(|\bmainHelper\b|\bsql\.Open\(|\bhttp\.(?:Get|Post)\(")
+# A corpus value we can paste back as a Go expression: int(5), string("a\x00"), []byte("x"), bool(true), rune('a').
+CORPUS_VALUE = re.compile(r"^(?:\[\]byte|string|bool|byte|rune|u?int(?:8|16|32|64)?|float(?:32|64))\(.*\)$")
+
+
+def fuzz_time() -> str:
+    return os.environ.get("HUNT_FUZZ_TIME", "60s")
+
+
+def func_body(src: str, name: str) -> str | None:
+    lines = src.split("\n")
+    for sym, a, b in top_blocks(lines, "go"):
+        if sym == name:
+            return "\n".join(lines[a - 1:b])
+    return None
+
+
+def corpus_args(entry: str) -> list[str] | None:
+    """Go expressions for one `go test fuzz v1` corpus file; None for a value that is not a plain literal (NaN, Inf)."""
+    rows = entry.strip().split("\n")
+    if not rows or rows[0].strip() != "go test fuzz v1":
+        return None
+    args = [r.strip() for r in rows[1:] if r.strip()]
+    if any(not CORPUS_VALUE.match(a) or re.search(r"Inf|NaN|frombits", a) for a in args):
+        return None
+    return args
+
+
+def freeze(name: str, mode: str, base: str, args: list[str]) -> tuple[str, str]:
+    """(test name, Go source) of a deterministic test that replays one fuzz input through the target's helper."""
+    test = f"TestHunt{mode}_{base}_Fuzz{hashlib.sha256(chr(10).join(args).encode()).hexdigest()[:8]}"
+    return test, (f"\n// Frozen by run.py fuzz from a minimized failing input of {name}.\n"
+                  f"func {test}(t *testing.T) {{\n\thuntCheck{mode}_{base}(t, {', '.join(args)})\n}}\n")
+
+
+def cmd_fuzz(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
+    """Fuzz each pure FuzzHuntA_<Name> target briefly. A failure is not a finding: its minimized input is frozen into a
+    deterministic TestHuntA_<Name>_Fuzz<hash> that calls huntCheckA_<Name>, appended to <tag>/response.json, and
+    must then go through `run.py run` (3/3), `cover` and `base` like any hunter test."""
+    if os.environ.get("HUNT_FUZZ") != "1":
+        raise InfraError("fuzzing is off: set HUNT_FUZZ=1 to run it")
+    if tag != "A":
+        raise InfraError(f"fuzz is for Mode A only, not {tag}")
+    wt = Path(state["wt"])
+    ensure_clean(wt)
+    require_disk(scratch())
+    resp_path = hdir / tag / "response.json"
+    resp = load_json(resp_path)
+    report: dict[str, Any] = {"targets": {}, "frozen": []}
+    candidates: list[tuple[int, str, str, str]] = []  # (file index, target, mode, base name)
+    for i, f in enumerate(resp["files"]):
+        if not str(f.get("path", "")).endswith(".go"):
+            continue
+        src = str(f.get("content", ""))
+        for m in FUZZ_TARGET.finditer(src):
+            name, mode, base = m.group(1), m.group(2), m.group(3)
+            check = func_body(src, f"huntCheck{mode}_{base}")
+            body = (func_body(src, name) or "") + "\n" + (check or "")
+            if mode != tag[0]:
+                report["targets"][name] = "SKIPPED wrong mode"
+            elif check is None:
+                report["targets"][name] = f"SKIPPED no huntCheck{mode}_{base}(t, ...) helper to freeze into"
+            elif STATEFUL.search(body):
+                report["targets"][name] = "SKIPPED stateful (Setup, store, network): only pure functions are fuzzed"
+            elif len(candidates) >= MAX_FUZZ_TARGETS:
+                report["targets"][name] = f"SKIPPED over the {MAX_FUZZ_TARGETS}-target limit"
+            else:
+                candidates.append((i, name, mode, base))
+    additions: dict[int, list[str]] = {}
+    placed: list[Path] = []
+    try:
+        placed = place(wt, resp["files"], {t["dir"] for t in state["targets"]})
+        for i, name, mode, base in candidates:
+            d = str(Path(resp["files"][i]["path"]).parent)
+            root = go_root(wt, d)
+            corpus = wt / d / "testdata" / "fuzz" / name
+            created = [p for p in (wt / d / "testdata", wt / d / "testdata" / "fuzz", corpus) if not p.exists()]
+            try:
+                p = sh(["go", "test", "-count=1", "-run", "^$", "-fuzz", f"^{name}$", f"-fuzztime={fuzz_time()}",
+                        "./" + os.path.relpath(wt / d, root)], root, check=False, timeout=1800)
+                entries = sorted(corpus.glob("*")) if corpus.is_dir() else []
+                if p.returncode == 0:
+                    report["targets"][name] = "PASS"
+                elif not entries:
+                    out = p.stdout + p.stderr
+                    if "[build failed]" in out or "[setup failed]" in out:
+                        raise CompileError(f"{name}:\n{out[-2500:]}")
+                    report["targets"][name] = "ERROR " + normalize_failure(out[-1500:], wt)
+                else:
+                    args = corpus_args(entries[0].read_text())
+                    if args is None:
+                        report["targets"][name] = "FAIL (input not freezable: " + entries[0].read_text()[:200] + ")"
+                    else:
+                        test, code = freeze(name, mode, base, args)
+                        report["targets"][name] = f"FAIL frozen as {test}"
+                        report["frozen"].append(test)
+                        additions.setdefault(i, []).append(code)
+            finally:
+                # The corpus lands next to the package; remove only what this run created so the worktree stays clean.
+                for c in reversed(created):
+                    if c.exists():
+                        _shutil.rmtree(c)
+    finally:
+        unplace(placed)
+    if additions:
+        (hdir / tag / "response.prefuzz.json").write_text(resp_path.read_text())
+        for i, frozen in additions.items():
+            resp["files"][i]["content"] = resp["files"][i]["content"] + "".join(frozen)
+        write_json(resp_path, resp)
+    write_json(hdir / f"fuzz_{tag}.json", report)
+    return report
+
+
 def _terminate(signum: int, _frame: Any) -> None:
     # SIGTERM / SIGHUP (a tool timeout, a closed terminal) unwind through the finally blocks, so a mutated file is
     # restored and hunt files are removed instead of being left in the worktree.
@@ -659,7 +778,7 @@ def _terminate(signum: int, _frame: Any) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 4 or argv[1] not in ("run", "base", "mutants", "cover"):
+    if len(argv) != 4 or argv[1] not in ("run", "base", "mutants", "cover", "fuzz"):
         print(__doc__)
         return 1
     cmd, pr, tag = argv[1], argv[2], argv[3]
@@ -683,6 +802,13 @@ def main(argv: list[str]) -> int:
                 for n, t in cov["tests"].items():
                     print(f"[{tag} cover] {n}: {t['verdict']} {sum(len(v) for v in t['hit'].values())} changed lines")
                 print(f"[{tag} cover] changed lines reached: {cov['reached']}/{cov['executable']}")
+            elif cmd == "fuzz":
+                rep = cmd_fuzz(hdir, state, tag)
+                for n, v in rep["targets"].items():
+                    print(f"[{tag} fuzz] {n}: {v}")
+                if rep["frozen"]:
+                    print(f"[{tag} fuzz] {len(rep['frozen'])} frozen test(s) added to {tag}/response.json: "
+                          f"run `run.py run <pr> {tag}` and `run.py cover <pr> {tag}` again")
             else:
                 for v in cmd_mutants(hdir, state, tag):
                     extra = v["killers"] or v.get("detail", "")[:160]

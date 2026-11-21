@@ -32,6 +32,10 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      `<tag>/request.repair.json` to a fresh agent, rerun. Still broken = report the hunter as failed.
    - `INFRA_ERROR` (exit 2): fix the environment and rerun. Never report it as "no findings".
    - A `FLAKY` test is reported as flaky. Never retry it, add sleeps, or raise `-count` to make it pass.
+   - Only with `HUNT_FUZZ=1` (set before step 3, so Mode A is asked for `FuzzHuntA_` targets): `run.py fuzz <pr> A`.
+     Each pure target is fuzzed for `HUNT_FUZZ_TIME` (default 60s). A failure is not a finding: its shrunk input is
+     frozen into `TestHuntA_<Name>_Fuzz<hash>` in `A/response.json`, so rerun `run.py run <pr> A` before going on.
+     Stateful targets (`Setup(`, store, network) are skipped by the script.
    - Then `run.py cover <pr> A`: each Mode A test runs alone with coverage (no `-race`). A test that reaches none of the
      PR's changed lines is `VACUOUS`: it is listed as dropped and kills no mutant. A `VACUOUS` test that failed 3/3 is
      still vetted in step 5. `UNKNOWN` (no profile) is never dropped. Mode B is not covered: its S3 tests stay off the

@@ -416,6 +416,79 @@ def test_pr_own_tests_score_mutants(tmp_path):
     assert v[0]["verdict"] == "KILLED" and v[0]["killers"] == ["calc::TestClampMiddle"]
 
 
+# ------------------------------------------------------------------ Go fuzzing (HUNT_FUZZ=1)
+
+FUZZ_CLAMP = ("\nfunc huntCheckA_Clamp(t *testing.T, v, lo, hi int) {\n\tif hi < lo {\n\t\treturn\n\t}\n"
+              "\tgot := Clamp(v, lo, hi)\n\tif got < lo || got > hi || (v >= lo && v <= hi && got != v) {\n"
+              "\t\tt.Fatalf(\"Clamp(%d, %d, %d) = %d\", v, lo, hi, got)\n\t}\n}\n\n"
+              "func FuzzHuntA_Clamp(f *testing.F) {\n\tf.Add(0, 0, 10)\n"
+              "\tf.Fuzz(func(t *testing.T, v, lo, hi int) { huntCheckA_Clamp(t, v, lo, hi) })\n}\n")
+
+
+def _add_to_response(hdir: Path, extra: str) -> None:
+    resp = json.loads((hdir / "A" / "response.json").read_text())
+    resp["files"][0]["content"] += extra
+    (hdir / "A" / "response.json").write_text(json.dumps(resp))
+
+
+def test_fuzz_is_off_unless_asked(tmp_path, monkeypatch):
+    monkeypatch.delenv("HUNT_FUZZ", raising=False)
+    hdir, state = make_hunt(tmp_path, "go_bug")
+    with pytest.raises(hunt_common.InfraError, match="HUNT_FUZZ=1"):
+        run.cmd_fuzz(hdir, state, "A")
+
+
+def test_fuzz_failure_is_frozen_into_a_deterministic_test_that_is_vetted_like_any_other(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUNT_FUZZ", "1")
+    monkeypatch.setenv("HUNT_FUZZ_TIME", "30s")
+    hdir, state = make_hunt(tmp_path, "go_bug")
+    _add_to_response(hdir, FUZZ_CLAMP)
+    rep = run.cmd_fuzz(hdir, state, "A")
+    assert rep["targets"]["FuzzHuntA_Clamp"].startswith("FAIL frozen as TestHuntA_Clamp_Fuzz")
+    frozen = rep["frozen"][0]
+    wt = Path(state["wt"])
+    assert not list(wt.rglob("hunt_*")) and not (wt / "calc" / "testdata").exists()
+    run.ensure_clean(wt)  # the corpus the fuzzer wrote is gone
+    assert (hdir / "A" / "response.prefuzz.json").exists()
+    assert frozen in (hdir / "A" / "response.json").read_text()
+    table = run.cmd_run(hdir, state, "A")
+    assert table[f"calc::{frozen}"] == "FAIL_3_OF_3"
+    assert run.cmd_base(hdir, state, "A")[f"calc::{frozen}"] == "NEW_PR_BUG"
+
+
+def test_fuzz_skips_stateful_and_unfreezable_targets(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUNT_FUZZ", "1")
+    hdir, state = make_hunt(tmp_path, "go_bug")
+    stateful = ("\nfunc huntCheckA_Store(t *testing.T, n int) {\n\tth := Setup(t)\n\t_ = th\n}\n\n"
+                "func FuzzHuntA_Store(f *testing.F) {\n\tf.Fuzz(func(t *testing.T, n int) { huntCheckA_Store(t, n) })\n}\n"
+                "\nfunc FuzzHuntA_NoHelper(f *testing.F) {\n\tf.Fuzz(func(t *testing.T, n int) {})\n}\n"
+                "\nfunc Setup(t *testing.T) int { return 0 }\n")
+    _add_to_response(hdir, stateful)
+    rep = run.cmd_fuzz(hdir, state, "A")
+    assert rep["targets"]["FuzzHuntA_Store"].startswith("SKIPPED stateful")
+    assert rep["targets"]["FuzzHuntA_NoHelper"].startswith("SKIPPED no huntCheckA_NoHelper")
+    assert rep["frozen"] == [] and not (hdir / "A" / "response.prefuzz.json").exists()
+
+
+def test_fuzz_prompt_only_goes_to_mode_a_when_fuzzing_is_on(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    hdir, state = make_hunt(tmp_path, "go_bug")
+    c = json.loads((hdir / "ctx.json").read_text())
+    monkeypatch.delenv("HUNT_FUZZ", raising=False)
+    assert "FuzzHuntA_" not in build_requests.hunter_system("A", state, c, strategies=True)
+    monkeypatch.setenv("HUNT_FUZZ", "1")
+    assert "FuzzHuntA_" in build_requests.hunter_system("A", state, c, strategies=True)
+    assert "FuzzHuntA_" not in build_requests.hunter_system("B", state, c, strategies=True)
+
+
+def test_corpus_args_accept_plain_literals_only():
+    assert run.corpus_args('go test fuzz v1\nint(5)\nstring("a\\x00")\n[]byte("x")\n') == \
+        ["int(5)", 'string("a\\x00")', '[]byte("x")']
+    assert run.corpus_args("go test fuzz v1\nfloat64(+Inf)\n") is None
+    assert run.corpus_args("go test fuzz v1\nfloat64(math.Float64frombits(0x7ff8000000000001))\n") is None
+    assert run.corpus_args("not a corpus\n") is None
+
+
 # ------------------------------------------------------------------ changed-line coverage gate
 
 CLAMP_ONLY = ("\nfunc TestHuntA_ClampOnly(t *testing.T) {\n\tif Clamp(5, 0, 3) != 3 {\n\t\tt.Fatal(\"clamp\")\n\t}\n}\n")
