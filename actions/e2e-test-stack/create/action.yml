@@ -1,0 +1,135 @@
+---
+name: E2E test stack create
+description: >-
+  Create a batch of remote Mattermost test servers through the e2e-test-stack control plane, check that every server
+  is ready, and upload its sealed create response. Assumes the repository's CI role through GitHub OIDC: the job
+  needs id-token: write, and Node 26 set up first.
+author: Mattermost
+inputs:
+  caller-key:
+    description: The repository's key in the control plane's callers (e.g. mobile); only its alias <caller-key>-<channel> is invoked
+    required: true
+  batch:
+    description: >-
+      Names the batch within the run (e.g. ios): 1-20 lowercase letters, digits and hyphens, starting and ending with a
+      letter or digit. The instance key is <caller-key>-<run id>-<batch>-<run attempt>, 44 characters at most
+    required: true
+  role-arn:
+    description: >-
+      The repository's CI role ARN in the account to create in (arn:aws:iam::<account id>:role/e2e-test-stack-ci-<caller-key>).
+      The batch is created in that role's account
+    required: true
+  channel:
+    description: v1 (the promoted build, the default) or edge (main's newest build)
+    default: v1
+  credentials-key:
+    description: >-
+      The repository's credentials key, a base64 X25519 private key (the E2E_TEST_STACK_CREDENTIALS_KEY secret), which
+      opens the secrets the control plane seals to the repository
+    required: true
+  server-image:
+    description: >-
+      The Mattermost server image under test: master, latest (the newest stable release), esr (the newest patch of the
+      newest Extended Support Release line), or an image reference by tag
+      (e.g. mattermostdevelopment/mattermost-enterprise-edition:master)
+    required: true
+  count:
+    description: Servers in the batch; empty is 1. The control plane's ceiling is 40
+    default: ""
+  ttl:
+    description: How long the batch lives before it is reaped, as a duration (90m, 2h); 2h is the default, 4h the ceiling
+    default: 2h
+  services:
+    description: >-
+      Comma-separated optional services: minio or azurite, elasticsearch or opensearch, keycloak, openldap. Empty runs
+      Postgres, Inbucket and the server alone
+    default: ""
+  os:
+    description: "The servers' OS: ubuntu-24.04 (the default) or ubuntu-26.04"
+    default: ubuntu-24.04
+  postgres:
+    description: "Postgres major version: 14, 15, 16 (the default), 17 or 18"
+    default: "16"
+  license:
+    description: "Licence SKU: enterprise-advanced (the default), or empty to run unlicensed"
+    default: enterprise-advanced
+  server-env:
+    description: >-
+      Server settings as a JSON object of strings, e.g. {"MM_FEATUREFLAGS_TESTFEATURE":"true"}. Holds no credential:
+      the control plane refuses one
+    default: ""
+  retries:
+    description: Attempts per failed server; empty is 1, a negative number none, the ceiling 3
+    default: ""
+  shared-admin-password:
+    description: true gives every server of the batch the same admin password
+    default: ""
+  wait-for-migrations:
+    description: true waits for the server's migrations before a server is ready
+    default: ""
+  github-token:
+    description: The token for api.github.com, which resolving latest or esr reads mattermost/mattermost's releases with
+    default: ${{ github.token }}
+outputs:
+  batch-id:
+    description: The batch's id; set whenever the control plane named a batch, so a later destroy can release it
+    value: ${{ steps.create.outputs.batch_id }}
+  sites:
+    description: JSON array of site URLs, index-aligned with the batch; "" where a server failed
+    value: ${{ steps.create.outputs.sites }}
+  indexes:
+    description: JSON array of the batch's indexes, [0, ..., count - 1]; empty unless every server is ready
+    value: ${{ steps.create.outputs.indexes }}
+  server-image:
+    description: The image the batch runs, with master, latest or esr resolved
+    value: ${{ steps.create.outputs.server_image }}
+  state:
+    description: The batch's state as create reported it, ready or failed
+    value: ${{ steps.create.outputs.state }}
+  duration-seconds:
+    description: Seconds from the request to every server ready, as the control plane measured it; empty when a server failed
+    value: ${{ steps.create.outputs.duration_seconds }}
+  response-path:
+    description: The create response file; its secrets are sealed. Empty when the control plane was not reached
+    value: ${{ steps.create.outputs.response_path }}
+runs:
+  using: composite
+  steps:
+    - id: create
+      shell: bash
+      env:
+        STACK_CALLER_KEY: ${{ inputs.caller-key }}
+        STACK_BATCH: ${{ inputs.batch }}
+        STACK_ROLE_ARN: ${{ inputs.role-arn }}
+        STACK_CHANNEL: ${{ inputs.channel }}
+        STACK_CREDENTIALS_KEY: ${{ inputs.credentials-key }}
+        STACK_SERVER_IMAGE: ${{ inputs.server-image }}
+        STACK_COUNT: ${{ inputs.count }}
+        STACK_TTL: ${{ inputs.ttl }}
+        STACK_SERVICES: ${{ inputs.services }}
+        STACK_OS: ${{ inputs.os }}
+        STACK_POSTGRES: ${{ inputs.postgres }}
+        STACK_LICENSE: ${{ inputs.license }}
+        STACK_SERVER_ENV: ${{ inputs.server-env }}
+        STACK_RETRIES: ${{ inputs.retries }}
+        STACK_SHARED_ADMIN_PASSWORD: ${{ inputs.shared-admin-password }}
+        STACK_WAIT_FOR_MIGRATIONS: ${{ inputs.wait-for-migrations }}
+        STACK_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: bash "${{ github.action_path }}/../run.sh" create
+    # This attempt's own response. Every secret in it is sealed.
+    - if: always() && steps.create.outputs.response_path != ''
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+      with:
+        name: e2e-test-stack-response-${{ inputs.batch }}-${{ github.run_attempt }}
+        path: ${{ steps.create.outputs.response_path }}
+        if-no-files-found: error
+        # A second create of the batch in the same attempt replaces the first's.
+        overwrite: true
+    # The newest response for the batch, replacing an earlier attempt's.
+    - if: always() && steps.create.outputs.response_path != ''
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+      with:
+        name: e2e-test-stack-create-${{ inputs.batch }}
+        path: ${{ steps.create.outputs.response_path }}
+        if-no-files-found: error
+        overwrite: true
