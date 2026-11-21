@@ -9244,10 +9244,10 @@ function bindRetryMiddleware(isStreamingPayload2) {
             throw lastError;
           }
           attempts = retryToken.getRetryCount();
-          const delay = retryToken.getRetryDelay();
-          totalRetryDelay += (retryToken?.$retryLog?.acquisitionDelay ?? 0) + delay;
-          if (delay > 0) {
-            await race(new Promise((resolve2) => setTimeout(resolve2, delay)), abortSignal);
+          const delay2 = retryToken.getRetryDelay();
+          totalRetryDelay += (retryToken?.$retryLog?.acquisitionDelay ?? 0) + delay2;
+          if (delay2 > 0) {
+            await race(new Promise((resolve2) => setTimeout(resolve2, delay2)), abortSignal);
           }
         }
       }
@@ -9322,7 +9322,7 @@ var init_DefaultRateLimiter = __esm({
     "use strict";
     init_service_error_classification();
     DefaultRateLimiter = class _DefaultRateLimiter {
-      static setTimeoutFn = (fn, delay) => setTimeout(fn, delay);
+      static setTimeoutFn = (fn, delay2) => setTimeout(fn, delay2);
       beta;
       minCapacity;
       minFillRate;
@@ -9381,8 +9381,8 @@ var init_DefaultRateLimiter = __esm({
         }
         this.refillTokenBucket();
         while (amount > this.availableTokens) {
-          const delay = (amount - this.availableTokens) / this.fillRate * 1e3;
-          await new Promise((resolve2) => _DefaultRateLimiter.setTimeoutFn(resolve2, delay));
+          const delay2 = (amount - this.availableTokens) / this.fillRate * 1e3;
+          await new Promise((resolve2) => _DefaultRateLimiter.setTimeoutFn(resolve2, delay2));
           this.refillTokenBucket();
         }
         this.availableTokens = this.availableTokens - amount;
@@ -9474,8 +9474,8 @@ var init_DefaultRetryBackoffStrategy = __esm({
         const t_i = b8 * Math.min(this.x * r8 ** i8, MAXIMUM_RETRY_DELAY);
         return Math.floor(t_i);
       }
-      setDelayBase(delay) {
-        this.x = delay;
+      setDelayBase(delay2) {
+        this.x = delay2;
       }
     };
   }
@@ -9495,8 +9495,8 @@ var init_DefaultRetryToken = __esm({
       $retryLog = {
         acquisitionDelay: 0
       };
-      constructor(delay, count, cost, longPoll) {
-        this.delay = delay;
+      constructor(delay2, count, cost, longPoll) {
+        this.delay = delay2;
         this.count = count;
         this.cost = cost;
         this.longPoll = longPoll;
@@ -20078,7 +20078,7 @@ var init_dist_es15 = __esm({
 var import_node_util2 = require("util");
 
 // src/create.ts
-var import_node_fs6 = require("fs");
+var import_node_crypto6 = require("crypto");
 var import_node_os4 = require("os");
 var import_node_path8 = require("path");
 init_retry2();
@@ -26430,6 +26430,7 @@ var InvokeCommand = class extends command5(_ep05, _mw05, "Invoke", Invoke$) {
 };
 
 // src/core/lambda.ts
+var import_promises4 = require("timers/promises");
 var REQUEST_TIMEOUT_MS = 96e4;
 var THROTTLE_ATTEMPTS = 5;
 var alias = (project, channel, callerKey) => ({
@@ -26453,7 +26454,23 @@ function lambdaClientConfig(region, credentials, requestTimeout = REQUEST_TIMEOU
 function lambdaClient(region, credentials) {
   return new LambdaClient(lambdaClientConfig(region, credentials));
 }
-function lambdaInvoke(client, wait = sleep, log = console.log) {
+var abortableSleep = (ms, signal) => (0, import_promises4.setTimeout)(ms, void 0, { signal }).catch(() => {
+});
+async function abortable(waited, signal) {
+  if (!signal) return waited;
+  if (signal.aborted) return;
+  let stop = () => {
+  };
+  try {
+    await Promise.race([
+      waited,
+      new Promise((resolve2) => signal.addEventListener("abort", stop = () => resolve2(), { once: true }))
+    ]);
+  } finally {
+    signal.removeEventListener("abort", stop);
+  }
+}
+function lambdaInvoke(client, wait = abortableSleep, log = console.log) {
   return async (input2, signal) => {
     for (let attempt = 1; ; attempt++) {
       try {
@@ -26472,7 +26489,8 @@ function lambdaInvoke(client, wait = sleep, log = console.log) {
         log(
           `e2e-test-stack: throttled; trying again in ${ms / 1e3} s (attempt ${attempt + 1} of ${THROTTLE_ATTEMPTS})`
         );
-        await wait(ms);
+        await abortable(wait(ms, signal), signal);
+        if (signal?.aborted) throw e7;
       }
     }
   };
@@ -27760,11 +27778,15 @@ var AssumeRoleWithWebIdentityCommand2 = class extends command6(_ep06, _mw06, "As
 
 // src/core/role.ts
 var SESSION_SECONDS = 3600;
-var ROLE_ARN = /^arn:aws[a-z-]*:iam::\d{12}:role\/[\w+=,.@/-]{1,512}$/;
+var ROLE_ARN = /^arn:aws:iam::\d{12}:role\/[\w+=,.@/-]{1,512}$/;
 function roleArnFrom(value, callerKey) {
   if (!value)
     throw new ActionError(
       "role-arn is required: the ARN of the repository's CI role in the account to use, arn:aws:iam::<account id>:role/e2e-test-stack-ci-<caller-key>"
+    );
+  if (/^arn:aws-[a-z-]+:/.test(value))
+    throw new ActionError(
+      "role-arn must be in the commercial AWS partition, arn:aws:iam::<account id>:role/<name>, where the control plane is"
     );
   if (!ROLE_ARN.test(value))
     throw new ActionError("role-arn must be an IAM role ARN, arn:aws:iam::<account id>:role/<name>");
@@ -31317,7 +31339,7 @@ async function serverImage(server, github) {
 // src/create.ts
 var MAX_INSTANCE_KEY = 44;
 var SERVICE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
-var DURATION_PART = /(\d+)(?:\.(\d+))?(ns|us|µs|ms|s|m|h)/g;
+var DURATION_PART = /(?=\.?\d)(\d*)(?:\.(\d*))?(ns|us|µs|ms|s|m|h)/g;
 var DURATION = new RegExp(`^(?:${DURATION_PART.source})+$`);
 var UNIT_NS = {
   ns: 1n,
@@ -31341,7 +31363,7 @@ var durationNs = (value) => {
   let ns = 0n;
   for (const [, whole, fraction = "", unit] of value.matchAll(DURATION_PART)) {
     const per = UNIT_NS[unit];
-    ns += BigInt(whole) * per + BigInt(fraction || "0") * per / 10n ** BigInt(fraction.length);
+    ns += BigInt(whole || "0") * per + BigInt(fraction || "0") * per / 10n ** BigInt(fraction.length);
   }
   return ns;
 };
@@ -31499,26 +31521,28 @@ function createWith(overrides = {}) {
     sleep: sleep2,
     fetch: overrides.fetch ?? fetch,
     sts: overrides.sts ?? stsClient,
-    connect: overrides.connect ?? ((region, credentials) => lambdaInvoke(lambdaClient(region, credentials), sleep2, log)),
-    fetchTimeoutMs: overrides.fetchTimeoutMs ?? FETCH_TIMEOUT_MS
+    connect: overrides.connect ?? ((region, credentials) => lambdaInvoke(lambdaClient(region, credentials), overrides.sleep ?? abortableSleep, log)),
+    fetchTimeoutMs: overrides.fetchTimeoutMs ?? FETCH_TIMEOUT_MS,
+    writeResponse: overrides.writeResponse ?? writeFile2
   };
   return (env2) => createBatch(env2, deps);
 }
 async function createBatch(env2, deps) {
   const { log } = deps;
-  const inputs = readCreateInputs(env2);
   const outputs = {};
   const summary = [];
   let serverTable = [];
   const secrets = masker(log);
   let failure;
-  const target = alias(PROJECT, inputs.channel, inputs.callerKey);
-  const named = `${target.FunctionName}:${target.Qualifier}`;
+  let invoked = false;
   const mayExist = " A batch may have been created; it is reaped at its ttl.";
   let teardown = "";
   let responseWriteError;
   const writeFailure = () => `the create response could not be written: ${errorText(responseWriteError)}.`;
   try {
+    const inputs = readCreateInputs(env2);
+    const target = alias(PROJECT, inputs.channel, inputs.callerKey);
+    const named = `${target.FunctionName}:${target.Qualifier}`;
     let image = inputs.serverImage;
     if (isServer(image)) {
       const github = githubClient(inputs.githubToken, deps.fetch, deps.sleep, log);
@@ -31527,8 +31551,11 @@ async function createBatch(env2, deps) {
     }
     outputs.server_image = image;
     const fields = { ...inputs.fields, server_image: image };
-    const responseFile = (0, import_node_path8.join)(env2.RUNNER_TEMP || (0, import_node_os4.tmpdir)(), `e2e-test-stack-create-${inputs.batch}`, RESPONSE_FILE);
-    (0, import_node_fs6.rmSync)(responseFile, { force: true });
+    const responseFile = (0, import_node_path8.join)(
+      env2.RUNNER_TEMP || (0, import_node_os4.tmpdir)(),
+      `e2e-test-stack-create-${inputs.batch}-${(0, import_node_crypto6.randomUUID)()}`,
+      RESPONSE_FILE
+    );
     const token = await requestIdToken(env2, deps.fetch, deps.sleep, log);
     secrets.mask(token);
     const credentials = await assumeRole(deps.sts(REGION), {
@@ -31542,6 +31569,7 @@ async function createBatch(env2, deps) {
     const invoke = deps.connect(REGION, credentials);
     log(`e2e-test-stack: create through ${named}, instance key ${fields.instance_key}`);
     let reply;
+    invoked = true;
     try {
       reply = await invoke({ ...target, Payload: JSON.stringify({ action: "create", ...fields }) });
     } catch (e7) {
@@ -31549,7 +31577,7 @@ async function createBatch(env2, deps) {
     }
     const text3 = payloadText(reply);
     try {
-      outputs.response_path = writeFile2(responseFile, text3);
+      outputs.response_path = deps.writeResponse(responseFile, text3);
     } catch (e7) {
       responseWriteError = e7;
     }
@@ -31565,8 +31593,7 @@ async function createBatch(env2, deps) {
     }
     const error = responseError(response);
     const batchId = typeof response.batch_id === "string" ? response.batch_id : "";
-    if (batchId)
-      teardown = ` Batch ${batchId} was created; the destroy action releases it, or it is reaped at its ttl.`;
+    if (batchId) teardown = ` Batch ${batchId} was created; it is reaped at its ttl.`;
     const sites = Array.isArray(response.sites) ? response.sites : [];
     const leases = Array.isArray(response.batch?.instances) ? response.batch.instances : [];
     const state2 = response.batch?.state ?? "";
@@ -31576,7 +31603,7 @@ async function createBatch(env2, deps) {
     outputs.state = state2;
     const timing2 = response.batch?.timing?.total_seconds;
     if (state2 === "ready" && typeof timing2 === "number") outputs.duration_seconds = String(timing2);
-    summary.push("### E2E test stack: create", "", "| | |", "|---|---|");
+    summary.push(...SUMMARY_HEAD);
     summary.push(`| Batch | \`${cell(batchId || "none")}\` |`, `| State | ${cell(state2 || "unknown")} |`);
     summary.push(`| Ready | ${ready} of ${leases.length} |`);
     if (response.batch?.expires_at) summary.push(`| Expires | ${cell(response.batch.expires_at)} |`);
@@ -31627,9 +31654,15 @@ async function createBatch(env2, deps) {
   } catch (e7) {
     const reported = e7 instanceof Error && e7.cause === responseWriteError;
     failure = responseWriteError !== void 0 && !reported ? also("create", e7, writeFailure()) : e7;
+    if (!summary.length) summary.push(...failedSummary(invoked));
   }
   settle(env2, "create", outputs, [...summary, ...serverTable], failure);
 }
+var SUMMARY_HEAD = ["### E2E test stack: create", "", "| | |", "|---|---|"];
+var failedSummary = (invoked) => [
+  ...SUMMARY_HEAD,
+  invoked ? "| State | failed, with no batch named; one may have been created, and is reaped at its ttl. The step's error says why |" : "| State | failed before the create was sent, so no batch was created. The step's error says why |"
+];
 var FETCH_ATTEMPTS = 3;
 var FETCH_RETRY_MS = 5e3;
 var FETCH_TIMEOUT_MS = 12e4;

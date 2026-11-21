@@ -11,12 +11,25 @@ import type { StsSend } from "./role.ts";
 
 const ROLE_ARN = "arn:aws:iam::111111111111:role/e2e-test-stack-ci-mobile";
 
-test("the role ARN is taken as given, in whichever account it names", () => {
+test("the role ARN is taken as given, in whichever commercial account it names", () => {
   assert.equal(roleArnFrom(ROLE_ARN, "mobile"), ROLE_ARN);
   assert.equal(
-    roleArnFrom("arn:aws-us-gov:iam::222222222222:role/path/e2e-test-stack-ci-mobile", "mobile"),
-    "arn:aws-us-gov:iam::222222222222:role/path/e2e-test-stack-ci-mobile",
+    roleArnFrom("arn:aws:iam::222222222222:role/path/e2e-test-stack-ci-mobile", "mobile"),
+    "arn:aws:iam::222222222222:role/path/e2e-test-stack-ci-mobile",
   );
+});
+
+test("a role in another partition is refused: the control plane is in the commercial one", () => {
+  for (const other of [
+    "arn:aws-us-gov:iam::222222222222:role/e2e-test-stack-ci-mobile",
+    "arn:aws-cn:iam::222222222222:role/e2e-test-stack-ci-mobile",
+  ])
+    assert.throws(
+      () => roleArnFrom(other, "mobile"),
+      (e: unknown) =>
+        /^role-arn must be in the commercial AWS partition/.test((e as Error).message) &&
+        !(e as Error).message.includes("222222222222"),
+    );
 });
 
 test("a role not named for the caller key is refused before anything is called, without quoting the ARN", () => {

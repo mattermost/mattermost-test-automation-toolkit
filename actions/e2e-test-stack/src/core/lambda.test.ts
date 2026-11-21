@@ -5,7 +5,7 @@ import { createServer } from "node:net";
 import type { Socket } from "node:net";
 import { test } from "node:test";
 import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
-import { alias, lambdaClient, lambdaClientConfig, lambdaInvoke, THROTTLE_ATTEMPTS } from "./lambda.ts";
+import { abortableSleep, alias, lambdaClient, lambdaClientConfig, lambdaInvoke, THROTTLE_ATTEMPTS } from "./lambda.ts";
 
 const CREDENTIALS = { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "example", sessionToken: "session" };
 
@@ -108,4 +108,37 @@ test("the Lambda client is sent a synchronous Invoke, and only a throttle is tri
   );
   await assert.rejects(throttled({ FunctionName: "f", Qualifier: "q", Payload: "{}" }), /Rate exceeded/);
   assert.equal(calls, THROTTLE_ATTEMPTS);
+});
+
+test("the default wait clears its timer when the signal aborts, so it never keeps the process up", async () => {
+  const controller = new AbortController();
+  const started = Date.now();
+  const waited = abortableSleep(60_000, controller.signal);
+  controller.abort();
+  await waited;
+  assert.ok(Date.now() - started < 1_000);
+  await abortableSleep(1);
+});
+
+test("a throttle wait ends when the call's signal aborts, and no other send is made", async () => {
+  let calls = 0;
+  const controller = new AbortController();
+  const invoke = lambdaInvoke(
+    {
+      send: async () => {
+        calls++;
+        throw Object.assign(new Error("Rate exceeded"), { name: "TooManyRequestsException" });
+      },
+    },
+    () => {
+      setTimeout(() => controller.abort(), 0);
+      return new Promise(() => {});
+    },
+    () => {},
+  );
+  await assert.rejects(
+    invoke({ FunctionName: "f", Qualifier: "q", Payload: "{}" }, controller.signal),
+    /Rate exceeded/,
+  );
+  assert.equal(calls, 1);
 });
