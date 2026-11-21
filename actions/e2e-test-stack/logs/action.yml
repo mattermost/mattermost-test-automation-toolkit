@@ -57,8 +57,8 @@ outputs:
     description: The directory holding the logs, server-<index>.log each; empty when none was saved
     value: ${{ steps.logs.outputs.logs_dir }}
   artifact-name:
-    description: The uploaded artifact's name; empty when nothing was uploaded
-    value: ${{ steps.logs.outputs.artifact_name }}
+    description: The uploaded artifact's name; empty unless the upload succeeded
+    value: ${{ steps.upload.outputs.artifact-id != '' && steps.logs.outputs.artifact_name || '' }}
 runs:
   using: composite
   steps:
@@ -78,7 +78,8 @@ runs:
         STACK_GITHUB_TOKEN: ${{ inputs.github-token }}
       run: bash "${{ github.action_path }}/../run.sh" logs
     # Whatever was saved, the full log or its tail, even when the step failed.
-    - if: always() && steps.logs.outputs.artifact_name != ''
+    - id: upload
+      if: always() && steps.logs.outputs.artifact_name != ''
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
       with:
         name: ${{ steps.logs.outputs.artifact_name }}

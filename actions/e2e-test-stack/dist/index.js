@@ -32331,10 +32331,37 @@ function readLogsInputs(env2) {
     refuse("github-token is required: a token that reads the run's artifacts, such as github.token with actions: read");
   return { ...common, batch, roleArn, credentialsKey, githubToken, repository, own, runId, allowance, artifactPrefix };
 }
-var scrubber = (secrets, also2) => {
-  const values = [.../* @__PURE__ */ new Set([...secrets.masked, ...also2])].filter(Boolean).sort((a8, b8) => b8.length - a8.length);
-  const pattern = values.length ? new RegExp(values.map((v2) => v2.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g") : void 0;
-  return (text4) => redactArns(pattern ? text4.replace(pattern, "***") : text4);
+var WHITESPACE = /\s/;
+var REACH = 1 << 16;
+var scrubber = (values) => {
+  const sorted = [...new Set(values)].filter(Boolean).sort((a8, b8) => b8.length - a8.length);
+  const pattern = sorted.length ? new RegExp(sorted.map((v2) => v2.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g") : void 0;
+  const scrub = (text4) => redactArns(pattern ? text4.replace(pattern, "***") : text4);
+  const outsideValues = (text4, at2) => {
+    if (!pattern) return at2;
+    pattern.lastIndex = 0;
+    for (let m5 = pattern.exec(text4); m5 && m5.index < at2; m5 = pattern.exec(text4))
+      if (m5.index + m5[0].length > at2) return m5.index;
+    return at2;
+  };
+  const cut = (text4, at2) => {
+    let c8 = at2;
+    for (let prev = -1; c8 !== prev; ) {
+      prev = c8;
+      const floor = Math.max(0, c8 - REACH);
+      const line = text4.lastIndexOf("\n", c8 - 1) + 1;
+      let space = 0;
+      for (let i8 = c8 - 1; i8 >= floor && !space; i8--) if (WHITESPACE.test(text4[i8])) space = i8 + 1;
+      c8 = outsideValues(text4, line > floor ? line : space || c8);
+    }
+    const code = text4.charCodeAt(c8 - 1);
+    return code >= 55296 && code <= 56319 ? c8 - 1 : c8;
+  };
+  return Object.assign(scrub, {
+    hold: sorted[0]?.length ?? 0,
+    cut,
+    with: (...more) => scrubber([...sorted, ...more])
+  });
 };
 async function pool(items, limit, task) {
   const results = new Array(items.length);
@@ -32458,7 +32485,7 @@ async function collectLogs(env2, deps) {
     }
     const dir = (0, import_node_path9.join)(env2.RUNNER_TEMP || (0, import_node_os5.tmpdir)(), `e2e-test-stack-logs-${inputs.batch}-${(0, import_node_crypto7.randomUUID)()}`);
     const artifactName = `${inputs.artifactPrefix}-${inputs.batch}${inputs.allowance ? `-run-${inputs.runId}` : ""}-${inputs.own.attempt}`;
-    const scrub = scrubber(secrets, [inputs.roleArn.split(":")[4] ?? ""]);
+    const scrub = scrubber([...secrets.masked, inputs.roleArn.split(":")[4] ?? ""]);
     log(
       `e2e-test-stack: collecting the logs of ${up.length} server(s) of batch ${batchId}, ${LOGS_CONCURRENCY} at a time`
     );
@@ -32535,10 +32562,9 @@ async function downloadTo(fetchImpl, url, path, scrub) {
       const text4 = decoder.decode(chunk.value, { stream: true });
       parts.push(text4);
       pending += text4.length;
-      if (pending < BLOCK_BYTES) continue;
+      if (pending < BLOCK_BYTES + scrub.hold) continue;
       const joined = parts.join("");
-      const end = joined.lastIndexOf("\n") + 1;
-      const cut = end > 0 ? end : joined.length;
+      const cut = scrub.cut(joined, joined.length - scrub.hold);
       await flush(joined.slice(0, cut));
       parts = [joined.slice(cut)];
       pending = parts[0].length;
@@ -32599,13 +32625,21 @@ async function collectSteps(server, batchId, batchToken, credentialsKey, dir, ta
   }
   secrets.mask(opened.url);
   const url = typeof opened.url === "string" ? opened.url : "";
-  const scrubbed = url ? (text4) => scrub(text4.split(url).join("***")) : scrub;
+  const scrubbed = url ? scrub.with(url) : scrub;
   const path = (0, import_node_path9.resolve)((0, import_node_path9.join)(dir, `server-${index}.log`));
   let tailFailure = "";
   if (typeof opened.content_gzip === "string" && opened.content_gzip)
     try {
       const tail = (0, import_node_zlib2.gunzipSync)(Buffer.from(opened.content_gzip, "base64"), { maxOutputLength: MAX_TAIL_BYTES });
-      server.path = writeFile2(path, scrubbed(tail.toString("utf8")));
+      const partial = `${path}.partial`;
+      try {
+        writeFile2(partial, scrubbed(tail.toString("utf8")));
+        (0, import_node_fs6.renameSync)(partial, path);
+      } catch (e7) {
+        (0, import_node_fs6.rmSync)(partial, { force: true });
+        throw e7;
+      }
+      server.path = path;
       server.full = logs2.truncated === false;
     } catch (e7) {
       tailFailure = ` The tail was not saved: ${reason(e7)}.`;

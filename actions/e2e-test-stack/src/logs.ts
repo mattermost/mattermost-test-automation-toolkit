@@ -48,7 +48,7 @@ export const LOGS_CONCURRENCY = 4;
 /** How long one full log may take to download and scrub, and the largest read. */
 export const DOWNLOAD_TIMEOUT_MS = 300_000;
 export const MAX_LOG_BYTES = 256 << 20;
-/** The size of the blocks of whole lines the full log is scrubbed and written in, and the longest line kept whole. */
+/** About the size of the blocks the full log is scrubbed and written in. */
 const BLOCK_BYTES = 1 << 20;
 /** The largest tail unzipped. */
 const MAX_TAIL_BYTES = 16 << 20;
@@ -118,17 +118,63 @@ export interface ServerLog {
 }
 
 /**
- * Text with every value masked so far, and each value of also, replaced in one pass, longest first, and ARNs taken
- * out. Other 12-digit numbers stay: a server's log holds sizes and ids, and the account id is in also. The pattern is
- * built once, from the values masked when it is made.
+ * Replaces each of its values with ***, in one left-to-right pass, longest first, then takes ARNs out. Other 12-digit
+ * numbers stay: a server's log holds sizes and ids.
  */
-const scrubber = (secrets: Masker, also: readonly string[]): ((text: string) => string) => {
-  const values = [...new Set([...secrets.masked, ...also])].filter(Boolean).sort((a, b) => b.length - a.length);
+export interface Scrubber {
+  (text: string): string;
+  /** The longest value: a cut leaves at least this much after it, so a value crossing the cut is seen whole. */
+  readonly hold: number;
+  /** Where to cut text at or before at, so each side scrubs as the whole would. */
+  cut(text: string, at: number): number;
+  /** This scrubber with more values. */
+  with(...more: string[]): Scrubber;
+}
+
+const WHITESPACE = /\s/;
+/** How far back a cut looks for a line break or whitespace. */
+const REACH = 1 << 16;
+
+export const scrubber = (values: readonly string[]): Scrubber => {
+  const sorted = [...new Set(values)].filter(Boolean).sort((a, b) => b.length - a.length);
   // Outside a character class, these are every character a pattern treats as special.
-  const pattern = values.length
-    ? new RegExp(values.map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g")
+  const pattern = sorted.length
+    ? new RegExp(sorted.map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g")
     : undefined;
-  return (text) => redactArns(pattern ? text.replace(pattern, "***") : text);
+  const scrub = (text: string) => redactArns(pattern ? text.replace(pattern, "***") : text);
+
+  /** at, or the start of the value a scrub of the whole text matches across it. */
+  const outsideValues = (text: string, at: number): number => {
+    if (!pattern) return at;
+    pattern.lastIndex = 0;
+    for (let m = pattern.exec(text); m && m.index < at; m = pattern.exec(text))
+      if (m.index + m[0].length > at) return m.index;
+    return at;
+  };
+  /**
+   * The cut at or before at that leaves each side to scrub as the whole would: after a line break within REACH, else
+   * after whitespace within REACH, and never inside a value. An ARN holds no whitespace, so it is split only within a
+   * run of more than REACH characters without any; the cut is never inside a value or a character.
+   */
+  const cut = (text: string, at: number): number => {
+    let c = at;
+    for (let prev = -1; c !== prev;) {
+      prev = c;
+      const floor = Math.max(0, c - REACH);
+      const line = text.lastIndexOf("\n", c - 1) + 1;
+      let space = 0;
+      for (let i = c - 1; i >= floor && !space; i--) if (WHITESPACE.test(text[i])) space = i + 1;
+      c = outsideValues(text, line > floor ? line : space || c);
+    }
+    // A cut between the two halves of a character would write neither.
+    const code = text.charCodeAt(c - 1);
+    return code >= 0xd800 && code <= 0xdbff ? c - 1 : c;
+  };
+  return Object.assign(scrub, {
+    hold: sorted[0]?.length ?? 0,
+    cut,
+    with: (...more: string[]) => scrubber([...sorted, ...more]),
+  });
 };
 
 /** Runs each task, at most limit at once, keeping their order. */
@@ -278,7 +324,7 @@ async function collectLogs(env: Env, deps: LogsDeps): Promise<void> {
     // Another run's logs name it, so collections for several runs in one attempt do not replace each other.
     const artifactName = `${inputs.artifactPrefix}-${inputs.batch}${inputs.allowance ? `-run-${inputs.runId}` : ""}-${inputs.own.attempt}`;
     // The role's account id, from its ARN, is taken out of the logs with the secrets.
-    const scrub = scrubber(secrets, [inputs.roleArn.split(":")[4] ?? ""]);
+    const scrub = scrubber([...secrets.masked, inputs.roleArn.split(":")[4] ?? ""]);
     log(
       `e2e-test-stack: collecting the logs of ${up.length} server(s) of batch ${batchId}, ${LOGS_CONCURRENCY} at a time`,
     );
@@ -318,17 +364,12 @@ async function collectLogs(env: Env, deps: LogsDeps): Promise<void> {
 }
 
 /**
- * Downloads a presigned URL to path, following no redirect, within DOWNLOAD_TIMEOUT_MS and MAX_LOG_BYTES. It scrubs
- * and writes the log in blocks of whole lines of about BLOCK_BYTES, so a secret that spans lines is matched within a
- * block; a line longer than BLOCK_BYTES is written in parts. A declared length over the limit is refused before the
- * body is read, and a missing or empty body is a failure, which leaves the tail as it was.
+ * Downloads a presigned URL to path, following no redirect, within DOWNLOAD_TIMEOUT_MS and MAX_LOG_BYTES, scrubbing
+ * and writing it in blocks of about BLOCK_BYTES. Each block ends where the scrubber's cut says, so a secret or an ARN
+ * is seen whole in one block. A declared length over the limit is refused before the body is read, and a missing or
+ * empty body is a failure, which leaves the tail as it was.
  */
-async function downloadTo(
-  fetchImpl: FetchImpl,
-  url: string,
-  path: string,
-  scrub: (text: string) => string,
-): Promise<void> {
+async function downloadTo(fetchImpl: FetchImpl, url: string, path: string, scrub: Scrubber): Promise<void> {
   const res = await fetchImpl(url, { redirect: "error", signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
   if (!res.ok) {
     await res.body?.cancel().catch(() => {});
@@ -366,11 +407,10 @@ async function downloadTo(
       const text = decoder.decode(chunk.value, { stream: true });
       parts.push(text);
       pending += text.length;
-      if (pending < BLOCK_BYTES) continue;
+      if (pending < BLOCK_BYTES + scrub.hold) continue;
       const joined = parts.join("");
-      const end = joined.lastIndexOf("\n") + 1;
-      // No line ends in a block's worth: the line is written in parts.
-      const cut = end > 0 ? end : joined.length;
+      // At least the longest value is held back, so one crossing the cut is seen whole in the next block.
+      const cut = scrub.cut(joined, joined.length - scrub.hold);
       await flush(joined.slice(0, cut));
       parts = [joined.slice(cut)];
       pending = parts[0].length;
@@ -393,7 +433,7 @@ async function collectOne(
   target: Omit<InvokeInput, "Payload">,
   invoke: Invoke,
   secrets: Masker,
-  scrub: (text: string) => string,
+  scrub: Scrubber,
   deps: LogsDeps,
 ): Promise<{ server: ServerLog; failure?: string }> {
   const server: ServerLog = { index, instance_id: "", path: "", full: false, containers: [] };
@@ -427,7 +467,7 @@ async function collectSteps(
   target: Omit<InvokeInput, "Payload">,
   invoke: Invoke,
   secrets: Masker,
-  scrub: (text: string) => string,
+  scrub: Scrubber,
   deps: LogsDeps,
 ): Promise<string | undefined> {
   const { index } = server;
@@ -460,13 +500,22 @@ async function collectSteps(
   // pass, so no other server's log is matched against it.
   secrets.mask(opened.url);
   const url = typeof opened.url === "string" ? opened.url : "";
-  const scrubbed = url ? (text: string) => scrub(text.split(url).join("***")) : scrub;
+  const scrubbed = url ? scrub.with(url) : scrub;
   const path = resolve(join(dir, `server-${index}.log`));
   let tailFailure = "";
   if (typeof opened.content_gzip === "string" && opened.content_gzip)
     try {
       const tail = gunzipSync(Buffer.from(opened.content_gzip, "base64"), { maxOutputLength: MAX_TAIL_BYTES });
-      server.path = writeFile(path, scrubbed(tail.toString("utf8")));
+      // Written beside its place and moved there whole, so a failed write leaves no part of it to upload.
+      const partial = `${path}.partial`;
+      try {
+        writeFile(partial, scrubbed(tail.toString("utf8")));
+        renameSync(partial, path);
+      } catch (e) {
+        rmSync(partial, { force: true });
+        throw e;
+      }
+      server.path = path;
       // Only a tail the control plane says is whole is the full log.
       server.full = logs.truncated === false;
     } catch (e) {

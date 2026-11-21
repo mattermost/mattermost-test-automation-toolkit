@@ -9,7 +9,7 @@ import { gzipSync } from "node:zlib";
 import sodium from "libsodium-wrappers";
 import type { InvokeInput, InvokeOutput } from "./core/lambda.ts";
 import { zip } from "./core/zip.fixture.ts";
-import { LOGS_CONCURRENCY, LOGS_OUTPUTS, logsWith, readLogsInputs } from "./logs.ts";
+import { LOGS_CONCURRENCY, LOGS_OUTPUTS, logsWith, readLogsInputs, scrubber } from "./logs.ts";
 import type { ServerLog } from "./logs.ts";
 import { ACTIONS } from "./run.ts";
 
@@ -32,7 +32,8 @@ const readOutputs = (path: string): Record<string, string> => {
     const m = /^([\w-]+)<<(.+)$/.exec(lines[i]);
     if (!m) continue;
     const value: string[] = [];
-    while (lines[++i] !== m[2]) value.push(lines[i]);
+    while (++i < lines.length && lines[i] !== m[2]) value.push(lines[i]);
+    assert.ok(i < lines.length, `output ${m[1]} has no closing delimiter`);
     out[m[1]] = value.join("\n");
   }
   return out;
@@ -537,4 +538,36 @@ test("each server's log URL is taken out of its own log", async () => {
   );
   await h.go();
   assert.equal(readFileSync(servers(h)[0].path, "utf8"), "fetched ***\n");
+});
+
+test("a cut falls after a line break or whitespace, never inside a secret, an ARN or a character", () => {
+  const s = scrubber(["secret-value", "line one\nline two"]);
+  const text = "aaaaaaaaaa secret-value b arn:aws:iam::123456789012:role/x c";
+  assert.equal(s.cut(text, 15), 11, "inside the secret: back to the whitespace before it");
+  const arnAt = text.indexOf("arn:");
+  assert.equal(s.cut(text, arnAt + 5), arnAt, "inside the ARN: back to the whitespace before it");
+  assert.equal(s.cut("ab\ncd ef", 8), 3, "a line break in reach is preferred");
+  const multi = "x line one\nline two y";
+  assert.equal(s.cut(multi, multi.indexOf("\n") + 1), 2, "inside a multi-line secret: back to before it");
+  assert.equal(s.cut("zzzzsecret-valuezz", 8), 4, "no whitespace: back to the secret's start");
+  assert.equal(s.cut("zz\u{1F600}zz", 3), 2, "never between a character's halves");
+  assert.equal(s.hold, "line one\nline two".length);
+});
+
+test("a long log with no line breaks keeps every secret out, wherever the blocks are cut", async () => {
+  // Mostly secret, in 64 KiB chunks as a download arrives, so nearly every cut would fall inside one.
+  const unit = "zadmin-pw-0";
+  const body = unit.repeat(300_000);
+  const bytes = new TextEncoder().encode(body);
+  const stream = new ReadableStream({
+    start(c) {
+      for (let at = 0; at < bytes.length; at += 65536) c.enqueue(bytes.slice(at, at + 65536));
+      c.close();
+    },
+  });
+  const h = harness(createResponse(), fetched(["ready"]), {}, { 0: new Response(stream) });
+  await h.go();
+  const saved = readFileSync(servers(h)[0].path, "utf8");
+  assert.ok(!saved.includes("admin-pw") && !saved.includes("pw-0"));
+  assert.equal(saved, "z***".repeat(300_000));
 });

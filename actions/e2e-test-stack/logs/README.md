@@ -52,7 +52,7 @@ action.
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `servers`       | JSON array, one entry per server that was up: `index`, `instance_id`, `path` (the full log, or its tail; empty when neither was saved), `full` and `containers` |
 | `logs-dir`      | The directory holding `server-<index>.log` for each server; empty when none was saved                                                                           |
-| `artifact-name` | The uploaded artifact's name; empty when nothing was uploaded                                                                                                   |
+| `artifact-name` | The uploaded artifact's name; empty unless the upload succeeded                                                                                                 |
 
 The artifact is kept 14 days.
 
@@ -81,7 +81,14 @@ logs:
         credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
 ```
 
-A `destroy` job then `needs: logs`, so the servers are still up while their logs are collected.
+A `destroy` job then needs `logs`, so the servers are still up while their logs are collected, and runs whatever
+`logs` did, so a failed collection never keeps the batch up:
+
+```yaml
+destroy:
+  needs: [create, logs]
+  if: always() && needs.create.result != 'skipped'
+```
 
 ## Failures
 
