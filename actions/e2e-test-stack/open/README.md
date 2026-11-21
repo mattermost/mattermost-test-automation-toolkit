@@ -61,6 +61,9 @@ test:
     matrix:
       index: ${{ fromJSON(needs.create.outputs.indexes) }}
   steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
     - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: "26"
