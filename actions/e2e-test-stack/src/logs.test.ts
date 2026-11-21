@@ -1,7 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -9,7 +9,7 @@ import { gzipSync } from "node:zlib";
 import sodium from "libsodium-wrappers";
 import type { InvokeInput, InvokeOutput } from "./core/lambda.ts";
 import { zip } from "./core/zip.fixture.ts";
-import { LOGS_CONCURRENCY, LOGS_OUTPUTS, logsWith, readLogsInputs, scrubber } from "./logs.ts";
+import { downloadTo, LOGS_CONCURRENCY, LOGS_OUTPUTS, logsWith, readLogsInputs, scrubber } from "./logs.ts";
 import type { ServerLog } from "./logs.ts";
 import { ACTIONS } from "./run.ts";
 
@@ -110,6 +110,8 @@ const harness = (
   logsReplies: Record<number, InvokeOutput> = {},
   downloads: Record<number, Response> = {},
   env: Record<string, string> = {},
+  /** Attempt 1's own response, e2e-test-stack-response-ios-1: "same" serves created's, "none" none, "expired" an expired one, "broken" one that does not download, or a body. */
+  own: unknown = "same",
 ): Harness => {
   let inFlight = 0;
   const h: Harness = {
@@ -131,28 +133,38 @@ const harness = (
             return Response.json({
               path: ".github/workflows/e2e.yml",
               head_branch: "main",
-              event: "push",
+              event: "workflow_dispatch",
               status: "completed",
               run_attempt: 1,
               head_repository: { full_name: "mattermost/mobile" },
             });
-          if (
-            /^https:\/\/api\.github\.com\/repos\/mattermost\/mobile\/actions\/runs\/(42|77)\/artifacts\?name=e2e-test-stack-create-ios&per_page=100&page=1$/.test(
+          if (url.startsWith(`${API}/runs/77/attempts/`))
+            return Response.json({ triggering_actor: { login: "alice", type: "User" } });
+          const listing =
+            /^https:\/\/api\.github\.com\/repos\/mattermost\/mobile\/actions\/runs\/(42|77)\/artifacts\?name=(e2e-test-stack-(?:create-ios|response-ios-1))&per_page=100&page=1$/.exec(
               url,
-            )
-          )
-            return Response.json({
-              artifacts:
-                created === undefined
-                  ? []
-                  : [{ id: 7, name: "e2e-test-stack-create-ios", created_at: "2026-11-22T00:00:00Z" }],
-            });
-          if (url === `${API}/artifacts/7/zip`)
-            return new Response(null, { status: 302, headers: { location: "https://blob.example/7" } });
-          if (url === "https://blob.example/7")
-            return new Response(
-              new Uint8Array(zip([{ name: "e2e-test-stack-create.json", data: JSON.stringify(created) }])),
             );
+          if (listing) {
+            const name = listing[2];
+            const mine = name.endsWith("response-ios-1");
+            const present = mine ? own !== "none" && (own !== "same" || created !== undefined) : created !== undefined;
+            return Response.json({
+              artifacts: present
+                ? [{ id: mine ? 8 : 7, name, created_at: "2026-11-22T00:00:00Z", expired: mine && own === "expired" }]
+                : [],
+            });
+          }
+          const zipped = /\/artifacts\/(7|8)\/zip$/.exec(url);
+          if (zipped)
+            return new Response(null, { status: 302, headers: { location: `https://blob.example/${zipped[1]}` } });
+          const blob = /^https:\/\/blob\.example\/(7|8)$/.exec(url);
+          if (blob) {
+            if (blob[1] === "8" && own === "broken") return new Response("", { status: 403 });
+            const body = blob[1] === "8" && own !== "same" ? own : created;
+            return new Response(
+              new Uint8Array(zip([{ name: "e2e-test-stack-create.json", data: JSON.stringify(body) }])),
+            );
+          }
           const m = /^https:\/\/logs\.example\/(\d+)\?/.exec(url);
           if (m) {
             h.downloads.push(url);
@@ -184,11 +196,14 @@ const harness = (
         GITHUB_REPOSITORY: "mattermost/mobile",
         GITHUB_RUN_ID: "42",
         GITHUB_RUN_ATTEMPT: "2",
+        GITHUB_EVENT_NAME: "workflow_dispatch",
+        GITHUB_TRIGGERING_ACTOR: "alice",
         RUNNER_TEMP: h.temp,
         ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.actions.example/id?api-version=2.0",
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: "request-token-1",
         STACK_CALLER_KEY: "mobile",
-        STACK_BATCH: "ios",
+        // batch, unless the test names one batch by its id instead: one or the other, never both.
+        ...(env.STACK_BATCH_ID ? {} : { STACK_BATCH: "ios" }),
         STACK_ROLE_ARN: ROLE_ARN,
         STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
         STACK_GITHUB_TOKEN: "gh-token",
@@ -313,21 +328,43 @@ test("a full log that breaks off keeps the tail, reported and uploaded", async (
   assert.equal(readOutputs(h.output).artifact_name, "e2e-test-stack-logs-ios-2");
 });
 
-test("another run's logs are named for it", async () => {
+test("batch-id collects that batch's logs, from another run started by hand by the same person, under a name of its own", async () => {
   const h = harness(
     { ...createResponse("mobile-77-ios-1-abc") },
     fetched(["ready"]),
     {},
     {},
     {
-      STACK_RUN_ID: "77",
-      STACK_ALLOWED_WORKFLOWS: ".github/workflows/e2e.yml",
-      STACK_ALLOWED_BRANCHES: "main",
-      STACK_ALLOWED_EVENTS: "push",
+      STACK_BATCH: "",
+      STACK_BATCH_ID: "mobile-77-ios-1-abc",
     },
   );
   await h.go();
-  assert.equal(readOutputs(h.output).artifact_name, "e2e-test-stack-logs-ios-run-77-2");
+  assert.equal(readOutputs(h.output).artifact_name, "e2e-test-stack-logs_mobile-77-ios-1-abc-2");
+
+  const other = harness(
+    { ...createResponse("mobile-77-ios-1-xyz") },
+    fetched(["ready"]),
+    {},
+    {},
+    {
+      STACK_BATCH: "",
+      STACK_BATCH_ID: "mobile-77-ios-1-abc",
+    },
+  );
+  await assert.rejects(other.go(), /names batch "mobile-77-ios-1-xyz", not mobile-77-ios-1-abc/);
+
+  const automated = harness(
+    { ...createResponse("mobile-77-ios-1-abc") },
+    fetched(["ready"]),
+    {},
+    {},
+    {
+      STACK_BATCH_ID: "mobile-77-ios-1-abc",
+      GITHUB_EVENT_NAME: "push",
+    },
+  );
+  await assert.rejects(automated.go(), /acted on only by a job started by hand/);
 });
 
 test("a run with no batch has no logs, and assumes no role", async () => {
@@ -424,8 +461,14 @@ test("logs refuses a missing or malformed input before anything is called", () =
   const refusedInput = (over: Record<string, string>, message: RegExp) =>
     assert.throws(() => readLogsInputs({ ...env, ...over }), message);
   refusedInput({ STACK_ARTIFACT_PREFIX: "a/b" }, /artifact-prefix must be/);
+  refusedInput({ STACK_ARTIFACT_PREFIX: "a_b" }, /artifact-prefix must be letters, digits, '\.' and '-'/);
   refusedInput({ STACK_ROLE_ARN: "" }, /role-arn is required/);
-  refusedInput({ STACK_RUN_ID: "77" }, /allowed-workflows, allowed-branches and allowed-events are required/);
+  refusedInput(
+    { STACK_BATCH: "", STACK_BATCH_ID: "tpp-77-ios-1-abc" },
+    /batch-id must be a batch of caller-key mobile/,
+  );
+  refusedInput({ STACK_BATCH_ID: "mobile-42-ios-1-abc" }, /give batch or batch-id, not both/);
+  refusedInput({ STACK_BATCH: "" }, /batch or batch-id is required/);
 });
 
 test("logs writes every output it declares, and action.yml reads exactly those", () => {
@@ -570,4 +613,66 @@ test("a long log with no line breaks keeps every secret out, wherever the blocks
   const saved = readFileSync(servers(h)[0].path, "utf8");
   assert.ok(!saved.includes("admin-pw") && !saved.includes("pw-0"));
   assert.equal(saved, "z***".repeat(300_000));
+});
+
+test("a log file that cannot be made cancels the download's body", async () => {
+  let cancelled = false;
+  const stream = new ReadableStream({
+    pull(c) {
+      c.enqueue(new TextEncoder().encode("line\n"));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  // The log's directory would be made under a regular file, which no one can do.
+  const parent = file("not-a-directory");
+  writeFileSync(parent, "");
+  await assert.rejects(
+    downloadTo(async () => new Response(stream), "https://logs.example/0", join(parent, "server-0.log"), scrubber([])),
+    /ENOTDIR|EEXIST/,
+  );
+  assert.ok(cancelled, "the body is cancelled");
+});
+
+test("another run's batch is read only from its attempt's own response, never the newest", async () => {
+  const h = harness(
+    { ...createResponse("mobile-77-ios-1-abc") },
+    fetched(["ready"]),
+    {},
+    {},
+    { STACK_BATCH_ID: "mobile-77-ios-1-abc" },
+    "none",
+  );
+  await assert.rejects(h.go(), /no create response of run 77 names batch mobile-77-ios-1-abc/);
+  assert.equal(h.stsCalls, 0);
+});
+
+test("in this run the newest stands in for the attempt's own response when it is missing or unreadable", async () => {
+  for (const own of ["none", "broken"]) {
+    const h = harness(
+      { ...createResponse("mobile-42-ios-1-abc") },
+      fetched(["ready"]),
+      {},
+      {},
+      { STACK_BATCH_ID: "mobile-42-ios-1-abc" },
+      own,
+    );
+    await h.go();
+    assert.equal(servers(h).length, 1, own);
+  }
+});
+
+test("an expired create response for batch-id has no logs, and passes", async () => {
+  const h = harness(
+    { ...createResponse("mobile-77-ios-1-abc") },
+    fetched(["ready"]),
+    {},
+    {},
+    { STACK_BATCH_ID: "mobile-77-ios-1-abc" },
+    "expired",
+  );
+  await h.go();
+  assert.equal(readOutputs(h.output).servers, "[]");
+  assert.match(readFileSync(h.summary, "utf8"), /create response has expired: no logs to collect/);
 });

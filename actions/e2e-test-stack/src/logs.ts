@@ -3,17 +3,17 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, renameSync, rmSync } from "node:fs";
 import { open } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { sleep as realSleep } from "../../shared/src/github.ts";
 import type { Env, FetchImpl, Sleep } from "../../shared/src/github.ts";
-import { createResponse } from "./core/artifacts.ts";
+import { createResponse, newest, readResponse, responseArtifact, runArtifacts } from "./core/artifacts.ts";
 import { batchAttempt } from "./core/batch.ts";
 import { ActionError } from "./core/errors.ts";
 import { githubClient } from "./core/github.ts";
 import {
-  batchFrom,
   credentialsKeyFrom,
   input,
   PROJECT,
@@ -35,8 +35,7 @@ import { isObject, maskBatchSecrets, responseError } from "./core/response.ts";
 import type { LogsSecrets } from "./core/response.ts";
 import { assumeRole, roleArnFrom, stsClient } from "./core/role.ts";
 import type { Credentials, StsSend } from "./core/role.ts";
-import { checkRun, runTargetFrom } from "./core/run-check.ts";
-import type { RunAllowance } from "./core/run-check.ts";
+import { batchTargetFrom, checkRun } from "./core/run-check.ts";
 import { openBatchSecrets, openSealed, SealedError } from "./core/sealed.ts";
 
 /** Every output the logs step writes; action.yml reads only these. */
@@ -54,7 +53,8 @@ const BLOCK_BYTES = 1 << 20;
 const MAX_TAIL_BYTES = 16 << 20;
 /** The start of the control plane's answer for a batch with no live server. */
 const GONE = "no live instances tagged";
-const ARTIFACT_PREFIX = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/;
+// No "_": it separates a batch id from the prefix, so the two forms of a name never meet.
+const ARTIFACT_PREFIX = /^[A-Za-z0-9][A-Za-z0-9.-]{0,99}$/;
 
 export interface LogsInputs extends StackInputs {
   batch: string;
@@ -66,10 +66,14 @@ export interface LogsInputs extends StackInputs {
   repository: string;
   /** This job's run. */
   own: Run;
-  /** The run whose batch's logs are collected: this run, or another named by run-id. */
+  /** The run whose batch's logs are collected: this run, or the one batch-id names. */
   runId: string;
-  /** What another run must be; undefined for this run. */
-  allowance?: RunAllowance;
+  /** True when that run is another than this job's. */
+  other: boolean;
+  /** Who started this job; set only for another run's batch, which only they may act on, by hand. */
+  actor: string;
+  /** The one batch, from batch-id; undefined for this run's newest. */
+  only?: { batchId: string; attempt: number };
   /** The uploaded artifact's name starts with it. */
   artifactPrefix: string;
 }
@@ -77,19 +81,31 @@ export interface LogsInputs extends StackInputs {
 /** Reads and checks logs' inputs and the job's run, before anything is called. */
 export function readLogsInputs(env: Env): LogsInputs {
   const common = stackInputs(env);
-  const batch = batchFrom(env);
   const own = runFrom(env);
   const repository = repositoryFrom(env);
-  const { runId, allowance } = runTargetFrom(env, own.runId);
+  const { batch, runId, other, actor, only } = batchTargetFrom(env, common.callerKey, own);
   const artifactPrefix = input(env, "artifact-prefix") || "e2e-test-stack-logs";
   if (!ARTIFACT_PREFIX.test(artifactPrefix))
-    refuse("artifact-prefix must be letters, digits, '.', '_' and '-', starting with a letter or digit, at most 100");
+    refuse("artifact-prefix must be letters, digits, '.' and '-', starting with a letter or digit, at most 100");
   const roleArn = roleArnFrom(input(env, "role-arn"), common.callerKey);
   const credentialsKey = credentialsKeyFrom(input(env, "credentials-key"));
   const githubToken = input(env, "github-token");
   if (!githubToken)
     refuse("github-token is required: a token that reads the run's artifacts, such as github.token with actions: read");
-  return { ...common, batch, roleArn, credentialsKey, githubToken, repository, own, runId, allowance, artifactPrefix };
+  return {
+    ...common,
+    batch,
+    roleArn,
+    credentialsKey,
+    githubToken,
+    repository,
+    own,
+    runId,
+    other,
+    actor,
+    only,
+    artifactPrefix,
+  };
 }
 
 /** What logs calls, injectable for tests. */
@@ -192,11 +208,11 @@ async function pool<T, R>(items: readonly T[], limit: number, task: (item: T) =>
 }
 
 /**
- * Collects the logs of every server still up in a run's batch: this run's, or another run's named by run-id once that
- * run is checked. The batch is the newest create response's, which must be exactly the run's. Each server's full log
- * is downloaded, a few at a time, bounded as it streams, with every known secret taken out, into one directory that
- * action.yml uploads. A batch already gone has no logs, and passes. Outputs and the summary are written whatever
- * happens.
+ * Collects the logs of every server still up in this run's batch, or in the one batch-id names, from its own run once
+ * that run is checked. The batch is the newest create response's, or that attempt's own, which must be exactly the
+ * run's. Each server's full log is downloaded, a few at a time, bounded as it streams, with every known secret taken
+ * out, into one directory that action.yml uploads. A batch already gone has no logs, and passes. Outputs and the
+ * summary are written whatever happens.
  */
 export function logsWith(overrides: Partial<LogsDeps> = {}): (env: Env) => Promise<void> {
   const log = overrides.log ?? console.log;
@@ -225,22 +241,58 @@ async function collectLogs(env: Env, deps: LogsDeps): Promise<void> {
   // The steps; a return ends them early, and the outputs and summary are written after, whatever happened.
   const steps = async (): Promise<void> => {
     const inputs = readLogsInputs(env);
-    const label = inputs.allowance ? `run ${inputs.runId}` : "this run";
+    const label = inputs.other ? `run ${inputs.runId}` : "this run";
     const github = githubClient(inputs.githubToken, deps.fetch, deps.sleep, log);
-    const latest = inputs.allowance
-      ? await checkRun(github, inputs.repository, inputs.runId, inputs.allowance, log)
-      : inputs.own.attempt;
+    const only = inputs.only;
+    const latest =
+      inputs.other && only
+        ? await checkRun(
+            github,
+            inputs.repository,
+            { runId: inputs.runId, attempt: only.attempt, actor: inputs.actor },
+            log,
+          )
+        : inputs.own.attempt;
+    const run = { repository: inputs.repository, runId: inputs.runId };
 
-    const found = await createResponse(
-      github,
-      { repository: inputs.repository, runId: inputs.runId },
-      inputs.batch,
-      label,
-    );
-    const response = found ? parseResponse(found.response.toString("utf8")) : undefined;
+    // With batch-id, that attempt's own response; in this run, the newest stands in when that one is missing. In
+    // another, a later attempt someone else started may have uploaded the newest, so it is never read.
+    let found: Buffer | undefined;
+    if (only) {
+      const name = responseArtifact(inputs.batch, only.attempt);
+      const all = await runArtifacts(github, run, name);
+      const mine = newest(all.filter((a) => !a.expired));
+      // An artifact is kept at least a day, longer than any batch lives: an expired one names a batch long gone.
+      if (!mine && all.length) {
+        log(
+          `e2e-test-stack: ${label}'s artifact ${name} has expired; its batch is long past its ttl: no logs to collect`,
+        );
+        summary.push(`Batch \`${cell(only.batchId)}\`'s create response has expired: no logs to collect.`);
+        outputs.servers = "[]";
+        return;
+      }
+      let unreadable: ActionError | undefined;
+      if (mine)
+        try {
+          found = await readResponse(github, run, mine, `${label}'s artifact ${name}`);
+        } catch (e) {
+          if (!(e instanceof ActionError)) throw e;
+          unreadable = e;
+        }
+      // In this run the newest stands in for an own response missing or unreadable; never in another.
+      if (!found && !inputs.other) found = (await createResponse(github, run, inputs.batch, label))?.response;
+      if (!found && unreadable) throw unreadable;
+    } else found = (await createResponse(github, run, inputs.batch, label))?.response;
+    const response = found ? parseResponse(found.toString("utf8")) : undefined;
     if (found && !response)
       throw new ActionError(`${label}'s create response for batch ${inputs.batch} is not a JSON object`);
     const batchId = typeof response?.batch_id === "string" ? response.batch_id : "";
+    if (only && batchId !== only.batchId)
+      throw new ActionError(
+        batchId
+          ? `${label}'s create response names batch ${JSON.stringify(batchId.slice(0, 100))}, not ${only.batchId}`
+          : `no create response of ${label} names batch ${only.batchId}`,
+      );
     if (!response || !batchId) {
       log(`e2e-test-stack: ${label} created no batch ${inputs.batch}: no logs to collect`);
       summary.push(`${label} has no batch \`${cell(inputs.batch)}\`: no logs to collect.`);
@@ -250,7 +302,7 @@ async function collectLogs(env: Env, deps: LogsDeps): Promise<void> {
     const owner = { callerKey: inputs.callerKey, runId: inputs.runId, batch: inputs.batch, attempt: latest };
     if (batchAttempt(batchId, owner) === undefined)
       throw new ActionError(
-        `the newest create response names batch ${JSON.stringify(batchId.slice(0, 100))}, which is not ${label}'s batch ${inputs.batch}`,
+        `the create response names batch ${JSON.stringify(batchId.slice(0, 100))}, which is not ${label}'s batch ${inputs.batch}`,
       );
     summary.push(`Batch \`${cell(batchId)}\` of ${label}.`, "");
 
@@ -322,7 +374,11 @@ async function collectLogs(env: Env, deps: LogsDeps): Promise<void> {
 
     const dir = join(env.RUNNER_TEMP || tmpdir(), `e2e-test-stack-logs-${inputs.batch}-${randomUUID()}`);
     // Another run's logs name it, so collections for several runs in one attempt do not replace each other.
-    const artifactName = `${inputs.artifactPrefix}-${inputs.batch}${inputs.allowance ? `-run-${inputs.runId}` : ""}-${inputs.own.attempt}`;
+    // A batch named by its id is uploaded under it after a "_", which no batch name holds, so it never shares a name with
+    // a batch collected in its own run.
+    const artifactName = only
+      ? `${inputs.artifactPrefix}_${only.batchId}-${inputs.own.attempt}`
+      : `${inputs.artifactPrefix}-${inputs.batch}-${inputs.own.attempt}`;
     // The role's account id, from its ARN, is taken out of the logs with the secrets.
     const scrub = scrubber([...secrets.masked, inputs.roleArn.split(":")[4] ?? ""]);
     log(
@@ -369,7 +425,7 @@ async function collectLogs(env: Env, deps: LogsDeps): Promise<void> {
  * is seen whole in one block. A declared length over the limit is refused before the body is read, and a missing or
  * empty body is a failure, which leaves the tail as it was.
  */
-async function downloadTo(fetchImpl: FetchImpl, url: string, path: string, scrub: Scrubber): Promise<void> {
+export async function downloadTo(fetchImpl: FetchImpl, url: string, path: string, scrub: Scrubber): Promise<void> {
   const res = await fetchImpl(url, { redirect: "error", signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
   if (!res.ok) {
     await res.body?.cancel().catch(() => {});
@@ -382,11 +438,14 @@ async function downloadTo(fetchImpl: FetchImpl, url: string, path: string, scrub
     throw tooLarge(`${length} bytes`);
   }
   if (!res.body) throw new ActionError("the download has no body");
-  mkdirSync(dirname(path), { recursive: true });
-  const file = await open(path, "w");
   const reader = res.body.getReader();
   let done = false;
+  let file: FileHandle | undefined;
   try {
+    // Inside the cleanup, so a file that cannot be made still cancels the body.
+    mkdirSync(dirname(path), { recursive: true });
+    file = await open(path, "w");
+    const out = file;
     const decoder = new TextDecoder();
     let read = 0;
     // Decoded text not yet written: whole lines, then the start of the next, kept as parts so none is rescanned.
@@ -394,7 +453,7 @@ async function downloadTo(fetchImpl: FetchImpl, url: string, path: string, scrub
     let pending = 0;
     const flush = async (text: string) => {
       // appendFile writes the whole text, however many writes it takes.
-      if (text) await file.appendFile(scrub(text));
+      if (text) await out.appendFile(scrub(text));
     };
     while (!done) {
       const chunk = await reader.read();
@@ -417,9 +476,14 @@ async function downloadTo(fetchImpl: FetchImpl, url: string, path: string, scrub
     }
     if (!read) throw new ActionError("the download is empty");
     await flush(parts.join("") + decoder.decode());
+  } catch (e) {
+    // A file that then fails to close does not hide why the download stopped.
+    await file?.close().catch(() => {});
+    file = undefined;
+    throw e;
   } finally {
     if (!done) await reader.cancel().catch(() => {});
-    await file.close();
+    await file?.close();
   }
 }
 

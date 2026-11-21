@@ -1,8 +1,8 @@
 ---
 name: E2E test stack destroy
 description: >-
-  Destroy every attempt's e2e-test-stack batch of a run, this run's or another's, from each attempt's create response:
-  check that every site, mail and SSO host is gone and that a second destroy finds nothing. Assumes role-arn itself:
+  Destroy every attempt's e2e-test-stack batch of this run, or one batch by its id, from its create response: check
+  that every site, mail and SSO host is gone and that a second destroy finds nothing. Assumes role-arn itself:
   the job needs id-token: write and actions: read, and Node 26 set up first.
 author: Mattermost
 inputs:
@@ -10,8 +10,16 @@ inputs:
     description: The repository's key in the control plane's callers (e.g. mobile), as create was given it
     required: true
   batch:
-    description: The batch within the run, as create was given it (e.g. ios)
-    required: true
+    description: >-
+      The batch within this run, as create was given it (e.g. ios), in the run that created it. Give this or batch-id,
+      not both
+    default: ""
+  batch-id:
+    description: >-
+      By hand: the one batch to destroy (e.g. mobile-1234-ios-1-a1b2c3). Another run's batch is destroyed only by a job
+      started by hand, when that run was started by hand too, by the same person, and has completed. Give this or
+      batch, not both
+    default: ""
   role-arn:
     description: >-
       The repository's CI role ARN in the account the batch was created in, as create was given it,
@@ -25,23 +33,6 @@ inputs:
       The repository's credentials key, a base64 X25519 private key (the E2E_TEST_STACK_CREDENTIALS_KEY secret), which
       opens each batch's token
     required: true
-  run-id:
-    description: >-
-      The run whose batches to destroy; empty is this run. Another run must match allowed-workflows, allowed-branches
-      and allowed-events, all three required for it
-    default: ""
-  allowed-workflows:
-    description: For another run-id. Comma- or newline-separated workflow files (.github/workflows/<file>) it may be of
-    default: ""
-  allowed-branches:
-    description: For another run-id. A JavaScript regular expression its whole head branch must match (e.g. main|release-.*)
-    default: ""
-  allowed-events:
-    description: For another run-id. Comma-separated events it may be for (e.g. push, workflow_dispatch)
-    default: ""
-  gone-window:
-    description: Seconds each host has to stop being served once its batch is destroyed; 180 (the default) to 1800
-    default: "180"
   github-token:
     description: The token for api.github.com, which reads the run and its artifacts; it needs actions read
     default: ${{ github.token }}
@@ -69,10 +60,6 @@ runs:
         STACK_ROLE_ARN: ${{ inputs.role-arn }}
         STACK_CHANNEL: ${{ inputs.channel }}
         STACK_CREDENTIALS_KEY: ${{ inputs.credentials-key }}
-        STACK_RUN_ID: ${{ inputs.run-id }}
-        STACK_ALLOWED_WORKFLOWS: ${{ inputs.allowed-workflows }}
-        STACK_ALLOWED_BRANCHES: ${{ inputs.allowed-branches }}
-        STACK_ALLOWED_EVENTS: ${{ inputs.allowed-events }}
-        STACK_GONE_WINDOW: ${{ inputs.gone-window }}
+        STACK_BATCH_ID: ${{ inputs.batch-id }}
         STACK_GITHUB_TOKEN: ${{ inputs.github-token }}
       run: bash "${{ github.action_path }}/../run.sh" destroy
