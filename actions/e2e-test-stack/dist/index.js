@@ -32164,6 +32164,7 @@ async function destroyBatches(env2, deps) {
         invoke = deps.connect(REGION, credentials);
       } catch (e7) {
         failures.push(`${reason(e7)}; no batch was destroyed, and each is reaped at its ttl`);
+        results.push(...found.targets.map(unsent));
       }
     if (invoke) {
       const target = alias(PROJECT, inputs.channel, inputs.callerKey);
@@ -32201,15 +32202,16 @@ async function destroyCall(invoke, target, payload) {
   if (reply.refused !== void 0) throw new ActionError(`the control plane refused the destroy: ${reply.refused}`);
   return reply.response;
 }
+var unsent = (t2) => ({
+  attempt: t2.attempt,
+  batch_id: t2.batchId,
+  state: "not destroyed",
+  gone: "not checked",
+  again: "not run",
+  cost_usd: ""
+});
 async function destroyOne(t2, target, invoke, secrets, inputs, current, deps, notes) {
-  const result = {
-    attempt: t2.attempt,
-    batch_id: t2.batchId,
-    state: "not destroyed",
-    gone: "not checked",
-    again: "not run",
-    cost_usd: ""
-  };
+  const result = unsent(t2);
   try {
     const failure = await destroySteps(t2, result, target, invoke, secrets, inputs, current, deps, notes);
     return { result, failure };
