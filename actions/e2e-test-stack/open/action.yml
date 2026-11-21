@@ -1,0 +1,61 @@
+---
+name: E2E test stack open
+description: >-
+  Open one server of this run's e2e-test-stack batch: find the batch's create response among the run's artifacts, open
+  its sealed secrets with the repository's credentials key, and set the server's site and admin credentials as masked
+  outputs. Calls only GitHub, never AWS: the job needs actions: read, and Node 26 set up first.
+author: Mattermost
+inputs:
+  caller-key:
+    description: The repository's key in the control plane's callers (e.g. mobile), as create was given it
+    required: true
+  batch:
+    description: The batch within the run, as create was given it (e.g. ios)
+    required: true
+  index:
+    description: The server whose fields are set as site-url, admin-username, admin-email, admin-password and mail-token
+    default: "0"
+  credentials-key:
+    description: >-
+      The repository's credentials key, a base64 X25519 private key (the E2E_TEST_STACK_CREDENTIALS_KEY secret), which
+      opens the secrets the control plane seals to the repository
+    required: true
+  github-token:
+    description: The token for api.github.com, which reads this run's artifacts; it needs actions read
+    default: ${{ github.token }}
+outputs:
+  site-url:
+    description: The server's site URL
+    value: ${{ steps.open.outputs.site_url }}
+  admin-username:
+    description: The server's admin username
+    value: ${{ steps.open.outputs.admin_username }}
+  admin-email:
+    description: The server's admin email
+    value: ${{ steps.open.outputs.admin_email }}
+  admin-password:
+    description: The server's admin password. Masked
+    value: ${{ steps.open.outputs.admin_password }}
+  mail-token:
+    description: The server's Inbucket HTTP Basic password, user inbucket. Masked
+    value: ${{ steps.open.outputs.mail_token }}
+  instances:
+    description: >-
+      JSON array, index-aligned with the batch, null where a server is not ready: site_url, state, admin_username,
+      admin_email, admin_password, mail_token, credentials and facts. Secrets masked
+    value: ${{ steps.open.outputs.instances }}
+  batch-id:
+    description: The batch's id
+    value: ${{ steps.open.outputs.batch_id }}
+runs:
+  using: composite
+  steps:
+    - id: open
+      shell: bash
+      env:
+        STACK_CALLER_KEY: ${{ inputs.caller-key }}
+        STACK_BATCH: ${{ inputs.batch }}
+        STACK_INDEX: ${{ inputs.index }}
+        STACK_CREDENTIALS_KEY: ${{ inputs.credentials-key }}
+        STACK_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: bash "${{ github.action_path }}/../run.sh" open
