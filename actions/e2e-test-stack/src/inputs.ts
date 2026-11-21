@@ -46,8 +46,8 @@ export interface Inputs {
   channel: Channel;
   project: string;
   region: string;
-  /** The repository's X25519 private key, 32 bytes. */
-  privateKey?: Uint8Array;
+  /** The repository's credentials key, which opens the sealed secrets: an X25519 private key, 32 bytes. */
+  credentialsKey?: Uint8Array;
   batchId?: string;
   batchToken?: string;
   /** A create response written by response-path, to read the batch id and token from. */
@@ -171,11 +171,11 @@ const list = (value: string): string[] =>
     .map((s) => s.trim())
     .filter(Boolean);
 
-/** Decodes the private key, which must be standard base64 of 32 bytes. */
-export function privateKeyFrom(value: string): Uint8Array {
+/** Decodes the credentials key, which must be standard base64 of 32 bytes. */
+export function credentialsKeyFrom(value: string): Uint8Array {
   const key = Buffer.from(value, "base64");
   if (!BASE64.test(value) || value.length % 4 !== 0 || key.length !== 32)
-    refuse("private-key must be the repository's X25519 private key: 32 bytes, standard base64");
+    refuse("credentials-key must be the repository's credentials key: 32 bytes, standard base64");
   return new Uint8Array(key);
 }
 
@@ -288,7 +288,7 @@ const checkRunInputs = (env: Env, repository: string): CheckRunInputs => {
 const noStackInputs = (env: Env, inputs: Inputs): Inputs => {
   const get = (k: string) => (env[k] ?? "").trim();
   const op = inputs.operation;
-  for (const name of ["private-key", "batch-id", "batch-token", "create-response"])
+  for (const name of ["credentials-key", "batch-id", "batch-token", "create-response"])
     if (get(`STACK_${name.replace(/-/g, "_").toUpperCase()}`))
       refuse(`${name} is not ${article(op)} ${op} input; ${op} calls no control plane`);
   if (op !== "earlier-response" && inputs.responsePath)
@@ -392,8 +392,8 @@ export function readInputs(env: Env): Inputs {
 
   if (NO_STACK.includes(op)) return noStackInputs(env, inputs);
 
-  const privateKey = get("STACK_PRIVATE_KEY");
-  if (privateKey) inputs.privateKey = privateKeyFrom(privateKey);
+  const credentialsKey = get("STACK_CREDENTIALS_KEY");
+  if (credentialsKey) inputs.credentialsKey = credentialsKeyFrom(credentialsKey);
 
   if (op === "open") {
     for (const name of ["batch-id", "batch-token", "response-path"])
@@ -401,7 +401,8 @@ export function readInputs(env: Env): Inputs {
         refuse(`${name} is not an open input; open reads the batch from create-response and calls nothing`);
     const createResponse = get("STACK_CREATE_RESPONSE");
     if (!createResponse) refuse("create-response is required for open: the create response file to open");
-    if (!inputs.privateKey) refuse("private-key is required for open: the create response's secrets are sealed to it");
+    if (!inputs.credentialsKey)
+      refuse("credentials-key is required for open: the create response's secrets are sealed to it");
     inputs.createResponse = createResponse;
     if (get("STACK_INDEX")) inputs.index = integer("index", get("STACK_INDEX"), 0);
     const prefix = batchPrefix(get("STACK_EXPECT_BATCH_PREFIX"));
@@ -413,9 +414,9 @@ export function readInputs(env: Env): Inputs {
     for (const name of ["batch-id", "batch-token", "create-response"])
       if (get(`STACK_${name.replace(/-/g, "_").toUpperCase()}`))
         refuse(`${name} names an existing batch; create does not take it`);
-    if (!inputs.privateKey)
+    if (!inputs.credentialsKey)
       refuse(
-        "private-key is required for create: without it the batch token, and so the batch's teardown, cannot be read",
+        "credentials-key is required for create: without it the batch token, and so the batch's teardown, cannot be read",
       );
     inputs.create = createFields(env);
     return inputs;
@@ -426,7 +427,8 @@ export function readInputs(env: Env): Inputs {
   const createResponse = get("STACK_CREATE_RESPONSE");
   if (createResponse) {
     if (batchToken) refuse("give batch-token or create-response, not both");
-    if (!inputs.privateKey) refuse("private-key is required with create-response: the batch token in it is sealed");
+    if (!inputs.credentialsKey)
+      refuse("credentials-key is required with create-response: the batch token in it is sealed");
     inputs.createResponse = createResponse;
   } else {
     if (!batchId) refuse(`batch-id is required for ${op}, or create-response to read it from`);
@@ -454,8 +456,8 @@ export function readInputs(env: Env): Inputs {
         refuse(`gone-window must be ${MAX_GONE_WINDOW_SECONDS} or less, got ${window}`);
     } else if (window) refuse('gone-window is used only with verify-gone: "true"');
   }
-  if (op !== "destroy" && !inputs.privateKey)
-    refuse(`private-key is required for ${op}: its secrets come back sealed to it`);
+  if (op !== "destroy" && !inputs.credentialsKey)
+    refuse(`credentials-key is required for ${op}: its secrets come back sealed to it`);
   if (op === "logs") {
     if (get("STACK_INDEX")) inputs.index = integer("index", get("STACK_INDEX"), 0);
     if (get("STACK_LOGS_PATH")) inputs.logsPath = get("STACK_LOGS_PATH");

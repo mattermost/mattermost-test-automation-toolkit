@@ -8,7 +8,7 @@ const KEY = Buffer.alloc(32, 7).toString("base64");
 const create = (over: Record<string, string> = {}) => ({
   STACK_OPERATION: "create",
   STACK_CALLER_KEY: "test-public-project",
-  STACK_PRIVATE_KEY: KEY,
+  STACK_CREDENTIALS_KEY: KEY,
   STACK_INSTANCE_KEY: "pr-1234",
   STACK_SERVER_IMAGE: "mattermostdevelopment/mattermost-enterprise-edition:master",
   STACK_CALLER_RUN_ID: "1234567890",
@@ -33,7 +33,7 @@ test("a create takes the defaults for channel, project and region, and only the 
   assert.equal(inputs.channel, "v1");
   assert.equal(inputs.project, "e2e-test-stack");
   assert.equal(inputs.region, "us-east-1");
-  assert.deepEqual(inputs.privateKey, new Uint8Array(32).fill(7));
+  assert.deepEqual(inputs.credentialsKey, new Uint8Array(32).fill(7));
   assert.deepEqual(inputs.create, {
     instance_key: "pr-1234",
     caller_run_id: "1234567890",
@@ -86,12 +86,15 @@ test("the common inputs are checked before anything is called", () => {
   refused(create({ STACK_CALLER_KEY: "Mobile" }), /caller-key must be/);
   refused(create({ STACK_CHANNEL: "edge-v1" }), /channel must be v1 or edge/);
   refused(create({ STACK_REGION: "useast1" }), /region must be/);
-  refused(create({ STACK_PRIVATE_KEY: Buffer.alloc(31).toString("base64") }), /private-key must be .* 32 bytes/);
-  refused(create({ STACK_PRIVATE_KEY: "not base64!" }), /private-key must be/);
+  refused(
+    create({ STACK_CREDENTIALS_KEY: Buffer.alloc(31).toString("base64") }),
+    /credentials-key must be .* 32 bytes/,
+  );
+  refused(create({ STACK_CREDENTIALS_KEY: "not base64!" }), /credentials-key must be/);
 });
 
 test("create refuses a missing or malformed field, naming the input", () => {
-  refused(create({ STACK_PRIVATE_KEY: "" }), /private-key is required for create/);
+  refused(create({ STACK_CREDENTIALS_KEY: "" }), /credentials-key is required for create/);
   refused(create({ STACK_INSTANCE_KEY: "" }), /instance-key is required/);
   refused(create({ STACK_INSTANCE_KEY: "PR_1234" }), /instance-key must be lowercase/);
   refused(create({ STACK_SERVER_IMAGE: "" }), /server-image is required/);
@@ -128,35 +131,41 @@ test("fetch, logs and destroy need the batch and its token, or a create response
   refused(destroy({ STACK_CREATE_RESPONSE: "create.json" }), /give batch-token or create-response, not both/);
   refused(
     destroy({ STACK_BATCH_TOKEN: "", STACK_CREATE_RESPONSE: "create.json" }),
-    /private-key is required with create-response/,
+    /credentials-key is required with create-response/,
   );
   refused(destroy({ STACK_INSTANCE_KEY: "pr-1" }), /instance-key is a create input; destroy does not take it/);
   refused(destroy({ STACK_INDEX: "0" }), /index is a logs and open input/);
-  refused(destroy({ STACK_OPERATION: "fetch" }), /private-key is required for fetch/);
-  refused(destroy({ STACK_OPERATION: "logs", STACK_PRIVATE_KEY: KEY, STACK_INDEXES: "0" }), /indexes is a fetch input/);
-  refused(destroy({ STACK_OPERATION: "logs", STACK_PRIVATE_KEY: KEY, STACK_INDEX: "-1" }), /index must be 0 or more/);
+  refused(destroy({ STACK_OPERATION: "fetch" }), /credentials-key is required for fetch/);
+  refused(
+    destroy({ STACK_OPERATION: "logs", STACK_CREDENTIALS_KEY: KEY, STACK_INDEXES: "0" }),
+    /indexes is a fetch input/,
+  );
+  refused(
+    destroy({ STACK_OPERATION: "logs", STACK_CREDENTIALS_KEY: KEY, STACK_INDEX: "-1" }),
+    /index must be 0 or more/,
+  );
 
   const viaResponse = readInputs(
     destroy({
       STACK_BATCH_ID: "",
       STACK_BATCH_TOKEN: "",
       STACK_CREATE_RESPONSE: "create.json",
-      STACK_PRIVATE_KEY: KEY,
+      STACK_CREDENTIALS_KEY: KEY,
     }),
   );
   assert.equal(viaResponse.createResponse, "create.json");
   assert.equal(viaResponse.batchId, undefined);
   assert.deepEqual(
-    readInputs(destroy({ STACK_OPERATION: "fetch", STACK_PRIVATE_KEY: KEY, STACK_INDEXES: "0, 3" })).indexes,
+    readInputs(destroy({ STACK_OPERATION: "fetch", STACK_CREDENTIALS_KEY: KEY, STACK_INDEXES: "0, 3" })).indexes,
     [0, 3],
   );
-  assert.equal(readInputs(destroy({ STACK_OPERATION: "logs", STACK_PRIVATE_KEY: KEY, STACK_INDEX: "2" })).index, 2);
+  assert.equal(readInputs(destroy({ STACK_OPERATION: "logs", STACK_CREDENTIALS_KEY: KEY, STACK_INDEX: "2" })).index, 2);
 });
 
-test("open needs a create response and the private key, takes an index, needs no caller key, and refuses the rest", () => {
+test("open needs a create response and the credentials key, takes an index, needs no caller key, and refuses the rest", () => {
   const open = (over: Record<string, string> = {}) => ({
     STACK_OPERATION: "open",
-    STACK_PRIVATE_KEY: KEY,
+    STACK_CREDENTIALS_KEY: KEY,
     STACK_CREATE_RESPONSE: "/tmp/create.json",
     ...over,
   });
@@ -168,7 +177,7 @@ test("open needs a create response and the private key, takes an index, needs no
   assert.equal(readInputs(open()).index, undefined);
 
   refused(open({ STACK_CREATE_RESPONSE: "" }), /create-response is required for open/);
-  refused(open({ STACK_PRIVATE_KEY: "" }), /private-key is required for open/);
+  refused(open({ STACK_CREDENTIALS_KEY: "" }), /credentials-key is required for open/);
   refused(open({ STACK_INDEX: "-1" }), /index must be 0 or more/);
   refused(open({ STACK_BATCH_ID: "pr-1234-abc" }), /batch-id is not an open input/);
   refused(open({ STACK_BATCH_TOKEN: "tok" }), /batch-token is not an open input/);
@@ -197,7 +206,7 @@ test("role takes the account, the recorded account's file and both role ARNs, an
   for (const account of ["", "dev", "recorded"])
     assert.equal(readInputs(role({ STACK_ACCOUNT: account })).role?.account, account);
   refused(role({ STACK_ACCOUNT: "staging" }), /account must be prod, dev or recorded, got "staging"/);
-  refused(role({ STACK_PRIVATE_KEY: KEY }), /private-key is not a role input; role calls no control plane/);
+  refused(role({ STACK_CREDENTIALS_KEY: KEY }), /credentials-key is not a role input; role calls no control plane/);
   refused(role({ STACK_RESPONSE_PATH: "/tmp/r.json" }), /response-path is not a role input/);
   refused(role({ STACK_SERVER: "esr" }), /server is a server-image input; role does not take it/);
   refused(destroy({ STACK_ACCOUNT: "prod" }), /account is a role input; destroy does not take it/);
@@ -314,7 +323,7 @@ test("expect-batch-prefix checks a create response's batch, and is refused witho
     STACK_BATCH_ID: "",
     STACK_BATCH_TOKEN: "",
     STACK_CREATE_RESPONSE: "c.json",
-    STACK_PRIVATE_KEY: KEY,
+    STACK_CREDENTIALS_KEY: KEY,
   };
   assert.equal(
     readInputs(destroy({ ...viaResponse, STACK_EXPECT_BATCH_PREFIX: "mobile-42-" })).expectBatchPrefix,
@@ -323,7 +332,7 @@ test("expect-batch-prefix checks a create response's batch, and is refused witho
   assert.equal(
     readInputs({
       STACK_OPERATION: "open",
-      STACK_PRIVATE_KEY: KEY,
+      STACK_CREDENTIALS_KEY: KEY,
       STACK_CREATE_RESPONSE: "c.json",
       STACK_EXPECT_BATCH_PREFIX: "tpp-",
     }).expectBatchPrefix,
@@ -352,7 +361,7 @@ test("verify-gone is a destroy input that needs a create response; gone-window o
     STACK_BATCH_ID: "",
     STACK_BATCH_TOKEN: "",
     STACK_CREATE_RESPONSE: "c.json",
-    STACK_PRIVATE_KEY: KEY,
+    STACK_CREDENTIALS_KEY: KEY,
   };
   const on = readInputs(destroy({ ...viaResponse, STACK_VERIFY_GONE: "true" }));
   assert.deepEqual([on.verifyGone, on.goneWindowSeconds], [true, 180]);
@@ -378,7 +387,7 @@ test("verify-gone is a destroy input that needs a create response; gone-window o
     /gone-window must be 1800 or less, got 1801/,
   );
   refused(
-    destroy({ STACK_OPERATION: "fetch", STACK_PRIVATE_KEY: KEY, STACK_VERIFY_GONE: "true" }),
+    destroy({ STACK_OPERATION: "fetch", STACK_CREDENTIALS_KEY: KEY, STACK_VERIFY_GONE: "true" }),
     /verify-gone is a destroy input; fetch does not take it/,
   );
 });

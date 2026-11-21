@@ -8,8 +8,8 @@ inputs:
   operation:
     description: >-
       create, fetch, logs or destroy, which call the control plane; open, which opens a create response's secrets
-      with private-key and calls nothing, for a test job that has no AWS credentials; or role, server-image, check-run
-      or earlier-response, which call no control plane and need no AWS credentials or private key
+      with credentials-key and calls nothing, for a test job that has no AWS credentials; or role, server-image, check-run
+      or earlier-response, which call no control plane and need no AWS credentials or credentials key
     required: true
   caller-key:
     description: >-
@@ -25,10 +25,11 @@ inputs:
   region:
     description: AWS region of the control plane
     default: us-east-1
-  private-key:
+  credentials-key:
     description: >-
-      The repository's X25519 private key, base64 (the E2E_STACK_PRIVATE_KEY secret). Required for create, fetch, logs and
-      open, and for destroy with create-response; it opens the secrets the control plane seals to the repository
+      The repository's credentials key, base64 (the E2E_TEST_STACK_CREDENTIALS_KEY secret), which opens the secrets the
+      control plane seals to the repository. Required for create, fetch, logs and open, and for destroy with
+      create-response
     default: ""
   batch-id:
     description: The batch to fetch, read the logs of or destroy (create's batch-id output)
@@ -39,7 +40,7 @@ inputs:
   create-response:
     description: >-
       Instead of batch-token: a create response file written by response-path, from which the batch id and its sealed
-      token are read with private-key. For a later job or run, through an uploaded artifact. Required for open
+      token are read with credentials-key. For a later job or run, through an uploaded artifact. Required for open
     default: ""
   instance-key:
     description: For create. Names the stack and prefixes its hostnames (e.g. pr-1234); lowercase letters, digits and hyphens
@@ -249,7 +250,7 @@ runs:
         STACK_CHANNEL: ${{ inputs.channel }}
         STACK_PROJECT: ${{ inputs.project }}
         STACK_REGION: ${{ inputs.region }}
-        STACK_PRIVATE_KEY: ${{ inputs.private-key }}
+        STACK_CREDENTIALS_KEY: ${{ inputs.credentials-key }}
         STACK_BATCH_ID: ${{ inputs.batch-id }}
         STACK_BATCH_TOKEN: ${{ inputs.batch-token }}
         STACK_CREATE_RESPONSE: ${{ inputs.create-response }}

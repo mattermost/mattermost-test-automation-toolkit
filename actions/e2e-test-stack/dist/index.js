@@ -26392,10 +26392,10 @@ var matching = (name, value, pattern, shape) => {
   return value;
 };
 var list = (value) => value.split(/[,\n]/).map((s3) => s3.trim()).filter(Boolean);
-function privateKeyFrom(value) {
+function credentialsKeyFrom(value) {
   const key = Buffer.from(value, "base64");
   if (!BASE64.test(value) || value.length % 4 !== 0 || key.length !== 32)
-    refuse("private-key must be the repository's X25519 private key: 32 bytes, standard base64");
+    refuse("credentials-key must be the repository's credentials key: 32 bytes, standard base64");
   return new Uint8Array(key);
 }
 var serverEnv = (value) => {
@@ -26498,7 +26498,7 @@ var checkRunInputs = (env2, repository) => {
 var noStackInputs = (env2, inputs) => {
   const get = (k7) => (env2[k7] ?? "").trim();
   const op = inputs.operation;
-  for (const name of ["private-key", "batch-id", "batch-token", "create-response"])
+  for (const name of ["credentials-key", "batch-id", "batch-token", "create-response"])
     if (get(`STACK_${name.replace(/-/g, "_").toUpperCase()}`))
       refuse(`${name} is not ${article(op)} ${op} input; ${op} calls no control plane`);
   if (op !== "earlier-response" && inputs.responsePath)
@@ -26591,15 +26591,16 @@ function readInputs(env2) {
     if (!ops.includes(op) && get(key))
       refuse(`${name} is ${article(ops[0])} ${and(ops)} input; ${op} does not take it`);
   if (NO_STACK.includes(op)) return noStackInputs(env2, inputs);
-  const privateKey = get("STACK_PRIVATE_KEY");
-  if (privateKey) inputs.privateKey = privateKeyFrom(privateKey);
+  const credentialsKey = get("STACK_CREDENTIALS_KEY");
+  if (credentialsKey) inputs.credentialsKey = credentialsKeyFrom(credentialsKey);
   if (op === "open") {
     for (const name of ["batch-id", "batch-token", "response-path"])
       if (get(`STACK_${name.replace(/-/g, "_").toUpperCase()}`))
         refuse(`${name} is not an open input; open reads the batch from create-response and calls nothing`);
     const createResponse2 = get("STACK_CREATE_RESPONSE");
     if (!createResponse2) refuse("create-response is required for open: the create response file to open");
-    if (!inputs.privateKey) refuse("private-key is required for open: the create response's secrets are sealed to it");
+    if (!inputs.credentialsKey)
+      refuse("credentials-key is required for open: the create response's secrets are sealed to it");
     inputs.createResponse = createResponse2;
     if (get("STACK_INDEX")) inputs.index = integer("index", get("STACK_INDEX"), 0);
     const prefix2 = batchPrefix(get("STACK_EXPECT_BATCH_PREFIX"));
@@ -26610,9 +26611,9 @@ function readInputs(env2) {
     for (const name of ["batch-id", "batch-token", "create-response"])
       if (get(`STACK_${name.replace(/-/g, "_").toUpperCase()}`))
         refuse(`${name} names an existing batch; create does not take it`);
-    if (!inputs.privateKey)
+    if (!inputs.credentialsKey)
       refuse(
-        "private-key is required for create: without it the batch token, and so the batch's teardown, cannot be read"
+        "credentials-key is required for create: without it the batch token, and so the batch's teardown, cannot be read"
       );
     inputs.create = createFields(env2);
     return inputs;
@@ -26622,7 +26623,8 @@ function readInputs(env2) {
   const createResponse = get("STACK_CREATE_RESPONSE");
   if (createResponse) {
     if (batchToken) refuse("give batch-token or create-response, not both");
-    if (!inputs.privateKey) refuse("private-key is required with create-response: the batch token in it is sealed");
+    if (!inputs.credentialsKey)
+      refuse("credentials-key is required with create-response: the batch token in it is sealed");
     inputs.createResponse = createResponse;
   } else {
     if (!batchId) refuse(`batch-id is required for ${op}, or create-response to read it from`);
@@ -26650,8 +26652,8 @@ function readInputs(env2) {
         refuse(`gone-window must be ${MAX_GONE_WINDOW_SECONDS} or less, got ${window2}`);
     } else if (window2) refuse('gone-window is used only with verify-gone: "true"');
   }
-  if (op !== "destroy" && !inputs.privateKey)
-    refuse(`private-key is required for ${op}: its secrets come back sealed to it`);
+  if (op !== "destroy" && !inputs.credentialsKey)
+    refuse(`credentials-key is required for ${op}: its secrets come back sealed to it`);
   if (op === "logs") {
     if (get("STACK_INDEX")) inputs.index = integer("index", get("STACK_INDEX"), 0);
     if (get("STACK_LOGS_PATH")) inputs.logsPath = get("STACK_LOGS_PATH");
@@ -30447,15 +30449,17 @@ var libsodium_wrappers_default = t;
 // src/sealed.ts
 var SealedError = class extends Error {
 };
-async function openSealed(sealed, privateKey) {
+async function openSealed(sealed, credentialsKey) {
   await libsodium_wrappers_default.ready;
   let plain;
   try {
     const box = libsodium_wrappers_default.from_base64(sealed, libsodium_wrappers_default.base64_variants.ORIGINAL);
-    plain = libsodium_wrappers_default.to_string(libsodium_wrappers_default.crypto_box_seal_open(box, libsodium_wrappers_default.crypto_scalarmult_base(privateKey), privateKey));
+    plain = libsodium_wrappers_default.to_string(
+      libsodium_wrappers_default.crypto_box_seal_open(box, libsodium_wrappers_default.crypto_scalarmult_base(credentialsKey), credentialsKey)
+    );
   } catch {
     throw new SealedError(
-      "e2e-test-stack: the sealed secrets did not open with private-key; is it the key registered for caller-key?"
+      "e2e-test-stack: the sealed secrets did not open with credentials-key; is it the key whose public half is registered for this repository?"
     );
   }
   try {
@@ -30649,11 +30653,11 @@ async function run({
         `e2e-test-stack: the batch in ${path}, ${JSON.stringify(String(created.batch_id).slice(0, 80))}, does not start with expect-batch-prefix ${prefix}; is it another run's create response?`
       );
     try {
-      return { created, secrets: await openSealed(created.batch.secrets, inputs.privateKey) };
+      return { created, secrets: await openSealed(created.batch.secrets, inputs.credentialsKey) };
     } catch (e6) {
       if (!(e6 instanceof SealedError)) throw e6;
       throw new SealedError(
-        `e2e-test-stack: the secrets in ${path} did not open with private-key; is it the key of the repository that created batch ${created.batch_id}?`,
+        `e2e-test-stack: the secrets in ${path} did not open with credentials-key; is it the key of the repository that created batch ${created.batch_id}?`,
         { cause: e6 }
       );
     }
@@ -30832,7 +30836,7 @@ async function run({
         );
       let secrets;
       try {
-        secrets = await openSealed(response.batch.secrets, inputs.privateKey);
+        secrets = await openSealed(response.batch.secrets, inputs.credentialsKey);
       } catch (e6) {
         if (e6 instanceof SealedError && operation2 === "create")
           throw new Error(
@@ -30859,7 +30863,7 @@ async function run({
         `| Tail | ${logs.no_object ? "no log object found" : `${logs.lines ?? 0} lines, ${logs.bytes ?? 0} bytes${logs.truncated ? ", truncated" : ""}`} |`
       );
       if (logs.secrets) {
-        const secrets = await openSealed(logs.secrets, inputs.privateKey);
+        const secrets = await openSealed(logs.secrets, inputs.credentialsKey);
         mask(secrets.url);
         const index = logs.index ?? inputs.index ?? 0;
         const path = inputs.logsPath || // The reply's batch id names the file only in the shape a batch id takes.

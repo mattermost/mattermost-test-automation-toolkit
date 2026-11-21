@@ -7,10 +7,10 @@ access: one AWS Lambda function per channel, `<project>-v1` (the promoted build)
 optional services) reachable over HTTPS; a batch is reaped at its `ttl` (1h by default, 4h at most) if nothing
 destroys it.
 
-Four more operations call no control plane and need no AWS credentials or private key; they do what a stack workflow
-does around its calls ([Workflow operations](#workflow-operations)): `role` picks the AWS account and its CI role,
-`server-image` names the server image to test, `check-run` checks a workflow run before its artifacts are read, and
-`earlier-response` finds an earlier attempt's create response in a re-run.
+Four more operations call no control plane and need neither AWS credentials nor the credentials key; they do what a
+stack workflow does around its calls ([Workflow operations](#workflow-operations)): `role` picks the AWS account and
+its CI role, `server-image` names the server image to test, `check-run` checks a workflow run before its artifacts
+are read, and `earlier-response` finds an earlier attempt's create response in a re-run.
 
 ## Keys and aliases
 
@@ -22,14 +22,16 @@ repository's CI role may invoke only its own aliases.
 
 Nothing secret comes back in the clear. The batch token, each instance's admin password, mail token and service
 credentials, and a logs call's URL and tail are sealed (libsodium `crypto_box_seal`) to the repository's public key.
-The action opens them with the repository's private key, masks every secret, and sets them as outputs. `open` does the
-same for a create response without calling anything, so a test job needs the private key but no AWS role.
+The action opens them with the repository's credentials key, masks every secret, and sets them as outputs. `open`
+does the same for a create response without calling anything, so a test job needs the credentials key but no AWS
+role.
 
 ## Setup
 
-1. **The private key.** Store the repository's base64 X25519 private key as a plain repository Actions secret,
-   `E2E_STACK_PRIVATE_KEY`, not an environment secret: a job that names an environment gets an OIDC subject of
-   `environment:<name>`, and the CI role trusts only branch subjects.
+1. **The credentials key.** The repository's credentials key is the base64 X25519 private key whose public half is
+   registered as the caller's `recipient_public_key` in the control plane. Store it as a plain repository Actions
+   secret, `E2E_TEST_STACK_CREDENTIALS_KEY`, not an environment secret: a job that names an environment gets an OIDC
+   subject of `environment:<name>`, and the CI role trusts only branch subjects.
 2. **The CI role.** `arn:aws:iam::<account>:role/e2e-test-stack-ci-<caller-key>`. It trusts jobs only on the branches
    registered for the repository, and only in these workflow files, so every call must be made from one of them:
    - `.github/workflows/e2e-test-stack-create.yml`
@@ -38,8 +40,8 @@ same for a create response without calling anything, so a test job needs the pri
    A repository with an existing E2E workflow makes both files reusable workflows (`on: workflow_call`) and calls
    them from it: create before its test matrix, destroy after. A called workflow's jobs carry the called file as
    `job_workflow_ref` and the caller's branch as subject, so the role trusts them. The calling job grants
-   `id-token: write` and passes `E2E_STACK_PRIVATE_KEY`; a called workflow gets no more than that. The test jobs stay
-   in the E2E workflow: each opens its server's credentials from the uploaded create response with `open`, which
+   `id-token: write` and passes `E2E_TEST_STACK_CREDENTIALS_KEY`; a called workflow gets no more than that. The test
+   jobs stay in the E2E workflow: each opens its server's credentials from the uploaded create response with `open`, which
    needs no AWS. See [Examples](#examples).
 
    The role trusts only the subject `repo:<owner>/<name>:ref:refs/heads/<branch>` with a matching `job_workflow_ref`,
@@ -76,7 +78,7 @@ the action uses it only for the download, and no output, file or summary carries
 | `channel`               | all                                       | `v1` (default) or `edge`. Use the channel the batch was created on                                                                                              |
 | `project`               | all                                       | The control plane's project, the prefix of its function names. Default `e2e-test-stack`                                                                         |
 | `region`                | all                                       | Default `us-east-1`                                                                                                                                             |
-| `private-key`           | create, fetch, logs, open                 | `${{ secrets.E2E_STACK_PRIVATE_KEY }}`. Also for destroy with `create-response`                                                                                 |
+| `credentials-key`       | create, fetch, logs, open                 | `${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}`. Also for destroy with `create-response`                                                                        |
 | `response-path`         | all but open                              | Write the raw response JSON here. Its secrets are sealed, so it is safe to upload as an artifact                                                                |
 | `instance-key`          | create                                    | Names the stack and prefixes its hostnames, e.g. `pr-1234`. Required                                                                                            |
 | `server-image`          | create                                    | The server image under test, by tag. Required                                                                                                                   |
@@ -94,7 +96,7 @@ the action uses it only for the download, and no output, file or summary carries
 | `caller-run-id`         | create                                    | Tagged on the batch for attribution. Default `github.run_id`                                                                                                    |
 | `batch-id`              | fetch, logs, destroy                      | The batch, from create's `batch-id` output                                                                                                                      |
 | `batch-token`           | fetch, logs, destroy                      | The batch's token, from create's `batch-token` output                                                                                                           |
-| `create-response`       | fetch, logs, destroy, open                | Instead of `batch-id` and `batch-token`: a create response written by `response-path`; the token is opened from it with `private-key`. Required for open        |
+| `create-response`       | fetch, logs, destroy, open                | Instead of `batch-id` and `batch-token`: a create response written by `response-path`; the token is opened from it with `credentials-key`. Required for open    |
 | `indexes`               | fetch                                     | Comma-separated instance indexes; empty fetches the whole batch                                                                                                 |
 | `index`                 | logs, open                                | logs: the instance whose logs to collect, default 0. open: the instance whose fields to set as `site-url`, `admin-username`, `admin-password` and `mail-token`  |
 | `logs-path`             | logs                                      | Where to write the full log ([Secrets at rest](#secrets-at-rest)); default a file under `RUNNER_TEMP`                                                           |
@@ -152,7 +154,7 @@ and fetch, logs and destroy the batch's token.
 ## Failures
 
 The step fails on an invalid input, a call the control plane refuses (its message is shown), secrets that do not open
-with `private-key`, an `error` in the response, and a `response-path` that cannot be written. A partial create
+with `credentials-key`, an `error` in the response, and a `response-path` that cannot be written. A partial create
 (`1 of 2 instances failed: [1]`) still returns its batch: the outputs, and `response-path` when it could be written,
 are set before the step fails, so a teardown with `if: always()` can destroy it. The control plane's messages are
 shown with ARNs and account ids taken out. A destroy of a batch that is already gone succeeds with `state` `not found`.
@@ -237,7 +239,7 @@ jobs:
     with:
       count: "3"
     secrets:
-      E2E_STACK_PRIVATE_KEY: ${{ secrets.E2E_STACK_PRIVATE_KEY }}
+      E2E_TEST_STACK_CREDENTIALS_KEY: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
   test:
     needs: stack
     runs-on: ubuntu-24.04
@@ -261,7 +263,7 @@ jobs:
         uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack@main
         with:
           operation: open
-          private-key: ${{ secrets.E2E_STACK_PRIVATE_KEY }}
+          credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
           create-response: ${{ runner.temp }}/create/e2e-test-stack-create.json
           index: ${{ matrix.index }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -284,7 +286,7 @@ jobs:
       id-token: write
     uses: ./.github/workflows/e2e-test-stack-destroy.yml
     secrets:
-      E2E_STACK_PRIVATE_KEY: ${{ secrets.E2E_STACK_PRIVATE_KEY }}
+      E2E_TEST_STACK_CREDENTIALS_KEY: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
 ```
 
 ```yaml
@@ -302,7 +304,7 @@ on:
       indexes:
         value: ${{ jobs.create.outputs.indexes }}
     secrets:
-      E2E_STACK_PRIVATE_KEY:
+      E2E_TEST_STACK_CREDENTIALS_KEY:
         required: true
 jobs:
   create:
@@ -323,7 +325,7 @@ jobs:
         with:
           operation: create
           caller-key: mobile
-          private-key: ${{ secrets.E2E_STACK_PRIVATE_KEY }}
+          credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
           instance-key: main-${{ github.run_number }}-${{ github.run_attempt }}
           server-image: mattermostdevelopment/mattermost-enterprise-edition:master
           count: ${{ inputs.count }}
@@ -347,7 +349,7 @@ name: E2E test stack destroy
 on:
   workflow_call:
     secrets:
-      E2E_STACK_PRIVATE_KEY:
+      E2E_TEST_STACK_CREDENTIALS_KEY:
         required: true
   workflow_dispatch:
     inputs:
@@ -379,7 +381,7 @@ jobs:
           operation: destroy
           caller-key: mobile
           channel: v1
-          private-key: ${{ secrets.E2E_STACK_PRIVATE_KEY }}
+          credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
           create-response: ${{ runner.temp }}/create/e2e-test-stack-create.json
 ```
 

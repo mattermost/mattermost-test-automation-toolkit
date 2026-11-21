@@ -19,7 +19,7 @@ import type { Download, InvokeInput, InvokeOutput } from "./stack.ts";
 await sodium.ready;
 const keys = sodium.crypto_box_keypair();
 const other = sodium.crypto_box_keypair();
-const PRIVATE_KEY = Buffer.from(keys.privateKey).toString("base64");
+const CREDENTIALS_KEY = Buffer.from(keys.privateKey).toString("base64");
 const seal = (value: unknown, publicKey = keys.publicKey): string =>
   Buffer.from(sodium.crypto_box_seal(JSON.stringify(value), publicKey)).toString("base64");
 
@@ -130,7 +130,7 @@ const masks = (h: Harness) =>
 const createEnv = (over: Record<string, string> = {}) => ({
   STACK_OPERATION: "create",
   STACK_CALLER_KEY: "test-public-project",
-  STACK_PRIVATE_KEY: PRIVATE_KEY,
+  STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
   STACK_INSTANCE_KEY: "pr-1234",
   STACK_SERVER_IMAGE: "mattermostdevelopment/mattermost-enterprise-edition:master",
   ...over,
@@ -138,7 +138,11 @@ const createEnv = (over: Record<string, string> = {}) => ({
 const SECRET_VALUES = ["batch-token-1", "admin-pw-0", "mail-0", "pg-pw-0", "minio-0", "ldap-pw-0"];
 
 test("each operation invokes the caller's own alias with the control plane's request JSON, naming no repository", () => {
-  const base = { STACK_CALLER_KEY: "test-public-project", STACK_PRIVATE_KEY: PRIVATE_KEY, STACK_CALLER_RUN_ID: "42" };
+  const base = {
+    STACK_CALLER_KEY: "test-public-project",
+    STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
+    STACK_CALLER_RUN_ID: "42",
+  };
   const created = buildRequest(
     readInputs({ ...base, ...createEnv(), STACK_CHANNEL: "edge", STACK_COUNT: "2", STACK_SERVER_ENV: '{"MM_X":"1"}' }),
   );
@@ -327,7 +331,7 @@ test("an invoke that fails names the action and the alias, keeps ARNs and accoun
   );
 });
 
-test("secrets that do not open with the private key fail the create, after its batch id is set", async () => {
+test("secrets that do not open with the credentials key fail the create, after its batch id is set", async () => {
   const h = harness(
     createEnv(),
     ok(
@@ -339,7 +343,7 @@ test("secrets that do not open with the private key fail the create, after its b
   );
   await assert.rejects(
     h.go(),
-    /batch pr-1234-abc: the sealed secrets did not open with private-key.*cannot be destroyed/,
+    /batch pr-1234-abc: the sealed secrets did not open with credentials-key.*cannot be destroyed/,
   );
   const out = readOutputs(h.output);
   assert.equal(out.batch_id, "pr-1234-abc");
@@ -347,7 +351,7 @@ test("secrets that do not open with the private key fail the create, after its b
   assert.deepEqual(masks(h), []);
 });
 
-test("sealed boxes open with the private key alone, and not with another", async () => {
+test("sealed boxes open with the credentials key alone, and not with another", async () => {
   assert.deepEqual(await openSealed(seal({ a: 1 }), keys.privateKey), { a: 1 });
   await assert.rejects(
     openSealed(seal({ a: 1 }), other.privateKey),
@@ -362,7 +366,7 @@ test("fetch masks and returns the instances it asked for, holes kept", async () 
       STACK_OPERATION: "fetch",
       STACK_CALLER_KEY: "mobile",
       STACK_CHANNEL: "edge",
-      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
       STACK_BATCH_ID: "pr-1234-abc",
       STACK_BATCH_TOKEN: "batch-token-1",
       STACK_INDEXES: "0",
@@ -399,7 +403,7 @@ test("logs masks the URL, writes the full log it downloads, and summarizes witho
     {
       STACK_OPERATION: "logs",
       STACK_CALLER_KEY: "mobile",
-      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
       STACK_BATCH_ID: "pr-1234-abc",
       STACK_BATCH_TOKEN: "batch-token-1",
       STACK_INDEX: "0",
@@ -453,7 +457,7 @@ test("logs with a create response takes every batch credential, ARNs and account
     {
       STACK_OPERATION: "logs",
       STACK_CALLER_KEY: "mobile",
-      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
       STACK_CREATE_RESPONSE: responsePath,
       STACK_INDEX: "0",
       STACK_LOGS_PATH: file("tail.log"),
@@ -489,7 +493,7 @@ test("a full log that does not download leaves the scrubbed tail and fails the s
     {
       STACK_OPERATION: "logs",
       STACK_CALLER_KEY: "mobile",
-      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
       STACK_BATCH_ID: "pr-1234-abc",
       STACK_BATCH_TOKEN: "batch-token-1",
       STACK_INDEX: "1",
@@ -526,7 +530,7 @@ test("a truncated tail with no URL for the full log fails the step, with the con
     {
       STACK_OPERATION: "logs",
       STACK_CALLER_KEY: "mobile",
-      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
       STACK_BATCH_ID: "pr-1234-abc",
       STACK_BATCH_TOKEN: "batch-token-1",
     },
@@ -553,7 +557,7 @@ test("a full log that cannot be written leaves the tail where it was and fails t
     {
       STACK_OPERATION: "logs",
       STACK_CALLER_KEY: "mobile",
-      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
       STACK_BATCH_ID: "pr-1234-abc",
       STACK_BATCH_TOKEN: "batch-token-1",
       STACK_LOGS_PATH: logsPath,
@@ -878,11 +882,11 @@ test("the Lambda client fails a call that runs past the request timeout, instead
   }
 });
 
-test("open reads every instance from a create response with the private key, masks first, and calls nothing", async () => {
+test("open reads every instance from a create response with the credentials key, masks first, and calls nothing", async () => {
   const responsePath = file("open.json");
   writeFileSync(responsePath, JSON.stringify(createResponse()));
   const h = harness(
-    { STACK_OPERATION: "open", STACK_PRIVATE_KEY: PRIVATE_KEY, STACK_CREATE_RESPONSE: responsePath },
+    { STACK_OPERATION: "open", STACK_CREDENTIALS_KEY: CREDENTIALS_KEY, STACK_CREATE_RESPONSE: responsePath },
     () => assert.fail("open must not call the control plane"),
   );
   await h.go();
@@ -903,7 +907,7 @@ test("open reads every instance from a create response with the private key, mas
 test("open with an index sets that instance's fields as their own outputs, and fails for one that did not come up", async () => {
   const responsePath = file("open-index.json");
   writeFileSync(responsePath, JSON.stringify(createResponse()));
-  const env = { STACK_OPERATION: "open", STACK_PRIVATE_KEY: PRIVATE_KEY, STACK_CREATE_RESPONSE: responsePath };
+  const env = { STACK_OPERATION: "open", STACK_CREDENTIALS_KEY: CREDENTIALS_KEY, STACK_CREATE_RESPONSE: responsePath };
   const h = harness({ ...env, STACK_INDEX: "0" }, () => assert.fail("open must not call the control plane"));
   await h.go();
   const out = readOutputs(h.output);
@@ -923,7 +927,7 @@ test("open with an index sets that instance's fields as their own outputs, and f
   const other = harness(
     {
       STACK_OPERATION: "open",
-      STACK_PRIVATE_KEY: Buffer.from(sodium.crypto_box_keypair().privateKey).toString("base64"),
+      STACK_CREDENTIALS_KEY: Buffer.from(sodium.crypto_box_keypair().privateKey).toString("base64"),
       STACK_CREATE_RESPONSE: responsePath,
     },
     () => assert.fail("open must not call the control plane"),
@@ -940,7 +944,7 @@ test("open refuses an instance that is not ready, and names the file it cannot r
       createResponse({ batch: { ...createResponse().batch, instances: [lease(0), { ...lease(1), state: "failed" }] } }),
     ),
   );
-  const env = { STACK_OPERATION: "open", STACK_PRIVATE_KEY: PRIVATE_KEY };
+  const env = { STACK_OPERATION: "open", STACK_CREDENTIALS_KEY: CREDENTIALS_KEY };
   const never = () => assert.fail("open must not call the control plane");
   const failed = harness({ ...env, STACK_CREATE_RESPONSE: notReady, STACK_INDEX: "1" }, never);
   await assert.rejects(failed.go(), /has no ready instance 1 to open/);
@@ -953,7 +957,7 @@ test("open refuses an instance that is not ready, and names the file it cannot r
   const other = harness(
     {
       ...env,
-      STACK_PRIVATE_KEY: Buffer.from(sodium.crypto_box_keypair().privateKey).toString("base64"),
+      STACK_CREDENTIALS_KEY: Buffer.from(sodium.crypto_box_keypair().privateKey).toString("base64"),
       STACK_CREATE_RESPONSE: notReady,
     },
     never,
@@ -962,7 +966,7 @@ test("open refuses an instance that is not ready, and names the file it cannot r
     assert.ok(e instanceof SealedError);
     assert.match(
       e.message,
-      /did not open with private-key; is it the key of the repository that created batch pr-1234-abc\?$/,
+      /did not open with credentials-key; is it the key of the repository that created batch pr-1234-abc\?$/,
     );
     assert.ok(e.message.includes(notReady));
     return true;
@@ -988,7 +992,7 @@ test("a reply's batch id that is not one does not name the logs file", async () 
     {
       STACK_OPERATION: "logs",
       STACK_CALLER_KEY: "mobile",
-      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
       STACK_BATCH_ID: "pr-1234-abc",
       STACK_BATCH_TOKEN: "batch-token-1",
     },
@@ -1012,7 +1016,7 @@ test("destroy reads the batch and its sealed token from a create response, and f
   const env = {
     STACK_OPERATION: "destroy",
     STACK_CALLER_KEY: "test-public-project",
-    STACK_PRIVATE_KEY: PRIVATE_KEY,
+    STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
     STACK_CREATE_RESPONSE: created,
   };
   const done = harness(
@@ -1044,7 +1048,7 @@ test("destroy reads the batch and its sealed token from a create response, and f
   assert.equal(mismatch.calls.length, 0);
 });
 
-test("a destroy with a batch token input masks it and needs no private key", async () => {
+test("a destroy with a batch token input masks it and needs no credentials key", async () => {
   const h = harness(
     {
       STACK_OPERATION: "destroy",
@@ -1253,7 +1257,7 @@ test("expect-batch-prefix refuses another run's create response before opening i
       {
         STACK_OPERATION: operation,
         STACK_CALLER_KEY: "test-public-project",
-        STACK_PRIVATE_KEY: PRIVATE_KEY,
+        STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
         STACK_CREATE_RESPONSE: created,
         STACK_EXPECT_BATCH_PREFIX: "pr-99-",
       },
@@ -1268,7 +1272,7 @@ test("expect-batch-prefix refuses another run's create response before opening i
   const matching = await runWith(
     {
       STACK_OPERATION: "open",
-      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
       STACK_CREATE_RESPONSE: (() => {
         const path = file("created.json");
         writeFileSync(path, JSON.stringify(createResponse()));
@@ -1287,7 +1291,7 @@ test("expect-batch-prefix refuses another run's create response before opening i
   const shorter = await runWith(
     {
       STACK_OPERATION: "open",
-      STACK_PRIVATE_KEY: PRIVATE_KEY,
+      STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
       STACK_CREATE_RESPONSE: run1234,
       STACK_EXPECT_BATCH_PREFIX: "mobile-123-",
     },
@@ -1308,7 +1312,7 @@ const destroyWithProbe = (over: Record<string, string> = {}) => {
   return {
     STACK_OPERATION: "destroy",
     STACK_CALLER_KEY: "test-public-project",
-    STACK_PRIVATE_KEY: PRIVATE_KEY,
+    STACK_CREDENTIALS_KEY: CREDENTIALS_KEY,
     STACK_CREATE_RESPONSE: created,
     STACK_VERIFY_GONE: "true",
     ...over,

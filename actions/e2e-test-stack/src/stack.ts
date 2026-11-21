@@ -346,7 +346,7 @@ export async function run({
   const writeFailure = (): string =>
     `response-path ${inputs.responsePath} could not be written: ${invokeError(responseWriteError)}.`;
 
-  // Reads a create response and opens its sealed secrets with the private key, naming the file in every failure.
+  // Reads a create response and opens its sealed secrets with the credentials key, naming the file in every failure.
   const readCreateResponse = async (path: string): Promise<{ created: StackResponse; secrets: BatchSecrets }> => {
     let created: StackResponse;
     try {
@@ -365,17 +365,17 @@ export async function run({
         `e2e-test-stack: the batch in ${path}, ${JSON.stringify(String(created.batch_id).slice(0, 80))}, does not start with expect-batch-prefix ${prefix}; is it another run's create response?`,
       );
     try {
-      return { created, secrets: (await openSealed(created.batch.secrets, inputs.privateKey!)) as BatchSecrets };
+      return { created, secrets: (await openSealed(created.batch.secrets, inputs.credentialsKey!)) as BatchSecrets };
     } catch (e) {
       if (!(e instanceof SealedError)) throw e;
       throw new SealedError(
-        `e2e-test-stack: the secrets in ${path} did not open with private-key; is it the key of the repository that created batch ${created.batch_id}?`,
+        `e2e-test-stack: the secrets in ${path} did not open with credentials-key; is it the key of the repository that created batch ${created.batch_id}?`,
         { cause: e },
       );
     }
   };
 
-  // Opens a create response's secrets with the private key, calling nothing: every instance's credentials, and with
+  // Opens a create response's secrets with the credentials key, calling nothing: every instance's credentials, and with
   // index that one's fields as their own outputs. The batch token stays sealed: open hands out no teardown.
   const openCreateResponse = async (): Promise<void> => {
     const { created, secrets } = await readCreateResponse(inputs.createResponse!);
@@ -575,7 +575,7 @@ export async function run({
         );
       let secrets: BatchSecrets;
       try {
-        secrets = (await openSealed(response.batch.secrets, inputs.privateKey!)) as BatchSecrets;
+        secrets = (await openSealed(response.batch.secrets, inputs.credentialsKey!)) as BatchSecrets;
       } catch (e) {
         if (e instanceof SealedError && operation === "create")
           throw new Error(
@@ -603,7 +603,7 @@ export async function run({
         `| Tail | ${logs.no_object ? "no log object found" : `${logs.lines ?? 0} lines, ${logs.bytes ?? 0} bytes${logs.truncated ? ", truncated" : ""}`} |`,
       );
       if (logs.secrets) {
-        const secrets = (await openSealed(logs.secrets, inputs.privateKey!)) as LogsSecrets;
+        const secrets = (await openSealed(logs.secrets, inputs.credentialsKey!)) as LogsSecrets;
         // Used only to download the log here: masked in case an error quotes it, and never an output.
         mask(secrets.url);
         const index = logs.index ?? inputs.index ?? 0;
