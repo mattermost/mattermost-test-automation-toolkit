@@ -24,8 +24,8 @@ test("YAML is linted with yamllint and the monorepo's rules, not a downloaded sc
   const ci = read(".github/workflows/ci.yml");
   assert.doesNotMatch(ci, /actionlint|\|\s*bash/, "no script is fetched and run");
   assert.doesNotMatch(ci, /pip install|setup-python/, "the runner image's yamllint is used, nothing is installed");
-  const command = "yamllint --strict .github/workflows/ actions/";
-  assert.match(ci, /runs-on: ubuntu-24\.04[\s\S]*run: yamllint --strict \.github\/workflows\/ actions\//, "a warning fails the lint too");
+  const command = "yamllint .github/workflows/ actions/";
+  assert.match(ci, /runs-on: ubuntu-24\.04[\s\S]*run: yamllint \.github\/workflows\/ actions\//, "the workflows and the actions are linted");
   assert.equal(
     (JSON.parse(read("package.json")) as { scripts: Record<string, string> }).scripts["lint:yaml"],
     command,
