@@ -31855,38 +31855,36 @@ function batchIdParts(batchId, callerKey) {
 }
 
 // src/core/probe.ts
+var CONTROL = /[\u0000-\u001f\u007f]/;
 var GONE = "No test server for this hostname";
 var PROBE_INTERVAL_MS = 5e3;
 var PROBE_REQUEST_MS = 15e3;
 var MAX_BODY = 64 << 10;
 function goneUrls(sites, ssoHosts) {
   const urls = [];
+  const rejected = [];
   const protocols = [];
+  const quoted = (v2) => JSON.stringify(typeof v2 === "string" ? v2.slice(0, 200) : typeof v2);
   for (const [i8, site] of sites.entries()) {
     if (site === "" || site === null || site === void 0) continue;
-    const quoted = JSON.stringify(typeof site === "string" ? site.slice(0, 200) : typeof site);
-    if (typeof site !== "string" || /[\u0000-\u001f\u007f]/.test(site))
-      throw new ActionError(`the site ${quoted} is not a URL`);
-    let url;
-    try {
-      url = new URL(site);
-    } catch {
-      throw new ActionError(`the site ${quoted} is not a URL`);
+    const clean = typeof site === "string" && !CONTROL.test(site);
+    const url = clean && URL.canParse(site) ? new URL(site) : void 0;
+    if (!url || url.protocol !== "https:" && url.protocol !== "http:") {
+      rejected.push(`the site ${quoted(site)} is not an http(s) URL`);
+      continue;
     }
-    if (url.protocol !== "https:" && url.protocol !== "http:")
-      throw new ActionError(`the site ${quoted} is not an http(s) URL`);
     urls.push(`${url.href.replace(/\/+$/, "")}/api/v4/system/ping`, `${url.protocol}//mail-${url.host}/`);
     protocols[i8] = url.protocol;
   }
   for (const [i8, host] of ssoHosts.entries()) {
     if (host === "" || host === null || host === void 0) continue;
-    if (typeof host !== "string" || !/^[a-z0-9.-]+(:\d+)?$/i.test(host))
-      throw new ActionError(
-        `the sso host ${JSON.stringify(typeof host === "string" ? host.slice(0, 200) : typeof host)} is not a hostname`
-      );
+    if (typeof host !== "string" || !/^[a-z0-9.-]+(:\d+)?$/i.test(host)) {
+      rejected.push(`the sso host ${quoted(host)} is not a hostname`);
+      continue;
+    }
     urls.push(`${protocols[i8] ?? "https:"}//${host}/`);
   }
-  return urls;
+  return { urls, rejected };
 }
 var noAnswer = (e7) => {
   if (e7 instanceof DOMException && (e7.name === "TimeoutError" || e7.name === "AbortError"))
@@ -32323,43 +32321,31 @@ async function destroySteps(t2, result, target, invoke, secrets, inputs, current
   const ssoOf = (r8) => (Array.isArray(r8.batch?.instances) ? r8.batch.instances : []).map((l5) => isObject(l5) ? l5.sso_host : void 0);
   const responseSites = sitesOf(t2.response);
   const replySites = sitesOf(first);
-  const lists = [
-    ["the create response's", () => goneUrls(responseSites, ssoOf(t2.response))],
-    [
-      "the destroy reply's",
-      () => goneUrls(
-        Array.from(
-          { length: Math.max(replySites.length, responseSites.length) },
-          (_2, i8) => replySites[i8] || responseSites[i8]
-        ),
-        ssoOf(first)
-      )
-    ]
-  ];
-  const urls = [];
-  const unread = [];
-  for (const [whose, read] of lists)
-    try {
-      urls.push(...read());
-    } catch (e7) {
-      unread.push(`${whose} hosts could not be read: ${reason(e7)}`);
-    }
-  if (unread.length === lists.length) return `batch ${t2.batchId}: ${unread.join("; ")}`;
-  urls.splice(0, urls.length, ...new Set(urls));
-  for (const u2 of unread) notes.push(`Batch ${t2.batchId}: ${u2}; the others were checked.`);
+  const fromResponse = goneUrls(responseSites, ssoOf(t2.response));
+  const fromReply = goneUrls(
+    Array.from(
+      { length: Math.max(replySites.length, responseSites.length) },
+      (_2, i8) => replySites[i8] || responseSites[i8]
+    ),
+    ssoOf(first)
+  );
+  const urls = [.../* @__PURE__ */ new Set([...fromResponse.urls, ...fromReply.urls])];
+  const rejected = [.../* @__PURE__ */ new Set([...fromResponse.rejected, ...fromReply.rejected])];
+  if (rejected.length) notes.push(`Batch ${t2.batchId}: not checked, as not a host: ${rejected.join("; ")}`);
+  const unchecked = rejected.length ? `; ${rejected.length} entr${rejected.length === 1 ? "y" : "ies"} not a host` : "";
   if (urls.length) {
     deps.log(
       `e2e-test-stack: probing ${urls.length} host(s) of batch ${t2.batchId} for the router's 404, within ${GONE_WINDOW_SECONDS} s`
     );
     const served = await probeGone(urls, GONE_WINDOW_SECONDS * 1e3, deps);
     if (served.length) {
-      result.gone = `not yet: ${served.length} of ${urls.length} still served after ${GONE_WINDOW_SECONDS} s`;
+      result.gone = `not yet: ${served.length} of ${urls.length} still served after ${GONE_WINDOW_SECONDS} s${unchecked}`;
       notes.push(`Batch ${t2.batchId}: still served after ${GONE_WINDOW_SECONDS} s: ${served.join("; ")}`);
       deps.log(
         `e2e-test-stack: ${served.length} of ${urls.length} host(s) of batch ${t2.batchId} still served: ${served.join("; ")}`
       );
-    } else result.gone = `yes, all ${urls.length}`;
-  } else result.gone = "no host to check";
+    } else result.gone = `yes, all ${urls.length}${unchecked}`;
+  } else result.gone = rejected.length ? `none checked${unchecked}` : "no host to check";
   let again;
   try {
     again = await destroyCall(invoke, target, payload);

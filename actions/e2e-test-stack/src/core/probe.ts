@@ -2,7 +2,9 @@
 // See LICENSE.txt for license information.
 import type { FetchImpl, Sleep } from "../../../shared/src/github.ts";
 import { readBody } from "./body.ts";
-import { ActionError } from "./errors.ts";
+
+// eslint-disable-next-line no-control-regex
+const CONTROL = /[\u0000-\u001f\u007f]/;
 
 /** The router's answer for a hostname with no running test server. */
 export const GONE = "No test server for this hostname";
@@ -22,39 +24,39 @@ export interface ProbeOptions {
 
 /**
  * The URLs that answer while a batch's servers are up: each site's ping, its mail- host, and each sso- host, all with
- * the site's protocol. ssoHosts is index-aligned with sites; an sso- host with no site is probed over https. Sites
- * that are empty (a server that never launched) are left out; a site that is not an http(s) URL fails.
+ * the site's protocol. ssoHosts is index-aligned with sites; an sso- host with no site is probed over https. Empty
+ * entries (a server that never launched) are left out. An entry that is not an http(s) URL or a hostname is skipped
+ * and named in rejected, so the others are still probed.
  */
-export function goneUrls(sites: readonly unknown[], ssoHosts: readonly unknown[]): string[] {
+export function goneUrls(
+  sites: readonly unknown[],
+  ssoHosts: readonly unknown[],
+): { urls: string[]; rejected: string[] } {
   const urls: string[] = [];
+  const rejected: string[] = [];
   const protocols: string[] = [];
+  const quoted = (v: unknown) => JSON.stringify(typeof v === "string" ? v.slice(0, 200) : typeof v);
   for (const [i, site] of sites.entries()) {
     if (site === "" || site === null || site === undefined) continue;
-    const quoted = JSON.stringify(typeof site === "string" ? site.slice(0, 200) : typeof site);
     // The URL parser drops control characters, which would otherwise reach the probe and its log lines unchecked.
-    // eslint-disable-next-line no-control-regex
-    if (typeof site !== "string" || /[\u0000-\u001f\u007f]/.test(site))
-      throw new ActionError(`the site ${quoted} is not a URL`);
-    let url: URL;
-    try {
-      url = new URL(site);
-    } catch {
-      throw new ActionError(`the site ${quoted} is not a URL`);
+    const clean = typeof site === "string" && !CONTROL.test(site);
+    const url = clean && URL.canParse(site) ? new URL(site) : undefined;
+    if (!url || (url.protocol !== "https:" && url.protocol !== "http:")) {
+      rejected.push(`the site ${quoted(site)} is not an http(s) URL`);
+      continue;
     }
-    if (url.protocol !== "https:" && url.protocol !== "http:")
-      throw new ActionError(`the site ${quoted} is not an http(s) URL`);
     urls.push(`${url.href.replace(/\/+$/, "")}/api/v4/system/ping`, `${url.protocol}//mail-${url.host}/`);
     protocols[i] = url.protocol;
   }
   for (const [i, host] of ssoHosts.entries()) {
     if (host === "" || host === null || host === undefined) continue;
-    if (typeof host !== "string" || !/^[a-z0-9.-]+(:\d+)?$/i.test(host))
-      throw new ActionError(
-        `the sso host ${JSON.stringify(typeof host === "string" ? host.slice(0, 200) : typeof host)} is not a hostname`,
-      );
+    if (typeof host !== "string" || !/^[a-z0-9.-]+(:\d+)?$/i.test(host)) {
+      rejected.push(`the sso host ${quoted(host)} is not a hostname`);
+      continue;
+    }
     urls.push(`${protocols[i] ?? "https:"}//${host}/`);
   }
-  return urls;
+  return { urls, rejected };
 }
 
 /** A failed request, as the last answer: why it got none. */

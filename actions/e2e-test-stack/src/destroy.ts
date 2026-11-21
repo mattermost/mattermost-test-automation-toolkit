@@ -512,31 +512,20 @@ async function destroySteps(
     (Array.isArray(r.batch?.instances) ? r.batch.instances : []).map((l) => (isObject(l) ? l.sso_host : undefined));
   const responseSites = sitesOf(t.response);
   const replySites = sitesOf(first);
-  const lists: [string, () => string[]][] = [
-    ["the create response's", () => goneUrls(responseSites, ssoOf(t.response))],
-    [
-      "the destroy reply's",
-      () =>
-        goneUrls(
-          Array.from(
-            { length: Math.max(replySites.length, responseSites.length) },
-            (_, i) => replySites[i] || responseSites[i],
-          ),
-          ssoOf(first),
-        ),
-    ],
-  ];
-  const urls: string[] = [];
-  const unread: string[] = [];
-  for (const [whose, read] of lists)
-    try {
-      urls.push(...read());
-    } catch (e) {
-      unread.push(`${whose} hosts could not be read: ${reason(e)}`);
-    }
-  if (unread.length === lists.length) return `batch ${t.batchId}: ${unread.join("; ")}`;
-  urls.splice(0, urls.length, ...new Set(urls));
-  for (const u of unread) notes.push(`Batch ${t.batchId}: ${u}; the others were checked.`);
+  const fromResponse = goneUrls(responseSites, ssoOf(t.response));
+  const fromReply = goneUrls(
+    Array.from(
+      { length: Math.max(replySites.length, responseSites.length) },
+      (_, i) => replySites[i] || responseSites[i],
+    ),
+    ssoOf(first),
+  );
+  const urls = [...new Set([...fromResponse.urls, ...fromReply.urls])];
+  // An entry that is not a URL or a hostname is skipped, every other host is still probed, and the summary says the
+  // check was not whole.
+  const rejected = [...new Set([...fromResponse.rejected, ...fromReply.rejected])];
+  if (rejected.length) notes.push(`Batch ${t.batchId}: not checked, as not a host: ${rejected.join("; ")}`);
+  const unchecked = rejected.length ? `; ${rejected.length} entr${rejected.length === 1 ? "y" : "ies"} not a host` : "";
   if (urls.length) {
     deps.log(
       `e2e-test-stack: probing ${urls.length} host(s) of batch ${t.batchId} for the router's 404, within ${GONE_WINDOW_SECONDS} s`,
@@ -545,13 +534,13 @@ async function destroySteps(
     // router stops serving it soon after.
     const served = await probeGone(urls, GONE_WINDOW_SECONDS * 1000, deps);
     if (served.length) {
-      result.gone = `not yet: ${served.length} of ${urls.length} still served after ${GONE_WINDOW_SECONDS} s`;
+      result.gone = `not yet: ${served.length} of ${urls.length} still served after ${GONE_WINDOW_SECONDS} s${unchecked}`;
       notes.push(`Batch ${t.batchId}: still served after ${GONE_WINDOW_SECONDS} s: ${served.join("; ")}`);
       deps.log(
         `e2e-test-stack: ${served.length} of ${urls.length} host(s) of batch ${t.batchId} still served: ${served.join("; ")}`,
       );
-    } else result.gone = `yes, all ${urls.length}`;
-  } else result.gone = "no host to check";
+    } else result.gone = `yes, all ${urls.length}${unchecked}`;
+  } else result.gone = rejected.length ? `none checked${unchecked}` : "no host to check";
 
   let again: StackResponse;
   try {

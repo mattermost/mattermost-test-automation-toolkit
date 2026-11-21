@@ -58,29 +58,50 @@ action.
 | `attempts` | JSON array, one entry per attempt with a batch: `attempt`, `batch_id`, `state` (the destroy's reported state, such as `"destroyed"`, `"not found"` or `"partially_destroyed"`; `"unknown"` when a reply named none; `"not destroyed"` when no destroy answered or none was sent), `gone`, `again` (the second destroy's state, `"unknown"`, `"failed"` or `"not run"`) and `cost_usd` |
 | `cost-usd` | The batches' estimated cost in USD; empty unless every batch the step destroyed had every server priced at a known rate                                                                                                                                                                                                                                                               |
 
-## Examples
+## Example
 
-After the tests, in the run that created the batch, as a job of `e2e-test-stack-destroy.yml` the E2E workflow calls:
+After the tests, in the run that created the batch. The E2E workflow calls the repository's
+`e2e-test-stack-destroy.yml` as a reusable workflow, and decides when:
 
 ```yaml
-destroy:
-  needs: [create, test]
-  if: always() && needs.create.result != 'skipped'
-  runs-on: ubuntu-24.04
-  permissions:
-    contents: read
-    actions: read
-    id-token: write
-  steps:
-    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-      with:
-        node-version: "26"
-    - uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack/destroy@main
-      with:
-        caller-key: mobile
-        batch: ios
-        role-arn: ${{ vars.E2E_TEST_STACK_ROLE_ARN_PROD }}
-        credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
+# The E2E workflow
+jobs:
+  # create, which calls e2e-test-stack-create.yml, and test …
+  destroy:
+    needs: [create, test]
+    if: always() && needs.create.result != 'skipped'
+    uses: ./.github/workflows/e2e-test-stack-destroy.yml
+    with:
+      batch: ios
+    secrets: inherit
+```
+
+The reusable workflow runs the action, as the CI role trusts only that file:
+
+```yaml
+# .github/workflows/e2e-test-stack-destroy.yml
+on:
+  workflow_call:
+    inputs:
+      batch: { type: string, required: true }
+
+jobs:
+  destroy:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+      - uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack/destroy@main
+        with:
+          caller-key: mobile
+          batch: ${{ inputs.batch }}
+          role-arn: ${{ vars.E2E_TEST_STACK_ROLE_ARN_PROD }}
+          credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
 ```
 
 ## Cleaning up by hand
