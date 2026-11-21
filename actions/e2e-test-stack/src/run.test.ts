@@ -52,6 +52,16 @@ test("a message that smuggles a frame-shaped line behind a lone \\r cannot start
   ]);
 });
 
+test("a frame carrying a legacy ##[command] is printed as text, not run", () => {
+  const e = new Error("boom");
+  e.stack = "Error: boom\n    at ##[warning]injected\n    at f (x##[error]y:1:2)";
+  assert.deepEqual(failureLines(e), [
+    "::error::e2e-test-stack: Error: boom",
+    "    at ## [warning]injected",
+    "    at f (x## [error]y:1:2)",
+  ]);
+});
+
 test("an error's cause chain is in the annotation, so a fetch or SDK failure shows its real reason", () => {
   const e = new TypeError("fetch failed", { cause: new Error("connect ECONNREFUSED 10.0.0.1:443") });
   e.stack = "TypeError: fetch failed";

@@ -31672,7 +31672,7 @@ function reportLines(e7) {
   const lines = [`::error::${commandText(redact(`e2e-test-stack: ${describe2(e7)}`))}`];
   if (!(e7 instanceof ActionError) && isError(e7) && typeof e7.stack === "string")
     lines.push(
-      ...e7.stack.split(/\r\n|\r|\n/).filter((l5) => /^\s+at /.test(l5)).map((l5) => commandText(redact(l5)))
+      ...e7.stack.split(/\r\n|\r|\n/).filter((l5) => /^\s+at /.test(l5)).map((l5) => commandText(redact(l5)).replaceAll("##[", "## ["))
     );
   return lines;
 }
