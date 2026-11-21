@@ -108,3 +108,50 @@ test("a JSON body over the limit is a final failure, refused by its declared len
   await assert.rejects(big.github.json("/x"), /attempt 1: \d+ bytes, more than \d+$/);
   assert.equal(big.calls.length, 1);
 });
+
+test("a download follows the API's redirect without the token, bounded, and never quotes the storage URL", async () => {
+  const blob = "https://storage.example/artifact.zip?sig=secret";
+  const c = client({
+    [api("/a/zip")]: [new Response(null, { status: 302, headers: { location: blob } })],
+    [blob]: [new Response("", { status: 500 }), new Response("PK-bytes")],
+  });
+  assert.equal((await c.github.download("/a/zip", 100)).toString(), "PK-bytes");
+  assert.equal(c.calls[0].init?.redirect, "manual");
+  assert.equal(c.calls[1].url, blob);
+  assert.equal(c.calls[1].init?.headers, undefined, "the storage URL gets no token");
+  assert.equal(c.calls[1].init?.redirect, "error");
+  assert.deepEqual(c.waits, [10_000]);
+
+  const denied = client({
+    [api("/a/zip")]: [new Response(null, { status: 302, headers: { location: blob } })],
+    [blob]: [new Response(`<Error>${blob}</Error>`, { status: 403 })],
+  });
+  await assert.rejects(denied.github.download("/a/zip", 100), (e: unknown) => {
+    const message = (e as Error).message;
+    return /attempt 1: the download answered HTTP 403$/.test(message) && !message.includes("sig=secret");
+  });
+  assert.equal(denied.calls.length, 2, "a 4xx from storage is final");
+});
+
+test("a download answered directly is read bounded; one with no usable location or over the limit is final", async () => {
+  const direct = client({ [api("/a/zip")]: [new Response("PK")] });
+  assert.equal((await direct.github.download("/a/zip", 100)).toString(), "PK");
+  const nowhere = client({ [api("/a/zip")]: [new Response(null, { status: 302 })] });
+  await assert.rejects(nowhere.github.download("/a/zip", 100), /attempt 1: HTTP 302 with no location$/);
+  for (const location of ["/storage/a.zip?sig=secret", "http://storage.example/a.zip?sig=secret", "::bad?sig=secret"]) {
+    const bad = client({ [api("/a/zip")]: [new Response(null, { status: 302, headers: { location } })] });
+    await assert.rejects(bad.github.download("/a/zip", 100), (e: unknown) => {
+      const message = (e as Error).message;
+      return (
+        /attempt 1: HTTP 302 with a location that is not an absolute https URL$/.test(message) &&
+        !message.includes("sig=")
+      );
+    });
+    assert.equal(bad.calls.length, 1, `${location} is never fetched`);
+  }
+  const big = client({ [api("/a/zip")]: [new Response("x".repeat(101))] });
+  await assert.rejects(big.github.download("/a/zip", 100), /attempt 1: more than 100 bytes$/);
+  assert.equal(big.calls.length, 1);
+  const missing = client({ [api("/a/zip")]: [json({ message: "Not Found" }, 404)] });
+  await assert.rejects(missing.github.download("/a/zip", 100), /attempt 1: HTTP 404/);
+});

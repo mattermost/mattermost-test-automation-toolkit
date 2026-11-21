@@ -929,7 +929,10 @@ test("secrets that open to something other than an object fail the create, namin
       {},
       ok(readyResponse({ batch: { state: "ready", instances: [lease(0)], secrets: seal(value) } })),
     );
-    await assert.rejects(h.go(), /batch tpp-42-ios-1-abc's secrets are not an object, .* reaped at its ttl/);
+    await assert.rejects(
+      h.go(),
+      /batch tpp-42-ios-1-abc: the sealed secrets opened but are not an object\. .* reaped at its ttl\.$/,
+    );
   }
   const odd = harness(
     {},

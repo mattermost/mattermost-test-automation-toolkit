@@ -39,6 +39,8 @@ GitHubError.prototype.name = "GitHubError";
 export interface GitHub {
   /** GETs a REST path and parses its JSON body. */
   json(path: string): Promise<unknown>;
+  /** GETs a REST path that answers with a redirect to a download, and reads at most max bytes of it. */
+  download(path: string, max: number): Promise<Buffer>;
 }
 
 /** A fetch failure's name and reason, with undici's cause code (ECONNRESET, ENOTFOUND) when it has one. */
@@ -82,7 +84,8 @@ const readBounded = async (res: Response, max: number): Promise<Buffer> => {
  * A GitHub REST client for api.github.com. Each call is tried up to GITHUB_ATTEMPTS times, each attempt bounded to
  * GITHUB_ATTEMPT_MS: again after GITHUB_RETRY_MS on a 5xx, a timeout or a network error, and after GITHUB_THROTTLE_MS
  * on a 429 or a secondary rate limit. Any other failure is final. Once it gives up, the error lists every attempt's.
- * An empty token sends no Authorization header.
+ * An empty token sends no Authorization header. A download's redirect is followed without the token, and its signed
+ * URL and its body are never quoted.
  */
 export function githubClient(
   token: string,
@@ -129,6 +132,27 @@ export function githubClient(
         } catch {
           throw new AttemptError(`HTTP ${res.status} with a body that is not JSON`, "final");
         }
+      }),
+    download: (path, max) =>
+      retried(path, async (signal) => {
+        const res = await fetchImpl(`${GITHUB_API}${path}`, { headers: headers(), redirect: "manual", signal });
+        if (res.status < 300 || res.status >= 400) {
+          if (!res.ok) throw await statusError(res);
+          return await readBounded(res, max);
+        }
+        await res.body?.cancel().catch(() => {});
+        const location = res.headers.get("location");
+        if (!location) throw new AttemptError(`HTTP ${res.status} with no location`, "final");
+        // Checked here so fetch never reports a bad location, which carries the signed query, in its error.
+        if (!URL.canParse(location) || new URL(location).protocol !== "https:")
+          throw new AttemptError(`HTTP ${res.status} with a location that is not an absolute https URL`, "final");
+        const blob = await fetchImpl(location, { redirect: "error", signal });
+        if (!blob.ok) {
+          await blob.body?.cancel().catch(() => {});
+          const kind: Kind = blob.status >= 500 ? "transient" : blob.status === 429 ? "throttled" : "final";
+          throw new AttemptError(`the download answered HTTP ${blob.status}`, kind);
+        }
+        return await readBounded(blob, max);
       }),
   };
 }

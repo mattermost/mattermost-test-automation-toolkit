@@ -10,7 +10,7 @@ import { classify, isServer, MASTER_IMAGE, serverImage } from "./server-image.ts
 /** A GitHub that answers json from a map of paths. */
 const fakeGitHub = (pages: Record<string, unknown>) => {
   const asked: string[] = [];
-  const github: GitHub = {
+  const github: Pick<GitHub, "json"> = {
     json: async (path) => {
       asked.push(path);
       if (!(path in pages)) throw new GitHubError(`GitHub GET ${path} failed: attempt 1: HTTP 404`);

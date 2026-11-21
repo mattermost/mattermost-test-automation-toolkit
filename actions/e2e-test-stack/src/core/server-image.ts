@@ -39,7 +39,7 @@ const newer = (a: Version, b: Version): boolean =>
 const text = (v: Version): string => `${v.major}.${v.minor}.${v.patch}`;
 
 /** Every release of mattermost/mattermost, a page of RELEASES_PER_PAGE at a time, up to RELEASE_PAGES pages. */
-async function releases(github: GitHub): Promise<Release[]> {
+async function releases(github: Pick<GitHub, "json">): Promise<Release[]> {
   const all: Release[] = [];
   for (let page = 1; page <= RELEASE_PAGES; page++) {
     const got = await github.json(`/repos/mattermost/mattermost/releases?per_page=${RELEASES_PER_PAGE}&page=${page}`);
@@ -78,7 +78,10 @@ export function classify(list: Release[]): { latest?: string; esr?: string } {
 }
 
 /** The server image for master, the newest stable release, or the newest ESR patch, and its version. */
-export async function serverImage(server: Server, github: GitHub): Promise<{ image: string; version: string }> {
+export async function serverImage(
+  server: Server,
+  github: Pick<GitHub, "json">,
+): Promise<{ image: string; version: string }> {
   if (server === "master") return { image: MASTER_IMAGE, version: "master" };
   const list = await releases(github);
   const version = classify(list)[server];

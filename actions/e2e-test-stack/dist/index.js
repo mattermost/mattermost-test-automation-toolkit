@@ -1589,16 +1589,16 @@ var init_exceptions = __esm({
         const candidate = value;
         return _ServiceException.prototype.isPrototypeOf(candidate) || Boolean(candidate.$fault) && Boolean(candidate.$metadata) && (candidate.$fault === "client" || candidate.$fault === "server");
       }
-      static [Symbol.hasInstance](instance) {
-        if (!instance) {
+      static [Symbol.hasInstance](instance2) {
+        if (!instance2) {
           return false;
         }
-        const candidate = instance;
+        const candidate = instance2;
         if (this === _ServiceException) {
-          return _ServiceException.isInstance(instance);
+          return _ServiceException.isInstance(instance2);
         }
-        if (_ServiceException.isInstance(instance)) {
-          if (this.prototype.isPrototypeOf(instance)) {
+        if (_ServiceException.isInstance(instance2)) {
+          if (this.prototype.isPrototypeOf(instance2)) {
             return true;
           }
           const targetId = Object.prototype.hasOwnProperty.call(this, "shapeId") ? this.shapeId : void 0;
@@ -10019,10 +10019,10 @@ var init_invoke_store = __esm({
     InvokeStoreMulti = class _InvokeStoreMulti extends InvokeStoreBase {
       als;
       static async create() {
-        const instance = new _InvokeStoreMulti();
+        const instance2 = new _InvokeStoreMulti();
         const asyncHooks = await import("async_hooks");
-        instance.als = new asyncHooks.AsyncLocalStorage();
-        return instance;
+        instance2.als = new asyncHooks.AsyncLocalStorage();
+        return instance2;
       }
       getContext() {
         return this.als.getStore();
@@ -10048,10 +10048,10 @@ var init_invoke_store = __esm({
       }
     };
     (function(InvokeStore2) {
-      let instance = null;
+      let instance2 = null;
       async function getInstanceAsync(forceInvokeStoreMulti) {
-        if (!instance) {
-          instance = (async () => {
+        if (!instance2) {
+          instance2 = (async () => {
             const isMulti = forceInvokeStoreMulti === true || "AWS_LAMBDA_MAX_CONCURRENCY" in process.env;
             const newInstance = isMulti ? await InvokeStoreMulti.create() : new InvokeStoreSingle();
             if (!NO_GLOBAL_AWS_LAMBDA && globalThis.awslambda?.InvokeStore) {
@@ -10064,12 +10064,12 @@ var init_invoke_store = __esm({
             }
           })();
         }
-        return instance;
+        return instance2;
       }
       InvokeStore2.getInstanceAsync = getInstanceAsync;
       InvokeStore2._testing = process.env.AWS_LAMBDA_BENCHMARK_MODE === "1" ? {
         reset: () => {
-          instance = null;
+          instance2 = null;
           if (globalThis.awslambda?.InvokeStore) {
             delete globalThis.awslambda.InvokeStore;
           }
@@ -14309,11 +14309,11 @@ var init_xml_parser = __esm({
               childTags.push(p5.parseTag());
             }
           } else {
-            let text2 = "";
+            let text3 = "";
             while (p5.i < p5.z && p5.x[p5.i] !== "<") {
-              text2 += p5.x[p5.i++];
+              text3 += p5.x[p5.i++];
             }
-            textParts.push(p5.decodeEntities(text2));
+            textParts.push(p5.decodeEntities(text3));
           }
         }
         if (!p5.isNext("</")) {
@@ -14328,18 +14328,18 @@ var init_xml_parser = __esm({
           return { tag, value: "" };
         }
         if (!hasAttrs && !hasElementChild) {
-          const text2 = textParts.length === 1 ? textParts[0] : textParts.join("");
-          if (text2.trim() === "" && text2.includes("\n")) {
+          const text3 = textParts.length === 1 ? textParts[0] : textParts.join("");
+          if (text3.trim() === "" && text3.includes("\n")) {
             return { tag, value: "" };
           }
-          return { tag, value: text2 };
+          return { tag, value: text3 };
         }
         const obj = {};
-        for (const text2 of textParts) {
-          if (text2.trim() === "" && text2.includes("\n")) {
+        for (const text3 of textParts) {
+          if (text3.trim() === "" && text3.includes("\n")) {
             continue;
           }
-          obj["#text"] = "#text" in obj ? obj["#text"] + text2 : text2;
+          obj["#text"] = "#text" in obj ? obj["#text"] + text3 : text3;
         }
         for (const child of childTags) {
           if (child.tag === "__proto__") {
@@ -20153,8 +20153,8 @@ var describe = (e7) => {
 };
 var statusError = async (res) => {
   const body = (await readBody(res, MAX_ERROR_BYTES, { truncate: true }).catch(() => Buffer.alloc(0))).toString("utf8").replace(/\s+/g, " ").trim();
-  const text2 = body.slice(0, 200);
-  const message = `HTTP ${res.status}${text2 ? ` ${text2}` : ""}`;
+  const text3 = body.slice(0, 200);
+  const message = `HTTP ${res.status}${text3 ? ` ${text3}` : ""}`;
   if (res.status >= 500) return new AttemptError(message, "transient");
   const secondary = /secondary rate limit/i.test(body);
   const primary = !secondary && res.headers.get("x-ratelimit-remaining") === "0";
@@ -20200,12 +20200,33 @@ function githubClient(token, fetchImpl = fetch, wait = sleep, log = console.log)
     json: (path) => retried(path, async (signal) => {
       const res = await fetchImpl(`${GITHUB_API}${path}`, { headers: headers(), signal });
       if (!res.ok) throw await statusError(res);
-      const text2 = (await readBounded(res, MAX_JSON_BYTES)).toString("utf8");
+      const text3 = (await readBounded(res, MAX_JSON_BYTES)).toString("utf8");
       try {
-        return JSON.parse(text2);
+        return JSON.parse(text3);
       } catch {
         throw new AttemptError(`HTTP ${res.status} with a body that is not JSON`, "final");
       }
+    }),
+    download: (path, max) => retried(path, async (signal) => {
+      const res = await fetchImpl(`${GITHUB_API}${path}`, { headers: headers(), redirect: "manual", signal });
+      if (res.status < 300 || res.status >= 400) {
+        if (!res.ok) throw await statusError(res);
+        return await readBounded(res, max);
+      }
+      await res.body?.cancel().catch(() => {
+      });
+      const location = res.headers.get("location");
+      if (!location) throw new AttemptError(`HTTP ${res.status} with no location`, "final");
+      if (!URL.canParse(location) || new URL(location).protocol !== "https:")
+        throw new AttemptError(`HTTP ${res.status} with a location that is not an absolute https URL`, "final");
+      const blob = await fetchImpl(location, { redirect: "error", signal });
+      if (!blob.ok) {
+        await blob.body?.cancel().catch(() => {
+        });
+        const kind = blob.status >= 500 ? "transient" : blob.status === 429 ? "throttled" : "final";
+        throw new AttemptError(`the download answered HTTP ${blob.status}`, kind);
+      }
+      return await readBounded(blob, max);
     })
   };
 }
@@ -20217,6 +20238,8 @@ var refuse = (message) => {
 var PROJECT = "e2e-test-stack";
 var REGION = "us-east-1";
 var LABEL = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+var BATCH = /^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$/;
+var RUN_NUMBER = /^\d+$/;
 var BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 var input = (env2, name) => (env2[`STACK_${name.replace(/-/g, "_").toUpperCase()}`] ?? "").trim();
 var integer = (name, value, min) => {
@@ -20237,6 +20260,30 @@ var matching = (name, value, pattern, shape) => {
   return value;
 };
 var list = (value) => value.split(/[,\n]/).map((s3) => s3.trim()).filter(Boolean);
+function callerKeyFrom(env2) {
+  const callerKey = input(env2, "caller-key");
+  if (!callerKey) refuse("caller-key is required: the repository's key in the control plane's callers, e.g. mobile");
+  matching("caller-key", callerKey, LABEL, "the repository's key: lowercase letters, digits and hyphens");
+  return callerKey;
+}
+function batchFrom(env2) {
+  const batch = input(env2, "batch");
+  if (!batch) refuse("batch is required: it names the batch within the run, e.g. ios");
+  matching(
+    "batch",
+    batch,
+    BATCH,
+    "1 to 20 lowercase letters, digits and hyphens, starting and ending with a letter or digit"
+  );
+  return batch;
+}
+function runFrom(env2) {
+  const runId = (env2.GITHUB_RUN_ID ?? "").trim();
+  const attempt = (env2.GITHUB_RUN_ATTEMPT ?? "").trim();
+  if (!RUN_NUMBER.test(runId) || !RUN_NUMBER.test(attempt) || !Number.isSafeInteger(Number(attempt)))
+    refuse("GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT must be set, as they are in a GitHub Actions job");
+  return { runId, attempt: Number(attempt) };
+}
 function credentialsKeyFrom(value) {
   if (!value)
     refuse("credentials-key is required: the repository's credentials key, from E2E_TEST_STACK_CREDENTIALS_KEY");
@@ -20246,9 +20293,7 @@ function credentialsKeyFrom(value) {
   return new Uint8Array(key);
 }
 function stackInputs(env2) {
-  const callerKey = input(env2, "caller-key");
-  if (!callerKey) refuse("caller-key is required: the repository's key in the control plane's callers, e.g. mobile");
-  matching("caller-key", callerKey, LABEL, "the repository's key: lowercase letters, digits and hyphens");
+  const callerKey = callerKeyFrom(env2);
   const channel = input(env2, "channel") || "v1";
   if (channel !== "edge" && channel !== "v1") refuse(`channel must be v1 or edge, got ${JSON.stringify(channel)}`);
   return { callerKey, channel };
@@ -26490,35 +26535,35 @@ var import_node_fs5 = require("fs");
 var import_node_path7 = require("path");
 
 // src/core/redact.ts
-var redact = (text2) => text2.replace(/arn:aws[a-z-]*:(?:[^\s"';()|`<>[\]{}]*[^\s"',;()|`<>[\]{}.])?/g, "[arn]").replace(/(?<![\w-])\d{12}(?![\w-])/g, "[account]");
+var redact = (text3) => text3.replace(/arn:aws[a-z-]*:(?:[^\s"';()|`<>[\]{}]*[^\s"',;()|`<>[\]{}.])?/g, "[arn]").replace(/(?<![\w-])\d{12}(?![\w-])/g, "[account]");
 var errorText = (e7) => {
   const name = e7?.name || "Error";
   const message = redact(String(e7?.message ?? e7)).split("\n")[0].slice(0, 200);
   return `${name}: ${message}`;
 };
-var handlerError = (text2) => {
+var handlerError = (text3) => {
   try {
-    const parsed = JSON.parse(text2);
+    const parsed = JSON.parse(text3);
     if (typeof parsed?.errorMessage === "string") return redact(parsed.errorMessage);
   } catch {
   }
-  return redact(text2.trim()).slice(0, 500) || "no reason given";
+  return redact(text3.trim()).slice(0, 500) || "no reason given";
 };
 
 // src/core/outputs.ts
-var commandText = (text2) => text2.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A");
+var commandText = (text3) => text3.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A");
 function writeOutputs(path, outputs) {
   if (!path) return;
-  let text2 = "";
+  let text3 = "";
   for (const [k8, v2] of Object.entries(outputs)) {
     if (v2 === void 0) continue;
     const delimiter = `ghadelimiter_${(0, import_node_crypto5.randomUUID)()}`;
-    text2 += `${k8}<<${delimiter}
+    text3 += `${k8}<<${delimiter}
 ${v2}
 ${delimiter}
 `;
   }
-  if (text2) (0, import_node_fs5.appendFileSync)(path, text2);
+  if (text3) (0, import_node_fs5.appendFileSync)(path, text3);
 }
 function appendSummary(path, lines) {
   if (path && lines.length) (0, import_node_fs5.appendFileSync)(path, redact(lines.join("\n")) + "\n");
@@ -26556,8 +26601,32 @@ function masker(log) {
     }
   };
 }
+function also(action, failure, text3) {
+  if (failure instanceof ActionError)
+    return new ActionError(`${failure.message} Also, ${text3}`, { cause: failure.cause });
+  return new ActionError(`${action} failed. Also, ${text3}`, { cause: failure });
+}
+function settle(env2, action, outputs, summary, failure) {
+  const unwritten = [];
+  try {
+    writeOutputs(env2.GITHUB_OUTPUT, outputs);
+  } catch (w2) {
+    unwritten.push(`the outputs could not be written (${errorText(w2)})`);
+  }
+  try {
+    appendSummary(env2.GITHUB_STEP_SUMMARY, summary);
+  } catch (w2) {
+    unwritten.push(`the summary could not be written (${errorText(w2)})`);
+  }
+  let reported = failure;
+  if (unwritten.length && reported !== void 0) reported = also(action, reported, `${unwritten.join("; ")}.`);
+  if (reported !== void 0)
+    throw reported instanceof Error ? reported : new Error(`${action} failed with a value that is not an error`, { cause: reported });
+  if (unwritten.length) throw new ActionError(`${unwritten.join("; ")}.`);
+}
 
 // src/core/response.ts
+var RESPONSE_FILE = "e2e-test-stack-create.json";
 var NOT_SECRET = /* @__PURE__ */ new Set(["postgres.user", "postgres.database"]);
 var SECRET_FACT = /(password|secret|token|_key)$/;
 function maskBatchSecrets(masker2, secrets) {
@@ -31185,6 +31254,12 @@ async function openSealed(sealed, credentialsKey) {
     throw new SealedError("the sealed secrets opened but are not JSON");
   }
 }
+async function openBatchSecrets(sealed, credentialsKey) {
+  const value = await openSealed(sealed, credentialsKey);
+  if (value === null || typeof value !== "object" || Array.isArray(value))
+    throw new SealedError("the sealed secrets opened but are not an object");
+  return value;
+}
 
 // src/core/server-image.ts
 var SERVERS = ["master", "latest", "esr"];
@@ -31241,9 +31316,6 @@ async function serverImage(server, github) {
 
 // src/create.ts
 var MAX_INSTANCE_KEY = 44;
-var RESPONSE_FILE = "e2e-test-stack-create.json";
-var BATCH = /^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$/;
-var RUN_ID = /^\d+$/;
 var SERVICE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 var DURATION_PART = /(\d+)(?:\.(\d+))?(ns|us|µs|ms|s|m|h)/g;
 var DURATION = new RegExp(`^(?:${DURATION_PART.source})+$`);
@@ -31314,18 +31386,8 @@ var serverEnv = (value) => {
 function readCreateInputs(env2) {
   const get = (name) => input(env2, name);
   const common = stackInputs(env2);
-  const batch = get("batch");
-  if (!batch) refuse("batch is required: it names the batch within the run, e.g. ios");
-  matching(
-    "batch",
-    batch,
-    BATCH,
-    "1 to 20 lowercase letters, digits and hyphens, starting and ending with a letter or digit"
-  );
-  const runId = (env2.GITHUB_RUN_ID ?? "").trim();
-  const attempt = (env2.GITHUB_RUN_ATTEMPT ?? "").trim();
-  if (!RUN_ID.test(runId) || !RUN_ID.test(attempt))
-    refuse("GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT must be set, as they are in a GitHub Actions job");
+  const batch = batchFrom(env2);
+  const { runId, attempt } = runFrom(env2);
   const instanceKey = `${common.callerKey}-${runId}-${batch}-${attempt}`;
   if (instanceKey.length > MAX_INSTANCE_KEY)
     refuse(
@@ -31485,21 +31547,21 @@ async function createBatch(env2, deps) {
     } catch (e7) {
       throw new ActionError(`the invoke of ${named} failed: ${errorText(e7)}.${mayExist}`);
     }
-    const text2 = payloadText(reply);
+    const text3 = payloadText(reply);
     try {
-      outputs.response_path = writeFile2(responseFile, text2);
+      outputs.response_path = writeFile2(responseFile, text3);
     } catch (e7) {
       responseWriteError = e7;
     }
     if (reply.FunctionError)
-      throw new ActionError(`the control plane refused the create: ${handlerError(text2)}.${mayExist}`);
+      throw new ActionError(`the control plane refused the create: ${handlerError(text3)}.${mayExist}`);
     if (reply.StatusCode !== 200)
-      throw new ActionError(`the invoke answered ${reply.StatusCode}: ${handlerError(text2)}.${mayExist}`);
+      throw new ActionError(`the invoke answered ${reply.StatusCode}: ${handlerError(text3)}.${mayExist}`);
     let response;
     try {
-      response = JSON.parse(text2);
+      response = JSON.parse(text3);
     } catch {
-      throw new ActionError(`the control plane's reply is not JSON: ${redact(text2).slice(0, 200)}.${mayExist}`);
+      throw new ActionError(`the control plane's reply is not JSON: ${redact(text3).slice(0, 200)}.${mayExist}`);
     }
     const error = responseError(response);
     const batchId = typeof response.batch_id === "string" ? response.batch_id : "";
@@ -31534,20 +31596,15 @@ async function createBatch(env2, deps) {
         throw new ActionError(
           `batch ${batchId} came back with no sealed secrets${error ? ` (${error})` : ""}; without its batch token it cannot be destroyed, and is reaped at its ttl`
         );
-      let value;
+      let opened;
       try {
-        value = await openSealed(response.batch.secrets, inputs.credentialsKey);
+        opened = await openBatchSecrets(response.batch.secrets, inputs.credentialsKey);
       } catch (e7) {
         if (!(e7 instanceof SealedError)) throw e7;
         throw new ActionError(
-          `batch ${batchId}: ${e7.message} Without its batch token it cannot be destroyed; it is reaped at its ttl.`
+          `batch ${batchId}: ${e7.message}. Without its batch token it cannot be destroyed; it is reaped at its ttl.`
         );
       }
-      if (value === null || typeof value !== "object" || Array.isArray(value))
-        throw new ActionError(
-          `batch ${batchId}'s secrets are not an object, so it has no batch token and cannot be destroyed; it is reaped at its ttl`
-        );
-      const opened = value;
       maskBatchSecrets(secrets, opened);
       if (typeof opened.batch_token !== "string" || !opened.batch_token)
         throw new ActionError(
@@ -31569,30 +31626,9 @@ async function createBatch(env2, deps) {
     outputs.indexes = JSON.stringify(Array.from({ length: expected }, (_2, i8) => i8));
   } catch (e7) {
     const reported = e7 instanceof Error && e7.cause === responseWriteError;
-    failure = responseWriteError !== void 0 && !reported ? also(e7, writeFailure()) : e7;
+    failure = responseWriteError !== void 0 && !reported ? also("create", e7, writeFailure()) : e7;
   }
-  {
-    const unwritten = [];
-    try {
-      writeOutputs(env2.GITHUB_OUTPUT, outputs);
-    } catch (w2) {
-      unwritten.push(`the outputs could not be written (${errorText(w2)})`);
-    }
-    try {
-      appendSummary(env2.GITHUB_STEP_SUMMARY, [...summary, ...serverTable]);
-    } catch (w2) {
-      unwritten.push(`the summary could not be written (${errorText(w2)})`);
-    }
-    if (unwritten.length && failure !== void 0) failure = also(failure, `${unwritten.join("; ")}.`);
-    if (failure !== void 0)
-      throw failure instanceof Error ? failure : new Error("create failed with a value that is not an error", { cause: failure });
-    if (unwritten.length) throw new ActionError(`${unwritten.join("; ")}.`);
-  }
-}
-function also(failure, text2) {
-  if (failure instanceof ActionError)
-    return new ActionError(`${failure.message} Also, ${text2}`, { cause: failure.cause });
-  return new ActionError(`create failed. Also, ${text2}`, { cause: failure });
+  settle(env2, "create", outputs, [...summary, ...serverTable], failure);
 }
 var FETCH_ATTEMPTS = 3;
 var FETCH_RETRY_MS = 5e3;
@@ -31619,14 +31655,14 @@ async function fetchReady(invoke, target, named, batchId, batchToken, expected, 
       await deps.sleep(ms);
     }
   }
-  const text2 = payloadText(reply);
-  if (reply.FunctionError) throw notReady(`was refused: ${handlerError(text2)}`);
-  if (reply.StatusCode !== 200) throw notReady(`answered ${reply.StatusCode}: ${handlerError(text2)}`);
+  const text3 = payloadText(reply);
+  if (reply.FunctionError) throw notReady(`was refused: ${handlerError(text3)}`);
+  if (reply.StatusCode !== 200) throw notReady(`answered ${reply.StatusCode}: ${handlerError(text3)}`);
   let response;
   try {
-    response = JSON.parse(text2);
+    response = JSON.parse(text3);
   } catch {
-    throw notReady(`returned a reply that is not JSON: ${redact(text2).slice(0, 200)}`);
+    throw notReady(`returned a reply that is not JSON: ${redact(text3).slice(0, 200)}`);
   }
   const error = responseError(response);
   if (error) throw notReady(`reported: ${error}`);
@@ -31641,8 +31677,249 @@ async function fetchReady(invoke, target, named, batchId, batchToken, expected, 
 }
 var create = createWith();
 
+// src/core/zip.ts
+var import_node_zlib = require("zlib");
+var ZipError = class extends Error {
+};
+ZipError.prototype.name = "ZipError";
+var EOCD = 101010256;
+var CENTRAL = 33639248;
+var LOCAL = 67324752;
+var EOCD_SEARCH = 22 + 65535;
+function readZipMember(zip, name, max) {
+  let end = -1;
+  for (let i8 = zip.length - 22; i8 >= Math.max(0, zip.length - EOCD_SEARCH); i8--)
+    if (zip.readUInt32LE(i8) === EOCD) {
+      end = i8;
+      break;
+    }
+  if (end < 0) throw new ZipError("not a ZIP archive: no end of central directory");
+  const entries2 = zip.readUInt16LE(end + 10);
+  const offset = zip.readUInt32LE(end + 16);
+  if (entries2 === 65535 || offset === 4294967295) throw new ZipError("a ZIP64 archive, which is not read");
+  let p5 = offset;
+  for (let i8 = 0; i8 < entries2; i8++) {
+    if (p5 + 46 > zip.length || zip.readUInt32LE(p5) !== CENTRAL) throw new ZipError("a malformed central directory");
+    const flags = zip.readUInt16LE(p5 + 8);
+    const method = zip.readUInt16LE(p5 + 10);
+    const crc = zip.readUInt32LE(p5 + 16);
+    const compressed = zip.readUInt32LE(p5 + 20);
+    const size = zip.readUInt32LE(p5 + 24);
+    const nameLength = zip.readUInt16LE(p5 + 28);
+    const extraLength = zip.readUInt16LE(p5 + 30);
+    const commentLength = zip.readUInt16LE(p5 + 32);
+    const local = zip.readUInt32LE(p5 + 42);
+    const entryName = zip.subarray(p5 + 46, p5 + 46 + nameLength).toString("utf8");
+    p5 += 46 + nameLength + extraLength + commentLength;
+    if (entryName !== name) continue;
+    if (flags & 1) throw new ZipError(`${name} is encrypted`);
+    if (compressed === 4294967295 || size === 4294967295 || local === 4294967295)
+      throw new ZipError(`${name} is a ZIP64 member, which is not read`);
+    if (size > max) throw new ZipError(`${name} is ${size} bytes, more than ${max}`);
+    if (local + 30 > zip.length || zip.readUInt32LE(local) !== LOCAL)
+      throw new ZipError(`${name} has no local header where the directory says`);
+    const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
+    if (start + compressed > zip.length) throw new ZipError(`${name} runs past the end of the archive`);
+    const raw = zip.subarray(start, start + compressed);
+    let data;
+    if (method === 0) data = Buffer.from(raw);
+    else if (method === 8) {
+      try {
+        data = (0, import_node_zlib.inflateRawSync)(raw, { maxOutputLength: Math.max(1, max) });
+      } catch (e7) {
+        throw new ZipError(`${name} does not inflate: ${errorText(e7)}`);
+      }
+    } else throw new ZipError(`${name} uses compression method ${method}, which is not read`);
+    if (data.length !== size || (0, import_node_zlib.crc32)(data) !== crc)
+      throw new ZipError(`${name} does not match its size and CRC-32 in the archive`);
+    return data;
+  }
+  return void 0;
+}
+
+// src/core/artifacts.ts
+var MAX_ARTIFACT_BYTES = 64 << 20;
+var MAX_RESPONSE_BYTES = 16 << 20;
+var PER_PAGE = 100;
+var PAGES = 10;
+var createArtifact = (batch) => `e2e-test-stack-create-${batch}`;
+async function newestArtifact(github, run2, name) {
+  const found = [];
+  for (let page = 1; page <= PAGES; page++) {
+    const got = await github.json(
+      `/repos/${run2.repository}/actions/runs/${run2.runId}/artifacts?name=${encodeURIComponent(name)}&per_page=${PER_PAGE}&page=${page}`
+    );
+    const listed = Array.isArray(got?.artifacts) ? got.artifacts : [];
+    for (const a8 of listed)
+      if (a8?.name === name && Number.isSafeInteger(a8.id))
+        found.push({
+          id: a8.id,
+          name,
+          createdAt: typeof a8.created_at === "string" ? a8.created_at : "",
+          expired: a8.expired === true
+        });
+    if (listed.length < PER_PAGE) break;
+  }
+  return found.sort((a8, b8) => b8.createdAt.localeCompare(a8.createdAt) || b8.id - a8.id)[0];
+}
+async function createResponse(github, run2, batch) {
+  const name = createArtifact(batch);
+  const artifact = await newestArtifact(github, run2, name);
+  if (!artifact) return void 0;
+  const what = `this run's artifact ${name}`;
+  if (artifact.expired) throw new ActionError(`${what} has expired, so the batch it names cannot be read`);
+  let archive;
+  try {
+    archive = await github.download(
+      `/repos/${run2.repository}/actions/artifacts/${artifact.id}/zip`,
+      MAX_ARTIFACT_BYTES
+    );
+  } catch (e7) {
+    throw new ActionError(`${what} exists but could not be downloaded: ${errorText(e7)}`, { cause: e7 });
+  }
+  let response;
+  try {
+    response = readZipMember(archive, RESPONSE_FILE, MAX_RESPONSE_BYTES);
+  } catch (e7) {
+    if (!(e7 instanceof ZipError)) throw e7;
+    throw new ActionError(`${what} could not be read: ${e7.message}`, { cause: e7 });
+  }
+  if (!response) throw new ActionError(`${what} holds no ${RESPONSE_FILE}`);
+  return { artifact, response };
+}
+
+// src/core/batch.ts
+var escape2 = (s3) => s3.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function batchAttempt(batchId, owner) {
+  const prefix = `${escape2(owner.callerKey)}-${escape2(owner.runId)}-${escape2(owner.batch)}`;
+  const m5 = new RegExp(`^${prefix}-([1-9][0-9]*)-[a-z0-9]+$`).exec(batchId);
+  if (!m5) return void 0;
+  const attempt = Number(m5[1]);
+  return Number.isSafeInteger(attempt) && attempt <= owner.attempt ? attempt : void 0;
+}
+
+// src/open.ts
+var REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+function readOpenInputs(env2) {
+  const callerKey = callerKeyFrom(env2);
+  const batch = batchFrom(env2);
+  const run2 = runFrom(env2);
+  const repository = (env2.GITHUB_REPOSITORY ?? "").trim();
+  if (!REPOSITORY.test(repository)) refuse("GITHUB_REPOSITORY must be set, as it is in a GitHub Actions job");
+  const index = integer("index", input(env2, "index") || "0", 0);
+  const credentialsKey = credentialsKeyFrom(input(env2, "credentials-key"));
+  const githubToken = input(env2, "github-token");
+  if (!githubToken)
+    refuse(
+      "github-token is required: a token that reads this run's artifacts, such as github.token with actions: read"
+    );
+  return { callerKey, batch, index, credentialsKey, githubToken, repository, run: run2 };
+}
+var text2 = (v2) => typeof v2 === "string" ? v2 : "";
+var strings = (v2) => Object.fromEntries(entries(v2).filter((e7) => typeof e7[1] === "string"));
+function instance(lease, site, opened) {
+  const siteUrl = text2(lease?.site_url) || text2(site);
+  if (lease?.state !== "ready" || !siteUrl || !isObject(opened)) return null;
+  return {
+    site_url: siteUrl,
+    state: lease.state,
+    admin_username: text2(lease.admin?.username),
+    admin_email: text2(lease.admin?.email),
+    admin_password: text2(opened.admin_password),
+    mail_token: text2(opened.mail_token),
+    credentials: strings(opened.credentials),
+    facts: strings(opened.facts)
+  };
+}
+function openWith(overrides = {}) {
+  const deps = {
+    log: overrides.log ?? console.log,
+    fetch: overrides.fetch ?? fetch,
+    sleep: overrides.sleep ?? sleep,
+    now: overrides.now ?? Date.now
+  };
+  return (env2) => openServer(env2, deps);
+}
+async function openServer(env2, deps) {
+  const { log } = deps;
+  const inputs = readOpenInputs(env2);
+  const outputs = {};
+  const secrets = masker(log);
+  const name = createArtifact(inputs.batch);
+  let failure;
+  try {
+    const github = githubClient(inputs.githubToken, deps.fetch, deps.sleep, log);
+    const found = await createResponse(
+      github,
+      { repository: inputs.repository, runId: inputs.run.runId },
+      inputs.batch
+    );
+    if (!found)
+      throw new ActionError(
+        `this run has no artifact ${name}: no create step for batch ${inputs.batch} uploaded a response in any of its attempts`
+      );
+    let response;
+    try {
+      response = JSON.parse(found.response.toString("utf8"));
+    } catch {
+      response = null;
+    }
+    if (!isObject(response)) throw new ActionError(`the create response in ${name} is not a JSON object`);
+    const batchId = typeof response.batch_id === "string" ? response.batch_id : "";
+    if (!batchId) {
+      const error = responseError(response);
+      throw new ActionError(
+        `the create response in ${name} names no batch: the create for batch ${inputs.batch} made none${error ? ` (${error})` : ""}`
+      );
+    }
+    const createdIn = batchAttempt(batchId, { ...inputs.run, callerKey: inputs.callerKey, batch: inputs.batch });
+    if (createdIn === void 0)
+      throw new ActionError(
+        `the create response in ${name} names batch ${JSON.stringify(batchId.slice(0, 100))}, which is not this run's: it must be ${inputs.callerKey}-${inputs.run.runId}-${inputs.batch}-<attempt 1 to ${inputs.run.attempt}>-<suffix>`
+      );
+    outputs.batch_id = batchId;
+    const expiresAt = Date.parse(typeof response.batch?.expires_at === "string" ? response.batch.expires_at : "");
+    if (Number.isFinite(expiresAt) && expiresAt <= deps.now())
+      throw new ActionError(
+        `batch ${batchId} expired at ${new Date(expiresAt).toISOString()}, the end of its ttl, and is reaped; its servers cannot be opened`
+      );
+    const sealed = response.batch?.secrets;
+    if (typeof sealed !== "string" || !sealed) throw new ActionError(`batch ${batchId} has no sealed secrets`);
+    let opened;
+    try {
+      opened = await openBatchSecrets(sealed, inputs.credentialsKey);
+    } catch (e7) {
+      if (!(e7 instanceof SealedError)) throw e7;
+      throw new ActionError(`batch ${batchId}: ${e7.message}`);
+    }
+    maskBatchSecrets(secrets, opened);
+    const leases = Array.isArray(response.batch?.instances) ? response.batch.instances : [];
+    const sites = Array.isArray(response.sites) ? response.sites : [];
+    const openedInstances = Array.isArray(opened.instances) ? opened.instances : [];
+    const instances = leases.map(
+      (lease, i8) => instance(lease, sites[i8], openedInstances[i8])
+    );
+    outputs.instances = JSON.stringify(instances);
+    const one = instances[inputs.index];
+    if (!one)
+      throw new ActionError(
+        `batch ${batchId} has no ready server at index ${inputs.index}: it lists ${leases.length}, ${instances.filter(Boolean).length} of them ready`
+      );
+    outputs.site_url = one.site_url;
+    outputs.admin_username = one.admin_username;
+    outputs.admin_email = one.admin_email;
+    outputs.admin_password = one.admin_password;
+    outputs.mail_token = one.mail_token;
+    log(`e2e-test-stack: opened server ${inputs.index} of batch ${batchId}, created in attempt ${createdIn}`);
+  } catch (e7) {
+    failure = e7;
+  }
+  settle(env2, "open", outputs, [], failure);
+}
+var open = openWith();
+
 // src/run.ts
-var ACTIONS = { create };
+var ACTIONS = { create, open };
 async function run(name, env2, actions = ACTIONS) {
   const action = name !== void 0 && Object.hasOwn(actions, name) ? actions[name] : void 0;
   if (!action) {
@@ -31663,21 +31940,21 @@ var aggregated = (e7) => {
 };
 function written(e7) {
   if (typeof e7 !== "object" || e7 === null) return String(e7);
-  const text2 = (0, import_node_util2.inspect)(e7, { depth: 1, breakLength: Infinity });
-  return text2.length > MAX_OBJECT_TEXT ? `${text2.slice(0, MAX_OBJECT_TEXT)}\u2026` : text2;
+  const text3 = (0, import_node_util2.inspect)(e7, { depth: 1, breakLength: Infinity });
+  return text3.length > MAX_OBJECT_TEXT ? `${text3.slice(0, MAX_OBJECT_TEXT)}\u2026` : text3;
 }
 function describe2(e7, depth = 0) {
   try {
     if (!isError(e7)) return written(e7);
-    let text2 = e7 instanceof ActionError ? e7.message : e7.message ? `${e7.name}: ${e7.message}` : e7.name;
+    let text3 = e7 instanceof ActionError ? e7.message : e7.message ? `${e7.name}: ${e7.message}` : e7.name;
     const errors = aggregated(e7);
     if (errors?.length && depth < MAX_DEPTH) {
       const listed = errors.slice(0, MAX_ERRORS).map((inner) => describe2(inner, depth + 1));
       const more = errors.length > MAX_ERRORS ? `; ${errors.length - MAX_ERRORS} more` : "";
-      text2 += ` (${listed.join("; ")}${more})`;
+      text3 += ` (${listed.join("; ")}${more})`;
     }
-    if (e7.cause !== void 0 && depth < MAX_DEPTH) text2 += `; caused by ${describe2(e7.cause, depth + 1)}`;
-    return text2;
+    if (e7.cause !== void 0 && depth < MAX_DEPTH) text3 += `; caused by ${describe2(e7.cause, depth + 1)}`;
+    return text3;
   } catch {
     return "a value that could not be read";
   }

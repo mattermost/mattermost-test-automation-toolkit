@@ -3,6 +3,9 @@
 import type { Masker } from "./outputs.ts";
 import { redact } from "./redact.ts";
 
+/** The create response's file, and its member in the uploaded artifact. */
+export const RESPONSE_FILE = "e2e-test-stack-create.json";
+
 /** What a stack's time was spent on, as the control plane reports it. */
 export interface Timing {
   total_seconds?: number;
@@ -76,9 +79,9 @@ export function maskBatchSecrets(masker: Masker, secrets: BatchSecrets): void {
   }
 }
 
-const isObject = (v: unknown): v is object => typeof v === "object" && v !== null && !Array.isArray(v);
+export const isObject = (v: unknown): v is object => typeof v === "object" && v !== null && !Array.isArray(v);
 /** An object's entries; none for anything else, so a string is not split into characters. */
-const entries = (v: unknown): [string, string | undefined][] =>
+export const entries = (v: unknown): [string, string | undefined][] =>
   isObject(v) ? (Object.entries(v) as [string, string | undefined][]) : [];
 
 /** The reply's error as text, redacted; empty when it has none. Whatever the field holds is reported, not thrown on. */

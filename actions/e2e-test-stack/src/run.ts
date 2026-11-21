@@ -4,6 +4,7 @@
 import { inspect, types } from "node:util";
 import type { Env } from "../../shared/src/github.ts";
 import { create } from "./create.ts";
+import { open } from "./open.ts";
 import { ActionError } from "./core/errors.ts";
 import { commandText } from "./core/outputs.ts";
 import { redact } from "./core/redact.ts";
@@ -15,7 +16,7 @@ export { ActionError, commandText };
 export type Action = (env: Env) => Promise<void>;
 
 /** Every action the bundle runs, by the name its action.yml passes to run.sh. */
-export const ACTIONS: Readonly<Record<string, Action>> = { create };
+export const ACTIONS: Readonly<Record<string, Action>> = { create, open };
 
 /** Runs the action named, or refuses a name the bundle does not have. */
 export async function run(name: string | undefined, env: Env, actions: Readonly<Record<string, Action>> = ACTIONS) {

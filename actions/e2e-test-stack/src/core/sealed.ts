@@ -2,6 +2,7 @@
 // See LICENSE.txt for license information.
 import sodium from "libsodium-wrappers";
 import { ActionError } from "./errors.ts";
+import type { BatchSecrets } from "./response.ts";
 
 /** A sealed box that does not open with the credentials key, or does not hold JSON. */
 export class SealedError extends ActionError {}
@@ -29,4 +30,12 @@ export async function openSealed(sealed: string, credentialsKey: Uint8Array): Pr
   } catch {
     throw new SealedError("the sealed secrets opened but are not JSON");
   }
+}
+
+/** Opens a batch's sealed secrets, which must hold a JSON object; anything else is a SealedError. */
+export async function openBatchSecrets(sealed: string, credentialsKey: Uint8Array): Promise<BatchSecrets> {
+  const value = await openSealed(sealed, credentialsKey);
+  if (value === null || typeof value !== "object" || Array.isArray(value))
+    throw new SealedError("the sealed secrets opened but are not an object");
+  return value;
 }
