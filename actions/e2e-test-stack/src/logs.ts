@@ -153,29 +153,34 @@ export const scrubber = (values: readonly string[]): Scrubber => {
     : undefined;
   const scrub = (text: string) => redactArns(pattern ? text.replace(pattern, "***") : text);
 
-  /** at, or the start of the value a scrub of the whole text matches across it. */
-  const outsideValues = (text: string, at: number): number => {
-    if (!pattern) return at;
-    pattern.lastIndex = 0;
-    for (let m = pattern.exec(text); m && m.index < at; m = pattern.exec(text))
-      if (m.index + m[0].length > at) return m.index;
-    return at;
-  };
   /**
    * The cut at or before at that leaves each side to scrub as the whole would: after a line break within REACH, else
-   * after whitespace within REACH, and never inside a value. An ARN holds no whitespace, so it is split only within a
-   * run of more than REACH characters without any; the cut is never inside a value or a character.
+   * after whitespace within REACH, outside every value; else at, or the start of the value across it. An ARN holds no
+   * whitespace, so it is split only within a run of more than REACH characters without any. One scan finds the values,
+   * one walk back finds the cut.
    */
   const cut = (text: string, at: number): number => {
-    let c = at;
-    for (let prev = -1; c !== prev;) {
-      prev = c;
-      const floor = Math.max(0, c - REACH);
-      const line = text.lastIndexOf("\n", c - 1) + 1;
-      let space = 0;
-      for (let i = c - 1; i >= floor && !space; i--) if (WHITESPACE.test(text[i])) space = i + 1;
-      c = outsideValues(text, line > floor ? line : space || c);
+    const floor = Math.max(0, at - REACH);
+    // The values a scrub of the whole text matches, in order, up to the one across at.
+    const spans: [number, number][] = [];
+    if (pattern) {
+      pattern.lastIndex = 0;
+      for (let m = pattern.exec(text); m && m.index < at; m = pattern.exec(text))
+        if (m.index + m[0].length > floor) spans.push([m.index, m.index + m[0].length]);
     }
+    /** The last cut in (floor, at] after a character that passes, outside every value; 0 when there is none. */
+    const after = (passes: (ch: string) => boolean): number => {
+      let s = spans.length - 1;
+      for (let i = at - 1; i >= floor; i--) {
+        while (s >= 0 && spans[s][0] > i) s--;
+        // A cut at i + 1 inside a value: the next one to try is at its start.
+        if (s >= 0 && spans[s][1] > i + 1) i = spans[s][0];
+        else if (passes(text[i])) return i + 1;
+      }
+      return 0;
+    };
+    const last = spans.at(-1);
+    const c = after((ch) => ch === "\n") || after((ch) => WHITESPACE.test(ch)) || (last && last[1] > at ? last[0] : at);
     // A cut between the two halves of a character would write neither.
     const code = text.charCodeAt(c - 1);
     return code >= 0xd800 && code <= 0xdbff ? c - 1 : c;

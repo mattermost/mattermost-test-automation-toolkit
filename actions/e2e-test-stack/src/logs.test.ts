@@ -600,6 +600,9 @@ test("a cut falls after a line break or whitespace, never inside a secret, an AR
   assert.equal(s.cut(multi, multi.indexOf("\n") + 1), 2, "inside a multi-line secret: back to before it");
   assert.equal(s.cut("zzzzsecret-valuezz", 8), 4, "no whitespace: back to the secret's start");
   assert.equal(s.cut("zz\u{1F600}zz", 3), 2, "never between a character's halves");
+  const spaced = scrubber(["pw a"]);
+  assert.equal(spaced.cut("x pw apw apw a", 14), 2, "back past values that hold whitespace, to the one before them");
+  assert.equal(spaced.cut("pw apw apw a", 10), 8, "no whitespace outside them: back to the start of the one across");
   assert.equal(s.hold, "line one\nline two".length);
 });
 
@@ -619,6 +622,21 @@ test("a long log with no line breaks keeps every secret out, wherever the blocks
   const saved = readFileSync(servers(h)[0].path, "utf8");
   assert.ok(!saved.includes("admin-pw") && !saved.includes("pw-0"));
   assert.equal(saved, "z***".repeat(300_000));
+});
+
+test("a log that repeats a secret holding whitespace streams in one pass per block", { timeout: 10_000 }, async () => {
+  // Every whitespace sits inside a secret, so no cut can fall after one.
+  const body = "pw a".repeat(600_000);
+  const bytes = new TextEncoder().encode(body);
+  const stream = new ReadableStream({
+    start(c) {
+      for (let at = 0; at < bytes.length; at += 65536) c.enqueue(bytes.slice(at, at + 65536));
+      c.close();
+    },
+  });
+  const path = file("repeated/server-0.log");
+  await downloadTo(async () => new Response(stream), "https://logs.example/0", path, scrubber(["pw a"]));
+  assert.equal(readFileSync(path, "utf8"), "***".repeat(600_000));
 });
 
 test("a log file that cannot be made cancels the download's body", async () => {

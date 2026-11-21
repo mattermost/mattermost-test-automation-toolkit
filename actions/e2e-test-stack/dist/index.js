@@ -32406,23 +32406,25 @@ var scrubber = (values) => {
   const sorted = [...new Set(values)].filter(Boolean).sort((a8, b8) => b8.length - a8.length);
   const pattern = sorted.length ? new RegExp(sorted.map((v2) => v2.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g") : void 0;
   const scrub = (text4) => redactArns(pattern ? text4.replace(pattern, "***") : text4);
-  const outsideValues = (text4, at2) => {
-    if (!pattern) return at2;
-    pattern.lastIndex = 0;
-    for (let m5 = pattern.exec(text4); m5 && m5.index < at2; m5 = pattern.exec(text4))
-      if (m5.index + m5[0].length > at2) return m5.index;
-    return at2;
-  };
   const cut = (text4, at2) => {
-    let c8 = at2;
-    for (let prev = -1; c8 !== prev; ) {
-      prev = c8;
-      const floor = Math.max(0, c8 - REACH);
-      const line = text4.lastIndexOf("\n", c8 - 1) + 1;
-      let space = 0;
-      for (let i8 = c8 - 1; i8 >= floor && !space; i8--) if (WHITESPACE.test(text4[i8])) space = i8 + 1;
-      c8 = outsideValues(text4, line > floor ? line : space || c8);
+    const floor = Math.max(0, at2 - REACH);
+    const spans = [];
+    if (pattern) {
+      pattern.lastIndex = 0;
+      for (let m5 = pattern.exec(text4); m5 && m5.index < at2; m5 = pattern.exec(text4))
+        if (m5.index + m5[0].length > floor) spans.push([m5.index, m5.index + m5[0].length]);
     }
+    const after = (passes) => {
+      let s3 = spans.length - 1;
+      for (let i8 = at2 - 1; i8 >= floor; i8--) {
+        while (s3 >= 0 && spans[s3][0] > i8) s3--;
+        if (s3 >= 0 && spans[s3][1] > i8 + 1) i8 = spans[s3][0];
+        else if (passes(text4[i8])) return i8 + 1;
+      }
+      return 0;
+    };
+    const last = spans.at(-1);
+    const c8 = after((ch) => ch === "\n") || after((ch) => WHITESPACE.test(ch)) || (last && last[1] > at2 ? last[0] : at2);
     const code = text4.charCodeAt(c8 - 1);
     return code >= 55296 && code <= 56319 ? c8 - 1 : c8;
   };
