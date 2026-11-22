@@ -21,10 +21,13 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
 2. **Context:** `ctx.py <pr> [--batch N]`. Quote its batch line. `skipped.log` lists every file not hunted; mention the
    deferred batches in the report and hunt them only if the user asks.
 3. **Hunters:** `build_requests.py <pr> hunters`, then dispatch `A/request.json` and `B/request.json` in parallel.
-   Both also get `prompts/strategy_x.md` (Mode A: S1 sibling guards, S2 adversarial callers and props; Mode B: S3
+   Both also get `prompts/strategy_x.md` (Mode A: S1 sibling guards, S2 adversarial callers and props, S4 existing-data compatibility; Mode B: S3
    merge-base differential) and the context it reads: `neighbors_same_file` (unchanged functions near the change, from
    the same file, topped up from the same directory) and `changed_functions_base_source`. Strengthen and repair rounds
    get the context but not `strategy_x.md`; mutant planters get neither.
+   Mode A's reference models come from base code and callers, never from the PR description; Mode B treats the
+   description as a claim to test, and adds a caller-side "claim vs caller contract" test where a claim changes
+   behaviour callers relied on.
    Mode A also gets the `RELIABILITY.md` rules this diff triggers; Mode B and mutant planters never do. Each goes
    to a fresh Agent with no messaging/MCP tools, prompted with `dispatch.md` (next to this file) and `{REQ}` = the path.
 4. **Run:** `run.py run <pr> A` and `run.py run <pr> B`.
@@ -32,19 +35,27 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      `<tag>/request.repair.json` to a fresh agent, rerun. Still broken = report the hunter as failed.
    - `INFRA_ERROR` (exit 2): fix the environment and rerun. Never report it as "no findings".
    - A `FLAKY` test is reported as flaky. Never retry it, add sleeps, or raise `-count` to make it pass.
-   - Only with `HUNT_FUZZ=1` (set before step 3, so Mode A is asked for `FuzzHuntA_` targets): `run.py fuzz <pr> A`.
-     Each pure target is fuzzed for `HUNT_FUZZ_TIME` (default 60s). A failure is not a finding: its shrunk input is
-     frozen into `TestHuntA_<Name>_Fuzz<hash>` in `A/response.json`, so rerun `run.py run <pr> A` before going on.
-     Stateful targets (`Setup(`, store, network) are skipped by the script.
+   - Fuzzing runs inside `run.py run <pr> A` when Mode A wrote `FuzzHuntA_` targets (pure Go functions only). A failing
+     input is shrunk and frozen into `TestHuntA_<Name>_Fuzz<hash>` in `A/response.json`, then vetted 3/3 like any test.
+     `HUNT_FUZZ=0` disables it; `HUNT_FUZZ_TIME` (default 60s) sets `-fuzztime`. `run.py fuzz <pr> A` stays as a manual command.
    - Then `run.py cover <pr> A`: each Mode A test runs alone with coverage (no `-race`). A test that reaches none of the
      PR's changed lines is `VACUOUS`: it is listed as dropped and kills no mutant. A `VACUOUS` test that failed 3/3 is
      still vetted in step 5. `UNKNOWN` (no profile) is never dropped. Mode B is not covered: its S3 tests stay off the
      changed lines on purpose.
+   - Then `old_tests.py <pr>` (no model): old tests on new code, now also covering `storetest/*.go`, with per-function
+     salvage; generated mock layers are skipped. `OLD_TEST_BREAKS` = the PR had to change that test to pass.
+     `OLD_TEST_SOMETIMES_BREAKS` = fails some head runs but passes 3/3 on the merge-base. Both are behaviour changes, not
+     yet bugs: step 7 sets them against the PR description. `OLD_TEST_UNCOMPILABLE` (the head API no longer fits the old
+     test) and `PRE_EXISTING` are listed, not reported as findings.
+   - Then `pr_tests.py <pr>` (no model): the PR's own added or edited Go tests run 3x with
+     `ENABLE_FULLY_PARALLEL_TESTS=true`. Verdicts: `PR_TEST_FAILS_UNDER_CI`, `PR_TEST_FAILS`, `FLAKY`, `PASS`.
 5. **Vet every `FAIL_3_OF_3`:**
    - Root-cause it with a throwaway diagnostic test, then delete it (`run.py` refuses to run on a dirty worktree).
    - `lessons.py match <scratch>/hunt<pr>/ctx.json` lists known false positives. If it is one, drop it.
-   - `run.py base <pr> <tag>` gives `NEW_PR_BUG`, `PRE_EXISTING`, `BASE_UNCOMPILABLE` or `BASE_FAILS_DIFFERENTLY`
-     (decide those from the diff, as for `NOT_RUN_ON_BASE`); `NOT_A_HEAD_FAILURE` means there is nothing to vet.
+   - `run.py base <pr> <tag>` gives `NEW_PR_BUG`, `PRE_EXISTING`, `NEW_API`, `BASE_FAILS_DIFFERENTLY`
+     (decide that one from the diff, as for `NOT_RUN_ON_BASE`). `NEW_API` = fails 3/3 on head and cannot compile on base
+     because it calls an API the PR adds: root-cause it, it is not a bug by itself. Compile failures are salvaged per test,
+     not per file; `NOT_A_HEAD_FAILURE` means there is nothing to vet.
    - Confirm a real caller (HTTP, websocket, plugin API, UI) reaches the input. If none does, it is a caller-unreachable nit.
    - A newly vetted false-positive pattern: `lessons.py add '<json>'`. Hunters see it once it is merged to the base
      branch; until then it stays in the working copy without blocking the trust gate.
@@ -59,10 +70,18 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      Unreached lines alone never start a strengthen round.
    - Always also run `run.py mutants <pr> PR` (a PR without tests in the hunted packages scores every mutant `SURVIVED`).
 7. **Report in chat only:**
-   - **New PR Bug** / **Pre-Existing Bug** / **Caller-unreachable nit**, each with its exact test command,
-     counterexample, root cause `file:line` and the caller that reaches it.
+   - **New PR Bug** (`NEW_PR_BUG`, root-caused) / **Pre-Existing Bug** / **Caller-unreachable nit**, each with its exact
+     test command, counterexample, root cause `file:line` and the caller that reaches it.
+   - **Behaviour change the PR's tests absorbed**: each `OLD_TEST_BREAKS` / `OLD_TEST_SOMETIMES_BREAKS` with its failure
+     text from `old_tests.messages.json`. If the PR description does not announce that change, mark it **unexplained**
+     (that is how a bug in the PR's intent shows up, which hunters cannot see). Mark it **breaks existing data/callers**
+     even when announced.
+   - **PR tests failing under CI flags**: each `PR_TEST_FAILS_UNDER_CI` / `PR_TEST_FAILS` / `FLAKY` from `pr_tests.py`.
+   - **New-API failures to root-cause**: each `NEW_API`.
+   - **UI/API base-vs-head diffs**: `/verify` compare runs (`verify_ui.mjs plan.json --compare <base_url>`, capture steps,
+     verdict `SAME` / `DIFF` / `REGRESSION`). A `DIFF` the PR does not explain is a finding. Skip when the PR has no UI/API surface.
    - One line per dropped artifact.
-   - Mutation table M1-M5 × (A, A2, PR), and under it "changed lines reached: X/Y" for A and A2. That is a floor, not
-     a quality score: never report it as a percentage.
+   - **Mutation table** M1-M5 x (A, A2, PR), the proof that the kept tests catch bugs, and under it "changed lines
+     reached: X/Y" for A and A2. That is a floor, not a quality score: never report it as a percentage.
    - If there is a New PR Bug, offer a review-comment draft. Never post it.
    - If nothing failed 3/3, say so plainly.

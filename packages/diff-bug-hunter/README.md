@@ -19,18 +19,34 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
   - **S2 adversarial callers (Mode A):** every role and session type for Go; omitted optional props, or required ones
     an untyped caller can skip, for React.
   - **S3 differential (Mode B):** inputs that reach no changed line must behave as the merge-base version did.
+  - **S4 existing-data compatibility (Mode A):** inputs and records valid and readable on the merge-base (old
+    usernames, existing custom emoji names, NULL or legacy columns, sanitized copies merged into full objects,
+    previously non-secret config) must stay valid and readable on head. Each test cites the base code that made the
+    input valid.
+- **Oracle rule:** the PR description is a claim to test, never the oracle. Mode A's reference model comes from base
+  code and callers. When a claim changes behaviour callers already relied on, Mode B also writes the caller-side test of
+  the old contract (`source`: "claim vs caller contract").
 - **Property shapes (Mode A):** round-trip, idempotence, no-panic, monotonic, and properties lifted from the PR's own
   example tests (`pr_tests_diff` in `ctx.json`). One of the 3 required citations may be a doc comment or a PR test.
 - **Changed-line coverage:** `run.py cover` runs each Mode A test alone with coverage. A test that reaches none of
   the changed lines is `VACUOUS`, dropped from the report and from mutant kills; the report shows "X/Y reached".
-- **Go fuzzing (opt-in, `HUNT_FUZZ=1`):** pure `FuzzHuntA_` targets are fuzzed briefly. A failing input is shrunk and
-  frozen into a deterministic `TestHuntA_*_Fuzz<hash>` test that is vetted 3/3 like any other.
+- **Go fuzzing (default on):** pure `FuzzHuntA_` targets are fuzzed inside `run.py run <pr> A`. A failing input is
+  shrunk and frozen into a deterministic `TestHuntA_*_Fuzz<hash>` test that is vetted 3/3 like any other.
+  `HUNT_FUZZ=0` disables it; `run.py fuzz` stays as a manual command.
+- **Old tests on new code (no model):** `old_tests.py` runs the merge-base version of every existing Go or Jest test the
+  PR edits or deletes (including `storetest/*.go`, salvaged per function; generated mock layers are skipped) on the PR
+  head. `OLD_TEST_BREAKS` means the PR had to change that test to pass; `OLD_TEST_SOMETIMES_BREAKS` fails some head runs
+  and passes 3/3 on base. Each is a behaviour change the report sets against the PR description: "unexplained" if
+  not announced, "breaks existing data/callers" even if announced.
+- **PR's own tests (no model):** `pr_tests.py` runs the Go tests the PR adds or edits 3x with
+  `ENABLE_FULLY_PARALLEL_TESTS=true`: `PR_TEST_FAILS_UNDER_CI`, `PR_TEST_FAILS`, `FLAKY` or `PASS`.
 - **Vetting:** each failure must reproduce 3/3. It is root-caused against `lessons.jsonl` (known false positives),
-  run on the merge-base (**New PR Bug** vs **Pre-Existing Bug**), and checked for caller reachability.
+  run on the merge-base (**New PR Bug** vs **Pre-Existing Bug**; `NEW_API` = fails 3/3 on head and cannot compile
+  on base because it calls an API the PR adds: root-cause it, not a bug by itself; compile failures are salvaged per test), and checked for caller reachability.
 - **Mutation gate:**
   - 3 visible plus 2 held-out mutants, each compile-checked (`go test -c`, single-file Babel parse).
   - One strengthen round if a visible mutant survives.
-  - The PR's own tests are scored for comparison.
+  - The PR's own tests are scored for comparison. The mutation table is the proof that the kept tests catch bugs.
 - **Mattermost invariants:** `RELIABILITY.md` holds 10 diff-triggered rules (guest isolation, cross-team and private
   channel boundaries, ClientConfig hash, WebSocket payloads, mention/HTML/NUL sanitization, store atomicity,
   migrations, concurrency, React async forms, selector memoization). Only rules whose path globs or diff regex match
@@ -100,7 +116,7 @@ locally, `scripts/start_pg.sh` starts a throwaway cluster.
 | `HUNT_REPO` | `mattermost/mattermost` | repository the PR belongs to |
 | `HUNT_NODE_BIN` | node on `PATH` | Node bin dir for Jest runs |
 | `HUNT_TRUSTED_REF` | merge-base with `origin/main` | where rules are read from (`worktree` = disk) |
-| `HUNT_FUZZ` | off | `1` asks Mode A for Go fuzz targets and enables `run.py fuzz` |
+| `HUNT_FUZZ` | on | `0` disables Go fuzzing in `run.py run <pr> A` |
 | `HUNT_FUZZ_TIME` | `60s` | `-fuzztime` per fuzz target |
 
 ## /verify
@@ -136,6 +152,8 @@ validated strictly (one action per step, one locator kind, known keys only) befo
   requests settle, so a late 500 is not missed. Exit codes: 0 PASS, 1 FAIL, 2 INVALID_PLAN / INFRA_ERROR.
 - **Deterministic oracle:** `expect` must hold at least one DOM check (`visible`, `text` + `contains`,
   `count` + `min`) or an `/api/v4/` read (`status`, `json_has`).
+- **Compare (base vs head):** `verify_ui.mjs plan.json --compare <base_url>` runs the plan's capture steps against both
+  servers. Verdicts `SAME`, `DIFF` or `REGRESSION`; a `DIFF` the PR does not explain is a finding.
 - **Freeze:** `--freeze specs/verify/<name>.spec.ts` turns a passing plan into a `@playwright/test` spec with the same oracle (allowed
   origins and the same proxy, settling, viewport, timeouts, `json_has` matching), so the check reruns in CI with no
   model, and it passes `tsc --strict`. It checks the server the run checked; set `VERIFY_REPLAY_BASE_URL` to point it
@@ -262,7 +280,7 @@ jobs:
   lessons.jsonl      append-only vetted false-positive patterns (top 5 injected into hunter prompts)
   prompts/           generic Mode A/B, language rules, mutant and strengthen prompts
   scripts/           trusted.py, prepare.py, ctx.py (+ prefilter.py), build_requests.py, reliability.py, run.py,
-                     lessons.py, mine_rules.py, eval_reverts.py, start_pg.sh
+                     old_tests.py, pr_tests.py, lessons.py, mine_rules.py, eval_reverts.py, start_pg.sh
 .claude/skills/verify/
   SKILL.md           plan, run, iterate (at most 3 runs), report
   scripts/verify_ui.mjs

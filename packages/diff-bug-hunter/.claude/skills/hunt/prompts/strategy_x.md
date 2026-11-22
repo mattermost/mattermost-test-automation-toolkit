@@ -1,4 +1,4 @@
-Strategies. Mode A applies S1 and S2; Mode B applies S3. Start each such test's `source` with its tag (S1, S2 or S3),
+Strategies. Mode A applies S1, S2 and S4; Mode B applies S3. Start each such test's `source` with its tag (S1, S2, S3 or S4),
 then the evidence your mode already requires.
 S1 Sibling guards (Mode A). `neighbors_same_file` holds unchanged functions near the PR's code: from the same file
 (`scope: same_file`) or, when that file has too few, from the same directory (`scope: same_dir`); `near` lists the
@@ -16,3 +16,12 @@ required prop that no shown caller can omit.
 S3 Unchanged-behaviour differential (Mode B). `changed_functions_base_source` holds the merge-base version of each
 function the PR changed or removed. For inputs that reach none of the PR's changed lines, assert the behaviour the base
 version has; cite the base `file:line` instead of a quoted claim. Skip any input whose path runs through a changed line.
+S4 Existing-data compatibility (Mode A). For each changed function, take inputs and records that were valid and readable
+on the merge-base (`changed_functions_base_source`, `callers`, fixtures and migrations in context) and assert they stay
+valid and readable on head with the same meaning. Look for: values the old validator accepted (existing usernames,
+names of existing custom emoji, IDs and slugs), partially populated or sanitized objects merged into full ones (a copy
+missing fields must not overwrite the full object), NULL or legacy column values scanned into non-pointer fields, config
+values that were non-secret or defined before the PR, and old enum, role or JSON shapes. Each such test cites the base
+`file:line` that made the input valid (it counts toward the 3 required citations) plus the callers or stored data that
+still carry it. A new rule that rejects or rewrites data the base accepted is a finding even if the PR description
+promises it: the stored data cannot be changed by the PR.
