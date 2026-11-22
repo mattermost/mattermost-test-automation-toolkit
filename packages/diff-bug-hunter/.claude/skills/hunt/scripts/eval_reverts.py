@@ -4,7 +4,7 @@
 """Score /hunt against real history: commits that were later reverted (known bugs) and clean commits (controls).
 
 usage: eval_reverts.py <manifest.json> [--repo <git dir>] [--out <dir>] [--dispatch '<cmd>'] [--only <id> ...]
-                       [--signals hunters,old,pr] [--controls <controls_extra.json>]
+                       [--signals hunters,diff,old,pr] [--controls <controls_extra.json>]
 
 Manifest (paths are relative to the manifest file):
   {"repo": "<local clone>",            (--repo overrides it; a case may name its own "repo")
@@ -84,19 +84,20 @@ from hunt_common import InfraError, git, require_disk, write_json
 CASE_KEYS = ("id", "bug_sha", "fix_sha", "area", "bug", "source")
 CONTROL_KEYS = ("id", "sha", "area")
 DEFAULT_THRESHOLDS = {"raw_recall_min": 0.0, "vetted_recall_min": 0.0, "fp_rate_max": 1.0}
-SIGNALS = ("hunters", "old", "pr")
+SIGNALS = ("hunters", "diff", "old", "pr")
 # per-entry signal flags: (name, results key, verdicts that fire it, the --signals group it belongs to)
 FLAGS: tuple[tuple[str, str, frozenset[str], str], ...] = (
     ("hunters_vetted", "base", frozenset({"NEW_PR_BUG"}), "hunters"),
     ("hunters_new_api", "base", frozenset({"NEW_API"}), "hunters"),
+    ("diff", "diff", frozenset({"DIFF"}), "diff"),
     ("old", "old", frozenset({"OLD_TEST_BREAKS"}), "old"),
     ("old_sometimes", "old", frozenset({"OLD_TEST_SOMETIMES_BREAKS"}), "old"),
     ("pr_ci", "pr", frozenset({"PR_TEST_FAILS_UNDER_CI"}), "pr"),
     ("pr_fails", "pr", frozenset({"PR_TEST_FAILS"}), "pr"),
 )
 # metric prefix per flag: hunters_vetted keeps its historical names (vetted_recall, fp_rate)
-METRIC_NAMES = {"hunters_new_api": "new_api", "old": "old", "old_sometimes": "old_sometimes", "pr_ci": "pr_ci",
-                "pr_fails": "pr_fails"}
+METRIC_NAMES = {"hunters_new_api": "new_api", "diff": "diff", "old": "old", "old_sometimes": "old_sometimes",
+                "pr_ci": "pr_ci", "pr_fails": "pr_fails"}
 # signals that count as a finding on their own (combined recall / FP)
 FINDINGS = ("hunters_vetted", "old", "old_sometimes", "pr_ci")
 
@@ -216,6 +217,27 @@ def hunt_tag(num: int, hdir: Path, state: dict[str, Any], tag: str, batch: int, 
     return row
 
 
+def hunt_diff(num: int, hdir: Path, state: dict[str, Any], batch: int, dispatch_cmd: str | None) -> dict[str, Any]:
+    """Mode D differential recorders for one batch, with the same 1-round repair and per-hunter isolation."""
+    row: dict[str, Any] = {"batch": batch, "hunter": "D"}
+    try:
+        try:
+            row["diff"] = run.cmd_diff(hdir, state, "D")
+        except run.CompileError as err:
+            if not dispatch_cmd:
+                raise
+            row["repaired"] = True
+            _repair(num, hdir, "D", err, dispatch_cmd)
+            row["diff"] = run.cmd_diff(hdir, state, "D")
+    except run.CompileError as err:
+        row.pop("diff", None)
+        row["compile_error"] = str(err)[-400:]
+    except InfraError as err:
+        row.pop("diff", None)
+        row["error"] = str(err)[-400:]
+    return row
+
+
 def old_signal(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
     try:
         return {"hunter": "OLD", "old": old_tests.cmd_old(hdir, state)["tests"]}
@@ -253,16 +275,23 @@ def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None,
     while batch <= batches:
         state = ctx.build(str(num), batch, prep, meta)
         batches = state["batches"]
-        if "hunters" in signals:
+        if "hunters" in signals or "diff" in signals:
             if e.get("responses") and batch == 1:
                 shutil.copytree(e["responses"], hdir, dirs_exist_ok=True)
-            elif dispatch_cmd:
-                build_requests.main(str(num), "hunters")  # writes <hdir>/A and B request.json (hunt_dir(num) == hdir)
+            if "hunters" in signals:
+                if not (e.get("responses") and batch == 1) and dispatch_cmd:
+                    build_requests.main(str(num), "hunters")  # writes <hdir>/A and B request.json
+                    for tag in ("A", "B"):
+                        dispatch(dispatch_cmd, hdir / tag / "request.json")
                 for tag in ("A", "B"):
-                    dispatch(dispatch_cmd, hdir / tag / "request.json")
-            for tag in ("A", "B"):
-                if (hdir / tag / "response.json").exists():
-                    results.append(hunt_tag(num, hdir, state, tag, batch, dispatch_cmd))
+                    if (hdir / tag / "response.json").exists():
+                        results.append(hunt_tag(num, hdir, state, tag, batch, dispatch_cmd))
+            if "diff" in signals:
+                if not (e.get("responses") and batch == 1) and dispatch_cmd:
+                    build_requests.main(str(num), "diff")
+                    dispatch(dispatch_cmd, hdir / "D" / "request.json")
+                if (hdir / "D" / "response.json").exists():
+                    results.append(hunt_diff(num, hdir, state, batch, dispatch_cmd))
         else:
             batches = 1  # the whole-commit signals need only the state, not one per batch
         batch += 1
@@ -338,10 +367,10 @@ def scorecard(manifest: dict[str, Any], hunted: dict[str, dict[str, Any]],
 
 def render(card: dict[str, Any]) -> str:
     signals = card.get("signals", list(SIGNALS))
-    cols = (("raw", "hunters"), ("vetted", "hunters"), ("new_api", "hunters"), ("old", "old"), ("old~", "old"),
-            ("pr_ci", "pr"))
-    keys = {"raw": "raw", "vetted": "hunters_vetted", "new_api": "hunters_new_api", "old": "old", "old~": "old_sometimes",
-            "pr_ci": "pr_ci"}
+    cols = (("raw", "hunters"), ("vetted", "hunters"), ("new_api", "hunters"), ("diff", "diff"), ("old", "old"),
+            ("old~", "old"), ("pr_ci", "pr"))
+    keys = {"raw": "raw", "vetted": "hunters_vetted", "new_api": "hunters_new_api", "diff": "diff", "old": "old",
+            "old~": "old_sometimes", "pr_ci": "pr_ci"}
 
     def cell(r: dict[str, Any], col: str, group: str) -> str:
         return "-" if group not in signals else ("yes" if r.get(keys[col]) else "no")
@@ -369,6 +398,7 @@ def render(card: dict[str, Any]) -> str:
                  f"{'ok' if c['fp_rate'] else 'ABOVE'}   (raw, before vetting: {m['raw_fp_rate']:.2f})")
     lines.append(f"{'signal':18} recall   fp-rate  ({card.get('cases', '?')} cases, {card.get('controls', '?')} controls)")
     table = (("hunters vetted", "vetted", "hunters"), ("hunters new-api", "new_api", "hunters"),
+             ("diff (Mode D)", "diff", "diff"),
              ("old tests", "old", "old"), ("old tests ~", "old_sometimes", "old"), ("pr tests (ci)", "pr_ci", "pr"),
              ("pr tests (fail)", "pr_fails", "pr"),
              ("combined (any)", "combined", None))
@@ -390,7 +420,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--out", type=Path)
     ap.add_argument("--dispatch")
     ap.add_argument("--only", nargs="*")
-    ap.add_argument("--signals", default=",".join(SIGNALS), help="comma list of hunters,old,pr (default all)")
+    ap.add_argument("--signals", default=",".join(SIGNALS), help="comma list of hunters,diff,old,pr (default all)")
     ap.add_argument("--controls", type=Path, help="extra controls (mine_controls.py output), appended to the manifest's")
     a = ap.parse_args(argv[1:])
     signals = tuple(x for x in SIGNALS if x in {w.strip() for w in a.signals.split(",")})

@@ -1,18 +1,18 @@
 ---
 name: hunt
-description: Blind Mode A (caller invariants) + Mode B (PR-promise falsifier) bug hunt on one mattermost/mattermost PR, with merge-base vetting and an opt-in (--mutants) compile-verified mutation gate. Use when asked to hunt, bug-hunt or falsify a Mattermost PR.
-argument-hint: <pr_number> [--batch N] [--mutants]
+description: Blind Mode A (caller invariants), Mode B (PR/release-promise falsifier) and Mode D (differential recorders) bug hunt on one mattermost/mattermost PR or release/commit range, with merge-base vetting and an opt-in (--mutants) compile-verified mutation gate. Use when asked to hunt, bug-hunt or falsify a Mattermost PR or release diff.
+argument-hint: <pr_number | base...head> [--batch N] [--mutants]
 ---
 
-Hunt PR #$ARGUMENTS. Scripts are in `scripts/` next to this file; run them with `cd <this dir>/scripts && python3 <script>`.
-`HUNT_SCRATCH` (default `<tmp>/hunt`) holds clones, worktrees and `hunt<pr>/`. Model output, hunter tests and mutants
+Hunt `$ARGUMENTS`. Target `<target>` is either a PR number (`40260`) or a git branch/tag/commit range (`release-11...release-12`, `release-12.0.0-rc1...release-12.1.0-rc3`, `base..head`; strip spaces around `..`/`...` so it is one shell argument). Scripts are in `scripts/` next to this file; run them with `cd <this dir>/scripts && python3 <script>`.
+`HUNT_SCRATCH` (default `<tmp>/hunt`) holds clones, worktrees and per-target `hunt<key>/` state. Model output, hunter tests and mutants
 are written only by `scripts/` (and by the agents they dispatch); you never edit them. The one file you write is a
 throwaway diagnostic test in step 5, deleted before the next script runs. Nothing is posted to GitHub and nothing is
-committed. Run one script at a time per PR: `prepare.py`, `ctx.py` and every `run.py` command share the worktrees
+committed. Run one script at a time per target: `prepare.py`, `ctx.py` and every `run.py` command share the worktrees
 and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the first is running (wait for a background
 `run.py` to finish first). Run slow suites in the background and never kill one: an interrupted run is cleaned up by
-`prepare.py <pr> --fresh`. Wait for a background command or agent through its completion notification. Never wait with
-`ScheduleWakeup`, `CronCreate` or `/loop`: a wakeup re-sends `/hunt <pr>`, and the hunt starts again from step 0.
+`prepare.py <target> --fresh`. Wait for a background command or agent through its completion notification. Never wait with
+`ScheduleWakeup`, `CronCreate` or `/loop`: a wakeup re-sends `/hunt <target>`, and the hunt starts again from step 0.
 
 0. **Trust gate:** `trusted.py check`. Rules (`SKILL.md`, `lessons.jsonl`, `RELIABILITY.md`, `prompts/`) come from
    the base branch, never the PR head. If the check fails, stop: a change to this skill cannot take part in its own hunt.

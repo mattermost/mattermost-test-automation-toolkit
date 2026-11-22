@@ -155,7 +155,7 @@ def test_eval_scores_each_signal_from_the_stubbed_checks(tmp_path, monkeypatch, 
     assert (m["vetted_recall"], m["fp_rate"]) == (1.0, 0.0)  # hunters unchanged by the new signals
     assert (m["old_recall"], m["old_sometimes_recall"], m["pr_ci_recall"], m["new_api_recall"]) == (1.0, 1.0, 1.0, 0.0)
     assert (m["old_fp_rate"], m["pr_ci_fp_rate"], m["pr_fails_fp_rate"], m["combined_fp_rate"]) == (0.0, 0.0, 1.0, 0.0)
-    assert card["signals"] == ["hunters", "old", "pr"]
+    assert card["signals"] == ["hunters", "diff", "old", "pr"]
     assert "pr tests (ci)" in capsys.readouterr().out
 
 
@@ -420,3 +420,39 @@ def test_mine_controls_never_picks_a_reverted_ticket_sharing_or_foreign_commit(t
     picked, _ = mine_controls.mine(repo, {**manifest, "controls": [{"id": "c", "sha": sha["merge_side"], "area": "a"}]}, 20)
     assert sha["merge_side"] not in {c["sha"] for c in picked}
     capsys.readouterr()
+
+
+def test_eval_scores_mode_d_diff_signal_from_responses_and_dispatch(tmp_path, monkeypatch, capsys):
+    # Case = diff_go (behaviour changes on head -> DIFF), control = diff_same (identical -> SAME).
+    bug_repo, ctl_repo = tmp_path / "diff_bug", tmp_path / "diff_same"
+    for r, name, msg in ((bug_repo, "diff_go", "Adjust calc behaviour"), (ctl_repo, "diff_same", "Refactor calc")):
+        r.mkdir()
+        _git(r, "init", "-q", "-b", "master")
+        for step in ("base", "head"):
+            for f in (FIX / name / step).rglob("*"):
+                if f.is_file():
+                    dst = r / f.relative_to(FIX / name / step)
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(f.read_bytes())
+            _git(r, "add", "-A")
+            _git(r, "commit", "-qm", "base" if step == "base" else msg)
+    bug = _git(bug_repo, "rev-parse", "HEAD")
+    _git(bug_repo, "revert", "--no-edit", "HEAD")
+    manifest = {
+        "cases": [{"id": "diff-case", "repo": str(bug_repo), "bug_sha": bug, "fix_sha": _git(bug_repo, "rev-parse", "HEAD"),
+                   "area": "calc", "bug": "Changed calc output", "source": "self-test fixture",
+                   "responses": str(FIX / "diff_go" / "responses")}],
+        "controls": [{"id": "diff-ctl", "repo": str(ctl_repo), "sha": _git(ctl_repo, "rev-parse", "HEAD"),
+                      "area": "calc", "responses": str(FIX / "diff_same" / "responses")}],
+    }
+    mpath = tmp_path / "manifest.json"
+    mpath.write_text(json.dumps(manifest))
+    code = eval_reverts.main(["eval_reverts.py", str(mpath), "--out", str(tmp_path / "out"), "--signals", "diff"])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    card = _card(tmp_path)
+    assert card["signals"] == ["diff"]
+    assert card["metrics"]["diff_recall"] == 1.0 and card["metrics"]["diff_fp_rate"] == 0.0
+    assert "diff (Mode D)" in out
+    rows = {r["id"]: r for r in card["rows"]}
+    assert rows["diff-case"]["diff"] is True and rows["diff-ctl"]["diff"] is False

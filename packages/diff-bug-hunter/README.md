@@ -2,8 +2,9 @@
 
 Two Claude Code skills that find bugs cheaply and only report what a deterministic check proves:
 
-- **`/hunt <pr_number>`** looks for new bugs in a `mattermost/mattermost` pull request. It reports a bug only when a
-  test fails deterministically on the unmodified PR code with a concrete counterexample.
+- **`/hunt <pr_number | base...head>`** looks for new bugs in a `mattermost/mattermost` pull request or release/commit
+  range (e.g. `release-11...release-12` or `release-12.0.0-rc1...release-12.1.0-rc3`). It reports a bug only when a
+  test fails deterministically on the unmodified head code with a concrete counterexample.
 - **`/verify <what to check>`** smoke-tests a UI change against a running server with a bounded, text-only Playwright
   plan. A passing plan can be frozen into a plain Playwright test that reruns in CI with no model.
 
@@ -67,7 +68,8 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
 
 `scripts/eval_reverts.py eval/revert_cases.json --repo <full mattermost clone> --dispatch '<cmd>'` hunts commits that
 Mattermost later reverted, plus size-matched clean commits from the same area, exactly as it hunts a PR (head = the
-commit, base = its parent, every batch, Mode A and B, 3/3 runs and base vetting). Hunters see only the commit's own
+commit, base = its parent, every batch, Modes A, B and D, 3/3 runs, base vetting, `old_tests` and `pr_tests`; select
+a subset with `--signals hunters,diff,old,pr`). Hunters see only the commit's own
 message; the ground-truth `bug` sentence, quoted from the revert PR, is never shown to them. `--dispatch` runs
 `<cmd> <request.json>` for each hunter request (a headless Claude Code call that follows `dispatch.md`); an entry may
 instead name recorded `responses`. The scorecard reports raw recall (any test fails 3/3), post-vetting recall
@@ -229,7 +231,7 @@ those `node_modules` unless the PR changes `package-lock.json`.
 
 ## CI integration
 
-Package self-test: 245 tests (pytest), run by this repository's `.github/workflows/diff-bug-hunter.yml` when
+Package self-test: 249 tests (pytest), run by this repository's `.github/workflows/diff-bug-hunter.yml` when
 `packages/diff-bug-hunter/` changes. The /verify tests need the Chromium build that matches the pinned Playwright, installed from the fixture
 directory:
 

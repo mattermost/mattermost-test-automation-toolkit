@@ -194,3 +194,20 @@ def test_up_leaves_e2e_dir_clean_and_down_validates_e2e(tmp_path, monkeypatch, f
     assert pr_server.default_e2e(tmp_path) == e2e
     with pytest.raises(SystemExit):
         pr_server.main(["down", "--e2e"])
+
+
+def test_pr_images_supports_release_ranges(monkeypatch):
+    calls = []
+
+    def fake_gh(path: str):
+        calls.append(path)
+        if "/compare/" in path:
+            return {"merge_base_commit": {"sha": "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+        if "/commits/" in path:
+            return {"sha": "2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(pr_server, "gh_json", fake_gh)
+    imgs = pr_server.pr_images("release-12.0.0-rc1...release-12.1.0-rc3")
+    assert imgs == {"head": f"{pr_server.IMAGE_REPO}:2222222", "base": f"{pr_server.IMAGE_REPO}:1111111"}
+    assert any("release-12.0.0-rc1...release-12.1.0-rc3" in c for c in calls)

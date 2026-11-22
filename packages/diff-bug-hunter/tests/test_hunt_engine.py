@@ -2284,6 +2284,7 @@ def test_eval_reverts_scores_a_real_bug_and_a_clean_control(tmp_path, monkeypatc
     assert code == 0 and "VERDICT: PASS" in out, out
     card = json.loads((tmp_path / "out" / "scorecard.json").read_text())
     assert card["metrics"] == {"raw_recall": 1.0, "vetted_recall": 1.0, "fp_rate": 0.0, "raw_fp_rate": 0.0,
+                               "diff_recall": 0.0, "diff_fp_rate": 0.0,
                                "old_recall": 0.0, "old_fp_rate": 0.0, "combined_recall": 1.0, "combined_fp_rate": 0.0,
                                "new_api_recall": 0.0, "new_api_fp_rate": 0.0, "old_sometimes_recall": 0.0,
                                "old_sometimes_fp_rate": 0.0, "pr_ci_recall": 0.0, "pr_ci_fp_rate": 0.0,
@@ -2674,3 +2675,52 @@ def test_suite_for_handles_symlinked_worktree_path(tmp_path):
         assert suite.go_patterns == {"calc": "^TestHuntA_"}
     finally:
         run.unplace(placed)
+
+
+def test_range_parsing_and_target_keys():
+    assert hunt_common.parse_range("40260") is None
+    assert hunt_common.parse_range("release-11...release-12") == ("release-11", "release-12")
+    assert hunt_common.parse_range("release-12.0.0-rc1 ... release-12.1.0-rc3") == ("release-12.0.0-rc1", "release-12.1.0-rc3")
+    assert hunt_common.parse_range("v11.0.0..v12.0.0") == ("v11.0.0", "v12.0.0")
+    for bad in ("..head", "base..", "..."):
+        with pytest.raises(hunt_common.InfraError, match="invalid range"):
+            hunt_common.parse_range(bad)
+    assert hunt_common.target_key("40260") == "40260"
+    k1 = hunt_common.target_key("release-12.0.0-rc1...release-12.1.0-rc3")
+    k2 = hunt_common.target_key("release-12.0.0-rc1..release-12.1.0-rc3")
+    assert k1 == k2 and "/" not in k1 and " " not in k1
+
+
+def test_prepare_and_ctx_work_on_release_tag_ranges(tmp_path, monkeypatch):
+    # A local git repo with release tags (no GitHub PR / gh API needed): prepare -> ctx -> run -> base end-to-end.
+    repo = tmp_path / "mm"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "release-12")
+    _overlay(FIX / "go_bug" / "base", repo)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base release")
+    _git(repo, "tag", "release-12.0.0-rc1")
+    _overlay(FIX / "go_bug" / "head", repo)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "Clamp upper bound change for rc3")
+    _git(repo, "tag", "release-12.1.0-rc3")
+
+    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
+    monkeypatch.setenv("HUNT_MM", str(repo))
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    monkeypatch.setattr(prepare, "pr_meta", lambda pr: pytest.fail("gh api must not be called for a range"))
+    target = "release-12.0.0-rc1...release-12.1.0-rc3"
+    prepare.prepare(target)
+    hdir = hunt_common.hunt_dir(target)
+    prep = json.loads((hdir / "prepare.json").read_text())
+    assert prep["range"] == ["release-12.0.0-rc1", "release-12.1.0-rc3"]
+    meta = ctx.range_meta(repo, prep["merge_base"], prep["head"], *prep["range"])
+    assert "Clamp upper bound change for rc3" in meta["body"]
+    state = ctx.build(target, 1, prep, meta)
+    c = json.loads((hdir / "ctx.json").read_text())
+    assert c["pr"]["number"] == 0 and c["pr"]["range"] == target
+    shutil.copytree(FIX / "go_bug" / "responses", hdir, dirs_exist_ok=True)
+    assert run.cmd_run(hdir, state, "A") == {"calc::TestHuntA_ClampRangeAndIdentity": "FAIL_3_OF_3"}
+    assert run.cmd_base(hdir, state, "A") == {"calc::TestHuntA_ClampRangeAndIdentity": "NEW_PR_BUG"}
+    with pytest.raises(prepare.AlreadyHunted):
+        prepare.prepare(target)

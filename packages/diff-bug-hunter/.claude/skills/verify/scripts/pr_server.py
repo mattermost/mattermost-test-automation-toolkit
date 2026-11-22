@@ -92,8 +92,17 @@ def gh_json(path: str) -> Any:
     return json.loads(p.stdout)
 
 
-def pr_images(pr: str) -> dict[str, str]:
-    meta = gh_json(f"repos/{REPO}/pulls/{pr}")
+def pr_images(target: str) -> dict[str, str]:
+    """Enterprise image tags for a PR number or a git range (`base..head` / `base...head`)."""
+    for sep in ("...", ".."):
+        if sep in target:
+            base_ref, head_ref = (s.strip() for s in target.split(sep, 1))
+            if not base_ref or not head_ref:
+                raise InfraError(f"invalid range {target!r}: expected <base>..<head> or <base>...<head>")
+            merge_base = gh_json(f"repos/{REPO}/compare/{base_ref}...{head_ref}")["merge_base_commit"]["sha"]
+            head = gh_json(f"repos/{REPO}/commits/{head_ref}")["sha"]
+            return {"head": image_for(head), "base": image_for(merge_base)}
+    meta = gh_json(f"repos/{REPO}/pulls/{target}")
     head = meta["head"]["sha"]
     head_ref = meta["head"].get("label") or head  # owner:branch works for fork PRs as well as same-repo PRs
     merge_base = gh_json(f"repos/{REPO}/compare/{meta['base']['sha']}...{head_ref}")["merge_base_commit"]["sha"]

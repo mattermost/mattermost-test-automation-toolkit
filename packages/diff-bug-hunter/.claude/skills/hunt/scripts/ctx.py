@@ -622,8 +622,12 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> di
         syms |= changed_symbols(f.patch, lang_of(f.path))
     targets = test_targets(wt, files)
     all_changed = sorted({f.path for f in diffs} | set(deleted))
+    pr_info: dict[str, Any] = {"number": int(pr) if str(pr).isdigit() else 0,
+                               "title": meta.get("title", ""), "description": meta.get("body") or ""}
+    if prep.get("range"):
+        pr_info["range"] = f"{prep['range'][0]}...{prep['range'][1]}"
     ctx: dict[str, Any] = {
-        "pr": {"number": int(pr), "title": meta.get("title", ""), "description": meta.get("body") or ""},
+        "pr": pr_info,
         "diff_production_code": "\n".join(patches[f] for f in files),
         "changed_files_head_source": [{"file": f, "source": source_view(wt, f, patches[f])} for f in files],
         "sibling_tests_and_helpers": sibling_tests(wt, files, syms),
@@ -643,16 +647,30 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> di
     return state
 
 
+def range_meta(repo: Path, mb: str, head: str, base_spec: str, head_spec: str) -> dict[str, Any]:
+    """Commit-log summary used in place of PR title/description when hunting a release or commit range."""
+    total = git(repo, "rev-list", "--count", "--no-merges", f"{mb}..{head}")
+    subjects = git(repo, "log", "--oneline", "--no-merges", "-n", "50", f"{mb}..{head}")
+    body = f"Range {base_spec}...{head_spec} ({total} non-merge commit(s)):\n{subjects}"
+    return {"title": f"{base_spec}...{head_spec}", "body": body}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("pr")
     ap.add_argument("--batch", type=int, default=1)
     a = ap.parse_args()
     with hunt_lock(hunt_dir(a.pr), a.pr):  # never rewrite state.json under a running run.py, nor read a half-made prep
-        prep = json.loads((hunt_dir(a.pr) / "prepare.json").read_text())
-        meta = json.loads(sh(["gh", "api", f"repos/{REPO}/pulls/{a.pr}"], Path(".")).stdout)
-        if meta.get("draft"):
-            print(f"note: PR #{a.pr} is a draft")
+        prep_path = hunt_dir(a.pr) / "prepare.json"
+        if not prep_path.exists():
+            raise InfraError(f"{prep_path} missing: run prepare.py first")
+        prep = json.loads(prep_path.read_text())
+        if prep.get("range"):
+            meta = range_meta(Path(prep["repo"]), prep["merge_base"], prep["head"], prep["range"][0], prep["range"][1])
+        else:
+            meta = json.loads(sh(["gh", "api", f"repos/{REPO}/pulls/{a.pr}"], Path(".")).stdout)
+            if meta.get("draft"):
+                print(f"note: PR #{a.pr} is a draft")
         st = build(a.pr, a.batch, prep, meta)
     ctx = json.loads((hunt_dir(a.pr) / "ctx.json").read_text())
     print(f"batch {st['batch']}/{st['batches']}: {len(st['changed'])} files, {len(ctx['callers'])} caller excerpts, "

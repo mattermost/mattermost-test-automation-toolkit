@@ -3,13 +3,13 @@
 # See LICENSE.txt for license information.
 """Step 1: worktrees + infrastructure gate.
 
-usage: prepare.py <pr> [--fresh]
-Creates <scratch>/wt<pr> at the PR head and <scratch>/wt<pr>.base at the merge-base, sets up go.work and webapp
-node_modules, and checks Postgres + Redis when the PR touches stateful server code. Prints INFRA_ERROR and exits 2 on any
-environment failure.
-Preparing again wipes hunt<pr>/. When it already holds hunter responses or verdicts for the PR's current head, that would
+usage: prepare.py <pr | base..head | base...head> [--fresh]
+Creates <scratch>/wt<key> at the PR head (or range head) and <scratch>/wt<key>.base at the merge-base, sets up
+go.work and webapp node_modules, and checks Postgres + Redis when the diff touches stateful server code. Prints
+INFRA_ERROR and exits 2 on any environment failure.
+Preparing again wipes hunt<key>/. When it already holds hunter responses or verdicts for the current head, that would
 throw away paid-for work (a restarted session does exactly this), so it prints ALREADY_HUNTED and exits 4 instead.
---fresh starts over anyway; a PR whose head moved starts over without it.
+--fresh starts over anyway; a PR or branch whose head moved starts over without it.
 """
 from __future__ import annotations
 
@@ -41,9 +41,11 @@ from hunt_common import (
     hunt_lock,
     mm_clone,
     node_env,
+    parse_range,
     require_disk,
     scratch,
     sh,
+    worktree_paths,
     write_json,
 )
 
@@ -172,9 +174,44 @@ def main(pr: str, fresh: bool = False) -> None:
         prepare(pr, fresh)
 
 
+def resolve_ref(mm: Path, ref: str) -> str:
+    """Resolve a branch, tag, or commit sha in `mm`, fetching it from origin when available."""
+    p = sh(git_cmd("fetch", "-q", "origin", ref), mm, check=False)
+    if p.returncode == 0:
+        return git(mm, "rev-parse", "FETCH_HEAD^{commit}")
+    for cand in (ref, f"origin/{ref}", f"refs/tags/{ref}", f"refs/remotes/origin/{ref}"):
+        q = sh(git_cmd("rev-parse", "-q", "--verify", f"{cand}^{{commit}}"), mm, check=False)
+        if q.returncode == 0:
+            return q.stdout.strip()
+    raise InfraError(f"cannot resolve ref {ref!r} in {mm}: {(p.stdout + p.stderr).strip()[-400:]}")
+
+
 def prepare(pr: str, fresh: bool = False) -> None:
     require_disk(scratch())  # worktrees, node_modules and Go builds: refuse early rather than half-prepare
     hdir = hunt_dir(pr)
+    rng = parse_range(pr)
+    wt, wt_base = worktree_paths(pr)
+    if rng is not None:
+        base_spec, head_spec = rng
+        mm = mm_clone()
+        ensure_clone(mm)
+        base_sha = resolve_ref(mm, base_spec)
+        head_sha = resolve_ref(mm, head_spec)
+        done = [] if fresh else existing_results(hdir, head_sha)
+        if done:
+            raise AlreadyHunted(f"{hdir.name}/ already has results for head {head_sha[:10]}: {', '.join(done)}. "
+                                "Do not start over: continue from the first step whose output is missing, or report. "
+                                "Pass --fresh only if the user asked for a new hunt.")
+        reset_hunt_dir(hdir, include_whole_pr=True)
+        (hdir / "prepare.json").unlink(missing_ok=True)
+        mb = worktrees(mm, head_sha, base_sha, wt, wt_base)
+        go_changed, web_changed = deps(mm, wt, wt_base, mb, head_sha)
+        write_json(hdir / "prepare.json", {"pr": pr, "range": [base_spec, head_spec], "repo": str(mm),
+                                           "wt": str(wt), "wt_base": str(wt_base), "head": head_sha,
+                                           "merge_base": mb, "base_ref": base_spec})
+        print(f"ready: head {wt} ({head_spec} @ {head_sha[:10]})  base {wt_base} ({base_spec} @ {mb[:10]})  "
+              f"go={go_changed} webapp={web_changed}")
+        return
     meta = pr_meta(pr)
     done = [] if fresh else existing_results(hdir, meta["head"]["sha"])
     if done:
@@ -189,19 +226,18 @@ def prepare(pr: str, fresh: bool = False) -> None:
     # The PR's own base branch (release-* cherry-picks are common), not always master.
     base = meta["base"]["ref"]
     git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", f"+{base}:refs/remotes/origin/{base}")
-    wt, wt_base = scratch() / f"wt{pr}", scratch() / f"wt{pr}.base"
     mb = worktrees(mm, f"pr-{pr}", f"origin/{base}", wt, wt_base)
     go_changed, web_changed = deps(mm, wt, wt_base, mb, f"pr-{pr}")
-    write_json(hunt_dir(pr) / "prepare.json", {"pr": pr, "repo": str(mm), "wt": str(wt), "wt_base": str(wt_base),
-                                              "head": git(mm, "rev-parse", f"pr-{pr}"), "merge_base": mb,
-                                              "base_ref": base})
+    write_json(hdir / "prepare.json", {"pr": pr, "repo": str(mm), "wt": str(wt), "wt_base": str(wt_base),
+                                       "head": git(mm, "rev-parse", f"pr-{pr}"), "merge_base": mb,
+                                       "base_ref": base})
     print(f"ready: head {wt}  base {wt_base} ({base} @ {mb[:10]})  go={go_changed} webapp={web_changed}")
 
 
 if __name__ == "__main__":
     try:
         if len(sys.argv) not in (2, 3) or sys.argv[2:] not in ([], ["--fresh"]):
-            sys.exit("usage: prepare.py <pr> [--fresh]")
+            sys.exit("usage: prepare.py <pr | base..head | base...head> [--fresh]")
         main(sys.argv[1], fresh=sys.argv[2:] == ["--fresh"])
     except AlreadyHunted as e:
         print(f"ALREADY_HUNTED {e}")

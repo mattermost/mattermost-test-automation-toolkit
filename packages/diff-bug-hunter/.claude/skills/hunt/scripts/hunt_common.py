@@ -8,6 +8,7 @@ else the skill needs lives inside the skill directory, so it works symlinked or 
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -49,8 +50,38 @@ def mm_clone() -> Path:
     return Path(os.environ.get("HUNT_MM") or scratch() / "mmfull")
 
 
+def parse_range(target: str) -> tuple[str, str] | None:
+    """Parse '<base>..<head>' or '<base>...<head>' into (base, head), or None for a PR number."""
+    s = str(target).strip()
+    for sep in ("...", ".."):
+        if sep in s:
+            base, head = s.split(sep, 1)
+            base, head = base.strip(), head.strip()
+            if not base or not head:
+                raise InfraError(f"invalid range {target!r}: expected <base>..<head> or <base>...<head>")
+            return base, head
+    return None
+
+
+def target_key(target: str | int) -> str:
+    """Filesystem-safe key for a PR number ('40260') or git range ('release-11..release-12' -> safe slug)."""
+    s = str(target).strip()
+    rng = parse_range(s)
+    if rng is None:
+        return s
+    canon = f"{rng[0]}...{rng[1]}"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", canon).strip("._-")
+    digest = hashlib.sha256(canon.encode()).hexdigest()[:8]
+    return f"{slug[:48]}-{digest}" if slug else digest
+
+
 def hunt_dir(pr: str | int) -> Path:
-    return scratch() / f"hunt{pr}"
+    return scratch() / f"hunt{target_key(pr)}"
+
+
+def worktree_paths(pr: str | int) -> tuple[Path, Path]:
+    key = target_key(pr)
+    return scratch() / f"wt{key}", scratch() / f"wt{key}.base"
 
 
 class InfraError(RuntimeError):
