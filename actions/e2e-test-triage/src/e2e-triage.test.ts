@@ -1555,15 +1555,16 @@ test("an answer that blames the PR without citing a change goes to the escalatio
   const kept = await run(ungrounded);
   assert.equal(kept.f.blocking, true);
   assert.equal(kept.f.escalated, true);
-  // Blame that names a related change is grounded and is not second-guessed.
+  // High-confidence blame that names a related change is grounded and is not second-guessed.
   const h = classify({ ...failing, error: "Error: expected server_form to be visible" }, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1);
   const pack = buildPack(h, [{ filename: "app/server_form.tsx", patch: "@@ -1 +1 @@" }], prCtx, []);
   const hunkId = pack.diff_hunks_of_files_named_in_error.find((x) => x.related)?.id;
   assert.ok(hunkId, "the changed component the error names is a related hunk");
   const models: string[] = [];
-  await judge([h], [pack], async (packs, model) => { models.push(model); return ok({ ...ungrounded, cited_evidence: ["error", hunkId] })(packs, model); }, DEFAULTS, () => {});
+  await judge([h], [pack], async (packs, model) => { models.push(model); return ok({ ...ungrounded, confidence: 0.9, cited_evidence: ["error", hunkId] })(packs, model); }, DEFAULTS, () => {});
   assert.deepEqual(models, [DEFAULTS.model]);
   assert.equal(h.blocking, true);
+  assert.equal(h.decision, "adjudicator_blame");
 });
 
 test("prices are looked up by model family and can be overridden", () => {
@@ -5691,4 +5692,54 @@ test("judge escalates release-run near-misses in the 0.60-0.84 band to escalatio
   assert.equal(f.blocking, false);
   assert.equal(f.decision, "adjudicator_unblock");
   assert.equal(f.escalated, true);
+});
+
+test("judge escalates borderline PR blame with hunk (0.60-0.84) and trunk-backed bug_on_master to escalationModel", async () => {
+  // Borderline blame with cited hunk -> escalates to Opus, which confirms >=0.85 blame.
+  const fBlame = firstFailure({ class: "REGRESSION", blocking: true, error: "Error in channel_header.tsx" });
+  const blamePack = buildPack(fBlame, [{ filename: "webapp/src/channel_header.tsx", patch: "@@ -1 +1 @@\n-old\n+new" }], { number: 42, repository: "o/r", title: "edit header" }, []);
+  const askedBlame: string[] = [];
+  const askBlame: AskFn = async (packs, model) => {
+    askedBlame.push(model);
+    return {
+      answers: packs.map(() => ({
+        cause: "caused_by_pr" as const,
+        confidence: model === "claude-opus-5-5" ? 0.91 : 0.72,
+        cited_evidence: ["hunk_0"],
+        explanation: "The diff changes channel_header.tsx.",
+        fix: "Restore the header label in webapp/src/channel_header.tsx.",
+      })),
+      usage: { input_tokens: 100, output_tokens: 50 },
+      served_model: model,
+    };
+  };
+  await judge([fBlame], [blamePack], askBlame, { ...DEFAULTS, model: "claude-sonnet-5-5", escalationModel: "claude-opus-5-5" });
+  assert.deepEqual(askedBlame, ["claude-sonnet-5-5", "claude-opus-5-5"]);
+  assert.deepEqual([fBlame.blocking, fBlame.decision, fBlame.escalated], [true, "adjudicator_blame", true]);
+
+  // Borderline bug_on_master citing trunk_history_14d with trunk failures -> escalates to Opus and clears.
+  const fMaster = firstFailure({
+    class: "REGRESSION",
+    blocking: true,
+    trunk: { runs: 20, fails: 2, flaky: 1, passes: 17, latest: "passed" },
+    cross_pr: { prs: [99], examples: ["PR #99"], passes: 10 },
+  });
+  const masterPack = buildPack(fMaster, [{ filename: "webapp/src/other.tsx", patch: "@@ -1 +1 @@\n-a\n+b" }], { number: 43, repository: "o/r", title: "unrelated" }, []);
+  const askedMaster: string[] = [];
+  const askMaster: AskFn = async (packs, model) => {
+    askedMaster.push(model);
+    return {
+      answers: packs.map(() => ({
+        cause: "bug_on_master" as const,
+        confidence: model === "claude-opus-5-5" ? 0.9 : 0.75,
+        cited_evidence: ["trunk_history_14d"],
+        explanation: "Same failure already occurs on master.",
+      })),
+      usage: { input_tokens: 100, output_tokens: 50 },
+      served_model: model,
+    };
+  };
+  await judge([fMaster], [masterPack], askMaster, { ...DEFAULTS, model: "claude-sonnet-5-5", escalationModel: "claude-opus-5-5" });
+  assert.deepEqual(askedMaster, ["claude-sonnet-5-5", "claude-opus-5-5"]);
+  assert.deepEqual([fMaster.blocking, fMaster.decision, fMaster.escalated], [false, "adjudicator_unblock", true]);
 });

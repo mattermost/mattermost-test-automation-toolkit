@@ -2411,8 +2411,8 @@ function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
   if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
   if (answer.confidence < cfg.escalateMin) return false;
   if (exoneratedSet(isTrunkRun).has(cls)) return answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.vetoMin;
-  const clears = CLEARING(cited) || cls !== "INFRA_ERROR" && answer.cause === "flaky_environment" && (isInfraError(pack.error) || cited.includes("earlier_failure_same_spec") && chainClears(pack));
-  return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && clears;
+  if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.minConfidence) return true;
+  return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && unblocks(answer.cause, cited, pack, cls);
 }
 var JUDGED_PER_CALL = 8;
 async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
