@@ -1,7 +1,7 @@
 ---
 name: hunt
-description: Blind Mode A (caller invariants) + Mode B (PR-promise falsifier) bug hunt on one mattermost/mattermost PR, with merge-base vetting and a compile-verified mutation gate. Use when asked to hunt, bug-hunt or falsify a Mattermost PR.
-argument-hint: <pr_number> [--batch N]
+description: Blind Mode A (caller invariants) + Mode B (PR-promise falsifier) bug hunt on one mattermost/mattermost PR, with merge-base vetting and an opt-in (--mutants) compile-verified mutation gate. Use when asked to hunt, bug-hunt or falsify a Mattermost PR.
+argument-hint: <pr_number> [--batch N] [--mutants]
 ---
 
 Hunt PR #$ARGUMENTS. Scripts are in `scripts/` next to this file; run them with `cd <this dir>/scripts && python3 <script>`.
@@ -11,11 +11,15 @@ throwaway diagnostic test in step 5, deleted before the next script runs. Nothin
 committed. Run one script at a time per PR: `prepare.py`, `ctx.py` and every `run.py` command share the worktrees
 and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the first is running (wait for a background
 `run.py` to finish first). Run slow suites in the background and never kill one: an interrupted run is cleaned up by
-`prepare.py <pr>`.
+`prepare.py <pr> --fresh`. Wait for a background command or agent through its completion notification. Never wait with
+`ScheduleWakeup`, `CronCreate` or `/loop`: a wakeup re-sends `/hunt <pr>`, and the hunt starts again from step 0.
 
 0. **Trust gate:** `trusted.py check`. Rules (`SKILL.md`, `lessons.jsonl`, `RELIABILITY.md`, `prompts/`) come from
    the base branch, never the PR head. If the check fails, stop: a change to this skill cannot take part in its own hunt.
 1. **Prepare:** `prepare.py <pr>` (worktrees at the PR head and its merge-base with the PR's own base branch).
+   `ALREADY_HUNTED` (exit 4) = this session or an earlier one already has results for the PR's current head, listed in
+   the message. Do not start over and do not rerun a step whose output exists: continue from the first step whose output
+   is missing, or go to step 7. `--fresh` only when the user asks for a new hunt. A PR whose head moved starts over by itself.
    `INFRA_ERROR` = stop and report it; that includes less than 2 GiB free under `HUNT_SCRATCH`, which `prepare.py`
    and every Go `-race` run check first.
 2. **Context:** `ctx.py <pr> [--batch N]`. Quote its batch line. `skipped.log` lists every file not hunted; mention the
@@ -67,7 +71,8 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
    - Confirm a real caller (HTTP, websocket, plugin API, UI) reaches the input. If none does, it is a caller-unreachable nit.
    - A newly vetted false-positive pattern: `lessons.py add '<json>'`. Hunters see it once it is merged to the base
      branch; until then it stays in the working copy without blocking the trust gate.
-6. **Mutation gate**, if Mode A has passing tests:
+6. **Mutation gate**, only when the arguments include `--mutants` and Mode A has passing tests. It grades the kept
+   tests and finds no bugs, and it is most of a hunt's wall time. Without `--mutants`, skip this step and go to step 7.
    - Planting: `build_requests.py <pr> mutants`, dispatch it, then `build_requests.py <pr> heldout`, dispatch it.
      Never show M or M2 to a hunter.
    - Score: `run.py mutants <pr> A`. Each mutant's `go test` gets `-timeout` = max(60 s, 5x the unmutated run of that
@@ -95,6 +100,7 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      verdict `SAME` / `DIFF` / `REGRESSION`). A `DIFF` the PR does not explain is a finding. Skip when the PR has no UI/API surface.
    - One line per dropped artifact.
    - **Mutation table** M1-M5 x (A, A2, PR), the proof that the kept tests catch bugs, and under it "changed lines
-     reached: X/Y" for A and A2. That is a floor, not a quality score: never report it as a percentage.
+     reached: X/Y" for A and A2. Without `--mutants`: one line "Mutation gate: not run (pass --mutants)", plus
+     "changed lines reached: X/Y" for A. That is a floor, not a quality score: never report it as a percentage.
    - If there is a New PR Bug, offer a review-comment draft. Never post it.
    - If nothing failed 3/3, say so plainly.

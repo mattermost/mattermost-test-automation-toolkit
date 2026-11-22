@@ -3,10 +3,13 @@
 # See LICENSE.txt for license information.
 """Step 1: worktrees + infrastructure gate.
 
-usage: prepare.py <pr>
+usage: prepare.py <pr> [--fresh]
 Creates <scratch>/wt<pr> at the PR head and <scratch>/wt<pr>.base at the merge-base, sets up go.work and webapp
 node_modules, and checks Postgres + Redis when the PR touches stateful server code. Prints INFRA_ERROR and exits 2 on any
 environment failure.
+Preparing again wipes hunt<pr>/. When it already holds hunter responses or verdicts for the PR's current head, that would
+throw away paid-for work (a restarted session does exactly this), so it prints ALREADY_HUNTED and exits 4 instead.
+--fresh starts over anyway; a PR whose head moved starts over without it.
 """
 from __future__ import annotations
 
@@ -139,22 +142,52 @@ def deps(repo: Path, wt: Path, wt_base: Path, mb: str, head_ref: str) -> tuple[b
     return go_changed, web_changed
 
 
-def main(pr: str) -> None:
+# Outputs that cost a model call or a long test run. Any of them for the current head means the hunt is under way.
+RESULTS = ("A/response.json", "B/response.json", "D/response.json", "A2/response.json", "run_*.json", "diff_*.json",
+           "old_tests.json", "pr_tests.json")
+
+
+class AlreadyHunted(RuntimeError):
+    pass
+
+
+def pr_meta(pr: str) -> dict:
+    return json.loads(sh(["gh", "api", f"repos/{REPO}/pulls/{pr}"], Path(".")).stdout)
+
+
+def existing_results(hdir: Path, head: str) -> list[str]:
+    """Result files in hdir that were made for `head` (as prepare.json recorded it); [] if none or another head."""
+    try:
+        prepared = json.loads((hdir / "prepare.json").read_text()).get("head")
+    except (OSError, ValueError):
+        return []
+    if prepared != head:
+        return []
+    return sorted(str(p.relative_to(hdir)) for pattern in RESULTS for p in hdir.glob(pattern))
+
+
+def main(pr: str, fresh: bool = False) -> None:
     # Held from the fetch to prepare.json: a run.py still using these worktrees must finish first.
     with hunt_lock(hunt_dir(pr), pr):
-        prepare(pr)
+        prepare(pr, fresh)
 
 
-def prepare(pr: str) -> None:
+def prepare(pr: str, fresh: bool = False) -> None:
     require_disk(scratch())  # worktrees, node_modules and Go builds: refuse early rather than half-prepare
-    # The worktrees are about to move: context, responses and verdicts from the previous preparation no longer apply.
     hdir = hunt_dir(pr)
+    meta = pr_meta(pr)
+    done = [] if fresh else existing_results(hdir, meta["head"]["sha"])
+    if done:
+        raise AlreadyHunted(f"hunt{pr}/ already has results for head {meta['head']['sha'][:10]}: {', '.join(done)}. "
+                            "Do not start over: continue from the first step whose output is missing, or report. "
+                            "Pass --fresh only if the user asked for a new hunt.")
+    # The worktrees are about to move: context, responses and verdicts from the previous preparation no longer apply.
     reset_hunt_dir(hdir)
     (hdir / "prepare.json").unlink(missing_ok=True)
     mm = mm_clone()
     ensure_clone(mm)
     # The PR's own base branch (release-* cherry-picks are common), not always master.
-    base = json.loads(sh(["gh", "api", f"repos/{REPO}/pulls/{pr}"], Path(".")).stdout)["base"]["ref"]
+    base = meta["base"]["ref"]
     git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", f"+{base}:refs/remotes/origin/{base}")
     wt, wt_base = scratch() / f"wt{pr}", scratch() / f"wt{pr}.base"
     mb = worktrees(mm, f"pr-{pr}", f"origin/{base}", wt, wt_base)
@@ -167,7 +200,12 @@ def prepare(pr: str) -> None:
 
 if __name__ == "__main__":
     try:
-        main(sys.argv[1])
+        if len(sys.argv) not in (2, 3) or sys.argv[2:] not in ([], ["--fresh"]):
+            sys.exit("usage: prepare.py <pr> [--fresh]")
+        main(sys.argv[1], fresh=sys.argv[2:] == ["--fresh"])
+    except AlreadyHunted as e:
+        print(f"ALREADY_HUNTED {e}")
+        sys.exit(4)
     except InfraError as e:
         print(f"INFRA_ERROR {e}")
         sys.exit(2)

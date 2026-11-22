@@ -1392,6 +1392,33 @@ def test_regen_and_repair_requests(tmp_path, monkeypatch):
     rep = json.loads((hdir / "A" / "request.repair.json").read_text())
     assert rep["response_path"].endswith("A/response.json") and "undefined: Nope" in rep["user"]
     assert (hdir / "A" / "response.prev.json").exists()
+    assert "undefined: Nope" in (hdir / "A" / "request.repair.md").read_text()  # the agent's readable copy
+
+
+def test_every_request_has_a_readable_text_copy_with_real_line_breaks(tmp_path, monkeypatch):
+    # PR 40176: the whole user message sat on one 198 KB line of request.json, the hunter's file reader could not
+    # page through it, and Hunter A wrote nothing.
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    hdir, _ = make_hunt(tmp_path, "clean")
+    monkeypatch.setattr(build_requests, "hunt_dir", lambda pr: hdir)
+    build_requests.main("1", "hunters")
+    req = json.loads((hdir / "A" / "request.json").read_text())
+    text = (hdir / "A" / "request.md").read_text()
+    assert max(len(line) for line in text.splitlines()) <= 2000
+    assert req["system"] in text and req["response_path"] in text and '"required"' in text
+    lines = text.splitlines()
+    # the diff and the numbered head source arrive line by line, as the agent must read them
+    assert "+func Percent(part, total int) int {" in lines
+    assert "    7  func Percent(part, total int) int {" in lines
+    assert "## diff_production_code" in lines and "## changed_files_head_source" in lines
+
+
+def test_text_rendering_keeps_every_value_and_fences_code_safely():
+    out = build_requests.render_text({"a": "x\ny", "b": [{"c": 1}, "z"], "d": "has ``` inside\nok", "e": None})
+    lines = out.splitlines()
+    assert "x" in lines and "y" in lines and "z" in out and "1" in out and "null" in out
+    assert "````" in out  # a fence longer than any backtick run inside the value
+    assert build_requests.render_text("x" * 5000).count("\n") >= 2  # one long line is wrapped, never cut
 
 
 
@@ -2389,10 +2416,44 @@ def test_prepare_drops_the_previous_context_and_verdicts_first(tmp_path, monkeyp
         (hdir / name).write_text("{}")
     (hdir / "A").mkdir()
     monkeypatch.setattr(prepare, "hunt_dir", lambda pr: hdir)
+    monkeypatch.setattr(prepare, "pr_meta", lambda pr: {"head": {"sha": "new"}, "base": {"ref": "master"}})
     monkeypatch.setattr(prepare, "mm_clone", lambda: (_ for _ in ()).throw(hunt_common.InfraError("stop here")))
     with pytest.raises(hunt_common.InfraError, match="stop here"):
-        prepare.prepare("9")
+        prepare.prepare("9")  # prepare.json records no head: these results are from some other preparation
     assert sorted(p.name for p in hdir.iterdir()) == []  # nothing from the old head survives a new preparation
+
+
+def _hunted(hdir: Path, head: str) -> None:
+    hdir.mkdir()
+    (hdir / "prepare.json").write_text(json.dumps({"head": head}))
+    (hdir / "A").mkdir()
+    (hdir / "A" / "response.json").write_text("{}")
+    (hdir / "run_A.json").write_text("{}")
+
+
+def test_prepare_never_wipes_results_for_the_same_head(tmp_path, monkeypatch):
+    # PR 40221: a headless session waited with ScheduleWakeup, each wakeup re-sent `/hunt <pr>`, and every restart
+    # wiped the finished results and paid for the hunters again (11 times, $25).
+    hdir = tmp_path / "hunt9"
+    _hunted(hdir, "abc")
+    monkeypatch.setattr(prepare, "hunt_dir", lambda pr: hdir)
+    monkeypatch.setattr(prepare, "pr_meta", lambda pr: {"head": {"sha": "abc"}, "base": {"ref": "master"}})
+    monkeypatch.setattr(prepare, "mm_clone", lambda: pytest.fail("re-prepared a hunt that already has results"))
+    with pytest.raises(prepare.AlreadyHunted, match="run_A.json"):
+        prepare.prepare("9")
+    assert (hdir / "run_A.json").exists() and (hdir / "A" / "response.json").exists()
+
+
+def test_prepare_starts_over_when_the_head_moved_or_fresh_is_asked(tmp_path, monkeypatch):
+    for head, fresh in (("old", False), ("abc", True)):
+        hdir = tmp_path / f"hunt-{head}"
+        _hunted(hdir, head)
+        monkeypatch.setattr(prepare, "hunt_dir", lambda pr, h=hdir: h)
+        monkeypatch.setattr(prepare, "pr_meta", lambda pr: {"head": {"sha": "abc"}, "base": {"ref": "master"}})
+        monkeypatch.setattr(prepare, "mm_clone", lambda: (_ for _ in ()).throw(hunt_common.InfraError("stop here")))
+        with pytest.raises(hunt_common.InfraError, match="stop here"):
+            prepare.prepare("9", fresh=fresh)
+        assert not (hdir / "run_A.json").exists() and not (hdir / "A").exists()
 
 
 @needs_playwright

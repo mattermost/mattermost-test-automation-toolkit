@@ -47,7 +47,8 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
 - **Vetting:** each failure must reproduce 3/3. It is root-caused against `lessons.jsonl` (known false positives),
   run on the merge-base (**New PR Bug** vs **Pre-Existing Bug**; `NEW_API` = fails 3/3 on head and cannot compile
   on base because it calls an API the PR adds: root-cause it, not a bug by itself; compile failures are salvaged per test), and checked for caller reachability.
-- **Mutation gate:**
+- **Mutation gate (opt-in, `/hunt <pr> --mutants`):** it grades the kept tests and finds no bugs, and it was about
+  70% of a hunt's wall time (PR 40094: bug at 8.4 min, hunt done at 52 min), so a default hunt stops after vetting.
   - 3 visible plus 2 held-out mutants, each compile-checked (`go test -c`, single-file Babel parse).
   - One strengthen round if a visible mutant survives.
   - The PR's own tests are scored for comparison. The mutation table is the proof that the kept tests catch bugs.
@@ -57,6 +58,8 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
   the change reach Mode A.
 - **Large-diff guard:** lockfiles, generated code, snapshots, i18n and existing tests are skipped. The rest is
   ranked by risk and hunted in batches of at most 5 files / 800 diff lines; `skipped.log` lists the rest.
+- **Restart safety:** `prepare.py` will not wipe a hunt that already has results for the PR's current head (`ALREADY_HUNTED`,
+  exit 4), so a restarted session resumes instead of paying for the hunters again. `--fresh` starts over.
 - **Resource discipline:** `prepare.py` and every Go `-race` run stop with `INFRA_ERROR` when less than 2 GiB is free
   under `HUNT_SCRATCH`. Flaky tests are reported as `FLAKY` (3 runs), never retried or slept around.
 

@@ -13,7 +13,8 @@ usage: build_requests.py <pr> hunters            -> A/, B/
                                                    NEEDS_REGENERATION, with that score's compiler error)
        build_requests.py <pr> repair <tag>       -> <tag>/request.repair.json (hunter files that did not compile, with
                                                    compile_<tag>.log; the old response is kept as response.prev.json)
-Each request is {tier, system, user, schema, response_path}; dispatch it with ../dispatch.md, one fresh agent each.
+Each request is {tier, system, user, schema, response_path}, plus the same request as text in request*.md (what the agent
+reads); dispatch it with ../dispatch.md, one fresh agent each.
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ if not _sys.pycache_prefix:
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -52,11 +54,48 @@ def langs(state: dict[str, Any]) -> list[str]:
     return sorted({t["lang"] for t in state["targets"]})
 
 
-def write(hdir: Path, tag: str, system: str, user: dict[str, Any], schema: dict[str, Any]) -> Path:
+MAX_LINE = 2000  # longer lines are cut by the agent's file reader, and one line cannot be paged
+
+
+def _wrap(line: str) -> list[str]:
+    return [line[i:i + MAX_LINE] for i in range(0, len(line), MAX_LINE)] or [""]
+
+
+def render_text(value: Any, level: int = 2) -> str:
+    """A request value as plain text with real line breaks: keys become headings, multi-line strings go in fences
+    longer than any backtick run inside them, and no line is longer than MAX_LINE (long lines are wrapped, never cut)."""
+    if isinstance(value, dict):
+        h = "#" * min(level, 6)
+        return "\n\n".join(f"{h} {k}\n\n{render_text(v, level + 1)}" for k, v in value.items()) or "{}"
+    if isinstance(value, list):
+        if all(not isinstance(v, (dict, list)) and not (isinstance(v, str) and "\n" in v) for v in value):
+            return "\n".join(line for v in value for line in _wrap(f"- {render_text(v, level)}")) or "[]"
+        h = "#" * min(level, 6)
+        return "\n\n".join(f"{h} [{i}]\n\n{render_text(v, level + 1)}" for i, v in enumerate(value)) or "[]"
+    if isinstance(value, str):
+        if "\n" not in value and len(value) <= MAX_LINE:
+            return value
+        fence = "`" * max(3, max((len(r) for r in re.findall(r"`+", value)), default=0) + 1)
+        body = "\n".join(part for line in value.split("\n") for part in _wrap(line))
+        return f"{fence}\n{body}\n{fence}"
+    return json.dumps(value)
+
+
+def write_request(path: Path, system: str, user: dict[str, Any], schema: dict[str, Any], response_path: Path) -> Path:
+    """request.json for the scripts, and the same request as text next to it (.md) for the agent that answers it."""
     req = {"tier": "opus", "system": system, "user": json.dumps(user, indent=1), "schema": schema,
-           "response_path": str(hdir / tag / "response.json")}
-    write_json(hdir / tag / "request.json", req)
-    return hdir / tag / "request.json"
+           "response_path": str(response_path)}
+    write_json(path, req)
+    text = "\n\n".join([
+        "# Request", f"Write one JSON object matching the schema below, and nothing else, to: {response_path}",
+        "# System", render_text(system), "# User", render_text(user, 2),
+        "# Schema", "```json\n" + json.dumps(schema, indent=1) + "\n```"])
+    path.with_suffix(".md").write_text(text + "\n")
+    return path
+
+
+def write(hdir: Path, tag: str, system: str, user: dict[str, Any], schema: dict[str, Any]) -> Path:
+    return write_request(hdir / tag / "request.json", system, user, schema, hdir / tag / "response.json")
 
 
 def hunter_system(mode: str, state: dict[str, Any], ctx: dict[str, Any], strategies: bool = False) -> str:
@@ -140,9 +179,7 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
         user = {**hunter_user(tag, ctx), "your_previous_files": load_json(kept)["files"],
                 "compiler_error": log.read_text()[-4000:]}
         system = hunter_system(tag[0], state, ctx) + prompt("repair")
-        req = {"tier": "opus", "system": system, "user": json.dumps(user, indent=1), "schema": HUNTER_SCHEMA,
-               "response_path": str(prev)}
-        write_json(hdir / tag / "request.repair.json", req)
+        write_request(hdir / tag / "request.repair.json", system, user, HUNTER_SCHEMA, prev)
         print(hdir / tag / "request.repair.json")
     else:
         sys.exit(__doc__)
