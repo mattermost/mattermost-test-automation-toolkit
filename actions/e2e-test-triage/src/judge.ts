@@ -131,7 +131,8 @@ Rules:
 - Cite only evidence items by their id from the pack. Never invent commits, versions, files or errors.
 - test_bug with high confidence requires base_change with a diff that fixes what this failure shows.
 - server_compat with high confidence requires other_platforms showing this test passing against another server version
-  on this build, and failing against this lane's version.
+  on this build, and failing against this lane's version. Passing on another OS against the SAME server version rules out
+  server_compat and points to flaky_environment (for example, a shared-server config race or runner timing).
 - flaky_environment with high confidence requires cross_pr or an error that is clearly infrastructural; it is ruled out
   when the test failed every try here and failed on every other lane.
 - app_bug: the error is about the app's behavior and no evidence points to the test, the environment or a server

@@ -5573,3 +5573,122 @@ test("changeTouchesFailure: a selector or phrase in documentation or a plain-tex
     assert.equal(changeTouchesFailure(sel, [{ filename, patch: line }]), null, filename);
   assert.equal(changeTouchesFailure(sel, [{ filename: "docs/empty-states.md", patch: line }, { filename: "a.tsx", patch: line }])?.file, "a.tsx");
 });
+
+test("laneOf maps mobile release/CMT groups to their main lane while keeping cmt-desktop isolated", () => {
+  assert.equal(laneOf("mobile-release-detox-ios-Server_12.1.0"), "detox-ios");
+  assert.equal(laneOf("mobile-release-detox-android-Server_12.1.0-rc2"), "detox-android");
+  assert.equal(laneOf("mobile-release-maestro-ios-Server_12.1.0"), "maestro-ios");
+  assert.equal(laneOf("mobile-cmt-detox-ios-Server_11.11.4"), "detox-ios");
+  assert.equal(laneOf("mobile-release-detox-ios-Server_12.1.0"), laneOf("mobile-main-detox-ios"));
+  assert.equal(laneOf("cmt-desktop"), "cmt-desktop", "multi-server desktop CMT groups stay isolated from desktop-pr");
+  assert.equal(historyLane({ repository: "o/r", commit_sha: "a", gh_run_id: "1", name: "cmt-desktop" }, configFrom({ HISTORY_LANE: "desktop-master" })), "default");
+});
+
+test("INFRA_RE matches Maestro device-unreachable, Detox isReady crash, and shared-server feature_disabled races", () => {
+  for (const err of [
+    "maestro.DeviceUnreachableException: Device became unreachable during flow",
+    'Error: Detox can\'t seem to connect to the test app(s)! pending request #-1000 ("isReady")',
+    "ApiError: attributes_feature_disabled: Custom attributes feature is disabled",
+    "ApiError: permission_policies.feature_disabled: ABAC feature is disabled",
+  ]) assert.equal(isInfraError(err), true, err);
+});
+
+test("infraVerdict and dropStormRuns catch small-suite storms (e.g. Maestro 9/13 wipeout)", async () => {
+  const fail = { error: "Error: element not found" };
+  assert.equal(infraVerdict(Array.from({ length: 9 }, () => fail), DEFAULTS, 13)?.includes("9 of 13 tests failed"), true);
+  assert.equal(infraVerdict(Array.from({ length: 4 }, () => fail), DEFAULTS, 8), null, "fewer than 5 failures is not a storm");
+  assert.equal(infraVerdict(Array.from({ length: 9 }, () => fail), DEFAULTS, 600), null, "9 of 600 is not a small-suite storm");
+  const rows: Observation[] = [
+    { file: "f.yaml", title: "t", status: "passed", retry_count: 0, gh_pr_number: null, branch: "main", commit_sha: "c2", created_at: "2026-10-02T00:00:00Z", group_id: "g_ok" },
+    { file: "f.yaml", title: "t", status: "failed", retry_count: 0, gh_pr_number: null, branch: "main", commit_sha: "c1", created_at: "2026-10-01T00:00:00Z", group_id: "g_storm" },
+  ];
+  const hist = new Map<string, Observation[]>([["k", [...rows]]]);
+  const dropped = await dropStormRuns({
+    history: hist,
+    fetchImpl: async () => Response.json({ test_stats: { total: 13, failed: 9, skipped: 0 } }),
+    base: "http://tsio",
+    minFailures: 30,
+    trunkBranch: "main",
+  });
+  assert.equal(dropped.has("g_storm"), true);
+});
+
+test("evaluateRun: trunk INFRA_ERROR is never held for a non-existent judge, and CI-only PRs are not held on remote infra errors", async () => {
+  const infraErr = 'Error: server at "https://calls.test.mattermost.cloud" is not healthy';
+  const threeInfra = [1, 2, 3].map((i) => ({ ...failing, file: `e2e/calls_${i}.test.ts`, title: `calls ${i}`, error: infraErr }));
+  const run = { ...runOf(threeInfra), counts: { total: 240, passed: 237, failed: 3, flaky: 0, skipped: 0 } };
+  const cfg = { ...DEFAULTS, infraClears: true };
+  const trunk = await evaluateRun({ run, id: { repository: "o/r", commit_sha: "abc", gh_run_id: "1", name: "desktop-master" }, prNumber: null, history: new Map(), diff: { files: [{ filename: "src/main/app.ts" }], ok: true }, trunkBranch: "master", testRoot: "e2e", cfg });
+  assert.equal(trunk.verdict, "SUCCESS", "trunk run clears INFRA_ERROR instead of deadlocking 'held for the judge'");
+  assert.ok(trunk.findings.every((f) => !f.blocking));
+
+  // Replay of desktop PR #4106 (Ruby version pin in .github/workflows/build.yml): 3 remote Calls server errors.
+  const ciOnlyPr = await evaluateRun({ run, id: { repository: "o/r", commit_sha: "def", gh_run_id: "2", name: "desktop-pr" }, prNumber: 4106, history: new Map(), diff: { files: [{ filename: ".github/workflows/build.yml" }], ok: true }, trunkBranch: "master", testRoot: "e2e", cfg });
+  assert.equal(ciOnlyPr.verdict, "SUCCESS", "CI-only PR cannot break remote test server");
+  assert.ok(ciOnlyPr.findings.every((f) => !f.blocking));
+
+  // Product PR with 3/3 infra errors still holds for the judge.
+  const productPr = await evaluateRun({ run, id: { repository: "o/r", commit_sha: "ghi", gh_run_id: "3", name: "desktop-pr" }, prNumber: 4107, history: new Map(), diff: { files: [{ filename: "src/main/server.ts" }], ok: true }, trunkBranch: "master", testRoot: "e2e", cfg });
+  assert.equal(productPr.verdict, "ACTION_REQUIRED");
+  assert.ok(productPr.findings.every((f) => f.blocking));
+});
+
+test("settlePR: does not promote reproducible_regression when sibling platform passed (no platform diff) or judge called flaky_environment", () => {
+  // Replay of mobile PR #10350 & #10309: failed 2/2 on Android, passed on iOS, shared TS diff.
+  const siblingPass = firstFailure({ tries: { ran: 2, failed: 2 }, other_lanes: [{ platform: "detox-ios", result: "passed" }] });
+  settlePR([siblingPass], ["app/components/post_list/post.tsx"], true, false, []);
+  assert.deepEqual([siblingPass.blocking, siblingPass.decision], [false, "first_failure"]);
+
+  // Platform-specific diff still blocks even if sibling platform passed.
+  const iosDiff = firstFailure({ tries: { ran: 2, failed: 2 }, other_lanes: [{ platform: "detox-android", result: "passed" }] });
+  settlePR([iosDiff], ["ios/Mattermost/AppDelegate.mm"], true, false, []);
+  assert.deepEqual([iosDiff.blocking, iosDiff.decision], [true, "reproducible_regression"]);
+
+  // Replay of mobile PR #10253: external website title changed; advisory judge said flaky_environment without citing hunks.
+  const judgedEnv = firstFailure({
+    tries: { ran: 2, failed: 2 },
+    judge: { cause: "flaky_environment", confidence: 0.85, cited_evidence: ["test", "error"], explanation: "External site mattermost.com changed its page title." },
+  });
+  settlePR([judgedEnv], ["app/screens/channel/index.tsx"], true, false, []);
+  assert.deepEqual([judgedEnv.blocking, judgedEnv.decision], [false, "first_failure"]);
+});
+
+test("markOutOfDate with fetchFileDiffs populates per-spec patch past the 300-file compare cap for release runs", async () => {
+  const spec = "detox/e2e/test/products/channels/smoke_test/bookmarks.e2e.ts";
+  const f = firstFailure({ file: "products/channels/smoke_test/bookmarks.e2e.ts", repo_path: spec });
+  const bigCompare = {
+    ahead_by: 400,
+    merge_base_commit: { sha: "mb", commit: { committer: { date: "2026-10-01T00:00:00Z" } } },
+    files: Array.from({ length: 300 }, (_, i) => ({ filename: `app/file_${i}.ts` })),
+    commits: [],
+  };
+  const api = async (_m: string, url: string) => {
+    if (url.includes("/compare/")) return bigCompare;
+    if (url.includes("commits?") && url.includes(encodeURIComponent(spec))) return [{ sha: "fix1234", commit: { committer: { date: "2026-10-10T00:00:00Z" }, message: "fix bookmarks spec (#10310)" } }];
+    if (url.endsWith("/commits/fix1234")) return { files: [{ filename: spec, patch: "@@ -10,1 +10,1 @@\n-oldTitle\n+newTitle" }] };
+    return [];
+  };
+  await markOutOfDate({ findings: [f], api, id: { repository: "o/r", commit_sha: "rel" }, baseBranch: "main", fetchFileDiffs: true });
+  assert.equal(f.out_of_date?.commit?.pr, 10310);
+  assert.match(String(f.out_of_date?.diff), /\+newTitle/);
+});
+
+test("judge escalates release-run near-misses in the 0.60-0.84 band to escalationModel", async () => {
+  const f = firstFailure({ release: true, blocking: true, out_of_date: { base: "main", behind: 50, commit: { sha: "abc1234", date: "2026-10-10", pr: 10310 }, diff: "@@ -1 +1 @@\n-a\n+b" } });
+  const pack = releasePack(f, { repository: "o/r", name: "mobile-release-detox-ios-Server_12.1.0", branch: "build-release-838", base: "main", historyBranch: "main" }, []);
+  const asked: string[] = [];
+  const ask: AskFn = async (packs, model) => {
+    asked.push(model);
+    const conf = model === "claude-opus-5-5" ? 0.92 : 0.72;
+    return {
+      answers: packs.map(() => ({ cause: "test_bug" as const, confidence: conf, cited_evidence: ["base_change"], explanation: "Main updated the stale assertion." })),
+      usage: { input_tokens: 100, output_tokens: 50 },
+      served_model: model,
+    };
+  };
+  await judge([f], [pack], ask, { ...DEFAULTS, model: "claude-sonnet-5-5", escalationModel: "claude-opus-5-5" });
+  assert.deepEqual(asked, ["claude-sonnet-5-5", "claude-opus-5-5"]);
+  assert.equal(f.blocking, false);
+  assert.equal(f.decision, "adjudicator_unblock");
+  assert.equal(f.escalated, true);
+});

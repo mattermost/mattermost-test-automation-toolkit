@@ -14,7 +14,7 @@ import { trunkBroken } from "./baseline.ts";
 import type { Baseline, TrunkRun } from "./baseline.ts";
 import { diagnoseLane, jobCause, laneDescription, laneTurnsGreen } from "./lane-diagnosis.ts";
 import type { LaneFacts } from "./lane-diagnosis.ts";
-import { errorLines, lanePrefixOf, stepLines } from "./lane-jobs.ts";
+import { errorLines, lanePrefixOf, readLaneJobs, stepLines } from "./lane-jobs.ts";
 import type { LaneJob } from "./lane-jobs.ts";
 import { triage } from "./triage.ts";
 
@@ -443,4 +443,21 @@ test("a lane crowded out of the base branch's last runs (an upgrade lane) has it
   bodies.length = 0;
   await fetchHistory(fetchImpl, "http://tsio", "o/r", [t], "2026-11-06T00:00:00Z", DEFAULTS, "master", null, () => {}, "playwright-full-enterprise");
   assert.equal(bodies.length, 2);
+});
+
+test("readLaneJobs filters flat-job workflows by lane-job-filter so one lane never blames another lane's dead job", async () => {
+  const jobs = [
+    { id: 1, name: "build-android-apk", status: "completed", conclusion: "failure", steps: [{ name: "gradle", conclusion: "failure" }] },
+    { id: 2, name: "build-ios-app", status: "completed", conclusion: "success", steps: [] },
+    { id: 3, name: "maestro-ios-e2e", status: "completed", conclusion: "failure", steps: [{ name: "run maestro", conclusion: "failure" }] },
+  ];
+  const fetchImpl = (async (url: string) => {
+    if (url.includes("/jobs?")) return Response.json({ total_count: jobs.length, jobs });
+    return new Response("2026-11-04T12:00:00Z ##[error]Device became unreachable");
+  }) as FetchImpl;
+  const res = await readLaneJobs({
+    fetchImpl, token: "t", repository: "o/r", runId: "1", attempt: "1",
+    filter: "maestro-ios,build-ios", log: () => {},
+  });
+  assert.deepEqual(res.jobs.map((j) => j.name), ["build-ios-app", "maestro-ios-e2e"]);
 });

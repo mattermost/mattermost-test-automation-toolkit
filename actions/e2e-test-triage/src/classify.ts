@@ -7,7 +7,7 @@ import type { At, ChangedFile, ChangedByPR, Config, Finding, Observation, SpecRu
 
 // The last alternative: a mobile spec whose shard uploaded nothing never ran.
 const INFRA_RE =
-  /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready|failed: 408 Request timed out after \d+ ?ms/i;
+  /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready|failed: 408 Request timed out after \d+ ?ms|maestro\.DeviceUnreachableException|Device became unreachable|pending request #-1000 \("isReady"\)|attributes_feature_disabled|permission_policies\.feature_disabled/i;
 
 export const isInfraError = (text: string | null | undefined): boolean => INFRA_RE.test(text ?? "");
 
@@ -657,13 +657,19 @@ export function markEarlierFailures(findings: Finding[]): Finding[] {
   return findings;
 }
 
+/** Small-suite storm: at least 5 failures and half the executed tests (catches Maestro / smoke-suite wipeouts under infraMinFailures). */
+export const isSmallSuiteStorm = (failed: number, total: number | undefined): boolean =>
+  total != null && total >= 6 && failed >= 5 && failed * 2 >= total;
+
 /** Run-level infrastructure call: many failures, or most failures share an infra signature. */
-export function infraVerdict(failing: readonly { error?: string | null }[], cfg: Config = DEFAULTS): string | null {
+export function infraVerdict(failing: readonly { error?: string | null }[], cfg: Config = DEFAULTS, total?: number): string | null {
   if (!failing.length) return null;
   const infra = failing.filter((t) => isInfraError(t.error)).length;
   if (infra >= Math.max(3, Math.ceil(failing.length / 2)))
     return `${infra} of ${failing.length} failures are infrastructure errors (server health, connectivity, device, shard that never ran); rerun when the environment recovers.`;
   if (failing.length >= cfg.infraMinFailures)
     return `${failing.length} tests failed in one run; check for a shared environment, build or product failure first.`;
+  if (isSmallSuiteStorm(failing.length, total))
+    return `${failing.length} of ${total} tests failed in one run; check for a shared environment, build or product failure first.`;
   return null;
 }

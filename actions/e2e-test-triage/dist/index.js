@@ -625,7 +625,7 @@ var DEFAULTS = {
   // them and cleared 4 of the 5 the PR did not cause, Fable 5.1 the fifth on escalation.
   model: "claude-sonnet-5-5"
 };
-var laneOf = (name) => String(name ?? "").replace(/^(mobile|desktop)-(pr|main|master)(-|$)/, "").replace(/-(master|main|release(-cut)?)$/, "") || "default";
+var laneOf = (name) => String(name ?? "").replace(/^(mobile|desktop)-(pr|main|master)(-|$)/, "").replace(/^mobile-(release|cmt)(-|$)/, "").replace(/-Server_[^/]+$/i, "").replace(/-(master|main|release(-cut)?)$/, "") || "default";
 var OS_OF_REPORT = [[/ubuntu/, "linux"], [/windows/, "windows"], [/macos/, "macos"]];
 var laneOfReport = (name) => {
   const rest = String(name).replace(/^e2e-on-/, "");
@@ -637,7 +637,7 @@ var repoPath = (testRoot, file) => {
   const root = String(testRoot).replace(/^\.?\/*/, "").replace(/\/+$/, "");
   return root === "" ? file : `${root}/${file}`;
 };
-var historyLane = (id, cfg = DEFAULTS) => cfg.historyLane || laneOf(id.name);
+var historyLane = (id, cfg = DEFAULTS) => cfg.historyLane ? laneOf(cfg.historyLane) : laneOf(id.name);
 function confidenceFrom(raw, warn) {
   if (raw == null || String(raw).trim() === "") return DEFAULTS.minConfidence;
   const n = Number(raw);
@@ -726,7 +726,7 @@ function configFrom(env, warn = () => {
 }
 
 // src/classify.ts
-var INFRA_RE = /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready|failed: 408 Request timed out after \d+ ?ms/i;
+var INFRA_RE = /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready|failed: 408 Request timed out after \d+ ?ms|maestro\.DeviceUnreachableException|Device became unreachable|pending request #-1000 \("isReady"\)|attributes_feature_disabled|permission_policies\.feature_disabled/i;
 var isInfraError = (text) => INFRA_RE.test(text ?? "");
 function isShardPlaceholder(t) {
   const title = t.title.trim();
@@ -1135,13 +1135,16 @@ function markEarlierFailures(findings) {
   }
   return findings;
 }
-function infraVerdict(failing, cfg = DEFAULTS) {
+var isSmallSuiteStorm = (failed, total) => total != null && total >= 6 && failed >= 5 && failed * 2 >= total;
+function infraVerdict(failing, cfg = DEFAULTS, total) {
   if (!failing.length) return null;
   const infra = failing.filter((t) => isInfraError(t.error)).length;
   if (infra >= Math.max(3, Math.ceil(failing.length / 2)))
     return `${infra} of ${failing.length} failures are infrastructure errors (server health, connectivity, device, shard that never ran); rerun when the environment recovers.`;
   if (failing.length >= cfg.infraMinFailures)
     return `${failing.length} tests failed in one run; check for a shared environment, build or product failure first.`;
+  if (isSmallSuiteStorm(failing.length, total))
+    return `${failing.length} of ${total} tests failed in one run; check for a shared environment, build or product failure first.`;
   return null;
 }
 
@@ -1262,7 +1265,7 @@ function evidenceFor(finding, evidence) {
 }
 
 // src/history.ts
-var HISTORY_RETRY_MS = [500, 1500, 4e3];
+var HISTORY_RETRY_MS = [1e3, 2500, 5e3];
 async function postHistory(fetchImpl, url, body) {
   let failure;
   for (let attempt = 0; attempt <= HISTORY_RETRY_MS.length; attempt++) {
@@ -1507,7 +1510,8 @@ async function dropStormRuns({
         try {
           const { test_stats: t } = await tsioJson(fetchImpl, base, `/reports/${encodeURIComponent(g)}`);
           const failed = t?.failed ?? 0;
-          (failed >= minFailures && failed * 10 >= (t?.total ?? 0) ? storms : quiet).add(g);
+          const executed = Math.max(0, (t?.total ?? 0) - (t?.skipped ?? 0));
+          (failed >= minFailures && failed * 10 >= (t?.total ?? 0) || isSmallSuiteStorm(failed, executed) ? storms : quiet).add(g);
         } catch {
         }
       });
@@ -1584,7 +1588,8 @@ async function markOutOfDate({
   until = null,
   log = () => {
   },
-  supportPaths = []
+  supportPaths = [],
+  fetchFileDiffs = false
 }) {
   if (!findings.length || !baseBranch) return { truncated: false };
   const cmp = await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`);
@@ -1646,11 +1651,29 @@ async function markOutOfDate({
     log(`${baseBranch} changed ${files.length}+ files since this PR last merged it, and the merge base has no date; ${rest.length} failure(s) unchecked`);
     return { truncated: true, unchecked: rest };
   }
-  log(`${baseBranch} changed ${files.length}+ files since this PR last merged it; checking the failing specs' directories instead`);
+  log(`${baseBranch} changed ${files.length}+ files since this PR last merged it; checking the failing specs' ${fetchFileDiffs ? "files and " : ""}directories instead`);
   const dirs = /* @__PURE__ */ new Map();
+  const filePatches = /* @__PURE__ */ new Map();
   const unchecked = [];
   for (const f of rest) {
     const path = f.repo_path ?? "";
+    if (fetchFileDiffs && path && (filePatches.has(path) || filePatches.size < 10)) {
+      if (!filePatches.has(path)) {
+        const q = new URLSearchParams({ sha: baseBranch, path, since, ...until ? { until } : {}, per_page: "5" });
+        const raw = await api("GET", `/repos/${id.repository}/commits?${q}`).catch(() => []);
+        const [c2, ...earlier] = (Array.isArray(raw) ? raw : []).filter((x) => x.sha !== base?.sha);
+        if (c2) {
+          const detail = await api("GET", `/repos/${id.repository}/commits/${c2.sha}`).catch(() => null);
+          const patch = detail?.files?.find((x) => x.filename === path)?.patch;
+          filePatches.set(path, { commit: commitRef(c2), also: earlier.slice(0, 4).map(commitRef), ...patch ? { diff: patch.slice(0, 4e3) } : {} });
+        } else filePatches.set(path, null);
+      }
+      const hit = filePatches.get(path);
+      if (hit) {
+        f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: hit.commit, ...hit.also.length ? { also: hit.also } : {}, ...hit.diff ? { diff: hit.diff } : {} };
+        continue;
+      }
+    }
     const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
     if (!dir) {
       unchecked.push(f);
@@ -2136,7 +2159,8 @@ Rules:
 - Cite only evidence items by their id from the pack. Never invent commits, versions, files or errors.
 - test_bug with high confidence requires base_change with a diff that fixes what this failure shows.
 - server_compat with high confidence requires other_platforms showing this test passing against another server version
-  on this build, and failing against this lane's version.
+  on this build, and failing against this lane's version. Passing on another OS against the SAME server version rules out
+  server_compat and points to flaky_environment (for example, a shared-server config race or runner timing).
 - flaky_environment with high confidence requires cross_pr or an error that is clearly infrastructural; it is ruled out
   when the test failed every try here and failed on every other lane.
 - app_bug: the error is about the app's behavior and no evidence points to the test, the environment or a server
@@ -2376,9 +2400,13 @@ function canChange(cls, pack, isTrunkRun = false) {
   return false;
 }
 function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
-  if (!answer || pack.release) return false;
+  if (!answer) return false;
   const known = new Set(evidenceIds(pack));
   const cited = answer.cited_evidence.filter((c) => known.has(c));
+  if (pack.release) {
+    if (answer.confidence < cfg.escalateMin || answer.confidence >= cfg.minConfidence) return false;
+    return answer.cause === "app_bug" || decideRelease({ ...answer, confidence: cfg.minConfidence }, pack, cfg).decision === "adjudicator_unblock";
+  }
   const hunk = cited.some((c) => c.startsWith("hunk_"));
   if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
   if (answer.confidence < cfg.escalateMin) return false;
@@ -2546,7 +2574,8 @@ async function evaluateRun({
 }) {
   const isTrunkRun = prNumber == null;
   const tests = run.failing.filter((t) => !isShardPlaceholder(t));
-  const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg), counts: run.counts, ai: newLedger(), missing: null };
+  const executed = Math.max(0, run.counts.total - run.counts.skipped);
+  const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg, executed || void 0), counts: run.counts, ai: newLedger(), missing: null };
   const changedFiles = new Set((diff.files ?? []).map((f) => f.filename));
   const editedBy = (file) => {
     const path = repoPath(testRoot, file);
@@ -2576,7 +2605,11 @@ async function evaluateRun({
         patches: diff.ok ? files : null
       });
     });
-    if (result.infra) {
+    const nonProductOnly = Boolean(prNumber) && diff.ok && files.length > 0 && files.every((f) => {
+      const cat = changeCategory(f.filename, changeContext);
+      return cat === "ci" || cat === "docs" || cat === "other" || !isProductChange(f.filename);
+    });
+    if (result.infra && (!isTrunkRun || Boolean(branchBase)) && !nonProductOnly) {
       const why = /infrastructure errors/.test(result.infra) ? "most of this run failed on its environment" : "many tests failed in this run";
       for (const f of result.findings)
         if (f.class === "INFRA_ERROR" && !f.blocking)
@@ -2726,7 +2759,10 @@ function settlePR(findings, changed, ownershipKnown, flagged, files = [], minTru
     const everyTry = Boolean(f.tries && f.tries.ran >= 2 && f.tries.failed === f.tries.ran);
     const elsewhere = f.failed_everywhere?.length ? f.failed_everywhere : null;
     const trunkClean = Boolean(t && t.runs >= minTrunkRuns && (t.lane_runs ?? t.runs) >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
-    if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length) {
+    const passedElsewhere = Boolean(f.other_lanes?.length) && f.other_lanes.some((l) => l.result === "passed") && !f.other_lanes.some((l) => l.result !== "passed" && l.result !== "skipped");
+    const platformChange = changed.some((name) => /(?:^|\/)(?:ios|android|macos|windows|linux)\/|\.(?:ios|android|macos|win32|linux)\./i.test(name));
+    const judgeClearsEnv = Boolean(f.judge && (f.judge.cause === "flaky_environment" || f.judge.cause === "bug_on_master") && f.judge.confidence >= 0.7 && !f.judge.cited_evidence.some((c) => c.startsWith("hunk_")));
+    if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length && !(passedElsewhere && !platformChange) && !judgeClearsEnv) {
       Object.assign(f, {
         untouched: true,
         decision: "reproducible_regression",
@@ -3770,7 +3806,7 @@ function errorLines(lines, max = 5) {
   }
   return [...counts.values()].sort((a, b) => b.n - a.n).slice(0, max).map((c) => c.line);
 }
-async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runnerName, prefix: given, log }) {
+async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runnerName, prefix: given, filter, log }) {
   const get = async (path) => {
     let last = null;
     for (let i = 0; i < 3; i++) {
@@ -3792,7 +3828,9 @@ async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runn
     const own = all.find((j) => j.runner_name === runnerName && j.status !== "completed");
     if (own) prefix = lanePrefixOf(own.name);
   }
-  const lane = prefix ? all.filter((j) => j.name.startsWith(prefix)) : all;
+  const tokens2 = String(filter ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const byPrefix = prefix ? all.filter((j) => j.name.startsWith(prefix)) : all;
+  const lane = tokens2.length ? byPrefix.filter((j) => tokens2.some((t) => j.name.toLowerCase().includes(t))) : byPrefix;
   const failedStep = (j) => j.steps?.find((s) => s.conclusion === "failure") ?? j.steps?.find((s) => s.conclusion === "cancelled" || s.conclusion === "timed_out") ?? null;
   let workerLogs = 0;
   const out = [];
@@ -3843,6 +3881,7 @@ async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRu
       attempt: runAttempt,
       runnerName: env.RUNNER_NAME ?? null,
       prefix: env.LANE_JOB_PREFIX || null,
+      filter: env.LANE_JOB_FILTER || null,
       log
     });
   } catch (e) {
@@ -4133,7 +4172,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       // A release run's matrix (OS x server version) is wider than a PR's platforms.
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log, limit: branchBase ? 20 : 5 }),
-      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths }),
+      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths, fetchFileDiffs: Boolean(branchBase) }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory

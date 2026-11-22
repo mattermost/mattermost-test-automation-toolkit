@@ -103,10 +103,13 @@ export function canChange(cls: string, pack: Pack, isTrunkRun = false): boolean 
 // one that blames the PR without the change that would explain it, which the judge's
 // rules forbid and which would otherwise keep a failure red on no evidence.
 function nearMiss(cls: string, answer: Answer | null | undefined, pack: Pack, cfg: Config, isTrunkRun: boolean): boolean {
-  // A release run's answer is not escalated: the second model's question would be the PR one.
-  if (!answer || pack.release) return false;
+  if (!answer) return false;
   const known = new Set(evidenceIds(pack));
   const cited = answer.cited_evidence.filter((c) => known.has(c));
+  if (pack.release) {
+    if (answer.confidence < cfg.escalateMin || answer.confidence >= cfg.minConfidence) return false;
+    return answer.cause === "app_bug" || decideRelease({ ...answer, confidence: cfg.minConfidence }, pack, cfg).decision === "adjudicator_unblock";
+  }
   const hunk = cited.some((c) => c.startsWith("hunk_"));
   if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
   if (answer.confidence < cfg.escalateMin) return false;

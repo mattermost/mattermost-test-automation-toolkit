@@ -96,8 +96,8 @@ export function errorLines(lines: string[], max = 5): string[] {
  * a run can hold several lanes. Every dead job outside the lane's own result jobs has its failed step's log read, up
  * to ten test workers (they fail alike when they fail together). Needs `actions: read`.
  */
-export async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runnerName, prefix: given, log }: {
-  fetchImpl: FetchImpl; token: string; repository: string; runId: string; attempt: string; runnerName?: string | null; prefix?: string | null; log: (message: string) => void;
+export async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runnerName, prefix: given, filter, log }: {
+  fetchImpl: FetchImpl; token: string; repository: string; runId: string; attempt: string; runnerName?: string | null; prefix?: string | null; filter?: string | null; log: (message: string) => void;
 }): Promise<LaneJobs> {
   const get = async (path: string): Promise<Response> => {
     let last: Error | null = null;
@@ -120,7 +120,9 @@ export async function readLaneJobs({ fetchImpl, token, repository, runId, attemp
     const own = all.find((j) => j.runner_name === runnerName && j.status !== "completed");
     if (own) prefix = lanePrefixOf(own.name);
   }
-  const lane = prefix ? all.filter((j) => j.name.startsWith(prefix)) : all;
+  const tokens = String(filter ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const byPrefix = prefix ? all.filter((j) => j.name.startsWith(prefix)) : all;
+  const lane = tokens.length ? byPrefix.filter((j) => tokens.some((t) => j.name.toLowerCase().includes(t))) : byPrefix;
   const failedStep = (j: GhJob) => j.steps?.find((s) => s.conclusion === "failure") ?? j.steps?.find((s) => s.conclusion === "cancelled" || s.conclusion === "timed_out") ?? null;
   let workerLogs = 0;
   const out: LaneJob[] = [];
