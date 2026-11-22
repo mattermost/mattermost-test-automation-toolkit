@@ -64,8 +64,8 @@ def hunter_system(mode: str, state: dict[str, Any], ctx: dict[str, Any], strateg
     common = prompt("common").replace("{lang_rules}", lang_rules).replace("{lessons}", lessons.render(lessons.match(ctx)))
     rules = reliability.render(reliability.match(ctx)) if mode.startswith("A") else ""
     extra = prompt("strategy_x") if strategies else ""
-    if mode == "A" and "go" in langs(state) and os.environ.get("HUNT_FUZZ") == "1":
-        extra += prompt("fuzz")  # only when `run.py fuzz` will run: otherwise the targets would be dead code
+    if mode == "A" and "go" in langs(state) and os.environ.get("HUNT_FUZZ") != "0":
+        extra += prompt("fuzz")  # `run.py run` fuzzes them unless HUNT_FUZZ=0; otherwise the targets would be dead code
     return prompt(f"mode_{mode.lower()}") + rules + extra + common
 
 

@@ -1,0 +1,10 @@
+{
+ "_note": "SELF-TEST FIXTURE: hand-written stand-in for a hunter response, never used as hunt output.",
+ "files": [
+  {
+   "path": "calc/hunt_hunta_test.go",
+   "content": "package calc\n\nimport (\n\t\"strings\"\n\t\"testing\"\n)\n\n// Calls ClampAll, which only head has; fails on head because ClampAll does not clamp.\nfunc TestHuntA_ClampAllClamps(t *testing.T) {\n\tgot := ClampAll([]int{-5, 50}, 0, 10)\n\tif got[0] != 0 || got[1] != 10 {\n\t\tt.Fatalf(\"%s: ClampAll = %v\", strings.TrimSpace(\" bad \"), got)\n\t}\n}\n\n// Also needs ClampAll, but passes on head: nothing to vet.\nfunc TestHuntA_ClampAllEmpty(t *testing.T) {\n\tif got := ClampAll(nil, 0, 10); len(got) != 0 {\n\t\tt.Fatalf(\"ClampAll(nil) = %v\", got)\n\t}\n}\n\n// Base APIs only: Clamp(10, 0, 10) must be 10 (head returns 9).\nfunc TestHuntA_ClampKeepsUpperBound(t *testing.T) {\n\tif got := Clamp(10, 0, 10); got != 10 {\n\t\tt.Fatalf(\"Clamp(10, 0, 10) = %d, want 10\", got)\n\t}\n}\n"
+  }
+ ],
+ "tests": []
+}

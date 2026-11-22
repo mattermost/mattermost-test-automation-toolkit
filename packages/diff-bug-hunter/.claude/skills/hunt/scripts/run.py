@@ -7,8 +7,9 @@ usage: run.py run <pr> <A|B|A2>        3 runs on unmodified PR head (Go with -ra
        run.py base <pr> <A|B|A2>       the same tests once on the merge-base worktree; writes base_<tag>.json
        run.py cover <pr> <A|A2>        each test alone with coverage (no -race); writes run_<tag>.coverage.json: which
                                        changed lines it reaches, VACUOUS if none (then it kills no mutant)
-       run.py fuzz <pr> A              HUNT_FUZZ=1 only: fuzz pure FuzzHuntA_<Name> targets (HUNT_FUZZ_TIME, default 60s);
-                                       a failure is frozen into TestHuntA_<Name>_Fuzz<hash> in A/response.json; writes fuzz_A.json
+       run.py fuzz <pr> A              fuzz pure FuzzHuntA_<Name> targets (HUNT_FUZZ_TIME, default 60s); a failure is frozen
+                                       into TestHuntA_<Name>_Fuzz<hash> in A/response.json; writes fuzz_A.json. `run A`
+                                       does this itself before its 3 runs; HUNT_FUZZ=0 turns both off
        run.py mutants <pr> <A|A2|PR>   compile-check then score every mutant (M, then held-back M2); writes mutants_<tag>.json
 Run these one at a time, and not while prepare.py or ctx.py runs for the same PR (they share the worktrees and hunt dir;
 a lock enforces it). Long runs belong in the background.
@@ -66,6 +67,14 @@ MISSING_ON_BASE = re.compile(r"is not a function|is not defined|is not a constru
 
 class CompileError(RuntimeError):
     pass
+
+
+class GoBuildError(CompileError):
+    """`go test` could not build one package of hunter tests; `pkg_dir` is that package's directory in the worktree."""
+
+    def __init__(self, msg: str, pkg_dir: str) -> None:
+        super().__init__(msg)
+        self.pkg_dir = pkg_dir
 
 
 @dataclass
@@ -224,7 +233,7 @@ def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome) -> Non
         got = {f"{d}::{m.group(2)}": m.group(1) for m in RESULT_GO.finditer(out) if "/" not in m.group(2)}
         if not got:
             if "[build failed]" in out or "[setup failed]" in out:
-                raise CompileError(f"{pkg}:\n{out[-2500:]}")
+                raise GoBuildError(f"{pkg}:\n{out[-2500:]}", d)
             if p.returncode != 0 and "=== RUN" in out:
                 # A test started and the binary died before any result line (panic in a goroutine, timeout):
                 # that is a test failure, not an environment problem.
@@ -345,6 +354,12 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
         write_json(hdir / f"run_{tag}.json", {})
         (hdir / f"run_{tag}.response.sha256").write_text(fingerprint(files))
         return {}
+    if tag == "A" and fuzz_enabled() and any(str(f.get("path", "")).endswith(".go") and FUZZ_TARGET.search(
+            str(f.get("content", ""))) for f in files):
+        # Discovery first: a failing input is frozen into the response, so the runs below (and cover and base, which
+        # fingerprint these files) see it as an ordinary test.
+        cmd_fuzz(hdir, state, tag)
+        files = load_json(hdir / tag / "response.json")["files"]
     placed: list[Path] = []
     outcomes = []
     try:
@@ -362,6 +377,115 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
     return table
 
 
+GO_ERROR = re.compile(r"^(\S+?\.go):(\d+):\d+: (.+)$", re.M)
+GO_UNDEFINED = re.compile(r"^(?:undefined: (\S+)|(\S+) undefined \()")
+GO_UNUSED_IMPORT = re.compile(r'^"[^"]+" imported (?:as \S+ )?and not used')
+JS_MISSING = re.compile(r"\(0 , (?:\w+\.)?(\w+)\) is not a function|(\S+) is not a function|(\w+) is not defined|"
+                        r"Cannot find module '([^']+)'")
+MAX_SALVAGE_ROUNDS = 3  # rounds that remove tests; dropping an import a removal left unused is not counted
+
+
+def go_build_errors(wt: Path, d: str) -> str:
+    """Every compiler error of one package's tests (-gcflags=-e lifts the default cap of 10)."""
+    root = go_root(wt, d)
+    p = sh(["go", "test", "-c", "-o", os.devnull, "-gcflags=-e", "./" + os.path.relpath(wt / d, root)], root,
+           check=False, timeout=900)
+    return p.stdout + p.stderr
+
+
+def undefined_names(msg: str) -> list[str]:
+    m = GO_UNDEFINED.match(msg)
+    return [g for g in m.groups() if g] if m else []
+
+
+def go_repair(wt: Path, placed: list[Path], d: str) -> tuple[dict[str, list[str]], bool] | None:
+    """Remove from the placed copies in package dir `d` the top-level funcs that the base compiler rejects, with every
+    helper-dependent func, and drop imports that a removal left unused. Removed lines are blanked, so later error line
+    numbers stay valid. Returns ({test identity: undefined identifiers} for removed tests, whether any func was
+    removed), or None when an error lies outside any placed hunter func (nothing can be salvaged then)."""
+    root = go_root(wt, d)
+    mine = {p.resolve(): p for p in placed if p.suffix == ".go" and p.parent.resolve() == (wt / d).resolve()}
+    by_func: dict[Path, dict[str, list[str]]] = {}   # file -> func -> messages
+    drop_import: dict[Path, set[int]] = {}
+    texts = {p: p.read_text().split("\n") for p in mine.values()}
+    blocks = {p: top_blocks(texts[p], "go") for p in mine.values()}
+    for m in GO_ERROR.finditer(go_build_errors(wt, d)):
+        f = (root / m.group(1)).resolve()
+        line, msg = int(m.group(2)), m.group(3).strip()
+        if f not in mine:
+            return None
+        p = mine[f]
+        if GO_UNUSED_IMPORT.match(msg):
+            drop_import.setdefault(p, set()).add(line)
+            continue
+        owner = next((sym for sym, a, b in blocks[p] if a <= line <= b), None)
+        if owner is None:
+            return None
+        by_func.setdefault(p, {}).setdefault(owner, []).append(msg)
+    if not by_func and not drop_import:
+        return None
+    removed: dict[str, list[str]] = {}
+    cut = False
+    for p, funcs in by_func.items():
+        idents: dict[str, list[str]] = {}
+        for sym, msgs in funcs.items():
+            idents[sym] = sorted({n for m in msgs for n in undefined_names(m)}) or msgs[:1]
+        # a removed helper takes down every func that mentions it, which inherit the helper's identifiers
+        spans = {sym: (a, b) for sym, a, b in blocks[p]}
+        grew = True
+        while grew:
+            grew = False
+            for sym in [s for s in idents if not s.split(".")[-1].startswith("TestHunt")]:
+                word = re.compile(rf"\b{re.escape(sym.split('.')[-1])}\b")
+                for other, (a, b) in spans.items():
+                    if other not in idents and word.search("\n".join(texts[p][a - 1:b])):
+                        idents[other] = idents[sym]
+                        grew = True
+        for sym, (a, b) in ((s, spans[s]) for s in idents):
+            texts[p][a - 1:b] = [""] * (b - a + 1)
+            cut = True
+            if sym.startswith("Test"):
+                removed[f"{d}::{sym}"] = idents[sym]
+    for p, nums in drop_import.items():
+        for n in nums:
+            texts[p][n - 1] = ""
+    for p, rows in texts.items():
+        p.write_text("\n".join(rows))
+    return removed, cut
+
+
+def salvage_go(wt: Path, state: dict[str, Any], tag: str, placed: list[Path]) -> tuple[Outcome, dict[str, list[str]]]:
+    """run_suite on the merge-base, but a Go test file that does not build there loses only the funcs the compiler
+    rejects (the placed copies, never response.json) and is retried, up to MAX_SALVAGE_ROUNDS rounds. Returns the
+    outcome of what remained and {removed test identity: identifiers it could not resolve}."""
+    gone: dict[str, list[str]] = {}
+    rounds = fixups = 0
+    while True:
+        live = [p for p in placed if p.exists()]
+        for p in live:  # a file left without a TestHunt<mode>_ func has nothing to run
+            if p.suffix == ".go" and not re.search(rf"^func TestHunt{tag[0]}_\w*\(", p.read_text(), re.M):
+                p.unlink()
+        live = [p for p in placed if p.exists()]
+        suite = suite_for(tag, state, live, wt)
+        if suite.empty():
+            return Outcome(), gone
+        try:
+            return run_suite(wt, suite, race=True), gone
+        except GoBuildError as e:
+            fixed = go_repair(wt, live, e.pkg_dir) if rounds < MAX_SALVAGE_ROUNDS and fixups < 3 else None
+            if fixed is None:
+                raise
+            gone.update(fixed[0])
+            if fixed[1]:
+                rounds += 1
+            else:
+                fixups += 1  # only imports changed: mechanical, so it does not use up a round
+
+
+def jest_missing(msg: str) -> list[str]:
+    return sorted({x for m in JS_MISSING.findall(msg) for x in m if x})[:5]
+
+
 def base_verdict(name: str, base_status: str, head: dict[str, str], head_msgs: dict[str, str], base_msg: str) -> str:
     """Only a test that failed 3/3 on head gets a bug verdict; anything else is labelled as not a failure."""
     if head.get(name) != "FAIL_3_OF_3":
@@ -374,7 +498,7 @@ def base_verdict(name: str, base_status: str, head: dict[str, str], head_msgs: d
         return "PRE_EXISTING"
     if MISSING_ON_BASE.search(base_msg):
         # Jest (Babel, no type check) loads a test of a function the PR adds; on base it fails as "not a function".
-        return "BASE_UNCOMPILABLE"
+        return "NEW_API"
     return "BASE_FAILS_DIFFERENTLY"  # decide from the diff, as for BASE_UNCOMPILABLE
 
 
@@ -395,9 +519,12 @@ def base_table(head: dict[str, str], head_msgs: dict[str, str], o: Outcome) -> d
     return out
 
 
-def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, str]:
+def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     """NEW_PR_BUG: failed 3/3 on head, passes on base. PRE_EXISTING: fails with the same normalized failure on base.
-    BASE_UNCOMPILABLE / BASE_FAILS_DIFFERENTLY / NOT_RUN_ON_BASE: decide from the diff. NOT_A_HEAD_FAILURE: nothing
+    NEW_API: failed 3/3 on head and cannot run on base because it uses an API the PR adds (a Go test the base compiler
+    rejects is cut from the placed copy and the rest is vetted; a Jest test that fails as "not a function"); the
+    undefined names are in the "new_api" key. It is not a bug by itself: root-cause it. BASE_UNCOMPILABLE ("*": nothing
+    could be salvaged) / BASE_FAILS_DIFFERENTLY / NOT_RUN_ON_BASE: decide from the diff. NOT_A_HEAD_FAILURE: nothing
     to vet."""
     wt = Path(state["wt_base"])
     ensure_clean(wt)
@@ -411,12 +538,23 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, str]:
     head = load_json(hdir / f"run_{tag}.json")
     head_msgs = (load_json(hdir / f"run_{tag}.messages.json")
                  if (hdir / f"run_{tag}.messages.json").exists() else {})
-    out: dict[str, str] = {}
+    out: dict[str, Any] = {}
     placed: list[Path] = []
     try:
         if files:
             placed = place(wt, files, {t["dir"] for t in state["targets"]})
-            out = base_table(head, head_msgs, run_suite(wt, suite_for(tag, state, placed, wt), race=True))
+            o, gone = salvage_go(wt, state, tag, placed)
+            out.update(base_table(head, head_msgs, o))
+            new_api: dict[str, list[str]] = {}
+            for n, idents in gone.items():  # removed from the base copies: vetted by what head said about them
+                out[n] = "NEW_API" if head.get(n) == "FAIL_3_OF_3" else "NOT_A_HEAD_FAILURE"
+                if out[n] == "NEW_API":
+                    new_api[n] = idents
+            for n, v in list(out.items()):
+                if v == "NEW_API" and n not in new_api:  # Jest: the failure text names what is missing
+                    new_api[n] = jest_missing(o.messages.get(n, ""))
+            if new_api:
+                out["new_api"] = new_api
     except CompileError as e:
         out = {"*": "BASE_UNCOMPILABLE", "detail": str(e)[-800:]}
     finally:
@@ -654,13 +792,17 @@ def vacuous_tests(hdir: Path, tag: str) -> set[str]:
     return {n for n, t in load_json(p)["tests"].items() if t["verdict"] == "VACUOUS" and t.get("head") != "FAIL_3_OF_3"}
 
 
-# ---------------------------------------------------------------- Go fuzzing (discovery only, HUNT_FUZZ=1)
+# ---------------------------------------------------------------- Go fuzzing (discovery only; HUNT_FUZZ=0 turns it off)
 
 MAX_FUZZ_TARGETS = 5
 FUZZ_TARGET = re.compile(r"^func (FuzzHunt([A-Z])_(\w+))\(\w+ \*testing\.F\)", re.M)
 STATEFUL = re.compile(r"\bSetup(?:WithStoreMock|Config|WithServerOptions)?\(|\bmainHelper\b|\bsql\.Open\(|\bhttp\.(?:Get|Post)\(")
 # A corpus value we can paste back as a Go expression: int(5), string("a\x00"), []byte("x"), bool(true), rune('a').
 CORPUS_VALUE = re.compile(r"^(?:\[\]byte|string|bool|byte|rune|u?int(?:8|16|32|64)?|float(?:32|64))\(.*\)$")
+
+
+def fuzz_enabled() -> bool:
+    return os.environ.get("HUNT_FUZZ") != "0"
 
 
 def fuzz_time() -> str:
@@ -697,8 +839,8 @@ def cmd_fuzz(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     """Fuzz each pure FuzzHuntA_<Name> target briefly. A failure is not a finding: its minimized input is frozen into a
     deterministic TestHuntA_<Name>_Fuzz<hash> that calls huntCheckA_<Name>, appended to <tag>/response.json, and
     must then go through `run.py run` (3/3), `cover` and `base` like any hunter test."""
-    if os.environ.get("HUNT_FUZZ") != "1":
-        raise InfraError("fuzzing is off: set HUNT_FUZZ=1 to run it")
+    if not fuzz_enabled():
+        raise InfraError("fuzzing is off: HUNT_FUZZ=0 is set")
     if tag != "A":
         raise InfraError(f"fuzz is for Mode A only, not {tag}")
     wt = Path(state["wt"])
@@ -720,6 +862,8 @@ def cmd_fuzz(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
                 report["targets"][name] = "SKIPPED wrong mode"
             elif check is None:
                 report["targets"][name] = f"SKIPPED no huntCheck{mode}_{base}(t, ...) helper to freeze into"
+            elif f"func TestHunt{mode}_{base}_Fuzz" in "".join(str(g.get("content", "")) for g in resp["files"]):
+                report["targets"][name] = "SKIPPED already frozen by an earlier run"  # a rerun must not re-add or re-wait
             elif STATEFUL.search(body):
                 report["targets"][name] = "SKIPPED stateful (Setup, store, network): only pure functions are fuzzed"
             elif len(candidates) >= MAX_FUZZ_TARGETS:
@@ -796,7 +940,8 @@ def main(argv: list[str]) -> int:
                     print(f"[{tag}] no tests in the hunter response")
             elif cmd == "base":
                 for n, c in cmd_base(hdir, state, tag).items():
-                    print(f"[{tag} @merge-base] {n}: {c if n != 'detail' else c[:300]}")
+                    shown = c[:300] if n == "detail" else c
+                    print(f"[{tag} @merge-base] {n}: {shown}")
             elif cmd == "cover":
                 cov = cmd_cover(hdir, state, tag)
                 for n, t in cov["tests"].items():
