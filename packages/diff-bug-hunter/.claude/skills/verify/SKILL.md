@@ -51,5 +51,19 @@ single `failure.png` only if the run FAILs. Hand its path to the user and never 
      checking app content.
 4. **Iterate:** on `FAIL`, read the failure snapshot and fix the plan only when the plan was wrong (wrong name, wrong
    region). Never relax an `expect` to make it pass. Stop after 3 runs.
-5. **Report in chat:** the plan, the verdict line, the snapshot lines that prove it, and the frozen spec path if any. A `FAIL` caused by the app is a
+5. **Compare (differential oracle):** when a base server (before the change) and a head server (with it) are both
+running, the oracle must come from code, not from you or the PR text. Add `{"capture": {"api": "/api/v4/config"}}`
+steps (GET an `/api/v4/` path, record the body, assert nothing) and snapshots, keep at least one `expect`, then run
+`node <this dir>/scripts/verify_ui.mjs plan.json --compare <base_url>`; the usual target (`VERIFY_BASE_URL` / `base_url`)
+is the head. Same steps, same credentials, both servers. Ids, timestamps, version/build fields and origins are
+normalised away; add `"ignore": ["json.path"]` for other known noise.
+- Output: `DIFF <step#> <json-path>: base=<v> head=<v>` lines, then `VERDICT: SAME` (exit 0), `DIFF` or `REGRESSION`
+(an `expect` passes on base, fails on head; exit 1), `FAIL` (a step failed; page errors and 5xx are diffed, not fatal, so noise both servers share is not a difference) or exit 2 `INVALID_PLAN` /
+`INFRA_ERROR`. `--freeze` is not supported with `--compare`.
+- **Rule:** every `DIFF` must be explained by the PR (the diff or its description names that field or behaviour) or it
+is a finding: report path, base value, head value. Never add an `ignore` just to silence one. A diff between two
+different releases also holds version noise; judge each line, do not dismiss them all.
+- The runner pre-sets `__landingPageSeen__` in localStorage, so logged-in plans land on the app instead of the
+"Where would you like to view this?" desktop-app prompt.
+6. **Report in chat:** the plan, the verdict line, the snapshot lines that prove it, and the frozen spec path if any. A `FAIL` caused by the app is a
    finding: give the steps to reproduce it.

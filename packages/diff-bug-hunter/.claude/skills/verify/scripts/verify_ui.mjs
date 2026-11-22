@@ -6,6 +6,7 @@
 // given, and then exactly one, failure.png, only when the run FAILs, for a person to look at; the agent never reads it.
 //
 // usage: verify_ui.mjs <plan.json> [--freeze <dir>/<name>.spec.ts] [--screenshot-on-fail]
+//        verify_ui.mjs <plan.json> --compare <base_url>
 //        verify_ui.mjs --feature-map <route or feature> [FEATURE_MAP.md]
 // Exit codes: 0 PASS, 1 FAIL (an expectation, a page error, a >= 500 /api/v4/ response, a request still running at the
 // settle deadline, or leaving the allowed origins), 2 INVALID_PLAN or INFRA_ERROR. Errors print only their first line
@@ -15,6 +16,31 @@
 // that refuses other origins, so not even a redirect hop reaches them), every step and the final check wait for
 // in-flight requests to settle, and success is a deterministic DOM or /api/v4/ check, never a model's judgement.
 // --freeze writes a passing plan as a @playwright/test spec with the same oracle, so the check reruns with no model.
+//
+// Compare mode (--compare <base_url>): the differential oracle. The same plan runs against the usual target (the "head":
+// plan.base_url / $VERIFY_BASE_URL / $MM_URL) and against <base_url> (the "base"), one after the other, with the same
+// credentials env and the same steps. Code decides, never a model: every {"capture": {"api": PATH}} body, every snapshot
+// and every expect result of the two runs is compared after normalisation (26-character ids, *_at / *At / timestamp
+// fields, ISO dates and clock times, version / build fields, the two origins and any localhost / 127.0.0.1 port, plus the plan's
+// "ignore" paths). Output is one `DIFF <step#> <json-path>: base=<v> head=<v>` line per difference (expects print as
+// `DIFF expect<N> result: ...`), then one verdict line:
+//   VERDICT: SAME        nothing differs                                                   exit 0
+//   VERDICT: DIFF        only captures / snapshots / expects that fail on base but pass on head differ   exit 1
+//   VERDICT: REGRESSION  an expect passes on base and fails on head                       exit 1
+//   VERDICT: FAIL ...    a run itself failed (a step that fails, a request still running at the deadline, leaving the
+//                        allowed origins). A base run that fails is reported as `FAIL base run failed`.   exit 1
+// Unlike a plain run, compare mode does not stop at an unmet expect, a page error or a >= 500 /api/v4/ response: it records
+// them and diffs them (`DIFF run problem: base=<absent> head="pageerror: ..."`), so noise that both servers share (e.g. a
+// plugin that throws) is not a difference, and the same problem on only one side is.
+//   VERDICT: INVALID_PLAN / INFRA_ERROR   (either server, named in the message)           exit 2
+// The base URL comes from the command line only, never from the plan, so a plan cannot send credentials anywhere. A DIFF
+// is not a failure by itself: explain each one from the PR, or it is a finding. --freeze is not supported with --compare.
+//
+// Landing page: before the first navigation the runner sets localStorage `__landingPageSeen__` on the server's origin, so
+// the webapp does not redirect to the "Where would you like to view this?" desktop-app prompt (/landing). Mattermost
+// reads it in BrowserStore.hasSeenLandingPage() (webapp/channels/src/stores/browser_store.tsx:75, constant
+// StoragePrefixes.LANDING_PAGE_SEEN in utils/constants.tsx; checked in root.tsx's redirectToLandingPageIfNecessary,
+// v11.0.2 root.tsx:147); any non-empty value counts, the app itself stores "true". Frozen specs set it the same way.
 //
 // Target (a server root, http or https, no user:password): plan.base_url, else $VERIFY_BASE_URL, else $MM_URL, else
 // http://localhost:8065; a malformed environment value is INFRA_ERROR. With credentials set, a
@@ -40,13 +66,18 @@
 //   "steps": [ at most MAX_STEPS of, each with exactly one action:
 //     {"goto": "/team/channels/town-square"} (a path) | {"click": LOC} | {"fill": LOC, "value": "text"} |
 //     {"press": "Enter", "on"?: LOC} | {"select": LOC, "value": "x"} | {"check": LOC} | {"wait_for": LOC} |
-//     {"snapshot": LOC | null} ],
+//     {"snapshot": LOC | null} | {"capture": {"api": "/api/v4/config"}} ],
+//   "ignore": ["json.path", ...],                 (optional, compare mode: capture paths to skip; "." joins keys, "[0]"
+//                                                  indexes arrays, "*" matches any run of characters, a path also
+//                                                  covers everything under it)
 //   "expect": [ at least one of
 //     {"visible": LOC} | {"text": LOC, "contains": "x"} | {"count": LOC, "min"?: 1} |
 //     {"api": {"path": "/api/v4/users/me", "status"?: 200, "json_has"?: {"username": "sysadmin"}}} ]
 // }
 // LOC: exactly one of {"role": "button", "name"?: "Save", "exact"?: true} | {"testid"} | {"label"} | {"placeholder"} |
 //      {"text"} | {"css"}, plus an optional integer "nth" (not in "count", which counts every match).
+// "capture" does a GET of an /api/v4/ path (same checks as api.path, same credentials) and records the JSON body without
+// asserting anything; only compare mode uses it, a plain run just reports the status.
 // "goto" and "api.path" are checked after URL resolution: they must stay on the server, and api.path under /api/v4/.
 
 import {createRequire} from 'node:module';
@@ -64,9 +95,10 @@ const DEFAULT_SETTLE_MS = 10000;
 const DEFAULT_BASE = 'http://localhost:8065';
 const LOC_KINDS = ['role', 'testid', 'label', 'placeholder', 'text', 'css'];
 const STEP_EXTRAS = {goto: [], click: [], fill: ['value'], press: ['on'], select: ['value'], check: [], wait_for: [],
-    snapshot: []};
+    snapshot: [], capture: []};
 const EXPECT_EXTRAS = {visible: [], text: ['contains'], count: ['min'], api: []};
-const TOP_KEYS = ['name', 'base_url', 'login', 'scope', 'allow_origins', 'steps', 'expect'];
+const TOP_KEYS = ['name', 'base_url', 'login', 'scope', 'allow_origins', 'steps', 'expect', 'ignore'];
+const MAX_DIFFS = 200;
 
 class PlanError extends Error {}
 class InfraError extends Error {}
@@ -126,6 +158,11 @@ function staysOn(p, origin) {
     } catch {
         return false;
     }
+}
+
+// Checked after URL resolution too: "/api/v4/../../x" or a stray tab must not reach a non-API handler.
+function isApiPath(p, origin) {
+    return nonEmpty(p) && p.startsWith('/api/v4/') && staysOn(p, origin) && new URL(p, origin).pathname.startsWith('/api/v4/');
 }
 
 function checkLocator(loc, where) {
@@ -199,6 +236,9 @@ export function validatePlan(plan, env = process.env) {
     if ('scope' in plan) {
         checkLocator(plan.scope, 'scope');
     }
+    if ('ignore' in plan && !(Array.isArray(plan.ignore) && plan.ignore.every(nonEmpty))) {
+        throw new PlanError('ignore must be an array of non-empty json-path strings');
+    }
     const allowOrigins = plan.allow_origins ?? [];
     if (!Array.isArray(allowOrigins)) {
         throw new PlanError('allow_origins must be an array');
@@ -240,6 +280,14 @@ export function validatePlan(plan, env = process.env) {
             if (s.snapshot !== null) {
                 checkLocator(s.snapshot, where);
             }
+        } else if (action === 'capture') {
+            const keys = isObj(s.capture) ? Object.keys(s.capture) : [];
+            if (keys.length !== 1 || keys[0] !== 'api') {
+                throw new PlanError(`${where}: capture takes exactly {"api": "/api/v4/..."}`);
+            }
+            if (!isApiPath(s.capture.api, origin)) {
+                throw new PlanError(`${where}: capture.api must be a path under /api/v4/ (got ${JSON.stringify(s.capture.api)})`);
+            }
         } else {
             checkLocator(s[action], where);
             if ((action === 'fill' || action === 'select') && typeof s.value !== 'string') {
@@ -258,9 +306,7 @@ export function validatePlan(plan, env = process.env) {
             if (!isObj(api) || Object.keys(api).some((k) => !['path', 'status', 'json_has'].includes(k))) {
                 throw new PlanError(`${where}: api takes only path, status and json_has`);
             }
-            // Checked after URL resolution too: "/api/v4/../../x" or a stray tab must not reach a non-API handler.
-            if (!nonEmpty(api.path) || !api.path.startsWith('/api/v4/') || !staysOn(api.path, origin) ||
-                !new URL(api.path, origin).pathname.startsWith('/api/v4/')) {
+            if (!isApiPath(api.path, origin)) {
                 throw new PlanError(`${where}: api.path must be a path under /api/v4/ (got ${JSON.stringify(api.path)})`);
             }
             if ('status' in api && !(Number.isInteger(api.status) && api.status >= 100 && api.status < 500)) {
@@ -567,6 +613,18 @@ function originOf(url) {
 
 // ---------------------------------------------------------------- the run
 
+// Runs in the page before any script (Playwright serialises it, so it must stay self-contained): the webapp redirects
+// to /landing unless localStorage `__landingPageSeen__` is set. Only the server's own origin gets the key.
+function landingPageSeen(origin) {
+    try {
+        if (location.origin === origin) {
+            localStorage.setItem('__landingPageSeen__', 'true');
+        }
+    } catch {
+        // about:blank or storage blocked: nothing to set
+    }
+}
+
 async function runStep(page, base, step) {
     if ('goto' in step) {
         await page.goto(new URL(step.goto, base).toString(), {waitUntil: 'domcontentloaded'});
@@ -626,6 +684,26 @@ async function poll(read, ok) {
     return value;
 }
 
+// No redirects: an answer from another host must never satisfy an expectation or be captured.
+function apiRead(page, base, apiPath, env) {
+    const auth = env.VERIFY_TOKEN ? {Authorization: `Bearer ${env.VERIFY_TOKEN}`} : {};
+    return page.request.get(new URL(apiPath, base).toString(),
+        {headers: {'X-Requested-With': 'XMLHttpRequest', ...auth}, maxRedirects: 0});
+}
+
+// A {"capture": {"api": PATH}} step: records status and body, asserts nothing.
+async function captureApi(page, base, apiPath, env) {
+    const res = await apiRead(page, base, apiPath, env);
+    const text = await res.text();
+    let json;
+    try {
+        json = JSON.parse(text);
+    } catch {
+        json = undefined;
+    }
+    return {path: apiPath, status: res.status(), json, text: json === undefined ? text : undefined};
+}
+
 async function checkExpect(page, base, e, env) {
     if (e.visible) {
         const ok = await locate(page, e.visible).waitFor({state: 'visible', timeout: ACTION_TIMEOUT_MS}).then(() => true, (err) => {
@@ -645,10 +723,7 @@ async function checkExpect(page, base, e, env) {
         const n = await poll(() => locateAll(page, e.count).count(), (c) => c >= min);
         return n >= min ? null : `count of ${JSON.stringify(e.count)} is ${n}, want >= ${min}`;
     }
-    const auth = env.VERIFY_TOKEN ? {Authorization: `Bearer ${env.VERIFY_TOKEN}`} : {};
-    // No redirects: an answer from another host must never satisfy an expectation.
-    const res = await page.request.get(new URL(e.api.path, base).toString(),
-        {headers: {'X-Requested-With': 'XMLHttpRequest', ...auth}, maxRedirects: 0});
+    const res = await apiRead(page, base, e.api.path, env);
     if (res.status() >= 500) {
         return `GET ${e.api.path} returned ${res.status()}; a server error never satisfies an expectation`;
     }
@@ -674,8 +749,12 @@ async function reachable(context, base) {
     }
 }
 
-export async function verify(plan, log = console.log, freezeTo = null, env = process.env, {screenshotOnFail = null} = {}) {
-    const {steps, base, allowed} = validatePlan(plan, env);
+// `record` ({captures: [], snapshots: [], expects: [], problems: []}) is compare mode: what each step saw is stored for
+// diffing, and an unmet expect, a page error or a >= 500 /api/v4/ response is recorded instead of ending the run (a step
+// that fails, a request still running at the deadline and leaving the allowed origins still end it).
+export async function verify(plan, log = console.log, freezeTo = null, env = process.env,
+    {screenshotOnFail = null, record = null} = {}) {
+    const {steps, base, origin, allowed} = validatePlan(plan, env);
     const limit = settleMs(env);
     const authed = hasCredentials(env);
     if (plan.login && !authed) {
@@ -717,6 +796,8 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
     };
     try {
         const context = await browser.newContext({viewport: {width: 1280, height: 800}});
+        // Skip the "Where would you like to view this?" desktop-app landing (see the header): set before any page script.
+        await context.addInitScript(landingPageSeen, origin);
         await context.route('**/*', (route) => {
             const origin = originOf(route.request().url());
             if (origin === null || allowedSet.has(origin)) {
@@ -765,10 +846,13 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
             }
         });
         page.setDefaultTimeout(ACTION_TIMEOUT_MS);
-        page.on('pageerror', (err) => problems.push(`pageerror: ${firstLine(err)}`));
+        // Compare mode records page errors and >= 500 /api/v4/ responses (a noisy plugin throws on both servers) and diffs
+        // them; a run alone treats each as a failure.
+        const soft = record ? record.problems : problems;
+        page.on('pageerror', (err) => soft.push(`pageerror: ${firstLine(err)}`));
         page.on('response', (res) => {
             if (res.status() >= 500 && new URL(res.url()).pathname.startsWith('/api/v4/')) {
-                problems.push(`HTTP ${res.status()} from ${res.request().method()} ${new URL(res.url()).pathname}`);
+                soft.push(`HTTP ${res.status()} from ${res.request().method()} ${new URL(res.url()).pathname}`);
             }
         });
         const afterStep = async () => {
@@ -793,7 +877,15 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
             const label = `step ${i + 1}/${steps.length} ${JSON.stringify(step)}`;
             try {
                 if ('snapshot' in step) {
-                    log(`${label}\n${await snapshot(page, step.snapshot ?? scope)}`);
+                    const text = await snapshot(page, step.snapshot ?? scope);
+                    record?.snapshots.push({step: i + 1, text});
+                    log(`${label}\n${text}`);
+                    continue;
+                }
+                if ('capture' in step) {
+                    const got = await captureApi(page, base, step.capture.api, env);
+                    record?.captures.push({step: i + 1, ...got});
+                    log(`${label} captured: HTTP ${got.status}, ${got.json === undefined ? 'not JSON' : 'JSON'}`);
                     continue;
                 }
                 await runStep(page, base, step);
@@ -828,10 +920,16 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                 }
                 why = msg;
             }
-            if (why || problems.length) {
+            record?.expects.push({n: i + 1, ok: !why, why: why ?? null});
+            if (why && record) {
+                log(`expect ${i + 1} not met ${JSON.stringify(e)}: ${why}`);
+            }
+            if ((why && !record) || problems.length) {
                 return await finish(1, `expect ${i + 1}: ${why ?? problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
             }
-            log(`expect ${i + 1} ok ${JSON.stringify(e)}`);
+            if (!why) {
+                log(`expect ${i + 1} ok ${JSON.stringify(e)}`);
+            }
         }
         // Late events (a 500 or page error after the last check) count too.
         await afterStep();
@@ -863,6 +961,194 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
         await browser.close().catch(() => {});
         guard.close();
     }
+}
+
+// ---------------------------------------------------------------- compare mode (--compare)
+
+const ID_RE = /\b[ybndrfg8ejkmcpqxot1uwisza345h769]{26}\b/g;  // Mattermost ids: 26 characters of its base32 alphabet
+const ISO_RE = /\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?/g;
+const CLOCK_RE = /\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AP]M)?\b/gi;  // times of day the webapp prints ("3:33 PM")
+const DAY_RE = /\b(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day, (?:January|February|March|April|May|June|July|August|September|October|November|December) \d{1,2}\b/g;
+const LOCAL_ORIGIN_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/g;
+const TIME_KEY_RE = /(?:_at|At|^timestamp|^Timestamp)$/;
+const VERSION_KEY_RE = /version|^build|^Build/i;
+
+const escapeRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// What differs between two servers on every run and means nothing: ids, dates, origins. `origins` are the two servers'.
+export function normalizeText(text, origins = []) {
+    let out = String(text);
+    for (const o of origins) {
+        out = out.replace(new RegExp(escapeRe(o), 'g'), '<origin>');
+    }
+    for (const o of origins) {
+        out = out.replace(new RegExp(escapeRe(new URL(o).host), 'g'), '<host>');
+    }
+    return out.replace(LOCAL_ORIGIN_RE, '<origin>').replace(ID_RE, '<id>').replace(ISO_RE, '<date>')
+        .replace(DAY_RE, '<date>').replace(CLOCK_RE, '<time>');
+}
+
+// A JSON value with the noise replaced by placeholders. A timestamp of 0 or null is kept: "never deleted" is a fact.
+export function normalizeJson(value, origins = [], key = '') {
+    if (Array.isArray(value)) {
+        return value.map((v) => normalizeJson(v, origins));
+    }
+    if (isObj(value)) {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) {
+            const nk = normalizeText(k, origins);
+            if (!(nk in out)) {
+                out[nk] = normalizeJson(v, origins, k);
+            }
+        }
+        return out;
+    }
+    if (TIME_KEY_RE.test(key) && (typeof value === 'string' || (typeof value === 'number' && value !== 0))) {
+        return '<time>';
+    }
+    if (VERSION_KEY_RE.test(key) && (typeof value === 'string' || typeof value === 'number')) {
+        return '<version>';
+    }
+    return typeof value === 'string' ? normalizeText(value, origins) : value;
+}
+
+function ignored(jsonPath, patterns) {
+    return patterns.some((pat) => new RegExp(`^${pat.split('*').map(escapeRe).join('.*')}(?:$|[.\\[])`).test(jsonPath));
+}
+
+const show = (v) => {
+    if (v === undefined) {
+        return '<absent>';
+    }
+    const t = JSON.stringify(v);
+    return t.length > 200 ? `${t.slice(0, 200)}...` : t;
+};
+
+// Leaf-level differences between two normalised JSON values: [{path, base, head}], "." joining keys and "[i]" indexes.
+export function diffJson(base, head, ignore = [], at = '') {
+    if (at && ignored(at, ignore)) {
+        return [];
+    }
+    if (isObj(base) && isObj(head)) {
+        return [...new Set([...Object.keys(base), ...Object.keys(head)])].flatMap((k) =>
+            diffJson(base[k], head[k], ignore, at ? `${at}.${k}` : k));
+    }
+    if (Array.isArray(base) && Array.isArray(head)) {
+        const n = Math.max(base.length, head.length);
+        return Array.from({length: n}, (_, i) => diffJson(base[i], head[i], ignore, `${at}[${i}]`)).flat();
+    }
+    return JSON.stringify(base) === JSON.stringify(head) ? [] : [{path: at || '$', base, head}];
+}
+
+// Line-level difference of two normalised snapshots: lines only in one side, paired in order.
+function diffLines(base, head) {
+    const count = (lines) => lines.reduce((m, l) => m.set(l, (m.get(l) ?? 0) + 1), new Map());
+    const take = (from, other) => {
+        const left = count(other);
+        return from.filter((l) => {
+            const n = left.get(l) ?? 0;
+            left.set(l, n - 1);
+            return n <= 0;
+        });
+    };
+    const a = base.split('\n');
+    const b = head.split('\n');
+    const onlyBase = take(a, b);
+    const onlyHead = take(b, a);
+    return Array.from({length: Math.max(onlyBase.length, onlyHead.length)}, (_, i) => ({base: onlyBase[i], head: onlyHead[i]}));
+}
+
+// All differences between two recorded runs, as {step, path, base, head} (strings already shown).
+export function diffRuns(base, head, origins, ignore = []) {
+    const diffs = [];
+    const add = (step, path, b, h) => diffs.push({step, path, base: b, head: h});
+    const norm = (c) => (c.json === undefined ? normalizeText(c.text ?? '', origins) : normalizeJson(c.json, origins));
+    for (const step of [...new Set([...base.captures, ...head.captures].map((c) => c.step))]) {
+        const b = base.captures.find((c) => c.step === step);
+        const h = head.captures.find((c) => c.step === step);
+        if (b.status !== h.status) {
+            add(step, 'status', b.status, h.status);
+        }
+        for (const d of diffJson(norm(b), norm(h), ignore)) {
+            add(step, d.path, show(d.base), show(d.head));
+        }
+    }
+    for (const b of base.snapshots) {
+        const h = head.snapshots.find((x) => x.step === b.step);
+        for (const d of diffLines(normalizeText(b.text, origins), normalizeText(h?.text ?? '', origins))) {
+            add(b.step, 'snapshot', show(d.base), show(d.head));
+        }
+    }
+    for (const b of base.expects) {
+        const h = head.expects.find((x) => x.n === b.n);
+        if (b.ok !== h?.ok) {
+            const side = (x) => (x.ok ? 'PASS' : `FAIL (${x.why})`);
+            add(`expect${b.n}`, 'result', side(b), side(h));
+        }
+    }
+    const rest = [...head.problems];
+    for (const b of base.problems.map((t) => normalizeText(t, origins))) {
+        const at = rest.findIndex((t) => normalizeText(t, origins) === b);
+        if (at >= 0) {
+            rest.splice(at, 1);
+        } else {
+            add('run', 'problem', show(b), show(undefined));
+        }
+    }
+    for (const h of rest) {
+        add('run', 'problem', show(undefined), show(normalizeText(h, origins)));
+    }
+    return diffs;
+}
+
+function tagged(prefix, rec) {
+    return (line) => {
+        const text = String(line);
+        if (text.startsWith('VERDICT: ')) {
+            rec.verdict = text.slice('VERDICT: '.length);
+        }
+        console.log(`[${prefix}] ${text}`);
+    };
+}
+
+// Runs the plan against the target (head) and `baseUrl`, and returns the exit code after printing the verdict.
+export async function compare(plan, baseUrl, env = process.env, log = console.log) {
+    const baseOrigin = httpOrigin(baseUrl, '--compare');
+    // The base run uses the plan without its own base_url: the head target is the plan's or the environment's, the base
+    // is the command line's, and both get the same credentials.
+    const {base_url: _drop, ...basePlan} = plan;
+    const baseEnv = {...env, VERIFY_BASE_URL: baseOrigin};
+    const sides = [['base', basePlan, baseEnv], ['head', plan, env]];
+    const recs = {};
+    const origins = [];
+    for (const [name, p, e] of sides) {
+        const rec = {captures: [], snapshots: [], expects: [], problems: [], verdict: ''};
+        recs[name] = rec;
+        let code;
+        try {
+            origins.push(validatePlan(p, e).origin);
+            code = await verify(p, tagged(name, rec), null, e, {record: rec});
+        } catch (err) {
+            const wrap = err instanceof PlanError ? PlanError : InfraError;
+            throw new wrap(`${name} run: ${firstLine(err)}`);
+        }
+        if (code !== 0) {
+            log(`VERDICT: FAIL ${name} run failed: ${rec.verdict.replace(/^FAIL /, '')}`);
+            return 1;
+        }
+    }
+    const diffs = diffRuns(recs.base, recs.head, origins, plan.ignore ?? []);
+    for (const d of diffs.slice(0, MAX_DIFFS)) {
+        log(`DIFF ${d.step} ${d.path}: base=${d.base} head=${d.head}`);
+    }
+    if (diffs.length > MAX_DIFFS) {
+        log(`... ${diffs.length - MAX_DIFFS} more differences not shown`);
+    }
+    const regressions = recs.base.expects.filter((b) => b.ok && !recs.head.expects.find((h) => h.n === b.n)?.ok);
+    log(`${diffs.length} difference(s) after normalising ids, timestamps, versions and origins; ${regressions.length} expect regression(s)`);
+    const verdict = regressions.length ? 'REGRESSION' : diffs.length ? 'DIFF' : 'SAME';
+    log(`VERDICT: ${verdict}`);
+    return verdict === 'SAME' ? 0 : 1;
 }
 
 // ---------------------------------------------------------------- --freeze
@@ -914,7 +1200,7 @@ function typedSubset() {
 export function freeze(plan, base, allowOrigins = [], authed = false) {
     const q = JSON.stringify;
     const lines = [];
-    const steps = (plan.steps ?? []).filter((s) => !('snapshot' in s)).length;
+    const steps = (plan.steps ?? []).filter((s) => !('snapshot' in s) && !('capture' in s)).length;
     const expects = plan.expect.length;
     for (const s of plan.steps ?? []) {
         if ('goto' in s) {
@@ -932,7 +1218,7 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
         } else if ('wait_for' in s) {
             lines.push(`await ${one(s.wait_for)}.waitFor({state: 'visible'});`);
         } else {
-            continue; // snapshots are for the agent's eyes; the frozen test asserts only the deterministic oracle
+            continue; // snapshots and captures are for the agent's eyes; the frozen test asserts only the deterministic oracle
         }
         lines.push('await settle();');
     }
@@ -1027,6 +1313,16 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async () => {
   guard = await startOriginGuard(http, net, ALLOWED, () => {});
   browser = await chromium.launch({args: [\`--proxy-server=http://127.0.0.1:\${guard.port}\`, '--proxy-bypass-list=<-loopback>']});
   const context = await browser.newContext({viewport: {width: 1280, height: 800}});
+  // Skip the webapp's desktop-app landing page, as verify_ui.mjs does.
+  await context.addInitScript((origin: string) => {
+    try {
+      if (location.origin === origin) {
+        localStorage.setItem('__landingPageSeen__', 'true');
+      }
+    } catch {
+      // about:blank or storage blocked
+    }
+  }, new URL(BASE).origin);
   const page = await context.newPage();
   const problems: string[] = [];
   const inflight = new Set<Request>();
@@ -1149,6 +1445,7 @@ function featureMapCli(query, file) {
 // ---------------------------------------------------------------- CLI
 
 const USAGE = 'usage: verify_ui.mjs <plan.json> [--freeze <dir>/<name>.spec.ts] [--screenshot-on-fail]\n' +
+    '       verify_ui.mjs <plan.json> --compare <base_url>\n' +
     '       verify_ui.mjs --feature-map <route or feature> [FEATURE_MAP.md]';
 
 async function main() {
@@ -1164,8 +1461,14 @@ async function main() {
     const screenshotOnFail = si >= 0 ? (args.splice(si, 1), 'failure.png') : null;
     const fi = args.indexOf('--freeze');
     const freezeTo = fi >= 0 ? args.splice(fi, 2)[1] : null;
-    if (args.length !== 1 || (fi >= 0 && !freezeTo)) {
+    const ci = args.indexOf('--compare');
+    const compareTo = ci >= 0 ? args.splice(ci, 2)[1] : null;
+    if (args.length !== 1 || (fi >= 0 && !freezeTo) || (ci >= 0 && !compareTo)) {
         console.error(USAGE);
+        return 2;
+    }
+    if (compareTo && (freezeTo || screenshotOnFail)) {
+        console.log('VERDICT: INVALID_PLAN --compare cannot be combined with --freeze or --screenshot-on-fail');
         return 2;
     }
     try {
@@ -1175,7 +1478,7 @@ async function main() {
         } catch (err) {
             throw new PlanError(`cannot read ${args[0]}: ${firstLine(err)}`);
         }
-        return await verify(plan, console.log, freezeTo, process.env, {screenshotOnFail});
+        return compareTo ? await compare(plan, compareTo) : await verify(plan, console.log, freezeTo, process.env, {screenshotOnFail});
     } catch (err) {
         // Anything unexpected is an infrastructure problem, never a FAIL, and only its first line is printed.
         const kind = err instanceof PlanError ? 'INVALID_PLAN' : 'INFRA_ERROR';
