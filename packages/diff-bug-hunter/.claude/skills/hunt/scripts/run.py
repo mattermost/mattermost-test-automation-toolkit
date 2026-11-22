@@ -37,6 +37,7 @@ if not _sys.pycache_prefix:
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -66,6 +67,13 @@ from hunt_common import (
 HUNT_FILE = re.compile(r"^(hunt_hunt[a-z0-9]+_test\.go|hunt_[a-z0-9]+\.test\.tsx?)$")
 RESULT_GO = re.compile(r"^\s*--- (PASS|FAIL|SKIP): (\S+)", re.M)
 PACKAGE_FAILED = "(package failed)"
+# `ok  \t<import path>\t15.116s` / `FAIL\t<import path>\t2.5s`: how long one package's test binary ran.
+GO_PACKAGE_TIME = re.compile(r"^(?:ok|FAIL)\s+\S+\s+([\d.]+)s\s*$", re.M)
+# A mutant's `go test` may run this many times as long as the unmutated baseline, and never less than the floor.
+# Past that the mutant made a test hang: go test panics, the package fails, and the mutant counts as KILLED. Without
+# the cap go test's own 10-minute default applies, once per hanging mutant.
+MUTANT_TIMEOUT_FACTOR = 5
+MUTANT_TIMEOUT_MIN_S = 60
 # A failure on the merge-base that only says the code under test does not exist there.
 MISSING_ON_BASE = re.compile(r"is not a function|is not defined|is not a constructor|Cannot find module|"
                              r"Cannot read propert(?:y|ies) of undefined|undefined is not", re.I)
@@ -99,6 +107,7 @@ class Outcome:
     results: dict[str, str] = field(default_factory=dict)   # identity -> PASS | FAIL | SKIP
     messages: dict[str, str] = field(default_factory=dict)  # identity -> normalized failure text
     packages: dict[str, str] = field(default_factory=dict)  # Go package dir -> PASS | FAIL, as its `go test` exited
+    runtimes: dict[str, float] = field(default_factory=dict)  # Go package dir -> seconds its test binary ran
     log: str = ""
 
 
@@ -226,15 +235,31 @@ def go_root(wt: Path, d: str) -> Path:
     raise InfraError(f"no go.mod above {d}")
 
 
-def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome) -> None:
+def go_package_runtime(out: str) -> float | None:
+    times = GO_PACKAGE_TIME.findall(out)
+    return float(times[-1]) if times else None
+
+
+def mutant_timeouts(base: Outcome) -> dict[str, int]:
+    """Per Go package, the `go test -timeout` (seconds) for a mutant run, from the baseline run of the same suite."""
+    return {d: max(MUTANT_TIMEOUT_MIN_S, math.ceil(MUTANT_TIMEOUT_FACTOR * t)) for d, t in base.runtimes.items()}
+
+
+def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome,
+           timeouts: dict[str, int] | None = None) -> None:
     if race:
         require_disk(scratch())  # before the -race build starts, not after it fails for lack of space
     for d, pattern in sorted(patterns.items()):
         root = go_root(wt, d)
         pkg = "./" + os.path.relpath(wt / d, root)
-        args = ["go", "test", "-count=1", "-v", "-run", pattern] + (["-race"] if race else []) + [pkg]
+        cap = (timeouts or {}).get(d)
+        args = (["go", "test", "-count=1", "-v", "-run", pattern] + (["-race"] if race else [])
+                + ([f"-timeout={cap}s"] if cap else []) + [pkg])
         p = sh(args, root, check=False, timeout=1800)
         out = p.stdout + p.stderr
+        runtime = go_package_runtime(out)
+        if runtime is not None:
+            into.runtimes[d] = runtime
         # Identities are package-qualified ("<dir>::<Test>") so equal test names in two packages never overwrite.
         got = {f"{d}::{m.group(2)}": m.group(1) for m in RESULT_GO.finditer(out) if "/" not in m.group(2)}
         if not got:
@@ -321,12 +346,12 @@ def jest_compiles(wt: Path, file: str) -> str | None:
 
 # ---------------------------------------------------------------- suite level
 
-def run_suite(wt: Path, s: Suite, race: bool) -> Outcome:
+def run_suite(wt: Path, s: Suite, race: bool, go_timeouts: dict[str, int] | None = None) -> Outcome:
     if s.empty():
         raise InfraError("suite is empty: no Go packages or Jest files to run")
     o = Outcome()
     if s.go_patterns:
-        go_run(wt, s.go_patterns, race, o)
+        go_run(wt, s.go_patterns, race, o, go_timeouts)
     if s.jest_files:
         jest_run(wt, s.jest_files, s.jest_prefix, o)
     return o
@@ -770,7 +795,7 @@ def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: Outcome,
             err = compiles(wt, m["file"])
             if err:
                 return {**v, "verdict": "NEEDS_REGENERATION", "detail": err}
-            r = run_suite(wt, suite, race=False).results
+            r = run_suite(wt, suite, race=False, go_timeouts=mutant_timeouts(base)).results
         except CompileError as e:
             return {**v, "verdict": "NEEDS_REGENERATION", "detail": str(e)[-1500:]}
         except InfraError as e:  # one mutant's environment failure (a compile-check timeout too) loses no other verdict

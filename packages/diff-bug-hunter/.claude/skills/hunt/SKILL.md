@@ -70,7 +70,8 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
 6. **Mutation gate**, if Mode A has passing tests:
    - Planting: `build_requests.py <pr> mutants`, dispatch it, then `build_requests.py <pr> heldout`, dispatch it.
      Never show M or M2 to a hunter.
-   - Score: `run.py mutants <pr> A`.
+   - Score: `run.py mutants <pr> A`. Each mutant's `go test` gets `-timeout` = max(60 s, 5x the unmutated run of that
+     package); a mutant that hangs a test past it is `KILLED` by `(package failed)`.
    - `NEEDS_REGENERATION`: `build_requests.py <pr> regen <id> <tag>` (the score that reported it), dispatch it once, then rescore. Still broken = dropped.
      `ERROR` = that mutant hit an environment failure; rerun once, then report it as unscored.
    - Any of M1-M3 `SURVIVED`: `build_requests.py <pr> strengthen M1,..` (it also passes the changed lines `cover`

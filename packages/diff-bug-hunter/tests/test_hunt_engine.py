@@ -387,6 +387,26 @@ def test_regenerated_mutant_replaces_broken_one(tmp_path):
     assert v["M2"]["verdict"] == "KILLED"
 
 
+def test_a_mutant_that_hangs_a_test_is_killed_at_the_baseline_derived_cap(tmp_path, monkeypatch):
+    # Without the cap, go test's own 10-minute default decides, once per hanging mutant (PR 40094's app package).
+    monkeypatch.setattr(run, "MUTANT_TIMEOUT_MIN_S", 5)
+    hdir, state = make_hunt(tmp_path, "clean")
+    (hdir / "M" / "response.json").write_text(json.dumps({"mutants": [
+        {"id": "M1", "file": "calc/percent.go", "old": "\t\treturn 0\n", "new": "\t\tfor {\n\t\t}\n",
+         "what_breaks": "a zero total loops forever"}]}))
+    shutil.rmtree(hdir / "M2")
+    v = {m["id"]: m for m in run.cmd_mutants(hdir, state, "A")}
+    assert v["M1"]["verdict"] == "KILLED" and v["M1"]["killers"] == ["calc::(package failed)"]
+    assert "\t\treturn 0\n" in (Path(state["wt"]) / "calc/percent.go").read_text()  # restored
+
+
+def test_go_package_runtime_is_read_from_the_summary_line():
+    assert run.go_package_runtime("--- PASS: TestX (1.20s)\nPASS\nok  \tgithub.com/x/app\t15.116s\n") == 15.116
+    assert run.go_package_runtime("FAIL\tgithub.com/x/app\t2.5s\n") == 2.5
+    assert run.go_package_runtime("FAIL\tgithub.com/x/app [build failed]\n") is None
+    assert run.mutant_timeouts(run.Outcome(runtimes={"a": 0.1, "b": 40.0})) == {"a": run.MUTANT_TIMEOUT_MIN_S, "b": 200}
+
+
 def test_zero_tests_is_infra_error_and_bad_test_is_compile_error(tmp_path):
     hdir, state = make_hunt(tmp_path, "clean")
     no_tests = "package calc\n\nimport \"testing\"\n\nfunc TestSomethingElse(t *testing.T) {}\n"
