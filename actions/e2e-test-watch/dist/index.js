@@ -2794,7 +2794,9 @@ function canChange(cls, pack, isTrunkRun = false) {
   const hunk = ids.some((id) => id.startsWith("hunk_"));
   if (exoneratedSet(isTrunkRun).has(cls)) return hunk;
   if (cls === "INFRA_ERROR") return CLEARING(ids);
-  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack);
+  const trunk = pack.trunk_history_14d;
+  const trunkUnstable = (trunk?.fails ?? 0) > 0 || (trunk?.flaky ?? 0) > 0 || trunk?.latest === "failed";
+  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack) || trunkUnstable;
   return false;
 }
 function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
@@ -3831,8 +3833,13 @@ async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runn
     if (own) prefix = lanePrefixOf(own.name);
   }
   const tokens2 = String(filter ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const include = tokens2.filter((t) => !t.startsWith("!"));
+  const exclude = tokens2.filter((t) => t.startsWith("!")).map((t) => t.slice(1)).filter(Boolean);
   const byPrefix = prefix ? all.filter((j) => j.name.startsWith(prefix)) : all;
-  const lane = tokens2.length ? byPrefix.filter((j) => tokens2.some((t) => j.name.toLowerCase().includes(t))) : byPrefix;
+  const lane = tokens2.length ? byPrefix.filter((j) => {
+    const name = j.name.toLowerCase();
+    return (!include.length || include.some((t) => name.includes(t))) && !exclude.some((t) => name.includes(t));
+  }) : byPrefix;
   const failedStep = (j) => j.steps?.find((s) => s.conclusion === "failure") ?? j.steps?.find((s) => s.conclusion === "cancelled" || s.conclusion === "timed_out") ?? null;
   let workerLogs = 0;
   const out = [];

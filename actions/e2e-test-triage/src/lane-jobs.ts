@@ -121,8 +121,15 @@ export async function readLaneJobs({ fetchImpl, token, repository, runId, attemp
     if (own) prefix = lanePrefixOf(own.name);
   }
   const tokens = String(filter ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const include = tokens.filter((t) => !t.startsWith("!"));
+  const exclude = tokens.filter((t) => t.startsWith("!")).map((t) => t.slice(1)).filter(Boolean);
   const byPrefix = prefix ? all.filter((j) => j.name.startsWith(prefix)) : all;
-  const lane = tokens.length ? byPrefix.filter((j) => tokens.some((t) => j.name.toLowerCase().includes(t))) : byPrefix;
+  const lane = tokens.length
+    ? byPrefix.filter((j) => {
+      const name = j.name.toLowerCase();
+      return (!include.length || include.some((t) => name.includes(t))) && !exclude.some((t) => name.includes(t));
+    })
+    : byPrefix;
   const failedStep = (j: GhJob) => j.steps?.find((s) => s.conclusion === "failure") ?? j.steps?.find((s) => s.conclusion === "cancelled" || s.conclusion === "timed_out") ?? null;
   let workerLogs = 0;
   const out: LaneJob[] = [];

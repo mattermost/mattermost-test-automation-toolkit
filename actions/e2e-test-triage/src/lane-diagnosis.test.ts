@@ -448,6 +448,7 @@ test("a lane crowded out of the base branch's last runs (an upgrade lane) has it
 test("readLaneJobs filters flat-job workflows by lane-job-filter so one lane never blames another lane's dead job", async () => {
   const jobs = [
     { id: 1, name: "build-android-apk", status: "completed", conclusion: "failure", steps: [{ name: "gradle", conclusion: "failure" }] },
+    { id: 4, name: "build-android-apk-maestro", status: "completed", conclusion: "failure", steps: [{ name: "gradle", conclusion: "failure" }] },
     { id: 2, name: "build-ios-app", status: "completed", conclusion: "success", steps: [] },
     { id: 3, name: "maestro-ios-e2e", status: "completed", conclusion: "failure", steps: [{ name: "run maestro", conclusion: "failure" }] },
   ];
@@ -460,4 +461,9 @@ test("readLaneJobs filters flat-job workflows by lane-job-filter so one lane nev
     filter: "maestro-ios,build-ios", log: () => {},
   });
   assert.deepEqual(res.jobs.map((j) => j.name), ["build-ios-app", "maestro-ios-e2e"]);
+  const detoxAndroid = await readLaneJobs({
+    fetchImpl, token: "t", repository: "o/r", runId: "1", attempt: "1",
+    filter: "detox-android,build-android-apk,!maestro", log: () => {},
+  });
+  assert.deepEqual(detoxAndroid.jobs.map((j) => j.name), ["build-android-apk"]);
 });

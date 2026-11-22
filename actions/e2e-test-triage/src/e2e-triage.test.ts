@@ -5717,14 +5717,15 @@ test("judge escalates borderline PR blame with hunk (0.60-0.84) and trunk-backed
   assert.deepEqual(askedBlame, ["claude-sonnet-5-5", "claude-opus-5-5"]);
   assert.deepEqual([fBlame.blocking, fBlame.decision, fBlame.escalated], [true, "adjudicator_blame", true]);
 
-  // Borderline bug_on_master citing trunk_history_14d with trunk failures -> escalates to Opus and clears.
+  // Borderline bug_on_master citing trunk_history_14d with trunk failures (and NO cross_pr/this_pr/hunk) -> canChange=true, escalates to Opus and clears.
   const fMaster = firstFailure({
     class: "REGRESSION",
     blocking: true,
     trunk: { runs: 20, fails: 2, flaky: 1, passes: 17, latest: "passed" },
-    cross_pr: { prs: [99], examples: ["PR #99"], passes: 10 },
+    cross_pr: { prs: [], examples: [], passes: 10 },
   });
   const masterPack = buildPack(fMaster, [{ filename: "webapp/src/other.tsx", patch: "@@ -1 +1 @@\n-a\n+b" }], { number: 43, repository: "o/r", title: "unrelated" }, []);
+  assert.equal(canChange("REGRESSION", masterPack), true, "trunk failures alone can carry a bug_on_master clear");
   const askedMaster: string[] = [];
   const askMaster: AskFn = async (packs, model) => {
     askedMaster.push(model);
