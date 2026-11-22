@@ -94,7 +94,8 @@ def _run_unit(wt: Path, unit: dict[str, Any]) -> tuple[dict[str, str], dict[str,
         names = sorted(set().union(*(h.results for h in heads)))
         seen = {n: classify([h.results.get(n, "MISSING") for h in heads]) for n in names}
         failing = [n for n in names if seen[n] == "FAIL_3_OF_3"]
-        retest = [n.split("::", 1)[1] for n in failing if not n.endswith(f"::{PACKAGE_FAILED}")]
+        pkg_failed = any(n.endswith(f"::{PACKAGE_FAILED}") for n in failing)
+        retest = list(unit["tests"]) if pkg_failed else [n.split("::", 1)[1] for n in failing]
         plain = _run(wt, unit, retest, False) if retest else Outcome()
     except CompileError as e:  # not a finding: generated code or build tags may be missing in this worktree
         return {f"{key}::*": "NOT_RUN"}, {f"{key}::*": str(e)[-1500:]}
@@ -102,7 +103,7 @@ def _run_unit(wt: Path, unit: dict[str, Any]) -> tuple[dict[str, str], dict[str,
     for n in names:
         v = seen[n]
         if v == "FAIL_3_OF_3":
-            without = "FAIL" if n.endswith(f"::{PACKAGE_FAILED}") else plain.results.get(n)
+            without = plain.packages.get(unit["dir"]) if n.endswith(f"::{PACKAGE_FAILED}") else plain.results.get(n)
             v = {"PASS": "PR_TEST_FAILS_UNDER_CI", "FAIL": "PR_TEST_FAILS"}.get(without or "", "FLAKY")
         table[n] = v
         failure = next((h.messages[n] for h in heads if n in h.messages), None)

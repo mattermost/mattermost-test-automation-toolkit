@@ -105,9 +105,10 @@ class ManifestError(ValueError):
     pass
 
 
-# What one entry can fail with: our own InfraError, a dispatch that timed out or exited (SubprocessError), a missing or
-# unreadable file (OSError), and a hunter response that is not valid JSON or lacks "files" (ValueError, KeyError).
-ENTRY_FAILURES = (InfraError, OSError, subprocess.SubprocessError, KeyError, ValueError)
+# What one entry can fail with: our own InfraError, a CompileError that escaped a signal, a dispatch that timed out or
+# exited (SubprocessError), a missing or unreadable file (OSError), and a hunter response that is not valid JSON or lacks
+# "files" (ValueError, KeyError).
+ENTRY_FAILURES = (InfraError, run.CompileError, OSError, subprocess.SubprocessError, KeyError, ValueError)
 
 
 def load_controls(path: Path) -> list[dict[str, Any]]:
@@ -218,7 +219,7 @@ def hunt_tag(num: int, hdir: Path, state: dict[str, Any], tag: str, batch: int, 
 def old_signal(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
     try:
         return {"hunter": "OLD", "old": old_tests.cmd_old(hdir, state)["tests"]}
-    except InfraError as err:  # the other signals' results stand; only this check is lost
+    except (InfraError, run.CompileError) as err:  # the other signals' results stand; only this check is lost
         return {"hunter": "OLD", "old": {}, "old_error": str(err)[-400:]}
 
 

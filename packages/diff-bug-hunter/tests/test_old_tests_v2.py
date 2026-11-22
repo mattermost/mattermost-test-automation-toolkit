@@ -225,3 +225,37 @@ def test_pr_tests_cap_and_uncompilable_package(tmp_path, monkeypatch):
     out = pr_tests.cmd_pr(hdir, state)
     assert out["tests"] == {"ci::*": "NOT_RUN"}
     assert "undefined: undefinedThing" in _msgs(hdir, "pr_tests")["ci::*"]
+
+
+def test_old_tests_base_compile_error_marks_unit_not_run_and_cleans_up(tmp_path, monkeypatch):
+    hdir, state = make_hunt(tmp_path, "old_layer")
+    real = old_tests.go_run
+
+    def fail_on_base(w, patterns, race, into):
+        if w == Path(state["wt_base"]):
+            raise old_tests.CompileError("base broken")
+        real(w, patterns, race, into)
+
+    monkeypatch.setattr(old_tests, "go_run", fail_on_base)
+    out = old_tests.cmd_old(hdir, state)
+    assert out["tests"] == {"calc::TestOne": "NOT_RUN"}
+    assert "base uncompilable" in _msgs(hdir, "old_tests")["calc::*"]
+    assert _clean(state["wt"], state["wt_base"])
+
+
+def test_pr_tests_retests_package_failure_without_ci_flag(tmp_path, monkeypatch):
+    hdir, state = make_hunt(tmp_path, "pr_ci_flag")
+
+    def fake_go_run(w, patterns, race, into):
+        d = next(iter(patterns))
+        if os.environ.get(pr_tests.FLAG) == "true":
+            into.results[f"{d}::{pr_tests.PACKAGE_FAILED}"] = "FAIL"
+            into.packages[d] = "FAIL"
+            into.messages[f"{d}::{pr_tests.PACKAGE_FAILED}"] = "TestMain panic under parallel"
+        else:
+            into.results[f"{d}::TestUsesStore"] = "PASS"
+            into.packages[d] = "PASS"
+
+    monkeypatch.setattr(pr_tests, "go_run", fake_go_run)
+    out = pr_tests.cmd_pr(hdir, state)
+    assert out["tests"] == {f"ci::{pr_tests.PACKAGE_FAILED}": "PR_TEST_FAILS_UNDER_CI"}

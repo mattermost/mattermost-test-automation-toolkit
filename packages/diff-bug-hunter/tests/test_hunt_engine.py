@@ -1341,6 +1341,7 @@ def test_base_verdicts_only_for_head_failures_and_missing_symbols():
     assert run.base_verdict("x::T3", "FAIL", head, msgs, "TypeError: (0 , _x.newHelper) is not a function") == "NEW_API"
     assert run.base_verdict("x::T3", "FAIL", head, msgs, msgs["x::T3"]) == "PRE_EXISTING"
     assert run.base_verdict("x::T4", "FAIL", head, msgs, "Error: other") == "BASE_FAILS_DIFFERENTLY"
+    assert run.base_verdict("x::T3", "FAIL", head, msgs, "TypeError: Cannot read properties of undefined (reading 'x')") == "BASE_FAILS_DIFFERENTLY"
     assert run.classify(["SKIP"] * 3) == "SKIP"
 
 
@@ -2429,6 +2430,8 @@ def _hunted(hdir: Path, head: str) -> None:
     (hdir / "A").mkdir()
     (hdir / "A" / "response.json").write_text("{}")
     (hdir / "run_A.json").write_text("{}")
+    (hdir / "old_tests.json").write_text("{}")
+    (hdir / "pr_tests.json").write_text("{}")
 
 
 def test_prepare_never_wipes_results_for_the_same_head(tmp_path, monkeypatch):
@@ -2454,6 +2457,7 @@ def test_prepare_starts_over_when_the_head_moved_or_fresh_is_asked(tmp_path, mon
         with pytest.raises(hunt_common.InfraError, match="stop here"):
             prepare.prepare("9", fresh=fresh)
         assert not (hdir / "run_A.json").exists() and not (hdir / "A").exists()
+        assert not (hdir / "old_tests.json").exists() and not (hdir / "pr_tests.json").exists()
 
 
 @needs_playwright
@@ -2609,3 +2613,49 @@ def test_old_jest_file_the_pr_edited_breaks_on_head_and_leaves_no_snapshot(tmp_p
                             "web/src/total.test.ts::total matches its snapshot": "PASS"}
     # jest wrote a new snapshot file on head and on base: both are removed
     assert _clean(Path(state["wt"])) and _clean(Path(state["wt_base"]))
+
+
+def test_trusted_check_blocks_gitignored_files_and_modified_pr_server(tmp_path, monkeypatch):
+    monkeypatch.delenv("HUNT_TRUSTED_REF", raising=False)
+    repo, skill = _skill_repo(tmp_path)
+    _git(repo, "checkout", "-q", "main")
+    pr_srv = skill.parent / "verify" / "scripts" / "pr_server.py"
+    pr_srv.parent.mkdir(parents=True)
+    pr_srv.write_text("# pr_server\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add pr_server")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    assert "trusted ref" in trusted.check(skill)
+    # A PR hiding a shadowing module behind .gitignore must still fail closed.
+    (repo / ".gitignore").write_text("json.py\n")
+    shadow = skill / "scripts" / "json.py"
+    shadow.write_text("raise RuntimeError('shadow')\n")
+    with pytest.raises(trusted.InfraError, match="json.py"):
+        trusted.check(skill)
+    shadow.unlink()
+    (repo / ".gitignore").unlink()
+    # Modifying sibling verify/scripts/pr_server.py must also fail closed.
+    pr_srv.write_text("# tampered\n")
+    with pytest.raises(trusted.InfraError, match="pr_server.py"):
+        trusted.check(skill)
+
+
+def test_shipped_lessons_pass_prune_with_zero_retirements(monkeypatch):
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    assert lessons.prune(lessons.load(), [], window=30) == []
+
+
+def test_mine_rules_root_file_glob():
+    import mine_rules
+    assert mine_rules.glob_of("main.go") == "*"
+    assert mine_rules.glob_of("server/a/b.go") == "server/a/*"
+
+
+def test_strengthen_strips_spaces_around_mutant_ids(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
+    hdir, _ = make_hunt(tmp_path, "clean")
+    monkeypatch.setattr(build_requests, "hunt_dir", lambda pr: hdir)
+    build_requests.main("1", "strengthen", "M1, M3")
+    req = json.loads((hdir / "A2" / "request.json").read_text())
+    user = json.loads(req["user"])
+    assert len(user["surviving_faults"]) == 2

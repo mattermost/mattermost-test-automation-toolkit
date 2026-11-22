@@ -148,7 +148,7 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
         avoid = " They must differ in location and kind from every fault in `already_planted`."
         print(write(hdir, "M2", mutant_system(state, 2, "M4, M5", avoid), user, MUTANT_SCHEMA))
     elif what == "strengthen":
-        survivors = set(arg.split(","))
+        survivors = {s.strip() for s in arg.split(",") if s.strip()}
         planted = load_json(hdir / "M" / "response.json")["mutants"]
         user = {**hunter_user("A", ctx), "your_previous_tests": load_json(hdir / "A" / "response.json")["files"],
                 "surviving_faults": [m["what_breaks"] for m in planted if m["id"] in survivors]}

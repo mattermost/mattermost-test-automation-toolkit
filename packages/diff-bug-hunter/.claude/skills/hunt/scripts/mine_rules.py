@@ -56,7 +56,8 @@ class Revert:
 
 
 def glob_of(path: str) -> str:
-    return "/".join(path.split("/")[:-1][:DEPTH]) + "/*"
+    parts = path.split("/")[:-1][:DEPTH]
+    return "/".join(parts) + "/*" if parts else "*"
 
 
 def wanted(path: str) -> bool:

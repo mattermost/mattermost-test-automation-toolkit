@@ -225,3 +225,18 @@ def test_normalisation_and_diff_functions():
         {"path": "a.b", "base": 1, "head": 2}, {"path": "a.c[1]", "base": 2, "head": 3}, {"path": "d", "base": 1},
         {"path": "e", "head": 1}]
     assert _module("m.diffJson({a: {b: 1}, c: 1}, {a: {b: 2}, c: 2}, ['a'])").count("path") == 1
+
+
+def test_normalize_json_preserves_multiple_id_keyed_entries():
+    a1, a2 = "ybndrfg8ejkmcpqxot1uwisza3", "h769h769h769h769h769h769h7"
+    b1, b2 = "345h769ybndrfg8ejkmcpqxot1", "uwisza345h769ybndrfg8ejkmc"
+    same = json.loads(_module(
+        f"m.diffJson(m.normalizeJson({{posts: {{'{a1}': {{msg: 'one'}}, '{a2}': {{msg: 'two'}}}}}}), "
+        f"m.normalizeJson({{posts: {{'{b2}': {{msg: 'two'}}, '{b1}': {{msg: 'one'}}}}}}))"
+    ))
+    assert same == []
+    changed = json.loads(_module(
+        f"m.diffJson(m.normalizeJson({{posts: {{'{a1}': {{msg: 'one'}}, '{a2}': {{msg: 'two'}}}}}}), "
+        f"m.normalizeJson({{posts: {{'{b1}': {{msg: 'one'}}, '{b2}': {{msg: 'BROKEN'}}}}}}))"
+    ))
+    assert changed and any("BROKEN" in json.dumps(d) for d in changed)

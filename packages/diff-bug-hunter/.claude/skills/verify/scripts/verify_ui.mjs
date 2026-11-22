@@ -994,11 +994,26 @@ export function normalizeJson(value, origins = [], key = '') {
         return value.map((v) => normalizeJson(v, origins));
     }
     if (isObj(value)) {
-        const out = {};
+        // Keys that normalize to the same placeholder (e.g. Mattermost's id-keyed posts/users maps) must not drop
+        // entries 2..N: keep every entry sorted deterministically by its normalized value under `<nk>#0`, `<nk>#1`, ...
+        const grouped = new Map();
         for (const [k, v] of Object.entries(value)) {
             const nk = normalizeText(k, origins);
-            if (!(nk in out)) {
-                out[nk] = normalizeJson(v, origins, k);
+            if (!grouped.has(nk)) {
+                grouped.set(nk, []);
+            }
+            grouped.get(nk).push(normalizeJson(v, origins, k));
+        }
+        const out = {};
+        for (const [nk, vals] of grouped) {
+            if (vals.length === 1) {
+                out[nk] = vals[0];
+            } else {
+                const sorted = vals.map((val) => [JSON.stringify(val), val])
+                    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+                sorted.forEach(([, val], idx) => {
+                    out[`${nk}#${idx}`] = val;
+                });
             }
         }
         return out;
@@ -1101,13 +1116,13 @@ export function diffRuns(base, head, origins, ignore = []) {
     return diffs;
 }
 
-function tagged(prefix, rec) {
+function tagged(prefix, rec, log = console.log) {
     return (line) => {
         const text = String(line);
         if (text.startsWith('VERDICT: ')) {
             rec.verdict = text.slice('VERDICT: '.length);
         }
-        console.log(`[${prefix}] ${text}`);
+        log(`[${prefix}] ${text}`);
     };
 }
 
@@ -1119,15 +1134,23 @@ export async function compare(plan, baseUrl, env = process.env, log = console.lo
     const {base_url: _drop, ...basePlan} = plan;
     const baseEnv = {...env, VERIFY_BASE_URL: baseOrigin};
     const sides = [['base', basePlan, baseEnv], ['head', plan, env]];
-    const recs = {};
     const origins = [];
+    // Validate both sides upfront so an invalid head plan fails fast without running Chromium against base.
+    for (const [name, p, e] of sides) {
+        try {
+            origins.push(validatePlan(p, e).origin);
+        } catch (err) {
+            const wrap = err instanceof PlanError ? PlanError : InfraError;
+            throw new wrap(`${name} run: ${firstLine(err)}`);
+        }
+    }
+    const recs = {};
     for (const [name, p, e] of sides) {
         const rec = {captures: [], snapshots: [], expects: [], problems: [], verdict: ''};
         recs[name] = rec;
         let code;
         try {
-            origins.push(validatePlan(p, e).origin);
-            code = await verify(p, tagged(name, rec), null, e, {record: rec});
+            code = await verify(p, tagged(name, rec, log), null, e, {record: rec});
         } catch (err) {
             const wrap = err instanceof PlanError ? PlanError : InfraError;
             throw new wrap(`${name} run: ${firstLine(err)}`);

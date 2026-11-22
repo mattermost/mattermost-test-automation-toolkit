@@ -113,8 +113,8 @@ holds the skill, never from the checked-out head.
 self-test's Babel 8 fixture needs it; hunting a webapp PR uses the webapp's own toolchain).
 For `make self-test lint`: `pip install pytest ruff mypy` and ShellCheck (`apt install shellcheck` or `pip install shellcheck-py`).
 Server packages that use `Setup(t)` (`api4`, `app`, `platform`, `store`) also need Postgres 16
-(`mmuser`/`mostest`, db `mattermost_test`) and Redis on localhost. If they are down and Postgres 16 is installed
-locally, `scripts/start_pg.sh` starts a throwaway cluster.
+(`mmuser`/`mostest`, db `mattermost_test`) and Redis on localhost. On Debian/Ubuntu, if Postgres is down and Postgres 16
+is installed locally, `scripts/start_pg.sh` starts a throwaway cluster; on macOS, start Postgres and Redis yourself.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -229,7 +229,7 @@ those `node_modules` unless the PR changes `package-lock.json`.
 
 ## CI integration
 
-Package self-test: 136 tests (pytest), run by this repository's `.github/workflows/diff-bug-hunter.yml` when
+Package self-test: 242 tests (pytest), run by this repository's `.github/workflows/diff-bug-hunter.yml` when
 `packages/diff-bug-hunter/` changes. The /verify tests need the Chromium build that matches the pinned Playwright, installed from the fixture
 directory:
 
@@ -291,12 +291,13 @@ jobs:
   RELIABILITY.md     10 diff-triggered Mattermost invariants (Mode A only)
   dispatch.md        the fixed prompt every blind subagent gets
   lessons.jsonl      append-only vetted false-positive patterns (top 5 injected into hunter prompts)
-  prompts/           generic Mode A/B, language rules, mutant and strengthen prompts
-  scripts/           trusted.py, prepare.py, ctx.py (+ prefilter.py), build_requests.py, reliability.py, run.py,
-                     old_tests.py, pr_tests.py, lessons.py, mine_rules.py, eval_reverts.py, start_pg.sh
+  prompts/           Mode A/B/D, strategies (S1-S4), fuzz, language rules, repair, mutant and strengthen prompts
+  scripts/           hunt_common.py, trusted.py, prepare.py, ctx.py (+ prefilter.py), build_requests.py,
+                     reliability.py, run.py, old_tests.py, pr_tests.py, lessons.py, mine_rules.py,
+                     mine_controls.py, eval_reverts.py, start_pg.sh
 .claude/skills/verify/
   SKILL.md           plan, run, iterate (at most 3 runs), report
-  scripts/verify_ui.mjs
+  scripts/verify_ui.mjs, pr_server.py
 scripts/install-skill.sh
 eval/revert_cases.json  real Mattermost reverts (bug_sha, fix_sha, area, quoted reason) and size-matched controls
 tests/               self-test: /hunt fixtures (Go bug, React bug, clean control), trusted rules, RELIABILITY

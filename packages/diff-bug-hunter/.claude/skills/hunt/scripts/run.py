@@ -75,8 +75,7 @@ GO_PACKAGE_TIME = re.compile(r"^(?:ok|FAIL)\s+\S+\s+([\d.]+)s\s*$", re.M)
 MUTANT_TIMEOUT_FACTOR = 5
 MUTANT_TIMEOUT_MIN_S = 60
 # A failure on the merge-base that only says the code under test does not exist there.
-MISSING_ON_BASE = re.compile(r"is not a function|is not defined|is not a constructor|Cannot find module|"
-                             r"Cannot read propert(?:y|ies) of undefined|undefined is not", re.I)
+MISSING_ON_BASE = re.compile(r"is not a function|is not defined|is not a constructor|Cannot find module", re.I)
 
 
 class CompileError(RuntimeError):
@@ -883,9 +882,37 @@ def js_regex_escape(s: str) -> str:
     return re.sub(r"[.*+?^${}()|[\]\\/]", lambda m: "\\" + m.group(0), s)
 
 
-def go_test_coverage(wt: Path, d: str, name: str, changed: dict[str, set[int]]) -> dict[str, tuple[set[int], set[int]]] | None:
+def go_cover_binary(wt: Path, d: str, changed: dict[str, set[int]], td: Path) -> tuple[Path | None, list[str]]:
+    """Compile one coverage-instrumented Go test binary per package so `cmd_cover` builds once, not once per test."""
+    root = go_root(wt, d)
+    go_files = [f for f in changed if f.endswith(".go") and not f.endswith("_test.go")
+                and (wt / f).resolve().is_relative_to(root.resolve())]
+    if not go_files:
+        return None, []
+    pkgs = sorted({"./" + os.path.relpath((wt / f).parent, root) for f in go_files})
+    bin_path = td / f"cover-{hashlib.sha256(d.encode()).hexdigest()[:8]}.test"
+    p = sh(["go", "test", "-c", "-cover", "-coverpkg=" + ",".join(pkgs), "-o", str(bin_path),
+            "./" + os.path.relpath(wt / d, root)], root, check=False, timeout=1800)
+    return (bin_path if p.returncode == 0 and bin_path.exists() else None), go_files
+
+
+def go_test_coverage(wt: Path, d: str, name: str, changed: dict[str, set[int]],
+                     prebuilt: tuple[Path | None, list[str]] | None = None) -> dict[str, tuple[set[int], set[int]]] | None:
     """Run one Go test alone with coverage of the changed packages in its module; None if no profile was written."""
     root = go_root(wt, d)
+    if prebuilt is not None:
+        bin_path, go_files = prebuilt
+        if not go_files:
+            return {}
+        if bin_path is None:
+            return None
+        with tempfile.TemporaryDirectory() as td:
+            prof = Path(td) / "cover.out"
+            sh([str(bin_path), f"-test.run=^{name}$", f"-test.coverprofile={prof}"], wt / d, check=False, timeout=1800)
+            if not prof.exists():
+                return None
+            text = prof.read_text()
+        return {f: go_profile_lines(text, os.path.relpath(wt / f, root)) for f in go_files}
     go_files = [f for f in changed if f.endswith(".go") and not f.endswith("_test.go")
                 and (wt / f).resolve().is_relative_to(root.resolve())]
     if not go_files:
@@ -962,14 +989,18 @@ def cmd_cover(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     placed: list[Path] = []
     try:
         placed = place(wt, files, {t["dir"] for t in state["targets"]})
-        for ident in sorted(table):
-            loc, name = ident.split("::", 1)
-            if name == PACKAGE_FAILED:
-                continue
-            if loc.endswith((".ts", ".tsx", ".js", ".jsx")):
-                per_test[ident] = jest_test_coverage(wt, loc, name, changed)
-            else:
-                per_test[ident] = go_test_coverage(wt, loc, name, changed)
+        with tempfile.TemporaryDirectory() as bin_td:
+            go_bins: dict[str, tuple[Path | None, list[str]]] = {}
+            for ident in sorted(table):
+                loc, name = ident.split("::", 1)
+                if name == PACKAGE_FAILED:
+                    continue
+                if loc.endswith((".ts", ".tsx", ".js", ".jsx")):
+                    per_test[ident] = jest_test_coverage(wt, loc, name, changed)
+                else:
+                    if loc not in go_bins:
+                        go_bins[loc] = go_cover_binary(wt, loc, changed, Path(bin_td))
+                    per_test[ident] = go_test_coverage(wt, loc, name, changed, prebuilt=go_bins[loc])
     finally:
         unplace(placed)
     out = cover_table(changed, per_test)

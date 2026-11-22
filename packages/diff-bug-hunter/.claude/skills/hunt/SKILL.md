@@ -22,22 +22,25 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
    is missing, or go to step 7. `--fresh` only when the user asks for a new hunt. A PR whose head moved starts over by itself.
    `INFRA_ERROR` = stop and report it; that includes less than 2 GiB free under `HUNT_SCRATCH`, which `prepare.py`
    and every Go `-race` run check first.
-   If the PR touches `webapp/` or a server API a page calls, also start
+   If the PR touches `webapp/` or a server API a page calls and `../../verify/scripts/pr_server.py` is installed, also start
    `python3 ../../verify/scripts/pr_server.py images <pr> --pull` (from `scripts/`) in the background now and check it
    printed the two image tags: the images for a `/verify` check are then pulled while the hunters work.
 2. **Context:** `ctx.py <pr> [--batch N]`. Quote its batch line. `skipped.log` lists every file not hunted; mention the
    deferred batches in the report and hunt them only if the user asks.
-3. **Hunters:** `build_requests.py <pr> hunters`, then dispatch `A/request.json` and `B/request.json` in parallel.
-   Both also get `prompts/strategy_x.md` (Mode A: S1 sibling guards, S2 adversarial callers and props, S4 existing-data compatibility; Mode B: S3
+3. **Hunters (A, B and D in parallel):** `build_requests.py <pr> hunters && build_requests.py <pr> diff`, then dispatch
+   `A/request.json`, `B/request.json` and `D/request.json` in parallel.
+   Modes A and B also get `prompts/strategy_x.md` (Mode A: S1 sibling guards, S2 adversarial callers and props, S4 existing-data compatibility; Mode B: S3
    merge-base differential) and the context it reads: `neighbors_same_file` (unchanged functions near the change, from
    the same file, topped up from the same directory) and `changed_functions_base_source`. Strengthen and repair rounds
    get the context but not `strategy_x.md`; mutant planters get neither.
    Mode A's reference models come from base code and callers, never from the PR description; Mode B treats the
    description as a claim to test, and adds a caller-side "claim vs caller contract" test where a claim changes
    behaviour callers relied on.
-   Mode A also gets the `RELIABILITY.md` rules this diff triggers; Mode B and mutant planters never do. Each goes
-   to a fresh Agent with no messaging/MCP tools, prompted with `dispatch.md` (next to this file) and `{REQ}` = the path.
-4. **Run:** `run.py run <pr> A` and `run.py run <pr> B`.
+   Mode A also gets the `RELIABILITY.md` rules this diff triggers; Mode B, Mode D and mutant planters never do. Mode D
+   writes only seeded input generators and recorders (no assertion, no expected value, nothing taken from the PR
+   description). Each goes to a fresh Agent with no messaging/MCP tools, prompted with `dispatch.md` (next to this file)
+   and `{REQ}` = the path.
+4. **Run:** `run.py run <pr> A`, `run.py run <pr> B` and `run.py diff <pr> D` (one script at a time; they share the worktrees).
    - `COMPILE_ERROR` (exit 3): one repair round. `build_requests.py <pr> repair <tag>`, dispatch
      `<tag>/request.repair.json` to a fresh agent, rerun. Still broken = report the hunter as failed.
    - `INFRA_ERROR` (exit 2): fix the environment and rerun. Never report it as "no findings".
@@ -56,14 +59,11 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      test) and `PRE_EXISTING` are listed, not reported as findings.
    - Then `pr_tests.py <pr>` (no model): the PR's own added or edited Go tests run 3x with
      `ENABLE_FULLY_PARALLEL_TESTS=true`. Verdicts: `PR_TEST_FAILS_UNDER_CI`, `PR_TEST_FAILS`, `FLAKY`, `PASS`.
-4b. **Differential recorders (Mode D), code decides:** `build_requests.py <pr> diff`, dispatch `D/request.json` to a fresh
-   Agent as in step 3, then `run.py diff <pr> D`. The model writes only seeded input generators and recorders (no
-   assertion, no expected value, nothing taken from the PR description); the same recorder runs twice on the PR head
-   and once on the merge-base, and code diffs the records per input. Verdicts per recorder: `SAME`, `DIFF` (up to 5
-   smallest examples: `input`, `base`, `head`), `NONDETERMINISTIC` (the two head runs disagree: records dropped),
-   `BASE_UNCOMPILABLE` / `BASE_FAILED` (that recorder cannot run on the merge-base: decide from the diff),
-   `RECORDER_FAILED`, `NO_RECORDS`. `COMPILE_ERROR` (exit 3): one repair round as in step 4 (`repair D`); `INFRA_ERROR`
-   (exit 2): fix and rerun. Files: `diff_D.json`, `diff_D.examples.json`.
+   - `run.py diff <pr> D` runs the Mode D recorders twice on the PR head and once on the merge-base, and code diffs the
+     records per input. Verdicts per recorder: `SAME`, `DIFF` (up to 5 smallest examples: `input`, `base`, `head`),
+     `NONDETERMINISTIC` (the two head runs disagree: records dropped), `BASE_UNCOMPILABLE` / `BASE_FAILED` (that
+     recorder cannot run on the merge-base: decide from the diff), `RECORDER_FAILED`, `NO_RECORDS`. Files:
+     `diff_D.json`, `diff_D.examples.json`.
 5. **Vet every `FAIL_3_OF_3`:**
    - Root-cause it with a throwaway diagnostic test, then delete it (`run.py` refuses to run on a dirty worktree).
    - `lessons.py match <scratch>/hunt<pr>/ctx.json` lists known false positives. If it is one, drop it.

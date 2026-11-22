@@ -11,10 +11,12 @@ usage: pr_server.py images <pr> [--pull]   print the enterprise image tags of th
                                            on another build (its volumes are dropped), check the running build is that image, then seed an admin for /verify
        pr_server.py down [--e2e <dir>]
 
---e2e defaults to $MM_E2E_DIR, else ~/Documents/mattermost/mattermost/e2e-tests. The stack is `make start-server` with
+--e2e defaults to $MM_E2E_DIR, else <cwd>/e2e-tests (searching upward from the current directory), else
+$HUNT_MM/e2e-tests. The stack is `make start-server` with
 TEST=none and only postgres + inbucket. Its containers use host networking: on Docker Desktop (macOS) turn on
 Settings > Resources > Network > Enable host networking. One stack per machine (port 8065), so base and head run one
-after the other; `up` holds a lock for the whole swap and replaces a server that runs another build (make stop-server
+after the other; `up` and `down` hold a lock in the system temp dir (leaving e2e-tests/ clean) and `up` replaces a
+server that runs another build (make stop-server
 drops its volumes), so a plan never runs against the wrong build. (The repo's Playwright Testcontainers stack was tried: its env-pinned settings,
 e.g. ServiceSettings.SiteURL, are read-only in the System Console, and an image swap took 166 s against ~100 s here.)
 Seeding: the first user on a fresh server becomes system admin. $VERIFY_USER / $VERIFY_PASSWORD are created if
@@ -28,6 +30,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -35,10 +38,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-REPO = "mattermost/mattermost"
+REPO = os.environ.get("HUNT_REPO", "mattermost/mattermost")
 IMAGE_REPO = "mattermostdevelopment/mattermost-enterprise-edition"
 SERVER_URL = "http://localhost:8065"  # the e2e stack's fixed port (e2e-tests/.ci/server.generate.sh)
-DEFAULT_E2E = Path.home() / "Documents/mattermost/mattermost/e2e-tests"
 STACK_ENV = {"TEST": "none", "ENABLED_DOCKER_SERVICES": "postgres inbucket"}
 # Onboarding preferences that put an overlay over the app (webapp components/onboarding_tasks/constants.ts).
 ONBOARDING_OFF = [("onboarding_task_list", "onboarding_task_list_show", "false"),
@@ -49,6 +51,25 @@ ONBOARDING_OFF = [("onboarding_task_list", "onboarding_task_list_show", "false")
 
 class InfraError(RuntimeError):
     pass
+
+
+def default_e2e(cwd: Path | None = None) -> Path:
+    """Locate mattermost's e2e-tests dir: $MM_E2E_DIR, else an e2e-tests dir above cwd, else $HUNT_MM/e2e-tests."""
+    if os.environ.get("MM_E2E_DIR"):
+        return Path(os.environ["MM_E2E_DIR"])
+    cur = (cwd or Path.cwd()).resolve()
+    for base in (cur, *cur.parents):
+        for cand in (base, base / "e2e-tests"):
+            if (cand / ".ci" / "server.generate.sh").exists():
+                return cand
+    if os.environ.get("HUNT_MM"):
+        return Path(os.environ["HUNT_MM"]) / "e2e-tests"
+    return cur / "e2e-tests"
+
+
+def lock_path() -> Path:
+    """One stack per machine (port 8065): keep the lock in tempdir so e2e-tests/ never gets an untracked file."""
+    return Path(tempfile.gettempdir()) / "mm-pr-server-8065.lock"
 
 
 def image_for(sha: str) -> str:
@@ -74,7 +95,8 @@ def gh_json(path: str) -> Any:
 def pr_images(pr: str) -> dict[str, str]:
     meta = gh_json(f"repos/{REPO}/pulls/{pr}")
     head = meta["head"]["sha"]
-    merge_base = gh_json(f"repos/{REPO}/compare/{meta['base']['sha']}...{head}")["merge_base_commit"]["sha"]
+    head_ref = meta["head"].get("label") or head  # owner:branch works for fork PRs as well as same-repo PRs
+    merge_base = gh_json(f"repos/{REPO}/compare/{meta['base']['sha']}...{head_ref}")["merge_base_commit"]["sha"]
     return {"head": image_for(head), "base": image_for(merge_base)}
 
 
@@ -144,13 +166,17 @@ def make(e2e: Path, target: str, image: str) -> None:
         raise InfraError(f"make {target} failed:\n{(p.stdout + p.stderr)[-1500:]}")
 
 
+def _require_e2e(e2e: Path) -> None:
+    if not (e2e / ".ci" / "server.generate.sh").exists():
+        raise InfraError(f"{e2e} is not the mattermost repo's e2e-tests dir (pass --e2e or set MM_E2E_DIR)")
+
+
 def up(image: str, e2e: Path) -> None:
     user, password = os.environ.get("VERIFY_USER"), os.environ.get("VERIFY_PASSWORD")
     if not (user and password):
         raise InfraError("set VERIFY_USER and VERIFY_PASSWORD (the admin /verify will log in as)")
-    if not (e2e / ".ci" / "server.generate.sh").exists():
-        raise InfraError(f"{e2e} is not the mattermost repo's e2e-tests dir")
-    with open(e2e / ".pr_server.lock", "w") as lock:
+    _require_e2e(e2e)
+    with open(lock_path(), "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)  # two swaps at once would leave one plan on the other's build
         build = running_build(SERVER_URL)
         if build is None or not build_matches(build, image):
@@ -167,14 +193,23 @@ def up(image: str, e2e: Path) -> None:
     print(f"VERIFY_BASE_URL={SERVER_URL} build={build[:10]}")
 
 
+def down(e2e: Path) -> None:
+    _require_e2e(e2e)
+    with open(lock_path(), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        make(e2e, "stop-server", f"{IMAGE_REPO}:master")
+
+
 def main(argv: list[str]) -> None:
     argv = list(argv)
     e2e_dir = None
     if "--e2e" in argv:
         i = argv.index("--e2e")
-        e2e_dir = argv[i + 1] if i + 1 < len(argv) else None
+        if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+            sys.exit(__doc__)
+        e2e_dir = argv[i + 1]
         del argv[i:i + 2]
-    e2e = Path(e2e_dir or os.environ.get("MM_E2E_DIR") or DEFAULT_E2E)
+    e2e = Path(e2e_dir) if e2e_dir else default_e2e()
     pull_too = "--pull" in argv
     args = [a for a in argv if a != "--pull"]
     if args[:1] == ["images"] and len(args) == 2:
@@ -187,7 +222,7 @@ def main(argv: list[str]) -> None:
     elif args[:1] == ["up"] and len(args) == 2:
         up(args[1], e2e)
     elif args == ["down"]:
-        make(e2e, "stop-server", f"{IMAGE_REPO}:master")
+        down(e2e)
     else:
         sys.exit(__doc__)
 

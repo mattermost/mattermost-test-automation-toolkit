@@ -182,7 +182,7 @@ def prepare(pr: str, fresh: bool = False) -> None:
                             "Do not start over: continue from the first step whose output is missing, or report. "
                             "Pass --fresh only if the user asked for a new hunt.")
     # The worktrees are about to move: context, responses and verdicts from the previous preparation no longer apply.
-    reset_hunt_dir(hdir)
+    reset_hunt_dir(hdir, include_whole_pr=True)
     (hdir / "prepare.json").unlink(missing_ok=True)
     mm = mm_clone()
     ensure_clone(mm)

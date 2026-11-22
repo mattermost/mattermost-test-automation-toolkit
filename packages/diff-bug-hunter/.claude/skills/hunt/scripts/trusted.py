@@ -82,7 +82,7 @@ def read(name: str, skill_dir: Path = SKILL_DIR) -> str:
     """Content of <skill_dir>/<name> as the trusted ref has it (see module doc)."""
     path = (skill_dir / name).resolve()
     root = repo_root(skill_dir)
-    if root is None or os.environ.get("HUNT_TRUSTED_REF") == WORKTREE:
+    if root is None or os.environ.get("HUNT_TRUSTED_REF", "").strip() == WORKTREE:
         return path.read_text() if path.exists() else ""
     if not _skill_tracked(root, skill_dir):
         return path.read_text() if path.exists() else ""
@@ -102,19 +102,28 @@ def check(skill_dir: Path = SKILL_DIR) -> str:
     root = repo_root(skill_dir)
     if root is None:
         return "skill is not in a git repository: local install, read from disk"
-    if os.environ.get("HUNT_TRUSTED_REF") == WORKTREE:
+    if os.environ.get("HUNT_TRUSTED_REF", "").strip() == WORKTREE:
         return "HUNT_TRUSTED_REF=worktree: rules read from disk (rule-editing mode)"
     rel = skill_dir.resolve().relative_to(root.resolve()).as_posix()
     if not _skill_tracked(root, skill_dir):
         return f"{rel} is not tracked: local install, read from disk"
-    _, tracked = _git(root, "ls-files", "--", rel, check=False)
+    # Step 1 of /hunt also invokes sibling verify/scripts/pr_server.py when present: guard it if tracked in this repo.
+    paths = [rel]
+    pr_server = (skill_dir.resolve().parent / "verify" / "scripts" / "pr_server.py")
+    if pr_server.exists() and pr_server.is_relative_to(root.resolve()):
+        ps_rel = pr_server.relative_to(root.resolve()).as_posix()
+        if (_git(root, "ls-files", "--error-unmatch", ps_rel, check=False)[0] == 0
+                or _tracked_at_head(root, ps_rel)):
+            paths.append(ps_rel)
+    _, tracked = _git(root, "ls-files", "--", *paths, check=False)
     bytecode = [f for f in tracked.splitlines() if "__pycache__/" in f or f.endswith((".pyc", ".pyo"))]
     if bytecode:
         raise InfraError(f"compiled bytecode is committed in the skill ({', '.join(bytecode[:3])}); Python could run it "
                          "instead of the reviewed source. Remove it from git.")
     ref = trusted_ref(root)
-    code, changed = _git(root, "diff", "--name-status", "--no-renames", ref, "--", rel, check=False)
-    _, untracked = _git(root, "ls-files", "--others", "--exclude-standard", "--", rel, check=False)
+    code, changed = _git(root, "diff", "--name-status", "--no-renames", ref, "--", *paths, check=False)
+    # No --exclude-standard: a PR must not hide a shadowing module (e.g. scripts/json.py) behind .gitignore.
+    _, untracked = _git(root, "ls-files", "--others", "--", *paths, check=False)
     # lessons.jsonl may hold lessons added since the base (lessons.py add appends there); read() takes the trusted
     # copy anyway, so an edited working copy cannot change what hunters see and must not block hunting. Only an
     # in-place edit is exempt: a deleted, added or untracked lessons file is reported like any other change.

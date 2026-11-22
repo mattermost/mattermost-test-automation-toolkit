@@ -172,3 +172,25 @@ def test_a_missing_tool_is_an_infra_error_not_a_traceback(monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:
         pr_server.run_cli(["images", "40094"])
     assert e.value.code == 2 and capsys.readouterr().out.startswith("INFRA_ERROR")
+
+
+def test_up_leaves_e2e_dir_clean_and_down_validates_e2e(tmp_path, monkeypatch, fake):
+    _, url = fake
+    e2e = tmp_path / "e2e-tests"
+    (e2e / ".ci").mkdir(parents=True)
+    (e2e / ".ci" / "server.generate.sh").write_text("")
+    monkeypatch.setenv("VERIFY_USER", "poster")
+    monkeypatch.setenv("VERIFY_PASSWORD", "pw")
+    monkeypatch.setattr(pr_server, "SERVER_URL", url)
+    calls = []
+    monkeypatch.setattr(pr_server, "make", lambda d, t, img: calls.append((d, t)))
+    pr_server.up("mattermostdevelopment/mattermost-enterprise-edition:5e62cb1", e2e)
+    assert not (e2e / ".pr_server.lock").exists()  # lock lives in tempdir, never in the repo
+    pr_server.down(e2e)
+    assert calls == [(e2e, "stop-server")]
+    with pytest.raises(pr_server.InfraError, match="not the mattermost repo's e2e-tests dir"):
+        pr_server.down(tmp_path / "empty")
+    monkeypatch.delenv("MM_E2E_DIR", raising=False)
+    assert pr_server.default_e2e(tmp_path) == e2e
+    with pytest.raises(SystemExit):
+        pr_server.main(["down", "--e2e"])

@@ -333,6 +333,13 @@ def _run_unit(wt: Path, wt_base: Path, unit: dict[str, Any], swap: Swap,
     try:
         base = run_once(wt_base, tests)
         more = [run_once(wt_base, [n.split("::", 1)[1] for n in some] if go else tests) for _ in range(RUNS - 1)] if some else []
+    except CompileError as e:
+        out = {f"{key}::{n}": "NOT_RUN" for n in (tests if go else [unit["file"]])}
+        out_msgs = {f"{key}::*": f"base uncompilable: {str(e)[-1500:]}"}
+        for t, why in removed.items():
+            out[f"{key}::{t}"] = "OLD_TEST_UNCOMPILABLE"
+            out_msgs[f"{key}::{t}"] = why[-1500:]
+        return out, out_msgs
     finally:
         base_swap.restore()  # nothing is swapped on base; this only removes files the run left behind
     table, msgs = {}, {}

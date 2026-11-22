@@ -119,9 +119,11 @@ def callers(wt: Path, files: list[str], symbols: set[str]) -> list[dict[str, str
     roots = sorted({f.split("/")[0] for f in files})
     for sym in sorted(symbols):
         for root in roots:
-            p = sh(["grep", "-rnw", "--include=*.go", "--include=*.ts", "--include=*.tsx", "--include=*.js",
+            p = sh(["grep", "-rnwIH", "--include=*.go", "--include=*.ts", "--include=*.tsx", "--include=*.js",
                     "--exclude-dir=node_modules", "--exclude-dir=vendor", sym, root], wt, check=False)
             for hit in p.stdout.splitlines():
+                if hit.count(":") < 2:
+                    continue
                 f, n_s, _ = hit.split(":", 2)
                 if (f in files or f.endswith(("_test.go", ".test.ts", ".test.tsx", ".test.js"))
                         or "/mocks/" in f or not n_s.isdigit()):
@@ -262,11 +264,13 @@ def file_diffs(repo: Path, mb: str, head: str) -> list[prefilter.FileDiff]:
 # log, old verdicts), so a new context removes them; prepare.json stays.
 STALE = ("A", "B", "D", "A2", "M", "M2", "R_*", "run_*", "base_*", "mutants_*", "compile_*", "fuzz_*", "diff_*", "ctx.json",
          "state.json", "skipped.log")
+WHOLE_PR_STALE = ("old_tests.json", "old_tests.messages.json", "pr_tests.json", "pr_tests.messages.json")
 
 
-def reset_hunt_dir(hdir: Path) -> None:
+def reset_hunt_dir(hdir: Path, *, include_whole_pr: bool = False) -> None:
     hdir.mkdir(parents=True, exist_ok=True)
-    for pattern in STALE:
+    patterns = STALE + WHOLE_PR_STALE if include_whole_pr else STALE
+    for pattern in patterns:
         for p in hdir.glob(pattern):
             if p.is_dir() and not p.is_symlink():
                 shutil.rmtree(p)
