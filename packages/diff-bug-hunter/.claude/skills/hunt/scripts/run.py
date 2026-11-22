@@ -310,8 +310,10 @@ def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "out.json"
             # --runTestsByPath: a bare path is a regex and would also run e.g. src/packages/.../actions/hunt_a.test.tsx
-            p = sh(["npx", "jest", "--runTestsByPath", os.path.relpath(wt / rel, root), "--watchAll=false", "--json",
-                    f"--outputFile={out}"],
+            # --ci=false: Jest turns --ci on by itself when CI is set, and then a test whose snapshot is missing fails
+            # instead of writing one (removed after the run). Verdicts must not depend on where the hunt runs.
+            p = sh(["npx", "jest", "--runTestsByPath", os.path.relpath(wt / rel, root), "--watchAll=false", "--ci=false",
+                    "--json", f"--outputFile={out}"],
                    root, check=False, timeout=1200, env=node_env())
             if not out.exists():
                 raise InfraError(f"jest wrote no results for {rel}:\n{(p.stdout + p.stderr)[-2500:]}")
@@ -906,7 +908,7 @@ def jest_test_coverage(wt: Path, rel: str, full_name: str,
     if not js_files:
         return {}
     with tempfile.TemporaryDirectory() as td:
-        args = ["npx", "jest", "--runTestsByPath", os.path.relpath(wt / rel, root), "--watchAll=false",
+        args = ["npx", "jest", "--runTestsByPath", os.path.relpath(wt / rel, root), "--watchAll=false", "--ci=false",
                 "-t", f"^{js_regex_escape(full_name)}$", "--coverage", "--coverageReporters=json",
                 f"--coverageDirectory={td}"]
         for f in js_files:
