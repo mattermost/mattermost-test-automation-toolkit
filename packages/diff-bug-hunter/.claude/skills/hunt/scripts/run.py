@@ -116,7 +116,9 @@ def normalize_failure(text: str, wt: Path) -> str:
     values written in hex (got 0x02, want 0x01) are kept; only frame offsets and 64-bit addresses are redacted."""
     text = text.replace(str(wt.resolve()), "<wt>").replace(str(wt), "<wt>")
     keep = [line for line in text.splitlines()
-            if not re.match(r"\s+at |\s*created by |\t\S+\.go:\d+(?: \+0x[0-9a-fA-F]+)?$", line)]  # JS and Go frames
+            if not re.match(r'\s+at |\s*created by |\t\S+\.go:\d+(?: \+0x[0-9a-fA-F]+)?$|'
+                            r'\s*\{"(?:timestamp":"[^"]+",)?"level":"(?:debug|info|warn)"|'
+                            r'\s*(?:debug|info|warn) \[\d{4}-\d{2}-\d{2}', line)]  # JS/Go frames & server noise logs
     text = "\n".join(keep)
     text = re.sub(r"(?i)goroutine \d+", "goroutine N", text)
     text = re.sub(r"\(\d+(?:\.\d+)?m?s\)", "", text)
@@ -128,8 +130,11 @@ def normalize_failure(text: str, wt: Path) -> str:
     text = re.sub(r"(?<=[\w)\]])\((?:[\s{},.?]|0x[0-9a-fA-F]+)*0x[0-9a-fA-F]+(?:[\s{},.?]|0x[0-9a-fA-F]+)*\)", "(...)",
                   text)
     text = re.sub(r"\b0x[0-9a-fA-F]{9,}\b", "0x?", text)  # heap, stack and mmap addresses (wider than 32 bits)
+    text = re.sub(r"\b20\d{2}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?: ?[+-]\d{2}:?\d{2}|Z)?\b", "<ts>", text)
     text = re.sub(r"[ \t]+", " ", text).strip()
-    return text[:4000]
+    # Keep the tail: Mattermost Setup(t) server-startup JSON logs exceed 4000 chars and would otherwise hide the
+    # actual assertion failure at the end, making two distinct failures compare equal as PRE_EXISTING.
+    return text[-4000:]
 
 
 def go_test_output(out: str) -> dict[str, str]:
@@ -239,9 +244,20 @@ def go_package_runtime(out: str) -> float | None:
     return float(times[-1]) if times else None
 
 
+def timeout_caps(runtimes: dict[str, float]) -> dict[str, int]:
+    """Per Go package, a `go test -timeout` (seconds) from observed runtimes, so a hanging mutant or base run panics
+    in max(60s, 5x baseline) instead of waiting for go test's 10-minute default."""
+    return {d: max(MUTANT_TIMEOUT_MIN_S, math.ceil(MUTANT_TIMEOUT_FACTOR * t)) for d, t in runtimes.items()}
+
+
 def mutant_timeouts(base: Outcome) -> dict[str, int]:
     """Per Go package, the `go test -timeout` (seconds) for a mutant run, from the baseline run of the same suite."""
-    return {d: max(MUTANT_TIMEOUT_MIN_S, math.ceil(MUTANT_TIMEOUT_FACTOR * t)) for d, t in base.runtimes.items()}
+    return timeout_caps(base.runtimes)
+
+
+def _rel(wt: Path, sub: str | Path, root: Path) -> str:
+    """Path of `wt / sub` relative to `root`, both resolved (macOS /tmp -> /private/tmp symlinks)."""
+    return os.path.relpath((wt / sub).resolve(), root.resolve())
 
 
 def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome,
@@ -250,7 +266,7 @@ def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome,
         require_disk(scratch())  # before the -race build starts, not after it fails for lack of space
     for d, pattern in sorted(patterns.items()):
         root = go_root(wt, d)
-        pkg = "./" + os.path.relpath(wt / d, root)
+        pkg = "./" + _rel(wt, d, root)
         cap = (timeouts or {}).get(d)
         args = (["go", "test", "-count=1", "-v", "-run", pattern] + (["-race"] if race else [])
                 + ([f"-timeout={cap}s"] if cap else []) + [pkg])
@@ -287,7 +303,7 @@ def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome,
 def go_compiles(wt: Path, file: str) -> str | None:
     d = str(Path(file).parent)
     root = go_root(wt, d)
-    p = sh(["go", "test", "-c", "-o", os.devnull, "./" + os.path.relpath(wt / d, root)], root, check=False, timeout=900)
+    p = sh(["go", "test", "-c", "-o", os.devnull, "./" + _rel(wt, d, root)], root, check=False, timeout=900)
     return None if p.returncode == 0 else (p.stdout + p.stderr)[-1500:]
 
 
@@ -311,7 +327,7 @@ def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
             # --runTestsByPath: a bare path is a regex and would also run e.g. src/packages/.../actions/hunt_a.test.tsx
             # --ci=false: Jest turns --ci on by itself when CI is set, and then a test whose snapshot is missing fails
             # instead of writing one (removed after the run). Verdicts must not depend on where the hunt runs.
-            p = sh(["npx", "jest", "--runTestsByPath", os.path.relpath(wt / rel, root), "--watchAll=false", "--ci=false",
+            p = sh(["npx", "jest", "--runTestsByPath", _rel(wt, rel, root), "--watchAll=false", "--ci=false",
                     "--json", f"--outputFile={out}"],
                    root, check=False, timeout=1200, env=node_env())
             if not out.exists():
@@ -404,6 +420,10 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
     table = {n: classify([o.results.get(n, "MISSING") for o in outcomes]) for n in names}
     write_json(hdir / f"run_{tag}.json", table)
     write_json(hdir / f"run_{tag}.messages.json", outcomes[0].messages)
+    runtimes = {d: max(o.runtimes[d] for o in outcomes if d in o.runtimes)
+                for d in set().union(*(o.runtimes for o in outcomes))}
+    if runtimes:
+        write_json(hdir / f"run_{tag}.runtimes.json", runtimes)
     (hdir / f"run_{tag}.log").write_text("\n\n=== run ===\n".join(o.log for o in outcomes))
     (hdir / f"run_{tag}.response.sha256").write_text(fingerprint(files))
     return table
@@ -420,7 +440,7 @@ MAX_SALVAGE_ROUNDS = 3  # rounds that remove tests; dropping an import a removal
 def go_build_errors(wt: Path, d: str) -> str:
     """Every compiler error of one package's tests (-gcflags=-e lifts the default cap of 10)."""
     root = go_root(wt, d)
-    p = sh(["go", "test", "-c", "-o", os.devnull, "-gcflags=-e", "./" + os.path.relpath(wt / d, root)], root,
+    p = sh(["go", "test", "-c", "-o", os.devnull, "-gcflags=-e", "./" + _rel(wt, d, root)], root,
            check=False, timeout=900)
     return p.stdout + p.stderr
 
@@ -486,8 +506,25 @@ def go_repair(wt: Path, placed: list[Path], d: str) -> tuple[dict[str, list[str]
     return removed, cut
 
 
+def _filter_base_suite(suite: Suite, failing: set[str], gone: dict[str, list[str]]) -> Suite:
+    """Narrow a merge-base suite to only packages/files with a FAIL_3_OF_3 head failure and, for Go packages without
+    a package-level failure, only the specific failing tests (minus any already removed by salvage)."""
+    go_patterns: dict[str, str] = {}
+    for d, pat in suite.go_patterns.items():
+        if f"{d}::{PACKAGE_FAILED}" in failing:
+            go_patterns[d] = pat
+            continue
+        names = sorted(n.split("::", 1)[1] for n in failing
+                       if n.startswith(f"{d}::") and n not in gone)
+        if names:
+            go_patterns[d] = "^(" + "|".join(re.escape(name) for name in names) + ")$"
+    jest_files = [rel for rel in suite.jest_files if any(n.startswith(f"{rel}::") for n in failing)]
+    return Suite(go_patterns=go_patterns, jest_files=jest_files, jest_prefix=suite.jest_prefix)
+
+
 def salvage_go(wt: Path, state: dict[str, Any], tag: str, placed: list[Path],
-               race: bool = True) -> tuple[Outcome, dict[str, list[str]]]:
+               race: bool = True, failing: set[str] | None = None,
+               go_timeouts: dict[str, int] | None = None) -> tuple[Outcome, dict[str, list[str]]]:
     """run_suite on the merge-base, but a Go test file that does not build there loses only the funcs the compiler
     rejects (the placed copies, never response.json) and is retried, up to MAX_SALVAGE_ROUNDS rounds. Returns the
     outcome of what remained and {removed test identity: identifiers it could not resolve}."""
@@ -500,10 +537,12 @@ def salvage_go(wt: Path, state: dict[str, Any], tag: str, placed: list[Path],
                 p.unlink()
         live = [p for p in placed if p.exists()]
         suite = suite_for(tag, state, live, wt)
+        if failing is not None:
+            suite = _filter_base_suite(suite, failing, gone)
         if suite.empty():
             return Outcome(), gone
         try:
-            return run_suite(wt, suite, race=race), gone
+            return run_suite(wt, suite, race=race, go_timeouts=go_timeouts), gone
         except GoBuildError as e:
             fixed = go_repair(wt, live, e.pkg_dir) if rounds < MAX_SALVAGE_ROUNDS and fixups < 3 else None
             if fixed is None:
@@ -571,12 +610,15 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     head = load_json(hdir / f"run_{tag}.json")
     head_msgs = (load_json(hdir / f"run_{tag}.messages.json")
                  if (hdir / f"run_{tag}.messages.json").exists() else {})
-    out: dict[str, Any] = {}
+    runtimes_path = hdir / f"run_{tag}.runtimes.json"
+    go_timeouts = timeout_caps(load_json(runtimes_path)) if runtimes_path.exists() else None
+    failing = {n for n, v in head.items() if v == "FAIL_3_OF_3"}
+    out: dict[str, Any] = {n: "NOT_A_HEAD_FAILURE" for n in head if n not in failing}
     placed: list[Path] = []
     try:
-        if files:
+        if files and failing:
             placed = place(wt, files, {t["dir"] for t in state["targets"]})
-            o, gone = salvage_go(wt, state, tag, placed)
+            o, gone = salvage_go(wt, state, tag, placed, failing=failing, go_timeouts=go_timeouts)
             out.update(base_table(head, head_msgs, o))
             new_api: dict[str, list[str]] = {}
             for n, idents in gone.items():  # removed from the base copies: vetted by what head said about them
@@ -889,10 +931,10 @@ def go_cover_binary(wt: Path, d: str, changed: dict[str, set[int]], td: Path) ->
                 and (wt / f).resolve().is_relative_to(root.resolve())]
     if not go_files:
         return None, []
-    pkgs = sorted({"./" + os.path.relpath((wt / f).parent, root) for f in go_files})
+    pkgs = sorted({"./" + _rel(wt, Path(f).parent, root) for f in go_files})
     bin_path = td / f"cover-{hashlib.sha256(d.encode()).hexdigest()[:8]}.test"
     p = sh(["go", "test", "-c", "-cover", "-coverpkg=" + ",".join(pkgs), "-o", str(bin_path),
-            "./" + os.path.relpath(wt / d, root)], root, check=False, timeout=1800)
+            "./" + _rel(wt, d, root)], root, check=False, timeout=1800)
     return (bin_path if p.returncode == 0 and bin_path.exists() else None), go_files
 
 
@@ -912,20 +954,20 @@ def go_test_coverage(wt: Path, d: str, name: str, changed: dict[str, set[int]],
             if not prof.exists():
                 return None
             text = prof.read_text()
-        return {f: go_profile_lines(text, os.path.relpath(wt / f, root)) for f in go_files}
+        return {f: go_profile_lines(text, _rel(wt, f, root)) for f in go_files}
     go_files = [f for f in changed if f.endswith(".go") and not f.endswith("_test.go")
                 and (wt / f).resolve().is_relative_to(root.resolve())]
     if not go_files:
         return {}
-    pkgs = sorted({"./" + os.path.relpath((wt / f).parent, root) for f in go_files})
+    pkgs = sorted({"./" + _rel(wt, Path(f).parent, root) for f in go_files})
     with tempfile.TemporaryDirectory() as td:
         prof = Path(td) / "cover.out"
         sh(["go", "test", "-count=1", "-run", f"^{name}$", f"-coverprofile={prof}", "-coverpkg=" + ",".join(pkgs),
-            "./" + os.path.relpath(wt / d, root)], root, check=False, timeout=1800)
+            "./" + _rel(wt, d, root)], root, check=False, timeout=1800)
         if not prof.exists():
             return None
         text = prof.read_text()
-    return {f: go_profile_lines(text, os.path.relpath(wt / f, root)) for f in go_files}
+    return {f: go_profile_lines(text, _rel(wt, f, root)) for f in go_files}
 
 
 def jest_test_coverage(wt: Path, rel: str, full_name: str,
@@ -935,11 +977,11 @@ def jest_test_coverage(wt: Path, rel: str, full_name: str,
     if not js_files:
         return {}
     with tempfile.TemporaryDirectory() as td:
-        args = ["npx", "jest", "--runTestsByPath", os.path.relpath(wt / rel, root), "--watchAll=false", "--ci=false",
+        args = ["npx", "jest", "--runTestsByPath", _rel(wt, rel, root), "--watchAll=false", "--ci=false",
                 "-t", f"^{js_regex_escape(full_name)}$", "--coverage", "--coverageReporters=json",
                 f"--coverageDirectory={td}"]
         for f in js_files:
-            args.append(f"--collectCoverageFrom={os.path.relpath(wt / f, root)}")
+            args.append(f"--collectCoverageFrom={_rel(wt, f, root)}")
         sh(args, root, check=False, timeout=1200, env=node_env())
         final = Path(td) / "coverage-final.json"
         if not final.exists():
@@ -1108,7 +1150,7 @@ def cmd_fuzz(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
             created = [p for p in (wt / d / "testdata", wt / d / "testdata" / "fuzz", corpus) if not p.exists()]
             try:
                 p = sh(["go", "test", "-count=1", "-run", "^$", "-fuzz", f"^{name}$", f"-fuzztime={fuzz_time()}",
-                        "./" + os.path.relpath(wt / d, root)], root, check=False, timeout=1800)
+                        "./" + _rel(wt, d, root)], root, check=False, timeout=1800)
                 entries = sorted(corpus.glob("*")) if corpus.is_dir() else []
                 if p.returncode == 0:
                     report["targets"][name] = "PASS"

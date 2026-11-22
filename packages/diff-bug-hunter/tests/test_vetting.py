@@ -112,3 +112,35 @@ def test_hunt_fuzz_0_runs_no_fuzzing(tmp_path, monkeypatch):
     assert not any("_Fuzz" in n for n in table)
     assert not (hdir / "fuzz_A.json").exists()
     _clean(state)
+
+
+def test_normalize_failure_keeps_tail_past_verbose_startup_logs(tmp_path):
+    # Mattermost Setup(t) tests emit >4000 chars of JSON startup/teardown logs around the assertion line.
+    startup = ('{"timestamp":"2026-11-23 03:27:37.127 +05:30","level":"info","msg":"Server init..."}\n') * 80
+    teardown = ('{"timestamp":"2026-11-23 03:27:45.127 +05:30","level":"info","msg":"Shutting down..."}\n') * 80
+    a = run.normalize_failure(startup + "    bot_test.go:42: expected 403, got 400\n" + teardown, tmp_path)
+    b = run.normalize_failure(startup + "    bot_test.go:42: expected 403, got 500\n" + teardown, tmp_path)
+    same = run.normalize_failure(startup.replace("03:27:37.127", "03:29:00.001") + "    bot_test.go:42: expected 403, got 400\n" + teardown, tmp_path)
+    assert "expected 403, got 400" in a and a != b and a == same
+
+
+def test_cmd_base_caps_timeout_and_skips_passing_tests(tmp_path, monkeypatch):
+    hdir, state = make_hunt(tmp_path, "go_newapi")
+    run.cmd_run(hdir, state, "A")
+    assert (hdir / "run_A.runtimes.json").exists()
+    seen: list[tuple[dict[str, str], dict[str, int] | None]] = []
+    real_run_suite = run.run_suite
+
+    def spy_run_suite(wt, suite, race, go_timeouts=None):
+        seen.append((dict(suite.go_patterns), go_timeouts))
+        return real_run_suite(wt, suite, race, go_timeouts)
+
+    monkeypatch.setattr(run, "run_suite", spy_run_suite)
+    out = run.cmd_base(hdir, state, "A")
+    assert out["calc::TestHuntA_ClampKeepsUpperBound"] == "NEW_PR_BUG"
+    assert out["calc::TestHuntA_ClampAllClamps"] == "NEW_API"
+    assert out["calc::TestHuntA_ClampAllEmpty"] == "NOT_A_HEAD_FAILURE"
+    # Passing test TestHuntA_ClampAllEmpty is excluded from the base -run pattern, and timeout cap is passed.
+    assert seen and all("ClampAllEmpty" not in pat for pats, _ in seen for pat in pats.values())
+    assert all(caps and caps.get("calc", 0) >= run.MUTANT_TIMEOUT_MIN_S for _, caps in seen)
+    _clean(state)
