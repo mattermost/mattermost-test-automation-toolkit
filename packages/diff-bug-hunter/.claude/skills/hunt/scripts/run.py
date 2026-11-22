@@ -604,14 +604,20 @@ def read_records(path: Path) -> dict[str, dict[int, dict[str, Any]]]:
             continue
         if not isinstance(rec, dict) or not isinstance(rec.get("test"), str) or not isinstance(rec.get("i"), int):
             continue
-        out.setdefault(rec["test"], {})[rec["i"]] = {k: v for k, v in rec.items() if k not in ("test", "i")}
+        out.setdefault(canon_record_name(rec["test"]), {})[rec["i"]] = {k: v for k, v in rec.items() if k not in ("test", "i")}
     return out
 
 
+def canon_record_name(name: str) -> str:
+    """One spelling for a recorder's name: TestHuntD_X and HuntD_X are the same recorder (a Jest recorder may label its
+    records Go-style, as seen on PR #40187, where every record went unmatched and both tests read NO_RECORDS)."""
+    return name[4:] if name.startswith("TestHuntD_") else name
+
+
 def record_name(identity: str) -> str:
-    """The `test` a recorder writes for a run.py identity: "<dir>::TestHuntD_X" -> TestHuntD_X, and for Jest
+    """The canonical `test` for a run.py identity: "<dir>::TestHuntD_X" -> HuntD_X, and for Jest
     "<file>::HuntD HuntD_x" (describe + title) -> HuntD_x."""
-    return identity.split("::", 1)[1].split(" ")[-1]
+    return canon_record_name(identity.split("::", 1)[1].split(" ")[-1])
 
 
 def diff_records(head: dict[int, dict[str, Any]], base: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:

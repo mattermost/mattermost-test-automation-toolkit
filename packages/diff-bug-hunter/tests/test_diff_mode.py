@@ -196,7 +196,7 @@ def test_diff_records_orders_by_input_size_and_marks_missing_and_changed_inputs(
 
 
 def test_record_name_for_go_and_jest_identities():
-    assert run.record_name("calc::TestHuntD_X") == "TestHuntD_X"
+    assert run.record_name("calc::TestHuntD_X") == "HuntD_X"  # canonical: TestHuntD_X and HuntD_X are one recorder
     assert run.record_name("web/src/hunt_d.test.ts::HuntD HuntD_x") == "HuntD_x"
 
 
@@ -244,3 +244,12 @@ def test_mode_d_files_pass_place_and_suite_for(tmp_path):
     finally:
         run.unplace(placed)
     assert run.HUNT_FILE.match("hunt_d.test.tsx") and run.HUNT_FILE.match("hunt_d.test.ts")
+
+
+def test_a_recorder_labelled_go_style_still_matches_its_jest_test(tmp_path):
+    """PR #40187: a Jest recorder wrote "TestHuntD_x" records for the Jest test "HuntD HuntD_x"; they must match."""
+    f = tmp_path / "out.jsonl"
+    f.write_text('{"test": "TestHuntD_x", "i": 0, "input": 1, "output": 2}\n')
+    assert run.read_records(f) == {"HuntD_x": {0: {"input": 1, "output": 2}}}
+    assert run.record_name("web/a.test.ts::HuntD HuntD_x") == "HuntD_x"
+    assert run.record_name("server/m::TestHuntD_x") == "HuntD_x"
