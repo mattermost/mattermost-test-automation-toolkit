@@ -102,23 +102,32 @@ def go_candidates(base_src: str, head_src: str | None) -> list[str]:
     return sorted(out)
 
 
+SUPPORT_DIRS = ("storetest", "searchtest")  # packages of store/search tests that other packages' tests call
+
+
+def support_dir(path: str) -> str | None:
+    """The first SUPPORT_DIRS name among the path's parent directories, if any."""
+    return next((d for d in Path(path).parent.parts if d in SUPPORT_DIRS), None)
+
+
 def support_files(repo: Path, mb: str, head: str) -> dict[str, str]:
-    """Edited or deleted non-test Go files under a storetest/ dir, which hold store tests that other packages call:
+    """Edited or deleted non-test Go files under a storetest/ or searchtest/ dir, which hold store tests that other packages call:
     path -> M/D. Generated files (the mocks) are left out by the caller, which reads the base source."""
     out: dict[str, str] = {}
     for line in git(repo, "diff", "--name-status", "--no-renames", mb, head).splitlines():
         status, _, path = line.partition("\t")
         p = Path(path)
         if (status[:1] in ("M", "D") and path.endswith(".go") and not path.endswith("_test.go")
-                and "storetest" in p.parent.parts and not p.name.startswith("hunt_")):
+                and support_dir(path) is not None and not p.name.startswith("hunt_")):
             out[path] = status[:1]
     return out
 
 
 def support_scope(path: str) -> str:
-    """The directory whose tests may call a storetest file: the parent of its (first) storetest dir."""
+    """The directory whose tests may call a support file: the parent of its support dir."""
     parts = Path(path).parts
-    return str(Path(*parts[:parts.index("storetest")])) if parts.index("storetest") else "."
+    i = parts.index(support_dir(path) or "")
+    return str(Path(*parts[:i])) if i else "."
 
 
 def support_exports(base_src: str, head_src: str | None) -> set[str]:
@@ -137,11 +146,11 @@ def support_exports(base_src: str, head_src: str | None) -> set[str]:
     return {n for n in changed if n[:1].isupper()}
 
 
-def store_callers(repo: Path, head: str, scope: str, names: set[str]) -> dict[str, dict[str, str]]:
-    """Test functions under `scope` whose body references storetest.<name>: package dir -> {Test function: file}."""
+def store_callers(repo: Path, head: str, scope: str, names: set[str], pkg: str = "storetest") -> dict[str, dict[str, str]]:
+    """Test functions under `scope` whose body references <pkg>.<name>: package dir -> {Test function: file}."""
     out: dict[str, dict[str, str]] = {}
-    ref = re.compile(r"\bstoretest\.(?:" + "|".join(re.escape(n) for n in sorted(names)) + r")\b")
-    p = sh(git_cmd("grep", "-l", "-e", r"storetest\.", head, "--", scope), repo, check=False)
+    ref = re.compile(rf"\b{pkg}\.(?:" + "|".join(re.escape(n) for n in sorted(names)) + r")\b")
+    p = sh(git_cmd("grep", "-l", "-e", rf"{pkg}\.", head, "--", scope), repo, check=False)
     for line in p.stdout.splitlines():
         path = line.split(":", 1)[1] if ":" in line else line
         if not path.endswith("_test.go"):
@@ -365,16 +374,16 @@ def plan(repo: Path, mb: str, head: str) -> tuple[list[dict[str, Any]], list[str
                 tests |= set(go_candidates(git(repo, "show", f"{mb}:{path}"), head_src))
         if tests:
             go_units[d] = {"lang": "go", "key": d, "dir": d, "tests": tests, "swap": list(entries), "callers": []}
-    by_scope: dict[str, list[tuple[str, str, set[str]]]] = {}
+    by_scope: dict[tuple[str, str], list[tuple[str, str, set[str]]]] = {}
     for path, status in sorted(support_files(repo, mb, head).items()):
         base_src = git(repo, "show", f"{mb}:{path}")
         if is_generated(base_src.split("\n")[:60]):
             continue  # storetest/mocks
         names = support_exports(base_src, git(repo, "show", f"{head}:{path}") if status == "M" else None)
         if names:
-            by_scope.setdefault(support_scope(path), []).append((path, status, names))
-    for scope, items in sorted(by_scope.items()):
-        found = store_callers(repo, head, scope, set().union(*(n for _, _, n in items)))
+            by_scope.setdefault((support_scope(path), support_dir(path) or "storetest"), []).append((path, status, names))
+    for (scope, pkg), items in sorted(by_scope.items()):
+        found = store_callers(repo, head, scope, set().union(*(n for _, _, n in items)), pkg)
         for d, callers in sorted(found.items()):
             callers = {t: f for t, f in callers.items() if files.get(f) != "A"}  # PR-added tests are not old tests
             if not callers or generated_layer(repo, [head, mb], d):

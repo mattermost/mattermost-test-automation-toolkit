@@ -24,7 +24,7 @@ EXCLUDE: list[tuple[str, str]] = [
     ("*/i18n/*.json", "translations"), ("i18n/*.json", "translations"),
     ("*_test.go", "existing test"), ("*.test.ts", "existing test"), ("*.test.tsx", "existing test"),
     ("*.test.js", "existing test"), ("*.test.jsx", "existing test"), ("*/tests/*", "existing test"),
-    ("*/testlib/*", "test helper"), ("*testlib*.go", "test helper"), ("*/storetest/*", "test helper"),
+    ("*/testlib/*", "test helper"), ("*testlib*.go", "test helper"), ("*/storetest/*", "test helper"), ("*/searchtest/*", "test helper"),
     ("*/e2e-tests/*", "e2e suite"), ("e2e-tests/*", "e2e suite"),
     ("*.spec.ts", "existing test"), ("*.spec.tsx", "existing test"), ("*.spec.js", "existing test"),
     ("*/vendor/*", "vendored"), ("vendor/*", "vendored"), ("*/node_modules/*", "vendored"),
