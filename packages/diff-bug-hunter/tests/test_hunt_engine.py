@@ -32,6 +32,7 @@ import build_requests  # noqa: E402
 import ctx  # noqa: E402
 import hunt_common  # noqa: E402
 import lessons  # noqa: E402
+import old_tests  # noqa: E402
 import prefilter  # noqa: E402
 import prepare  # noqa: E402
 import reliability  # noqa: E402
@@ -416,7 +417,7 @@ def test_pr_own_tests_score_mutants(tmp_path):
     assert v[0]["verdict"] == "KILLED" and v[0]["killers"] == ["calc::TestClampMiddle"]
 
 
-# ------------------------------------------------------------------ Go fuzzing (HUNT_FUZZ=1)
+# ------------------------------------------------------------------ Go fuzzing (on unless HUNT_FUZZ=0)
 
 FUZZ_CLAMP = ("\nfunc huntCheckA_Clamp(t *testing.T, v, lo, hi int) {\n\tif hi < lo {\n\t\treturn\n\t}\n"
               "\tgot := Clamp(v, lo, hi)\n\tif got < lo || got > hi || (v >= lo && v <= hi && got != v) {\n"
@@ -431,11 +432,13 @@ def _add_to_response(hdir: Path, extra: str) -> None:
     (hdir / "A" / "response.json").write_text(json.dumps(resp))
 
 
-def test_fuzz_is_off_unless_asked(tmp_path, monkeypatch):
-    monkeypatch.delenv("HUNT_FUZZ", raising=False)
+def test_fuzz_is_off_only_when_hunt_fuzz_is_0(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUNT_FUZZ", "0")
     hdir, state = make_hunt(tmp_path, "go_bug")
-    with pytest.raises(hunt_common.InfraError, match="HUNT_FUZZ=1"):
+    with pytest.raises(hunt_common.InfraError, match="HUNT_FUZZ=0"):
         run.cmd_fuzz(hdir, state, "A")
+    monkeypatch.delenv("HUNT_FUZZ")  # unset = on
+    assert run.cmd_fuzz(hdir, state, "A")["targets"] == {}
 
 
 def test_fuzz_failure_is_frozen_into_a_deterministic_test_that_is_vetted_like_any_other(tmp_path, monkeypatch):
@@ -454,6 +457,7 @@ def test_fuzz_failure_is_frozen_into_a_deterministic_test_that_is_vetted_like_an
     table = run.cmd_run(hdir, state, "A")
     assert table[f"calc::{frozen}"] == "FAIL_3_OF_3"
     assert run.cmd_base(hdir, state, "A")[f"calc::{frozen}"] == "NEW_PR_BUG"
+    assert run.cmd_fuzz(hdir, state, "A")["targets"]["FuzzHuntA_Clamp"].startswith("SKIPPED already frozen")
 
 
 def test_fuzz_skips_stateful_and_unfreezable_targets(tmp_path, monkeypatch):
@@ -474,8 +478,10 @@ def test_fuzz_prompt_only_goes_to_mode_a_when_fuzzing_is_on(tmp_path, monkeypatc
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
     hdir, state = make_hunt(tmp_path, "go_bug")
     c = json.loads((hdir / "ctx.json").read_text())
-    monkeypatch.delenv("HUNT_FUZZ", raising=False)
+    monkeypatch.setenv("HUNT_FUZZ", "0")
     assert "FuzzHuntA_" not in build_requests.hunter_system("A", state, c, strategies=True)
+    monkeypatch.delenv("HUNT_FUZZ")  # the default is on
+    assert "FuzzHuntA_" in build_requests.hunter_system("A", state, c, strategies=True)
     monkeypatch.setenv("HUNT_FUZZ", "1")
     assert "FuzzHuntA_" in build_requests.hunter_system("A", state, c, strategies=True)
     assert "FuzzHuntA_" not in build_requests.hunter_system("B", state, c, strategies=True)
@@ -1312,7 +1318,7 @@ def test_base_verdicts_only_for_head_failures_and_missing_symbols():
     msgs = {"x::T3": "Error: expect(received).toBe(expected)", "x::T4": "Error: boom"}
     assert run.base_verdict("x::T1", "PASS", head, msgs, "") == "NEW_PR_BUG"
     assert run.base_verdict("x::T2", "PASS", head, msgs, "") == "NOT_A_HEAD_FAILURE"
-    assert run.base_verdict("x::T3", "FAIL", head, msgs, "TypeError: (0 , _x.newHelper) is not a function") == "BASE_UNCOMPILABLE"
+    assert run.base_verdict("x::T3", "FAIL", head, msgs, "TypeError: (0 , _x.newHelper) is not a function") == "NEW_API"
     assert run.base_verdict("x::T3", "FAIL", head, msgs, msgs["x::T3"]) == "PRE_EXISTING"
     assert run.base_verdict("x::T4", "FAIL", head, msgs, "Error: other") == "BASE_FAILS_DIFFERENTLY"
     assert run.classify(["SKIP"] * 3) == "SKIP"
@@ -2229,7 +2235,11 @@ def test_eval_reverts_scores_a_real_bug_and_a_clean_control(tmp_path, monkeypatc
     out = capsys.readouterr().out
     assert code == 0 and "VERDICT: PASS" in out, out
     card = json.loads((tmp_path / "out" / "scorecard.json").read_text())
-    assert card["metrics"] == {"raw_recall": 1.0, "vetted_recall": 1.0, "fp_rate": 0.0, "raw_fp_rate": 0.0}
+    assert card["metrics"] == {"raw_recall": 1.0, "vetted_recall": 1.0, "fp_rate": 0.0, "raw_fp_rate": 0.0,
+                               "old_recall": 0.0, "old_fp_rate": 0.0, "combined_recall": 1.0, "combined_fp_rate": 0.0,
+                               "new_api_recall": 0.0, "new_api_fp_rate": 0.0, "old_sometimes_recall": 0.0,
+                               "old_sometimes_fp_rate": 0.0, "pr_ci_recall": 0.0, "pr_ci_fp_rate": 0.0,
+                               "pr_fails_recall": 0.0, "pr_fails_fp_rate": 0.0}
     # the same responses always give the same scorecard
     assert eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out2")]) == 0
     assert json.loads((tmp_path / "out2" / "scorecard.json").read_text()) == card
@@ -2456,3 +2466,65 @@ def test_mutant_scoring_stops_on_low_disk_before_placing_anything(tmp_path, monk
         run.cmd_mutants(hdir, state, "A")
     assert not list(Path(state["wt"]).rglob("hunt_*"))  # no hunter file was placed, nothing was built
     assert not (hdir / "mutants_A.json").exists()
+
+
+# ------------------------------------------------------------------ old tests on new code (no model)
+
+def _clean(wt: Path) -> bool:
+    try:
+        run.ensure_clean(wt)  # the same rule run.py applies: node_modules and go.work do not count
+    except run.InfraError:
+        return False
+    return True
+
+
+def test_old_test_the_pr_had_to_edit_breaks_on_head_and_passes_on_base(tmp_path):
+    hdir, state = make_hunt(tmp_path, "old_test_break")
+    out = old_tests.cmd_old(hdir, state)
+    assert out["tests"] == {
+        "calc::TestClampHigh": "OLD_TEST_BREAKS",   # the edit hid the new off-by-one
+        "calc::TestClampMiddle": "PASS",            # edited (a comment) but the old version still holds
+        "dbl::TestDouble": "OLD_TEST_UNCOMPILABLE", # Double was renamed: an API change, not a finding
+    }
+    # TestClampLow is unchanged, so it never runs; the PR-added top_test.go (which uses a head-only helper) was moved
+    # aside, or the calc package would not have compiled with the base calc_test.go
+    assert [u["tests"] for u in out["units"]] == [["TestClampHigh", "TestClampMiddle"], ["TestDouble"]]
+    msgs = json.loads((hdir / "old_tests.messages.json").read_text())
+    assert "got 9, want 10" in msgs["calc::TestClampHigh"]
+    assert "undefined: Double" in msgs["dbl::*"]
+    assert _clean(Path(state["wt"])) and _clean(Path(state["wt_base"]))
+    assert (Path(state["wt"]) / "calc/top_test.go").exists()  # head files are back
+
+
+def test_old_tests_run_nothing_when_the_pr_only_adds_tests(tmp_path):
+    hdir, state = make_hunt(tmp_path, "go_bug")  # adds TestClampMiddle to an existing file; TestClampOwn is unchanged
+    assert old_tests.cmd_old(hdir, state) == {"tests": {}, "units": [], "skipped": []}
+
+
+def test_old_tests_pick_tests_that_call_a_changed_helper():
+    base = ("package c\n\nfunc helper() int {\n\treturn 1\n}\n\nfunc TestA(t *testing.T) {\n\t_ = helper()\n}\n\n"
+            "func TestB(t *testing.T) {\n\t_ = 2\n}\n")
+    head = base.replace("return 1", "return 2")
+    assert old_tests.go_candidates(base, head) == ["TestA"]
+    assert old_tests.go_candidates(base, None) == ["TestA", "TestB"]  # a deleted file: every test is old
+    assert old_tests.go_candidates(base, base) == []
+
+
+def test_old_tests_restore_head_files_even_when_a_run_is_interrupted(tmp_path, monkeypatch):
+    hdir, state = make_hunt(tmp_path, "old_test_break")
+    def boom(*a, **k):
+        raise SystemExit(143)  # SIGTERM mid-run
+    monkeypatch.setattr(old_tests, "go_run", boom)
+    with pytest.raises(SystemExit):
+        old_tests.cmd_old(hdir, state)
+    assert _clean(Path(state["wt"]))
+
+
+@pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(), reason="run `make jest-deps` first")
+def test_old_jest_file_the_pr_edited_breaks_on_head_and_leaves_no_snapshot(tmp_path):
+    hdir, state = make_hunt(tmp_path, "old_test_jest")
+    out = old_tests.cmd_old(hdir, state)
+    assert out["tests"] == {"web/src/total.test.ts::total adds every value": "OLD_TEST_BREAKS",
+                            "web/src/total.test.ts::total matches its snapshot": "PASS"}
+    # jest wrote a new snapshot file on head and on base: both are removed
+    assert _clean(Path(state["wt"])) and _clean(Path(state["wt_base"]))

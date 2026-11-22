@@ -4,6 +4,7 @@
 """Score /hunt against real history: commits that were later reverted (known bugs) and clean commits (controls).
 
 usage: eval_reverts.py <manifest.json> [--repo <git dir>] [--out <dir>] [--dispatch '<cmd>'] [--only <id> ...]
+                       [--signals hunters,old,pr] [--controls <controls_extra.json>]
 
 Manifest (paths are relative to the manifest file):
   {"repo": "<local clone>",            (--repo overrides it; a case may name its own "repo")
@@ -20,10 +21,32 @@ Each entry is hunted like a PR: head = the commit, base = its first parent, ever
 "responses" directory (batch 1 only) or, with --dispatch, from `<cmd> <request.json>`, which must write the request's
 response_path (for example a headless Claude Code call that follows ../dispatch.md).
 
+A hunter's COMPILE_ERROR gets the one repair round of SKILL.md step 4 when --dispatch is set (compile_<tag>.log,
+build_requests.py repair, dispatch the request, rerun); still broken is a miss. An InfraError inside one hunter tag
+(a target directory with no jest.config, say) is recorded on that tag: the other tag and the other signals still run.
+
+Each entry also runs two model-free signals once: old_tests.py (the base version of every existing test the commit
+edits or deletes, run on the commit) and pr_tests.py (the tests the commit itself adds or edits, run as CI would; a
+missing pr_tests module is recorded as "signal not available"). --signals picks among hunters, old and pr (default
+all). --controls appends the controls mined by mine_controls.py (ids must stay unique).
+
+Signals, per entry:
+  hunters_vetted    a NEW_PR_BUG verdict (fails 3/3 on head, passes on base)
+  hunters_new_api   a NEW_API verdict (fails on head, cannot compile on base: it calls an API the commit adds)
+  old               an OLD_TEST_BREAKS verdict
+  old_sometimes     an OLD_TEST_SOMETIMES_BREAKS verdict
+  pr_ci             a PR_TEST_FAILS_UNDER_CI verdict (fails with the CI flag, passes without it)
+  pr_fails          a PR_TEST_FAILS verdict (fails either way: a broken commit, or this machine lacks something)
+
 Scorecard (deterministic for the same responses):
   raw recall          cases with any test failing 3/3 on head / cases
-  post-vetting recall cases with a NEW_PR_BUG verdict (fails on head, passes on base) / cases
+  post-vetting recall cases with a NEW_PR_BUG verdict / cases
   false-positive rate controls with a NEW_PR_BUG verdict / controls
+  <signal> recall/FP  cases / controls where that signal fired, per signal above (new_api, old, old_sometimes, pr_ci, pr_fails)
+  combined recall/FP  cases / controls where a finding signal fired: hunters_vetted, old, old_sometimes or pr_ci.
+                      new_api and pr_fails need root-causing first, so they are reported but not combined.
+The thresholds apply to the hunter metrics (raw, post-vetting, false-positive rate) only. Seconds per entry go to
+timings.json, outside the scorecard.
 Exit 0 PASS (every threshold met, no entry errored), 1 FAIL, 2 invalid manifest or an entry that could not run.
 """
 from __future__ import annotations
@@ -40,17 +63,20 @@ if not _sys.pycache_prefix:
     _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
 
 import argparse
+import importlib
 import json
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import build_requests
 import ctx
+import old_tests
 import prepare
 import run
 from hunt_common import InfraError, git, require_disk, write_json
@@ -58,6 +84,21 @@ from hunt_common import InfraError, git, require_disk, write_json
 CASE_KEYS = ("id", "bug_sha", "fix_sha", "area", "bug", "source")
 CONTROL_KEYS = ("id", "sha", "area")
 DEFAULT_THRESHOLDS = {"raw_recall_min": 0.0, "vetted_recall_min": 0.0, "fp_rate_max": 1.0}
+SIGNALS = ("hunters", "old", "pr")
+# per-entry signal flags: (name, results key, verdicts that fire it, the --signals group it belongs to)
+FLAGS: tuple[tuple[str, str, frozenset[str], str], ...] = (
+    ("hunters_vetted", "base", frozenset({"NEW_PR_BUG"}), "hunters"),
+    ("hunters_new_api", "base", frozenset({"NEW_API"}), "hunters"),
+    ("old", "old", frozenset({"OLD_TEST_BREAKS"}), "old"),
+    ("old_sometimes", "old", frozenset({"OLD_TEST_SOMETIMES_BREAKS"}), "old"),
+    ("pr_ci", "pr", frozenset({"PR_TEST_FAILS_UNDER_CI"}), "pr"),
+    ("pr_fails", "pr", frozenset({"PR_TEST_FAILS"}), "pr"),
+)
+# metric prefix per flag: hunters_vetted keeps its historical names (vetted_recall, fp_rate)
+METRIC_NAMES = {"hunters_new_api": "new_api", "old": "old", "old_sometimes": "old_sometimes", "pr_ci": "pr_ci",
+                "pr_fails": "pr_fails"}
+# signals that count as a finding on their own (combined recall / FP)
+FINDINGS = ("hunters_vetted", "old", "old_sometimes", "pr_ci")
 
 
 class ManifestError(ValueError):
@@ -69,11 +110,21 @@ class ManifestError(ValueError):
 ENTRY_FAILURES = (InfraError, OSError, subprocess.SubprocessError, KeyError, ValueError)
 
 
-def load_manifest(path: Path, repo_override: Path | None) -> dict[str, Any]:
+def load_controls(path: Path) -> list[dict[str, Any]]:
+    """Controls mined by mine_controls.py: {\"controls\": [...]} or a bare list."""
+    data = json.loads(path.read_text())
+    controls = data.get("controls") if isinstance(data, dict) else data
+    if not isinstance(controls, list):
+        raise ManifestError(f"{path}: expected a controls list")
+    return controls
+
+
+def load_manifest(path: Path, repo_override: Path | None,
+                  extra_controls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     m = json.loads(path.read_text())
     if not m.get("cases") or not isinstance(m["cases"], list):
         raise ManifestError("manifest needs a non-empty cases list")
-    controls = m.get("controls") or []
+    controls = (m.get("controls") or []) + (extra_controls or [])
     ids = [e.get("id") for e in m["cases"] + controls]
     if len(ids) != len(set(ids)):
         raise ManifestError("entry ids must be unique")
@@ -121,8 +172,71 @@ def dispatch(cmd: str, request: Path) -> None:
         raise InfraError(f"dispatch failed for {request} (exit {p.returncode}): {(p.stdout + p.stderr)[-800:]}")
 
 
-def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None) -> dict[str, Any]:
-    """Hunt one commit as if it were PR #num; returns its run and base tables per batch and hunter."""
+def _attempt(hdir: Path, state: dict[str, Any], tag: str, row: dict[str, Any]) -> None:
+    row["run"] = run.cmd_run(hdir, state, tag)
+    row["base"] = run.cmd_base(hdir, state, tag)
+
+
+def _repair(num: int, hdir: Path, tag: str, err: run.CompileError, dispatch_cmd: str) -> None:
+    """SKILL.md step 4's one repair round: what run.py main() writes on COMPILE_ERROR, then build_requests.py repair, then
+    one dispatch of the repair request. The old response goes away first so a dispatch that writes nothing fails."""
+    (hdir / f"compile_{tag}.log").write_text(str(err))
+    build_requests.main(str(num), "repair", tag)  # keeps the old response as response.prev.json
+    response = hdir / tag / "response.json"
+    response.unlink()
+    try:
+        dispatch(dispatch_cmd, hdir / tag / "request.repair.json")
+    except InfraError:
+        response.write_text((hdir / tag / "response.prev.json").read_text())  # the first response stays the record
+        raise
+
+
+def hunt_tag(num: int, hdir: Path, state: dict[str, Any], tag: str, batch: int, dispatch_cmd: str | None) -> dict[str, Any]:
+    """One hunter's run and base tables. Its own failures stay on its row: a compile error is a miss (as in a real hunt
+    that exhausted its repair round), an InfraError loses only this hunter."""
+    row: dict[str, Any] = {"batch": batch, "hunter": tag}
+    try:
+        try:
+            _attempt(hdir, state, tag, row)
+        except run.CompileError as err:
+            if not dispatch_cmd:
+                raise
+            row.pop("run", None)
+            row["repaired"] = True
+            _repair(num, hdir, tag, err, dispatch_cmd)
+            _attempt(hdir, state, tag, row)
+    except run.CompileError as err:
+        row.pop("run", None)
+        row.pop("base", None)
+        row["compile_error"] = str(err)[-400:]
+    except InfraError as err:
+        row.pop("base", None)
+        row["error"] = str(err)[-400:]
+    return row
+
+
+def old_signal(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return {"hunter": "OLD", "old": old_tests.cmd_old(hdir, state)["tests"]}
+    except InfraError as err:  # the other signals' results stand; only this check is lost
+        return {"hunter": "OLD", "old": {}, "old_error": str(err)[-400:]}
+
+
+def pr_signal(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
+    try:
+        pr_tests = importlib.import_module("pr_tests")  # built by another module: absent is "not available", not a crash
+    except ImportError as err:
+        return {"hunter": "PR", "pr": {}, "pr_error": f"signal not available: {err}"}
+    try:
+        return {"hunter": "PR", "pr": pr_tests.cmd_pr(hdir, state)["tests"]}
+    except InfraError as err:
+        return {"hunter": "PR", "pr": {}, "pr_error": str(err)[-400:]}
+
+
+def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None,
+               signals: tuple[str, ...] = SIGNALS) -> dict[str, Any]:
+    """Hunt one commit as if it were PR #num; returns its run and base tables per batch and hunter, then the model-free
+    signals (old tests, the PR's own tests). Only a failure to prepare or read an entry raises."""
     repo, head = e["repo"], e["head"]
     base = git(repo, "rev-parse", f"{head}^1")
     message = git(repo, "log", "-1", "--format=%s%x00%b", head).split("\x00", 1)
@@ -138,23 +252,24 @@ def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None)
     while batch <= batches:
         state = ctx.build(str(num), batch, prep, meta)
         batches = state["batches"]
-        if e.get("responses") and batch == 1:
-            shutil.copytree(e["responses"], hdir, dirs_exist_ok=True)
-        elif dispatch_cmd:
-            build_requests.main(str(num), "hunters")  # writes <hdir>/A and B request.json (hunt_dir(num) == hdir)
+        if "hunters" in signals:
+            if e.get("responses") and batch == 1:
+                shutil.copytree(e["responses"], hdir, dirs_exist_ok=True)
+            elif dispatch_cmd:
+                build_requests.main(str(num), "hunters")  # writes <hdir>/A and B request.json (hunt_dir(num) == hdir)
+                for tag in ("A", "B"):
+                    dispatch(dispatch_cmd, hdir / tag / "request.json")
             for tag in ("A", "B"):
-                dispatch(dispatch_cmd, hdir / tag / "request.json")
-        for tag in ("A", "B"):
-            if not (hdir / tag / "response.json").exists():
-                continue
-            row: dict[str, Any] = {"batch": batch, "hunter": tag}
-            try:
-                row["run"] = run.cmd_run(hdir, state, tag)
-                row["base"] = run.cmd_base(hdir, state, tag)
-            except run.CompileError as err:
-                row["compile_error"] = str(err)[-400:]  # a miss, as in a real hunt that exhausted its repair round
-            results.append(row)
+                if (hdir / tag / "response.json").exists():
+                    results.append(hunt_tag(num, hdir, state, tag, batch, dispatch_cmd))
+        else:
+            batches = 1  # the whole-commit signals need only the state, not one per batch
         batch += 1
+    # whole-commit, model-free: once per entry, after every batch (each run leaves the worktrees clean)
+    if "old" in signals:
+        results.append(old_signal(hdir, state))
+    if "pr" in signals:
+        results.append(pr_signal(hdir, state))
     return {"results": results}
 
 
@@ -164,14 +279,35 @@ def score(entry: dict[str, Any]) -> tuple[bool, bool]:
     return raw, vetted
 
 
-def scorecard(manifest: dict[str, Any], hunted: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def flags(entry: dict[str, Any], signals: tuple[str, ...] = SIGNALS) -> dict[str, bool]:
+    """Which signals fired for one entry: any table of that kind holding one of the signal's verdicts."""
+    results = entry.get("results", [])
+    return {name: group in signals and any(v in verdicts for r in results for v in r.get(key, {}).values())
+            for name, key, verdicts, group in FLAGS}
+
+
+def score_old(entry: dict[str, Any]) -> bool:
+    return flags(entry)["old"]
+
+
+def _first(entry: dict[str, Any], key: str) -> str | None:
+    return next((r[key] for r in entry.get("results", []) if r.get(key)), None)
+
+
+def scorecard(manifest: dict[str, Any], hunted: dict[str, dict[str, Any]],
+              signals: tuple[str, ...] = SIGNALS) -> dict[str, Any]:
     rows = []
     for kind, entries in (("case", manifest["cases"]), ("control", manifest["controls"])):
         for e in entries:
             h = hunted[e["id"]]
-            raw, vetted = score(h)
-            rows.append({"kind": kind, "id": e["id"], "area": e["area"], "raw": raw, "vetted": vetted,
-                         "error": h.get("error"), "responses": bool(h.get("results"))})
+            raw, _ = score(h)
+            f = flags(h, signals)
+            tag_errors = [f"{r['hunter']}: {r['error']}" for r in h.get("results", []) if r.get("error")]
+            rows.append({"kind": kind, "id": e["id"], "area": e["area"], "raw": raw and "hunters" in signals,
+                         "vetted": f["hunters_vetted"], **f, "any": any(f[k] for k in FINDINGS),
+                         "error": h.get("error"), "old_error": _first(h, "old_error"), "pr_error": _first(h, "pr_error"),
+                         "hunter_errors": tag_errors,
+                         "responses": any(r.get("hunter") in ("A", "B") for r in h.get("results", []))})
     cases = [r for r in rows if r["kind"] == "case"]
     controls = [r for r in rows if r["kind"] == "control"]
 
@@ -183,29 +319,66 @@ def scorecard(manifest: dict[str, Any], hunted: dict[str, dict[str, Any]]) -> di
         "vetted_recall": ratio(sum(r["vetted"] for r in cases), len(cases)),
         "fp_rate": ratio(sum(r["vetted"] for r in controls), len(controls)),
         "raw_fp_rate": ratio(sum(r["raw"] for r in controls), len(controls)),
+        "combined_recall": ratio(sum(r["any"] for r in cases), len(cases)),
+        "combined_fp_rate": ratio(sum(r["any"] for r in controls), len(controls)),
     }
+    for flag, name in METRIC_NAMES.items():
+        metrics[f"{name}_recall"] = ratio(sum(r[flag] for r in cases), len(cases))
+        metrics[f"{name}_fp_rate"] = ratio(sum(r[flag] for r in controls), len(controls))
     t = manifest["thresholds"]
     checks = {"raw_recall": metrics["raw_recall"] >= t["raw_recall_min"],
               "vetted_recall": metrics["vetted_recall"] >= t["vetted_recall_min"],
               "fp_rate": metrics["fp_rate"] <= t["fp_rate_max"]}
     errors = [r["id"] for r in rows if r["error"]]
     verdict = "ERROR" if errors else ("PASS" if all(checks.values()) else "FAIL")
-    return {"rows": rows, "metrics": metrics, "thresholds": t, "checks": checks, "errors": errors, "verdict": verdict}
+    return {"rows": rows, "metrics": metrics, "thresholds": t, "checks": checks, "errors": errors, "verdict": verdict,
+            "signals": list(signals), "cases": len(cases), "controls": len(controls)}
 
 
 def render(card: dict[str, Any]) -> str:
-    lines = [f"{'kind':8} {'id':28} {'area':24} raw   vetted"]
+    signals = card.get("signals", list(SIGNALS))
+    cols = (("raw", "hunters"), ("vetted", "hunters"), ("new_api", "hunters"), ("old", "old"), ("old~", "old"),
+            ("pr_ci", "pr"))
+    keys = {"raw": "raw", "vetted": "hunters_vetted", "new_api": "hunters_new_api", "old": "old", "old~": "old_sometimes",
+            "pr_ci": "pr_ci"}
+
+    def cell(r: dict[str, Any], col: str, group: str) -> str:
+        return "-" if group not in signals else ("yes" if r.get(keys[col]) else "no")
+
+    lines = [f"{'kind':8} {'id':28} {'area':24} " + " ".join(f"{c:7}" for c, _ in cols)]
     for r in card["rows"]:
-        note = f"  ERROR {r['error'][:120]}" if r["error"] else ("" if r["responses"] else "  (no hunter responses)")
-        lines.append(f"{r['kind']:8} {r['id']:28} {r['area']:24} {'yes' if r['raw'] else 'no ':5} "
-                     f"{'yes' if r['vetted'] else 'no'}{note}")
+        notes = []
+        if r["error"]:
+            notes.append(f"ERROR {r['error'][:120]}")
+        elif "hunters" in signals and not r["responses"]:
+            notes.append("(no hunter responses)")
+        notes += [f"hunter {e[:100]} ERROR" for e in r.get("hunter_errors", [])]
+        if r.get("old_error"):
+            notes.append(f"old-tests ERROR {r['old_error'][:80]}")
+        if r.get("pr_error"):
+            notes.append(f"pr-tests ERROR {r['pr_error'][:80]}")
+        lines.append(f"{r['kind']:8} {r['id']:28} {r['area']:24} " + " ".join(f"{cell(r, c, g):7}" for c, g in cols)
+                     + ("  " + "; ".join(notes) if notes else ""))
     m, t, c = card["metrics"], card["thresholds"], card["checks"]
-    raw = f"raw recall          {m['raw_recall']:.2f} (min {t['raw_recall_min']:.2f}) {'ok' if c['raw_recall'] else 'BELOW'}"
-    vetted = (f"post-vetting recall {m['vetted_recall']:.2f} (min {t['vetted_recall_min']:.2f}) "
-              f"{'ok' if c['vetted_recall'] else 'BELOW'}")
-    fp = (f"false-positive rate {m['fp_rate']:.2f} (max {t['fp_rate_max']:.2f}) {'ok' if c['fp_rate'] else 'ABOVE'}"
-          f"   (raw, before vetting: {m['raw_fp_rate']:.2f})")
-    lines += [raw, vetted, fp, f"VERDICT: {card['verdict']}"]
+    lines.append(f"raw recall          {m['raw_recall']:.2f} (min {t['raw_recall_min']:.2f}) "
+                 f"{'ok' if c['raw_recall'] else 'BELOW'}")
+    lines.append(f"post-vetting recall {m['vetted_recall']:.2f} (min {t['vetted_recall_min']:.2f}) "
+                 f"{'ok' if c['vetted_recall'] else 'BELOW'}")
+    lines.append(f"false-positive rate {m['fp_rate']:.2f} (max {t['fp_rate_max']:.2f}) "
+                 f"{'ok' if c['fp_rate'] else 'ABOVE'}   (raw, before vetting: {m['raw_fp_rate']:.2f})")
+    lines.append(f"{'signal':18} recall   fp-rate  ({card.get('cases', '?')} cases, {card.get('controls', '?')} controls)")
+    table = (("hunters vetted", "vetted", "hunters"), ("hunters new-api", "new_api", "hunters"),
+             ("old tests", "old", "old"), ("old tests ~", "old_sometimes", "old"), ("pr tests (ci)", "pr_ci", "pr"),
+             ("pr tests (fail)", "pr_fails", "pr"),
+             ("combined (any)", "combined", None))
+    for label, name, group in table:
+        if group is not None and group not in signals:
+            lines.append(f"{label:18} off")
+        else:
+            rec = m["vetted_recall" if name == "vetted" else f"{name}_recall"]
+            fp = m["fp_rate" if name == "vetted" else f"{name}_fp_rate"]
+            lines.append(f"{label:18} {rec:<8.2f} {fp:.2f}")
+    lines.append(f"VERDICT: {card['verdict']}")
     return "\n".join(lines)
 
 
@@ -216,10 +389,18 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--out", type=Path)
     ap.add_argument("--dispatch")
     ap.add_argument("--only", nargs="*")
+    ap.add_argument("--signals", default=",".join(SIGNALS), help="comma list of hunters,old,pr (default all)")
+    ap.add_argument("--controls", type=Path, help="extra controls (mine_controls.py output), appended to the manifest's")
     a = ap.parse_args(argv[1:])
+    signals = tuple(x for x in SIGNALS if x in {w.strip() for w in a.signals.split(",")})
+    unknown = {w.strip() for w in a.signals.split(",")} - set(SIGNALS)
+    if unknown or not signals:
+        print(f"INVALID_SIGNALS {a.signals!r}: choose from {','.join(SIGNALS)}")
+        return 2
     try:
-        manifest = load_manifest(a.manifest.resolve(), a.repo.resolve() if a.repo else None)
-    except (ManifestError, InfraError, KeyError, json.JSONDecodeError) as err:
+        extra = load_controls(a.controls.resolve()) if a.controls else None
+        manifest = load_manifest(a.manifest.resolve(), a.repo.resolve() if a.repo else None, extra)
+    except (ManifestError, InfraError, OSError, KeyError, json.JSONDecodeError) as err:
         print(f"INVALID_MANIFEST {err}")
         return 2
     if a.only:
@@ -230,13 +411,18 @@ def main(argv: list[str]) -> int:
     out.mkdir(parents=True, exist_ok=True)
     os.environ["HUNT_SCRATCH"] = str(out)  # hunt_dir(n) == <out>/hunt<n>, so build_requests writes where we read
     hunted: dict[str, dict[str, Any]] = {}
+    timings: dict[str, float] = {}
     for num, e in enumerate(manifest["cases"] + manifest["controls"], 1):
+        start = time.monotonic()
         try:
-            hunted[e["id"]] = hunt_entry(e, num, out, a.dispatch)
+            hunted[e["id"]] = hunt_entry(e, num, out, a.dispatch, signals)
         except ENTRY_FAILURES as err:
             # an ERROR verdict (exit 2): the entry could not run, which is not the same as a miss or a clean result
             hunted[e["id"]] = {"error": f"{type(err).__name__}: {str(err).splitlines()[0] if str(err) else 'no detail'}"}
-    card = scorecard(manifest, hunted)
+        timings[e["id"]] = round(time.monotonic() - start, 1)
+        write_json(out / "timings.json", timings)  # each entry as it ends: a long run can be followed
+        write_json(out / f"entry_{num}_{e['id']}.json", hunted[e["id"]])
+    card = scorecard(manifest, hunted, signals)
     write_json(out / "scorecard.json", card)
     print(render(card))
     print(f"details: {out}/scorecard.json")

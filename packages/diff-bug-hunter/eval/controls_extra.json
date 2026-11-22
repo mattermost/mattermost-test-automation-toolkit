@@ -1,0 +1,297 @@
+{
+ "_about": "Extra size-matched clean controls from mine_controls.py: per case, non-merge commits within 90 days in the same directory with 0.5x-2x its non-test source files and changed lines, never reverted, sharing no MM- ticket with it.",
+ "per_case": 4,
+ "filled": {
+  "user-patch-remote-id": 4,
+  "plugin-settings-sanitize": 4,
+  "status-store-select": 4,
+  "license-recursive-load": 4,
+  "typing-emoji-suppression": 2,
+  "show-more-image-height": 0,
+  "username-alpha-first": 4,
+  "channel-api-db-perf": 4,
+  "pray-emoji-aliases": 4,
+  "redux-current-user-profile": 4,
+  "ws-reconnect-current-user": 4,
+  "desktop-external-auth": 4,
+  "read-channel-content-permission": 4
+ },
+ "controls": [
+  {
+   "id": "user-patch-remote-id-ctl1",
+   "area": "server/channels/api4",
+   "sha": "b2eb45e6159987b6f8c91d63bf4c6caa2eb45bbc",
+   "matches": "user-patch-remote-id"
+  },
+  {
+   "id": "user-patch-remote-id-ctl2",
+   "area": "server/channels/api4",
+   "sha": "9efe617be8b8f1d036e12721e8e73b69a543ed34",
+   "matches": "user-patch-remote-id"
+  },
+  {
+   "id": "user-patch-remote-id-ctl3",
+   "area": "server/channels/api4",
+   "sha": "99b73d4c4acf5ff3546c2548a5aaa804c2aa1b04",
+   "matches": "user-patch-remote-id"
+  },
+  {
+   "id": "user-patch-remote-id-ctl4",
+   "area": "server/channels/api4",
+   "sha": "6dac3b9df47b00dcdd6b6481305a3092b043aed4",
+   "matches": "user-patch-remote-id"
+  },
+  {
+   "id": "plugin-settings-sanitize-ctl1",
+   "area": "server/public/model",
+   "sha": "9526493725b1a5fc2a3722e7d4397ba395fb698c",
+   "matches": "plugin-settings-sanitize"
+  },
+  {
+   "id": "plugin-settings-sanitize-ctl2",
+   "area": "server/public/model",
+   "sha": "494b570f3a23e2c7efec62bce74a2e5dcce946ec",
+   "matches": "plugin-settings-sanitize"
+  },
+  {
+   "id": "plugin-settings-sanitize-ctl3",
+   "area": "server/public/model",
+   "sha": "fddb7eee1416c0335530f303e3d62a3da56f424b",
+   "matches": "plugin-settings-sanitize"
+  },
+  {
+   "id": "plugin-settings-sanitize-ctl4",
+   "area": "server/public/model",
+   "sha": "b1a93b7edc0ab191936b187299560ef1d44c1bd3",
+   "matches": "plugin-settings-sanitize"
+  },
+  {
+   "id": "status-store-select-ctl1",
+   "area": "server/channels/store/sqlstore",
+   "sha": "9fc83f24b507ab2b07dc4afda988ca971e93b6cd",
+   "matches": "status-store-select"
+  },
+  {
+   "id": "status-store-select-ctl2",
+   "area": "server/channels/store/sqlstore",
+   "sha": "b59f10cbbd666a9057fe2cc8712569d431681554",
+   "matches": "status-store-select"
+  },
+  {
+   "id": "status-store-select-ctl3",
+   "area": "server/channels/store/sqlstore",
+   "sha": "b11d53677473a8bbad6c193660a38a43364826a9",
+   "matches": "status-store-select"
+  },
+  {
+   "id": "status-store-select-ctl4",
+   "area": "server/channels/store/sqlstore",
+   "sha": "7df4727353add907ee17bc532156d87fbfae88ae",
+   "matches": "status-store-select"
+  },
+  {
+   "id": "license-recursive-load-ctl1",
+   "area": "server/channels/app",
+   "sha": "8c2fc884717c3bbe6a3644a7b5442889b59936db",
+   "matches": "license-recursive-load"
+  },
+  {
+   "id": "license-recursive-load-ctl2",
+   "area": "server/channels/app",
+   "sha": "e8569c91af9159bf3857a2a2a63a2c35912f8170",
+   "matches": "license-recursive-load"
+  },
+  {
+   "id": "license-recursive-load-ctl3",
+   "area": "server/channels/app",
+   "sha": "29cd6177c02f7f3d238b3d4afbc2f6aa9a35356c",
+   "matches": "license-recursive-load"
+  },
+  {
+   "id": "license-recursive-load-ctl4",
+   "area": "server/channels/app",
+   "sha": "f65dad83bbf12a97a3226d3ff70bde7e4b1712db",
+   "matches": "license-recursive-load"
+  },
+  {
+   "id": "typing-emoji-suppression-ctl1",
+   "area": "server/channels/app/platform",
+   "sha": "17d11db395e42753140842448a606f28bbc7c00f",
+   "matches": "typing-emoji-suppression"
+  },
+  {
+   "id": "typing-emoji-suppression-ctl2",
+   "area": "server/channels/app/platform",
+   "sha": "e0b5b951f1dff2c224b7e296b8637c3384f70fc8",
+   "matches": "typing-emoji-suppression"
+  },
+  {
+   "id": "username-alpha-first-ctl1",
+   "area": "server/public/model",
+   "sha": "5d7027a17242f9172056171dff4de01cacdbff08",
+   "matches": "username-alpha-first"
+  },
+  {
+   "id": "username-alpha-first-ctl2",
+   "area": "server/public/model",
+   "sha": "d1ae710d457b3ce20565e5491dc4dde09a7eb268",
+   "matches": "username-alpha-first"
+  },
+  {
+   "id": "username-alpha-first-ctl3",
+   "area": "server/public/model",
+   "sha": "84a0c09d56b52dc830eb3acbe6fd89e47f9ad5e7",
+   "matches": "username-alpha-first"
+  },
+  {
+   "id": "username-alpha-first-ctl4",
+   "area": "server/public/model",
+   "sha": "da6b40665ac58fba36023d9b1d05a36319bd5bb6",
+   "matches": "username-alpha-first"
+  },
+  {
+   "id": "channel-api-db-perf-ctl1",
+   "area": "server/channels",
+   "sha": "48bf4e9bd8792c26bfe0759dc9153d4dd443d45c",
+   "matches": "channel-api-db-perf"
+  },
+  {
+   "id": "channel-api-db-perf-ctl2",
+   "area": "server/channels",
+   "sha": "a59f5ccded2088eecebebc252d06e29ffaa1fbe8",
+   "matches": "channel-api-db-perf"
+  },
+  {
+   "id": "channel-api-db-perf-ctl3",
+   "area": "server/channels",
+   "sha": "95670abcea1cb5d867edb0f110f2fcbc388c7e60",
+   "matches": "channel-api-db-perf"
+  },
+  {
+   "id": "channel-api-db-perf-ctl4",
+   "area": "server/channels",
+   "sha": "2ff0fe343e9637ec42b2254071b410d20af5a7b3",
+   "matches": "channel-api-db-perf"
+  },
+  {
+   "id": "pray-emoji-aliases-ctl1",
+   "area": "webapp/channels",
+   "sha": "71fb10ae7a20107b219ec51daee246832f197b61",
+   "matches": "pray-emoji-aliases"
+  },
+  {
+   "id": "pray-emoji-aliases-ctl2",
+   "area": "webapp/channels",
+   "sha": "009d6136f0139377ab3cf6cda8983b18d1c29f36",
+   "matches": "pray-emoji-aliases"
+  },
+  {
+   "id": "pray-emoji-aliases-ctl3",
+   "area": "webapp/channels",
+   "sha": "e96fb9c32c3aa84692310eccdd10c1ea9fa7d15f",
+   "matches": "pray-emoji-aliases"
+  },
+  {
+   "id": "pray-emoji-aliases-ctl4",
+   "area": "webapp/channels",
+   "sha": "a24ef3f07d2ab91e11fe323d36d4d14981b8803e",
+   "matches": "pray-emoji-aliases"
+  },
+  {
+   "id": "redux-current-user-profile-ctl1",
+   "area": "webapp/channels/src/packages/mattermost-redux",
+   "sha": "6d1a42773e3ded0812091e37c6fd5356b55582fd",
+   "matches": "redux-current-user-profile"
+  },
+  {
+   "id": "redux-current-user-profile-ctl2",
+   "area": "webapp/channels/src/packages/mattermost-redux",
+   "sha": "14fcc8a22e05efdb9e535e49257da80a9228507e",
+   "matches": "redux-current-user-profile"
+  },
+  {
+   "id": "redux-current-user-profile-ctl3",
+   "area": "webapp/channels/src/packages/mattermost-redux",
+   "sha": "72b648cf81d94475e57fef123d3ae57ecedbcbb8",
+   "matches": "redux-current-user-profile"
+  },
+  {
+   "id": "redux-current-user-profile-ctl4",
+   "area": "webapp/channels/src/packages/mattermost-redux",
+   "sha": "05cd245e9799e5a7113a1fe7d932ed6e4c2a5e69",
+   "matches": "redux-current-user-profile"
+  },
+  {
+   "id": "ws-reconnect-current-user-ctl1",
+   "area": "webapp/channels/src/packages/mattermost-redux",
+   "sha": "525c21a9d3c9f1983a20b5f6c37bff9787a5d846",
+   "matches": "ws-reconnect-current-user"
+  },
+  {
+   "id": "ws-reconnect-current-user-ctl2",
+   "area": "webapp/channels/src/packages/mattermost-redux",
+   "sha": "96d3e5864f95065e4845101ad3cabc9cb9a58f35",
+   "matches": "ws-reconnect-current-user"
+  },
+  {
+   "id": "ws-reconnect-current-user-ctl3",
+   "area": "webapp/channels/src/packages/mattermost-redux",
+   "sha": "2dc55918c7d3e7f3126d5891267d901c46238eb4",
+   "matches": "ws-reconnect-current-user"
+  },
+  {
+   "id": "ws-reconnect-current-user-ctl4",
+   "area": "webapp/channels/src/packages/mattermost-redux",
+   "sha": "070ee26081dfa68ce0d2611b34a077754cae82f9",
+   "matches": "ws-reconnect-current-user"
+  },
+  {
+   "id": "desktop-external-auth-ctl1",
+   "area": "server/channels",
+   "sha": "077c16ef6107c7a644e4103cc6e7cebdc1f32e81",
+   "matches": "desktop-external-auth"
+  },
+  {
+   "id": "desktop-external-auth-ctl2",
+   "area": "server/channels",
+   "sha": "bc4904e5b374b8bdb0c404cb5dc01ca2e7613a6e",
+   "matches": "desktop-external-auth"
+  },
+  {
+   "id": "desktop-external-auth-ctl3",
+   "area": "server/channels",
+   "sha": "2c6179a0a6849e05a8dd8807830b75739d8b8323",
+   "matches": "desktop-external-auth"
+  },
+  {
+   "id": "desktop-external-auth-ctl4",
+   "area": "server/channels",
+   "sha": "b5c48e75b385533cd3dc329b658cb47768a7b992",
+   "matches": "desktop-external-auth"
+  },
+  {
+   "id": "read-channel-content-permission-ctl1",
+   "area": "server/channels",
+   "sha": "aa88f8bf59b8e43b6fd1aea35b8c4c81a6636738",
+   "matches": "read-channel-content-permission"
+  },
+  {
+   "id": "read-channel-content-permission-ctl2",
+   "area": "server/channels",
+   "sha": "d860548a7651152409055401871f759fe4964898",
+   "matches": "read-channel-content-permission"
+  },
+  {
+   "id": "read-channel-content-permission-ctl3",
+   "area": "server/channels",
+   "sha": "9d569df9b419d4afc8c48bf4aa70611349236a14",
+   "matches": "read-channel-content-permission"
+  },
+  {
+   "id": "read-channel-content-permission-ctl4",
+   "area": "server/channels",
+   "sha": "aad25be4e148a271287e1c730f88ffdb9c0f085b",
+   "matches": "read-channel-content-permission"
+  }
+ ]
+}
