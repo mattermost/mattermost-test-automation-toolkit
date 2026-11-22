@@ -1,0 +1,31 @@
+{
+ "_note": "SELF-TEST FIXTURE: hand-written stand-in for a hunter response, never used as hunt output.",
+ "files": [
+  {
+   "path": "calc/hunt_huntd_test.go",
+   "content": "// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.\n// See LICENSE.txt for license information.\n\npackage calc\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"math/rand\"\n\t\"os\"\n\t\"testing\"\n)\n\nfunc huntDErr(err error) any {\n\tif err == nil {\n\t\treturn nil\n\t}\n\treturn err.Error()\n}\n\nfunc huntDRecord(name string, i int, input any, call func() any) {\n\trec := map[string]any{\"test\": name, \"i\": i, \"input\": input}\n\tfunc() {\n\t\tdefer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\trec[\"panic\"] = fmt.Sprint(r)\n\t\t\t}\n\t\t}()\n\t\trec[\"output\"] = call()\n\t}()\n\tline, err := json.Marshal(rec)\n\tif err != nil {\n\t\tline, _ = json.Marshal(map[string]any{\"test\": name, \"i\": i, \"input\": fmt.Sprintf(\"%#v\", input), \"panic\": \"unmarshalable: \" + err.Error()})\n\t}\n\tout := os.Getenv(\"HUNT_DIFF_OUT\")\n\tif out == \"\" {\n\t\treturn\n\t}\n\tf, ferr := os.OpenFile(out, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)\n\tif ferr != nil {\n\t\tpanic(ferr)\n\t}\n\tdefer f.Close()\n\t_, _ = f.Write(append(line, '\\n'))\n}\n\nfunc huntDInts(seed int64) []int {\n\tr := rand.New(rand.NewSource(seed))\n\tout := []int{0, 1, -1, 7, -7, 1 << 20}\n\tfor i := 0; i < 200; i++ {\n\t\tout = append(out, r.Intn(2000)-1000)\n\t}\n\treturn out\n}\n\n// Recorded through the unchanged caller Total, not the changed Scale.\nfunc TestHuntD_TotalViaCaller(t *testing.T) {\n\tfor i, v := range huntDInts(1) {\n\t\tin := []int{v, 3}\n\t\thuntDRecord(\"TestHuntD_TotalViaCaller\", i, in, func() any { return Total(in) })\n\t}\n}\n\nfunc TestHuntD_Ratio(t *testing.T) {\n\tr := rand.New(rand.NewSource(2))\n\tfor i := 0; i < 200; i++ {\n\t\tin := []int{r.Intn(100), r.Intn(5)}\n\t\thuntDRecord(\"TestHuntD_Ratio\", i, in, func() any { return Ratio(in[0], in[1]) })\n\t}\n}\n\nfunc TestHuntD_Label(t *testing.T) {\n\tfor i, v := range huntDInts(3) {\n\t\thuntDRecord(\"TestHuntD_Label\", i, v, func() any { return Label(v) })\n\t}\n}\n\nfunc TestHuntD_Bonus(t *testing.T) {\n\tfor i, v := range huntDInts(4) {\n\t\thuntDRecord(\"TestHuntD_Bonus\", i, v, func() any { return Bonus(v) })\n\t}\n}\n"
+  }
+ ],
+ "tests": [
+  {
+   "test_name": "TestHuntD_TotalViaCaller",
+   "checks": "differential recorder",
+   "source": "fixture"
+  },
+  {
+   "test_name": "TestHuntD_Ratio",
+   "checks": "differential recorder",
+   "source": "fixture"
+  },
+  {
+   "test_name": "TestHuntD_Label",
+   "checks": "differential recorder",
+   "source": "fixture"
+  },
+  {
+   "test_name": "TestHuntD_Bonus",
+   "checks": "differential recorder",
+   "source": "fixture"
+  }
+ ]
+}

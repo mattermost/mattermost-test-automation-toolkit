@@ -4,6 +4,8 @@
 """Step 3/5: write the blind request.json files for hunters and mutant planters.
 
 usage: build_requests.py <pr> hunters            -> A/, B/
+       build_requests.py <pr> diff               -> D/ (differential recorders: no assertions; `run.py diff <pr> D` diffs the
+                                                   recorded outputs of the merge-base and the PR head)
        build_requests.py <pr> mutants            -> M/ (3 visible faults)
        build_requests.py <pr> heldout            -> M2/ (2 held-back faults; needs M/response.json)
        build_requests.py <pr> strengthen <ids>   -> A2/ (needs A/response.json; ids = surviving mutants, e.g. M1,M3)
@@ -96,6 +98,9 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
         for mode in ("A", "B"):
             print(write(hdir, mode, hunter_system(mode, state, ctx, strategies=True), hunter_user(mode, ctx),
                         HUNTER_SCHEMA))
+    elif what == "diff":
+        # Mode D gets Mode A's context but no strategies, reliability rules or fuzz rules: a recorder asserts nothing.
+        print(write(hdir, "D", hunter_system("D", state, ctx), hunter_user("D", ctx), HUNTER_SCHEMA))
     elif what == "mutants":
         print(write(hdir, "M", mutant_system(state, 3, "M1, M2, M3"), mutant_user(ctx), MUTANT_SCHEMA))
     elif what == "heldout":

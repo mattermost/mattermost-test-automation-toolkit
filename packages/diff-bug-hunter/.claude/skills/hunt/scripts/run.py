@@ -5,6 +5,10 @@
 
 usage: run.py run <pr> <A|B|A2>        3 runs on unmodified PR head (Go with -race); writes run_<tag>.json
        run.py base <pr> <A|B|A2>       the same tests once on the merge-base worktree; writes base_<tag>.json
+       run.py diff <pr> D              differential recorders (build_requests.py <pr> diff): run on the PR head twice (records
+                                       that differ = NONDETERMINISTIC, dropped) and once on the merge-base, then diff the
+                                       records per (test, input). SAME | DIFF | NONDETERMINISTIC | BASE_UNCOMPILABLE |
+                                       BASE_FAILED | RECORDER_FAILED | NO_RECORDS; writes diff_D.json, diff_D.examples.json
        run.py cover <pr> <A|A2>        each test alone with coverage (no -race); writes run_<tag>.coverage.json: which
                                        changed lines it reaches, VACUOUS if none (then it kills no mutant)
        run.py fuzz <pr> A              fuzz pure FuzzHuntA_<Name> targets (HUNT_FUZZ_TIME, default 60s); a failure is frozen
@@ -30,6 +34,7 @@ if not _sys.pycache_prefix:
     _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
     _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
 
+import contextlib
 import hashlib
 import json
 import os
@@ -37,6 +42,7 @@ import re
 import signal
 import sys
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -454,7 +460,8 @@ def go_repair(wt: Path, placed: list[Path], d: str) -> tuple[dict[str, list[str]
     return removed, cut
 
 
-def salvage_go(wt: Path, state: dict[str, Any], tag: str, placed: list[Path]) -> tuple[Outcome, dict[str, list[str]]]:
+def salvage_go(wt: Path, state: dict[str, Any], tag: str, placed: list[Path],
+               race: bool = True) -> tuple[Outcome, dict[str, list[str]]]:
     """run_suite on the merge-base, but a Go test file that does not build there loses only the funcs the compiler
     rejects (the placed copies, never response.json) and is retried, up to MAX_SALVAGE_ROUNDS rounds. Returns the
     outcome of what remained and {removed test identity: identifiers it could not resolve}."""
@@ -470,7 +477,7 @@ def salvage_go(wt: Path, state: dict[str, Any], tag: str, placed: list[Path]) ->
         if suite.empty():
             return Outcome(), gone
         try:
-            return run_suite(wt, suite, race=True), gone
+            return run_suite(wt, suite, race=race), gone
         except GoBuildError as e:
             fixed = go_repair(wt, live, e.pkg_dir) if rounds < MAX_SALVAGE_ROUNDS and fixups < 3 else None
             if fixed is None:
@@ -561,6 +568,162 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
         unplace(placed)
     write_json(hdir / f"base_{tag}.json", out)
     return out
+
+
+# ---------------------------------------------------------------- differential recorders (Mode D)
+
+DIFF_EXAMPLES = 5
+NO_RECORD = "<no record>"
+TARGET_MISSING = re.compile(r"target missing", re.I)
+
+
+@contextlib.contextmanager
+def diff_out(path: Path) -> Iterator[None]:
+    """HUNT_DIFF_OUT=<path> for the test processes started inside the block (go test and jest inherit os.environ)."""
+    old = os.environ.get("HUNT_DIFF_OUT")
+    os.environ["HUNT_DIFF_OUT"] = str(path)
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("HUNT_DIFF_OUT", None)
+        else:
+            os.environ["HUNT_DIFF_OUT"] = old
+
+
+def read_records(path: Path) -> dict[str, dict[int, dict[str, Any]]]:
+    """{test name: {i: record without test and i}} from one HUNT_DIFF_OUT file. A line that is not a JSON object with a
+    test and an integer i is skipped (a recorder that printed something else); a repeated (test, i) keeps the last."""
+    out: dict[str, dict[int, dict[str, Any]]] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict) or not isinstance(rec.get("test"), str) or not isinstance(rec.get("i"), int):
+            continue
+        out.setdefault(rec["test"], {})[rec["i"]] = {k: v for k, v in rec.items() if k not in ("test", "i")}
+    return out
+
+
+def record_name(identity: str) -> str:
+    """The `test` a recorder writes for a run.py identity: "<dir>::TestHuntD_X" -> TestHuntD_X, and for Jest
+    "<file>::HuntD HuntD_x" (describe + title) -> HuntD_x."""
+    return identity.split("::", 1)[1].split(" ")[-1]
+
+
+def diff_records(head: dict[int, dict[str, Any]], base: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every (test, i) whose record differs, smallest input (by JSON length) first. An input that differs between the two
+    sides (a generator that reads the code under test) is shown as `base_input` next to `input`."""
+    def side(rec: dict[str, Any] | None) -> Any:
+        if rec is None:
+            return NO_RECORD
+        return {"panic": rec["panic"]} if "panic" in rec else rec.get("output")
+
+    found = []
+    for i in sorted(set(head) | set(base)):
+        h, b = head.get(i), base.get(i)
+        if h == b:
+            continue
+        ex: dict[str, Any] = {"i": i, "input": (h or b or {}).get("input"), "base": side(b), "head": side(h)}
+        if h is not None and b is not None and h.get("input") != b.get("input"):
+            ex["base_input"] = b.get("input")
+        found.append(ex)
+    return sorted(found, key=lambda e: (len(json.dumps(e["input"], sort_keys=True)), e["i"]))
+
+
+def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str]:
+    """Run the Mode D recorders on the PR head (twice) and on the merge-base (once), then compare their records.
+    The model wrote the inputs and the recorder; code decides: SAME (all records equal), DIFF (some differ: up to
+    DIFF_EXAMPLES smallest examples per test in diff_D.examples.json), NONDETERMINISTIC (the two head runs disagree: the
+    test's records are dropped), BASE_UNCOMPILABLE (that test cannot build or load on the merge-base because it uses
+    something the PR adds), BASE_FAILED, RECORDER_FAILED (failed on head), NO_RECORDS (passed but wrote nothing)."""
+    if tag != "D":
+        raise InfraError(f"diff is for the Mode D tag (D), not {tag}")
+    wt, wt_base = Path(state["wt"]), Path(state["wt_base"])
+    ensure_clean(wt)
+    ensure_clean(wt_base)
+    require_disk(scratch())
+    files = load_json(hdir / tag / "response.json")["files"]
+    verdicts: dict[str, str] = {}
+    detail: dict[str, Any] = {}
+    for stale in (f"diff_{tag}.json", f"diff_{tag}.examples.json"):
+        (hdir / stale).unlink(missing_ok=True)
+    if not files:
+        write_json(hdir / f"diff_{tag}.json", verdicts)
+        write_json(hdir / f"diff_{tag}.examples.json", detail)
+        return verdicts
+    targets = {t["dir"] for t in state["targets"]}
+    with tempfile.TemporaryDirectory() as td:
+        h1, h2, bf = Path(td) / "head1.jsonl", Path(td) / "head2.jsonl", Path(td) / "base.jsonl"
+        placed: list[Path] = []
+        runs: list[Outcome] = []
+        try:
+            placed = place(wt, files, targets)
+            for out in (h1, h2):
+                with diff_out(out):
+                    runs.append(run_suite(wt, suite_for(tag, state, placed, wt), race=False))
+        finally:
+            unplace(placed)
+        head_recs = [read_records(h1), read_records(h2)]
+        gone: dict[str, list[str]] = {}
+        base: Outcome | None = None
+        base_error = ""
+        placed = []
+        try:
+            placed = place(wt_base, files, targets)
+            with diff_out(bf):
+                base, gone = salvage_go(wt_base, state, tag, placed, race=False)
+        except CompileError as e:
+            base_error = str(e)[-800:]
+        finally:
+            unplace(placed)
+        base_recs = read_records(bf)
+        for src, side in ((h1, "head"), (bf, "base")):  # every record, for triage beyond the 5 examples per test
+            (hdir / f"diff_{tag}.{side}.jsonl").write_text(src.read_text() if src.exists() else "")
+    for ident in sorted(set(runs[0].results) | set(runs[1].results)):
+        name = record_name(ident)
+        statuses = [r.results.get(ident, "MISSING") for r in runs]
+        a, b = head_recs[0].get(name, {}), head_recs[1].get(name, {})
+        if any(s != "PASS" for s in statuses):
+            verdicts[ident] = "RECORDER_FAILED"
+            msg = runs[0].messages.get(ident) or runs[1].messages.get(ident, "")
+            detail[ident] = {"detail": f"head runs: {statuses}; {msg[:600]}"}
+        elif not a and not b:
+            verdicts[ident] = "NO_RECORDS"
+        elif a != b:
+            verdicts[ident] = "NONDETERMINISTIC"
+            keys = set(a) | set(b)
+            detail[ident] = {"detail": f"{len([i for i in keys if a.get(i) != b.get(i)])} of {len(keys)} records differ "
+                                       "between two runs on the PR head; dropped"}
+        elif base_error:
+            verdicts[ident] = "BASE_UNCOMPILABLE"
+            detail[ident] = {"detail": base_error}
+        elif ident in gone:
+            verdicts[ident] = "BASE_UNCOMPILABLE"
+            detail[ident] = {"detail": "undefined on the merge-base: " + ", ".join(gone[ident])}
+        else:
+            assert base is not None
+            status = base.results.get(ident, "MISSING")
+            msg = base.messages.get(ident, "")
+            if status != "PASS":
+                missing = MISSING_ON_BASE.search(msg) or TARGET_MISSING.search(msg)
+                verdicts[ident] = "BASE_UNCOMPILABLE" if missing else "BASE_FAILED"
+                detail[ident] = {"detail": f"base run: {status}; {msg[:600]}"}
+            elif not base_recs.get(name):
+                verdicts[ident] = "BASE_FAILED"
+                detail[ident] = {"detail": "the recorder passed on the merge-base but wrote no records"}
+            else:
+                diffs = diff_records(a, base_recs[name])
+                verdicts[ident] = "DIFF" if diffs else "SAME"
+                if diffs:
+                    detail[ident] = {"differing": len(diffs), "compared": len(set(a) | set(base_recs[name])),
+                                     "examples": diffs[:DIFF_EXAMPLES]}
+    write_json(hdir / f"diff_{tag}.json", verdicts)
+    write_json(hdir / f"diff_{tag}.examples.json", detail)
+    return verdicts
 
 
 def all_mutants(hdir: Path) -> list[dict[str, Any]]:
@@ -922,7 +1085,7 @@ def _terminate(signum: int, _frame: Any) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 4 or argv[1] not in ("run", "base", "mutants", "cover", "fuzz"):
+    if len(argv) != 4 or argv[1] not in ("run", "base", "mutants", "cover", "fuzz", "diff"):
         print(__doc__)
         return 1
     cmd, pr, tag = argv[1], argv[2], argv[3]
@@ -947,6 +1110,19 @@ def main(argv: list[str]) -> int:
                 for n, t in cov["tests"].items():
                     print(f"[{tag} cover] {n}: {t['verdict']} {sum(len(v) for v in t['hit'].values())} changed lines")
                 print(f"[{tag} cover] changed lines reached: {cov['reached']}/{cov['executable']}")
+            elif cmd == "diff":
+                verdicts = cmd_diff(hdir, state, tag)
+                info = load_json(hdir / f"diff_{tag}.examples.json")
+                for n, verdict in verdicts.items():
+                    d = info.get(n, {})
+                    count = f" ({d['differing']} of {d['compared']} inputs differ)" if verdict == "DIFF" else ""
+                    print(f"[{tag} diff] {n}: {verdict}{count}" + (f" {d['detail'][:300]}" if "detail" in d else ""))
+                    for ex in d.get("examples", []):
+                        print(f"    input: {json.dumps(ex['input'], sort_keys=True)[:300]}")
+                        print(f"    base:  {json.dumps(ex['base'], sort_keys=True)[:300]}")
+                        print(f"    head:  {json.dumps(ex['head'], sort_keys=True)[:300]}")
+                if not verdicts:
+                    print(f"[{tag} diff] no recorders in the hunter response")
             elif cmd == "fuzz":
                 rep = cmd_fuzz(hdir, state, tag)
                 for n, v in rep["targets"].items():

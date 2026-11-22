@@ -49,6 +49,14 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      test) and `PRE_EXISTING` are listed, not reported as findings.
    - Then `pr_tests.py <pr>` (no model): the PR's own added or edited Go tests run 3x with
      `ENABLE_FULLY_PARALLEL_TESTS=true`. Verdicts: `PR_TEST_FAILS_UNDER_CI`, `PR_TEST_FAILS`, `FLAKY`, `PASS`.
+4b. **Differential recorders (Mode D), code decides:** `build_requests.py <pr> diff`, dispatch `D/request.json` to a fresh
+   Agent as in step 3, then `run.py diff <pr> D`. The model writes only seeded input generators and recorders (no
+   assertion, no expected value, nothing taken from the PR description); the same recorder runs twice on the PR head
+   and once on the merge-base, and code diffs the records per input. Verdicts per recorder: `SAME`, `DIFF` (up to 5
+   smallest examples: `input`, `base`, `head`), `NONDETERMINISTIC` (the two head runs disagree: records dropped),
+   `BASE_UNCOMPILABLE` / `BASE_FAILED` (that recorder cannot run on the merge-base: decide from the diff),
+   `RECORDER_FAILED`, `NO_RECORDS`. `COMPILE_ERROR` (exit 3): one repair round as in step 4 (`repair D`); `INFRA_ERROR`
+   (exit 2): fix and rerun. Files: `diff_D.json`, `diff_D.examples.json`.
 5. **Vet every `FAIL_3_OF_3`:**
    - Root-cause it with a throwaway diagnostic test, then delete it (`run.py` refuses to run on a dirty worktree).
    - `lessons.py match <scratch>/hunt<pr>/ctx.json` lists known false positives. If it is one, drop it.
@@ -76,6 +84,10 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      text from `old_tests.messages.json`. If the PR description does not announce that change, mark it **unexplained**
      (that is how a bug in the PR's intent shows up, which hunters cannot see). Mark it **breaks existing data/callers**
      even when announced.
+   - **Behaviour diff on generated inputs**: each `DIFF` from `run.py diff`, with its smallest example (input, base, head),
+     and whether the PR description announces that change. An unannounced change, or one that breaks data callers
+     already stored (settings, records, IDs a caller still holds), is a finding. An announced change that only
+     fixes a crash (base panics, head returns a value) is not.
    - **PR tests failing under CI flags**: each `PR_TEST_FAILS_UNDER_CI` / `PR_TEST_FAILS` / `FLAKY` from `pr_tests.py`.
    - **New-API failures to root-cause**: each `NEW_API`.
    - **UI/API base-vs-head diffs**: `/verify` compare runs (`verify_ui.mjs plan.json --compare <base_url>`, capture steps,

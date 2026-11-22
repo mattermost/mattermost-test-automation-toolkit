@@ -1,0 +1,16 @@
+{
+ "_note": "SELF-TEST FIXTURE: hand-written stand-in for a hunter response, never used as hunt output.",
+ "files": [
+  {
+   "path": "calc/hunt_huntd_test.go",
+   "content": "// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.\n// See LICENSE.txt for license information.\n\npackage calc\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"math/rand\"\n\t\"os\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc huntDErr(err error) any {\n\tif err == nil {\n\t\treturn nil\n\t}\n\treturn err.Error()\n}\n\nfunc huntDRecord(name string, i int, input any, call func() any) {\n\trec := map[string]any{\"test\": name, \"i\": i, \"input\": input}\n\tfunc() {\n\t\tdefer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\trec[\"panic\"] = fmt.Sprint(r)\n\t\t\t}\n\t\t}()\n\t\trec[\"output\"] = call()\n\t}()\n\tline, err := json.Marshal(rec)\n\tif err != nil {\n\t\tline, _ = json.Marshal(map[string]any{\"test\": name, \"i\": i, \"input\": fmt.Sprintf(\"%#v\", input), \"panic\": \"unmarshalable: \" + err.Error()})\n\t}\n\tout := os.Getenv(\"HUNT_DIFF_OUT\")\n\tif out == \"\" {\n\t\treturn\n\t}\n\tf, ferr := os.OpenFile(out, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)\n\tif ferr != nil {\n\t\tpanic(ferr)\n\t}\n\tdefer f.Close()\n\t_, _ = f.Write(append(line, '\\n'))\n}\n\nfunc TestHuntD_ScaleAt(t *testing.T) {\n\tr := rand.New(rand.NewSource(1))\n\tfor i := 0; i < 200; i++ {\n\t\tv := r.Intn(2000) - 1000\n\t\thuntDRecord(\"TestHuntD_ScaleAt\", i, v, func() any { return map[string]any{\"v\": Scale(v), \"at\": time.Now().UnixNano()} })\n\t}\n}\n"
+  }
+ ],
+ "tests": [
+  {
+   "test_name": "TestHuntD_ScaleAt",
+   "checks": "differential recorder",
+   "source": "fixture"
+  }
+ ]
+}

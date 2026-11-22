@@ -33,6 +33,10 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
 - **Go fuzzing (default on):** pure `FuzzHuntA_` targets are fuzzed inside `run.py run <pr> A`. A failing input is
   shrunk and frozen into a deterministic `TestHuntA_*_Fuzz<hash>` test that is vetted 3/3 like any other.
   `HUNT_FUZZ=0` disables it; `run.py fuzz` stays as a manual command.
+- **Differential recorders (Mode D, `run.py diff <pr> D`):** the model writes only seeded input generators and recorders,
+  never an expected value. Code runs them twice on the head (a disagreement is `NONDETERMINISTIC`) and once on the
+  merge-base, then diffs the recorded outputs per input: `SAME` or `DIFF` with the smallest examples. It finds a PR whose
+  intent is the bug, such as a sanitizer that starts masking values the base returned.
 - **Old tests on new code (no model):** `old_tests.py` runs the merge-base version of every existing Go or Jest test the
   PR edits or deletes (including `storetest/*.go`, salvaged per function; generated mock layers are skipped) on the PR
   head. `OLD_TEST_BREAKS` means the PR had to change that test to pass; `OLD_TEST_SOMETIMES_BREAKS` fails some head runs

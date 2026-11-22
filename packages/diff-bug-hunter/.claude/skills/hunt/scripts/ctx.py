@@ -260,7 +260,7 @@ def file_diffs(repo: Path, mb: str, head: str) -> list[prefilter.FileDiff]:
 
 # Outputs of an earlier hunt or batch. Left in place they would be reused (an old regenerated mutant, an old compile
 # log, old verdicts), so a new context removes them; prepare.json stays.
-STALE = ("A", "B", "A2", "M", "M2", "R_*", "run_*", "base_*", "mutants_*", "compile_*", "fuzz_*", "ctx.json",
+STALE = ("A", "B", "D", "A2", "M", "M2", "R_*", "run_*", "base_*", "mutants_*", "compile_*", "fuzz_*", "diff_*", "ctx.json",
          "state.json", "skipped.log")
 
 
