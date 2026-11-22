@@ -2659,3 +2659,18 @@ def test_strengthen_strips_spaces_around_mutant_ids(tmp_path, monkeypatch):
     req = json.loads((hdir / "A2" / "request.json").read_text())
     user = json.loads(req["user"])
     assert len(user["surviving_faults"]) == 2
+
+
+def test_suite_for_handles_symlinked_worktree_path(tmp_path):
+    # macOS /tmp -> /private/tmp: placed paths from under() are resolved while wt may be a symlink.
+    real_wt = tmp_path / "real_wt"
+    (real_wt / "calc").mkdir(parents=True)
+    link_wt = tmp_path / "link_wt"
+    link_wt.symlink_to(real_wt)
+    placed = run.place(link_wt, [{"path": "calc/hunt_hunta_test.go",
+                                  "content": "package calc\nfunc TestHuntA_Ok(t *testing.T) {}\n"}], {"calc"})
+    try:
+        suite = run.suite_for("A", {"targets": [{"lang": "go", "dir": "calc"}]}, placed, link_wt)
+        assert suite.go_patterns == {"calc": "^TestHuntA_"}
+    finally:
+        run.unplace(placed)

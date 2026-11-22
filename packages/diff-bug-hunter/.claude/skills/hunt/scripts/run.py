@@ -211,7 +211,7 @@ def suite_for(tag: str, state: dict[str, Any], placed: list[Path], wt: Path) -> 
         return s
     mode = tag[0]
     for p in placed:
-        rel = str(p.relative_to(wt))
+        rel = str(p.resolve().relative_to(wt.resolve()))
         if rel.endswith(".go"):
             # One -run pattern per package: another file's match would hide a file whose tests are misnamed.
             if not re.search(rf"^func TestHunt{mode}_\w*\(", p.read_text(), re.M):

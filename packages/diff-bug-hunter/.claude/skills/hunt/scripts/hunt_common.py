@@ -28,7 +28,7 @@ REPO = os.environ.get("HUNT_REPO", "mattermost/mattermost")
 
 
 def scratch() -> Path:
-    return Path(os.environ.get("HUNT_SCRATCH") or Path(tempfile.gettempdir()) / "hunt")
+    return Path(os.environ.get("HUNT_SCRATCH") or Path(tempfile.gettempdir()) / "hunt").resolve()
 
 
 MIN_FREE_BYTES = 2 * 1024**3  # a Go -race build of a Mattermost package plus worktrees needs about this much
