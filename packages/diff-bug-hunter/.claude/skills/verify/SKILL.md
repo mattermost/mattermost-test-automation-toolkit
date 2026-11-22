@@ -11,6 +11,14 @@ single `failure.png` only if the run FAILs. Hand its path to the user and never 
 
 1. **Server and auth:** check that the target answers `GET /api/v4/system/ping`: the `base_url` the user gave, else
    `VERIFY_BASE_URL`, else `MM_URL`, else `http://localhost:8065`. If it doesn't, stop and report `INFRA_ERROR`; do not start or reconfigure servers unasked.
+   - **A PR's own build** (when the user asks to check a PR): never build it locally. `scripts/pr_server.py images <pr> --pull`
+     gives and pulls the enterprise images of the PR head and its merge-base (`/hunt` starts this at step 1 when the PR
+     touches `webapp/` or a server API a page calls; otherwise start it yourself, a cold pull is 10-15 min). `scripts/pr_server.py up <image>` runs the mattermost repo's
+     own e2e stack on that image at `http://localhost:8065`, **replaces** a server running another build (`make stop-server`
+     drops its volumes: ask before running it over a stack the user is using), and seeds the
+     `VERIFY_USER` admin with the onboarding overlay off. One stack at a time: run the plan on head, then `up` the base
+     image and run it again, and compare the two verdicts (`--compare` needs both up at once). An image swap takes
+     ~100 s, the plan seconds. A missing image = CI has not built that commit yet: say so, do not build it.
    - Logged-in pages: the runner authenticates through the API before the first step, so no step goes to the login
      form. Put `"login": true` in the plan so missing credentials fail as `INFRA_ERROR`.
    - `VERIFY_USER` + `VERIFY_PASSWORD`: `POST /api/v4/users/login`. The server sets `MMAUTHTOKEN`, `MMUSERID` and
@@ -32,6 +40,9 @@ single `failure.png` only if the run FAILs. Hand its path to the user and never 
      appended as `portal [role=…]:` blocks, so click their items by role and name as usual.
    - Stay on the server under test. Other origins are blocked, and a redirect, navigation or websocket to one fails
      the run; add `allow_origins` only for assets the app really loads.
+   - Admin console: a button that tests a setting (Test Live URL, Test Connection) tests the **saved** value: save first,
+     or the page answers "Please save unsaved changes first". Match the server's own error text in `expect`, never
+     a prefix that the page's other messages share.
    - `expect` must hold at least one deterministic check: a DOM assertion (`visible`, `text` + `contains`,
      `count` + `min`) or an `/api/v4/` read (`api.path`, `status`, `json_has`). Choose checks that would fail if
      the change were broken.

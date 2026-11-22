@@ -22,6 +22,9 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
    is missing, or go to step 7. `--fresh` only when the user asks for a new hunt. A PR whose head moved starts over by itself.
    `INFRA_ERROR` = stop and report it; that includes less than 2 GiB free under `HUNT_SCRATCH`, which `prepare.py`
    and every Go `-race` run check first.
+   If the PR touches `webapp/` or a server API a page calls, also start
+   `python3 ../../verify/scripts/pr_server.py images <pr> --pull` (from `scripts/`) in the background now and check it
+   printed the two image tags: the images for a `/verify` check are then pulled while the hunters work.
 2. **Context:** `ctx.py <pr> [--batch N]`. Quote its batch line. `skipped.log` lists every file not hunted; mention the
    deferred batches in the report and hunt them only if the user asks.
 3. **Hunters:** `build_requests.py <pr> hunters`, then dispatch `A/request.json` and `B/request.json` in parallel.

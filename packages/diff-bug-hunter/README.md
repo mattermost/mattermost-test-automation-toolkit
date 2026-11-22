@@ -161,6 +161,12 @@ validated strictly (one action per step, one locator kind, known keys only) befo
   `count` + `min`) or an `/api/v4/` read (`status`, `json_has`).
 - **Compare (base vs head):** `verify_ui.mjs plan.json --compare <base_url>` runs the plan's capture steps against both
   servers. Verdicts `SAME`, `DIFF` or `REGRESSION`; a `DIFF` the PR does not explain is a finding.
+- **A PR's build, no local build:** `scripts/pr_server.py images <pr> --pull` pulls the published enterprise images of
+  the PR head and its merge-base (`/hunt` starts it at step 1, so the pull overlaps the hunt).
+  `scripts/pr_server.py up <image>` runs the mattermost repo's own `e2e-tests` stack on that image at `:8065`, replaces a
+  server that runs another build (its volumes are dropped), and seeds an admin with the onboarding overlay off. Measured on PR 40094: image swap
+  102 s, plan seconds, 119 s end to end with the image cached. The stack uses host networking (Docker Desktop: enable it
+  under Settings > Resources > Network).
 - **Freeze:** `--freeze specs/verify/<name>.spec.ts` turns a passing plan into a `@playwright/test` spec with the same oracle (allowed
   origins and the same proxy, settling, viewport, timeouts, `json_has` matching), so the check reruns in CI with no
   model, and it passes `tsc --strict`. It checks the server the run checked; set `VERIFY_REPLAY_BASE_URL` to point it
