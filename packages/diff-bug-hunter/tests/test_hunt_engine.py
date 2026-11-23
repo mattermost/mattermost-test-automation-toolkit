@@ -2869,3 +2869,19 @@ def test_mode_d_failure_detail_strips_server_noise_and_keeps_tail(tmp_path, monk
     ex = json.loads((hdir / "diff_D.examples.json").read_text())
     detail = ex["calc::TestHuntD_NoisyFail"]["detail"]
     assert "REAL_TAIL_CAUSE_12345" in detail and "role_store.go" not in detail, detail
+
+
+def test_prefilter_uses_max_plus_breadth_aligned_with_dev_rubric():
+    auth_only = prefilter.FileDiff("server/channels/app/login.go", 5, 2, "+checkAuth(session)\n")
+    multi_lower = prefilter.FileDiff(
+        "server/channels/app/settings_cache.go", 40, 10,
+        "+var mu sync.Mutex\n+cfg := getConfig()\n+reducer(dispatch(x))\n",
+    )
+    persistence = prefilter.FileDiff("server/channels/store/sqlstore/post_store.go", 20, 5, "+tx.Commit()\n")
+    api_ws = prefilter.FileDiff("server/channels/wsapi/channel.go", 15, 3, "+broadcastEvent()\n")
+    assert prefilter.risk(auth_only) == 10.0
+    assert prefilter.risk(multi_lower) == 7.5  # max(7) + 0.5 for config; does not beat Tier 1 auth
+    assert prefilter.risk(persistence) == 9.0
+    assert prefilter.risk(api_ws) == 8.0
+    p = prefilter.plan([multi_lower, api_ws, persistence, auth_only], max_files=2)
+    assert [f.path for f in p.batches[0]] == [auth_only.path, persistence.path]

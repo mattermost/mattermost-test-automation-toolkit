@@ -34,13 +34,17 @@ EXCLUDE: list[tuple[str, str]] = [
 SOURCE_EXT = (".go", ".ts", ".tsx", ".js", ".jsx")
 
 # (regex, weight). Searched in the path and in the file's added/removed lines.
+# Aligned with Mattermost's internal PR risk rubric (0-10 scale; starting points to calibrate against revert history).
+# Tier 1 Critical (8-10), Tier 2 High (5-7), Tier 3 Moderate (3-4). Non-source CI/Docker files stay excluded above
+# because /hunt generates Go/Jest unit tests.
 RISK: list[tuple[str, int]] = [
-    (r"auth|permission|session|token|password|mfa|saml|ldap|oauth|guest|sanitiz|escape|role", 10),
-    (r"parse|unmarshal|decode|regexp|validate|isvalid", 8),
-    (r"sync\.|go func|atomic\.|mutex|lock\(|chan |select \{", 7),
-    (r"/api4/|/web/|handler|router|http\.", 6),
-    (r"/store/|sqlstore|transaction|tx\.|commit|rollback", 6),
-    (r"reducer|actions?/|selectors?/|dispatch\(", 5),
+    (r"auth|permission|session|token|password|mfa|saml|ldap|oauth|guest|role|secret|crypt|tls|cert", 10),
+    (r"/store/|sqlstore|transaction|tx\.|commit|rollback|migration|backfill|kvstore|upgrade", 9),
+    (r"sanitiz|escape|parse|unmarshal|decode|regexp|validate|isvalid|upload|ssrf|markdown|html|signature|hmac", 9),
+    (r"/api4/|/wsapi/|websocket|/plugin/|/web/|webhook|handler|router|http\.", 8),
+    (r"sync\.|go func|atomic\.|mutex|lock\(|chan |select \{|cache|cluster|job|queue", 7),
+    (r"config|featureflag|audit|license", 5),
+    (r"reducer|actions?/|selectors?/|dispatch\(", 4),
     (r"/app/|/platform/", 3),
 ]
 
@@ -72,10 +76,16 @@ def excluded(path: str) -> str | None:
     return None
 
 
-def risk(f: FileDiff) -> int:
+def risk(f: FileDiff) -> float:
+    """Max-based score plus breadth bonus (+0.5 per extra Tier 1/2 category, cap +2.0), matching Mattermost's PR risk
+    rubric so a Tier 1 auth, persistence or input-handling file always outranks a multi-keyword Tier 2/3 file."""
     changed = "\n".join(line for line in f.patch.splitlines() if line[:1] in "+-" and line[:3] not in ("+++", "---"))
     text = f"{f.path}\n{changed}".lower()
-    return sum(w for rx, w in RISK if re.search(rx, text))
+    hits = [w for rx, w in RISK if re.search(rx, text)]
+    if not hits:
+        return 0.0
+    extra_high = max(0, sum(1 for w in hits if w >= 5) - 1)
+    return max(hits) + min(2.0, 0.5 * extra_high)
 
 
 def plan(files: list[FileDiff], max_files: int = MAX_FILES, max_lines: int = MAX_LINES) -> Plan:
@@ -116,6 +126,6 @@ def describe(p: Plan, batch: int) -> list[str]:
         for f in b:
             tag = "HUNT" if i == batch else f"DEFERRED to batch {i}"
             over = " (oversize: diff truncated)" if f.lines > MAX_LINES else ""
-            lines.append(f"{tag}\t{f.path}\trisk={risk(f)} lines={f.lines}{over}")
+            lines.append(f"{tag}\t{f.path}\trisk={risk(f):g} lines={f.lines}{over}")
     lines += [f"EXCLUDED\t{path}\t{reason}" for path, reason in p.skipped]
     return lines

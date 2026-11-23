@@ -236,7 +236,7 @@ those `node_modules` unless the PR changes `package-lock.json`.
 
 ## CI integration
 
-Package self-test: 253 tests (pytest), run by this repository's `.github/workflows/diff-bug-hunter.yml` when
+Package self-test: 254 tests (pytest), run by this repository's `.github/workflows/diff-bug-hunter.yml` when
 `packages/diff-bug-hunter/` changes. The /verify tests need the Chromium build that matches the pinned Playwright, installed from the fixture
 directory:
 
