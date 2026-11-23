@@ -44,7 +44,7 @@ export interface StatusRow {
 }
 
 /** Summarizes the latest status of each lane into the aggregate's state and description. */
-export type LaneSummarizer = (lanes: LaneStatus[], untriaged?: LaneStatus[], release?: boolean) => LaneSummary;
+export type LaneSummarizer = (lanes: LaneStatus[], untriaged?: LaneStatus[], release?: boolean, pr?: boolean) => LaneSummary;
 
 export interface StatusPublisher {
   allowed(operation: string): Promise<boolean>;
@@ -185,7 +185,9 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
     const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
-    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease), context: summaryContext }, snapshotOwner());
+    // A run with no PR (main, a release branch) names its failures against the commit, not a PR.
+    const pr = Number(id.gh_pr_number || 0) > 0;
+    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease, pr), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,

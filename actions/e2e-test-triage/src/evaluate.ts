@@ -5,10 +5,10 @@ import { identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
 import { BORDERLINE, causedByPR, changeTouchesFailure, classify, classifyNotRun, errorSignature, holdFailedEverywhere, infraVerdict, isShardPlaceholder, isSpecNotRun, isSpecStopped, isProductChange, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, historyLane, repoPath } from "./config.ts";
-import { commonSenseClear } from "./common-sense.ts";
+import { commonSenseClear, isPlatformFile } from "./common-sense.ts";
 import { sameTestOnOtherReports } from "./enrich.ts";
 import { evidenceFor } from "./evidence.ts";
-import { buildPack, namesChangedFile, releasePack } from "./pack.ts";
+import { buildPack, changeCategory, namesChangedFile, releasePack } from "./pack.ts";
 import type { OtherFailure, ReleaseRef } from "./pack.ts";
 import { judge } from "./decision.ts";
 import type { OutOfDateResult } from "./history.ts";
@@ -99,7 +99,8 @@ export async function evaluateRun({
   // A shard placeholder (no test name, a desktop shard stub, a mobile spec that did not run) has no history to read and
   // nothing to show the model. The run is red for it: it is counted, and not classified, asked or flagged.
   const tests = run.failing.filter((t) => !isShardPlaceholder(t));
-  const result: EvaluatedRun = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg), counts: run.counts, ai: newLedger(), missing: null };
+  const executed = Math.max(0, run.counts.total - run.counts.skipped);
+  const result: EvaluatedRun = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg, executed || undefined), counts: run.counts, ai: newLedger(), missing: null };
   // A shard that sent nothing ran none of its specs: they stay placeholders and the shard is re-run. A spec its shard's
   // Jest process stopped before (the shard ran) is judged by its own history (see classifyNotRun), never re-run for.
   // Like OWNED_BY_PR: a spec this change edits has to run; unknown when the change list or the test root is.
@@ -135,8 +136,13 @@ export async function evaluateRun({
       });
     });
     // A PR that breaks its own server fails every test on the environment, so on a flagged run only the judge clears
-    // an environment error.
-    if (result.infra) {
+    // an environment error. A trunk run (no PR, not a release branch) has no judge, and a PR touching only docs or
+    // repo metadata cannot break a remote test environment.
+    const nonProductOnly = Boolean(prNumber) && diff.ok && files.length > 0 && files.every((f) => {
+      const cat = changeCategory(f.filename, changeContext);
+      return cat === "docs" || cat === "other";
+    });
+    if (result.infra && (!isTrunkRun || Boolean(branchBase)) && !nonProductOnly) {
       const why = /infrastructure errors/.test(result.infra) ? "most of this run failed on its environment" : "many tests failed in this run";
       for (const f of result.findings)
         if (f.class === "INFRA_ERROR" && !f.blocking)
@@ -346,7 +352,10 @@ export function settlePR(findings: Finding[], changed: string[], ownershipKnown:
     // records only the platform's result, not its error, so it may be another failure altogether.
     const elsewhere = f.failed_everywhere?.length ? f.failed_everywhere : null;
     const trunkClean = Boolean(t && t.runs >= minTrunkRuns && (t.lane_runs ?? t.runs) >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
-    if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length) {
+    const passedElsewhere = Boolean(f.other_lanes?.length) && f.other_lanes!.some((l) => l.result === "passed") && !f.other_lanes!.some((l) => l.result !== "passed" && l.result !== "skipped");
+    const platformChange = changed.some(isPlatformFile);
+    const judgeClearsEnv = !elsewhere && Boolean(f.judge && f.judge.cause === "flaky_environment" && f.judge.confidence >= 0.7 && !f.judge.cited_evidence.some((c) => c.startsWith("hunk_")));
+    if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length && !(passedElsewhere && !platformChange) && !judgeClearsEnv) {
       Object.assign(f, {
         untouched: true,
         decision: "reproducible_regression",
