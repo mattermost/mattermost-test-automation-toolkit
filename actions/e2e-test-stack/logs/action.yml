@@ -1,0 +1,75 @@
+---
+name: E2E test stack logs
+description: >-
+  Collect the logs of every server still up in this run's e2e-test-stack batch, or in one batch by its id, with every
+  known secret taken out, and upload them as one artifact. Assumes role-arn itself: the job needs id-token: write and
+  actions: read, and Node 26 set up first.
+author: Mattermost
+inputs:
+  caller-key:
+    description: The repository's key in the control plane's callers (e.g. mobile), as create was given it
+    required: true
+  batch:
+    description: >-
+      The batch within this run, as create was given it (e.g. ios), in the run that created it. Give this or batch-id,
+      not both
+    default: ""
+  batch-id:
+    description: >-
+      By hand: the one batch whose logs to collect (e.g. mobile-1234-ios-1-a1b2c3). Another run's only by a job started
+      by hand, when that run was started by hand too, by the same person, and has completed. Give this or batch, not
+      both
+    default: ""
+  role-arn:
+    description: >-
+      The repository's CI role ARN in the account the batch was created in, as create was given it,
+      arn:aws:iam::<account id>:role/e2e-test-stack-ci-<caller-key>
+    required: true
+  channel:
+    description: v1 (the default) or edge, as create was given it
+    default: v1
+  credentials-key:
+    description: >-
+      The repository's credentials key, a base64 X25519 private key (the E2E_TEST_STACK_CREDENTIALS_KEY secret), which
+      opens the batch's token and each log's URL
+    required: true
+  github-token:
+    description: The token for api.github.com, which reads the run and its artifacts; it needs actions read
+    default: ${{ github.token }}
+outputs:
+  servers:
+    description: >-
+      JSON array, one entry per server that was up: index, instance_id, path (the full log, or its tail when the full
+      log was not saved; empty when neither was), full and containers
+    value: ${{ steps.logs.outputs.servers }}
+  logs-dir:
+    description: The directory holding the logs, server-<index>.log each; empty when none was saved
+    value: ${{ steps.logs.outputs.logs_dir }}
+  artifact-name:
+    description: The uploaded artifact's name; empty unless the upload succeeded
+    value: ${{ steps.upload.outputs.artifact-id != '' && steps.logs.outputs.artifact_name || '' }}
+runs:
+  using: composite
+  steps:
+    - id: logs
+      shell: bash
+      env:
+        STACK_CALLER_KEY: ${{ inputs.caller-key }}
+        STACK_BATCH: ${{ inputs.batch }}
+        STACK_ROLE_ARN: ${{ inputs.role-arn }}
+        STACK_CHANNEL: ${{ inputs.channel }}
+        STACK_CREDENTIALS_KEY: ${{ inputs.credentials-key }}
+        STACK_BATCH_ID: ${{ inputs.batch-id }}
+        STACK_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: bash "${{ github.action_path }}/../run.sh" logs
+    # Whatever was saved, the full log or its tail, even when the step failed.
+    - id: upload
+      if: always() && steps.logs.outputs.artifact_name != ''
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+      with:
+        name: ${{ steps.logs.outputs.artifact_name }}
+        path: ${{ steps.logs.outputs.logs_dir }}
+        if-no-files-found: error
+        retention-days: 14
+        # A second collection in the same attempt replaces the first's.
+        overwrite: true

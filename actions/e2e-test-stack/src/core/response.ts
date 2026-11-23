@@ -71,6 +71,27 @@ export interface StackResponse {
       note?: string;
     };
   };
+  /** From logs. */
+  logs?: Logs;
+}
+
+/** One server's logs, as a logs call reports them; the URL and tail are sealed. */
+export interface Logs {
+  instance_id?: string;
+  index?: number;
+  containers?: string[];
+  lines?: number;
+  bytes?: number;
+  truncated?: boolean;
+  /** No log object was found: the command printed nothing, or its output was not yet written. */
+  no_object?: boolean;
+  secrets?: string;
+}
+
+/** What logs.secrets opens to: the full log's presigned URL, and its tail, gzipped and base64. */
+export interface LogsSecrets {
+  url?: string;
+  content_gzip?: string;
 }
 
 /** One instance's secrets, as batch.secrets opens to them. */
