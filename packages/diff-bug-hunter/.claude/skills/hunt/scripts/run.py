@@ -114,11 +114,12 @@ def normalize_failure(text: str, wt: Path) -> str:
     """Failure text with what differs between two runs of the same failure removed: worktree paths, stack frames,
     durations, memory addresses and goroutine ids. Two failures compare equal only if they say the same thing, so
     values written in hex (got 0x02, want 0x01) are kept; only frame offsets and 64-bit addresses are redacted."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)  # strip ANSI color codes (mlog console warn/info/debug)
     text = text.replace(str(wt.resolve()), "<wt>").replace(str(wt), "<wt>")
     keep = [line for line in text.splitlines()
             if not re.match(r'\s+at |\s*created by |\t\S+\.go:\d+(?: \+0x[0-9a-fA-F]+)?$|'
                             r'\s*\{"(?:timestamp":"[^"]+",)?"level":"(?:debug|info|warn)"|'
-                            r'\s*(?:debug|info|warn) \[\d{4}-\d{2}-\d{2}', line)]  # JS/Go frames & server noise logs
+                            r'\s*(?:debug|info|warn) \[(?:\d{4}-\d{2}-\d{2}|<ts>)', line)]  # JS/Go frames & server noise logs
     text = "\n".join(keep)
     text = re.sub(r"(?i)goroutine \d+", "goroutine N", text)
     text = re.sub(r"\(\d+(?:\.\d+)?m?s\)", "", text)
@@ -764,7 +765,7 @@ def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str
         if any(s != "PASS" for s in statuses):
             verdicts[ident] = "RECORDER_FAILED"
             msg = runs[0].messages.get(ident) or runs[1].messages.get(ident, "")
-            detail[ident] = {"detail": f"head runs: {statuses}; {msg[:600]}"}
+            detail[ident] = {"detail": f"head runs: {statuses}; {normalize_failure(msg, wt)[-600:]}"}
         elif not a and not b:
             verdicts[ident] = "NO_RECORDS"
         elif a != b:
@@ -785,7 +786,7 @@ def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str
             if status != "PASS":
                 missing = MISSING_ON_BASE.search(msg) or TARGET_MISSING.search(msg)
                 verdicts[ident] = "BASE_UNCOMPILABLE" if missing else "BASE_FAILED"
-                detail[ident] = {"detail": f"base run: {status}; {msg[:600]}"}
+                detail[ident] = {"detail": f"base run: {status}; {normalize_failure(msg, wt_base)[-600:]}"}
             elif not base_recs.get(name):
                 verdicts[ident] = "BASE_FAILED"
                 detail[ident] = {"detail": "the recorder passed on the merge-base but wrote no records"}

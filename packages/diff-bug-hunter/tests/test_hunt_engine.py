@@ -2848,3 +2848,24 @@ def test_verify_strict_locators_and_fail_only_diagnostics(tmp_path, ui_server):
                                   "expect": [{"text": {"css": "#m"}, "contains": "never"}]}, auth="none")
     assert code == 1 and "diagnostics at failure:" in out, out
     assert "console.error: boom-console" in out and "HTTP 404 from GET /api/v4/missing404" in out, out
+
+
+def test_mode_d_failure_detail_strips_server_noise_and_keeps_tail(tmp_path, monkeypatch):
+    hdir, state = make_hunt(tmp_path, "go_bug")
+    (hdir / "D").mkdir()
+    src = ('package calc\n\nimport (\n\t"fmt"\n\t"testing"\n)\n\n'
+           'func TestHuntD_NoisyFail(t *testing.T) {\n'
+           '\tfor i := 0; i < 40; i++ {\n'
+           '\t\tfmt.Println("\\x1b[33mwarn\\x1b[0m [2026-11-23 00:00:00.000 Z] Preserving role permissions caller=\\"sqlstore/role_store.go:123\\"")\n'
+           '\t}\n'
+           '\tt.Fatal("REAL_TAIL_CAUSE_12345")\n'
+           '}\n')
+    (hdir / "D" / "response.json").write_text(json.dumps({
+        "files": [{"path": "calc/hunt_huntd_test.go", "content": src}],
+        "tests": [{"test_name": "TestHuntD_NoisyFail", "checks": "differential recorder", "source": "calc"}],
+    }))
+    v = run.cmd_diff(hdir, state, "D")
+    assert v == {"calc::TestHuntD_NoisyFail": "RECORDER_FAILED"}
+    ex = json.loads((hdir / "diff_D.examples.json").read_text())
+    detail = ex["calc::TestHuntD_NoisyFail"]["detail"]
+    assert "REAL_TAIL_CAUSE_12345" in detail and "role_store.go" not in detail, detail

@@ -1,6 +1,6 @@
 
-You write tests for ONE pull request. You cannot run code. Write exactly one file per entry in `your_test_files`, at
-that path; a file may hold few tests but every listed file must exist.
+You write tests for ONE pull request. You cannot run code. Write files ONLY at paths listed in `your_test_files`.
+Omit any listed path for which you have no real test — never emit an empty file, comment-only stub, or `t.Skip()` placeholder.
 Rules:
 - Reuse the sibling test helpers exactly. Do NOT redeclare any identifier that already exists in those test files.
 - Deterministic only: fixed seeds, fake timers for time, repeat evaluations when map/iteration order could matter.
