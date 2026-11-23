@@ -573,7 +573,7 @@ test("a partial create still sets its outputs and writes the response, then fail
     (e: unknown) =>
       e instanceof ActionError &&
       e.message ===
-        `create reported: 1 of 2 instances failed: [1]. Batch ${BATCH_ID} was created; it is reaped at its ttl.`,
+        `create reported: 1 of 2 instances failed: [1]. Batch ${BATCH_ID} was created; the destroy action releases it, or it is reaped at its ttl.`,
   );
   const out = readOutputs(h.output);
   assert.equal(out.batch_id, BATCH_ID);
@@ -665,7 +665,7 @@ test("a ready create is fetched, and fails unless the control plane finds every 
     (e: unknown) =>
       e instanceof ActionError &&
       e.message ===
-        `the fetch of batch ${BATCH_ID} found it not found with 0 of 1 servers ready, 0 listed; every server must be ready. Batch ${BATCH_ID} was created; it is reaped at its ttl.`,
+        `the fetch of batch ${BATCH_ID} found it not found with 0 of 1 servers ready, 0 listed; every server must be ready. Batch ${BATCH_ID} was created; the destroy action releases it, or it is reaped at its ttl.`,
   );
   const out = readOutputs(notFound.output);
   assert.equal(out.batch_id, BATCH_ID);
@@ -831,7 +831,7 @@ test("a response that cannot be written fails the create after its batch id is s
   blocked(h);
   await assert.rejects(
     h.go(),
-    /^ActionError: the create response could not be written: .*\. Batch tpp-42-ios-1-abc was created; it is reaped at its ttl\.$/,
+    /^ActionError: the create response could not be written: .*\. Batch tpp-42-ios-1-abc was created; the destroy action releases it, or it is reaped at its ttl\.$/,
   );
   const out = readOutputs(h.output);
   assert.equal(out.batch_id, BATCH_ID);

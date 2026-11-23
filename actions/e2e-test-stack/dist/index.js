@@ -12936,15 +12936,15 @@ var init_dist_es5 = __esm({
 
 // ../../node_modules/@smithy/node-http-handler/dist-es/build-abort-error.js
 function buildAbortError(abortSignal) {
-  const reason = abortSignal && typeof abortSignal === "object" && "reason" in abortSignal ? abortSignal.reason : void 0;
-  if (reason) {
-    if (reason instanceof Error) {
+  const reason2 = abortSignal && typeof abortSignal === "object" && "reason" in abortSignal ? abortSignal.reason : void 0;
+  if (reason2) {
+    if (reason2 instanceof Error) {
       const abortError3 = new Error("Request aborted");
       abortError3.name = "AbortError";
-      abortError3.cause = reason;
+      abortError3.cause = reason2;
       return abortError3;
     }
-    const abortError2 = new Error(String(reason));
+    const abortError2 = new Error(String(reason2));
     abortError2.name = "AbortError";
     return abortError2;
   }
@@ -14309,11 +14309,11 @@ var init_xml_parser = __esm({
               childTags.push(p5.parseTag());
             }
           } else {
-            let text3 = "";
+            let text4 = "";
             while (p5.i < p5.z && p5.x[p5.i] !== "<") {
-              text3 += p5.x[p5.i++];
+              text4 += p5.x[p5.i++];
             }
-            textParts.push(p5.decodeEntities(text3));
+            textParts.push(p5.decodeEntities(text4));
           }
         }
         if (!p5.isNext("</")) {
@@ -14328,18 +14328,18 @@ var init_xml_parser = __esm({
           return { tag, value: "" };
         }
         if (!hasAttrs && !hasElementChild) {
-          const text3 = textParts.length === 1 ? textParts[0] : textParts.join("");
-          if (text3.trim() === "" && text3.includes("\n")) {
+          const text4 = textParts.length === 1 ? textParts[0] : textParts.join("");
+          if (text4.trim() === "" && text4.includes("\n")) {
             return { tag, value: "" };
           }
-          return { tag, value: text3 };
+          return { tag, value: text4 };
         }
         const obj = {};
-        for (const text3 of textParts) {
-          if (text3.trim() === "" && text3.includes("\n")) {
+        for (const text4 of textParts) {
+          if (text4.trim() === "" && text4.includes("\n")) {
             continue;
           }
-          obj["#text"] = "#text" in obj ? obj["#text"] + text3 : text3;
+          obj["#text"] = "#text" in obj ? obj["#text"] + text4 : text4;
         }
         for (const child of childTags) {
           if (child.tag === "__proto__") {
@@ -20153,8 +20153,8 @@ var describe = (e7) => {
 };
 var statusError = async (res) => {
   const body = (await readBody(res, MAX_ERROR_BYTES, { truncate: true }).catch(() => Buffer.alloc(0))).toString("utf8").replace(/\s+/g, " ").trim();
-  const text3 = body.slice(0, 200);
-  const message = `HTTP ${res.status}${text3 ? ` ${text3}` : ""}`;
+  const text4 = body.slice(0, 200);
+  const message = `HTTP ${res.status}${text4 ? ` ${text4}` : ""}`;
   if (res.status >= 500) return new AttemptError(message, "transient");
   const secondary = /secondary rate limit/i.test(body);
   const primary = !secondary && res.headers.get("x-ratelimit-remaining") === "0";
@@ -20200,9 +20200,9 @@ function githubClient(token, fetchImpl = fetch, wait = sleep, log = console.log)
     json: (path) => retried(path, async (signal) => {
       const res = await fetchImpl(`${GITHUB_API}${path}`, { headers: headers(), signal });
       if (!res.ok) throw await statusError(res);
-      const text3 = (await readBounded(res, MAX_JSON_BYTES)).toString("utf8");
+      const text4 = (await readBounded(res, MAX_JSON_BYTES)).toString("utf8");
       try {
-        return JSON.parse(text3);
+        return JSON.parse(text4);
       } catch {
         throw new AttemptError(`HTTP ${res.status} with a body that is not JSON`, "final");
       }
@@ -20276,6 +20276,12 @@ function batchFrom(env2) {
     "1 to 20 lowercase letters, digits and hyphens, starting and ending with a letter or digit"
   );
   return batch;
+}
+var REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+function repositoryFrom(env2) {
+  const repository = (env2.GITHUB_REPOSITORY ?? "").trim();
+  if (!REPOSITORY.test(repository)) refuse("GITHUB_REPOSITORY must be set, as it is in a GitHub Actions job");
+  return repository;
 }
 function runFrom(env2) {
   const runId = (env2.GITHUB_RUN_ID ?? "").trim();
@@ -26553,35 +26559,35 @@ var import_node_fs5 = require("fs");
 var import_node_path7 = require("path");
 
 // src/core/redact.ts
-var redact = (text3) => text3.replace(/arn:aws[a-z-]*:(?:[^\s"';()|`<>[\]{}]*[^\s"',;()|`<>[\]{}.])?/g, "[arn]").replace(/(?<![\w-])\d{12}(?![\w-])/g, "[account]");
+var redact = (text4) => text4.replace(/arn:aws[a-z-]*:(?:[^\s"';()|`<>[\]{}]*[^\s"',;()|`<>[\]{}.])?/g, "[arn]").replace(/(?<![\w-])\d{12}(?![\w-])/g, "[account]");
 var errorText = (e7) => {
   const name = e7?.name || "Error";
   const message = redact(String(e7?.message ?? e7)).split("\n")[0].slice(0, 200);
   return `${name}: ${message}`;
 };
-var handlerError = (text3) => {
+var handlerError = (text4) => {
   try {
-    const parsed = JSON.parse(text3);
+    const parsed = JSON.parse(text4);
     if (typeof parsed?.errorMessage === "string") return redact(parsed.errorMessage);
   } catch {
   }
-  return redact(text3.trim()).slice(0, 500) || "no reason given";
+  return redact(text4.trim()).slice(0, 500) || "no reason given";
 };
 
 // src/core/outputs.ts
-var commandText = (text3) => text3.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A");
+var commandText = (text4) => text4.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A");
 function writeOutputs(path, outputs) {
   if (!path) return;
-  let text3 = "";
+  let text4 = "";
   for (const [k8, v2] of Object.entries(outputs)) {
     if (v2 === void 0) continue;
     const delimiter = `ghadelimiter_${(0, import_node_crypto5.randomUUID)()}`;
-    text3 += `${k8}<<${delimiter}
+    text4 += `${k8}<<${delimiter}
 ${v2}
 ${delimiter}
 `;
   }
-  if (text3) (0, import_node_fs5.appendFileSync)(path, text3);
+  if (text4) (0, import_node_fs5.appendFileSync)(path, text4);
 }
 function appendSummary(path, lines) {
   if (path && lines.length) (0, import_node_fs5.appendFileSync)(path, redact(lines.join("\n")) + "\n");
@@ -26619,10 +26625,10 @@ function masker(log) {
     }
   };
 }
-function also(action, failure, text3) {
+function also(action, failure, text4) {
   if (failure instanceof ActionError)
-    return new ActionError(`${failure.message} Also, ${text3}`, { cause: failure.cause });
-  return new ActionError(`${action} failed. Also, ${text3}`, { cause: failure });
+    return new ActionError(`${failure.message} Also, ${text4}`, { cause: failure.cause });
+  return new ActionError(`${action} failed. Also, ${text4}`, { cause: failure });
 }
 function settle(env2, action, outputs, summary, failure) {
   const unwritten = [];
@@ -31575,25 +31581,26 @@ async function createBatch(env2, deps) {
     } catch (e7) {
       throw new ActionError(`the invoke of ${named} failed: ${errorText(e7)}.${mayExist}`);
     }
-    const text3 = payloadText(reply);
+    const text4 = payloadText(reply);
     try {
-      outputs.response_path = deps.writeResponse(responseFile, text3);
+      outputs.response_path = deps.writeResponse(responseFile, text4);
     } catch (e7) {
       responseWriteError = e7;
     }
     if (reply.FunctionError)
-      throw new ActionError(`the control plane refused the create: ${handlerError(text3)}.${mayExist}`);
+      throw new ActionError(`the control plane refused the create: ${handlerError(text4)}.${mayExist}`);
     if (reply.StatusCode !== 200)
-      throw new ActionError(`the invoke answered ${reply.StatusCode}: ${handlerError(text3)}.${mayExist}`);
+      throw new ActionError(`the invoke answered ${reply.StatusCode}: ${handlerError(text4)}.${mayExist}`);
     let response;
     try {
-      response = JSON.parse(text3);
+      response = JSON.parse(text4);
     } catch {
-      throw new ActionError(`the control plane's reply is not JSON: ${redact(text3).slice(0, 200)}.${mayExist}`);
+      throw new ActionError(`the control plane's reply is not JSON: ${redact(text4).slice(0, 200)}.${mayExist}`);
     }
     const error = responseError(response);
     const batchId = typeof response.batch_id === "string" ? response.batch_id : "";
-    if (batchId) teardown = ` Batch ${batchId} was created; it is reaped at its ttl.`;
+    if (batchId)
+      teardown = ` Batch ${batchId} was created; the destroy action releases it, or it is reaped at its ttl.`;
     const sites = Array.isArray(response.sites) ? response.sites : [];
     const leases = Array.isArray(response.batch?.instances) ? response.batch.instances : [];
     const state2 = response.batch?.state ?? "";
@@ -31668,7 +31675,7 @@ var FETCH_RETRY_MS = 5e3;
 var FETCH_TIMEOUT_MS = 12e4;
 var transientError = (e7) => typeof e7 === "object" && e7 !== null && isTransientError(e7);
 async function fetchReady(invoke, target, named, batchId, batchToken, expected, teardown, deps) {
-  const notReady = (reason) => new ActionError(`the fetch of batch ${batchId} ${reason}.${teardown}`);
+  const notReady = (reason2) => new ActionError(`the fetch of batch ${batchId} ${reason2}.${teardown}`);
   let reply;
   for (let attempt = 1; !reply; attempt++) {
     const signal = AbortSignal.timeout(deps.fetchTimeoutMs);
@@ -31678,24 +31685,24 @@ async function fetchReady(invoke, target, named, batchId, batchToken, expected, 
         signal
       );
     } catch (e7) {
-      const reason = signal.aborted ? `got no reply in ${deps.fetchTimeoutMs / 1e3} s` : errorText(e7);
+      const reason2 = signal.aborted ? `got no reply in ${deps.fetchTimeoutMs / 1e3} s` : errorText(e7);
       if (!(signal.aborted || transientError(e7)) || attempt >= FETCH_ATTEMPTS)
-        throw notReady(`through ${named} failed: ${reason}`);
+        throw notReady(`through ${named} failed: ${reason2}`);
       const ms = FETCH_RETRY_MS * attempt;
       deps.log(
-        `e2e-test-stack: the fetch of batch ${batchId} failed (${reason}); trying again in ${ms / 1e3} s (attempt ${attempt + 1} of ${FETCH_ATTEMPTS})`
+        `e2e-test-stack: the fetch of batch ${batchId} failed (${reason2}); trying again in ${ms / 1e3} s (attempt ${attempt + 1} of ${FETCH_ATTEMPTS})`
       );
       await deps.sleep(ms);
     }
   }
-  const text3 = payloadText(reply);
-  if (reply.FunctionError) throw notReady(`was refused: ${handlerError(text3)}`);
-  if (reply.StatusCode !== 200) throw notReady(`answered ${reply.StatusCode}: ${handlerError(text3)}`);
+  const text4 = payloadText(reply);
+  if (reply.FunctionError) throw notReady(`was refused: ${handlerError(text4)}`);
+  if (reply.StatusCode !== 200) throw notReady(`answered ${reply.StatusCode}: ${handlerError(text4)}`);
   let response;
   try {
-    response = JSON.parse(text3);
+    response = JSON.parse(text4);
   } catch {
-    throw notReady(`returned a reply that is not JSON: ${redact(text3).slice(0, 200)}`);
+    throw notReady(`returned a reply that is not JSON: ${redact(text4).slice(0, 200)}`);
   }
   const error = responseError(response);
   if (error) throw notReady(`reported: ${error}`);
@@ -31776,11 +31783,13 @@ var MAX_RESPONSE_BYTES = 16 << 20;
 var PER_PAGE = 100;
 var PAGES = 10;
 var createArtifact = (batch) => `e2e-test-stack-create-${batch}`;
-async function newestArtifact(github, run2, name) {
+var responseArtifact = (batch, attempt) => `e2e-test-stack-response-${batch}-${attempt}`;
+async function runArtifacts(github, run2, name) {
   const found = [];
+  const filter = `name=${encodeURIComponent(name)}&`;
   for (let page = 1; page <= PAGES; page++) {
     const got = await github.json(
-      `/repos/${run2.repository}/actions/runs/${run2.runId}/artifacts?name=${encodeURIComponent(name)}&per_page=${PER_PAGE}&page=${page}`
+      `/repos/${run2.repository}/actions/runs/${run2.runId}/artifacts?${filter}per_page=${PER_PAGE}&page=${page}`
     );
     const listed = Array.isArray(got?.artifacts) ? got.artifacts : [];
     for (const a8 of listed)
@@ -31793,13 +31802,13 @@ async function newestArtifact(github, run2, name) {
         });
     if (listed.length < PER_PAGE) break;
   }
-  return found.sort((a8, b8) => b8.createdAt.localeCompare(a8.createdAt) || b8.id - a8.id)[0];
+  return found;
 }
-async function createResponse(github, run2, batch) {
-  const name = createArtifact(batch);
-  const artifact = await newestArtifact(github, run2, name);
-  if (!artifact) return void 0;
-  const what = `this run's artifact ${name}`;
+var newest = (artifacts) => [...artifacts].sort((a8, b8) => b8.createdAt.localeCompare(a8.createdAt) || b8.id - a8.id)[0];
+async function newestArtifact(github, run2, name) {
+  return newest(await runArtifacts(github, run2, name));
+}
+async function readResponse(github, run2, artifact, what) {
   if (artifact.expired) throw new ActionError(`${what} has expired, so the batch it names cannot be read`);
   let archive;
   try {
@@ -31818,7 +31827,13 @@ async function createResponse(github, run2, batch) {
     throw new ActionError(`${what} could not be read: ${e7.message}`, { cause: e7 });
   }
   if (!response) throw new ActionError(`${what} holds no ${RESPONSE_FILE}`);
-  return { artifact, response };
+  return response;
+}
+async function createResponse(github, run2, batch) {
+  const name = createArtifact(batch);
+  const artifact = await newestArtifact(github, run2, name);
+  if (!artifact) return void 0;
+  return { artifact, response: await readResponse(github, run2, artifact, `this run's artifact ${name}`) };
 }
 
 // src/core/batch.ts
@@ -31830,15 +31845,521 @@ function batchAttempt(batchId, owner) {
   const attempt = Number(m5[1]);
   return Number.isSafeInteger(attempt) && attempt <= owner.attempt ? attempt : void 0;
 }
+function batchIdParts(batchId, callerKey) {
+  const batch = BATCH.source.replace(/^\^|\$$/g, "").replace(/\((?!\?)/g, "(?:");
+  const m5 = new RegExp(`^${escape2(callerKey)}-([1-9][0-9]{0,19})-(${batch})-([1-9][0-9]{0,5})-[a-z0-9]+$`).exec(
+    batchId
+  );
+  return m5 ? { runId: m5[1], batch: m5[2], attempt: Number(m5[3]) } : void 0;
+}
+
+// src/core/probe.ts
+var CONTROL = /[\u0000-\u001f\u007f]/;
+var GONE = "No test server for this hostname";
+var PROBE_INTERVAL_MS = 5e3;
+var PROBE_REQUEST_MS = 15e3;
+var MAX_BODY = 64 << 10;
+function goneUrls(sites, ssoHosts) {
+  const urls = [];
+  const rejected = [];
+  const protocols = [];
+  const quoted = (v2) => JSON.stringify(typeof v2 === "string" ? v2.slice(0, 200) : typeof v2);
+  for (const [i8, site] of sites.entries()) {
+    if (site === "" || site === null || site === void 0) continue;
+    const clean = typeof site === "string" && !CONTROL.test(site);
+    const url = clean && URL.canParse(site) ? new URL(site) : void 0;
+    if (!url || url.protocol !== "https:" && url.protocol !== "http:") {
+      rejected.push(`the site ${quoted(site)} is not an http(s) URL`);
+      continue;
+    }
+    urls.push(`${url.href.replace(/\/+$/, "")}/api/v4/system/ping`, `${url.protocol}//mail-${url.host}/`);
+    protocols[i8] = url.protocol;
+  }
+  for (const [i8, host] of ssoHosts.entries()) {
+    if (host === "" || host === null || host === void 0) continue;
+    if (typeof host !== "string" || !/^[a-z0-9.-]+(:\d+)?$/i.test(host)) {
+      rejected.push(`the sso host ${quoted(host)} is not a hostname`);
+      continue;
+    }
+    urls.push(`${protocols[i8] ?? "https:"}//${host}/`);
+  }
+  return { urls, rejected };
+}
+var noAnswer = (e7) => {
+  if (e7 instanceof DOMException && (e7.name === "TimeoutError" || e7.name === "AbortError"))
+    return "no answer, timed out";
+  const err = e7;
+  const code = typeof err?.cause?.code === "string" ? err.cause.code : "";
+  return `no answer, ${code || String(err?.message ?? e7)}`.split("\n")[0];
+};
+async function probeGone(urls, windowMs, o5) {
+  const start = o5.now();
+  const elapsed = () => Math.round((o5.now() - start) / 1e3);
+  const probe = async (url) => {
+    let attempts = 0;
+    let last = "no attempt";
+    for (; ; ) {
+      const left = windowMs - (o5.now() - start);
+      if (left <= 0) break;
+      attempts++;
+      try {
+        const res = await o5.fetch(url, {
+          redirect: "manual",
+          // AbortSignal.timeout takes whole milliseconds; the clock gives fractions.
+          signal: AbortSignal.timeout(Math.max(1, Math.floor(Math.min(left, PROBE_REQUEST_MS))))
+        });
+        const body = (await readBody(res, MAX_BODY, { truncate: true })).toString("utf8");
+        if (res.status === 404 && body.includes(GONE)) {
+          o5.log(`e2e-test-stack:   gone ${url} (after ${attempts} attempt(s), ${elapsed()} s)`);
+          return void 0;
+        }
+        last = `HTTP ${res.status}`;
+      } catch (e7) {
+        last = noAnswer(e7);
+      }
+      const rest = windowMs - (o5.now() - start);
+      if (rest <= 0) break;
+      await o5.sleep(Math.min(rest, PROBE_INTERVAL_MS));
+    }
+    return `${url} is still served after ${elapsed()} s (${attempts} attempt(s)): last ${last}`;
+  };
+  return (await Promise.all(urls.map(probe))).filter((f8) => f8 !== void 0);
+}
+
+// src/core/run-check.ts
+var text2 = (v2) => typeof v2 === "string" ? v2 : "";
+async function checkRun(github, repository, byHand, log) {
+  const { runId, attempt, actor } = byHand;
+  const run2 = await github.json(`/repos/${repository}/actions/runs/${runId}`);
+  const from = text2(run2?.head_repository?.full_name);
+  const event = text2(run2?.event);
+  const described = JSON.stringify(
+    `${text2(run2?.path) || "no workflow"} on ${text2(run2?.head_branch) || "no branch"} (${event || "no event"}) from ${from || "no repository"}`
+  );
+  if (from !== repository)
+    throw new ActionError(`run ${runId} is not one of this repository's own: it is ${described}`);
+  if (event !== "workflow_dispatch")
+    throw new ActionError(
+      `run ${runId} was not started by hand: it is ${described}. Its own destroy releases its batches, or the reaper at their ttl`
+    );
+  const status = text2(run2?.status);
+  if (status !== "completed")
+    throw new ActionError(
+      `run ${runId} is ${JSON.stringify(status || "in no state")}, not completed: act on its batches once it completes`
+    );
+  const latest = run2?.run_attempt;
+  if (typeof latest !== "number" || !Number.isSafeInteger(latest) || latest < 1)
+    throw new ActionError(`run ${runId} has no attempt number`);
+  if (attempt > latest) throw new ActionError(`run ${runId} has ${latest} attempt(s), not ${attempt}`);
+  const made = await github.json(
+    `/repos/${repository}/actions/runs/${runId}/attempts/${attempt}`
+  );
+  const by = text2(made?.triggering_actor?.login);
+  if (text2(made?.triggering_actor?.type) !== "User")
+    throw new ActionError(
+      `attempt ${attempt} of run ${runId} was started by ${JSON.stringify(by || "nobody named")}, not a person: no one may act on its batches by hand`
+    );
+  if (!by || by !== actor)
+    throw new ActionError(
+      `attempt ${attempt} of run ${runId} was started by ${JSON.stringify(by || "nobody named")}, not by ${JSON.stringify(actor)}: only they may act on its batches by hand`
+    );
+  log(`e2e-test-stack: run ${runId} is ${described}; attempt ${attempt} was started by ${by}, as this job was`);
+  return latest;
+}
+function batchTargetFrom(env2, callerKey, own) {
+  const batchId = input(env2, "batch-id");
+  const given = input(env2, "batch");
+  if (batchId && given)
+    refuse("give batch or batch-id, not both: batch in the run that created the batch, batch-id to name one by hand");
+  if (!batchId) {
+    if (!given)
+      refuse(
+        "batch or batch-id is required: batch (e.g. ios) in the run that created the batch, batch-id to name one by hand"
+      );
+    return { batch: batchFrom(env2), runId: own.runId, other: false, actor: "" };
+  }
+  const parts = batchIdParts(batchId, callerKey) ?? refuse(
+    `batch-id must be a batch of caller-key ${callerKey}, <caller-key>-<run id>-<batch>-<attempt>-<suffix>, got ${JSON.stringify(batchId.slice(0, 100))}`
+  );
+  const only = { batchId, attempt: parts.attempt };
+  if (parts.runId === own.runId) return { batch: parts.batch, runId: own.runId, other: false, actor: "", only };
+  if ((env2.GITHUB_EVENT_NAME ?? "") !== "workflow_dispatch")
+    refuse("batch-id names another run's batch, which is acted on only by a job started by hand (workflow_dispatch)");
+  const actor = (env2.GITHUB_TRIGGERING_ACTOR ?? "").trim();
+  if (!actor) refuse("GITHUB_TRIGGERING_ACTOR must be set, as it is in a GitHub Actions job");
+  return { batch: parts.batch, runId: parts.runId, other: true, actor, only };
+}
+
+// src/destroy.ts
+var GONE_WINDOW_SECONDS = 30;
+var NOT_FOUND = "not found";
+function readDestroyInputs(env2) {
+  const common = stackInputs(env2);
+  const own = runFrom(env2);
+  const repository = repositoryFrom(env2);
+  const { batch, runId, other, actor, only } = batchTargetFrom(env2, common.callerKey, own);
+  const roleArn = roleArnFrom(input(env2, "role-arn"), common.callerKey);
+  const credentialsKey = credentialsKeyFrom(input(env2, "credentials-key"));
+  const githubToken = input(env2, "github-token");
+  if (!githubToken)
+    refuse("github-token is required: a token that reads the run's artifacts, such as github.token with actions: read");
+  return {
+    ...common,
+    batch,
+    roleArn,
+    credentialsKey,
+    githubToken,
+    repository,
+    own,
+    runId,
+    other,
+    actor,
+    only
+  };
+}
+var parse = (raw) => {
+  try {
+    const value = JSON.parse(raw.toString("utf8"));
+    return isObject(value) ? value : void 0;
+  } catch {
+    return void 0;
+  }
+};
+var reason = (e7) => e7 instanceof ActionError ? e7.message : errorText(e7);
+async function findTargets(github, run2, inputs, latest, label, log) {
+  const failures = [];
+  const owner = { callerKey: inputs.callerKey, runId: run2.runId, batch: inputs.batch, attempt: latest };
+  const find = async (name) => {
+    const all = await runArtifacts(github, run2, name);
+    const usable = newest(all.filter((a8) => !a8.expired));
+    if (!usable && all.length)
+      log(`e2e-test-stack: ${label}'s artifact ${name} has expired; its batch is long past its ttl`);
+    return usable;
+  };
+  const lookUp = async (name) => {
+    const what = `${label}'s artifact ${name}`;
+    try {
+      const artifact = await find(name);
+      if (!artifact) return void 0;
+      const response = parse(await readResponse(github, run2, artifact, what));
+      return response ? { response } : { failure: `${what} is not a JSON object` };
+    } catch (e7) {
+      return { failure: reason(e7) };
+    }
+  };
+  const named = (batchId) => JSON.stringify(batchId.slice(0, 100));
+  const byAttempt = /* @__PURE__ */ new Map();
+  const unread = /* @__PURE__ */ new Map();
+  const accounted = /* @__PURE__ */ new Set();
+  const only = inputs.only;
+  const attemptNumbers = only ? [only.attempt] : Array.from({ length: latest }, (_2, i8) => i8 + 1);
+  const newestName = createArtifact(inputs.batch);
+  const [own, newestFound] = only ? await (async () => {
+    const mine = await lookUp(responseArtifact(inputs.batch, only.attempt));
+    return [[mine], mine?.response ? void 0 : await lookUp(newestName)];
+  })() : await Promise.all([
+    Promise.all(attemptNumbers.map((n5) => lookUp(responseArtifact(inputs.batch, n5)))),
+    lookUp(newestName)
+  ]);
+  for (const [i8, found] of own.entries()) {
+    const n5 = attemptNumbers[i8];
+    if (!found) continue;
+    if (!found.response) {
+      unread.set(n5, found.failure);
+      continue;
+    }
+    accounted.add(n5);
+    const batchId = typeof found.response.batch_id === "string" ? found.response.batch_id : "";
+    if (!batchId) {
+      log(`e2e-test-stack: attempt ${n5} made no batch: its create response names none`);
+      continue;
+    }
+    if (batchAttempt(batchId, owner) !== n5 || only && batchId !== only.batchId) {
+      failures.push(
+        `attempt ${n5}: ${responseArtifact(inputs.batch, n5)} names batch ${named(batchId)}, ${only ? `not ${only.batchId}` : `which attempt ${n5} of ${label} did not create`}`
+      );
+      continue;
+    }
+    byAttempt.set(n5, { attempt: n5, batchId, response: found.response, from: responseArtifact(inputs.batch, n5) });
+  }
+  if (newestFound) {
+    const { response, failure } = newestFound;
+    const batchId = typeof response?.batch_id === "string" ? response.batch_id : "";
+    if (!response) {
+      if (accounted.size + unread.size === attemptNumbers.length)
+        log(`e2e-test-stack: ${failure}; each attempt's own response is reported instead`);
+      else failures.push(`${failure}; a batch only it names is not destroyed, and is reaped at its ttl`);
+    } else if (only) {
+      if (inputs.other)
+        log(
+          `e2e-test-stack: ${newestName} is not used for another run's batch: only attempt ${only.attempt}'s own response is`
+        );
+      else if (batchId === only.batchId && !accounted.has(only.attempt)) {
+        log(
+          `e2e-test-stack: attempt ${only.attempt}'s own response is ${unread.has(only.attempt) ? "unreadable" : "missing"}; batch ${only.batchId} is taken from ${newestName}`
+        );
+        unread.delete(only.attempt);
+        byAttempt.set(only.attempt, { attempt: only.attempt, batchId, response, from: newestName });
+      }
+    } else if (batchId) {
+      const n5 = batchAttempt(batchId, owner);
+      const later = batchAttempt(batchId, { ...owner, attempt: Number.MAX_SAFE_INTEGER });
+      if (n5 === void 0 && later !== void 0)
+        failures.push(
+          `${newestName} names batch ${named(batchId)} of attempt ${later}, later than ${label}'s attempt ${latest} when it was read: run destroy again for it`
+        );
+      else if (n5 === void 0)
+        failures.push(`${newestName} names batch ${named(batchId)}, which is not ${label}'s batch ${inputs.batch}`);
+      else if (!accounted.has(n5)) {
+        log(
+          `e2e-test-stack: attempt ${n5}'s own response is ${unread.has(n5) ? "unreadable" : "missing"}; its batch is taken from ${newestName}`
+        );
+        unread.delete(n5);
+        byAttempt.set(n5, { attempt: n5, batchId, response, from: newestName });
+      }
+    }
+  }
+  for (const [n5, failure] of unread)
+    failures.push(`attempt ${n5}: ${failure}; its batch, if any, is not destroyed, and is reaped at its ttl`);
+  if (only && !byAttempt.size && !failures.length)
+    failures.push(
+      `no create response of ${label} names batch ${only.batchId}, so it cannot be destroyed; it is reaped at its ttl`
+    );
+  return { targets: [...byAttempt.values()].sort((a8, b8) => a8.attempt - b8.attempt), failures };
+}
+var money = (c8) => !c8 ? "" : c8.start_unknown ? "unknown start" : c8.estimated === false ? "no known rate" : `${(typeof c8.total === "number" ? c8.total : 0).toFixed(2)} ${c8.currency || "USD"}`;
+var percent = (n5) => typeof n5 === "number" ? `${n5.toFixed(0)}%` : "";
+function wholeCost(response) {
+  const cost = response.batch?.cost;
+  const present = (Array.isArray(response.batch?.instances) ? response.batch.instances : []).filter(
+    (l5) => isObject(l5)
+  );
+  const whole = !!cost && response.batch?.state === "destroyed" && present.every((l5) => isObject(l5.cost)) && cost.estimated !== false && !cost.start_unknown && (cost.currency ?? "USD") === "USD";
+  return whole ? typeof cost.total === "number" ? cost.total : 0 : void 0;
+}
+function destroyWith(overrides = {}) {
+  const log = overrides.log ?? console.log;
+  const deps = {
+    log,
+    fetch: overrides.fetch ?? fetch,
+    sleep: overrides.sleep ?? sleep,
+    now: overrides.now ?? (() => performance.now()),
+    clock: overrides.clock ?? Date.now,
+    sts: overrides.sts ?? stsClient,
+    connect: overrides.connect ?? ((region, credentials) => lambdaInvoke(lambdaClient(region, credentials), overrides.sleep ?? abortableSleep, log))
+  };
+  return (env2) => destroyBatches(env2, deps);
+}
+async function destroyBatches(env2, deps) {
+  const { log } = deps;
+  const outputs = {};
+  const summary = ["### E2E test stack: destroy", ""];
+  const secrets = masker(log);
+  const results = [];
+  const failures = [];
+  const notes = [];
+  let failure;
+  try {
+    const inputs = readDestroyInputs(env2);
+    const run2 = { repository: inputs.repository, runId: inputs.runId };
+    const label = inputs.other ? `run ${inputs.runId}` : "this run";
+    const github = githubClient(inputs.githubToken, deps.fetch, deps.sleep, log);
+    const latest = inputs.other && inputs.only ? await checkRun(
+      github,
+      inputs.repository,
+      { runId: inputs.runId, attempt: inputs.only.attempt, actor: inputs.actor },
+      log
+    ) : inputs.own.attempt;
+    if (inputs.only && inputs.only.attempt > latest)
+      throw new ActionError(
+        `batch ${inputs.only.batchId} is from attempt ${inputs.only.attempt}, but ${label} has ${latest}`
+      );
+    summary.push(
+      inputs.only ? `Batch \`${cell(inputs.only.batchId)}\` of ${label}.` : `Batch \`${cell(inputs.batch)}\` of ${label}, attempts 1 to ${latest}.`,
+      ""
+    );
+    const found = await findTargets(github, run2, inputs, latest, label, log);
+    failures.push(...found.failures);
+    let invoke;
+    if (found.targets.length)
+      try {
+        const token = await requestIdToken(env2, deps.fetch, deps.sleep, log);
+        secrets.mask(token);
+        const credentials = await assumeRole(deps.sts(REGION), {
+          roleArn: inputs.roleArn,
+          sessionName: `e2e-test-stack-destroy-${inputs.own.runId}`,
+          token
+        });
+        secrets.mask(credentials.accessKeyId);
+        secrets.mask(credentials.secretAccessKey);
+        secrets.mask(credentials.sessionToken);
+        invoke = deps.connect(REGION, credentials);
+      } catch (e7) {
+        failures.push(`${reason(e7)}; no batch was destroyed, and each is reaped at its ttl`);
+        results.push(...found.targets.map(unsent));
+      }
+    if (invoke) {
+      const target = alias(PROJECT, inputs.channel, inputs.callerKey);
+      const current = inputs.other ? void 0 : inputs.own.attempt;
+      const settled = await Promise.all(
+        found.targets.map((t2) => destroyOne(t2, target, invoke, secrets, inputs, current, deps, notes))
+      );
+      for (const [i8, s3] of settled.entries()) {
+        results.push(s3.result);
+        if (s3.failure) failures.push(`attempt ${found.targets[i8].attempt}: ${s3.failure}`);
+      }
+    } else if (!failures.length)
+      log(`e2e-test-stack: ${label} has no create response for batch ${inputs.batch}: no batch to destroy`);
+    outputs.attempts = JSON.stringify(results);
+    const destroyed = results.filter((r8) => r8.state === "destroyed");
+    if (destroyed.length && destroyed.every((r8) => r8.cost_usd !== ""))
+      outputs.cost_usd = destroyed.reduce((sum, r8) => sum + Number(r8.cost_usd), 0).toFixed(2);
+    if (failures.length)
+      throw new ActionError(`destroy failed for batch ${inputs.only?.batchId ?? inputs.batch}: ${failures.join("; ")}`);
+  } catch (e7) {
+    failure = e7;
+  }
+  if (results.length) {
+    summary.push("| Attempt | Batch | Destroy | Hosts gone | Destroy again | Cost |", "|---|---|---|---|---|---|");
+    for (const r8 of results)
+      summary.push(
+        `| ${r8.attempt} | \`${cell(r8.batch_id)}\` | ${cell(r8.state)} | ${cell(r8.gone)} | ${cell(r8.again)} | ${cell(r8.cost_usd ? `${r8.cost_usd} USD` : "")} |`
+      );
+    summary.push("");
+  } else summary.push(failure ? "No batch was destroyed; the step's error says why." : "No batch to destroy.", "");
+  summary.push(...[...notes].sort().map((n5) => `- ${cell(n5)}`));
+  settle(env2, "destroy", outputs, summary, failure);
+}
+async function call(invoke, target, payload) {
+  const named = `${target.FunctionName}:${target.Qualifier}`;
+  let reply;
+  try {
+    reply = await invoke({ ...target, Payload: JSON.stringify(payload) });
+  } catch (e7) {
+    throw new ActionError(`the invoke of ${named} failed: ${reason(e7)}`);
+  }
+  const text4 = reply.Payload ? new TextDecoder().decode(reply.Payload) : "";
+  if (reply.FunctionError) throw new ActionError(`the control plane refused the destroy: ${handlerError(text4)}`);
+  if (reply.StatusCode !== 200) throw new ActionError(`the invoke answered ${reply.StatusCode}: ${handlerError(text4)}`);
+  const response = parse(Buffer.from(text4));
+  if (!response) throw new ActionError(`the control plane's reply is not a JSON object: ${redact(text4).slice(0, 200)}`);
+  return response;
+}
+var unsent = (t2) => ({
+  attempt: t2.attempt,
+  batch_id: t2.batchId,
+  state: "not destroyed",
+  gone: "not checked",
+  again: "not run",
+  cost_usd: ""
+});
+async function destroyOne(t2, target, invoke, secrets, inputs, current, deps, notes) {
+  const result = unsent(t2);
+  try {
+    const failure = await destroySteps(t2, result, target, invoke, secrets, inputs, current, deps, notes);
+    return { result, failure };
+  } catch (e7) {
+    return { result, failure: `batch ${t2.batchId}: ${reason(e7)}` };
+  }
+}
+async function destroySteps(t2, result, target, invoke, secrets, inputs, current, deps, notes) {
+  const kept = "it is reaped at its ttl";
+  const sealed = t2.response.batch?.secrets;
+  if (typeof sealed !== "string" || !sealed)
+    return `batch ${t2.batchId} in ${t2.from} has no sealed secrets, so it cannot be destroyed; ${kept}`;
+  let batchToken;
+  try {
+    const opened = await openBatchSecrets(sealed, inputs.credentialsKey);
+    maskBatchSecrets(secrets, opened);
+    if (typeof opened.batch_token !== "string" || !opened.batch_token)
+      return `batch ${t2.batchId}'s secrets hold no batch token, so it cannot be destroyed; ${kept}`;
+    batchToken = opened.batch_token;
+  } catch (e7) {
+    if (!(e7 instanceof SealedError)) throw e7;
+    return `batch ${t2.batchId}: ${e7.message}, so it cannot be destroyed; ${kept}`;
+  }
+  deps.log(`e2e-test-stack: destroying batch ${t2.batchId}, attempt ${t2.attempt}, from ${t2.from}`);
+  const payload = { action: "destroy", batch_id: t2.batchId, batch_token: batchToken };
+  let first;
+  try {
+    first = await call(invoke, target, payload);
+  } catch (e7) {
+    return `batch ${t2.batchId}: ${reason(e7)}; ${kept}`;
+  }
+  const state2 = typeof first.batch?.state === "string" ? first.batch.state : "";
+  result.state = state2 || "unknown";
+  const error = responseError(first);
+  if (error) return `the destroy of batch ${t2.batchId} reported ${state2 || "no state"}: ${error}`;
+  if (state2 === NOT_FOUND && t2.attempt === current && t2.response.batch?.state === "ready") {
+    const expiresAt = Date.parse(typeof t2.response.batch?.expires_at === "string" ? t2.response.batch.expires_at : "");
+    if (!(Number.isFinite(expiresAt) && expiresAt <= deps.clock()))
+      return `batch ${t2.batchId} was not found, but this attempt created it, so it should still have been up`;
+    notes.push(`Batch ${t2.batchId} was not found: it passed its expiry and was reaped.`);
+  }
+  if (state2 !== "destroyed" && state2 !== NOT_FOUND)
+    return `the destroy of batch ${t2.batchId} reported ${state2 || "no state"}, not destroyed`;
+  const cost = wholeCost(first);
+  if (cost !== void 0) result.cost_usd = cost.toFixed(2);
+  const sizing = first.batch?.sizing;
+  if (first.batch?.cost && cost === void 0)
+    notes.push(`Batch ${t2.batchId}: cost ${money(first.batch.cost)}, not every server priced.`);
+  if (sizing) {
+    const alternative = sizing.alternative && typeof sizing.saving === "number" && sizing.saving > 0 ? `; ${sizing.alternative} would have cost ${typeof sizing.counterfactual === "number" ? sizing.counterfactual.toFixed(2) : "?"} USD, ${sizing.saving.toFixed(2)} less` : "";
+    notes.push(
+      `Batch ${t2.batchId}: sustained CPU ${percent(sizing.sustained_cpu) || "unknown"} on ${sizing.instance_type || "its instance type"}${alternative}${sizing.note ? `. ${sizing.note}` : ""}`
+    );
+  }
+  const sitesOf = (r8) => Array.isArray(r8.sites) ? r8.sites : [];
+  const ssoOf = (r8) => (Array.isArray(r8.batch?.instances) ? r8.batch.instances : []).map((l5) => isObject(l5) ? l5.sso_host : void 0);
+  const responseSites = sitesOf(t2.response);
+  const replySites = sitesOf(first);
+  const fromResponse = goneUrls(responseSites, ssoOf(t2.response));
+  const fromReply = goneUrls(
+    Array.from(
+      { length: Math.max(replySites.length, responseSites.length) },
+      (_2, i8) => replySites[i8] || responseSites[i8]
+    ),
+    ssoOf(first)
+  );
+  const urls = [.../* @__PURE__ */ new Set([...fromResponse.urls, ...fromReply.urls])];
+  const rejected = [.../* @__PURE__ */ new Set([...fromResponse.rejected, ...fromReply.rejected])];
+  if (rejected.length) notes.push(`Batch ${t2.batchId}: not checked, as not a host: ${rejected.join("; ")}`);
+  const unchecked = rejected.length ? `; ${rejected.length} entr${rejected.length === 1 ? "y" : "ies"} not a host` : "";
+  if (urls.length) {
+    deps.log(
+      `e2e-test-stack: probing ${urls.length} host(s) of batch ${t2.batchId} for the router's 404, within ${GONE_WINDOW_SECONDS} s`
+    );
+    const served = await probeGone(urls, GONE_WINDOW_SECONDS * 1e3, deps);
+    if (served.length) {
+      result.gone = `not yet: ${served.length} of ${urls.length} still served after ${GONE_WINDOW_SECONDS} s${unchecked}`;
+      notes.push(`Batch ${t2.batchId}: still served after ${GONE_WINDOW_SECONDS} s: ${served.join("; ")}`);
+      deps.log(
+        `e2e-test-stack: ${served.length} of ${urls.length} host(s) of batch ${t2.batchId} still served: ${served.join("; ")}`
+      );
+    } else result.gone = `yes, all ${urls.length}${unchecked}`;
+  } else result.gone = rejected.length ? `none checked${unchecked}` : "no host to check";
+  let again;
+  try {
+    again = await call(invoke, target, payload);
+  } catch (e7) {
+    result.again = "failed";
+    return `the second destroy of batch ${t2.batchId}: ${reason(e7)}`;
+  }
+  result.again = typeof again.batch?.state === "string" ? again.batch.state : "unknown";
+  const againError = responseError(again);
+  if (againError) return `the second destroy of batch ${t2.batchId} reported ${result.again}: ${againError}`;
+  if (result.again !== NOT_FOUND)
+    return `a second destroy of batch ${t2.batchId} reported ${result.again}, not ${JSON.stringify(NOT_FOUND)}`;
+  return void 0;
+}
+var destroy = destroyWith();
 
 // src/open.ts
-var REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 function readOpenInputs(env2) {
   const callerKey = callerKeyFrom(env2);
   const batch = batchFrom(env2);
   const run2 = runFrom(env2);
-  const repository = (env2.GITHUB_REPOSITORY ?? "").trim();
-  if (!REPOSITORY.test(repository)) refuse("GITHUB_REPOSITORY must be set, as it is in a GitHub Actions job");
+  const repository = repositoryFrom(env2);
   const index = integer("index", input(env2, "index") || "0", 0);
   const credentialsKey = credentialsKeyFrom(input(env2, "credentials-key"));
   const githubToken = input(env2, "github-token");
@@ -31848,18 +32369,18 @@ function readOpenInputs(env2) {
     );
   return { callerKey, batch, index, credentialsKey, githubToken, repository, run: run2 };
 }
-var text2 = (v2) => typeof v2 === "string" ? v2 : "";
+var text3 = (v2) => typeof v2 === "string" ? v2 : "";
 var strings = (v2) => Object.fromEntries(entries(v2).filter((e7) => typeof e7[1] === "string"));
 function instance(lease, site, opened) {
-  const siteUrl = text2(lease?.site_url) || text2(site);
+  const siteUrl = text3(lease?.site_url) || text3(site);
   if (lease?.state !== "ready" || !siteUrl || !isObject(opened)) return null;
   return {
     site_url: siteUrl,
     state: lease.state,
-    admin_username: text2(lease.admin?.username),
-    admin_email: text2(lease.admin?.email),
-    admin_password: text2(opened.admin_password),
-    mail_token: text2(opened.mail_token),
+    admin_username: text3(lease.admin?.username),
+    admin_email: text3(lease.admin?.email),
+    admin_password: text3(opened.admin_password),
+    mail_token: text3(opened.mail_token),
     credentials: strings(opened.credentials),
     facts: strings(opened.facts)
   };
@@ -31952,7 +32473,7 @@ async function openServer(env2, deps) {
 var open = openWith();
 
 // src/run.ts
-var ACTIONS = { create, open };
+var ACTIONS = { create, destroy, open };
 async function run(name, env2, actions = ACTIONS) {
   const action = name !== void 0 && Object.hasOwn(actions, name) ? actions[name] : void 0;
   if (!action) {
@@ -31973,21 +32494,21 @@ var aggregated = (e7) => {
 };
 function written(e7) {
   if (typeof e7 !== "object" || e7 === null) return String(e7);
-  const text3 = (0, import_node_util2.inspect)(e7, { depth: 1, breakLength: Infinity });
-  return text3.length > MAX_OBJECT_TEXT ? `${text3.slice(0, MAX_OBJECT_TEXT)}\u2026` : text3;
+  const text4 = (0, import_node_util2.inspect)(e7, { depth: 1, breakLength: Infinity });
+  return text4.length > MAX_OBJECT_TEXT ? `${text4.slice(0, MAX_OBJECT_TEXT)}\u2026` : text4;
 }
 function describe2(e7, depth = 0) {
   try {
     if (!isError(e7)) return written(e7);
-    let text3 = e7 instanceof ActionError ? e7.message : e7.message ? `${e7.name}: ${e7.message}` : e7.name;
+    let text4 = e7 instanceof ActionError ? e7.message : e7.message ? `${e7.name}: ${e7.message}` : e7.name;
     const errors = aggregated(e7);
     if (errors?.length && depth < MAX_DEPTH) {
       const listed = errors.slice(0, MAX_ERRORS).map((inner) => describe2(inner, depth + 1));
       const more = errors.length > MAX_ERRORS ? `; ${errors.length - MAX_ERRORS} more` : "";
-      text3 += ` (${listed.join("; ")}${more})`;
+      text4 += ` (${listed.join("; ")}${more})`;
     }
-    if (e7.cause !== void 0 && depth < MAX_DEPTH) text3 += `; caused by ${describe2(e7.cause, depth + 1)}`;
-    return text3;
+    if (e7.cause !== void 0 && depth < MAX_DEPTH) text4 += `; caused by ${describe2(e7.cause, depth + 1)}`;
+    return text4;
   } catch {
     return "a value that could not be read";
   }

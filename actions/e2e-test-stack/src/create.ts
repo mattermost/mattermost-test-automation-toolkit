@@ -421,7 +421,8 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
     }
     const error = responseError(response);
     const batchId = typeof response.batch_id === "string" ? response.batch_id : "";
-    if (batchId) teardown = ` Batch ${batchId} was created; it is reaped at its ttl.`;
+    if (batchId)
+      teardown = ` Batch ${batchId} was created; the destroy action releases it, or it is reaped at its ttl.`;
     const sites = Array.isArray(response.sites) ? response.sites : [];
     const leases = Array.isArray(response.batch?.instances) ? response.batch.instances : [];
     const state = response.batch?.state ?? "";

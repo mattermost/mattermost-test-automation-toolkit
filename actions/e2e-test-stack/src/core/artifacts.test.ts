@@ -2,7 +2,14 @@
 // See LICENSE.txt for license information.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createArtifact, createResponse, newestArtifact } from "./artifacts.ts";
+import {
+  createArtifact,
+  createResponse,
+  newestArtifact,
+  readResponse,
+  responseArtifact,
+  runArtifacts,
+} from "./artifacts.ts";
 import { ActionError } from "./errors.ts";
 import { GitHubError } from "./github.ts";
 import type { GitHub } from "./github.ts";
@@ -109,4 +116,33 @@ test("an artifact that exists but expired, cannot be downloaded or read, or hold
 test("a listing GitHub refuses fails with GitHub's error", async () => {
   const { github } = fakeGitHub({});
   await assert.rejects(createResponse(github, RUN, "ios"), /GitHub GET .* failed: attempt 1: HTTP 404/);
+});
+
+test("the run's artifacts of a name are listed across pages, keeping only that name and a usable id", async () => {
+  const name = responseArtifact("ios", 2);
+  const page = (n: number) => `/repos/mattermost/mobile/actions/runs/42/artifacts?name=${name}&per_page=100&page=${n}`;
+  const full = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, name, created_at: "", expired: false }));
+  const { github } = fakeGitHub({
+    [page(1)]: { artifacts: full },
+    [page(2)]: {
+      artifacts: [
+        { id: 101, name, expired: true },
+        { id: "x", name },
+        { id: 102, name: "other" },
+      ],
+    },
+  });
+  const all = await runArtifacts(github, RUN, name);
+  assert.equal(all.length, 101);
+  assert.deepEqual(all[100], { id: 101, name: "e2e-test-stack-response-ios-2", createdAt: "", expired: true });
+});
+
+test("any artifact's response is read, naming it as the caller says when it cannot be", async () => {
+  const artifact = { id: 9, name: "n", createdAt: "", expired: false };
+  const { github } = fakeGitHub({}, { [zipPath(9)]: archive('{"batch_id":"x"}') });
+  assert.equal((await readResponse(github, RUN, artifact, "run 42's artifact n")).toString(), '{"batch_id":"x"}');
+  await assert.rejects(
+    readResponse(github, RUN, { ...artifact, expired: true }, "run 42's artifact n"),
+    /^ActionError: run 42's artifact n has expired/,
+  );
 });

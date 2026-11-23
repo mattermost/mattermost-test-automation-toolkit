@@ -6,7 +6,16 @@ import { createArtifact, createResponse } from "./core/artifacts.ts";
 import { batchAttempt } from "./core/batch.ts";
 import { ActionError } from "./core/errors.ts";
 import { githubClient } from "./core/github.ts";
-import { batchFrom, callerKeyFrom, credentialsKeyFrom, input, integer, refuse, runFrom } from "./core/inputs.ts";
+import {
+  batchFrom,
+  callerKeyFrom,
+  credentialsKeyFrom,
+  input,
+  integer,
+  refuse,
+  repositoryFrom,
+  runFrom,
+} from "./core/inputs.ts";
 import type { Run } from "./core/inputs.ts";
 import { masker, settle } from "./core/outputs.ts";
 import { entries, isObject, maskBatchSecrets, responseError } from "./core/response.ts";
@@ -24,8 +33,6 @@ export const OPEN_OUTPUTS = [
   "site_url",
 ] as const;
 type OpenOutputs = { [K in (typeof OPEN_OUTPUTS)[number]]?: string };
-
-const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 export interface OpenInputs {
   callerKey: string;
@@ -46,8 +53,7 @@ export function readOpenInputs(env: Env): OpenInputs {
   const callerKey = callerKeyFrom(env);
   const batch = batchFrom(env);
   const run = runFrom(env);
-  const repository = (env.GITHUB_REPOSITORY ?? "").trim();
-  if (!REPOSITORY.test(repository)) refuse("GITHUB_REPOSITORY must be set, as it is in a GitHub Actions job");
+  const repository = repositoryFrom(env);
   const index = integer("index", input(env, "index") || "0", 0);
   const credentialsKey = credentialsKeyFrom(input(env, "credentials-key"));
   const githubToken = input(env, "github-token");

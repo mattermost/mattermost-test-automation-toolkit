@@ -16,6 +16,9 @@ Each action is a folder here with its own `action.yml` and README. They share th
 - [`open`](open/README.md): opens one server of this run's batch from its create response, and sets its site and admin
   credentials as masked outputs. Calls only GitHub, never AWS. Uses:
   `mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack/open@main`.
+- [`destroy`](destroy/README.md): destroys every attempt's batch of this run, or one batch by its id, checks that every
+  host is gone and that a second destroy finds nothing. Uses:
+  `mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack/destroy@main`.
 
 ## Keys, aliases and sealed secrets
 
@@ -38,8 +41,9 @@ them with the repository's credentials key and mask every secret before writing 
 2. **The CI role.** `arn:aws:iam::<account id>:role/e2e-test-stack-ci-<caller-key>`, one per repository in each
    account. The caller passes the one to use as `role-arn`, and the batch is in that role's account. It trusts only
    jobs on the branches registered for the repository, in the workflow files registered for it, so `pull_request`
-   runs are refused. `create` assumes it itself with the job's GitHub OIDC token, so its job grants
-   `id-token: write`. `open` assumes no role: it reads the run's artifacts, so its job grants `actions: read`.
+   runs are refused. `create` and `destroy` assume it themselves with the job's GitHub OIDC token, so their jobs grant
+   `id-token: write`; `destroy` also reads the run's artifacts, so its job grants `actions: read` too. `open` assumes
+   no role: it reads the run's artifacts, so its job grants `actions: read`.
 3. **Node.** The actions run on Node 26 or later and fail before doing anything on an older one. The runner's default
    Node is older, so run [`actions/setup-node`](https://github.com/actions/setup-node) with `node-version: "26"`
    first. That switches Node for the rest of the job, so a job that runs its tests on another version sets that

@@ -1,0 +1,65 @@
+---
+name: E2E test stack destroy
+description: >-
+  Destroy every attempt's e2e-test-stack batch of this run, or one batch by its id, from its create response: check
+  that every site, mail and SSO host is gone and that a second destroy finds nothing. Assumes role-arn itself:
+  the job needs id-token: write and actions: read, and Node 26 set up first.
+author: Mattermost
+inputs:
+  caller-key:
+    description: The repository's key in the control plane's callers (e.g. mobile), as create was given it
+    required: true
+  batch:
+    description: >-
+      The batch within this run, as create was given it (e.g. ios), in the run that created it. Give this or batch-id,
+      not both
+    default: ""
+  batch-id:
+    description: >-
+      By hand: the one batch to destroy (e.g. mobile-1234-ios-1-a1b2c3). Another run's batch is destroyed only by a job
+      started by hand, when that run was started by hand too, by the same person, and has completed. Give this or
+      batch, not both
+    default: ""
+  role-arn:
+    description: >-
+      The repository's CI role ARN in the account the batch was created in, as create was given it,
+      arn:aws:iam::<account id>:role/e2e-test-stack-ci-<caller-key>
+    required: true
+  channel:
+    description: v1 (the default) or edge, as create was given it
+    default: v1
+  credentials-key:
+    description: >-
+      The repository's credentials key, a base64 X25519 private key (the E2E_TEST_STACK_CREDENTIALS_KEY secret), which
+      opens each batch's token
+    required: true
+  github-token:
+    description: The token for api.github.com, which reads the run and its artifacts; it needs actions read
+    default: ${{ github.token }}
+outputs:
+  attempts:
+    description: >-
+      JSON array, one entry per attempt with a batch: attempt, batch_id, state (the destroy's reported state, such as
+      destroyed, "not found" or partially_destroyed; "unknown" when a reply named none; "not destroyed" when no
+      destroy answered or none was sent), gone, again (the second destroy's state, "unknown", "failed" or "not run")
+      and cost_usd
+    value: ${{ steps.destroy.outputs.attempts }}
+  cost-usd:
+    description: >-
+      The batches' estimated cost in USD; empty unless every batch this step destroyed had every server priced at a
+      known rate
+    value: ${{ steps.destroy.outputs.cost_usd }}
+runs:
+  using: composite
+  steps:
+    - id: destroy
+      shell: bash
+      env:
+        STACK_CALLER_KEY: ${{ inputs.caller-key }}
+        STACK_BATCH: ${{ inputs.batch }}
+        STACK_ROLE_ARN: ${{ inputs.role-arn }}
+        STACK_CHANNEL: ${{ inputs.channel }}
+        STACK_CREDENTIALS_KEY: ${{ inputs.credentials-key }}
+        STACK_BATCH_ID: ${{ inputs.batch-id }}
+        STACK_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: bash "${{ github.action_path }}/../run.sh" destroy
