@@ -2885,3 +2885,31 @@ def test_prefilter_uses_max_plus_breadth_aligned_with_dev_rubric():
     assert prefilter.risk(api_ws) == 8.0
     p = prefilter.plan([multi_lower, api_ws, persistence, auth_only], max_files=2)
     assert [f.path for f in p.batches[0]] == [auth_only.path, persistence.path]
+
+
+@needs_playwright
+def test_verify_freeze_emits_covers_and_verified_at_and_rejects_multiline(tmp_path, ui_server):
+    plan = {
+        "name": "covers metadata",
+        "base_url": ui_server,
+        "covers": ["server/channels/api4/config.go", "webapp/channels/src/foo.tsx"],
+        "verified_at": "5e62cb1",
+        "steps": [{"capture": {"api": "/api/v4/users/me"}}],
+        "expect": [{"api": {"path": "/api/v4/users/me", "status": 401}}],
+    }
+    code, out = verify(tmp_path, plan, "--freeze", "meta.spec.ts", auth="none")
+    assert code == 0, out
+    spec = (tmp_path / "meta.spec.ts").read_text()
+    assert "// covers: server/channels/api4/config.go, webapp/channels/src/foo.tsx\n" in spec
+    assert "// verified-at: 5e62cb1\n" in spec
+    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
+    (tmp_path / "tsconfig.json").write_text(json.dumps({"compilerOptions": {
+        "strict": True, "noEmit": True, "target": "es2022", "module": "esnext", "moduleResolution": "bundler",
+        "types": ["node"], "skipLibCheck": True}, "files": ["meta.spec.ts"]}))
+    tc = subprocess.run(["node", str(VERIFY_DEPS / "typescript" / "bin" / "tsc"), "-p", "."], cwd=tmp_path,
+                        env=_node_env("none"), capture_output=True, text=True, timeout=180, check=False)
+    assert tc.returncode == 0, tc.stdout + tc.stderr
+    for bad in ({"verified_at": "abc\nevil()"}, {"covers": ["ok\nbad"]}, {"covers": []}):
+        bad_plan = {"base_url": ui_server, "steps": [], "expect": [{"api": {"path": "/api/v4/users/me", "status": 401}}], **bad}
+        bcode, bout = verify(tmp_path, bad_plan, auth="none")
+        assert bcode == 2 and "INVALID_PLAN" in bout, (bad, bout)

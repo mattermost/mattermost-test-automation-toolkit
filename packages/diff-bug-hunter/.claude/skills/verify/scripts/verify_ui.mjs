@@ -60,6 +60,8 @@
 //   "name": "what this checks",                  (optional; the frozen test's title)
 //   "base_url": "http://localhost:8065",          (optional, http or https)
 //   "login": true,                                (optional: INFRA_ERROR when no VERIFY_* credentials are set)
+//   "covers": ["server/channels/api4/foo.go"],    (optional: single-line paths emitted as `// covers:` in --freeze)
+//   "verified_at": "5e62cb1",                     (optional: single-line commit/ref emitted as `// verified-at:` in --freeze)
 //   "scope": LOC,                                 (snapshot scope; default #app-content if present, else body. Open
 //                                                  dialogs, menus and listboxes outside it are always appended.)
 //   "allow_origins": ["https://cdn.example.com"], (extra origins the page may load)
@@ -108,7 +110,7 @@ const MAX_DRAG_OFFSET = 2000;
 const VAR_NAME_RE = /^[A-Za-z_]\w*$/;
 const VAR_REF_RE = /\$([A-Za-z_]\w*)/g;
 const URL_VAR_VAL_RE = /^[A-Za-z0-9._-]+$/;
-const TOP_KEYS = ['name', 'base_url', 'login', 'scope', 'allow_origins', 'steps', 'expect', 'ignore'];
+const TOP_KEYS = ['name', 'base_url', 'login', 'scope', 'allow_origins', 'steps', 'expect', 'ignore', 'covers', 'verified_at'];
 const MAX_DIFFS = 200;
 
 class PlanError extends Error {}
@@ -306,6 +308,12 @@ export function validatePlan(plan, env = process.env) {
     }
     if ('ignore' in plan && !(Array.isArray(plan.ignore) && plan.ignore.every(nonEmpty))) {
         throw new PlanError('ignore must be an array of non-empty json-path strings');
+    }
+    if ('covers' in plan && !(Array.isArray(plan.covers) && plan.covers.length > 0 && plan.covers.every((c) => nonEmpty(c) && !/[\r\n]/.test(c)))) {
+        throw new PlanError('covers must be a non-empty array of single-line file paths');
+    }
+    if ('verified_at' in plan && !(nonEmpty(plan.verified_at) && !/[\r\n]/.test(plan.verified_at))) {
+        throw new PlanError('verified_at must be a non-empty single-line string');
     }
     const allowOrigins = plan.allow_origins ?? [];
     if (!Array.isArray(allowOrigins)) {
@@ -1593,13 +1601,18 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
 // Same API login as verify_ui.mjs (copied from its apiLogin): no steps spent on the login form.
 const apiLogin: (context: BrowserContext, base: string, env: NodeJS.ProcessEnv) => Promise<string> = ${apiLogin.toString()};
 ` : '';
+    const metaLines = [
+        ...(plan.covers?.length ? [`// covers: ${plan.covers.join(', ')}`] : []),
+        ...(plan.verified_at ? [`// verified-at: ${plan.verified_at}`] : []),
+    ];
+    const metaBlock = metaLines.length ? `${metaLines.join('\n')}\n` : '';
     return `// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
 // Frozen by verify_ui.mjs from a passing plan, with the same oracle: allowed origins only, every step settles, and page
 // errors, >= 500 /api/v4/ responses, requests still running at the deadline, or leaving the allowed origins fail.
 // It checks the server the run checked; set VERIFY_REPLAY_BASE_URL to point it at another one.
-import {chromium, expect, test, type Browser, type BrowserContext, type Page, type Request} from '@playwright/test';
+${metaBlock}import {chromium, expect, test, type Browser, type BrowserContext, type Page, type Request} from '@playwright/test';
 import * as http from 'node:http';
 import * as net from 'node:net';
 

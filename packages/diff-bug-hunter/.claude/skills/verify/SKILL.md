@@ -64,6 +64,7 @@ single `failure.png` only if the run FAILs. Hand its path to the user and never 
    - Exit 2: `INVALID_PLAN` (fix the plan) or `INFRA_ERROR` (fix the environment; never report it as a finding).
    - Add `--freeze <dir>/<name>.spec.ts` once the plan passes. It writes a plain `@playwright/test` spec with the
      same oracle, which reruns in CI with no model and no tokens. Offer it to the user; do not commit it unasked.
+     Optional `"covers": ["path/..."]` and `"verified_at": "<sha>"` keys emit `// covers:` and `// verified-at:` headers for drift tracking.
    - Freeze into a dedicated folder (e.g. `e2e-tests/playwright/specs/verify/`), never `/tmp`, and rerun it from
      there: with no config, Playwright collects tests from every file under the current folder. The spec checks the
      server this run checked; `VERIFY_REPLAY_BASE_URL` points it at another one.
@@ -87,4 +88,4 @@ different releases also holds version noise; judge each line, do not dismiss the
 - The runner pre-sets `__landingPageSeen__` in localStorage, so logged-in plans land on the app instead of the
 "Where would you like to view this?" desktop-app prompt.
 6. **Report in chat:** the plan, the verdict line, the snapshot lines that prove it, and the frozen spec path if any. A `FAIL` caused by the app is a
-   finding: give the steps to reproduce it.
+   finding: give the steps to reproduce it, and pair it with a passing nearby control case (e.g. valid control input or passing base build) to prove the harness and auth work.

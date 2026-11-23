@@ -69,7 +69,7 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
    - `lessons.py match <scratch>/hunt<pr>/ctx.json` lists known false positives. If it is one, drop it.
    - `run.py base <pr> <tag>` gives `NEW_PR_BUG`, `PRE_EXISTING`, `NEW_API`, `BASE_FAILS_DIFFERENTLY`
      (decide that one from the diff, as for `NOT_RUN_ON_BASE`). `NEW_API` = fails 3/3 on head and cannot compile on base
-     because it calls an API the PR adds: root-cause it, it is not a bug by itself. Compile failures are salvaged per test,
+     because it calls an API the PR adds: root-cause it, it is not a bug by itself, and pair it with a passing nearby control input on the same new API so you prove the test harness works. Compile failures are salvaged per test,
      not per file; `NOT_A_HEAD_FAILURE` means there is nothing to vet.
    - Confirm a real caller (HTTP, websocket, plugin API, UI) reaches the input. If none does, it is a caller-unreachable nit.
    - A newly vetted false-positive pattern: `lessons.py add '<json>'`. Hunters see it once it is merged to the base
