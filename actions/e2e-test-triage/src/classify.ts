@@ -7,7 +7,7 @@ import type { At, ChangedFile, ChangedByPR, Config, Finding, Observation, SpecRu
 
 // The last alternative: a mobile spec whose shard uploaded nothing never ran.
 const INFRA_RE =
-  /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready|failed: 408 Request timed out after \d+ ?ms/i;
+  /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready|failed: 408 Request timed out after \d+ ?ms|maestro\.DeviceUnreachableException|Device became unreachable|pending request #-1000 \("isReady"\)|attributes_feature_disabled|permission_policies\.feature_disabled/i;
 
 export const isInfraError = (text: string | null | undefined): boolean => INFRA_RE.test(text ?? "");
 
@@ -273,9 +273,15 @@ export function classify(
     .filter((o) => FAILED_STATUSES.has(o.status))
     .map((o) => sameKey(o.error_excerpt))
     .filter((k): k is string => Boolean(k)))];
+  const unstableTrunk = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
+  const trunkSameError = (ownKey.kind === "distinctive" || ownKey.kind === "stuck") &&
+    unstableTrunk.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)));
+  // Action-only timeouts ("action locator.click" without a target) do not identify a step for bug_on_master.
+  const trunkSameTarget = trunkSameError && (ownKey.kind === "distinctive" || (Boolean(ownKey.key) && !/^action \S+$/.test(ownKey.key!)));
   const stats = {
     trunk: {
       runs: trunk.length, fails: trunkFails, flaky: trunkFlaky, passes: trunkPasses, latest: latestTrunk?.status ?? "",
+      ...(trunkSameTarget ? { same_error: true } : {}),
       lane_runs: laneRuns,
     },
     cross_pr: {
@@ -354,18 +360,17 @@ export function classify(
   const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
   /** Why trunk's instability says nothing about this failure, or null when it may be the same flake. */
   const notTrunksFlake = (): Finding | null => {
-    const unstable = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
     // A failure with an error to compare is cleared only where trunk failed the same way: a trunk failure with another
     // error, or with none to compare (a hook timeout, an empty excerpt), says nothing about this one.
-    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !unstable.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
-      const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
+    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !trunkSameError) {
+      const there = unstableTrunk.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
       return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
     }
     // A bare timeout or an error with nothing to compare names no cause. One that failed every try here is cleared only
     // where trunk failed the same kind of way (the same bare timeout, or no error either): trunk's flakes of another
     // error say nothing about it. Unknown tries are left as before.
     if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran &&
-      !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
+      !unstableTrunk.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
       const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
       return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`, true);
     }
@@ -657,13 +662,19 @@ export function markEarlierFailures(findings: Finding[]): Finding[] {
   return findings;
 }
 
+/** Small-suite storm: at least 5 failures and half the executed tests (catches Maestro / smoke-suite wipeouts under infraMinFailures). */
+export const isSmallSuiteStorm = (failed: number, total: number | undefined): boolean =>
+  total != null && total >= 6 && failed >= 5 && failed * 2 >= total;
+
 /** Run-level infrastructure call: many failures, or most failures share an infra signature. */
-export function infraVerdict(failing: readonly { error?: string | null }[], cfg: Config = DEFAULTS): string | null {
+export function infraVerdict(failing: readonly { error?: string | null }[], cfg: Config = DEFAULTS, total?: number): string | null {
   if (!failing.length) return null;
   const infra = failing.filter((t) => isInfraError(t.error)).length;
   if (infra >= Math.max(3, Math.ceil(failing.length / 2)))
     return `${infra} of ${failing.length} failures are infrastructure errors (server health, connectivity, device, shard that never ran); rerun when the environment recovers.`;
   if (failing.length >= cfg.infraMinFailures)
     return `${failing.length} tests failed in one run; check for a shared environment, build or product failure first.`;
+  if (isSmallSuiteStorm(failing.length, total))
+    return `${failing.length} of ${total} tests failed in one run; check for a shared environment, build or product failure first.`;
   return null;
 }

@@ -30,6 +30,9 @@ const PLATFORM_FILES: Record<string, RegExp> = {
 /** Whether a file path matches the platform-specific patterns for `platform`. */
 export const onlyOnPlatform = (platform: string, file: string): boolean => Boolean(PLATFORM_FILES[platform]?.test(file));
 
+/** Whether a file path is specific to any single platform (e.g. Podfile, ios/, android/, *.gradle, win32). */
+export const isPlatformFile = (file: string): boolean => Object.keys(PLATFORM_FILES).some((p) => onlyOnPlatform(p, file));
+
 /** A file only other platforms build, so a change to it cannot reach this one. */
 const onlyElsewhere = (platform: string, file: string): boolean =>
   !onlyOnPlatform(platform, file) && Object.keys(PLATFORM_FILES).some((p) => p !== platform && onlyOnPlatform(p, file));
