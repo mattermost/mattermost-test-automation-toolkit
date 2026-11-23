@@ -64,6 +64,8 @@ export const DEFAULTS: Config = {
 export const laneOf = (name: string | null | undefined): string =>
   String(name ?? "")
     .replace(/^(mobile|desktop)-(pr|main|master)(-|$)/, "")
+    .replace(/^mobile-(release|cmt)(-|$)/, "")
+    .replace(/-Server_[^/]+$/i, "")
     .replace(/-(master|main|release(-cut)?)$/, "") || "default";
 
 // The OS a desktop report stands for, by the name it is uploaded under (the release version after it is ignored).
@@ -91,7 +93,8 @@ export const repoPath = (testRoot: string | null | undefined, file: string): str
  * The lane whose history a run is judged against: its own, or HISTORY_LANE for a lane the trunk
  * rarely runs (mattermost's subpath suite reads the enterprise lane: same tests and server build).
  */
-export const historyLane = (id: CompositeIdentity, cfg: Config = DEFAULTS): string | null => cfg.historyLane || laneOf(id.name);
+export const historyLane = (id: CompositeIdentity, cfg: Config = DEFAULTS): string | null =>
+  cfg.historyLane ? laneOf(cfg.historyLane) : laneOf(id.name);
 
 /**
  * MIN_CONFIDENCE, kept within the documented 0.5-1: unset uses the default, a value that is not a number

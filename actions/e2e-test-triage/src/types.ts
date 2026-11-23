@@ -54,6 +54,8 @@ export interface TrunkStats {
   flaky: number;
   passes: number;
   latest: string;
+  /** True when at least one unstable trunk run failed/flaked with this same error (ids masked). */
+  same_error?: boolean;
   /**
    * The runs known to be the history lane's own: with a lane set, a row that names no lane counts in runs but not here.
    * Absent: every run counts (no lane set, or stats built elsewhere).
@@ -204,7 +206,7 @@ export interface Pack {
     lane?: string;
   };
   error: string;
-  trunk_history_14d: { runs: number; fails: number; flaky: number; latest: string };
+  trunk_history_14d: { runs: number; fails: number; flaky: number; latest: string; same_error?: boolean };
   cross_pr_failures_14d: { id: "cross_pr"; other_prs_where_this_test_failed: string[]; other_pr_runs_where_it_passed: number };
   pr: {
     number: number | null;

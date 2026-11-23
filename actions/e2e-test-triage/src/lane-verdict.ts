@@ -55,7 +55,7 @@ export async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, 
   try {
     jobs = await readLaneJobs({
       fetchImpl, token: String(env.GITHUB_TOKEN ?? ""), repository: id.repository, runId: String(env.GITHUB_RUN_ID || id.gh_run_id), attempt: runAttempt,
-      runnerName: env.RUNNER_NAME ?? null, prefix: env.LANE_JOB_PREFIX || null, log,
+      runnerName: env.RUNNER_NAME ?? null, prefix: env.LANE_JOB_PREFIX || null, filter: env.LANE_JOB_FILTER || null, log,
     });
   } catch (e) {
     jobsError = String(e instanceof Error ? e.message : e).slice(0, 160);
@@ -66,6 +66,6 @@ export async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, 
   if ((orchestration || noResults) && !allPassed(orchestration) && base) baseline = await readBaseline({ api, fetchImpl, tsio, id, context, base, trunkRun, log, historyLane: env.HISTORY_LANE || null });
   const verdict = diagnoseLane({ trunkRun, orchestration, orchestrationError, jobs: jobs?.jobs ?? null, jobsError, prFiles, baseline, lanePaths, staleRerun, judgedSpecs });
   const startName = env.LANE_START_JOB || "prepare-run";
-  const startJobId = jobs?.jobs.find((j) => j.short === startName)?.id ?? null;
+  const startJobId = (jobs?.allJobs ?? jobs?.jobs)?.find((j) => j.short === startName)?.id ?? null;
   return { verdict, orchestration, jobs, baseline, startJobId };
 }

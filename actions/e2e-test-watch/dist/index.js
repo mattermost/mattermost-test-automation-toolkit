@@ -83,7 +83,7 @@ var DEFAULTS = {
   // them and cleared 4 of the 5 the PR did not cause, Fable 5.1 the fifth on escalation.
   model: "claude-sonnet-5-5"
 };
-var laneOf = (name) => String(name ?? "").replace(/^(mobile|desktop)-(pr|main|master)(-|$)/, "").replace(/-(master|main|release(-cut)?)$/, "") || "default";
+var laneOf = (name) => String(name ?? "").replace(/^(mobile|desktop)-(pr|main|master)(-|$)/, "").replace(/^mobile-(release|cmt)(-|$)/, "").replace(/-Server_[^/]+$/i, "").replace(/-(master|main|release(-cut)?)$/, "") || "default";
 var OS_OF_REPORT = [[/ubuntu/, "linux"], [/windows/, "windows"], [/macos/, "macos"]];
 var laneOfReport = (name) => {
   const rest = String(name).replace(/^e2e-on-/, "");
@@ -95,7 +95,7 @@ var repoPath = (testRoot, file) => {
   const root = String(testRoot).replace(/^\.?\/*/, "").replace(/\/+$/, "");
   return root === "" ? file : `${root}/${file}`;
 };
-var historyLane = (id, cfg = DEFAULTS) => cfg.historyLane || laneOf(id.name);
+var historyLane = (id, cfg = DEFAULTS) => cfg.historyLane ? laneOf(cfg.historyLane) : laneOf(id.name);
 function confidenceFrom(raw, warn) {
   if (raw == null || String(raw).trim() === "") return DEFAULTS.minConfidence;
   const n = Number(raw);
@@ -395,8 +395,434 @@ function missingReports(missing) {
   return { text: `the run's results are incomplete (${received ?? "?"} of ${expected} reports arrived; TSIO group ${state})`, short: `results incomplete: ${received ?? "?"} of ${expected} reports` };
 }
 
+// ../e2e-test-triage/src/classify.ts
+var INFRA_RE = /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready|failed: 408 Request timed out after \d+ ?ms|maestro\.DeviceUnreachableException|Device became unreachable|pending request #-1000 \("isReady"\)|attributes_feature_disabled|permission_policies\.feature_disabled/i;
+var isInfraError = (text) => INFRA_RE.test(text ?? "");
+function isShardPlaceholder(t) {
+  const title = t.title.trim();
+  const error = String(t.error ?? "").trim();
+  if (!title) return true;
+  if (/^\[[^\]]*\] CI shard failure$/.test(title) && (!error || /(?:^|\/)tsio-shard-failure\.ts$/.test(String(t.file ?? "")))) return true;
+  if (title === "CI infrastructure failure" && /^ci\/[^/]+\.stub$/.test(String(t.file ?? ""))) return true;
+  return isSpecNotRun(t);
+}
+function isSpecNotRun(t) {
+  return t.title.trim() === "spec did not run" && /was assigned to a shard but produced no result/.test(String(t.error ?? "").trim());
+}
+var isSpecStopped = (t) => isSpecNotRun(t) && /its Jest process stopped before reaching this spec/.test(String(t.error ?? ""));
+function classifyNotRun(test, runs, cfg, groupId, edited = false) {
+  const out = (cls, reason, blocking) => ({
+    ...test,
+    class: cls,
+    reason,
+    blocking,
+    trunk: { runs: 0, fails: 0, flaky: 0, passes: 0, latest: "" },
+    cross_pr: { prs: [], examples: [], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" }
+  });
+  const why = isSpecStopped(test) ? "Did not run: its Jest process stopped before reaching it" : "Did not run: its shard sent no result";
+  if (edited === null) return out("NOT_RUN", `${why}, and whether this change edits it could not be checked.`, true);
+  if (edited) return out("NOT_RUN", `${why}, and this change edits it, so it has to run.`, true);
+  if (!runs) return out("NOT_RUN", `${why}, and its history could not be read.`, true);
+  const others = runs.filter((r) => r.group_id !== String(groupId));
+  const notRun = others.filter((r) => r.status === "not_run").length;
+  const ran = others.filter((r) => r.status === "passed" || r.status === "failed");
+  const skipped = others.filter((r) => r.status === "skipped").length;
+  const failed = ran.filter((r) => r.status === "failed").length;
+  if (!ran.length && skipped >= cfg.minTrunkRuns)
+    return out("FLAKY_NOT_RUN", `${why}, but it skipped every test in all ${skipped} recent runs where it was reached, so nothing was lost.`, false);
+  if (failed * 20 > ran.length) return out("NOT_RUN", `${why}, and it failed in ${failed} of the ${ran.length} recent runs where it ran.`, true);
+  if (ran.length < cfg.minTrunkRuns) return out("NOT_RUN", `${why}, and it ran in only ${ran.length} recent runs (need ${cfg.minTrunkRuns}) to call it intermittent.`, true);
+  if (!notRun) return out("NOT_RUN", `${why}, which it has not done in the last ${others.length} runs.`, true);
+  return out("FLAKY_NOT_RUN", `${why}, as it did in ${notRun} of the last ${others.length} runs; it passed in ${failed ? `${ran.length - failed} of the` : "all"} ${ran.length} where it ran.`, false);
+}
+var FIXED_STREAK = 3;
+var EXONERATED = /* @__PURE__ */ new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
+var EXONERATED_ON_TRUNK = /* @__PURE__ */ new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
+var exoneratedSet = (isTrunkRun) => isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED;
+function causedByPR(f) {
+  if (f.out_of_date && f.class !== "OWNED_BY_PR") return false;
+  return f.class === "OWNED_BY_PR" || Boolean(f.pr_streak) || Boolean(f.changed_by_pr) || f.untouched === false || Boolean(f.mass) && !f.mass_unproven || f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto" || f.decision === "reproducible_regression";
+}
+var BORDERLINE = /* @__PURE__ */ new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
+var JUDGED = /* @__PURE__ */ new Set([...BORDERLINE, "INFRA_ERROR"]);
+var ANCHOR_NAME = /^(?=.{6,})[A-Za-z_][\w-]*[A-Za-z0-9_]$/;
+var namesOneElement = (name) => ANCHOR_NAME.test(name) && /[_-]|[a-z][A-Z]/.test(name);
+var SELECTOR_RE = /(?:^|[\s'"`(\[>+~,]|<[a-z][\w-]*)[.#]([A-Za-z_][\w-]*)/g;
+var TEST_ID_RE = /(?:getByTestId\(\s*|data-testid\s*=\s*\\?|testid\s*[:=]\s*)['"`]([^'"`]+)['"`]/gi;
+var TEXT_RES = [
+  /^Expected(?: string| substring| pattern)?:\s*"(.+)"\s*$/i,
+  /getByText\(\s*(['"`])(.+?)\1/i,
+  /\bname:\s*(['"`])(.+?)\1/i,
+  /Expected to find content:\s*'(.+?)'/i,
+  /to (?:have|contain) text\s*'(.+?)'/i
+];
+var words = (text) => text.toLowerCase().replace(/\{[^{}]*\}/g, " ").replace(/\d[\d,.]*/g, " ").replace(/[^\p{L}\s]+/gu, " ").replace(/\s+/g, " ").trim();
+var escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function failureAnchors(error) {
+  const message = [];
+  for (const raw of String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (/^at\s/.test(line)) break;
+    if (line) message.push(line);
+  }
+  const names = /* @__PURE__ */ new Map();
+  const texts = /* @__PURE__ */ new Set();
+  for (const line of message) {
+    for (const m of line.matchAll(TEST_ID_RE)) if (m[1].length >= 4) names.set(m[1], "test id");
+    for (const m of line.matchAll(SELECTOR_RE)) if (namesOneElement(m[1]) && !names.has(m[1])) names.set(m[1], "selector");
+    for (const re of TEXT_RES) {
+      const m = re.exec(line);
+      const text = m?.[m.length - 1];
+      if (text && words(text).split(" ").length >= 3) texts.add(text);
+    }
+  }
+  return { names: [...names].map(([name, kind]) => ({ name, kind })), texts: [...texts] };
+}
+var secondary = (file) => /(?:^|\/)__snapshots__\/|\.snap$|\.(?:test|spec)\.[cm]?[jt]sx?$|_test\.go$/.test(file);
+var LOCK_FILE = /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|go\.sum|Gemfile\.lock|Podfile\.lock)$/;
+var NOT_EXECUTED = /\.(?:md|mdx|markdown|rst|adoc|txt)$|(?:^|\/)(?:LICENSE|NOTICE|CHANGELOG|AUTHORS)(?:\.[^/]*)?$/i;
+var isProductChange = (file) => !secondary(file) && !LOCK_FILE.test(file) && !NOT_EXECUTED.test(file);
+function changeTouchesFailure(test, files) {
+  if (!files?.length) return null;
+  const { names, texts } = failureAnchors(test.error);
+  if (!names.length && !texts.length) return null;
+  const spec = test.repo_path ?? test.file;
+  const nameRes = names.map((a) => ({ ...a, re: new RegExp(`(?<![\\w-])${escapeRe(a.name)}(?![\\w-])`) }));
+  const textWords = texts.map((t) => ({ text: t, words: words(t) }));
+  const ordered = [...files].sort((a, b) => Number(secondary(a.filename)) - Number(secondary(b.filename)));
+  for (const f of ordered) {
+    if (!f.patch || f.filename === spec || LOCK_FILE.test(f.filename) || NOT_EXECUTED.test(f.filename)) continue;
+    const changedLines = f.patch.split("\n").filter((line) => /^[+-]/.test(line) && !/^(?:\+\+\+|---)\s/.test(line));
+    const holds = (body, a) => a.re ? a.re.test(body) : Boolean(a.words) && words(body).includes(a.words);
+    const removedHere = (a) => !changedLines.some((l) => l.startsWith("+") && holds(l.slice(1), a));
+    const shown = (line, a) => (line.startsWith("-") ? changedLines.find((l) => l.startsWith("+") && holds(l.slice(1), a)) ?? line : line).slice(1).trim().slice(0, 200);
+    for (const line of changedLines) {
+      const body = line.slice(1);
+      const gone = line.startsWith("-");
+      const named = nameRes.find((a) => holds(body, a));
+      if (named) return { file: f.filename, anchor: named.name, kind: named.kind, line: shown(line, named), removed: gone && removedHere(named) };
+      const said = textWords.find((t) => holds(body, t));
+      if (said) return { file: f.filename, anchor: said.text, kind: "text", line: shown(line, said), removed: gone && removedHere(said) };
+    }
+  }
+  return null;
+}
+var describeChange = (c) => c.kind === "text" ? `the text "${c.anchor.slice(0, 120)}"` : `the ${c.kind} ${c.anchor}`;
+function prStreak(f, streak, base, touched) {
+  return Object.assign(f, {
+    class: "REGRESSION",
+    blocking: true,
+    pr_streak: streak,
+    ...touched ? { changed_by_pr: touched, untouched: false } : {},
+    reason: `Failed the same way on this PR's last ${streak} commits and never on ${base}, so it is not a flake${touched ? `; this PR changes ${describeChange(touched)} that the test looks for, in ${touched.file}` : ""}.`
+  });
+}
+function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = null, lane = null, opts = {}) {
+  const { isTrunkRun = false, groupId = null, trunkBranch = null, commitSha = null, patches = null } = opts;
+  const own = new Set(changedFiles);
+  const seen = groupId == null ? observations : observations.filter((o) => o.group_id !== groupId);
+  const ran = seen.filter((o) => o.status !== "skipped");
+  const inLane = lane == null ? ran : ran.filter((o) => o.name == null || laneOf(o.name) === lane);
+  const prOf = (o) => o.gh_pr_number == null || o.gh_pr_number === "" ? null : Number(o.gh_pr_number);
+  const currentPR = prNumber == null ? null : Number(prNumber);
+  const trunk = inLane.filter((o) => prOf(o) == null && (trunkBranch == null || o.branch === trunkBranch));
+  const others = inLane.filter((o) => prOf(o) != null && prOf(o) !== currentPR);
+  const mine = currentPR == null ? [] : inLane.filter((o) => prOf(o) === currentPR);
+  const minePassed = mine.filter((o) => o.status === "passed" || o.status === "flaky");
+  const laneRuns = lane == null ? trunk.length : trunk.filter((o) => o.name != null && laneOf(o.name) === lane).length;
+  const trunkFails = trunk.filter((o) => FAILED_STATUSES.has(o.status)).length;
+  const trunkFlaky = trunk.filter((o) => o.status === "flaky").length;
+  const trunkPasses = trunk.filter((o) => o.status === "passed").length;
+  const latestTrunk = trunk[0];
+  let streak = 0;
+  while (streak < trunk.length && FAILED_STATUSES.has(trunk[streak].status)) streak++;
+  const at = (o) => o ? { commit_sha: o.commit_sha ?? null, created_at: o.created_at ?? null } : null;
+  const ownKey = failureKey(test.error);
+  const ownSignature = errorSignature(test.error);
+  const sameAsOwn = (excerpt) => {
+    const k = failureKey(excerpt);
+    if (ownKey.kind === "stuck") {
+      return k.kind === "stuck" && k.key === ownKey.key && (ownSignature === errorSignature(excerpt) || ownSignature == null && errorSignature(excerpt) == null);
+    }
+    return ownKey.kind === "distinctive" ? k.kind === ownKey.kind && k.key === ownKey.key : k.kind === ownKey.kind;
+  };
+  const crossFailures = others.filter((o) => FAILED_STATUSES.has(o.status) && sameAsOwn(o.error_excerpt));
+  const failedPRs = [...new Set(crossFailures.map(prOf))];
+  const otherPasses = others.filter((o) => o.status === "passed" || o.status === "flaky").length;
+  const failureSignatures = [...new Set([...trunk, ...others].filter((o) => FAILED_STATUSES.has(o.status)).map((o) => sameKey(o.error_excerpt)).filter((k) => Boolean(k)))];
+  const unstableTrunk = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
+  const trunkSameError = (ownKey.kind === "distinctive" || ownKey.kind === "stuck") && unstableTrunk.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)));
+  const trunkSameTarget = trunkSameError && (ownKey.kind === "distinctive" || Boolean(ownKey.key) && !/^action \S+$/.test(ownKey.key));
+  const stats = {
+    trunk: {
+      runs: trunk.length,
+      fails: trunkFails,
+      flaky: trunkFlaky,
+      passes: trunkPasses,
+      latest: latestTrunk?.status ?? "",
+      ...trunkSameTarget ? { same_error: true } : {},
+      lane_runs: laneRuns
+    },
+    cross_pr: {
+      prs: failedPRs,
+      examples: crossFailures.filter((o, i, all) => all.findIndex((x) => prOf(x) === prOf(o)) === i).slice(0, 12).map((o) => `PR ${prOf(o)} (${o.commit_sha?.slice(0, 7) ?? "unknown"}, ${o.created_at?.slice(5, 10) ?? "?"})`),
+      passes: otherPasses
+    },
+    failure_signatures: failureSignatures,
+    trunk_break: streak ? { first_fail: at(trunk[streak - 1]), last_pass: at(trunk[streak]) } : null,
+    this_pr: {
+      runs: mine.length,
+      passes: minePassed.length,
+      fails: mine.filter((o) => FAILED_STATUSES.has(o.status)).length,
+      last_pass: minePassed[0] ? { commit_sha: minePassed[0].commit_sha ?? null, created_at: minePassed[0].created_at ?? null } : null,
+      latest: mine[0]?.status ?? ""
+    }
+  };
+  const out = (cls, reason, blocking) => ({ ...test, class: cls, reason, blocking, ...stats });
+  const otherError = (rows) => {
+    const mine2 = errorSignature(maskIds(test.error));
+    if (mine2 == null || !rows.length) return null;
+    const sigs = rows.map((o) => errorSignature(maskIds(o.error_excerpt)));
+    return sigs.every(Boolean) && !sigs.includes(mine2) ? sigs[0] ?? null : null;
+  };
+  if (own.has(test.repo_path ?? test.file))
+    return out("OWNED_BY_PR", isTrunkRun ? `This commit changes ${test.file}; a failure in a spec the commit edits is not noise.` : `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
+  if (!isTrunkRun && currentPR != null && !test.identity_unresolved && !failedPRs.length && !isInfraError(test.error)) {
+    const earlier = /* @__PURE__ */ new Set();
+    for (const o of mine) {
+      if (!FAILED_STATUSES.has(o.status) || !sameFirstLine(o.error_excerpt, test.error)) break;
+      if (o.commit_sha && o.commit_sha !== commitSha) earlier.add(o.commit_sha);
+    }
+    const streak2 = earlier.size + 1;
+    const trunkFailedSame = trunk.some((o) => (FAILED_STATUSES.has(o.status) || o.status === "flaky") && sameFirstLine(o.error_excerpt, test.error));
+    if (streak2 >= 2 && trunk.length >= cfg.minTrunkRuns && laneRuns >= cfg.minTrunkRuns && latestTrunk?.status === "passed" && !trunkFailedSame) {
+      return prStreak(out("REGRESSION", "", true), streak2, trunkBranch || "the default branch", changeTouchesFailure(test, patches));
+    }
+  }
+  if (isInfraError(test.error))
+    return out("INFRA_ERROR", cfg.infraClears ? "Environment error, not the change: the test failed on its environment (see the error). Rerun when it recovers." : "Environment error: the test failed on its environment (see the error). Rerun; if it fails the same way again, the change may be the cause.", !cfg.infraClears);
+  if (test.identity_unresolved)
+    return out(
+      "INSUFFICIENT_DATA",
+      `The available suite/report identity does not uniquely identify "${test.title}" in ${test.file}; history cannot clear it.`,
+      true
+    );
+  const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
+  const notTrunksFlake = () => {
+    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !trunkSameError) {
+      const there = unstableTrunk.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
+      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
+    }
+    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran && !unstableTrunk.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
+      const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
+      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`, true);
+    }
+    return null;
+  };
+  if (isTrunkRun) {
+    if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status))
+      return out("BROKEN_ON_TRUNK", `Still failing: the previous ${lane ?? "trunk"} run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}) failed this test too. That is a streak, not a flake.`, true);
+    let rough = 0;
+    while (rough < trunk.length && (FAILED_STATUSES.has(trunk[rough].status) || trunk[rough].status === "flaky")) rough++;
+    if (rough >= 2 && trunk.slice(0, rough).some((o) => FAILED_STATUSES.has(o.status)))
+      return out("BROKEN_ON_TRUNK", `Still failing: failed or passed only on retry in each of the previous ${rough} ${lane ?? "trunk"} runs. A pass on retry is not a fix.`, true);
+    if (failedPRs.length >= Math.min(2, cfg.crossPRMinPRs) && trunkFails === 0 && trunkPasses > 0)
+      return out("FLAKY_CROSS_PR", `Failed${ownKey.kind === "distinctive" ? " with the same error" : ownKey.kind === "stuck" ? " stuck at the same step" : ""} on ${failedPRs.length} PRs in the last ${cfg.crossPRRuns} runs (${stats.cross_pr.examples.slice(0, 3).join(", ")}) while ${trunkBranch || "trunk"} passed ${trunkPasses} of ${trunk.length}.`, false);
+    if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0) {
+      if (laplace < cfg.pMin)
+        return out("REGRESSION", `Rarely unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the previous ${trunk.length} runs, too few to call this failure a flake.`, true);
+      const unlike = notTrunksFlake();
+      if (unlike) return unlike;
+      return out("FLAKY_ON_TRUNK", `Intermittent on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the previous ${trunk.length} runs, and the last one passed${latestTrunk?.status === "flaky" ? " on retry" : ""}.`, false);
+    }
+    if (trunk.length < cfg.minTrunkRuns)
+      return out("INSUFFICIENT_DATA", `Only ${trunk.length} earlier trunk runs (need ${cfg.minTrunkRuns}); cannot tell a flake from a new break.`, true);
+    return out("REGRESSION", `New on trunk: passed in all ${trunk.length} previous runs.`, true);
+  }
+  if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status)) {
+    if (ownKey.kind === "bare" || ownKey.kind === "stuck" && !sameFirstLine(maskIds(latestTrunk.error_excerpt), maskIds(test.error))) {
+      const there = errorFirstLine(latestTrunk.error_excerpt);
+      return out("REGRESSION", `Trunk fails this test too, but ${ownKey.kind === "bare" ? "this timeout names no step to compare" : "not stuck at this step"}${there ? `; its latest run failed with "${there.slice(0, 160)}"` : ""}; this one may be the PR's.`, true);
+    }
+    const trunkError = otherError(trunk.slice(0, streak));
+    if (trunkError)
+      return out("REGRESSION", `Trunk fails this test too, but with another error ("${trunkError.slice(0, 160)}"); this one may be the PR's.`, true);
+    return out("BROKEN_ON_TRUNK", `Trunk's latest run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}, ${latestTrunk.created_at?.slice(0, 10) ?? "unknown date"}) fails this test too.`, false);
+  }
+  let recent = 0;
+  while (recent < trunk.length && trunk[recent].status === "passed") recent++;
+  let broken = 0;
+  const breakKey = (error) => {
+    const k = failureKey(error);
+    return k.kind === "distinctive" || k.kind === "stuck" ? `${k.kind}:${maskIds(k.key)}` : null;
+  };
+  const ownBreak = breakKey(test.error);
+  const sameBreak = (excerpt) => Boolean(excerpt) && ownBreak != null && breakKey(excerpt) === ownBreak;
+  while (recent + broken < trunk.length && FAILED_STATUSES.has(trunk[recent + broken].status) && sameBreak(trunk[recent + broken].error_excerpt)) broken++;
+  if (recent && broken >= FIXED_STREAK)
+    return Object.assign(out("FIXED_ON_TRUNK", `${trunkBranch || "Trunk"} failed this test the same way in ${broken} runs in a row, then passed from ${trunk[recent - 1].commit_sha?.slice(0, 7) ?? "unknown"} on: trunk fixed it.`, true), {
+      trunk_fixed: { last_fail: at(trunk[recent]), first_pass: at(trunk[recent - 1]) }
+    });
+  if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0 && laplace >= cfg.pMin && latestTrunk?.status !== "failed") {
+    const unlike = notTrunksFlake();
+    if (unlike) return unlike;
+    return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the last ${trunk.length} trunk runs.`, false);
+  }
+  if (failedPRs.length >= cfg.crossPRMinPRs && trunkFails === 0 && trunkPasses > 0)
+    return out("FLAKY_CROSS_PR", `Failed${ownKey.kind === "distinctive" ? " with the same error" : ownKey.kind === "stuck" ? " stuck at the same step" : ownKey.kind === "bare" ? " with the same bare timeout" : ""} on ${failedPRs.length} other PRs in the last ${cfg.crossPRRuns} runs (${stats.cross_pr.examples.slice(0, 3).join(", ")}) while trunk stayed green.`, false);
+  if (trunk.length < cfg.minTrunkRuns)
+    return out("INSUFFICIENT_DATA", `Only ${trunk.length} trunk runs found (need ${cfg.minTrunkRuns}); history cannot clear it.`, true);
+  return out("REGRESSION", `Fails here, passes on trunk (${trunkPasses}/${trunk.length}) and was not failing on other PRs enough to call it flaky (${failedPRs.length}).`, true);
+}
+var GENERIC_ERROR_RE = /^(?:\w*error:\s*)?(?:thrown:\s*)?["']?(?:test timeout|exceeded timeout|timeout of|timed out)/i;
+function errorSignature(error) {
+  const kept = [];
+  for (const line of String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).map((l) => l.trim())) {
+    if (!line) continue;
+    if (/^at\s/.test(line) || /^call log:/i.test(line)) break;
+    kept.push(line);
+    if (kept.length === 3) break;
+  }
+  if (!kept.length || GENERIC_ERROR_RE.test(kept[0])) return null;
+  const sig = kept.join(" ").replace(/\s+at\s+(?:async\s+)?(?:\S+\s+)?\(?(?:file:\/\/)?(?:[A-Za-z]:)?[\\/].*$/, "").replace(/\b(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{6,}\b/gi, "<id>").replace(/\b\d{4,}\b/g, "<n>").replace(/\s+/g, " ").trim();
+  return sig.length >= 30 ? sig : null;
+}
+var TIMEOUT_FIRST_RE = /^(?:\w*error:\s*)?(?:thrown:\s*)?(?:test failed:\s*)?["']?(?:test timeout|exceeded timeout|timeout of\b|timed out|[\d.]+\s*sec timeout|[\w.]+:\s*timeout\s*[\d.]+\s*ms|timeout\s*[\d.]+\s*ms)/i;
+var TIMEOUT_ACTION_RE = /^(?:\w*error:\s*)?([\w.]+):\s*timeout\s*[\d.]+\s*ms/i;
+var FRAME_RE = /^at\s|^(?:>\s*)?\d+\s*\||^\||^\^|^Add a timeout value/;
+var FIRST_LINE_STEP = [
+  [/timed out (?:after waiting for|waiting for)\s+(.+)$/i, (m) => /^[\d.,\s]*(?:ms|sec|s)?\s*$/i.test(m[1]) ? null : `waiting for ${m[1]}`],
+  [/timed out retrying after [\d.]+\s*ms:\s*(.+)$/i, (m) => `retrying ${m[1].replace(/,\s*but the text was.*$/, "")}`],
+  [/timeout expired without matching of given matcher:\s*(.+)$/i, (m) => `matcher ${m[1]}`],
+  [/timed out while waiting for expectation:\s*(.+?)(?:\s+TIMEOUT\(.*\))?$/i, (m) => `expectation ${m[1]}`],
+  [/while waiting for event\s+("[^"]*"|\S+)/i, (m) => `event ${m[1]}`]
+];
+function stuckStep(lines) {
+  const first = lines[0];
+  const action = TIMEOUT_ACTION_RE.exec(first)?.[1] ?? null;
+  let target = null;
+  for (const l of [...lines.slice(1), first]) {
+    const w = /^-?\s*(waiting for\s+.+)$/i.exec(l);
+    if (w) {
+      target = w[1];
+      break;
+    }
+  }
+  for (const [re, describe] of FIRST_LINE_STEP) {
+    if (target) break;
+    const m = re.exec(first);
+    if (m) target = describe(m);
+  }
+  if (!action && !target) return null;
+  return [action ? `action ${action}` : null, target].filter(Boolean).join(" ").replace(/\b(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{6,}\b/gi, "<id>").replace(/\b\d{4,}\b/g, "<n>").replace(/\b\d+(?:\.\d+)?\s*sec\b/gi, "<n>sec").replace(/\s+/g, " ").trim();
+}
+var maskIds = (error) => String(error ?? "").replace(/(?<![a-z0-9])[a-z0-9]{26}(?![a-z0-9])/g, "<id>");
+function sameFirstLine(a, b) {
+  const ka = failureKey(a);
+  const kb = failureKey(b);
+  return (ka.kind === "distinctive" || ka.kind === "stuck") && kb.kind === ka.kind && kb.key === ka.key;
+}
+function failureKey(error) {
+  const lines = [];
+  for (const raw of String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/)) {
+    const l = raw.trim();
+    if (!l) continue;
+    if (lines.length && FRAME_RE.test(l)) break;
+    lines.push(l);
+  }
+  if (lines.length && TIMEOUT_FIRST_RE.test(lines[0])) {
+    const step = stuckStep(lines);
+    return step ? { kind: "stuck", key: step } : { kind: "bare", key: null };
+  }
+  const sig = errorSignature(error);
+  return sig ? { kind: "distinctive", key: sig } : { kind: "unusable", key: null };
+}
+function sameKey(error) {
+  return failureKey(error).kind === "distinctive" ? errorSignature(error) : null;
+}
+function sameFailure(findings) {
+  const blamed = (f) => f.judge?.cause === "caused_by_pr";
+  const keyOf = (f) => {
+    const sig = sameKey(f.error);
+    return sig ? JSON.stringify([f.repo_path ?? f.file, sig]) : null;
+  };
+  const anchors = /* @__PURE__ */ new Map();
+  for (const f of findings) {
+    if (f.blocking || !EXONERATED.has(f.class) || f.identity_unresolved || blamed(f)) continue;
+    const sig = sameKey(f.error);
+    if (!sig || !(f.failure_signatures ?? []).includes(sig)) continue;
+    const k = keyOf(f);
+    if (!anchors.has(k)) anchors.set(k, f);
+  }
+  for (const f of findings) {
+    if (!f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.decision === "evidence_incomplete" || f.failed_everywhere || f.pr_streak || blamed(f)) continue;
+    const k = keyOf(f);
+    const anchor = k ? anchors.get(k) : void 0;
+    if (!anchor) continue;
+    Object.assign(f, {
+      class: "SAME_FAILURE_AS_CLEARED",
+      blocking: false,
+      decision: "same_failure",
+      same_as: anchor.full_title || anchor.title,
+      same_as_class: anchor.class,
+      reason: `Fails with the same error as "${anchor.title}" in this spec, which history cleared (${anchor.class}): ${anchor.reason}`
+    });
+  }
+  return findings;
+}
+function holdFailedEverywhere(findings) {
+  const flaky = /* @__PURE__ */ new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
+  for (const f of findings) {
+    if (!(BORDERLINE.has(f.class) || flaky.has(f.class)) || f.identity_unresolved || !f.tries || f.tries.ran < 2 || f.tries.failed !== f.tries.ran) continue;
+    const on = [...new Set((f.other_lanes ?? []).filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform))];
+    if (!on.length) continue;
+    const why = `Failed all ${f.tries.ran} tries here and failed on ${on.join(" and ")} on this same commit; a flake rarely does that.`;
+    Object.assign(f, {
+      ...flaky.has(f.class) || !f.blocking ? { class: "REGRESSION" } : {},
+      blocking: true,
+      failed_everywhere: on,
+      reason: `${why} ${flaky.has(f.class) ? `Its clear does not stand: ${f.reason}` : f.reason}`
+    });
+  }
+  return findings;
+}
+var errorFirstLine = (error) => (String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).find((l) => l.trim()) ?? "").trim().slice(0, 200);
+var differentError = (a, b) => {
+  const ka = failureKey(a);
+  const kb = failureKey(b);
+  return ka.kind !== kb.kind || ka.key !== kb.key || ka.key == null && errorFirstLine(a) !== errorFirstLine(b);
+};
+function markEarlierFailures(findings) {
+  const earlier = (a, b) => Boolean(a.report_name) && a.report_name === b.report_name && typeof a.ordinal === "number" && typeof b.ordinal === "number" && a.ordinal < b.ordinal;
+  for (const f of findings) {
+    const spec = f.repo_path ?? f.file;
+    let first = null;
+    for (const o of findings) {
+      if (o === f || (o.repo_path ?? o.file) !== spec || !earlier(o, f) || !differentError(o.error, f.error)) continue;
+      if (!first || earlier(o, first)) first = o;
+    }
+    if (first) f.earlier_failure = { title: (first.full_title || first.title).slice(0, 200), error: errorFirstLine(first.error), class: first.class };
+  }
+  return findings;
+}
+var isSmallSuiteStorm = (failed, total) => total != null && total >= 6 && failed >= 5 && failed * 2 >= total;
+function infraVerdict(failing, cfg = DEFAULTS, total) {
+  if (!failing.length) return null;
+  const infra = failing.filter((t) => isInfraError(t.error)).length;
+  if (infra >= Math.max(3, Math.ceil(failing.length / 2)))
+    return `${infra} of ${failing.length} failures are infrastructure errors (server health, connectivity, device, shard that never ran); rerun when the environment recovers.`;
+  if (failing.length >= cfg.infraMinFailures)
+    return `${failing.length} tests failed in one run; check for a shared environment, build or product failure first.`;
+  if (isSmallSuiteStorm(failing.length, total))
+    return `${failing.length} of ${total} tests failed in one run; check for a shared environment, build or product failure first.`;
+  return null;
+}
+
 // ../e2e-test-triage/src/history.ts
-var HISTORY_RETRY_MS = [500, 1500, 4e3];
+var HISTORY_RETRY_MS = [1e3, 2500, 5e3];
 async function postHistory(fetchImpl, url, body) {
   let failure;
   for (let attempt = 0; attempt <= HISTORY_RETRY_MS.length; attempt++) {
@@ -641,7 +1067,8 @@ async function dropStormRuns({
         try {
           const { test_stats: t } = await tsioJson(fetchImpl, base, `/reports/${encodeURIComponent(g)}`);
           const failed = t?.failed ?? 0;
-          (failed >= minFailures && failed * 10 >= (t?.total ?? 0) ? storms : quiet).add(g);
+          const executed = Math.max(0, (t?.total ?? 0) - (t?.skipped ?? 0));
+          (failed >= minFailures && failed * 10 >= (t?.total ?? 0) || isSmallSuiteStorm(failed, executed) ? storms : quiet).add(g);
         } catch {
         }
       });
@@ -718,7 +1145,8 @@ async function markOutOfDate({
   until = null,
   log = () => {
   },
-  supportPaths = []
+  supportPaths = [],
+  fetchFileDiffs = false
 }) {
   if (!findings.length || !baseBranch) return { truncated: false };
   const cmp = await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`);
@@ -780,11 +1208,32 @@ async function markOutOfDate({
     log(`${baseBranch} changed ${files.length}+ files since this PR last merged it, and the merge base has no date; ${rest.length} failure(s) unchecked`);
     return { truncated: true, unchecked: rest };
   }
-  log(`${baseBranch} changed ${files.length}+ files since this PR last merged it; checking the failing specs' directories instead`);
+  log(`${baseBranch} changed ${files.length}+ files since this PR last merged it; checking the failing specs' ${fetchFileDiffs ? "files and " : ""}directories instead`);
   const dirs = /* @__PURE__ */ new Map();
+  const filePatches = /* @__PURE__ */ new Map();
+  if (fetchFileDiffs) {
+    const uniquePaths = [...new Set(rest.map((f) => f.repo_path ?? "").filter(Boolean))].slice(0, 10);
+    await Promise.all(uniquePaths.map(async (path) => {
+      const q = new URLSearchParams({ sha: baseBranch, path, since, ...until ? { until } : {}, per_page: "5" });
+      const raw = await api("GET", `/repos/${id.repository}/commits?${q}`).catch(() => []);
+      const [c, ...earlier] = (Array.isArray(raw) ? raw : []).filter((x) => x.sha !== base?.sha);
+      if (!c) {
+        filePatches.set(path, null);
+        return;
+      }
+      const detail = await api("GET", `/repos/${id.repository}/commits/${c.sha}`).catch(() => null);
+      const patch = detail?.files?.find((x) => x.filename === path)?.patch;
+      filePatches.set(path, { commit: commitRef(c), also: earlier.slice(0, 4).map(commitRef), ...patch ? { diff: patch.slice(0, 4e3) } : {} });
+    }));
+  }
   const unchecked = [];
   for (const f of rest) {
     const path = f.repo_path ?? "";
+    const hit = fetchFileDiffs && path ? filePatches.get(path) : null;
+    if (hit) {
+      f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: hit.commit, ...hit.also.length ? { also: hit.also } : {}, ...hit.diff ? { diff: hit.diff } : {} };
+      continue;
+    }
     const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
     if (!dir) {
       unchecked.push(f);
@@ -835,426 +1284,6 @@ async function markBrokeBy({ findings, api, id, log = () => {
     const w = windows.get(key);
     if (w?.total) f.broke_by = w;
   }
-}
-
-// ../e2e-test-triage/src/classify.ts
-var INFRA_RE = /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready|failed: 408 Request timed out after \d+ ?ms/i;
-var isInfraError = (text) => INFRA_RE.test(text ?? "");
-function isShardPlaceholder(t) {
-  const title = t.title.trim();
-  const error = String(t.error ?? "").trim();
-  if (!title) return true;
-  if (/^\[[^\]]*\] CI shard failure$/.test(title) && (!error || /(?:^|\/)tsio-shard-failure\.ts$/.test(String(t.file ?? "")))) return true;
-  if (title === "CI infrastructure failure" && /^ci\/[^/]+\.stub$/.test(String(t.file ?? ""))) return true;
-  return isSpecNotRun(t);
-}
-function isSpecNotRun(t) {
-  return t.title.trim() === "spec did not run" && /was assigned to a shard but produced no result/.test(String(t.error ?? "").trim());
-}
-var isSpecStopped = (t) => isSpecNotRun(t) && /its Jest process stopped before reaching this spec/.test(String(t.error ?? ""));
-function classifyNotRun(test, runs, cfg, groupId, edited = false) {
-  const out = (cls, reason, blocking) => ({
-    ...test,
-    class: cls,
-    reason,
-    blocking,
-    trunk: { runs: 0, fails: 0, flaky: 0, passes: 0, latest: "" },
-    cross_pr: { prs: [], examples: [], passes: 0 },
-    failure_signatures: [],
-    trunk_break: null,
-    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" }
-  });
-  const why = isSpecStopped(test) ? "Did not run: its Jest process stopped before reaching it" : "Did not run: its shard sent no result";
-  if (edited === null) return out("NOT_RUN", `${why}, and whether this change edits it could not be checked.`, true);
-  if (edited) return out("NOT_RUN", `${why}, and this change edits it, so it has to run.`, true);
-  if (!runs) return out("NOT_RUN", `${why}, and its history could not be read.`, true);
-  const others = runs.filter((r) => r.group_id !== String(groupId));
-  const notRun = others.filter((r) => r.status === "not_run").length;
-  const ran = others.filter((r) => r.status === "passed" || r.status === "failed");
-  const skipped = others.filter((r) => r.status === "skipped").length;
-  const failed = ran.filter((r) => r.status === "failed").length;
-  if (!ran.length && skipped >= cfg.minTrunkRuns)
-    return out("FLAKY_NOT_RUN", `${why}, but it skipped every test in all ${skipped} recent runs where it was reached, so nothing was lost.`, false);
-  if (failed * 20 > ran.length) return out("NOT_RUN", `${why}, and it failed in ${failed} of the ${ran.length} recent runs where it ran.`, true);
-  if (ran.length < cfg.minTrunkRuns) return out("NOT_RUN", `${why}, and it ran in only ${ran.length} recent runs (need ${cfg.minTrunkRuns}) to call it intermittent.`, true);
-  if (!notRun) return out("NOT_RUN", `${why}, which it has not done in the last ${others.length} runs.`, true);
-  return out("FLAKY_NOT_RUN", `${why}, as it did in ${notRun} of the last ${others.length} runs; it passed in ${failed ? `${ran.length - failed} of the` : "all"} ${ran.length} where it ran.`, false);
-}
-var FIXED_STREAK = 3;
-var EXONERATED = /* @__PURE__ */ new Set(["BROKEN_ON_TRUNK", "FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
-var EXONERATED_ON_TRUNK = /* @__PURE__ */ new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
-var exoneratedSet = (isTrunkRun) => isTrunkRun ? EXONERATED_ON_TRUNK : EXONERATED;
-function causedByPR(f) {
-  if (f.out_of_date && f.class !== "OWNED_BY_PR") return false;
-  return f.class === "OWNED_BY_PR" || Boolean(f.pr_streak) || Boolean(f.changed_by_pr) || f.untouched === false || Boolean(f.mass) && !f.mass_unproven || f.decision === "adjudicator_blame" || f.decision === "adjudicator_veto" || f.decision === "reproducible_regression";
-}
-var BORDERLINE = /* @__PURE__ */ new Set(["REGRESSION", "INSUFFICIENT_DATA"]);
-var JUDGED = /* @__PURE__ */ new Set([...BORDERLINE, "INFRA_ERROR"]);
-var ANCHOR_NAME = /^(?=.{6,})[A-Za-z_][\w-]*[A-Za-z0-9_]$/;
-var namesOneElement = (name) => ANCHOR_NAME.test(name) && /[_-]|[a-z][A-Z]/.test(name);
-var SELECTOR_RE = /(?:^|[\s'"`(\[>+~,]|<[a-z][\w-]*)[.#]([A-Za-z_][\w-]*)/g;
-var TEST_ID_RE = /(?:getByTestId\(\s*|data-testid\s*=\s*\\?|testid\s*[:=]\s*)['"`]([^'"`]+)['"`]/gi;
-var TEXT_RES = [
-  /^Expected(?: string| substring| pattern)?:\s*"(.+)"\s*$/i,
-  /getByText\(\s*(['"`])(.+?)\1/i,
-  /\bname:\s*(['"`])(.+?)\1/i,
-  /Expected to find content:\s*'(.+?)'/i,
-  /to (?:have|contain) text\s*'(.+?)'/i
-];
-var words = (text) => text.toLowerCase().replace(/\{[^{}]*\}/g, " ").replace(/\d[\d,.]*/g, " ").replace(/[^\p{L}\s]+/gu, " ").replace(/\s+/g, " ").trim();
-var escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-function failureAnchors(error) {
-  const message = [];
-  for (const raw of String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/)) {
-    const line = raw.trim();
-    if (/^at\s/.test(line)) break;
-    if (line) message.push(line);
-  }
-  const names = /* @__PURE__ */ new Map();
-  const texts = /* @__PURE__ */ new Set();
-  for (const line of message) {
-    for (const m of line.matchAll(TEST_ID_RE)) if (m[1].length >= 4) names.set(m[1], "test id");
-    for (const m of line.matchAll(SELECTOR_RE)) if (namesOneElement(m[1]) && !names.has(m[1])) names.set(m[1], "selector");
-    for (const re of TEXT_RES) {
-      const m = re.exec(line);
-      const text = m?.[m.length - 1];
-      if (text && words(text).split(" ").length >= 3) texts.add(text);
-    }
-  }
-  return { names: [...names].map(([name, kind]) => ({ name, kind })), texts: [...texts] };
-}
-var secondary = (file) => /(?:^|\/)__snapshots__\/|\.snap$|\.(?:test|spec)\.[cm]?[jt]sx?$|_test\.go$/.test(file);
-var LOCK_FILE = /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|go\.sum|Gemfile\.lock|Podfile\.lock)$/;
-var NOT_EXECUTED = /\.(?:md|mdx|markdown|rst|adoc|txt)$|(?:^|\/)(?:LICENSE|NOTICE|CHANGELOG|AUTHORS)(?:\.[^/]*)?$/i;
-var isProductChange = (file) => !secondary(file) && !LOCK_FILE.test(file) && !NOT_EXECUTED.test(file);
-function changeTouchesFailure(test, files) {
-  if (!files?.length) return null;
-  const { names, texts } = failureAnchors(test.error);
-  if (!names.length && !texts.length) return null;
-  const spec = test.repo_path ?? test.file;
-  const nameRes = names.map((a) => ({ ...a, re: new RegExp(`(?<![\\w-])${escapeRe(a.name)}(?![\\w-])`) }));
-  const textWords = texts.map((t) => ({ text: t, words: words(t) }));
-  const ordered = [...files].sort((a, b) => Number(secondary(a.filename)) - Number(secondary(b.filename)));
-  for (const f of ordered) {
-    if (!f.patch || f.filename === spec || LOCK_FILE.test(f.filename) || NOT_EXECUTED.test(f.filename)) continue;
-    const changedLines = f.patch.split("\n").filter((line) => /^[+-]/.test(line) && !/^(?:\+\+\+|---)\s/.test(line));
-    const holds = (body, a) => a.re ? a.re.test(body) : Boolean(a.words) && words(body).includes(a.words);
-    const removedHere = (a) => !changedLines.some((l) => l.startsWith("+") && holds(l.slice(1), a));
-    const shown = (line, a) => (line.startsWith("-") ? changedLines.find((l) => l.startsWith("+") && holds(l.slice(1), a)) ?? line : line).slice(1).trim().slice(0, 200);
-    for (const line of changedLines) {
-      const body = line.slice(1);
-      const gone = line.startsWith("-");
-      const named = nameRes.find((a) => holds(body, a));
-      if (named) return { file: f.filename, anchor: named.name, kind: named.kind, line: shown(line, named), removed: gone && removedHere(named) };
-      const said = textWords.find((t) => holds(body, t));
-      if (said) return { file: f.filename, anchor: said.text, kind: "text", line: shown(line, said), removed: gone && removedHere(said) };
-    }
-  }
-  return null;
-}
-var describeChange = (c) => c.kind === "text" ? `the text "${c.anchor.slice(0, 120)}"` : `the ${c.kind} ${c.anchor}`;
-function prStreak(f, streak, base, touched) {
-  return Object.assign(f, {
-    class: "REGRESSION",
-    blocking: true,
-    pr_streak: streak,
-    ...touched ? { changed_by_pr: touched, untouched: false } : {},
-    reason: `Failed the same way on this PR's last ${streak} commits and never on ${base}, so it is not a flake${touched ? `; this PR changes ${describeChange(touched)} that the test looks for, in ${touched.file}` : ""}.`
-  });
-}
-function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = null, lane = null, opts = {}) {
-  const { isTrunkRun = false, groupId = null, trunkBranch = null, commitSha = null, patches = null } = opts;
-  const own = new Set(changedFiles);
-  const seen = groupId == null ? observations : observations.filter((o) => o.group_id !== groupId);
-  const ran = seen.filter((o) => o.status !== "skipped");
-  const inLane = lane == null ? ran : ran.filter((o) => o.name == null || laneOf(o.name) === lane);
-  const prOf = (o) => o.gh_pr_number == null || o.gh_pr_number === "" ? null : Number(o.gh_pr_number);
-  const currentPR = prNumber == null ? null : Number(prNumber);
-  const trunk = inLane.filter((o) => prOf(o) == null && (trunkBranch == null || o.branch === trunkBranch));
-  const others = inLane.filter((o) => prOf(o) != null && prOf(o) !== currentPR);
-  const mine = currentPR == null ? [] : inLane.filter((o) => prOf(o) === currentPR);
-  const minePassed = mine.filter((o) => o.status === "passed" || o.status === "flaky");
-  const laneRuns = lane == null ? trunk.length : trunk.filter((o) => o.name != null && laneOf(o.name) === lane).length;
-  const trunkFails = trunk.filter((o) => FAILED_STATUSES.has(o.status)).length;
-  const trunkFlaky = trunk.filter((o) => o.status === "flaky").length;
-  const trunkPasses = trunk.filter((o) => o.status === "passed").length;
-  const latestTrunk = trunk[0];
-  let streak = 0;
-  while (streak < trunk.length && FAILED_STATUSES.has(trunk[streak].status)) streak++;
-  const at = (o) => o ? { commit_sha: o.commit_sha ?? null, created_at: o.created_at ?? null } : null;
-  const ownKey = failureKey(test.error);
-  const ownSignature = errorSignature(test.error);
-  const sameAsOwn = (excerpt) => {
-    const k = failureKey(excerpt);
-    if (ownKey.kind === "stuck") {
-      return k.kind === "stuck" && k.key === ownKey.key && (ownSignature === errorSignature(excerpt) || ownSignature == null && errorSignature(excerpt) == null);
-    }
-    return ownKey.kind === "distinctive" ? k.kind === ownKey.kind && k.key === ownKey.key : k.kind === ownKey.kind;
-  };
-  const crossFailures = others.filter((o) => FAILED_STATUSES.has(o.status) && sameAsOwn(o.error_excerpt));
-  const failedPRs = [...new Set(crossFailures.map(prOf))];
-  const otherPasses = others.filter((o) => o.status === "passed" || o.status === "flaky").length;
-  const failureSignatures = [...new Set([...trunk, ...others].filter((o) => FAILED_STATUSES.has(o.status)).map((o) => sameKey(o.error_excerpt)).filter((k) => Boolean(k)))];
-  const stats = {
-    trunk: {
-      runs: trunk.length,
-      fails: trunkFails,
-      flaky: trunkFlaky,
-      passes: trunkPasses,
-      latest: latestTrunk?.status ?? "",
-      lane_runs: laneRuns
-    },
-    cross_pr: {
-      prs: failedPRs,
-      examples: crossFailures.filter((o, i, all) => all.findIndex((x) => prOf(x) === prOf(o)) === i).slice(0, 12).map((o) => `PR ${prOf(o)} (${o.commit_sha?.slice(0, 7) ?? "unknown"}, ${o.created_at?.slice(5, 10) ?? "?"})`),
-      passes: otherPasses
-    },
-    failure_signatures: failureSignatures,
-    trunk_break: streak ? { first_fail: at(trunk[streak - 1]), last_pass: at(trunk[streak]) } : null,
-    this_pr: {
-      runs: mine.length,
-      passes: minePassed.length,
-      fails: mine.filter((o) => FAILED_STATUSES.has(o.status)).length,
-      last_pass: minePassed[0] ? { commit_sha: minePassed[0].commit_sha ?? null, created_at: minePassed[0].created_at ?? null } : null,
-      latest: mine[0]?.status ?? ""
-    }
-  };
-  const out = (cls, reason, blocking) => ({ ...test, class: cls, reason, blocking, ...stats });
-  const otherError = (rows) => {
-    const mine2 = errorSignature(maskIds(test.error));
-    if (mine2 == null || !rows.length) return null;
-    const sigs = rows.map((o) => errorSignature(maskIds(o.error_excerpt)));
-    return sigs.every(Boolean) && !sigs.includes(mine2) ? sigs[0] ?? null : null;
-  };
-  if (own.has(test.repo_path ?? test.file))
-    return out("OWNED_BY_PR", isTrunkRun ? `This commit changes ${test.file}; a failure in a spec the commit edits is not noise.` : `This PR changes ${test.file}; a failure in a spec the PR edits is the PR's to explain.`, true);
-  if (!isTrunkRun && currentPR != null && !test.identity_unresolved && !failedPRs.length && !isInfraError(test.error)) {
-    const earlier = /* @__PURE__ */ new Set();
-    for (const o of mine) {
-      if (!FAILED_STATUSES.has(o.status) || !sameFirstLine(o.error_excerpt, test.error)) break;
-      if (o.commit_sha && o.commit_sha !== commitSha) earlier.add(o.commit_sha);
-    }
-    const streak2 = earlier.size + 1;
-    const trunkFailedSame = trunk.some((o) => (FAILED_STATUSES.has(o.status) || o.status === "flaky") && sameFirstLine(o.error_excerpt, test.error));
-    if (streak2 >= 2 && trunk.length >= cfg.minTrunkRuns && laneRuns >= cfg.minTrunkRuns && latestTrunk?.status === "passed" && !trunkFailedSame) {
-      return prStreak(out("REGRESSION", "", true), streak2, trunkBranch || "the default branch", changeTouchesFailure(test, patches));
-    }
-  }
-  if (isInfraError(test.error))
-    return out("INFRA_ERROR", cfg.infraClears ? "Environment error, not the change: the test failed on its environment (see the error). Rerun when it recovers." : "Environment error: the test failed on its environment (see the error). Rerun; if it fails the same way again, the change may be the cause.", !cfg.infraClears);
-  if (test.identity_unresolved)
-    return out(
-      "INSUFFICIENT_DATA",
-      `The available suite/report identity does not uniquely identify "${test.title}" in ${test.file}; history cannot clear it.`,
-      true
-    );
-  const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
-  const notTrunksFlake = () => {
-    const unstable = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
-    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !unstable.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
-      const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
-      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
-    }
-    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran && !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
-      const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
-      return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`, true);
-    }
-    return null;
-  };
-  if (isTrunkRun) {
-    if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status))
-      return out("BROKEN_ON_TRUNK", `Still failing: the previous ${lane ?? "trunk"} run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}) failed this test too. That is a streak, not a flake.`, true);
-    let rough = 0;
-    while (rough < trunk.length && (FAILED_STATUSES.has(trunk[rough].status) || trunk[rough].status === "flaky")) rough++;
-    if (rough >= 2 && trunk.slice(0, rough).some((o) => FAILED_STATUSES.has(o.status)))
-      return out("BROKEN_ON_TRUNK", `Still failing: failed or passed only on retry in each of the previous ${rough} ${lane ?? "trunk"} runs. A pass on retry is not a fix.`, true);
-    if (failedPRs.length >= Math.min(2, cfg.crossPRMinPRs) && trunkFails === 0 && trunkPasses > 0)
-      return out("FLAKY_CROSS_PR", `Failed${ownKey.kind === "distinctive" ? " with the same error" : ownKey.kind === "stuck" ? " stuck at the same step" : ""} on ${failedPRs.length} PRs in the last ${cfg.crossPRRuns} runs (${stats.cross_pr.examples.slice(0, 3).join(", ")}) while ${trunkBranch || "trunk"} passed ${trunkPasses} of ${trunk.length}.`, false);
-    if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0) {
-      if (laplace < cfg.pMin)
-        return out("REGRESSION", `Rarely unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the previous ${trunk.length} runs, too few to call this failure a flake.`, true);
-      const unlike = notTrunksFlake();
-      if (unlike) return unlike;
-      return out("FLAKY_ON_TRUNK", `Intermittent on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the previous ${trunk.length} runs, and the last one passed${latestTrunk?.status === "flaky" ? " on retry" : ""}.`, false);
-    }
-    if (trunk.length < cfg.minTrunkRuns)
-      return out("INSUFFICIENT_DATA", `Only ${trunk.length} earlier trunk runs (need ${cfg.minTrunkRuns}); cannot tell a flake from a new break.`, true);
-    return out("REGRESSION", `New on trunk: passed in all ${trunk.length} previous runs.`, true);
-  }
-  if (latestTrunk && FAILED_STATUSES.has(latestTrunk.status)) {
-    if (ownKey.kind === "bare" || ownKey.kind === "stuck" && !sameFirstLine(maskIds(latestTrunk.error_excerpt), maskIds(test.error))) {
-      const there = errorFirstLine(latestTrunk.error_excerpt);
-      return out("REGRESSION", `Trunk fails this test too, but ${ownKey.kind === "bare" ? "this timeout names no step to compare" : "not stuck at this step"}${there ? `; its latest run failed with "${there.slice(0, 160)}"` : ""}; this one may be the PR's.`, true);
-    }
-    const trunkError = otherError(trunk.slice(0, streak));
-    if (trunkError)
-      return out("REGRESSION", `Trunk fails this test too, but with another error ("${trunkError.slice(0, 160)}"); this one may be the PR's.`, true);
-    return out("BROKEN_ON_TRUNK", `Trunk's latest run (${latestTrunk.commit_sha?.slice(0, 7) ?? "unknown"}, ${latestTrunk.created_at?.slice(0, 10) ?? "unknown date"}) fails this test too.`, false);
-  }
-  let recent = 0;
-  while (recent < trunk.length && trunk[recent].status === "passed") recent++;
-  let broken = 0;
-  const breakKey = (error) => {
-    const k = failureKey(error);
-    return k.kind === "distinctive" || k.kind === "stuck" ? `${k.kind}:${maskIds(k.key)}` : null;
-  };
-  const ownBreak = breakKey(test.error);
-  const sameBreak = (excerpt) => Boolean(excerpt) && ownBreak != null && breakKey(excerpt) === ownBreak;
-  while (recent + broken < trunk.length && FAILED_STATUSES.has(trunk[recent + broken].status) && sameBreak(trunk[recent + broken].error_excerpt)) broken++;
-  if (recent && broken >= FIXED_STREAK)
-    return Object.assign(out("FIXED_ON_TRUNK", `${trunkBranch || "Trunk"} failed this test the same way in ${broken} runs in a row, then passed from ${trunk[recent - 1].commit_sha?.slice(0, 7) ?? "unknown"} on: trunk fixed it.`, true), {
-      trunk_fixed: { last_fail: at(trunk[recent]), first_pass: at(trunk[recent - 1]) }
-    });
-  if (trunk.length >= cfg.minTrunkRuns && trunkFails + trunkFlaky > 0 && laplace >= cfg.pMin && latestTrunk?.status !== "failed") {
-    const unlike = notTrunksFlake();
-    if (unlike) return unlike;
-    return out("FLAKY_ON_TRUNK", `Unstable on trunk: ${trunkFails} failures and ${trunkFlaky} flaky passes in the last ${trunk.length} trunk runs.`, false);
-  }
-  if (failedPRs.length >= cfg.crossPRMinPRs && trunkFails === 0 && trunkPasses > 0)
-    return out("FLAKY_CROSS_PR", `Failed${ownKey.kind === "distinctive" ? " with the same error" : ownKey.kind === "stuck" ? " stuck at the same step" : ownKey.kind === "bare" ? " with the same bare timeout" : ""} on ${failedPRs.length} other PRs in the last ${cfg.crossPRRuns} runs (${stats.cross_pr.examples.slice(0, 3).join(", ")}) while trunk stayed green.`, false);
-  if (trunk.length < cfg.minTrunkRuns)
-    return out("INSUFFICIENT_DATA", `Only ${trunk.length} trunk runs found (need ${cfg.minTrunkRuns}); history cannot clear it.`, true);
-  return out("REGRESSION", `Fails here, passes on trunk (${trunkPasses}/${trunk.length}) and was not failing on other PRs enough to call it flaky (${failedPRs.length}).`, true);
-}
-var GENERIC_ERROR_RE = /^(?:\w*error:\s*)?(?:thrown:\s*)?["']?(?:test timeout|exceeded timeout|timeout of|timed out)/i;
-function errorSignature(error) {
-  const kept = [];
-  for (const line of String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).map((l) => l.trim())) {
-    if (!line) continue;
-    if (/^at\s/.test(line) || /^call log:/i.test(line)) break;
-    kept.push(line);
-    if (kept.length === 3) break;
-  }
-  if (!kept.length || GENERIC_ERROR_RE.test(kept[0])) return null;
-  const sig = kept.join(" ").replace(/\s+at\s+(?:async\s+)?(?:\S+\s+)?\(?(?:file:\/\/)?(?:[A-Za-z]:)?[\\/].*$/, "").replace(/\b(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{6,}\b/gi, "<id>").replace(/\b\d{4,}\b/g, "<n>").replace(/\s+/g, " ").trim();
-  return sig.length >= 30 ? sig : null;
-}
-var TIMEOUT_FIRST_RE = /^(?:\w*error:\s*)?(?:thrown:\s*)?(?:test failed:\s*)?["']?(?:test timeout|exceeded timeout|timeout of\b|timed out|[\d.]+\s*sec timeout|[\w.]+:\s*timeout\s*[\d.]+\s*ms|timeout\s*[\d.]+\s*ms)/i;
-var TIMEOUT_ACTION_RE = /^(?:\w*error:\s*)?([\w.]+):\s*timeout\s*[\d.]+\s*ms/i;
-var FRAME_RE = /^at\s|^(?:>\s*)?\d+\s*\||^\||^\^|^Add a timeout value/;
-var FIRST_LINE_STEP = [
-  [/timed out (?:after waiting for|waiting for)\s+(.+)$/i, (m) => /^[\d.,\s]*(?:ms|sec|s)?\s*$/i.test(m[1]) ? null : `waiting for ${m[1]}`],
-  [/timed out retrying after [\d.]+\s*ms:\s*(.+)$/i, (m) => `retrying ${m[1].replace(/,\s*but the text was.*$/, "")}`],
-  [/timeout expired without matching of given matcher:\s*(.+)$/i, (m) => `matcher ${m[1]}`],
-  [/timed out while waiting for expectation:\s*(.+?)(?:\s+TIMEOUT\(.*\))?$/i, (m) => `expectation ${m[1]}`],
-  [/while waiting for event\s+("[^"]*"|\S+)/i, (m) => `event ${m[1]}`]
-];
-function stuckStep(lines) {
-  const first = lines[0];
-  const action = TIMEOUT_ACTION_RE.exec(first)?.[1] ?? null;
-  let target = null;
-  for (const l of [...lines.slice(1), first]) {
-    const w = /^-?\s*(waiting for\s+.+)$/i.exec(l);
-    if (w) {
-      target = w[1];
-      break;
-    }
-  }
-  for (const [re, describe] of FIRST_LINE_STEP) {
-    if (target) break;
-    const m = re.exec(first);
-    if (m) target = describe(m);
-  }
-  if (!action && !target) return null;
-  return [action ? `action ${action}` : null, target].filter(Boolean).join(" ").replace(/\b(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{6,}\b/gi, "<id>").replace(/\b\d{4,}\b/g, "<n>").replace(/\b\d+(?:\.\d+)?\s*sec\b/gi, "<n>sec").replace(/\s+/g, " ").trim();
-}
-var maskIds = (error) => String(error ?? "").replace(/(?<![a-z0-9])[a-z0-9]{26}(?![a-z0-9])/g, "<id>");
-function sameFirstLine(a, b) {
-  const ka = failureKey(a);
-  const kb = failureKey(b);
-  return (ka.kind === "distinctive" || ka.kind === "stuck") && kb.kind === ka.kind && kb.key === ka.key;
-}
-function failureKey(error) {
-  const lines = [];
-  for (const raw of String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/)) {
-    const l = raw.trim();
-    if (!l) continue;
-    if (lines.length && FRAME_RE.test(l)) break;
-    lines.push(l);
-  }
-  if (lines.length && TIMEOUT_FIRST_RE.test(lines[0])) {
-    const step = stuckStep(lines);
-    return step ? { kind: "stuck", key: step } : { kind: "bare", key: null };
-  }
-  const sig = errorSignature(error);
-  return sig ? { kind: "distinctive", key: sig } : { kind: "unusable", key: null };
-}
-function sameKey(error) {
-  return failureKey(error).kind === "distinctive" ? errorSignature(error) : null;
-}
-function sameFailure(findings) {
-  const blamed = (f) => f.judge?.cause === "caused_by_pr";
-  const keyOf = (f) => {
-    const sig = sameKey(f.error);
-    return sig ? JSON.stringify([f.repo_path ?? f.file, sig]) : null;
-  };
-  const anchors = /* @__PURE__ */ new Map();
-  for (const f of findings) {
-    if (f.blocking || !EXONERATED.has(f.class) || f.identity_unresolved || blamed(f)) continue;
-    const sig = sameKey(f.error);
-    if (!sig || !(f.failure_signatures ?? []).includes(sig)) continue;
-    const k = keyOf(f);
-    if (!anchors.has(k)) anchors.set(k, f);
-  }
-  for (const f of findings) {
-    if (!f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.decision === "evidence_incomplete" || f.failed_everywhere || f.pr_streak || blamed(f)) continue;
-    const k = keyOf(f);
-    const anchor = k ? anchors.get(k) : void 0;
-    if (!anchor) continue;
-    Object.assign(f, {
-      class: "SAME_FAILURE_AS_CLEARED",
-      blocking: false,
-      decision: "same_failure",
-      same_as: anchor.full_title || anchor.title,
-      same_as_class: anchor.class,
-      reason: `Fails with the same error as "${anchor.title}" in this spec, which history cleared (${anchor.class}): ${anchor.reason}`
-    });
-  }
-  return findings;
-}
-function holdFailedEverywhere(findings) {
-  const flaky = /* @__PURE__ */ new Set(["FLAKY_ON_TRUNK", "FLAKY_CROSS_PR"]);
-  for (const f of findings) {
-    if (!(BORDERLINE.has(f.class) || flaky.has(f.class)) || f.identity_unresolved || !f.tries || f.tries.ran < 2 || f.tries.failed !== f.tries.ran) continue;
-    const on = [...new Set((f.other_lanes ?? []).filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform))];
-    if (!on.length) continue;
-    const why = `Failed all ${f.tries.ran} tries here and failed on ${on.join(" and ")} on this same commit; a flake rarely does that.`;
-    Object.assign(f, {
-      ...flaky.has(f.class) || !f.blocking ? { class: "REGRESSION" } : {},
-      blocking: true,
-      failed_everywhere: on,
-      reason: `${why} ${flaky.has(f.class) ? `Its clear does not stand: ${f.reason}` : f.reason}`
-    });
-  }
-  return findings;
-}
-var errorFirstLine = (error) => (String(error ?? "").replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).find((l) => l.trim()) ?? "").trim().slice(0, 200);
-var differentError = (a, b) => {
-  const ka = failureKey(a);
-  const kb = failureKey(b);
-  return ka.kind !== kb.kind || ka.key !== kb.key || ka.key == null && errorFirstLine(a) !== errorFirstLine(b);
-};
-function markEarlierFailures(findings) {
-  const earlier = (a, b) => Boolean(a.report_name) && a.report_name === b.report_name && typeof a.ordinal === "number" && typeof b.ordinal === "number" && a.ordinal < b.ordinal;
-  for (const f of findings) {
-    const spec = f.repo_path ?? f.file;
-    let first = null;
-    for (const o of findings) {
-      if (o === f || (o.repo_path ?? o.file) !== spec || !earlier(o, f) || !differentError(o.error, f.error)) continue;
-      if (!first || earlier(o, first)) first = o;
-    }
-    if (first) f.earlier_failure = { title: (first.full_title || first.title).slice(0, 200), error: errorFirstLine(first.error), class: first.class };
-  }
-  return findings;
-}
-function infraVerdict(failing, cfg = DEFAULTS) {
-  if (!failing.length) return null;
-  const infra = failing.filter((t) => isInfraError(t.error)).length;
-  if (infra >= Math.max(3, Math.ceil(failing.length / 2)))
-    return `${infra} of ${failing.length} failures are infrastructure errors (server health, connectivity, device, shard that never ran); rerun when the environment recovers.`;
-  if (failing.length >= cfg.infraMinFailures)
-    return `${failing.length} tests failed in one run; check for a shared environment, build or product failure first.`;
-  return null;
 }
 
 // ../e2e-test-triage/src/render.ts
@@ -1697,8 +1726,10 @@ var laneName = (context) => String(context).replace(/^e2e(-test)?\//, "");
 function namedIn(description) {
   const d = String(description ?? "");
   const count2 = (re) => Number(re.exec(d)?.[1] ?? 0);
+  const brokenMain = count2(/(\d+) broken on main/);
   return {
-    cleared: count2(/(\d+) cleared by triage/) + count2(/(\d+) flaky/) + count2(/(\d+) broken on main/) + count2(/(\d+) test bug/) + count2(/(\d+) server compat/),
+    cleared: count2(/(\d+) cleared by triage/) + count2(/(\d+) flaky/) + brokenMain + count2(/(\d+) test bug/) + count2(/(\d+) server compat/),
+    brokenMain,
     caused: count2(/(\d+) caused by PR/),
     appBug: count2(/(\d+) app bug/),
     fixed: count2(/(\d+) fixed on main/),
@@ -1717,22 +1748,28 @@ function releaseFromDescriptions(descriptions) {
   if (ds.some((d) => /\b\d+ out of date\b/.test(d))) return true;
   return void 0;
 }
-function redReason(description = "", release = false) {
+var CLEARED_WORDINGS = ["full", "short", "none"];
+var STATUS_LIMIT = 140;
+function redReason(description = "", release = false, pr = true, wording = "full") {
   const d = String(description);
   const lane = /^\((machine failure, [^)]+|broken on main, not your change|broken on main|fixed on main, not your change|fixed on main, merge [^)]+|out of date, merge [^)]+|caused by PR|needs investigation)\)/.exec(d)?.[1];
   if (lane) return lane.replace(/^out of date/, "fixed on main").replace(/^needs investigation$/, "machine failure, re-run");
   if (/triage is checking why/.test(d)) return "triage is checking why";
-  const { cleared, caused, appBug, fixed, outdated, machine, brokenBranch, check } = namedIn(d);
+  const { cleared, brokenMain: brokenOnMain, caused, appBug, fixed, outdated, machine, brokenBranch, check } = namedIn(d);
   const parts = [];
   const pull = PULL_GUIDANCE.exec(d)?.[0];
-  const notYours = cleared + (release ? 0 : fixed);
-  if (notYours) parts.push(`${notYours} not caused by PR`);
+  const brokenMain = pr ? 0 : brokenOnMain;
+  const notYours = cleared - brokenMain + (release ? 0 : fixed);
+  if (brokenMain) parts.push(`${brokenMain} broken on main`);
+  const clearedAt = parts.length;
+  if (notYours) parts.push(wording === "full" ? `${notYours} not caused by ${pr ? "PR" : "this commit"}` : `${notYours} cleared`);
   if (caused) parts.push(`${caused} caused by PR`);
   if (appBug) parts.push(`${appBug} app bug`);
   const fixedHere = (release ? fixed : 0) + outdated;
   if (fixedHere) parts.push(`${fixedHere} fixed on main`);
   else if (pull) parts.push("fixed on main");
   if (brokenBranch) parts.push(`${brokenBranch} broken on branch`);
+  const actionAt = parts.length;
   if (machine + check) parts.push(`${machine + check} machine failure${machine + check === 1 ? "" : "s"}, re-run`);
   const held = /not re-run: ([^;)]+)/.exec(d)?.[1];
   const again = /re-running the failed jobs/.test(d) ? "re-running" : "re-run";
@@ -1747,38 +1784,101 @@ function redReason(description = "", release = false) {
   if (/environment errors, re-run/.test(d)) parts.push("environment errors, re-run");
   else if (/investigation required|many failures in one run/.test(d)) parts.push("many failures in one run");
   if (/triage could not finish/.test(d)) parts.push("triage could not finish");
+  if (wording === "action" && parts.length > actionAt) parts.splice(0, actionAt);
+  else if ((wording === "none" || wording === "action") && notYours && parts.length > 1) parts.splice(clearedAt, 1);
   return parts.length ? parts.join(", ") : "still red";
 }
-function laneSummary(lanes, untriaged = [], release) {
+function laneSummary(lanes, untriaged = [], release, pr = true) {
   const seen = lanes.filter((l) => Boolean(l.status));
+  const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
+  const rerunNote = (reasons) => reasons.some((r) => /(?<!not )\bre-run\b/.test(r)) ? ", re-run" : "";
   const redOthers = untriaged.filter((l) => l.status && l.status.state !== "success" && l.status.state !== "pending");
   const judgedOther = (l) => /^\([^)]+\) /.test(String(l.status?.description ?? ""));
   const otherRed = redOthers.filter((l) => !judgedOther(l)).map((l) => laneName(l.context));
-  const otherJudged = redOthers.filter(judgedOther).map((l) => `${laneName(l.context)}: ${redReason(l.status?.description, release ?? false)}`);
-  const otherText = [
-    ...otherJudged.slice(0, 2),
-    otherJudged.length > 2 ? `+${otherJudged.length - 2} triaged red` : "",
-    otherRed.length ? `not triaged: ${otherRed.slice(0, 2).join(", ")}${otherRed.length > 2 ? ` +${otherRed.length - 2}` : ""} red` : ""
-  ].filter(Boolean).join(" \xB7 ");
-  const withOther = (text) => {
-    if (!otherText) return text;
-    if (`${text} \xB7 ${otherText}`.length <= 140) return `${text} \xB7 ${otherText}`;
-    const count2 = otherJudged.length ? `${otherJudged.length + otherRed.length} other E2E check(s) red` : `not triaged: ${otherRed.length} red`;
-    const room = 140 - count2.length - 3;
-    return `${text.length > room ? `${text.slice(0, room - 1)}\u2026` : text} \xB7 ${count2}`;
+  const judged = redOthers.filter(judgedOther);
+  const otherReason = (l, wording) => redReason(l.status?.description, isRelease, pr, wording);
+  const otherNamed = (wording, shownJudged, shownRed) => {
+    const namedJudged = judged.filter((_, i) => shownJudged.includes(i));
+    const restJudged = judged.filter((_, i) => !shownJudged.includes(i));
+    const namedRed = otherRed.filter((_, i) => shownRed.includes(i));
+    const restRed = otherRed.length - namedRed.length;
+    const red2 = [namedRed.join(", "), restRed ? `${namedRed.length ? "+" : ""}${restRed}` : ""].filter(Boolean).join(" ");
+    return [
+      ...namedJudged.map((l) => `${laneName(l.context)}: ${otherReason(l, wording)}`),
+      restJudged.length ? `${namedJudged.length ? "+" : ""}${restJudged.length} triaged red${rerunNote(restJudged.map((l) => otherReason(l, "none")))}` : "",
+      otherRed.length ? `not triaged: ${red2} red` : ""
+    ].filter(Boolean).join(" \xB7 ");
   };
-  const waiting = seen.filter((l) => l.status.state === "pending");
-  if (waiting.length) return { state: "pending", description: withOther(`Triage is checking: waiting for ${waiting.map((l) => laneName(l.context)).join(", ")}`) };
+  const subsets = (n, k) => k === 0 ? [[]] : Array.from({ length: n }, (_, i) => i).flatMap((i) => subsets(n - i - 1, k - 1).map((rest) => [i, ...rest.map((j) => j + i + 1)]));
+  const choices = (n, min = 0) => [.../* @__PURE__ */ new Set([Math.min(2, n), Math.min(1, n), 0])].filter((k) => k >= min).flatMap((k) => subsets(n, k));
+  const judgedNamed = choices(judged.length, 1).flatMap((j) => choices(otherRed.length).map((r) => [j, r]));
+  const otherSteps = [
+    ...judgedNamed.flatMap((shown) => [[shown, CLEARED_WORDINGS], [shown, ["action"]]]),
+    ...choices(otherRed.length, 1).map((r) => [[[], r], ["none"]]),
+    ...judged.length && otherRed.length ? [[[[], []], ["none"]]] : []
+  ];
+  const otherCount = judged.length ? `${judged.length + otherRed.length} other E2E check(s) red${rerunNote(judged.map((l) => otherReason(l, "none")))}` : `not triaged: ${otherRed.length} red`;
+  const join2 = (...parts) => parts.filter(Boolean).join(" \xB7 ");
+  const fit = (texts, fewer = []) => {
+    const fits = (text) => text.length <= STATUS_LIMIT;
+    const own = [...new Set(texts)];
+    if (redOthers.length) {
+      for (const [[shownJudged, shownRed], wordings] of otherSteps) {
+        for (const text of own) {
+          for (const wording of wordings) {
+            const candidate = join2(text, otherNamed(wording, shownJudged, shownRed));
+            if (fits(candidate)) return candidate;
+          }
+        }
+      }
+    }
+    const other = redOthers.length ? otherCount : "";
+    const all = [...own, ...fewer];
+    for (const text of all) {
+      const candidate = join2(text, other);
+      if (fits(candidate)) return candidate;
+    }
+    const room = STATUS_LIMIT - (other ? other.length + 3 : 0);
+    return join2(`${(all[all.length - 1] ?? "").slice(0, room - 1)}\u2026`, other);
+  };
+  const waiting = seen.filter((l) => l.status.state === "pending").map((l) => laneName(l.context));
+  if (waiting.length) {
+    const waitingFor = (shown) => shown ? `Triage is checking: waiting for ${waiting.slice(0, shown).join(", ")}${shown < waiting.length ? ` +${waiting.length - shown} more` : ""}` : `Triage is checking: waiting for ${waiting.length} lane(s)`;
+    return { state: "pending", description: fit(Array.from({ length: waiting.length + 1 }, (_, i) => waitingFor(waiting.length - i))) };
+  }
   const red = seen.filter((l) => l.status.state !== "success");
-  const isRelease = release ?? releaseFromDescriptions(seen.map((l) => l.status.description)) ?? false;
   const cleared = seen.filter((l) => {
     const n = namedIn(l.status.description);
     return l.status.state === "success" && n.cleared + (isRelease ? 0 : n.fixed) > 0;
   });
   const clearedText = cleared.length ? `${cleared.map((l) => laneName(l.context)).join(", ")} cleared by triage` : "";
-  if (red.length) return { state: "failure", description: withOther([...red.map((l) => `${laneName(l.context)}: ${redReason(l.status.description, isRelease)}`), clearedText].filter(Boolean).join(" \xB7 ")) };
-  if (otherText) return { state: "success", description: withOther([clearedText, "triaged lanes green"].filter(Boolean).join(" \xB7 ")) };
-  return { state: "success", description: clearedText ? `${clearedText} \xB7 all lanes green` : "All lanes green" };
+  const clearedCount = cleared.length ? `${cleared.length} lane(s) cleared by triage` : "";
+  if (red.length) {
+    const reasons = (wording) => red.map((l) => ({ name: laneName(l.context), reason: redReason(l.status.description, isRelease, pr, wording) }));
+    const named = (wording, shown) => {
+      const rs = reasons(wording);
+      const rest = rs.slice(shown).map((r) => r.reason);
+      const counted = rest.length ? `${shown ? "+" : ""}${rest.length}${shown ? " more" : ""} lane(s) red${rerunNote(rest)}` : "";
+      return join2(...rs.slice(0, shown).map((r) => `${r.name}: ${r.reason}`), counted);
+    };
+    const texts = [
+      ...CLEARED_WORDINGS.map((wording) => join2(named(wording, red.length), clearedText)),
+      join2(named("none", red.length), clearedCount),
+      named("none", red.length)
+    ];
+    const fewer = [];
+    for (let shown = red.length; shown >= 0; shown--) {
+      for (const wording of ["none", "action"]) {
+        if (shown || wording === "action") fewer.push(join2(named(wording, shown), clearedCount), named(wording, shown));
+      }
+    }
+    return { state: "failure", description: fit(texts, fewer) };
+  }
+  if (redOthers.length) {
+    return { state: "success", description: fit([join2(clearedText, "triaged lanes green"), join2(clearedCount, "triaged lanes green"), "triaged lanes green"]) };
+  }
+  if (clearedText) return { state: "success", description: fit([`${clearedText} \xB7 all lanes green`, `${clearedCount} \xB7 all lanes green`]) };
+  return { state: "success", description: "All lanes green" };
 }
 
 // ../shared/src/status.ts
@@ -1888,7 +1988,8 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
     const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
-    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease), context: summaryContext }, snapshotOwner());
+    const pr = Number(id.gh_pr_number || 0) > 0;
+    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease, pr), context: summaryContext }, snapshotOwner());
   };
   return {
     allowed,
@@ -2100,7 +2201,13 @@ function buildPack(finding, compareFiles, pr, others, ctx = NO_CHANGE_CONTEXT) {
   const pack = {
     test: { title: finding.title, full_title: finding.full_title ?? null, suite: finding.suite_title ?? null, file: finding.file, report_scope: finding.report_scope ?? null, report_name: finding.report_name ?? null, lane: pr.lane },
     error: compactError(finding.error),
-    trunk_history_14d: { runs: finding.trunk.runs, fails: finding.trunk.fails, flaky: finding.trunk.flaky, latest: finding.trunk.latest },
+    trunk_history_14d: {
+      runs: finding.trunk.runs,
+      fails: finding.trunk.fails,
+      flaky: finding.trunk.flaky,
+      latest: finding.trunk.latest,
+      ...finding.trunk.same_error ? { same_error: true } : {}
+    },
     cross_pr_failures_14d: { id: "cross_pr", other_prs_where_this_test_failed: finding.cross_pr.examples, other_pr_runs_where_it_passed: finding.cross_pr.passes },
     pr: { number: pr.number, repository: pr.repository, title: pr.title, changed_file_count: names.length, changed_files: names.slice(0, 200), spec_file_changed_by_pr: names.includes(ownPath), change_summary: changes },
     diff_hunks_of_files_named_in_error: hunks,
@@ -2462,7 +2569,8 @@ Rules:
 - Cite only evidence items by their id from the pack. Never invent commits, versions, files or errors.
 - test_bug with high confidence requires base_change with a diff that fixes what this failure shows.
 - server_compat with high confidence requires other_platforms showing this test passing against another server version
-  on this build, and failing against this lane's version.
+  on this build, and failing against this lane's version. Passing on another OS against the SAME server version rules out
+  server_compat and points to flaky_environment (for example, a shared-server config race or runner timing).
 - flaky_environment with high confidence requires cross_pr or an error that is clearly infrastructural; it is ruled out
   when the test failed every try here and failed on every other lane.
 - app_bug: the error is about the app's behavior and no evidence points to the test, the environment or a server
@@ -2631,6 +2739,7 @@ var PLATFORM_FILES = {
   macos: /(^|[/_.-])(mac|macos|darwin|osx|dmg|mas)([/_.-]|$)|\.(entitlements|plist)$/i
 };
 var onlyOnPlatform = (platform, file) => Boolean(PLATFORM_FILES[platform]?.test(file));
+var isPlatformFile = (file) => Object.keys(PLATFORM_FILES).some((p) => onlyOnPlatform(p, file));
 var onlyElsewhere = (platform, file) => !onlyOnPlatform(platform, file) && Object.keys(PLATFORM_FILES).some((p) => p !== platform && onlyOnPlatform(p, file));
 function commonSenseClear(f, pack) {
   if (!pack || !f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.out_of_date || f.pr_streak || f.decision === "evidence_incomplete") return null;
@@ -2648,6 +2757,7 @@ function commonSenseClear(f, pack) {
 }
 
 // ../e2e-test-triage/src/decision.ts
+var trunkSameFailure = (trunk) => Boolean(trunk?.same_error) && ((trunk?.fails ?? 0) > 0 || (trunk?.flaky ?? 0) > 0 || trunk?.latest === "failed");
 function unblocks(cause, cited, pack, cls = "") {
   const has = (...ids) => ids.some((id) => cited.includes(id));
   const trunk = pack.trunk_history_14d ?? {};
@@ -2656,7 +2766,7 @@ function unblocks(cause, cited, pack, cls = "") {
     return (cause === "flaky_environment" || cause === "bug_on_master") && has("cross_pr", "this_pr");
   }
   if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error) || has("earlier_failure_same_spec") && chainClears(pack);
-  if (cause === "bug_on_master") return has("cross_pr") || has("trunk_history_14d") && ((trunk.fails ?? 0) > 0 || (trunk.flaky ?? 0) > 0 || trunk.latest === "failed");
+  if (cause === "bug_on_master") return has("cross_pr") || has("trunk_history_14d") && trunkSameFailure(trunk);
   if (cause === "test_bug") return has("this_pr");
   return false;
 }
@@ -2698,19 +2808,23 @@ function canChange(cls, pack, isTrunkRun = false) {
   const hunk = ids.some((id) => id.startsWith("hunk_"));
   if (exoneratedSet(isTrunkRun).has(cls)) return hunk;
   if (cls === "INFRA_ERROR") return CLEARING(ids);
-  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack);
+  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack) || trunkSameFailure(pack.trunk_history_14d);
   return false;
 }
 function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
-  if (!answer || pack.release) return false;
+  if (!answer) return false;
   const known = new Set(evidenceIds(pack));
   const cited = answer.cited_evidence.filter((c) => known.has(c));
+  if (pack.release) {
+    if (answer.confidence < cfg.escalateMin || answer.confidence >= cfg.minConfidence) return false;
+    return answer.cause === "app_bug" || decideRelease({ ...answer, confidence: cfg.minConfidence }, pack, cfg).decision === "adjudicator_unblock";
+  }
   const hunk = cited.some((c) => c.startsWith("hunk_"));
   if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
   if (answer.confidence < cfg.escalateMin) return false;
   if (exoneratedSet(isTrunkRun).has(cls)) return answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.vetoMin;
-  const clears = CLEARING(cited) || cls !== "INFRA_ERROR" && answer.cause === "flaky_environment" && (isInfraError(pack.error) || cited.includes("earlier_failure_same_spec") && chainClears(pack));
-  return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && clears;
+  if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.minConfidence) return true;
+  return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && unblocks(answer.cause, cited, pack, cls);
 }
 var JUDGED_PER_CALL = 8;
 async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
@@ -2872,7 +2986,8 @@ async function evaluateRun({
 }) {
   const isTrunkRun = prNumber == null;
   const tests = run.failing.filter((t) => !isShardPlaceholder(t));
-  const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg), counts: run.counts, ai: newLedger(), missing: null };
+  const executed = Math.max(0, run.counts.total - run.counts.skipped);
+  const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg, executed || void 0), counts: run.counts, ai: newLedger(), missing: null };
   const changedFiles = new Set((diff.files ?? []).map((f) => f.filename));
   const editedBy = (file) => {
     const path = repoPath(testRoot, file);
@@ -2902,7 +3017,11 @@ async function evaluateRun({
         patches: diff.ok ? files : null
       });
     });
-    if (result.infra) {
+    const nonProductOnly = Boolean(prNumber) && diff.ok && files.length > 0 && files.every((f) => {
+      const cat = changeCategory(f.filename, changeContext);
+      return cat === "docs" || cat === "other";
+    });
+    if (result.infra && (!isTrunkRun || Boolean(branchBase)) && !nonProductOnly) {
       const why = /infrastructure errors/.test(result.infra) ? "most of this run failed on its environment" : "many tests failed in this run";
       for (const f of result.findings)
         if (f.class === "INFRA_ERROR" && !f.blocking)
@@ -3052,7 +3171,10 @@ function settlePR(findings, changed, ownershipKnown, flagged, files = [], minTru
     const everyTry = Boolean(f.tries && f.tries.ran >= 2 && f.tries.failed === f.tries.ran);
     const elsewhere = f.failed_everywhere?.length ? f.failed_everywhere : null;
     const trunkClean = Boolean(t && t.runs >= minTrunkRuns && (t.lane_runs ?? t.runs) >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
-    if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length) {
+    const passedElsewhere = Boolean(f.other_lanes?.length) && f.other_lanes.some((l) => l.result === "passed") && !f.other_lanes.some((l) => l.result !== "passed" && l.result !== "skipped");
+    const platformChange = changed.some(isPlatformFile);
+    const judgeClearsEnv = !elsewhere && Boolean(f.judge && f.judge.cause === "flaky_environment" && f.judge.confidence >= 0.7 && !f.judge.cited_evidence.some((c) => c.startsWith("hunk_")));
+    if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length && !(passedElsewhere && !platformChange) && !judgeClearsEnv) {
       Object.assign(f, {
         untouched: true,
         decision: "reproducible_regression",
@@ -3700,7 +3822,7 @@ function errorLines(lines, max = 5) {
   }
   return [...counts.values()].sort((a, b) => b.n - a.n).slice(0, max).map((c) => c.line);
 }
-async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runnerName, prefix: given, log }) {
+async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runnerName, prefix: given, filter, log }) {
   const get = async (path) => {
     let last = null;
     for (let i = 0; i < 3; i++) {
@@ -3722,7 +3844,14 @@ async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runn
     const own = all.find((j) => j.runner_name === runnerName && j.status !== "completed");
     if (own) prefix = lanePrefixOf(own.name);
   }
-  const lane = prefix ? all.filter((j) => j.name.startsWith(prefix)) : all;
+  const tokens2 = String(filter ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const include = tokens2.filter((t) => !t.startsWith("!"));
+  const exclude = tokens2.filter((t) => t.startsWith("!")).map((t) => t.slice(1)).filter(Boolean);
+  const byPrefix = prefix ? all.filter((j) => j.name.startsWith(prefix)) : all;
+  const lane = tokens2.length ? byPrefix.filter((j) => {
+    const name = j.name.toLowerCase();
+    return (!include.length || include.some((t) => name.includes(t))) && !exclude.some((t) => name.includes(t));
+  }) : byPrefix;
   const failedStep = (j) => j.steps?.find((s) => s.conclusion === "failure") ?? j.steps?.find((s) => s.conclusion === "cancelled" || s.conclusion === "timed_out") ?? null;
   let workerLogs = 0;
   const out = [];
@@ -3744,7 +3873,8 @@ async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runn
     }
     out.push(job);
   }
-  return { prefix, jobs: out };
+  const allJobs = byPrefix.map((j) => ({ id: j.id, short: j.name.slice(prefix.length) }));
+  return { prefix, jobs: out, allJobs };
 }
 
 // ../e2e-test-triage/src/lane-verdict.ts
@@ -3773,6 +3903,7 @@ async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRu
       attempt: runAttempt,
       runnerName: env.RUNNER_NAME ?? null,
       prefix: env.LANE_JOB_PREFIX || null,
+      filter: env.LANE_JOB_FILTER || null,
       log
     });
   } catch (e) {
@@ -3783,7 +3914,7 @@ async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRu
   if ((orchestration || noResults) && !allPassed(orchestration) && base) baseline = await readBaseline({ api, fetchImpl, tsio, id, context, base, trunkRun, log, historyLane: env.HISTORY_LANE || null });
   const verdict = diagnoseLane({ trunkRun, orchestration, orchestrationError, jobs: jobs?.jobs ?? null, jobsError, prFiles, baseline, lanePaths, staleRerun, judgedSpecs });
   const startName = env.LANE_START_JOB || "prepare-run";
-  const startJobId = jobs?.jobs.find((j) => j.short === startName)?.id ?? null;
+  const startJobId = (jobs?.allJobs ?? jobs?.jobs)?.find((j) => j.short === startName)?.id ?? null;
   return { verdict, orchestration, jobs, baseline, startJobId };
 }
 
@@ -4063,7 +4194,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       // A release run's matrix (OS x server version) is wider than a PR's platforms.
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log, limit: branchBase ? 20 : 5 }),
-      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths }),
+      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths, fetchFileDiffs: Boolean(branchBase) }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory

@@ -1555,15 +1555,16 @@ test("an answer that blames the PR without citing a change goes to the escalatio
   const kept = await run(ungrounded);
   assert.equal(kept.f.blocking, true);
   assert.equal(kept.f.escalated, true);
-  // Blame that names a related change is grounded and is not second-guessed.
+  // High-confidence blame that names a related change is grounded and is not second-guessed.
   const h = classify({ ...failing, error: "Error: expected server_form to be visible" }, [...trunkPasses(8), ...crossPR(31)], [], undefined, 1);
   const pack = buildPack(h, [{ filename: "app/server_form.tsx", patch: "@@ -1 +1 @@" }], prCtx, []);
   const hunkId = pack.diff_hunks_of_files_named_in_error.find((x) => x.related)?.id;
   assert.ok(hunkId, "the changed component the error names is a related hunk");
   const models: string[] = [];
-  await judge([h], [pack], async (packs, model) => { models.push(model); return ok({ ...ungrounded, cited_evidence: ["error", hunkId] })(packs, model); }, DEFAULTS, () => {});
+  await judge([h], [pack], async (packs, model) => { models.push(model); return ok({ ...ungrounded, confidence: 0.9, cited_evidence: ["error", hunkId] })(packs, model); }, DEFAULTS, () => {});
   assert.deepEqual(models, [DEFAULTS.model]);
   assert.equal(h.blocking, true);
+  assert.equal(h.decision, "adjudicator_blame");
 });
 
 test("prices are looked up by model family and can be overridden", () => {
@@ -2080,13 +2081,15 @@ test("a blocking environment error is never cleared as broken on trunk by trunk'
   const f = classify({ file: "specs/s0.spec.ts", title: "t0", error: SERVER_DOWN }, [], []);
   assert.equal(f.class, "INFRA_ERROR");
   const base = buildPack(f, [], { lane: "linux" } as PrRef, []);
-  const pack: Pack = { ...base, trunk_history_14d: { ...base.trunk_history_14d, fails: 1, latest: "failed" } };
+  const pack: Pack = { ...base, trunk_history_14d: { ...base.trunk_history_14d, fails: 1, latest: "failed", same_error: true } };
+  const diffErrPack: Pack = { ...base, trunk_history_14d: { ...base.trunk_history_14d, fails: 1, latest: "failed" } };
   const onTrunk: Answer = { cause: "bug_on_master", confidence: 0.95, cited_evidence: ["trunk_history_14d"], explanation: "x" };
   assert.equal(decide("INFRA_ERROR", onTrunk, pack).blocking, true);
   assert.equal(unblocks("bug_on_master", ["trunk_history_14d"], pack, "INFRA_ERROR"), false);
   assert.equal(unblocks("bug_on_master", ["cross_pr"], pack, "INFRA_ERROR"), true, "the same failure on another PR still clears");
   assert.equal(unblocks("test_bug", ["cross_pr"], pack, "INFRA_ERROR"), false, "a test bug still needs a pass earlier on this PR");
-  assert.equal(unblocks("bug_on_master", ["trunk_history_14d"], pack, "REGRESSION"), true, "other classes keep the trunk rule");
+  assert.equal(unblocks("bug_on_master", ["trunk_history_14d"], pack, "REGRESSION"), true, "other classes keep the trunk rule when trunk failed the same way");
+  assert.equal(unblocks("bug_on_master", ["trunk_history_14d"], diffErrPack, "REGRESSION"), false, "a different error on trunk cannot clear as bug_on_master");
 });
 
 test("a blocking environment error (infraClears off) is the judge's to clear or blame on any run", async () => {
@@ -5572,4 +5575,225 @@ test("changeTouchesFailure: a selector or phrase in documentation or a plain-tex
   for (const filename of ["docs/empty-states.md", "webapp/README.mdx", "CHANGELOG.md", "notes/selectors.txt", "LICENSE"])
     assert.equal(changeTouchesFailure(sel, [{ filename, patch: line }]), null, filename);
   assert.equal(changeTouchesFailure(sel, [{ filename: "docs/empty-states.md", patch: line }, { filename: "a.tsx", patch: line }])?.file, "a.tsx");
+});
+
+test("laneOf maps mobile release/CMT groups to their main lane while keeping cmt-desktop isolated", () => {
+  assert.equal(laneOf("mobile-release-detox-ios-Server_12.1.0"), "detox-ios");
+  assert.equal(laneOf("mobile-release-detox-android-Server_12.1.0-rc2"), "detox-android");
+  assert.equal(laneOf("mobile-release-maestro-ios-Server_12.1.0"), "maestro-ios");
+  assert.equal(laneOf("mobile-cmt-detox-ios-Server_11.11.4"), "detox-ios");
+  assert.equal(laneOf("mobile-release-detox-ios-Server_12.1.0"), laneOf("mobile-main-detox-ios"));
+  assert.equal(laneOf("cmt-desktop"), "cmt-desktop", "multi-server desktop CMT groups stay isolated from desktop-pr");
+  assert.equal(historyLane({ repository: "o/r", commit_sha: "a", gh_run_id: "1", name: "cmt-desktop" }, configFrom({ HISTORY_LANE: "desktop-master" })), "default");
+});
+
+test("INFRA_RE matches Maestro device-unreachable, Detox isReady crash, and shared-server feature_disabled races", () => {
+  for (const err of [
+    "maestro.DeviceUnreachableException: Device became unreachable during flow",
+    'Error: Detox can\'t seem to connect to the test app(s)! pending request #-1000 ("isReady")',
+    "ApiError: attributes_feature_disabled: Custom attributes feature is disabled",
+    "ApiError: permission_policies.feature_disabled: ABAC feature is disabled",
+  ]) assert.equal(isInfraError(err), true, err);
+});
+
+test("infraVerdict and dropStormRuns catch small-suite storms (e.g. Maestro 9/13 wipeout)", async () => {
+  const fail = { error: "Error: element not found" };
+  assert.equal(infraVerdict(Array.from({ length: 9 }, () => fail), DEFAULTS, 13)?.includes("9 of 13 tests failed"), true);
+  assert.equal(infraVerdict(Array.from({ length: 4 }, () => fail), DEFAULTS, 8), null, "fewer than 5 failures is not a storm");
+  assert.equal(infraVerdict(Array.from({ length: 9 }, () => fail), DEFAULTS, 600), null, "9 of 600 is not a small-suite storm");
+  const rows: Observation[] = [
+    { file: "f.yaml", title: "t", status: "passed", retry_count: 0, gh_pr_number: null, branch: "main", commit_sha: "c2", created_at: "2026-10-02T00:00:00Z", group_id: "g_ok" },
+    { file: "f.yaml", title: "t", status: "failed", retry_count: 0, gh_pr_number: null, branch: "main", commit_sha: "c1", created_at: "2026-10-01T00:00:00Z", group_id: "g_storm" },
+  ];
+  const hist = new Map<string, Observation[]>([["k", [...rows]]]);
+  const dropped = await dropStormRuns({
+    history: hist,
+    fetchImpl: async () => Response.json({ test_stats: { total: 13, failed: 9, skipped: 0 } }),
+    base: "http://tsio",
+    minFailures: 30,
+    trunkBranch: "main",
+  });
+  assert.equal(dropped.has("g_storm"), true);
+});
+
+test("evaluateRun: trunk INFRA_ERROR is never held for a non-existent judge, and docs/metadata-only PRs are not held on remote infra errors", async () => {
+  const infraErr = 'Error: server at "https://calls.test.mattermost.cloud" is not healthy';
+  const threeInfra = [1, 2, 3].map((i) => ({ ...failing, file: `e2e/calls_${i}.test.ts`, title: `calls ${i}`, error: infraErr }));
+  const run = { ...runOf(threeInfra), counts: { total: 240, passed: 237, failed: 3, flaky: 0, skipped: 0 } };
+  const cfg = { ...DEFAULTS, infraClears: true };
+  const trunk = await evaluateRun({ run, id: { repository: "o/r", commit_sha: "abc", gh_run_id: "1", name: "desktop-master" }, prNumber: null, history: new Map(), diff: { files: [{ filename: "src/main/app.ts" }], ok: true }, trunkBranch: "master", testRoot: "e2e", cfg });
+  assert.equal(trunk.verdict, "SUCCESS", "trunk run clears INFRA_ERROR instead of deadlocking 'held for the judge'");
+  assert.ok(trunk.findings.every((f) => !f.blocking));
+
+  // Docs and repo-metadata-only PRs cannot break a remote test server.
+  for (const filename of ["README.md", "CODEOWNERS"]) {
+    const docsPr = await evaluateRun({ run, id: { repository: "o/r", commit_sha: "def", gh_run_id: "2", name: "desktop-pr" }, prNumber: 4106, history: new Map(), diff: { files: [{ filename }], ok: true }, trunkBranch: "master", testRoot: "e2e", cfg });
+    assert.equal(docsPr.verdict, "SUCCESS", `${filename}-only PR cannot break remote test server`);
+    assert.ok(docsPr.findings.every((f) => !f.blocking));
+  }
+
+  // Product, CI workflow (any filename), and lockfile PRs with 3/3 infra errors still hold for the judge.
+  for (const filename of ["src/main/server.ts", ".github/workflows/build.yml", ".github/workflows/e2e-functional.yml", "package-lock.json"]) {
+    const heldPr = await evaluateRun({ run, id: { repository: "o/r", commit_sha: "ghi", gh_run_id: "3", name: "desktop-pr" }, prNumber: 4107, history: new Map(), diff: { files: [{ filename }], ok: true }, trunkBranch: "master", testRoot: "e2e", cfg });
+    assert.equal(heldPr.verdict, "ACTION_REQUIRED", `${filename} must hold infra errors for the judge`);
+    assert.ok(heldPr.findings.every((f) => f.blocking));
+  }
+});
+
+test("settlePR: does not promote reproducible_regression when sibling platform passed (no platform diff) or judge called flaky_environment (unless failed_everywhere)", () => {
+  // Replay of mobile PR #10350 & #10309: failed 2/2 on Android, passed on iOS, shared TS diff.
+  const siblingPass = firstFailure({ tries: { ran: 2, failed: 2 }, other_lanes: [{ platform: "detox-ios", result: "passed" }] });
+  settlePR([siblingPass], ["app/components/post_list/post.tsx"], true, false, []);
+  assert.deepEqual([siblingPass.blocking, siblingPass.decision], [false, "first_failure"]);
+
+  // Platform-specific diff (including Podfile via shared PLATFORM_FILES) still blocks even if sibling platform passed.
+  for (const file of ["ios/Mattermost/AppDelegate.mm", "Podfile"]) {
+    const iosDiff = firstFailure({ tries: { ran: 2, failed: 2 }, other_lanes: [{ platform: "detox-android", result: "passed" }] });
+    settlePR([iosDiff], [file], true, false, []);
+    assert.deepEqual([iosDiff.blocking, iosDiff.decision], [true, "reproducible_regression"], `${file} is platform-specific`);
+  }
+
+  // Replay of mobile PR #10253: external website title changed; advisory judge said flaky_environment without citing hunks.
+  const judgedEnv = firstFailure({
+    tries: { ran: 2, failed: 2 },
+    judge: { cause: "flaky_environment", confidence: 0.85, cited_evidence: ["test", "error"], explanation: "External site mattermost.com changed its page title." },
+  });
+  settlePR([judgedEnv], ["app/screens/channel/index.tsx"], true, false, []);
+  assert.deepEqual([judgedEnv.blocking, judgedEnv.decision], [false, "first_failure"]);
+
+  // Advisory bug_on_master without qualifying trunk evidence must NOT bypass reproducible_regression.
+  const advisoryMaster = firstFailure({
+    tries: { ran: 2, failed: 2 },
+    judge: { cause: "bug_on_master", confidence: 0.9, cited_evidence: ["trunk_history_14d"], explanation: "Advisory guess on clean trunk." },
+  });
+  settlePR([advisoryMaster], ["app/screens/channel/index.tsx"], true, false, []);
+  assert.deepEqual([advisoryMaster.blocking, advisoryMaster.decision], [true, "reproducible_regression"]);
+
+  // A failure that failed_everywhere (all tries here AND on sibling platform) is never cleared by advisory judge text.
+  const failedAll = firstFailure({
+    tries: { ran: 2, failed: 2 },
+    failed_everywhere: ["detox-ios"],
+    judge: { cause: "flaky_environment", confidence: 0.9, cited_evidence: ["test", "error"], explanation: "Advisory guess." },
+  });
+  settlePR([failedAll], ["app/screens/channel/index.tsx"], true, false, []);
+  assert.deepEqual([failedAll.blocking, failedAll.decision], [true, "reproducible_regression"]);
+});
+
+test("markOutOfDate with fetchFileDiffs populates per-spec patch past the 300-file compare cap for release runs", async () => {
+  const spec = "detox/e2e/test/products/channels/smoke_test/bookmarks.e2e.ts";
+  const f = firstFailure({ file: "products/channels/smoke_test/bookmarks.e2e.ts", repo_path: spec });
+  const bigCompare = {
+    ahead_by: 400,
+    merge_base_commit: { sha: "mb", commit: { committer: { date: "2026-10-01T00:00:00Z" } } },
+    files: Array.from({ length: 300 }, (_, i) => ({ filename: `app/file_${i}.ts` })),
+    commits: [],
+  };
+  const api = async (_m: string, url: string) => {
+    if (url.includes("/compare/")) return bigCompare;
+    if (url.includes("commits?") && url.includes(encodeURIComponent(spec))) return [{ sha: "fix1234", commit: { committer: { date: "2026-10-10T00:00:00Z" }, message: "fix bookmarks spec (#10310)" } }];
+    if (url.endsWith("/commits/fix1234")) return { files: [{ filename: spec, patch: "@@ -10,1 +10,1 @@\n-oldTitle\n+newTitle" }] };
+    return [];
+  };
+  await markOutOfDate({ findings: [f], api, id: { repository: "o/r", commit_sha: "rel" }, baseBranch: "main", fetchFileDiffs: true });
+  assert.equal(f.out_of_date?.commit?.pr, 10310);
+  assert.match(String(f.out_of_date?.diff), /\+newTitle/);
+});
+
+test("judge escalates release-run near-misses in the 0.60-0.84 band to escalationModel", async () => {
+  const f = firstFailure({ release: true, blocking: true, out_of_date: { base: "main", behind: 50, commit: { sha: "abc1234", date: "2026-10-10", pr: 10310 }, diff: "@@ -1 +1 @@\n-a\n+b" } });
+  const pack = releasePack(f, { repository: "o/r", name: "mobile-release-detox-ios-Server_12.1.0", branch: "build-release-838", base: "main", historyBranch: "main" }, []);
+  const asked: string[] = [];
+  const ask: AskFn = async (packs, model) => {
+    asked.push(model);
+    const conf = model === "claude-opus-5-5" ? 0.92 : 0.72;
+    return {
+      answers: packs.map(() => ({ cause: "test_bug" as const, confidence: conf, cited_evidence: ["base_change"], explanation: "Main updated the stale assertion." })),
+      usage: { input_tokens: 100, output_tokens: 50 },
+      served_model: model,
+    };
+  };
+  await judge([f], [pack], ask, { ...DEFAULTS, model: "claude-sonnet-5-5", escalationModel: "claude-opus-5-5" });
+  assert.deepEqual(asked, ["claude-sonnet-5-5", "claude-opus-5-5"]);
+  assert.equal(f.blocking, false);
+  assert.equal(f.decision, "adjudicator_unblock");
+  assert.equal(f.escalated, true);
+});
+
+test("judge escalates borderline PR blame with hunk (0.60-0.84) and trunk-backed bug_on_master to escalationModel", async () => {
+  // Borderline blame with cited hunk -> escalates to Opus, which confirms >=0.85 blame.
+  const fBlame = firstFailure({ class: "REGRESSION", blocking: true, error: "Error in channel_header.tsx" });
+  const blamePack = buildPack(fBlame, [{ filename: "webapp/src/channel_header.tsx", patch: "@@ -1 +1 @@\n-old\n+new" }], { number: 42, repository: "o/r", title: "edit header" }, []);
+  const askedBlame: string[] = [];
+  const askBlame: AskFn = async (packs, model) => {
+    askedBlame.push(model);
+    return {
+      answers: packs.map(() => ({
+        cause: "caused_by_pr" as const,
+        confidence: model === "claude-opus-5-5" ? 0.91 : 0.72,
+        cited_evidence: ["hunk_0"],
+        explanation: "The diff changes channel_header.tsx.",
+        fix: "Restore the header label in webapp/src/channel_header.tsx.",
+      })),
+      usage: { input_tokens: 100, output_tokens: 50 },
+      served_model: model,
+    };
+  };
+  await judge([fBlame], [blamePack], askBlame, { ...DEFAULTS, model: "claude-sonnet-5-5", escalationModel: "claude-opus-5-5" });
+  assert.deepEqual(askedBlame, ["claude-sonnet-5-5", "claude-opus-5-5"]);
+  assert.deepEqual([fBlame.blocking, fBlame.decision, fBlame.escalated], [true, "adjudicator_blame", true]);
+
+  // Borderline bug_on_master citing trunk_history_14d with same-error trunk failures (and NO cross_pr/this_pr/hunk) -> canChange=true, escalates to Opus and clears.
+  const fMaster = firstFailure({
+    class: "REGRESSION",
+    blocking: true,
+    trunk: { runs: 20, fails: 2, flaky: 1, passes: 17, latest: "passed", same_error: true },
+    cross_pr: { prs: [], examples: [], passes: 10 },
+  });
+  const masterPack = buildPack(fMaster, [{ filename: "webapp/src/other.tsx", patch: "@@ -1 +1 @@\n-a\n+b" }], { number: 43, repository: "o/r", title: "unrelated" }, []);
+  assert.equal(canChange("REGRESSION", masterPack), true, "same-error trunk failures can carry a bug_on_master clear");
+  // Trunk failing with a DIFFERENT error must NOT carry a bug_on_master clear.
+  const diffErrFinding = classify(
+    { file: "specs/s0.spec.ts", title: "t0", error: "AssertionError: expected button A to be visible" },
+    [
+      { file: "specs/s0.spec.ts", title: "t0", status: "failed", retry_count: 0, gh_pr_number: null, branch: "master", error_excerpt: "AssertionError: completely different modal crash" },
+      ...trunkPasses(8),
+    ],
+    [],
+  );
+  assert.equal(diffErrFinding.class, "REGRESSION");
+  assert.equal(diffErrFinding.trunk.same_error, undefined);
+  const diffErrPack = buildPack(diffErrFinding, [], { number: 43, repository: "o/r", title: "unrelated" }, []);
+  assert.equal(canChange("REGRESSION", diffErrPack), false, "different-error trunk failures cannot carry a bug_on_master clear");
+  assert.equal(unblocks("bug_on_master", ["trunk_history_14d"], diffErrPack, "REGRESSION"), false);
+  // Action-only timeout (no target) must NOT set same_error, whereas a targeted timeout DOES.
+  const actionOnlyTimeout = classify(
+    { file: "specs/s0.spec.ts", title: "t0", error: "locator.click: Timeout 30000ms exceeded." },
+    [{ file: "specs/s0.spec.ts", title: "t0", status: "failed", retry_count: 0, gh_pr_number: null, branch: "master", error_excerpt: "locator.click: Timeout 30000ms exceeded." }, ...trunkPasses(25)],
+    [],
+  );
+  assert.equal(actionOnlyTimeout.trunk.same_error, undefined, "action-only timeout has no target");
+  assert.equal(canChange("REGRESSION", buildPack(actionOnlyTimeout, [], { number: 43, repository: "o/r", title: "unrelated" }, [])), false);
+  const targetedTimeout = classify(
+    { file: "specs/s0.spec.ts", title: "t0", error: "locator.click: Timeout 30000ms exceeded.\n- waiting for getByTestId('post_textbox')" },
+    [{ file: "specs/s0.spec.ts", title: "t0", status: "failed", retry_count: 0, gh_pr_number: null, branch: "master", error_excerpt: "locator.click: Timeout 30000ms exceeded.\n- waiting for getByTestId('post_textbox')" }, ...trunkPasses(25)],
+    [],
+  );
+  assert.equal(targetedTimeout.trunk.same_error, true, "targeted timeout matches the same step");
+  const askedMaster: string[] = [];
+  const askMaster: AskFn = async (packs, model) => {
+    askedMaster.push(model);
+    return {
+      answers: packs.map(() => ({
+        cause: "bug_on_master" as const,
+        confidence: model === "claude-opus-5-5" ? 0.9 : 0.75,
+        cited_evidence: ["trunk_history_14d"],
+        explanation: "Same failure already occurs on master.",
+      })),
+      usage: { input_tokens: 100, output_tokens: 50 },
+      served_model: model,
+    };
+  };
+  await judge([fMaster], [masterPack], askMaster, { ...DEFAULTS, model: "claude-sonnet-5-5", escalationModel: "claude-opus-5-5" });
+  assert.deepEqual(askedMaster, ["claude-sonnet-5-5", "claude-opus-5-5"]);
+  assert.deepEqual([fMaster.blocking, fMaster.decision, fMaster.escalated], [false, "adjudicator_unblock", true]);
 });
