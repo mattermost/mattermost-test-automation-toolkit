@@ -9,6 +9,9 @@ import { answerKey, cachedAnswer, expectedOutput, maxTokensFor, systemFor } from
 import { costOf, ledgerTotals, newLedger } from "./pricing.ts";
 import type { Answer, BatchResult, Config, Finding, Ledger, Pack } from "./types.ts";
 
+const trunkSameFailure = (trunk?: Partial<Pack["trunk_history_14d"]>): boolean =>
+  Boolean(trunk?.same_error) && ((trunk?.fails ?? 0) > 0 || (trunk?.flaky ?? 0) > 0 || trunk?.latest === "failed");
+
 /**
  * What a non-PR cause must cite before it can clear a judged finding, as the judge's rules
  * require. A related hunk is not on the list: it is evidence the PR may be the cause. Producer
@@ -24,7 +27,7 @@ export function unblocks(cause: string, cited: string[], pack: Pack, cls = ""): 
     return (cause === "flaky_environment" || cause === "bug_on_master") && has("cross_pr", "this_pr");
   }
   if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error) || (has("earlier_failure_same_spec") && chainClears(pack));
-  if (cause === "bug_on_master") return has("cross_pr") || (has("trunk_history_14d") && ((trunk.fails ?? 0) > 0 || (trunk.flaky ?? 0) > 0 || trunk.latest === "failed"));
+  if (cause === "bug_on_master") return has("cross_pr") || (has("trunk_history_14d") && trunkSameFailure(trunk));
   if (cause === "test_bug") return has("this_pr");
   return false;
 }
@@ -95,7 +98,7 @@ export function canChange(cls: string, pack: Pack, isTrunkRun = false): boolean 
   const hunk = ids.some((id) => id.startsWith("hunk_"));
   if (exoneratedSet(isTrunkRun).has(cls)) return hunk;
   if (cls === "INFRA_ERROR") return CLEARING(ids);
-  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack);
+  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack) || trunkSameFailure(pack.trunk_history_14d);
   return false;
 }
 
@@ -103,16 +106,19 @@ export function canChange(cls: string, pack: Pack, isTrunkRun = false): boolean 
 // one that blames the PR without the change that would explain it, which the judge's
 // rules forbid and which would otherwise keep a failure red on no evidence.
 function nearMiss(cls: string, answer: Answer | null | undefined, pack: Pack, cfg: Config, isTrunkRun: boolean): boolean {
-  // A release run's answer is not escalated: the second model's question would be the PR one.
-  if (!answer || pack.release) return false;
+  if (!answer) return false;
   const known = new Set(evidenceIds(pack));
   const cited = answer.cited_evidence.filter((c) => known.has(c));
+  if (pack.release) {
+    if (answer.confidence < cfg.escalateMin || answer.confidence >= cfg.minConfidence) return false;
+    return answer.cause === "app_bug" || decideRelease({ ...answer, confidence: cfg.minConfidence }, pack, cfg).decision === "adjudicator_unblock";
+  }
   const hunk = cited.some((c) => c.startsWith("hunk_"));
   if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
   if (answer.confidence < cfg.escalateMin) return false;
   if (exoneratedSet(isTrunkRun).has(cls)) return answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.vetoMin;
-  const clears = CLEARING(cited) || (cls !== "INFRA_ERROR" && answer.cause === "flaky_environment" && (isInfraError(pack.error) || (cited.includes("earlier_failure_same_spec") && chainClears(pack))));
-  return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && clears;
+  if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.minConfidence) return true;
+  return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && unblocks(answer.cause, cited, pack, cls);
 }
 
 /** A group of findings that share one question to the model: the first is asked, the others take its answer. */

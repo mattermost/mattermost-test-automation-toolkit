@@ -141,6 +141,12 @@ inputs:
       Empty finds it from this job's own name (the jobs before its lane-result job)
     required: false
     default: ""
+  lane-job-filter:
+    description: >-
+      Comma-separated case-insensitive substrings matching this lane's jobs in flat-job workflows (e.g. "maestro-ios,build-ios"
+      or "ubuntu,linux"), so one lane never blames another lane's dead job
+    required: false
+    default: ""
   lane-start-job:
     description: >-
       The lane's first job, without the prefix. A lane red on a machine failure after its TSIO run began is re-run from
@@ -219,6 +225,7 @@ runs:
         FINDINGS_FILE: ${{ inputs.findings-file }}
         RERUN_ATTEMPTS: ${{ inputs.rerun-attempts }}
         LANE_JOB_PREFIX: ${{ inputs.lane-job-prefix }}
+        LANE_JOB_FILTER: ${{ inputs.lane-job-filter }}
         LANE_START_JOB: ${{ inputs.lane-start-job }}
       run: node "${{ github.action_path }}/dist/index.js"
     # The request for a re-run, for e2e-test-rerun: one marker per lane and attempt, named with the attempt and the

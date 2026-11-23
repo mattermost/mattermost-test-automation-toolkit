@@ -4,6 +4,7 @@
 import type { FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { FAILED_STATUSES, identityKey, isFailedTry, outcomeOf, outcomeWithDuplicates, tsioJson } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity } from "../../shared/src/tsio.ts";
+import { isSmallSuiteStorm } from "./classify.ts";
 import { CHANGED_FILES_MAX_PAGES, COMPARE_FILE_CAP, DEFAULTS, HISTORY_MAX_FILES, HISTORY_MAX_PAGES, HISTORY_PER_PAGE, laneOf } from "./config.ts";
 import type { BrokeBy, ChangedFile, Config, Finding, Observation, OutOfDate, SpecHistory, SpecRun, TestRef } from "./types.ts";
 
@@ -21,7 +22,7 @@ interface HistoryPage {
 
 // Waits before each retry of a history page. TSIO's history read can time out at its gateway (504) under load: two runs
 // of PR 38885 lost their triage to one 504 each, so a failed read is tried four times over about six seconds.
-const HISTORY_RETRY_MS: readonly number[] = [500, 1500, 4000];
+const HISTORY_RETRY_MS: readonly number[] = [1000, 2500, 5000];
 
 /**
  * POSTs one history page. A timeout, a dropped connection or a 5xx answer is retried (see HISTORY_RETRY_MS); any other
@@ -349,9 +350,10 @@ export async function dropStormRuns({
     for (let i = 0; i < Math.min(list.length, STORM_READS) && Date.now() < deadline; i += STORM_READ_BATCH) {
       const batch = list.slice(i, Math.min(i + STORM_READ_BATCH, STORM_READS)).map(async (g) => {
         try {
-          const { test_stats: t } = await tsioJson<{ test_stats?: { total?: number; failed?: number } | null }>(fetchImpl, base, `/reports/${encodeURIComponent(g)}`);
+          const { test_stats: t } = await tsioJson<{ test_stats?: { total?: number; failed?: number; skipped?: number } | null }>(fetchImpl, base, `/reports/${encodeURIComponent(g)}`);
           const failed = t?.failed ?? 0;
-          (failed >= minFailures && failed * 10 >= (t?.total ?? 0) ? storms : quiet).add(g);
+          const executed = Math.max(0, (t?.total ?? 0) - (t?.skipped ?? 0));
+          ((failed >= minFailures && failed * 10 >= (t?.total ?? 0)) || isSmallSuiteStorm(failed, executed) ? storms : quiet).add(g);
         } catch {
           // Unread: left out below with the storms.
         }
@@ -485,6 +487,7 @@ export async function markOutOfDate({
   until = null,
   log = () => {},
   supportPaths = [],
+  fetchFileDiffs = false,
 }: {
   findings: Finding[];
   api: GhApi;
@@ -495,6 +498,8 @@ export async function markOutOfDate({
   log?: (message: string) => void;
   /** Repository directories of the code the specs run through (see Config.supportPaths). */
   supportPaths?: string[];
+  /** When the 300-file compare cap cuts off a release run, fetch per-spec commit patches so test_bug clears stay possible. */
+  fetchFileDiffs?: boolean;
 }): Promise<OutOfDateResult> {
   if (!findings.length || !baseBranch) return { truncated: false };
   const cmp = (await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`)) as CompareResult | null;
@@ -562,11 +567,32 @@ export async function markOutOfDate({
     log(`${baseBranch} changed ${files.length}+ files since this PR last merged it, and the merge base has no date; ${rest.length} failure(s) unchecked`);
     return { truncated: true, unchecked: rest };
   }
-  log(`${baseBranch} changed ${files.length}+ files since this PR last merged it; checking the failing specs' directories instead`);
+  log(`${baseBranch} changed ${files.length}+ files since this PR last merged it; checking the failing specs' ${fetchFileDiffs ? "files and " : ""}directories instead`);
   const dirs = new Map<string, OutOfDate["commit"] | "unchecked">();
+  const filePatches = new Map<string, { commit: OutOfDate["commit"]; also: NonNullable<OutOfDate["also"]>; diff?: string } | null>();
+  if (fetchFileDiffs) {
+    const uniquePaths = [...new Set(rest.map((f) => f.repo_path ?? "").filter(Boolean))].slice(0, 10);
+    await Promise.all(uniquePaths.map(async (path) => {
+      const q = new URLSearchParams({ sha: baseBranch, path, since, ...(until ? { until } : {}), per_page: "5" });
+      const raw = await (api("GET", `/repos/${id.repository}/commits?${q}`) as Promise<unknown>).catch(() => []);
+      const [c, ...earlier] = (Array.isArray(raw) ? (raw as CommitRow[]) : []).filter((x) => x.sha !== base?.sha);
+      if (!c) {
+        filePatches.set(path, null);
+        return;
+      }
+      const detail = (await api("GET", `/repos/${id.repository}/commits/${c.sha}`).catch(() => null)) as { files?: { filename: string; patch?: string }[] } | null;
+      const patch = detail?.files?.find((x) => x.filename === path)?.patch;
+      filePatches.set(path, { commit: commitRef(c), also: earlier.slice(0, 4).map(commitRef), ...(patch ? { diff: patch.slice(0, 4000) } : {}) });
+    }));
+  }
   const unchecked: Finding[] = [];
   for (const f of rest) {
     const path = f.repo_path ?? "";
+    const hit = fetchFileDiffs && path ? filePatches.get(path) : null;
+    if (hit) {
+      f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: hit.commit, ...(hit.also.length ? { also: hit.also } : {}), ...(hit.diff ? { diff: hit.diff } : {}) };
+      continue;
+    }
     const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
     if (!dir) {
       unchecked.push(f);
