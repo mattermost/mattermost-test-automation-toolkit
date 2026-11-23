@@ -21,7 +21,7 @@ export interface CommitStatus {
 /** Waits between attempts of a retried call; a test passes one that does not sleep. */
 export type Sleep = (ms: number) => Promise<void>;
 
-const sleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export const sleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // A commit status POST only sets that context's latest state: posting it again posts the same
 // row, so a GitHub 5xx, a 429 or a dropped connection is tried again. Left failed, the lane
@@ -38,7 +38,7 @@ const retryable = (status: number): boolean => status >= 500 || status === 429;
  * Whether a fetch error is a dropped connection (undici TypeError "fetch failed" or "terminated") or an expired/aborted
  * signal (DOMException TimeoutError or AbortError). Any other TypeError (e.g. an invalid header value) is not retried.
  */
-const networkError = (e: unknown): boolean =>
+export const networkError = (e: unknown): boolean =>
   (e instanceof TypeError && (e.message === "fetch failed" || e.message === "terminated")) ||
   (e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError"));
 

@@ -3,18 +3,19 @@
 
 import { inspect, types } from "node:util";
 import type { Env } from "../../shared/src/github.ts";
+import { create } from "./create.ts";
+import { ActionError } from "./core/errors.ts";
+import { commandText } from "./core/outputs.ts";
+import { redact } from "./core/redact.ts";
 
 export type { Env };
+export { ActionError, commandText };
 
 /** One action: reads its inputs from env, writes its outputs and summary, and throws to fail. */
 export type Action = (env: Env) => Promise<void>;
 
 /** Every action the bundle runs, by the name its action.yml passes to run.sh. */
-export const ACTIONS: Readonly<Record<string, Action>> = {};
-
-/** A failure an action raises on purpose, with a message for the person reading the run; it is reported without a stack. */
-export class ActionError extends Error {}
-ActionError.prototype.name = "ActionError";
+export const ACTIONS: Readonly<Record<string, Action>> = { create };
 
 /** Runs the action named, or refuses a name the bundle does not have. */
 export async function run(name: string | undefined, env: Env, actions: Readonly<Record<string, Action>> = ACTIONS) {
@@ -27,10 +28,6 @@ export async function run(name: string | undefined, env: Env, actions: Readonly<
   }
   await action(env);
 }
-
-/** Escapes text for a workflow command, as @actions/core does, so a line break cannot start another command. */
-export const commandText = (text: string): string =>
-  text.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A");
 
 /** How deep a cause chain, and errors nested in an AggregateError, are followed. */
 const MAX_DEPTH = 5;
@@ -79,6 +76,7 @@ function describe(e: unknown, depth = 0): string {
 /**
  * The lines that report a failure: an error annotation naming the action, with the error's cause chain, then, for an
  * error that is not an ActionError (a file read, the SDK, a bug), its stack frames, which point into dist/index.js.
+ * ARNs and account ids are taken out of every line.
  */
 export function failureLines(e: unknown): string[] {
   try {
@@ -90,7 +88,8 @@ export function failureLines(e: unknown): string[] {
 }
 
 function reportLines(e: unknown): string[] {
-  const lines = [`::error::${commandText(`e2e-test-stack: ${describe(e)}`)}`];
+  // Redacted: an error from the SDK, or a cause it carries, may name an ARN or an account id.
+  const lines = [`::error::${commandText(redact(`e2e-test-stack: ${describe(e)}`))}`];
   // Only the frames: the stack's first lines repeat the message, which is already in the annotation. The stack is
   // split on every line break the runner reads, a lone \r included, and each frame is escaped too. The runner reads a
   // legacy ##[command] anywhere in a plain line, so ##[ is broken up.
@@ -99,7 +98,8 @@ function reportLines(e: unknown): string[] {
       ...e.stack
         .split(/\r\n|\r|\n/)
         .filter((l) => /^\s+at /.test(l))
-        .map((l) => commandText(l).replaceAll("##[", "## [")),
+        // Broken up after redaction, so a placeholder cannot complete a ##[.
+        .map((l) => commandText(redact(l)).replaceAll("##[", "## [")),
     );
   return lines;
 }
