@@ -136,11 +136,11 @@ export async function evaluateRun({
       });
     });
     // A PR that breaks its own server fails every test on the environment, so on a flagged run only the judge clears
-    // an environment error. A trunk run (no PR, not a release branch) has no judge, and a PR touching only CI/docs/metadata
-    // cannot break a remote test environment.
+    // an environment error. A trunk run (no PR, not a release branch) has no judge, and a PR touching only docs,
+    // repo metadata, or non-E2E CI workflows cannot break a remote test environment.
     const nonProductOnly = Boolean(prNumber) && diff.ok && files.length > 0 && files.every((f) => {
       const cat = changeCategory(f.filename, changeContext);
-      return cat === "ci" || cat === "docs" || cat === "other" || !isProductChange(f.filename);
+      return cat === "docs" || cat === "other" || (cat === "ci" && !/e2e|cmt|test|playwright|cypress|detox|maestro/i.test(f.filename));
     });
     if (result.infra && (!isTrunkRun || Boolean(branchBase)) && !nonProductOnly) {
       const why = /infrastructure errors/.test(result.infra) ? "most of this run failed on its environment" : "many tests failed in this run";

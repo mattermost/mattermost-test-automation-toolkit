@@ -83,7 +83,7 @@ var DEFAULTS = {
   // them and cleared 4 of the 5 the PR did not cause, Fable 5.1 the fifth on escalation.
   model: "claude-sonnet-5-5"
 };
-var laneOf = (name) => String(name ?? "").replace(/^(mobile|desktop)-(pr|main|master)(-|$)/, "").replace(/^mobile-(release|cmt)(-|$)/, "").replace(/-Server_[^/]+$/i, "").replace(/-(master|main|release(-cut)?)$/, "") || "default";
+var laneOf = (name) => String(name ?? "").replace(/^(mobile|desktop)-(pr|main|master)(-|$)/, "").replace(/-(master|main|release(-cut)?)$/, "") || "default";
 var OS_OF_REPORT = [[/ubuntu/, "linux"], [/windows/, "windows"], [/macos/, "macos"]];
 var laneOfReport = (name) => {
   const rest = String(name).replace(/^e2e-on-/, "");
@@ -95,7 +95,7 @@ var repoPath = (testRoot, file) => {
   const root = String(testRoot).replace(/^\.?\/*/, "").replace(/\/+$/, "");
   return root === "" ? file : `${root}/${file}`;
 };
-var historyLane = (id, cfg = DEFAULTS) => cfg.historyLane ? laneOf(cfg.historyLane) : laneOf(id.name);
+var historyLane = (id, cfg = DEFAULTS) => cfg.historyLane || laneOf(id.name);
 function confidenceFrom(raw, warn) {
   if (raw == null || String(raw).trim() === "") return DEFAULTS.minConfidence;
   const n = Number(raw);
@@ -395,8 +395,450 @@ function missingReports(missing) {
   return { text: `the run's results are incomplete (${received ?? "?"} of ${expected} reports arrived; TSIO group ${state})`, short: `results incomplete: ${received ?? "?"} of ${expected} reports` };
 }
 
+// ../e2e-test-triage/src/history.ts
+var HISTORY_RETRY_MS = [500, 1500, 4e3];
+async function postHistory(fetchImpl, url, body) {
+  let failure;
+  for (let attempt = 0; attempt <= HISTORY_RETRY_MS.length; attempt++) {
+    if (attempt > 0) await new Promise((resolve2) => setTimeout(resolve2, HISTORY_RETRY_MS[attempt - 1]));
+    try {
+      const res = await fetchImpl(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(12e4) });
+      if (res.status < 500) return res;
+      failure = new Error(`TSIO history ${res.status}`);
+    } catch (e) {
+      failure = e;
+    }
+  }
+  throw failure;
+}
+async function fetchSpecRuns(fetchImpl, base, repository, files, until, cfg = DEFAULTS, lane = null, reportName = null) {
+  const history = { byFile: /* @__PURE__ */ new Map(), truncated: false };
+  const wanted = [...new Set(files.filter(Boolean))].slice(0, HISTORY_MAX_FILES);
+  const runs = /* @__PURE__ */ new Map();
+  for (let page = 1; page <= HISTORY_MAX_PAGES && wanted.length; page++) {
+    const body = { repository, until, files: wanted, page, per_page: HISTORY_PER_PAGE, runs: cfg.crossPRRuns };
+    if (reportName) body.report = reportName;
+    const res = await postHistory(fetchImpl, `${base}/api/v1/reports/history`, body);
+    if (!res.ok) throw new Error(`TSIO history ${res.status}`);
+    const { observations = [], has_more: hasMore } = await res.json();
+    for (const o of observations) {
+      if (o.group_id == null || !wanted.includes(o.file)) continue;
+      if (lane != null && o.name != null && laneOf(o.name) !== lane) continue;
+      if (!runs.has(o.file)) runs.set(o.file, /* @__PURE__ */ new Map());
+      const byGroup = runs.get(o.file);
+      const group = String(o.group_id);
+      if (!byGroup.has(group)) byGroup.set(group, { notRun: false, tests: /* @__PURE__ */ new Map() });
+      const run = byGroup.get(group);
+      if (o.title === "spec did not run") run.notRun = true;
+      else {
+        const key = JSON.stringify([o.report_name ?? "", o.full_title || o.title]);
+        if (!run.tests.has(key)) run.tests.set(key, []);
+        run.tests.get(key).push(o);
+      }
+    }
+    if (!hasMore) break;
+    if (page === HISTORY_MAX_PAGES) history.truncated = true;
+  }
+  for (const [file, byGroup] of runs) {
+    const outcomes = [];
+    for (const [group_id, run] of byGroup) {
+      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0)), (a) => a.report_name ?? null).status);
+      const status = run.notRun ? "not_run" : results.some((s) => FAILED_STATUSES.has(s)) ? "failed" : results.every((s) => s === "skipped") ? "skipped" : "passed";
+      outcomes.push({ group_id, status });
+    }
+    history.byFile.set(file, outcomes);
+  }
+  return history;
+}
+async function fetchHistory(fetchImpl, base, repository, tests, until, cfg = DEFAULTS, trunkBranch = null, reportName = null, warn = () => {
+}, lane = null) {
+  const byTest = Object.assign(/* @__PURE__ */ new Map(), {
+    truncated: false,
+    reportUnknown: false,
+    // rows can't say which report (platform) they came from
+    ambiguous: /* @__PURE__ */ new Set()
+    // tests whose rows can't be tied to them alone
+  });
+  const files = [...new Set(tests.map((t) => t.file).filter(Boolean))].slice(0, HISTORY_MAX_FILES);
+  if (files.length === 0) return byTest;
+  const byLeaf = /* @__PURE__ */ new Map();
+  for (const t of tests) {
+    const leaf = `${t.file}
+${t.title}`;
+    if (!byLeaf.has(leaf)) byLeaf.set(leaf, []);
+    byLeaf.get(leaf).push(t);
+  }
+  const queries = [];
+  if (trunkBranch) queries.push({ branch: trunkBranch, runs: cfg.trunkRuns });
+  queries.push({ runs: cfg.crossPRRuns });
+  const laneTrunkRuns = /* @__PURE__ */ new Set();
+  const allTrunkRuns = /* @__PURE__ */ new Set();
+  let widened = false;
+  const seen = /* @__PURE__ */ new Map();
+  const ancestryByLeaf = /* @__PURE__ */ new Map();
+  const fallbackByLeaf = /* @__PURE__ */ new Map();
+  const dedupe = queries.length > 1;
+  for (let qi = 0; qi < queries.length; qi++) {
+    const q = queries[qi];
+    for (let page = 1; page <= HISTORY_MAX_PAGES; page++) {
+      const body = { repository, until, files, page, per_page: HISTORY_PER_PAGE, ...q };
+      if (reportName) body.report = reportName;
+      const res = await postHistory(fetchImpl, `${base}/api/v1/reports/history`, body);
+      if (!res.ok) throw new Error(`TSIO history ${res.status}`);
+      const page_ = await res.json();
+      const observations = page_.observations ?? [];
+      const hasMore = page_.has_more;
+      for (const o of observations) {
+        const leaf = `${o.file}
+${o.title}`;
+        const candidates = byLeaf.get(leaf);
+        if (!candidates) continue;
+        if (qi === 0 && o.group_id != null) allTrunkRuns.add(String(o.group_id));
+        if (lane != null && o.name != null && laneOf(o.name) !== lane) continue;
+        if (qi === 0 && o.group_id != null) laneTrunkRuns.add(String(o.group_id));
+        if (reportName) {
+          if (!o.report_name) byTest.reportUnknown = true;
+          else if (!String(o.report_name).startsWith(reportName)) continue;
+        }
+        const ancestry = o.full_title || o.suite_title;
+        if (ancestry) {
+          if (!ancestryByLeaf.has(leaf)) ancestryByLeaf.set(leaf, /* @__PURE__ */ new Set());
+          ancestryByLeaf.get(leaf).add(ancestry);
+        }
+        let test = null;
+        const comparable = Boolean(o.full_title) && candidates.every((c) => c.full_title);
+        if (comparable) {
+          test = candidates.find((c) => c.full_title === o.full_title) ?? null;
+          if (!test) continue;
+        } else if (candidates.length > 1 || candidates[0].identity_ambiguous) {
+          for (const c of candidates) byTest.ambiguous.add(identityKey(c));
+          continue;
+        } else {
+          test = candidates[0];
+          if (Boolean(test.full_title) !== Boolean(o.full_title)) {
+            byTest.ambiguous.add(identityKey(test));
+            continue;
+          }
+          if (!fallbackByLeaf.has(leaf)) fallbackByLeaf.set(leaf, /* @__PURE__ */ new Set());
+          fallbackByLeaf.get(leaf).add(identityKey(test));
+          if (test.suite_title && o.suite_title && test.suite_title !== o.suite_title)
+            byTest.ambiguous.add(identityKey(test));
+        }
+        const k = identityKey(test);
+        if (dedupe && o.group_id != null) {
+          const rowKey = JSON.stringify([o.group_id, o.report_name, o.full_title, o.suite_title, k, o.retry_count, o.ordinal ?? 0]);
+          const previous = seen.get(rowKey);
+          if (previous !== void 0) {
+            if (previous !== o.status) byTest.ambiguous.add(k);
+            continue;
+          }
+          seen.set(rowKey, o.status);
+        }
+        if (!byTest.has(k)) byTest.set(k, []);
+        byTest.get(k).push(o);
+      }
+      if (!hasMore) break;
+      if (page === HISTORY_MAX_PAGES) {
+        byTest.truncated = true;
+        warn(`history for ${files.length} file(s) hit the ${HISTORY_MAX_PAGES}-page cap with more to come; nothing will be cleared on partial history`);
+      }
+    }
+    if (qi === 0 && trunkBranch && lane != null && !widened && laneTrunkRuns.size < cfg.minTrunkRuns && allTrunkRuns.size >= cfg.minTrunkRuns) {
+      widened = true;
+      const since = new Date(Date.parse(until) - cfg.windowDays * 864e5).toISOString();
+      warn(`only ${laneTrunkRuns.size} run(s) of ${lane} among ${trunkBranch}'s last ${cfg.trunkRuns}; reading ${trunkBranch}'s history since ${since.slice(0, 10)}`);
+      queries.splice(1, 0, { branch: trunkBranch, since });
+    }
+  }
+  for (const [key, rows] of byTest) {
+    const runs = /* @__PURE__ */ new Map();
+    const collapsed = [];
+    for (const row of rows) {
+      if (row.group_id == null) {
+        collapsed.push(row);
+        continue;
+      }
+      const run = JSON.stringify([row.group_id, reportName ? row.report_name ?? "" : ""]);
+      if (!runs.has(run)) runs.set(run, []);
+      runs.get(run).push(row);
+    }
+    for (const attempts of runs.values()) {
+      attempts.sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0));
+      const { status, last } = outcomeOf(attempts);
+      const failedTry = status === "flaky" ? attempts.filter((a) => FAILED_STATUSES.has(a.status) && a.error_excerpt).at(-1) ?? attempts.filter((a) => a.status === "flaky" && a.error_excerpt).at(-1) : void 0;
+      collapsed.push({ ...last, status, ...failedTry?.error_excerpt ? { error_excerpt: failedTry.error_excerpt } : {} });
+    }
+    byTest.set(key, collapsed);
+  }
+  for (const [leaf, keys] of fallbackByLeaf) {
+    if ((ancestryByLeaf.get(leaf)?.size ?? 0) > 1)
+      for (const key of keys) byTest.ambiguous.add(key);
+  }
+  for (const [key, rows] of byTest) {
+    const reportsByGroup = /* @__PURE__ */ new Map();
+    for (const row of rows) {
+      if (!row.group_id || !row.report_name) continue;
+      const groupKey = String(row.group_id);
+      if (!reportsByGroup.has(groupKey)) reportsByGroup.set(groupKey, /* @__PURE__ */ new Set());
+      reportsByGroup.get(groupKey).add(row.report_name);
+    }
+    if ([...reportsByGroup.values()].some((reports) => reports.size > 1)) byTest.ambiguous.add(key);
+  }
+  const at = (o) => Date.parse(o.created_at ?? "") || 0;
+  for (const rows of byTest.values()) rows.sort((a, b) => at(b) - at(a));
+  return byTest;
+}
+function trunkRunsOn(history, branch) {
+  let most = 0;
+  for (const rows of history.values()) {
+    const runs = rows.filter((o) => (o.gh_pr_number == null || o.gh_pr_number === "") && o.branch === branch).length;
+    most = Math.max(most, runs);
+  }
+  return most;
+}
+var STORM_READS = 100;
+var STORM_READ_BATCH = 10;
+var STORM_DEADLINE_MS = 3e4;
+async function dropStormRuns({
+  history,
+  fetchImpl,
+  base,
+  minFailures,
+  trunkBranch = null,
+  own = null,
+  pr = null,
+  log = () => {
+  },
+  deadlineMs = STORM_DEADLINE_MS
+}) {
+  const prOf = (o) => o.gh_pr_number == null || o.gh_pr_number === "" ? null : Number(o.gh_pr_number);
+  const isOwn = (o) => o.group_id != null && String(o.group_id) === String(own);
+  const isTrunk = (o) => prOf(o) == null && (trunkBranch == null || o.branch === trunkBranch);
+  const streak = /* @__PURE__ */ new Set();
+  for (const rows of history.values()) {
+    for (const o of rows) {
+      if (isOwn(o) || !isTrunk(o) || o.status === "skipped") continue;
+      if (!isFailedTry(o.status)) break;
+      streak.add(o);
+    }
+  }
+  const counted = (o) => o.group_id != null && !isOwn(o) && isFailedTry(o.status) && !streak.has(o) && (pr == null || prOf(o) !== Number(pr));
+  const newest = /* @__PURE__ */ new Map();
+  for (const rows of history.values())
+    for (const o of rows)
+      if (counted(o)) newest.set(String(o.group_id), Math.max(newest.get(String(o.group_id)) ?? 0, Date.parse(o.created_at ?? "") || 0));
+  const list = [...newest.keys()].sort((a, b) => newest.get(b) - newest.get(a));
+  const storms = /* @__PURE__ */ new Set();
+  const quiet = /* @__PURE__ */ new Set();
+  const deadline = Date.now() + deadlineMs;
+  let timer;
+  const late = new Promise((resolve2) => {
+    timer = setTimeout(resolve2, deadlineMs);
+  });
+  try {
+    for (let i = 0; i < Math.min(list.length, STORM_READS) && Date.now() < deadline; i += STORM_READ_BATCH) {
+      const batch = list.slice(i, Math.min(i + STORM_READ_BATCH, STORM_READS)).map(async (g) => {
+        try {
+          const { test_stats: t } = await tsioJson(fetchImpl, base, `/reports/${encodeURIComponent(g)}`);
+          const failed = t?.failed ?? 0;
+          (failed >= minFailures && failed * 10 >= (t?.total ?? 0) ? storms : quiet).add(g);
+        } catch {
+        }
+      });
+      await Promise.race([Promise.all(batch), late]);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+  const dropped = new Set(list.filter((g) => !quiet.has(g)));
+  if (!dropped.size) return dropped;
+  for (const [key, rows] of history) history.set(key, rows.filter((o) => !counted(o) || !dropped.has(String(o.group_id))));
+  const unread = dropped.size - storms.size;
+  log(`history: left out the failures of ${storms.size} storm run(s)${unread ? ` and of ${unread} that could not be read` : ""}`);
+  return dropped;
+}
+async function fetchChangedFiles(api, id, prNumber, log = () => {
+}) {
+  try {
+    if (prNumber) {
+      const files2 = [];
+      for (let page = 1; page <= CHANGED_FILES_MAX_PAGES; page++) {
+        const batch = await api("GET", `/repos/${id.repository}/pulls/${prNumber}/files?per_page=100&page=${page}`);
+        files2.push(...batch ?? []);
+        if (!batch || batch.length < 100) return { files: files2, ok: true };
+      }
+      log(`stopped after ${CHANGED_FILES_MAX_PAGES} pages of changed files; ownership is incomplete and nothing will be cleared`);
+      return { files: files2, ok: false };
+    }
+    const files = [];
+    for (let page = 1; page <= CHANGED_FILES_MAX_PAGES; page++) {
+      const commit = await api("GET", `/repos/${id.repository}/commits/${id.commit_sha}?per_page=100&page=${page}`);
+      const batch = commit?.files ?? [];
+      files.push(...batch);
+      if (batch.length < 100) return { files, ok: true };
+    }
+    log(`stopped after ${CHANGED_FILES_MAX_PAGES} pages of commit files; ownership is incomplete and nothing will be cleared`);
+    return { files, ok: false };
+  } catch (e) {
+    log(`changed files unavailable: ${String(e).slice(0, 200)}`);
+    return { files: [], ok: false };
+  }
+}
+var OUT_OF_DATE_DIR_CAP = 20;
+var commitRef = (c) => ({
+  sha: c.sha,
+  date: String(c.commit?.committer?.date ?? c.commit?.author?.date ?? "").slice(0, 10),
+  pr: Number(/\(#(\d+)\)/.exec(c.commit?.message ?? "")?.[1]) || null
+});
+async function markFixedOnTrunk({ findings, api, id, baseBranch, log = () => {
+} }) {
+  if (!findings.length) return;
+  const cmp = baseBranch ? await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`) : null;
+  const lacking = new Map((cmp?.commits ?? []).map((c) => [c.sha, c]));
+  const complete = cmp != null && (cmp.ahead_by ?? 0) <= lacking.size;
+  for (const f of findings) {
+    const lastFail = f.trunk_fixed?.last_fail?.commit_sha;
+    const firstPass = f.trunk_fixed?.first_pass?.commit_sha;
+    if (lastFail && lacking.has(lastFail)) {
+      const pass = firstPass ? lacking.get(firstPass) : void 0;
+      f.out_of_date = { base: baseBranch, behind: cmp.ahead_by ?? null, commit: pass ? commitRef(pass) : null, fixed: true };
+    } else if (firstPass && complete && !lacking.has(firstPass)) {
+      Object.assign(f, { class: "REGRESSION", reason: `${f.reason} This branch has that fix (by ${firstPass.slice(0, 7)}) and still fails the same way.` });
+    } else {
+      log(`whether this PR has ${baseBranch}'s fix for ${f.title} is unknown`);
+      Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} Whether this branch has that fix could not be checked.` });
+    }
+  }
+}
+async function markOutOfDate({
+  findings,
+  api,
+  id,
+  baseBranch,
+  until = null,
+  log = () => {
+  },
+  supportPaths = []
+}) {
+  if (!findings.length || !baseBranch) return { truncated: false };
+  const cmp = await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`);
+  if (!cmp?.ahead_by) return { truncated: false };
+  const files = cmp.files ?? [];
+  const truncated = files.length >= COMPARE_FILE_CAP;
+  const changed = new Set(files.map((x) => x.filename));
+  const onBase = new Set((cmp.commits ?? []).map((c) => c.sha));
+  const commits = /* @__PURE__ */ new Map();
+  const rest = [];
+  for (const f of findings) {
+    const path = f.repo_path;
+    if (!path || !changed.has(path)) {
+      if (truncated) rest.push(f);
+      continue;
+    }
+    if (!commits.has(path)) {
+      const log_ = await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(path)}&per_page=10`).catch(() => []);
+      const [c, ...earlier] = (log_ ?? []).filter((x) => onBase.has(x.sha));
+      commits.set(path, { commit: c ? commitRef(c) : null, also: earlier.slice(0, 4).map(commitRef) });
+    }
+    const { commit, also } = commits.get(path) ?? { commit: null, also: [] };
+    const diff = files.find((x) => x.filename === path)?.patch;
+    f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit, ...also.length ? { also } : {}, ...diff ? { diff: diff.slice(0, 4e3) } : {} };
+  }
+  const base = cmp.merge_base_commit;
+  const since = base?.commit?.committer?.date ?? base?.commit?.author?.date ?? null;
+  const supportChange = async (specCommits) => {
+    for (const dir of supportPaths) {
+      let rows = [];
+      if (!truncated) {
+        if (!files.some((x) => x.filename.startsWith(`${dir}/`))) continue;
+        const raw = await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(dir)}&per_page=30`).catch(() => []);
+        rows = (Array.isArray(raw) ? raw : []).filter((x) => onBase.has(x.sha));
+      } else if (since) {
+        const q = new URLSearchParams({ sha: baseBranch, path: dir, since, ...until ? { until } : {}, per_page: "30" });
+        const raw = await api("GET", `/repos/${id.repository}/commits?${q}`).catch((e) => (log(`${baseBranch} commits in ${dir} unavailable: ${String(e).slice(0, 160)}`), []));
+        rows = (Array.isArray(raw) ? raw : []).filter((x) => x.sha !== base?.sha);
+      }
+      const c = rows.find((x) => specCommits.has(x.sha));
+      if (c) return { dir, commit: commitRef(c) };
+    }
+    return null;
+  };
+  let support;
+  const markSupport = async (list) => {
+    const unmarked = list.filter((f) => !f.out_of_date);
+    if (!unmarked.length || !supportPaths.length) return;
+    const specCommits = new Set(findings.flatMap((f) => f.out_of_date && !f.out_of_date.support ? [f.out_of_date.commit, ...f.out_of_date.also ?? []] : []).map((c) => c?.sha).filter((x) => Boolean(x)));
+    if (!specCommits.size) return;
+    if (support === void 0) support = await supportChange(specCommits);
+    if (support) for (const f of unmarked) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by ?? null, commit: support.commit, support: support.dir };
+  };
+  if (!truncated) {
+    await markSupport(findings);
+    return { truncated: false };
+  }
+  if (!since) {
+    log(`${baseBranch} changed ${files.length}+ files since this PR last merged it, and the merge base has no date; ${rest.length} failure(s) unchecked`);
+    return { truncated: true, unchecked: rest };
+  }
+  log(`${baseBranch} changed ${files.length}+ files since this PR last merged it; checking the failing specs' directories instead`);
+  const dirs = /* @__PURE__ */ new Map();
+  const unchecked = [];
+  for (const f of rest) {
+    const path = f.repo_path ?? "";
+    const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+    if (!dir) {
+      unchecked.push(f);
+      continue;
+    }
+    if (!dirs.has(dir)) {
+      if (dirs.size >= OUT_OF_DATE_DIR_CAP) {
+        unchecked.push(f);
+        continue;
+      }
+      const q = new URLSearchParams({ sha: baseBranch, path: dir, since, ...until ? { until } : {}, per_page: "1" });
+      dirs.set(dir, await api("GET", `/repos/${id.repository}/commits?${q}`).then((raw) => {
+        const c2 = (Array.isArray(raw) ? raw : []).find((x) => x.sha !== base?.sha);
+        return c2 ? commitRef(c2) : null;
+      }).catch((e) => (log(`${baseBranch} commits in ${dir} unavailable: ${String(e).slice(0, 160)}`), "unchecked")));
+    }
+    const c = dirs.get(dir);
+    if (c === "unchecked") unchecked.push(f);
+    else if (c) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: c };
+  }
+  await markSupport(findings.filter((f) => !unchecked.includes(f)));
+  return { truncated: true, unchecked };
+}
+async function markBrokeBy({ findings, api, id, log = () => {
+} }) {
+  const windows = /* @__PURE__ */ new Map();
+  for (const f of findings) {
+    const from = f.trunk_break?.last_pass?.commit_sha;
+    const to = f.trunk_break?.first_fail?.commit_sha;
+    if (from === to) continue;
+    const key = `${from}...${to}`;
+    if (!windows.has(key)) {
+      if (windows.size >= 10) continue;
+      windows.set(key, await api("GET", `/repos/${id.repository}/compare/${key}?per_page=100`).then((raw) => {
+        const c = raw;
+        return {
+          from,
+          to,
+          total: c.total_commits ?? (c.commits ?? []).length,
+          commits: (c.commits ?? []).slice(-5).map((x) => ({
+            sha: x.sha,
+            pr: Number(/\(#(\d+)\)\s*$/.exec(String(x.commit?.message ?? "").split("\n")[0])?.[1]) || null,
+            author: x.author?.login ?? null
+          }))
+        };
+      }).catch((e) => (log(`commits between ${String(from).slice(0, 7)} and ${String(to).slice(0, 7)} unavailable: ${String(e).slice(0, 160)}`), null)));
+    }
+    const w = windows.get(key);
+    if (w?.total) f.broke_by = w;
+  }
+}
+
 // ../e2e-test-triage/src/classify.ts
-var INFRA_RE = /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready|failed: 408 Request timed out after \d+ ?ms|maestro\.DeviceUnreachableException|Device became unreachable|pending request #-1000 \("isReady"\)|attributes_feature_disabled|permission_policies\.feature_disabled/i;
+var INFRA_RE = /server (?:is )?not healthy|server at "[^"]*" is not healthy|No response from server|ECONNREFUSED|ENOTFOUND|net::ERR_|browser has been closed|browser has disconnected|Target page, context or browser has been closed|StatusRuntimeException: UNAVAILABLE|Failed to launch|Could not connect to|socket hang up|502 Bad Gateway|503 Service|Timed out waiting for the (?:server|app)|was assigned to a shard but produced no result|was not JSON|answered with an HTML page|HTML from server|server did not attach file|cloudflare-5xx-errors|service is not ready|failed: 408 Request timed out after \d+ ?ms/i;
 var isInfraError = (text) => INFRA_RE.test(text ?? "");
 function isShardPlaceholder(t) {
   const title = t.title.trim();
@@ -805,479 +1247,14 @@ function markEarlierFailures(findings) {
   }
   return findings;
 }
-var isSmallSuiteStorm = (failed, total) => total != null && total >= 6 && failed >= 5 && failed * 2 >= total;
-function infraVerdict(failing, cfg = DEFAULTS, total) {
+function infraVerdict(failing, cfg = DEFAULTS) {
   if (!failing.length) return null;
   const infra = failing.filter((t) => isInfraError(t.error)).length;
   if (infra >= Math.max(3, Math.ceil(failing.length / 2)))
     return `${infra} of ${failing.length} failures are infrastructure errors (server health, connectivity, device, shard that never ran); rerun when the environment recovers.`;
   if (failing.length >= cfg.infraMinFailures)
     return `${failing.length} tests failed in one run; check for a shared environment, build or product failure first.`;
-  if (isSmallSuiteStorm(failing.length, total))
-    return `${failing.length} of ${total} tests failed in one run; check for a shared environment, build or product failure first.`;
   return null;
-}
-
-// ../e2e-test-triage/src/history.ts
-var HISTORY_RETRY_MS = [1e3, 2500, 5e3];
-async function postHistory(fetchImpl, url, body) {
-  let failure;
-  for (let attempt = 0; attempt <= HISTORY_RETRY_MS.length; attempt++) {
-    if (attempt > 0) await new Promise((resolve2) => setTimeout(resolve2, HISTORY_RETRY_MS[attempt - 1]));
-    try {
-      const res = await fetchImpl(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(12e4) });
-      if (res.status < 500) return res;
-      failure = new Error(`TSIO history ${res.status}`);
-    } catch (e) {
-      failure = e;
-    }
-  }
-  throw failure;
-}
-async function fetchSpecRuns(fetchImpl, base, repository, files, until, cfg = DEFAULTS, lane = null, reportName = null) {
-  const history = { byFile: /* @__PURE__ */ new Map(), truncated: false };
-  const wanted = [...new Set(files.filter(Boolean))].slice(0, HISTORY_MAX_FILES);
-  const runs = /* @__PURE__ */ new Map();
-  for (let page = 1; page <= HISTORY_MAX_PAGES && wanted.length; page++) {
-    const body = { repository, until, files: wanted, page, per_page: HISTORY_PER_PAGE, runs: cfg.crossPRRuns };
-    if (reportName) body.report = reportName;
-    const res = await postHistory(fetchImpl, `${base}/api/v1/reports/history`, body);
-    if (!res.ok) throw new Error(`TSIO history ${res.status}`);
-    const { observations = [], has_more: hasMore } = await res.json();
-    for (const o of observations) {
-      if (o.group_id == null || !wanted.includes(o.file)) continue;
-      if (lane != null && o.name != null && laneOf(o.name) !== lane) continue;
-      if (!runs.has(o.file)) runs.set(o.file, /* @__PURE__ */ new Map());
-      const byGroup = runs.get(o.file);
-      const group = String(o.group_id);
-      if (!byGroup.has(group)) byGroup.set(group, { notRun: false, tests: /* @__PURE__ */ new Map() });
-      const run = byGroup.get(group);
-      if (o.title === "spec did not run") run.notRun = true;
-      else {
-        const key = JSON.stringify([o.report_name ?? "", o.full_title || o.title]);
-        if (!run.tests.has(key)) run.tests.set(key, []);
-        run.tests.get(key).push(o);
-      }
-    }
-    if (!hasMore) break;
-    if (page === HISTORY_MAX_PAGES) history.truncated = true;
-  }
-  for (const [file, byGroup] of runs) {
-    const outcomes = [];
-    for (const [group_id, run] of byGroup) {
-      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0)), (a) => a.report_name ?? null).status);
-      const status = run.notRun ? "not_run" : results.some((s) => FAILED_STATUSES.has(s)) ? "failed" : results.every((s) => s === "skipped") ? "skipped" : "passed";
-      outcomes.push({ group_id, status });
-    }
-    history.byFile.set(file, outcomes);
-  }
-  return history;
-}
-async function fetchHistory(fetchImpl, base, repository, tests, until, cfg = DEFAULTS, trunkBranch = null, reportName = null, warn = () => {
-}, lane = null) {
-  const byTest = Object.assign(/* @__PURE__ */ new Map(), {
-    truncated: false,
-    reportUnknown: false,
-    // rows can't say which report (platform) they came from
-    ambiguous: /* @__PURE__ */ new Set()
-    // tests whose rows can't be tied to them alone
-  });
-  const files = [...new Set(tests.map((t) => t.file).filter(Boolean))].slice(0, HISTORY_MAX_FILES);
-  if (files.length === 0) return byTest;
-  const byLeaf = /* @__PURE__ */ new Map();
-  for (const t of tests) {
-    const leaf = `${t.file}
-${t.title}`;
-    if (!byLeaf.has(leaf)) byLeaf.set(leaf, []);
-    byLeaf.get(leaf).push(t);
-  }
-  const queries = [];
-  if (trunkBranch) queries.push({ branch: trunkBranch, runs: cfg.trunkRuns });
-  queries.push({ runs: cfg.crossPRRuns });
-  const laneTrunkRuns = /* @__PURE__ */ new Set();
-  const allTrunkRuns = /* @__PURE__ */ new Set();
-  let widened = false;
-  const seen = /* @__PURE__ */ new Map();
-  const ancestryByLeaf = /* @__PURE__ */ new Map();
-  const fallbackByLeaf = /* @__PURE__ */ new Map();
-  const dedupe = queries.length > 1;
-  for (let qi = 0; qi < queries.length; qi++) {
-    const q = queries[qi];
-    for (let page = 1; page <= HISTORY_MAX_PAGES; page++) {
-      const body = { repository, until, files, page, per_page: HISTORY_PER_PAGE, ...q };
-      if (reportName) body.report = reportName;
-      const res = await postHistory(fetchImpl, `${base}/api/v1/reports/history`, body);
-      if (!res.ok) throw new Error(`TSIO history ${res.status}`);
-      const page_ = await res.json();
-      const observations = page_.observations ?? [];
-      const hasMore = page_.has_more;
-      for (const o of observations) {
-        const leaf = `${o.file}
-${o.title}`;
-        const candidates = byLeaf.get(leaf);
-        if (!candidates) continue;
-        if (qi === 0 && o.group_id != null) allTrunkRuns.add(String(o.group_id));
-        if (lane != null && o.name != null && laneOf(o.name) !== lane) continue;
-        if (qi === 0 && o.group_id != null) laneTrunkRuns.add(String(o.group_id));
-        if (reportName) {
-          if (!o.report_name) byTest.reportUnknown = true;
-          else if (!String(o.report_name).startsWith(reportName)) continue;
-        }
-        const ancestry = o.full_title || o.suite_title;
-        if (ancestry) {
-          if (!ancestryByLeaf.has(leaf)) ancestryByLeaf.set(leaf, /* @__PURE__ */ new Set());
-          ancestryByLeaf.get(leaf).add(ancestry);
-        }
-        let test = null;
-        const comparable = Boolean(o.full_title) && candidates.every((c) => c.full_title);
-        if (comparable) {
-          test = candidates.find((c) => c.full_title === o.full_title) ?? null;
-          if (!test) continue;
-        } else if (candidates.length > 1 || candidates[0].identity_ambiguous) {
-          for (const c of candidates) byTest.ambiguous.add(identityKey(c));
-          continue;
-        } else {
-          test = candidates[0];
-          if (Boolean(test.full_title) !== Boolean(o.full_title)) {
-            byTest.ambiguous.add(identityKey(test));
-            continue;
-          }
-          if (!fallbackByLeaf.has(leaf)) fallbackByLeaf.set(leaf, /* @__PURE__ */ new Set());
-          fallbackByLeaf.get(leaf).add(identityKey(test));
-          if (test.suite_title && o.suite_title && test.suite_title !== o.suite_title)
-            byTest.ambiguous.add(identityKey(test));
-        }
-        const k = identityKey(test);
-        if (dedupe && o.group_id != null) {
-          const rowKey = JSON.stringify([o.group_id, o.report_name, o.full_title, o.suite_title, k, o.retry_count, o.ordinal ?? 0]);
-          const previous = seen.get(rowKey);
-          if (previous !== void 0) {
-            if (previous !== o.status) byTest.ambiguous.add(k);
-            continue;
-          }
-          seen.set(rowKey, o.status);
-        }
-        if (!byTest.has(k)) byTest.set(k, []);
-        byTest.get(k).push(o);
-      }
-      if (!hasMore) break;
-      if (page === HISTORY_MAX_PAGES) {
-        byTest.truncated = true;
-        warn(`history for ${files.length} file(s) hit the ${HISTORY_MAX_PAGES}-page cap with more to come; nothing will be cleared on partial history`);
-      }
-    }
-    if (qi === 0 && trunkBranch && lane != null && !widened && laneTrunkRuns.size < cfg.minTrunkRuns && allTrunkRuns.size >= cfg.minTrunkRuns) {
-      widened = true;
-      const since = new Date(Date.parse(until) - cfg.windowDays * 864e5).toISOString();
-      warn(`only ${laneTrunkRuns.size} run(s) of ${lane} among ${trunkBranch}'s last ${cfg.trunkRuns}; reading ${trunkBranch}'s history since ${since.slice(0, 10)}`);
-      queries.splice(1, 0, { branch: trunkBranch, since });
-    }
-  }
-  for (const [key, rows] of byTest) {
-    const runs = /* @__PURE__ */ new Map();
-    const collapsed = [];
-    for (const row of rows) {
-      if (row.group_id == null) {
-        collapsed.push(row);
-        continue;
-      }
-      const run = JSON.stringify([row.group_id, reportName ? row.report_name ?? "" : ""]);
-      if (!runs.has(run)) runs.set(run, []);
-      runs.get(run).push(row);
-    }
-    for (const attempts of runs.values()) {
-      attempts.sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0));
-      const { status, last } = outcomeOf(attempts);
-      const failedTry = status === "flaky" ? attempts.filter((a) => FAILED_STATUSES.has(a.status) && a.error_excerpt).at(-1) ?? attempts.filter((a) => a.status === "flaky" && a.error_excerpt).at(-1) : void 0;
-      collapsed.push({ ...last, status, ...failedTry?.error_excerpt ? { error_excerpt: failedTry.error_excerpt } : {} });
-    }
-    byTest.set(key, collapsed);
-  }
-  for (const [leaf, keys] of fallbackByLeaf) {
-    if ((ancestryByLeaf.get(leaf)?.size ?? 0) > 1)
-      for (const key of keys) byTest.ambiguous.add(key);
-  }
-  for (const [key, rows] of byTest) {
-    const reportsByGroup = /* @__PURE__ */ new Map();
-    for (const row of rows) {
-      if (!row.group_id || !row.report_name) continue;
-      const groupKey = String(row.group_id);
-      if (!reportsByGroup.has(groupKey)) reportsByGroup.set(groupKey, /* @__PURE__ */ new Set());
-      reportsByGroup.get(groupKey).add(row.report_name);
-    }
-    if ([...reportsByGroup.values()].some((reports) => reports.size > 1)) byTest.ambiguous.add(key);
-  }
-  const at = (o) => Date.parse(o.created_at ?? "") || 0;
-  for (const rows of byTest.values()) rows.sort((a, b) => at(b) - at(a));
-  return byTest;
-}
-function trunkRunsOn(history, branch) {
-  let most = 0;
-  for (const rows of history.values()) {
-    const runs = rows.filter((o) => (o.gh_pr_number == null || o.gh_pr_number === "") && o.branch === branch).length;
-    most = Math.max(most, runs);
-  }
-  return most;
-}
-var STORM_READS = 100;
-var STORM_READ_BATCH = 10;
-var STORM_DEADLINE_MS = 3e4;
-async function dropStormRuns({
-  history,
-  fetchImpl,
-  base,
-  minFailures,
-  trunkBranch = null,
-  own = null,
-  pr = null,
-  log = () => {
-  },
-  deadlineMs = STORM_DEADLINE_MS
-}) {
-  const prOf = (o) => o.gh_pr_number == null || o.gh_pr_number === "" ? null : Number(o.gh_pr_number);
-  const isOwn = (o) => o.group_id != null && String(o.group_id) === String(own);
-  const isTrunk = (o) => prOf(o) == null && (trunkBranch == null || o.branch === trunkBranch);
-  const streak = /* @__PURE__ */ new Set();
-  for (const rows of history.values()) {
-    for (const o of rows) {
-      if (isOwn(o) || !isTrunk(o) || o.status === "skipped") continue;
-      if (!isFailedTry(o.status)) break;
-      streak.add(o);
-    }
-  }
-  const counted = (o) => o.group_id != null && !isOwn(o) && isFailedTry(o.status) && !streak.has(o) && (pr == null || prOf(o) !== Number(pr));
-  const newest = /* @__PURE__ */ new Map();
-  for (const rows of history.values())
-    for (const o of rows)
-      if (counted(o)) newest.set(String(o.group_id), Math.max(newest.get(String(o.group_id)) ?? 0, Date.parse(o.created_at ?? "") || 0));
-  const list = [...newest.keys()].sort((a, b) => newest.get(b) - newest.get(a));
-  const storms = /* @__PURE__ */ new Set();
-  const quiet = /* @__PURE__ */ new Set();
-  const deadline = Date.now() + deadlineMs;
-  let timer;
-  const late = new Promise((resolve2) => {
-    timer = setTimeout(resolve2, deadlineMs);
-  });
-  try {
-    for (let i = 0; i < Math.min(list.length, STORM_READS) && Date.now() < deadline; i += STORM_READ_BATCH) {
-      const batch = list.slice(i, Math.min(i + STORM_READ_BATCH, STORM_READS)).map(async (g) => {
-        try {
-          const { test_stats: t } = await tsioJson(fetchImpl, base, `/reports/${encodeURIComponent(g)}`);
-          const failed = t?.failed ?? 0;
-          const executed = Math.max(0, (t?.total ?? 0) - (t?.skipped ?? 0));
-          (failed >= minFailures && failed * 10 >= (t?.total ?? 0) || isSmallSuiteStorm(failed, executed) ? storms : quiet).add(g);
-        } catch {
-        }
-      });
-      await Promise.race([Promise.all(batch), late]);
-    }
-  } finally {
-    clearTimeout(timer);
-  }
-  const dropped = new Set(list.filter((g) => !quiet.has(g)));
-  if (!dropped.size) return dropped;
-  for (const [key, rows] of history) history.set(key, rows.filter((o) => !counted(o) || !dropped.has(String(o.group_id))));
-  const unread = dropped.size - storms.size;
-  log(`history: left out the failures of ${storms.size} storm run(s)${unread ? ` and of ${unread} that could not be read` : ""}`);
-  return dropped;
-}
-async function fetchChangedFiles(api, id, prNumber, log = () => {
-}) {
-  try {
-    if (prNumber) {
-      const files2 = [];
-      for (let page = 1; page <= CHANGED_FILES_MAX_PAGES; page++) {
-        const batch = await api("GET", `/repos/${id.repository}/pulls/${prNumber}/files?per_page=100&page=${page}`);
-        files2.push(...batch ?? []);
-        if (!batch || batch.length < 100) return { files: files2, ok: true };
-      }
-      log(`stopped after ${CHANGED_FILES_MAX_PAGES} pages of changed files; ownership is incomplete and nothing will be cleared`);
-      return { files: files2, ok: false };
-    }
-    const files = [];
-    for (let page = 1; page <= CHANGED_FILES_MAX_PAGES; page++) {
-      const commit = await api("GET", `/repos/${id.repository}/commits/${id.commit_sha}?per_page=100&page=${page}`);
-      const batch = commit?.files ?? [];
-      files.push(...batch);
-      if (batch.length < 100) return { files, ok: true };
-    }
-    log(`stopped after ${CHANGED_FILES_MAX_PAGES} pages of commit files; ownership is incomplete and nothing will be cleared`);
-    return { files, ok: false };
-  } catch (e) {
-    log(`changed files unavailable: ${String(e).slice(0, 200)}`);
-    return { files: [], ok: false };
-  }
-}
-var OUT_OF_DATE_DIR_CAP = 20;
-var commitRef = (c) => ({
-  sha: c.sha,
-  date: String(c.commit?.committer?.date ?? c.commit?.author?.date ?? "").slice(0, 10),
-  pr: Number(/\(#(\d+)\)/.exec(c.commit?.message ?? "")?.[1]) || null
-});
-async function markFixedOnTrunk({ findings, api, id, baseBranch, log = () => {
-} }) {
-  if (!findings.length) return;
-  const cmp = baseBranch ? await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`) : null;
-  const lacking = new Map((cmp?.commits ?? []).map((c) => [c.sha, c]));
-  const complete = cmp != null && (cmp.ahead_by ?? 0) <= lacking.size;
-  for (const f of findings) {
-    const lastFail = f.trunk_fixed?.last_fail?.commit_sha;
-    const firstPass = f.trunk_fixed?.first_pass?.commit_sha;
-    if (lastFail && lacking.has(lastFail)) {
-      const pass = firstPass ? lacking.get(firstPass) : void 0;
-      f.out_of_date = { base: baseBranch, behind: cmp.ahead_by ?? null, commit: pass ? commitRef(pass) : null, fixed: true };
-    } else if (firstPass && complete && !lacking.has(firstPass)) {
-      Object.assign(f, { class: "REGRESSION", reason: `${f.reason} This branch has that fix (by ${firstPass.slice(0, 7)}) and still fails the same way.` });
-    } else {
-      log(`whether this PR has ${baseBranch}'s fix for ${f.title} is unknown`);
-      Object.assign(f, { decision: "evidence_incomplete", reason: `${f.reason} Whether this branch has that fix could not be checked.` });
-    }
-  }
-}
-async function markOutOfDate({
-  findings,
-  api,
-  id,
-  baseBranch,
-  until = null,
-  log = () => {
-  },
-  supportPaths = [],
-  fetchFileDiffs = false
-}) {
-  if (!findings.length || !baseBranch) return { truncated: false };
-  const cmp = await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`);
-  if (!cmp?.ahead_by) return { truncated: false };
-  const files = cmp.files ?? [];
-  const truncated = files.length >= COMPARE_FILE_CAP;
-  const changed = new Set(files.map((x) => x.filename));
-  const onBase = new Set((cmp.commits ?? []).map((c) => c.sha));
-  const commits = /* @__PURE__ */ new Map();
-  const rest = [];
-  for (const f of findings) {
-    const path = f.repo_path;
-    if (!path || !changed.has(path)) {
-      if (truncated) rest.push(f);
-      continue;
-    }
-    if (!commits.has(path)) {
-      const log_ = await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(path)}&per_page=10`).catch(() => []);
-      const [c, ...earlier] = (log_ ?? []).filter((x) => onBase.has(x.sha));
-      commits.set(path, { commit: c ? commitRef(c) : null, also: earlier.slice(0, 4).map(commitRef) });
-    }
-    const { commit, also } = commits.get(path) ?? { commit: null, also: [] };
-    const diff = files.find((x) => x.filename === path)?.patch;
-    f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit, ...also.length ? { also } : {}, ...diff ? { diff: diff.slice(0, 4e3) } : {} };
-  }
-  const base = cmp.merge_base_commit;
-  const since = base?.commit?.committer?.date ?? base?.commit?.author?.date ?? null;
-  const supportChange = async (specCommits) => {
-    for (const dir of supportPaths) {
-      let rows = [];
-      if (!truncated) {
-        if (!files.some((x) => x.filename.startsWith(`${dir}/`))) continue;
-        const raw = await api("GET", `/repos/${id.repository}/commits?sha=${encodeURIComponent(baseBranch)}&path=${encodeURIComponent(dir)}&per_page=30`).catch(() => []);
-        rows = (Array.isArray(raw) ? raw : []).filter((x) => onBase.has(x.sha));
-      } else if (since) {
-        const q = new URLSearchParams({ sha: baseBranch, path: dir, since, ...until ? { until } : {}, per_page: "30" });
-        const raw = await api("GET", `/repos/${id.repository}/commits?${q}`).catch((e) => (log(`${baseBranch} commits in ${dir} unavailable: ${String(e).slice(0, 160)}`), []));
-        rows = (Array.isArray(raw) ? raw : []).filter((x) => x.sha !== base?.sha);
-      }
-      const c = rows.find((x) => specCommits.has(x.sha));
-      if (c) return { dir, commit: commitRef(c) };
-    }
-    return null;
-  };
-  let support;
-  const markSupport = async (list) => {
-    const unmarked = list.filter((f) => !f.out_of_date);
-    if (!unmarked.length || !supportPaths.length) return;
-    const specCommits = new Set(findings.flatMap((f) => f.out_of_date && !f.out_of_date.support ? [f.out_of_date.commit, ...f.out_of_date.also ?? []] : []).map((c) => c?.sha).filter((x) => Boolean(x)));
-    if (!specCommits.size) return;
-    if (support === void 0) support = await supportChange(specCommits);
-    if (support) for (const f of unmarked) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by ?? null, commit: support.commit, support: support.dir };
-  };
-  if (!truncated) {
-    await markSupport(findings);
-    return { truncated: false };
-  }
-  if (!since) {
-    log(`${baseBranch} changed ${files.length}+ files since this PR last merged it, and the merge base has no date; ${rest.length} failure(s) unchecked`);
-    return { truncated: true, unchecked: rest };
-  }
-  log(`${baseBranch} changed ${files.length}+ files since this PR last merged it; checking the failing specs' ${fetchFileDiffs ? "files and " : ""}directories instead`);
-  const dirs = /* @__PURE__ */ new Map();
-  const filePatches = /* @__PURE__ */ new Map();
-  const unchecked = [];
-  for (const f of rest) {
-    const path = f.repo_path ?? "";
-    if (fetchFileDiffs && path && (filePatches.has(path) || filePatches.size < 10)) {
-      if (!filePatches.has(path)) {
-        const q = new URLSearchParams({ sha: baseBranch, path, since, ...until ? { until } : {}, per_page: "5" });
-        const raw = await api("GET", `/repos/${id.repository}/commits?${q}`).catch(() => []);
-        const [c2, ...earlier] = (Array.isArray(raw) ? raw : []).filter((x) => x.sha !== base?.sha);
-        if (c2) {
-          const detail = await api("GET", `/repos/${id.repository}/commits/${c2.sha}`).catch(() => null);
-          const patch = detail?.files?.find((x) => x.filename === path)?.patch;
-          filePatches.set(path, { commit: commitRef(c2), also: earlier.slice(0, 4).map(commitRef), ...patch ? { diff: patch.slice(0, 4e3) } : {} });
-        } else filePatches.set(path, null);
-      }
-      const hit = filePatches.get(path);
-      if (hit) {
-        f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: hit.commit, ...hit.also.length ? { also: hit.also } : {}, ...hit.diff ? { diff: hit.diff } : {} };
-        continue;
-      }
-    }
-    const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
-    if (!dir) {
-      unchecked.push(f);
-      continue;
-    }
-    if (!dirs.has(dir)) {
-      if (dirs.size >= OUT_OF_DATE_DIR_CAP) {
-        unchecked.push(f);
-        continue;
-      }
-      const q = new URLSearchParams({ sha: baseBranch, path: dir, since, ...until ? { until } : {}, per_page: "1" });
-      dirs.set(dir, await api("GET", `/repos/${id.repository}/commits?${q}`).then((raw) => {
-        const c2 = (Array.isArray(raw) ? raw : []).find((x) => x.sha !== base?.sha);
-        return c2 ? commitRef(c2) : null;
-      }).catch((e) => (log(`${baseBranch} commits in ${dir} unavailable: ${String(e).slice(0, 160)}`), "unchecked")));
-    }
-    const c = dirs.get(dir);
-    if (c === "unchecked") unchecked.push(f);
-    else if (c) f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: c };
-  }
-  await markSupport(findings.filter((f) => !unchecked.includes(f)));
-  return { truncated: true, unchecked };
-}
-async function markBrokeBy({ findings, api, id, log = () => {
-} }) {
-  const windows = /* @__PURE__ */ new Map();
-  for (const f of findings) {
-    const from = f.trunk_break?.last_pass?.commit_sha;
-    const to = f.trunk_break?.first_fail?.commit_sha;
-    if (from === to) continue;
-    const key = `${from}...${to}`;
-    if (!windows.has(key)) {
-      if (windows.size >= 10) continue;
-      windows.set(key, await api("GET", `/repos/${id.repository}/compare/${key}?per_page=100`).then((raw) => {
-        const c = raw;
-        return {
-          from,
-          to,
-          total: c.total_commits ?? (c.commits ?? []).length,
-          commits: (c.commits ?? []).slice(-5).map((x) => ({
-            sha: x.sha,
-            pr: Number(/\(#(\d+)\)\s*$/.exec(String(x.commit?.message ?? "").split("\n")[0])?.[1]) || null,
-            author: x.author?.login ?? null
-          }))
-        };
-      }).catch((e) => (log(`commits between ${String(from).slice(0, 7)} and ${String(to).slice(0, 7)} unavailable: ${String(e).slice(0, 160)}`), null)));
-    }
-    const w = windows.get(key);
-    if (w?.total) f.broke_by = w;
-  }
 }
 
 // ../e2e-test-triage/src/render.ts
@@ -2557,8 +2534,7 @@ Rules:
 - Cite only evidence items by their id from the pack. Never invent commits, versions, files or errors.
 - test_bug with high confidence requires base_change with a diff that fixes what this failure shows.
 - server_compat with high confidence requires other_platforms showing this test passing against another server version
-  on this build, and failing against this lane's version. Passing on another OS against the SAME server version rules out
-  server_compat and points to flaky_environment (for example, a shared-server config race or runner timing).
+  on this build, and failing against this lane's version.
 - flaky_environment with high confidence requires cross_pr or an error that is clearly infrastructural; it is ruled out
   when the test failed every try here and failed on every other lane.
 - app_bug: the error is about the app's behavior and no evidence points to the test, the environment or a server
@@ -2794,25 +2770,19 @@ function canChange(cls, pack, isTrunkRun = false) {
   const hunk = ids.some((id) => id.startsWith("hunk_"));
   if (exoneratedSet(isTrunkRun).has(cls)) return hunk;
   if (cls === "INFRA_ERROR") return CLEARING(ids);
-  const trunk = pack.trunk_history_14d;
-  const trunkUnstable = (trunk?.fails ?? 0) > 0 || (trunk?.flaky ?? 0) > 0 || trunk?.latest === "failed";
-  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack) || trunkUnstable;
+  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack);
   return false;
 }
 function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
-  if (!answer) return false;
+  if (!answer || pack.release) return false;
   const known = new Set(evidenceIds(pack));
   const cited = answer.cited_evidence.filter((c) => known.has(c));
-  if (pack.release) {
-    if (answer.confidence < cfg.escalateMin || answer.confidence >= cfg.minConfidence) return false;
-    return answer.cause === "app_bug" || decideRelease({ ...answer, confidence: cfg.minConfidence }, pack, cfg).decision === "adjudicator_unblock";
-  }
   const hunk = cited.some((c) => c.startsWith("hunk_"));
   if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
   if (answer.confidence < cfg.escalateMin) return false;
   if (exoneratedSet(isTrunkRun).has(cls)) return answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.vetoMin;
-  if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.minConfidence) return true;
-  return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && unblocks(answer.cause, cited, pack, cls);
+  const clears = CLEARING(cited) || cls !== "INFRA_ERROR" && answer.cause === "flaky_environment" && (isInfraError(pack.error) || cited.includes("earlier_failure_same_spec") && chainClears(pack));
+  return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && clears;
 }
 var JUDGED_PER_CALL = 8;
 async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
@@ -2974,8 +2944,7 @@ async function evaluateRun({
 }) {
   const isTrunkRun = prNumber == null;
   const tests = run.failing.filter((t) => !isShardPlaceholder(t));
-  const executed = Math.max(0, run.counts.total - run.counts.skipped);
-  const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg, executed || void 0), counts: run.counts, ai: newLedger(), missing: null };
+  const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg), counts: run.counts, ai: newLedger(), missing: null };
   const changedFiles = new Set((diff.files ?? []).map((f) => f.filename));
   const editedBy = (file) => {
     const path = repoPath(testRoot, file);
@@ -3005,11 +2974,7 @@ async function evaluateRun({
         patches: diff.ok ? files : null
       });
     });
-    const nonProductOnly = Boolean(prNumber) && diff.ok && files.length > 0 && files.every((f) => {
-      const cat = changeCategory(f.filename, changeContext);
-      return cat === "ci" || cat === "docs" || cat === "other" || !isProductChange(f.filename);
-    });
-    if (result.infra && (!isTrunkRun || Boolean(branchBase)) && !nonProductOnly) {
+    if (result.infra) {
       const why = /infrastructure errors/.test(result.infra) ? "most of this run failed on its environment" : "many tests failed in this run";
       for (const f of result.findings)
         if (f.class === "INFRA_ERROR" && !f.blocking)
@@ -3159,10 +3124,7 @@ function settlePR(findings, changed, ownershipKnown, flagged, files = [], minTru
     const everyTry = Boolean(f.tries && f.tries.ran >= 2 && f.tries.failed === f.tries.ran);
     const elsewhere = f.failed_everywhere?.length ? f.failed_everywhere : null;
     const trunkClean = Boolean(t && t.runs >= minTrunkRuns && (t.lane_runs ?? t.runs) >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
-    const passedElsewhere = Boolean(f.other_lanes?.length) && f.other_lanes.some((l) => l.result === "passed") && !f.other_lanes.some((l) => l.result !== "passed" && l.result !== "skipped");
-    const platformChange = changed.some((name) => /(?:^|\/)(?:ios|android|macos|windows|linux)\/|\.(?:ios|android|macos|win32|linux)\./i.test(name));
-    const judgeClearsEnv = Boolean(f.judge && (f.judge.cause === "flaky_environment" || f.judge.cause === "bug_on_master") && f.judge.confidence >= 0.7 && !f.judge.cited_evidence.some((c) => c.startsWith("hunk_")));
-    if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length && !(passedElsewhere && !platformChange) && !judgeClearsEnv) {
+    if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length) {
       Object.assign(f, {
         untouched: true,
         decision: "reproducible_regression",
@@ -3810,7 +3772,7 @@ function errorLines(lines, max = 5) {
   }
   return [...counts.values()].sort((a, b) => b.n - a.n).slice(0, max).map((c) => c.line);
 }
-async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runnerName, prefix: given, filter, log }) {
+async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runnerName, prefix: given, log }) {
   const get = async (path) => {
     let last = null;
     for (let i = 0; i < 3; i++) {
@@ -3832,14 +3794,7 @@ async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runn
     const own = all.find((j) => j.runner_name === runnerName && j.status !== "completed");
     if (own) prefix = lanePrefixOf(own.name);
   }
-  const tokens2 = String(filter ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-  const include = tokens2.filter((t) => !t.startsWith("!"));
-  const exclude = tokens2.filter((t) => t.startsWith("!")).map((t) => t.slice(1)).filter(Boolean);
-  const byPrefix = prefix ? all.filter((j) => j.name.startsWith(prefix)) : all;
-  const lane = tokens2.length ? byPrefix.filter((j) => {
-    const name = j.name.toLowerCase();
-    return (!include.length || include.some((t) => name.includes(t))) && !exclude.some((t) => name.includes(t));
-  }) : byPrefix;
+  const lane = prefix ? all.filter((j) => j.name.startsWith(prefix)) : all;
   const failedStep = (j) => j.steps?.find((s) => s.conclusion === "failure") ?? j.steps?.find((s) => s.conclusion === "cancelled" || s.conclusion === "timed_out") ?? null;
   let workerLogs = 0;
   const out = [];
@@ -3890,7 +3845,6 @@ async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRu
       attempt: runAttempt,
       runnerName: env.RUNNER_NAME ?? null,
       prefix: env.LANE_JOB_PREFIX || null,
-      filter: env.LANE_JOB_FILTER || null,
       log
     });
   } catch (e) {
@@ -4181,7 +4135,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       // A release run's matrix (OS x server version) is wider than a PR's platforms.
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log, limit: branchBase ? 20 : 5 }),
-      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths, fetchFileDiffs: Boolean(branchBase) }),
+      outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory

@@ -5628,10 +5628,12 @@ test("evaluateRun: trunk INFRA_ERROR is never held for a non-existent judge, and
   assert.equal(ciOnlyPr.verdict, "SUCCESS", "CI-only PR cannot break remote test server");
   assert.ok(ciOnlyPr.findings.every((f) => !f.blocking));
 
-  // Product PR with 3/3 infra errors still holds for the judge.
-  const productPr = await evaluateRun({ run, id: { repository: "o/r", commit_sha: "ghi", gh_run_id: "3", name: "desktop-pr" }, prNumber: 4107, history: new Map(), diff: { files: [{ filename: "src/main/server.ts" }], ok: true }, trunkBranch: "master", testRoot: "e2e", cfg });
-  assert.equal(productPr.verdict, "ACTION_REQUIRED");
-  assert.ok(productPr.findings.every((f) => f.blocking));
+  // Product PR, E2E workflow PR, and lockfile PR with 3/3 infra errors still hold for the judge.
+  for (const filename of ["src/main/server.ts", ".github/workflows/e2e-functional.yml", "package-lock.json"]) {
+    const heldPr = await evaluateRun({ run, id: { repository: "o/r", commit_sha: "ghi", gh_run_id: "3", name: "desktop-pr" }, prNumber: 4107, history: new Map(), diff: { files: [{ filename }], ok: true }, trunkBranch: "master", testRoot: "e2e", cfg });
+    assert.equal(heldPr.verdict, "ACTION_REQUIRED", `${filename} must hold infra errors for the judge`);
+    assert.ok(heldPr.findings.every((f) => f.blocking));
+  }
 });
 
 test("settlePR: does not promote reproducible_regression when sibling platform passed (no platform diff) or judge called flaky_environment", () => {

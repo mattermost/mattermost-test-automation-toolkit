@@ -1654,25 +1654,28 @@ async function markOutOfDate({
   log(`${baseBranch} changed ${files.length}+ files since this PR last merged it; checking the failing specs' ${fetchFileDiffs ? "files and " : ""}directories instead`);
   const dirs = /* @__PURE__ */ new Map();
   const filePatches = /* @__PURE__ */ new Map();
+  if (fetchFileDiffs) {
+    const uniquePaths = [...new Set(rest.map((f) => f.repo_path ?? "").filter(Boolean))].slice(0, 10);
+    await Promise.all(uniquePaths.map(async (path) => {
+      const q = new URLSearchParams({ sha: baseBranch, path, since, ...until ? { until } : {}, per_page: "5" });
+      const raw = await api("GET", `/repos/${id.repository}/commits?${q}`).catch(() => []);
+      const [c, ...earlier] = (Array.isArray(raw) ? raw : []).filter((x) => x.sha !== base?.sha);
+      if (!c) {
+        filePatches.set(path, null);
+        return;
+      }
+      const detail = await api("GET", `/repos/${id.repository}/commits/${c.sha}`).catch(() => null);
+      const patch = detail?.files?.find((x) => x.filename === path)?.patch;
+      filePatches.set(path, { commit: commitRef(c), also: earlier.slice(0, 4).map(commitRef), ...patch ? { diff: patch.slice(0, 4e3) } : {} });
+    }));
+  }
   const unchecked = [];
   for (const f of rest) {
     const path = f.repo_path ?? "";
-    if (fetchFileDiffs && path && (filePatches.has(path) || filePatches.size < 10)) {
-      if (!filePatches.has(path)) {
-        const q = new URLSearchParams({ sha: baseBranch, path, since, ...until ? { until } : {}, per_page: "5" });
-        const raw = await api("GET", `/repos/${id.repository}/commits?${q}`).catch(() => []);
-        const [c2, ...earlier] = (Array.isArray(raw) ? raw : []).filter((x) => x.sha !== base?.sha);
-        if (c2) {
-          const detail = await api("GET", `/repos/${id.repository}/commits/${c2.sha}`).catch(() => null);
-          const patch = detail?.files?.find((x) => x.filename === path)?.patch;
-          filePatches.set(path, { commit: commitRef(c2), also: earlier.slice(0, 4).map(commitRef), ...patch ? { diff: patch.slice(0, 4e3) } : {} });
-        } else filePatches.set(path, null);
-      }
-      const hit = filePatches.get(path);
-      if (hit) {
-        f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: hit.commit, ...hit.also.length ? { also: hit.also } : {}, ...hit.diff ? { diff: hit.diff } : {} };
-        continue;
-      }
+    const hit = fetchFileDiffs && path ? filePatches.get(path) : null;
+    if (hit) {
+      f.out_of_date = { base: baseBranch, behind: cmp.ahead_by, commit: hit.commit, ...hit.also.length ? { also: hit.also } : {}, ...hit.diff ? { diff: hit.diff } : {} };
+      continue;
     }
     const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
     if (!dir) {
@@ -2609,7 +2612,7 @@ async function evaluateRun({
     });
     const nonProductOnly = Boolean(prNumber) && diff.ok && files.length > 0 && files.every((f) => {
       const cat = changeCategory(f.filename, changeContext);
-      return cat === "ci" || cat === "docs" || cat === "other" || !isProductChange(f.filename);
+      return cat === "docs" || cat === "other" || cat === "ci" && !/e2e|cmt|test|playwright|cypress|detox|maestro/i.test(f.filename);
     });
     if (result.infra && (!isTrunkRun || Boolean(branchBase)) && !nonProductOnly) {
       const why = /infrastructure errors/.test(result.infra) ? "most of this run failed on its environment" : "many tests failed in this run";
