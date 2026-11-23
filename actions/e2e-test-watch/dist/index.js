@@ -3223,7 +3223,6 @@ function rowOf(f, secrets) {
     out_of_date: Boolean(f.out_of_date),
     tries: f.tries ? { ran: f.tries.ran, failed: f.tries.failed } : null,
     other_lanes_failed: (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform),
-    other_lanes_passed: (f.other_lanes ?? []).filter((o) => o.result === "passed").map((o) => o.platform),
     ai: { cause: judge2?.cause ?? null, confidence: judge2?.confidence ?? null, cited: judge2?.cited_evidence ?? [], cleared: f.decision === "adjudicator_unblock", explanation: judge2 ? clip(redact(judge2.explanation, secrets), 200) : null }
   };
 }

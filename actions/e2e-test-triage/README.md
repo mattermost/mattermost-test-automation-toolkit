@@ -547,7 +547,6 @@ characters at most). Fields, in `schema` 2:
     "reason": "", "error_first_line": "", "out_of_date": false,
     "tries": { "ran": 1, "failed": 1 },
     "other_lanes_failed": ["android"],
-    "other_lanes_passed": ["ios"],
     "ai": { "cause": "caused_by_pr | null", "confidence": 0.9, "cited": ["hunk_0"], "cleared": false, "explanation": "one or two sentences | null" }
   }]
 }
