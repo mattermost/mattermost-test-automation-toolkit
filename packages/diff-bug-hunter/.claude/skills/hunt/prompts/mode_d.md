@@ -6,9 +6,12 @@ Per recorder:
    name and signature (`changed_functions_base_source`). Never call anything the PR adds. Prefer an unchanged caller or
    public entry point that reaches the changed code (`callers`) over the changed function itself: that is what real
    callers observe. One recorder per target; at most 6.
-2. Generate inputs with a fixed seed: 200 seeded inputs, plus hand-picked edge cases taken from callers, fixtures and the
-   base code (empty, nil/null, zero, boundary, oversized, unicode, values that callers or stored data really carry).
-   Shape the generator after the real data the callers pass (field names, enum values, nesting), not after the PR.
+2. Generate inputs with a fixed seed: 200 seeded inputs stratified roughly 50/50 between (a) inputs exercising the PR's
+   changed conditions/branches and (b) untouched paths and existing stored-data shapes (to expose unintended blast radius),
+   plus hand-picked edge cases from callers, fixtures and base code (empty, nil/null, zero, boundary, deeply nested,
+   oversized, malformed UTF-8/unicode, values callers or stored data carry). Shape the generator after real caller data
+   (field names, enum values, nesting), not after the PR. For stateful targets (stores, Redux reducers, lifecycle handlers),
+   include 2-6 step operation sequences and record the canonical final state and error.
 3. Call the target once per input through the helper below. The helper appends one JSON line per input to the file named
    by env `HUNT_DIFF_OUT`: {"test", "i", "input", "output"}. A panic or throw is recorded as "panic" instead of "output"
    and does not stop the loop.

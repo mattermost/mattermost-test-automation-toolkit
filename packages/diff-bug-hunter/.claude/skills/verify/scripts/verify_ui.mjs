@@ -66,18 +66,23 @@
 //   "steps": [ at most MAX_STEPS of, each with exactly one action:
 //     {"goto": "/team/channels/town-square"} (a path) | {"click": LOC} | {"fill": LOC, "value": "text"} |
 //     {"press": "Enter", "on"?: LOC} | {"select": LOC, "value": "x"} | {"check": LOC} | {"wait_for": LOC} |
-//     {"snapshot": LOC | null} | {"capture": {"api": "/api/v4/config"}} ],
+//     {"drag": {"from": LOC, "to": LOC | "dx": N, "dy": N, "release"?: false}} | {"mouse_up": true} |
+//     {"snapshot": LOC | null} |
+//     {"capture": {"api": "/api/v4/config" | {"path": "/api/v4/...", "method"?: "POST", "body"?: ...}, "save"?: {"id": "id"}}} ],
 //   "ignore": ["json.path", ...],                 (optional, compare mode: capture paths to skip; "." joins keys, "[0]"
 //                                                  indexes arrays, "*" matches any run of characters, a path also
 //                                                  covers everything under it)
 //   "expect": [ at least one of
 //     {"visible": LOC} | {"text": LOC, "contains": "x"} | {"count": LOC, "min"?: 1} |
-//     {"api": {"path": "/api/v4/users/me", "status"?: 200, "json_has"?: {"username": "sysadmin"}}} ]
+//     {"api": {"path": "/api/v4/users/me", "method"?: "GET"|"POST"|"PUT"|"PATCH"|"DELETE", "body"?: ...,
+//              "status"?: 200, "json_has"?: {"username": "sysadmin"}}} ]
 // }
 // LOC: exactly one of {"role": "button", "name"?: "Save", "exact"?: true} | {"testid"} | {"label"} | {"placeholder"} |
-//      {"text"} | {"css"}, plus an optional integer "nth" (not in "count", which counts every match).
-// "capture" does a GET of an /api/v4/ path (same checks as api.path, same credentials) and records the JSON body without
-// asserting anything; only compare mode uses it, a plain run just reports the status.
+//      {"text"} | {"css"}, plus an optional integer "nth" (not in "count", which counts every match). Locators are
+//      strict by default: omitting "nth" requires a unique match.
+// "capture" calls an /api/v4/ endpoint (same checks as api.path, same credentials, auto X-CSRF-Token on writes) and
+// records the JSON body without asserting; optional "save" extracts scalar fields into $var for later paths/bodies.
+// Plans with only "capture" steps and "expect.api" checks skip Chromium and run directly via Playwright APIRequestContext.
 // "goto" and "api.path" are checked after URL resolution: they must stay on the server, and api.path under /api/v4/.
 
 import {createRequire} from 'node:module';
@@ -95,8 +100,14 @@ const DEFAULT_SETTLE_MS = 10000;
 const DEFAULT_BASE = 'http://localhost:8065';
 const LOC_KINDS = ['role', 'testid', 'label', 'placeholder', 'text', 'css'];
 const STEP_EXTRAS = {goto: [], click: [], fill: ['value'], press: ['on'], select: ['value'], check: [], wait_for: [],
-    snapshot: [], capture: []};
+    drag: [], mouse_up: [], snapshot: [], capture: []};
 const EXPECT_EXTRAS = {visible: [], text: ['contains'], count: ['min'], api: []};
+const API_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+const MAX_BODY_BYTES = 65536;
+const MAX_DRAG_OFFSET = 2000;
+const VAR_NAME_RE = /^[A-Za-z_]\w*$/;
+const VAR_REF_RE = /\$([A-Za-z_]\w*)/g;
+const URL_VAR_VAL_RE = /^[A-Za-z0-9._-]+$/;
 const TOP_KEYS = ['name', 'base_url', 'login', 'scope', 'allow_origins', 'steps', 'expect', 'ignore'];
 const MAX_DIFFS = 200;
 
@@ -161,8 +172,65 @@ function staysOn(p, origin) {
 }
 
 // Checked after URL resolution too: "/api/v4/../../x" or a stray tab must not reach a non-API handler.
-function isApiPath(p, origin) {
-    return nonEmpty(p) && p.startsWith('/api/v4/') && staysOn(p, origin) && new URL(p, origin).pathname.startsWith('/api/v4/');
+// When `allowVars` is true (plan validation), `$var` placeholders are treated as safe path tokens and re-checked at runtime.
+function isApiPath(p, origin, allowVars = false) {
+    if (!nonEmpty(p)) {
+        return false;
+    }
+    const probe = allowVars ? p.replace(VAR_REF_RE, 'x') : p;
+    return probe.startsWith('/api/v4/') && staysOn(probe, origin) && new URL(probe, origin).pathname.startsWith('/api/v4/');
+}
+
+function checkApiSpec(spec, origin, where, allowExpectKeys = false) {
+    const allowedKeys = allowExpectKeys ? ['path', 'method', 'body', 'status', 'json_has'] : ['path', 'method', 'body'];
+    if (!isObj(spec) || Object.keys(spec).some((k) => !allowedKeys.includes(k))) {
+        throw new PlanError(`${where}: api takes only ${allowedKeys.join(', ')}`);
+    }
+    if (!isApiPath(spec.path, origin, true)) {
+        throw new PlanError(`${where}: api.path must be a path under /api/v4/ (got ${JSON.stringify(spec.path)})`);
+    }
+    if ('method' in spec && !(typeof spec.method === 'string' && API_METHODS.includes(spec.method.toUpperCase()))) {
+        throw new PlanError(`${where}: api.method must be one of ${API_METHODS.join(', ')}`);
+    }
+    if ('body' in spec) {
+        let encoded;
+        try {
+            encoded = JSON.stringify(spec.body);
+        } catch {
+            throw new PlanError(`${where}: api.body must be JSON-serializable`);
+        }
+        if (encoded === undefined || Buffer.byteLength(encoded, 'utf8') > MAX_BODY_BYTES) {
+            throw new PlanError(`${where}: api.body must be <= ${MAX_BODY_BYTES} bytes`);
+        }
+    }
+}
+
+function checkDrag(drag, where) {
+    if (!isObj(drag)) {
+        throw new PlanError(`${where}: drag must be an object`);
+    }
+    const unknown = Object.keys(drag).filter((k) => !['from', 'to', 'dx', 'dy', 'release'].includes(k));
+    if (unknown.length) {
+        throw new PlanError(`${where}: unknown drag key(s) ${unknown.join(', ')}`);
+    }
+    checkLocator(drag.from, `${where} drag.from`);
+    const hasTo = 'to' in drag;
+    const hasDelta = 'dx' in drag || 'dy' in drag;
+    if (hasTo === hasDelta) {
+        throw new PlanError(`${where}: drag needs either "to" or numeric "dx"/"dy" (not both)`);
+    }
+    if (hasTo) {
+        checkLocator(drag.to, `${where} drag.to`);
+    } else {
+        for (const axis of ['dx', 'dy']) {
+            if (axis in drag && !(typeof drag[axis] === 'number' && Number.isFinite(drag[axis]) && Math.abs(drag[axis]) <= MAX_DRAG_OFFSET)) {
+                throw new PlanError(`${where}: drag.${axis} must be a finite number in [-${MAX_DRAG_OFFSET}, ${MAX_DRAG_OFFSET}]`);
+            }
+        }
+    }
+    if ('release' in drag && typeof drag.release !== 'boolean') {
+        throw new PlanError(`${where}: drag.release must be true or false`);
+    }
 }
 
 function checkLocator(loc, where) {
@@ -265,8 +333,9 @@ export function validatePlan(plan, env = process.env) {
         if (action === 'goto') {
             // A path on the server under test ("/team/channels/x"), never a URL: a frozen spec must be able to target
             // another server, and plans never leave this one.
-            if (!nonEmpty(s.goto) || !s.goto.startsWith('/') || s.goto.startsWith('//') || s.goto.includes('\\') ||
-                !staysOn(s.goto, origin)) {
+            const probe = typeof s.goto === 'string' ? s.goto.replace(VAR_REF_RE, 'x') : '';
+            if (!nonEmpty(s.goto) || !probe.startsWith('/') || probe.startsWith('//') || probe.includes('\\') ||
+                !staysOn(probe, origin)) {
                 throw new PlanError(`${where}: goto must be a path starting with "/" (got ${JSON.stringify(s.goto)}); plans stay on the server under test`);
             }
         } else if (action === 'press') {
@@ -276,17 +345,32 @@ export function validatePlan(plan, env = process.env) {
             if ('on' in s) {
                 checkLocator(s.on, `${where} on`);
             }
+        } else if (action === 'drag') {
+            checkDrag(s.drag, where);
+        } else if (action === 'mouse_up') {
+            if (s.mouse_up !== true) {
+                throw new PlanError(`${where}: mouse_up must be true`);
+            }
         } else if (action === 'snapshot') {
             if (s.snapshot !== null) {
                 checkLocator(s.snapshot, where);
             }
         } else if (action === 'capture') {
             const keys = isObj(s.capture) ? Object.keys(s.capture) : [];
-            if (keys.length !== 1 || keys[0] !== 'api') {
-                throw new PlanError(`${where}: capture takes exactly {"api": "/api/v4/..."}`);
+            if (!keys.includes('api') || keys.some((k) => !['api', 'save'].includes(k))) {
+                throw new PlanError(`${where}: capture takes {"api": "/api/v4/..." | {path, method?, body?}, "save"?: {var: "json.path"}}`);
             }
-            if (!isApiPath(s.capture.api, origin)) {
-                throw new PlanError(`${where}: capture.api must be a path under /api/v4/ (got ${JSON.stringify(s.capture.api)})`);
+            if (typeof s.capture.api === 'string') {
+                if (!isApiPath(s.capture.api, origin, true)) {
+                    throw new PlanError(`${where}: capture.api must be a path under /api/v4/ (got ${JSON.stringify(s.capture.api)})`);
+                }
+            } else {
+                checkApiSpec(s.capture.api, origin, `${where} capture`);
+            }
+            if ('save' in s.capture) {
+                if (!isObj(s.capture.save) || Object.entries(s.capture.save).some(([k, v]) => !VAR_NAME_RE.test(k) || !nonEmpty(v))) {
+                    throw new PlanError(`${where}: capture.save must map identifier names to non-empty JSON paths`);
+                }
             }
         } else {
             checkLocator(s[action], where);
@@ -303,12 +387,7 @@ export function validatePlan(plan, env = process.env) {
         const kind = exactlyOne(e, EXPECT_EXTRAS, where);
         if (kind === 'api') {
             const api = e.api;
-            if (!isObj(api) || Object.keys(api).some((k) => !['path', 'status', 'json_has'].includes(k))) {
-                throw new PlanError(`${where}: api takes only path, status and json_has`);
-            }
-            if (!isApiPath(api.path, origin)) {
-                throw new PlanError(`${where}: api.path must be a path under /api/v4/ (got ${JSON.stringify(api.path)})`);
-            }
+            checkApiSpec(api, origin, where, true);
             if ('status' in api && !(Number.isInteger(api.status) && api.status >= 100 && api.status < 500)) {
                 throw new PlanError(`${where}: api.status must be an integer from 100 to 499 (a server error always fails)`);
             }
@@ -361,9 +440,11 @@ function locateAll(page, loc) {
     return page.locator(loc.css);
 }
 
+// Strict by default: omitting `nth` requires a unique match so an ambiguous locator fails loudly instead of silently
+// acting on or asserting the wrong element (pass `nth: 0` explicitly when multiple matches are intended).
 function locate(page, loc) {
     const l = locateAll(page, loc);
-    return loc.nth === undefined ? l.first() : l.nth(loc.nth);
+    return loc.nth === undefined ? l : l.nth(loc.nth);
 }
 
 // Mattermost renders menus, modals, pickers and autocompletes in React portals at the end of <body>, outside
@@ -625,9 +706,56 @@ function landingPageSeen(origin) {
     }
 }
 
-async function runStep(page, base, step) {
+function readJsonPath(obj, dotPath) {
+    let cur = obj;
+    for (const seg of dotPath.replace(/\[(\d+)\]/g, '.$1').split('.').filter(Boolean)) {
+        if (cur === null || cur === undefined || typeof cur !== 'object') {
+            return undefined;
+        }
+        cur = cur[seg];
+    }
+    return cur;
+}
+
+function expandPath(raw, origin, vars, mustBeApi) {
+    const out = raw.replace(VAR_REF_RE, (_, name) => {
+        if (!Object.hasOwn(vars, name)) {
+            throw new Error(`unknown saved variable $${name}`);
+        }
+        const val = String(vars[name]);
+        if (!URL_VAR_VAL_RE.test(val)) {
+            throw new Error(`saved variable $${name} has unsafe URL token ${JSON.stringify(val)}`);
+        }
+        return val;
+    });
+    if (mustBeApi ? !isApiPath(out, origin) : (!out.startsWith('/') || out.startsWith('//') || out.includes('\\') || !staysOn(out, origin))) {
+        throw new Error(`resolved path ${JSON.stringify(out)} left ${mustBeApi ? '/api/v4/' : origin}`);
+    }
+    return out;
+}
+
+function expandBody(val, vars) {
+    if (typeof val === 'string') {
+        return val.replace(VAR_REF_RE, (_, name) => {
+            if (!Object.hasOwn(vars, name)) {
+                throw new Error(`unknown saved variable $${name}`);
+            }
+            return String(vars[name]);
+        });
+    }
+    if (Array.isArray(val)) {
+        return val.map((v) => expandBody(v, vars));
+    }
+    if (isObj(val)) {
+        return Object.fromEntries(Object.entries(val).map(([k, v]) => [k, expandBody(v, vars)]));
+    }
+    return val;
+}
+
+async function runStep(page, base, origin, step, vars) {
     if ('goto' in step) {
-        await page.goto(new URL(step.goto, base).toString(), {waitUntil: 'domcontentloaded'});
+        const target = expandPath(step.goto, origin, vars, false);
+        await page.goto(new URL(target, base).toString(), {waitUntil: 'domcontentloaded'});
     } else if ('click' in step) {
         await locate(page, step.click).click();
     } else if ('fill' in step) {
@@ -640,6 +768,35 @@ async function runStep(page, base, step) {
         await locate(page, step.check).check();
     } else if ('wait_for' in step) {
         await locate(page, step.wait_for).waitFor({state: 'visible'});
+    } else if ('drag' in step) {
+        const d = step.drag;
+        const src = await locate(page, d.from).boundingBox();
+        if (!src) {
+            throw new Error(`drag source has no bounding box: ${JSON.stringify(d.from)}`);
+        }
+        const sx = src.x + src.width / 2;
+        const sy = src.y + src.height / 2;
+        let tx;
+        let ty;
+        if (d.to) {
+            const dst = await locate(page, d.to).boundingBox();
+            if (!dst) {
+                throw new Error(`drag target has no bounding box: ${JSON.stringify(d.to)}`);
+            }
+            tx = dst.x + dst.width / 2;
+            ty = dst.y + dst.height / 2;
+        } else {
+            tx = sx + (d.dx ?? 0);
+            ty = sy + (d.dy ?? 0);
+        }
+        await page.mouse.move(sx, sy);
+        await page.mouse.down();
+        await page.mouse.move(tx, ty, {steps: 5});
+        if (d.release !== false) {
+            await page.mouse.up();
+        }
+    } else if ('mouse_up' in step) {
+        await page.mouse.up();
     }
 }
 
@@ -684,16 +841,73 @@ async function poll(read, ok) {
     return value;
 }
 
-// No redirects: an answer from another host must never satisfy an expectation or be captured.
-function apiRead(page, base, apiPath, env) {
-    const auth = env.VERIFY_TOKEN ? {Authorization: `Bearer ${env.VERIFY_TOKEN}`} : {};
-    return page.request.get(new URL(apiPath, base).toString(),
-        {headers: {'X-Requested-With': 'XMLHttpRequest', ...auth}, maxRedirects: 0});
+// Browser-less login for API-only plans (same semantics as apiLogin, using APIRequestContext directly).
+async function apiOnlyLogin(reqCtx, base, env) {
+    const headers = {'X-Requested-With': 'XMLHttpRequest'};
+    if (env.VERIFY_TOKEN) {
+        let me;
+        try {
+            me = await reqCtx.get(new URL('/api/v4/users/me', base).toString(),
+                {headers: {...headers, Authorization: `Bearer ${env.VERIFY_TOKEN}`}, maxRedirects: 0});
+        } catch (err) {
+            throw new Error(firstLine(err));
+        }
+        if (!me.ok()) {
+            throw new Error(`VERIFY_TOKEN rejected by GET /api/v4/users/me: HTTP ${me.status()}`);
+        }
+        const user = await me.json();
+        return `token auth as ${user.username} (API-only, no browser)`;
+    }
+    let res;
+    try {
+        res = await reqCtx.post(new URL('/api/v4/users/login', base).toString(),
+            {data: {login_id: env.VERIFY_USER, password: env.VERIFY_PASSWORD}, headers, maxRedirects: 0});
+    } catch (err) {
+        throw new Error(firstLine(err));
+    }
+    if (!res.ok()) {
+        throw new Error(`login as ${env.VERIFY_USER} failed: HTTP ${res.status()}`);
+    }
+    const state = await reqCtx.storageState();
+    const names = new Set((state.cookies ?? []).map((c) => c.name));
+    const missing = ['MMAUTHTOKEN', 'MMUSERID', 'MMCSRF'].filter((name) => !names.has(name));
+    if (missing.length) {
+        throw new Error(`login as ${env.VERIFY_USER} set no ${missing.join(', ')} cookie`);
+    }
+    return `password login as ${env.VERIFY_USER} (API-only, no browser)`;
 }
 
-// A {"capture": {"api": PATH}} step: records status and body, asserts nothing.
-async function captureApi(page, base, apiPath, env) {
-    const res = await apiRead(page, base, apiPath, env);
+async function csrfHeader(reqHost, base, env) {
+    if (env.VERIFY_TOKEN) {
+        return {};
+    }
+    const cookies = typeof reqHost.cookies === 'function'
+        ? await reqHost.cookies(base)
+        : ((await reqHost.storageState()).cookies ?? []);
+    const csrf = cookies.find((c) => c.name === 'MMCSRF');
+    return csrf ? {'X-CSRF-Token': csrf.value} : {};
+}
+
+// No redirects: an answer from another host must never satisfy an expectation or be captured.
+async function apiCall(reqHost, base, origin, spec, env, vars) {
+    const rawSpec = typeof spec === 'string' ? {path: spec} : spec;
+    const method = (rawSpec.method ?? 'GET').toUpperCase();
+    const apiPath = expandPath(rawSpec.path, origin, vars, true);
+    const body = 'body' in rawSpec ? expandBody(rawSpec.body, vars) : undefined;
+    const auth = env.VERIFY_TOKEN ? {Authorization: `Bearer ${env.VERIFY_TOKEN}`} : {};
+    const csrf = method !== 'GET' ? await csrfHeader(reqHost, base, env) : {};
+    const req = reqHost.request ?? reqHost;
+    const opts = {method, headers: {'X-Requested-With': 'XMLHttpRequest', ...auth, ...csrf}, maxRedirects: 0};
+    if (body !== undefined) {
+        opts.data = body;
+    }
+    const res = await req.fetch(new URL(apiPath, base).toString(), opts);
+    return {res, method, apiPath};
+}
+
+// A {"capture": {"api": PATH | {path, method?, body?}, "save"?: {...}}} step: records status and body, asserts nothing.
+async function captureApi(reqHost, base, origin, capSpec, env, vars) {
+    const {res, method, apiPath} = await apiCall(reqHost, base, origin, capSpec.api, env, vars);
     const text = await res.text();
     let json;
     try {
@@ -701,10 +915,19 @@ async function captureApi(page, base, apiPath, env) {
     } catch {
         json = undefined;
     }
-    return {path: apiPath, status: res.status(), json, text: json === undefined ? text : undefined};
+    if (capSpec.save) {
+        for (const [name, dotPath] of Object.entries(capSpec.save)) {
+            const val = readJsonPath(json, dotPath);
+            if (val === undefined || val === null || typeof val === 'object') {
+                throw new Error(`capture.save.${name}: path ${JSON.stringify(dotPath)} not found as scalar in ${method} ${apiPath} (HTTP ${res.status()})`);
+            }
+            vars[name] = String(val);
+        }
+    }
+    return {path: apiPath, method, status: res.status(), json, text: json === undefined ? text : undefined};
 }
 
-async function checkExpect(page, base, e, env) {
+async function checkExpect(reqHost, page, base, origin, e, env, vars) {
     if (e.visible) {
         const ok = await locate(page, e.visible).waitFor({state: 'visible', timeout: ACTION_TIMEOUT_MS}).then(() => true, (err) => {
             if (err?.name === 'TimeoutError') {
@@ -723,26 +946,27 @@ async function checkExpect(page, base, e, env) {
         const n = await poll(() => locateAll(page, e.count).count(), (c) => c >= min);
         return n >= min ? null : `count of ${JSON.stringify(e.count)} is ${n}, want >= ${min}`;
     }
-    const res = await apiRead(page, base, e.api.path, env);
+    const {res, method, apiPath} = await apiCall(reqHost, base, origin, e.api, env, vars);
     if (res.status() >= 500) {
-        return `GET ${e.api.path} returned ${res.status()}; a server error never satisfies an expectation`;
+        return `${method} ${apiPath} returned ${res.status()}; a server error never satisfies an expectation`;
     }
     const status = e.api.status ?? 200;
     if (res.status() !== status) {
-        return `GET ${e.api.path} returned ${res.status()}, want ${status}`;
+        return `${method} ${apiPath} returned ${res.status()}, want ${status}`;
     }
     if (e.api.json_has) {
         const body = await res.json().catch(() => null);
         if (!subset(e.api.json_has, body)) {
-            return `GET ${e.api.path} body lacks ${JSON.stringify(e.api.json_has)}: ${JSON.stringify(body).slice(0, 300)}`;
+            return `${method} ${apiPath} body lacks ${JSON.stringify(e.api.json_has)}: ${JSON.stringify(body).slice(0, 300)}`;
         }
     }
     return null;
 }
 
-async function reachable(context, base) {
+async function reachable(reqHost, base) {
     try {
-        await context.request.get(new URL('/api/v4/system/ping', base).toString(), {timeout: 5000, maxRedirects: 0});
+        const req = reqHost.request ?? reqHost;
+        await req.get(new URL('/api/v4/system/ping', base).toString(), {timeout: 5000, maxRedirects: 0});
         return true;
     } catch {
         return false;
@@ -762,18 +986,26 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
     }
     const allowedSet = new Set(allowed);
     const scope = plan.scope ?? null;
-    const {chromium} = loadPlaywright();
+    const needsBrowser = steps.some((s) => !('capture' in s)) || plan.expect.some((e) => !e.api);
+    const {chromium, request} = loadPlaywright();
     const problems = [];
+    const diagnostics = [];
     const blocked = new Set();
-    const guard = await startOriginGuard(http, net, allowedSet, (origin) => blocked.add(origin));
-    let browser;
-    try {
-        browser = await chromium.launch({args: guardArgs(guard.port)});
-    } catch (err) {
-        guard.close();
-        throw new InfraError(`cannot start Chromium: ${firstLine(err)}`);
-    }
+    const vars = {};
+    let guard = null;
+    let browser = null;
+    let apiCtx = null;
     let page = null;
+    let reqHost = null;
+    if (needsBrowser) {
+        guard = await startOriginGuard(http, net, allowedSet, (o) => blocked.add(o));
+        try {
+            browser = await chromium.launch({args: guardArgs(guard.port)});
+        } catch (err) {
+            guard.close();
+            throw new InfraError(`cannot start Chromium: ${firstLine(err)}`);
+        }
+    }
     const finish = async (code, reason = '', snap = '') => {
         if (blocked.size) {
             log(`blocked other origins: ${[...blocked].join(', ')} (add to allow_origins if the app needs them)`);
@@ -789,90 +1021,123 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
             }
         }
         log(code === 0 ? 'VERDICT: PASS' : `VERDICT: FAIL ${reason}`);
+        if (code === 1 && diagnostics.length) {
+            log(`diagnostics at failure:\n${diagnostics.slice(0, 15).join('\n')}`);
+        }
         if (snap) {
             log(`scope snapshot at failure:\n${snap}`);
         }
         return code;
     };
+    const failSnap = async () => (page ? await snapshot(page, scope).catch(() => '(no snapshot)') : '');
     try {
-        const context = await browser.newContext({viewport: {width: 1280, height: 800}});
-        // Skip the "Where would you like to view this?" desktop-app landing (see the header): set before any page script.
-        await context.addInitScript(landingPageSeen, origin);
-        await context.route('**/*', (route) => {
-            const origin = originOf(route.request().url());
-            if (origin === null || allowedSet.has(origin)) {
-                return route.continue();
-            }
-            blocked.add(origin);
-            return route.abort('blockedbyclient');
-        });
-        page = await context.newPage();
-        page.inflight = new Set();
-        const loading = new Set();  // frames with a navigation request in progress
-        page.on('request', (r) => {
-            page.inflight.add(r);
-            if (r.isNavigationRequest()) {
-                loading.add(r.frame());
-            }
-            // Redirect hops are not routed, so the route above cannot block them: check every request here.
-            const origin = originOf(r.url());
-            if (origin !== null && !allowedSet.has(origin)) {
-                blocked.add(origin);
-                if (r.redirectedFrom()) {
-                    problems.push(`redirected to a non-allowed origin: ${r.method()} ${origin}`);
-                } else if (r.isNavigationRequest() && r.frame() === page.mainFrame()) {
-                    problems.push(`navigated to a non-allowed origin: ${origin}`);
+        if (needsBrowser) {
+            const context = await browser.newContext({viewport: {width: 1280, height: 800}});
+            reqHost = context;
+            // Skip the "Where would you like to view this?" desktop-app landing (see the header): set before any page script.
+            await context.addInitScript(landingPageSeen, origin);
+            await context.route('**/*', (route) => {
+                const o = originOf(route.request().url());
+                if (o === null || allowedSet.has(o)) {
+                    return route.continue();
+                }
+                blocked.add(o);
+                return route.abort('blockedbyclient');
+            });
+            page = await context.newPage();
+            page.inflight = new Set();
+            const loading = new Set();  // frames with a navigation request in progress
+            page.on('request', (r) => {
+                page.inflight.add(r);
+                if (r.isNavigationRequest()) {
+                    loading.add(r.frame());
+                }
+                // Redirect hops are not routed, so the route above cannot block them: check every request here.
+                const o = originOf(r.url());
+                if (o !== null && !allowedSet.has(o)) {
+                    blocked.add(o);
+                    if (r.redirectedFrom()) {
+                        problems.push(`redirected to a non-allowed origin: ${r.method()} ${o}`);
+                    } else if (r.isNavigationRequest() && r.frame() === page.mainFrame()) {
+                        problems.push(`navigated to a non-allowed origin: ${o}`);
+                    }
+                }
+            });
+            page.on('requestfinished', (r) => page.inflight.delete(r));
+            page.on('requestfailed', (r) => page.inflight.delete(r));
+            // A request the page cancels by loading another document never gets requestfinished/requestfailed; forget it
+            // then. Only a real load counts: an in-page URL change (history.pushState) cancels nothing.
+            page.on('framenavigated', (frame) => {
+                if (!loading.delete(frame)) {
+                    return;
+                }
+                for (const r of page.inflight) {
+                    if (r.frame() === frame && !r.isNavigationRequest()) {
+                        page.inflight.delete(r);
+                    }
+                }
+            });
+            page.on('websocket', (ws) => {
+                const o = originOf(ws.url());
+                if (o !== null && !allowedSet.has(o)) {
+                    problems.push(`websocket to a non-allowed origin: ${o}`);
+                }
+            });
+            page.setDefaultTimeout(ACTION_TIMEOUT_MS);
+            // Compare mode records page errors and >= 500 /api/v4/ responses (a noisy plugin throws on both servers) and diffs
+            // them; a run alone treats each as a failure. 4xx /api/v4/ and console.error are fail-only diagnostics.
+            const soft = record ? record.problems : problems;
+            page.on('pageerror', (err) => soft.push(`pageerror: ${firstLine(err)}`));
+            page.on('console', (msg) => {
+                if (msg.type() === 'error' && diagnostics.length < 20) {
+                    diagnostics.push(`console.error: ${firstLine(msg.text())}`);
+                }
+            });
+            page.on('response', (res) => {
+                const pathname = new URL(res.url()).pathname;
+                if (!pathname.startsWith('/api/v4/')) {
+                    return;
+                }
+                if (res.status() >= 500) {
+                    soft.push(`HTTP ${res.status()} from ${res.request().method()} ${pathname}`);
+                } else if (res.status() >= 400 && diagnostics.length < 20) {
+                    diagnostics.push(`HTTP ${res.status()} from ${res.request().method()} ${pathname}`);
+                }
+            });
+            if (authed) {
+                try {
+                    log(await apiLogin(context, base, env));
+                } catch (err) {
+                    const msg = firstLine(err);
+                    throw new InfraError(/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|net::ERR_/.test(msg) ? `server unreachable at ${base}: ${msg}` : msg);
                 }
             }
-        });
-        page.on('requestfinished', (r) => page.inflight.delete(r));
-        page.on('requestfailed', (r) => page.inflight.delete(r));
-        // A request the page cancels by loading another document never gets requestfinished/requestfailed; forget it
-        // then. Only a real load counts: an in-page URL change (history.pushState) cancels nothing.
-        page.on('framenavigated', (frame) => {
-            if (!loading.delete(frame)) {
+        } else {
+            // Browser-less fast path: API-only plans skip Chromium and run directly on Playwright's APIRequestContext.
+            apiCtx = await request.newContext();
+            reqHost = apiCtx;
+            if (authed) {
+                try {
+                    log(await apiOnlyLogin(apiCtx, base, env));
+                } catch (err) {
+                    const msg = firstLine(err);
+                    throw new InfraError(/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|net::ERR_/.test(msg) ? `server unreachable at ${base}: ${msg}` : msg);
+                }
+            }
+        }
+        const afterStep = async () => {
+            if (!page) {
                 return;
             }
-            for (const r of page.inflight) {
-                if (r.frame() === frame && !r.isNavigationRequest()) {
-                    page.inflight.delete(r);
-                }
-            }
-        });
-        page.on('websocket', (ws) => {
-            const origin = originOf(ws.url());
-            if (origin !== null && !allowedSet.has(origin)) {
-                problems.push(`websocket to a non-allowed origin: ${origin}`);
-            }
-        });
-        page.setDefaultTimeout(ACTION_TIMEOUT_MS);
-        // Compare mode records page errors and >= 500 /api/v4/ responses (a noisy plugin throws on both servers) and diffs
-        // them; a run alone treats each as a failure.
-        const soft = record ? record.problems : problems;
-        page.on('pageerror', (err) => soft.push(`pageerror: ${firstLine(err)}`));
-        page.on('response', (res) => {
-            if (res.status() >= 500 && new URL(res.url()).pathname.startsWith('/api/v4/')) {
-                soft.push(`HTTP ${res.status()} from ${res.request().method()} ${new URL(res.url()).pathname}`);
-            }
-        });
-        const afterStep = async () => {
             const late = await settle(page, limit);
             if (late) {
                 problems.push(late);
             }
-            const origin = originOf(page.url());
-            if (page.url().startsWith('chrome-error:') || (origin !== null && !allowedSet.has(origin))) {
-                problems.push(`the page left the allowed origins: now on ${origin ?? page.url()}`);
+            const o = originOf(page.url());
+            if (page.url().startsWith('chrome-error:') || (o !== null && !allowedSet.has(o))) {
+                problems.push(`the page left the allowed origins: now on ${o ?? page.url()}`);
             }
         };
-        if (authed) {
-            try {
-                log(await apiLogin(context, base, env));
-            } catch (err) {
-                const msg = firstLine(err);
-                throw new InfraError(/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|net::ERR_/.test(msg) ? `server unreachable at ${base}: ${msg}` : msg);
-            }
-        }
         for (const [i, step] of steps.entries()) {
             const label = `step ${i + 1}/${steps.length} ${JSON.stringify(step)}`;
             try {
@@ -883,39 +1148,38 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                     continue;
                 }
                 if ('capture' in step) {
-                    const got = await captureApi(page, base, step.capture.api, env);
+                    const got = await captureApi(reqHost, base, origin, step.capture, env, vars);
                     record?.captures.push({step: i + 1, ...got});
                     log(`${label} captured: HTTP ${got.status}, ${got.json === undefined ? 'not JSON' : 'JSON'}`);
                     continue;
                 }
-                await runStep(page, base, step);
+                await runStep(page, base, origin, step, vars);
                 await afterStep();
             } catch (err) {
                 const msg = firstLine(err);
                 if (planMistake(err)) {
                     throw new PlanError(`${label}: ${msg}`);
                 }
-                if (/net::ERR_|ECONNREFUSED/.test(msg) && !(await reachable(context, base))) {
+                if (/net::ERR_|ECONNREFUSED/.test(msg) && !(await reachable(reqHost, base))) {
                     throw new InfraError(`server unreachable at ${base}: ${msg}`);
                 }
-                const snap = await snapshot(page, scope).catch(() => '(no snapshot)');
-                return await finish(1, `${label} failed: ${problems.length ? `${problems.join('; ')}; ` : ''}${msg}${actionHint(err)}`, snap);
+                return await finish(1, `${label} failed: ${problems.length ? `${problems.join('; ')}; ` : ''}${msg}${actionHint(err)}`, await failSnap());
             }
             if (problems.length) {
-                return await finish(1, `${label}: ${problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
+                return await finish(1, `${label}: ${problems.join('; ')}`, await failSnap());
             }
             log(`${label} ok`);
         }
         for (const [i, e] of plan.expect.entries()) {
             let why;
             try {
-                why = await checkExpect(page, base, e, env);
+                why = await checkExpect(reqHost, page, base, origin, e, env, vars);
             } catch (err) {
                 const msg = firstLine(err);
                 if (planMistake(err)) {
                     throw new PlanError(`expect ${i + 1}: ${msg}`);
                 }
-                if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|net::ERR_/.test(msg) && !(await reachable(context, base))) {
+                if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|net::ERR_/.test(msg) && !(await reachable(reqHost, base))) {
                     throw new InfraError(`server unreachable at ${base}: ${msg}`);
                 }
                 why = msg;
@@ -925,7 +1189,7 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                 log(`expect ${i + 1} not met ${JSON.stringify(e)}: ${why}`);
             }
             if ((why && !record) || problems.length) {
-                return await finish(1, `expect ${i + 1}: ${why ?? problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
+                return await finish(1, `expect ${i + 1}: ${why ?? problems.join('; ')}`, await failSnap());
             }
             if (!why) {
                 log(`expect ${i + 1} ok ${JSON.stringify(e)}`);
@@ -934,7 +1198,7 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
         // Late events (a 500 or page error after the last check) count too.
         await afterStep();
         if (problems.length) {
-            return await finish(1, `after the checks: ${problems.join('; ')}`, await snapshot(page, scope).catch(() => ''));
+            return await finish(1, `after the checks: ${problems.join('; ')}`, await failSnap());
         }
         if (freezeTo) {
             try {
@@ -958,8 +1222,9 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
         }
         return await finish(0);
     } finally {
-        await browser.close().catch(() => {});
-        guard.close();
+        await apiCtx?.dispose().catch(() => {});
+        await browser?.close().catch(() => {});
+        guard?.close();
     }
 }
 
@@ -1197,7 +1462,7 @@ function locatorCode(loc) {
     return `page.locator(${q(loc.css)})`;
 }
 
-const one = (loc) => `${locatorCode(loc)}.${loc.nth === undefined ? 'first()' : `nth(${Number(loc.nth)})`}`;
+const one = (loc) => (loc.nth === undefined ? locatorCode(loc) : `${locatorCode(loc)}.nth(${Number(loc.nth)})`);
 
 // The spec gets the runner's own startOriginGuard(); its one helper with an untyped parameter gets a type.
 function typedGuard() {
@@ -1223,11 +1488,21 @@ function typedSubset() {
 export function freeze(plan, base, allowOrigins = [], authed = false) {
     const q = JSON.stringify;
     const lines = [];
-    const steps = (plan.steps ?? []).filter((s) => !('snapshot' in s) && !('capture' in s)).length;
+    const emittedSteps = (plan.steps ?? []).filter((s) => {
+        if ('snapshot' in s) {
+            return false;
+        }
+        if ('capture' in s) {
+            const rawApi = typeof s.capture.api === 'string' ? {path: s.capture.api} : s.capture.api;
+            return Boolean(s.capture.save) || (rawApi.method ?? 'GET').toUpperCase() !== 'GET';
+        }
+        return true;
+    });
+    const steps = emittedSteps.length;
     const expects = plan.expect.length;
     for (const s of plan.steps ?? []) {
         if ('goto' in s) {
-            lines.push(`await page.goto(new URL(${q(s.goto)}, BASE).toString(), {waitUntil: 'domcontentloaded'});`);
+            lines.push(`await page.goto(new URL(expandPath(${q(s.goto)}, false), BASE).toString(), {waitUntil: 'domcontentloaded'});`);
         } else if ('click' in s) {
             lines.push(`await ${one(s.click)}.click();`);
         } else if ('fill' in s) {
@@ -1240,8 +1515,45 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
             lines.push(`await ${one(s.check)}.check();`);
         } else if ('wait_for' in s) {
             lines.push(`await ${one(s.wait_for)}.waitFor({state: 'visible'});`);
+        } else if ('drag' in s) {
+            const d = s.drag;
+            lines.push('{',
+                `  const src = await ${one(d.from)}.boundingBox();`,
+                "  expect(src, 'drag source has bounding box').not.toBeNull();",
+                '  const sx = src!.x + src!.width / 2, sy = src!.y + src!.height / 2;');
+            if (d.to) {
+                lines.push(`  const dst = await ${one(d.to)}.boundingBox();`,
+                    "  expect(dst, 'drag target has bounding box').not.toBeNull();",
+                    '  const tx = dst!.x + dst!.width / 2, ty = dst!.y + dst!.height / 2;');
+            } else {
+                lines.push(`  const tx = sx + ${Number(d.dx ?? 0)}, ty = sy + ${Number(d.dy ?? 0)};`);
+            }
+            lines.push('  await page.mouse.move(sx, sy);',
+                '  await page.mouse.down();',
+                '  await page.mouse.move(tx, ty, {steps: 5});');
+            if (d.release !== false) {
+                lines.push('  await page.mouse.up();');
+            }
+            lines.push('}');
+        } else if ('mouse_up' in s) {
+            lines.push('await page.mouse.up();');
+        } else if ('capture' in s) {
+            const rawApi = typeof s.capture.api === 'string' ? {path: s.capture.api} : s.capture.api;
+            const method = (rawApi.method ?? 'GET').toUpperCase();
+            if (!s.capture.save && method === 'GET') {
+                continue; // read-only captures without save are for --compare / the agent's eyes
+            }
+            const bodyArg = 'body' in rawApi ? `, expandBody(${q(rawApi.body)})` : '';
+            lines.push('{', `  const res = await apiCall(page, expandPath(${q(rawApi.path)}, true), ${q(method)}${bodyArg});`);
+            if (s.capture.save) {
+                lines.push('  const data: unknown = await res.json();');
+                for (const [k, dotPath] of Object.entries(s.capture.save)) {
+                    lines.push(`  { const v = readJsonPath(data, ${q(dotPath)}); expect(v !== undefined && v !== null && typeof v !== 'object', ${q(`capture.save.${k}`)}).toBe(true); vars[${q(k)}] = String(v); }`);
+                }
+            }
+            lines.push('}');
         } else {
-            continue; // snapshots and captures are for the agent's eyes; the frozen test asserts only the deterministic oracle
+            continue; // snapshots are for the agent's eyes; the frozen test asserts only the deterministic oracle
         }
         lines.push('await settle();');
     }
@@ -1253,7 +1565,9 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
         } else if (e.count) {
             lines.push(`await expect.poll(() => ${locatorCode(e.count)}.count(), {timeout: TIMEOUT}).toBeGreaterThanOrEqual(${Number(e.min ?? 1)});`);
         } else {
-            lines.push('{', `  const res = await apiGet(page, ${q(e.api.path)});`,
+            const method = (e.api.method ?? 'GET').toUpperCase();
+            const bodyArg = 'body' in e.api ? `, expandBody(${q(e.api.body)})` : '';
+            lines.push('{', `  const res = await apiCall(page, expandPath(${q(e.api.path)}, true), ${q(method)}${bodyArg});`,
                 "  expect(res.status(), 'no server error').toBeLessThan(500);",
                 `  expect(res.status()).toBe(${Number(e.api.status ?? 200)});`);
             if (e.api.json_has) {
@@ -1299,17 +1613,41 @@ const TIMEOUT = ${ACTION_TIMEOUT_MS};
 const originOf: (url: string) => string | null = ${originOf.toString()};
 ${typedSubset()}
 
-// API reads of a signed-in plan carry the token when there is one; errors keep only their first line (the full one
-// lists headers).
-async function apiGet(page: Page, path: string) {
+// API calls of a signed-in plan carry the token or auto X-CSRF-Token on writes; errors keep only their first line.
+async function apiCall(page: Page, path: string, method = 'GET', body?: unknown) {
   const token = AUTHED ? process.env.VERIFY_TOKEN : undefined;
   const auth: Record<string, string> = token ? {Authorization: \`Bearer \${token}\`} : {};
+  let csrf: Record<string, string> = {};
+  if (method !== 'GET' && !token) {
+    const c = (await page.context().cookies(BASE)).find((x) => x.name === 'MMCSRF');
+    if (c) {
+      csrf = {'X-CSRF-Token': c.value};
+    }
+  }
+  const opts: {method: string; headers: Record<string, string>; maxRedirects: number; data?: unknown} = {
+    method,
+    headers: {'X-Requested-With': 'XMLHttpRequest', ...auth, ...csrf},
+    maxRedirects: 0,
+  };
+  if (body !== undefined) {
+    opts.data = body;
+  }
   try {
-    return await page.request.get(new URL(path, BASE).toString(),
-      {headers: {'X-Requested-With': 'XMLHttpRequest', ...auth}, maxRedirects: 0});
+    return await page.request.fetch(new URL(path, BASE).toString(), opts);
   } catch (err) {
     throw new Error(String(err instanceof Error ? err.message : err).split('\\n')[0]);
   }
+}
+
+function readJsonPath(obj: unknown, dotPath: string): unknown {
+  let cur: unknown = obj;
+  for (const seg of dotPath.replace(/\\[(\\d+)\\]/g, '.$1').split('.').filter(Boolean)) {
+    if (cur === null || cur === undefined || typeof cur !== 'object') {
+      return undefined;
+    }
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
 }
 ${loginFn}
 // Same origin guard as verify_ui.mjs (copied from its startOriginGuard): Chromium connects only through this local
@@ -1333,6 +1671,41 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async () => {
   expect(Number.isFinite(SETTLE_MS) && SETTLE_MS > 0, 'VERIFY_SETTLE_MS must be a positive number').toBe(true);
   // As long as the runner may take: login, every step and expectation at their limits, and the final settle.
   test.setTimeout(60000 + ${steps} * (TIMEOUT + SETTLE_MS) + ${expects} * TIMEOUT + SETTLE_MS);
+  const vars: Record<string, string> = {};
+  const expandPath = (raw: string, mustBeApi: boolean): string => {
+    const out = raw.replace(/\\$([A-Za-z_][A-Za-z0-9_]*)/g, (_: string, name: string) => {
+      expect(Object.prototype.hasOwnProperty.call(vars, name), \`unknown saved variable $\${name}\`).toBe(true);
+      const val = vars[name];
+      expect(/^[A-Za-z0-9._~-]+$/.test(val), \`saved variable $\${name} has unsafe URL token\`).toBe(true);
+      return val;
+    });
+    const u = new URL(out, BASE);
+    expect(u.origin, \`path \${out} left \${BASE}\`).toBe(new URL(BASE).origin);
+    if (mustBeApi) {
+      expect(u.pathname.startsWith('/api/v4/'), \`path \${out} left /api/v4/\`).toBe(true);
+    }
+    return out;
+  };
+  const expandBody = (val: unknown): unknown => {
+    if (typeof val === 'string') {
+      return val.replace(/\\$([A-Za-z_][A-Za-z0-9_]*)/g, (_: string, name: string) => {
+        expect(Object.prototype.hasOwnProperty.call(vars, name), \`unknown saved variable $\${name}\`).toBe(true);
+        return vars[name];
+      });
+    }
+    if (Array.isArray(val)) {
+      return val.map((v) => expandBody(v));
+    }
+    if (val !== null && typeof val === 'object') {
+      const rec = val as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const k of Object.keys(rec)) {
+        out[k] = expandBody(rec[k]);
+      }
+      return out;
+    }
+    return val;
+  };
   guard = await startOriginGuard(http, net, ALLOWED, () => {});
   browser = await chromium.launch({args: [\`--proxy-server=http://127.0.0.1:\${guard.port}\`, '--proxy-bypass-list=<-loopback>']});
   const context = await browser.newContext({viewport: {width: 1280, height: 800}});

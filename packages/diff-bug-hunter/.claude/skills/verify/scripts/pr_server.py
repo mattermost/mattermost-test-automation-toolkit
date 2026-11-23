@@ -41,6 +41,7 @@ from typing import Any
 REPO = os.environ.get("HUNT_REPO", "mattermost/mattermost")
 IMAGE_REPO = "mattermostdevelopment/mattermost-enterprise-edition"
 SERVER_URL = "http://localhost:8065"  # the e2e stack's fixed port (e2e-tests/.ci/server.generate.sh)
+MEMBER_USER = "verify_member"  # regular non-admin account seeded alongside VERIFY_USER for RBAC / permission checks
 STACK_ENV = {"TEST": "none", "ENABLED_DOCKER_SERVICES": "postgres inbucket"}
 # Onboarding preferences that put an overlay over the app (webapp components/onboarding_tasks/constants.ts).
 ONBOARDING_OFF = [("onboarding_task_list", "onboarding_task_list_show", "false"),
@@ -143,7 +144,8 @@ def _error_id(e: urllib.error.HTTPError) -> str:
 
 
 def seed(url: str, user: str, password: str) -> None:
-    """Admin `user` (the first account on a fresh server is system admin), team `verify`, onboarding off."""
+    """Admin `user` (the first account on a fresh server is system admin), non-admin `verify_member`, team `verify`,
+    and onboarding off for both."""
     try:
         request("POST", f"{url}/api/v4/users", {"username": user, "email": f"{user}@example.com", "password": password})
     except urllib.error.HTTPError as e:
@@ -159,13 +161,45 @@ def seed(url: str, user: str, password: str) -> None:
         raise InfraError(f"logging in as {user}: no session token in the response")
     if "system_admin" not in (me.get("roles") or ""):
         raise InfraError(f"{user} is not a system admin: the server already had users before seeding")
+    team_id = ""
     try:
-        request("POST", f"{url}/api/v4/teams", {"name": "verify", "display_name": "Verify", "type": "O"}, token)
+        _, team = request("POST", f"{url}/api/v4/teams", {"name": "verify", "display_name": "Verify", "type": "O"}, token)
+        team_id = (team or {}).get("id") or ""
     except urllib.error.HTTPError as e:
         if e.code != 400:
             raise InfraError(f"creating team verify: HTTP {e.code}") from e
+        try:
+            _, team = request("GET", f"{url}/api/v4/teams/name/verify", token=token)
+            team_id = (team or {}).get("id") or ""
+        except urllib.error.HTTPError:
+            team_id = ""
     prefs = [{"user_id": me["id"], "category": c, "name": n, "value": v} for c, n, v in ONBOARDING_OFF]
     request("PUT", f"{url}/api/v4/users/{me['id']}/preferences", prefs, token)
+    if user != MEMBER_USER:
+        member_id = ""
+        try:
+            _, member = request("POST", f"{url}/api/v4/users",
+                                {"username": MEMBER_USER, "email": f"{MEMBER_USER}@example.com", "password": password})
+            member_id = (member or {}).get("id") or ""
+        except urllib.error.HTTPError as e:
+            reason = _error_id(e)
+            if reason != "app.user.save.username_exists.app_error":
+                raise InfraError(f"creating {MEMBER_USER}: HTTP {e.code} {reason}") from e
+            try:
+                _, member = request("GET", f"{url}/api/v4/users/username/{MEMBER_USER}", token=token)
+                member_id = (member or {}).get("id") or ""
+            except urllib.error.HTTPError:
+                member_id = ""
+        if member_id:
+            if team_id:
+                try:
+                    request("POST", f"{url}/api/v4/teams/{team_id}/members",
+                            {"team_id": team_id, "user_id": member_id}, token)
+                except urllib.error.HTTPError as e:
+                    if e.code not in (400, 404):
+                        raise InfraError(f"adding {MEMBER_USER} to team verify: HTTP {e.code}") from e
+            mprefs = [{"user_id": member_id, "category": c, "name": n, "value": v} for c, n, v in ONBOARDING_OFF]
+            request("PUT", f"{url}/api/v4/users/{member_id}/preferences", mprefs, token)
 
 
 def make(e2e: Path, target: str, image: str) -> None:
@@ -199,7 +233,7 @@ def up(image: str, e2e: Path) -> None:
         if build is None or not build_matches(build, image):
             raise InfraError(f"{SERVER_URL} runs {build!r}, expected {image} (host networking off?)")
         seed(SERVER_URL, user, password)
-    print(f"VERIFY_BASE_URL={SERVER_URL} build={build[:10]}")
+    print(f"VERIFY_BASE_URL={SERVER_URL} build={build[:10]} VERIFY_MEMBER_USER={MEMBER_USER}")
 
 
 def down(e2e: Path) -> None:

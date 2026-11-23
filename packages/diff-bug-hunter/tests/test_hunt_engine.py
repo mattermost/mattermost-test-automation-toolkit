@@ -798,6 +798,22 @@ function openMenu() {
     d.setAttribute('aria-label', 'Leave channel'); d.innerHTML = '<button>Yes, leave</button>'; document.body.appendChild(d); };
   m.appendChild(item); document.body.appendChild(m);
 }</script></body></html>""",
+    "/drag": """<html><body><main><div id="handle" style="width:40px;height:40px;background:#ccc">Drag</div>
+<button onclick="document.getElementById('handle')?.remove()">Unmount</button><p id="state">idle</p></main>
+<script>
+let startX = null;
+const log = [];
+const upd = (s) => { log.push(s); document.getElementById('state').textContent = log.join(','); };
+document.getElementById('handle').addEventListener('mousedown', (e) => { startX = e.clientX; upd('down'); });
+window.addEventListener('mousemove', (e) => { if (startX !== null && Math.abs(e.clientX - startX) >= 30) { upd('dragged'); startX = null; } });
+window.addEventListener('mouseup', () => upd('up'));
+</script></body></html>""",
+    "/dup": """<html><body><main><button onclick="document.getElementById('r').textContent='first'">Submit</button>
+<button onclick="document.getElementById('r').textContent='second'">Submit</button><p id="r">none</p></main></body></html>""",
+    "/diag": """<html><body><main><p id="m">ready</p></main><script>
+console.error('boom-console');
+fetch('/api/v4/missing404');
+</script></body></html>""",
 }
 
 TOKEN, USER_ID = "tok-123", "uid1"
@@ -888,7 +904,24 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"id": USER_ID, "username": "tester"}).encode())
         elif self.path == "/api/v4/things":
             SEEN.append((self.headers.get("Host", ""), self.path, self.headers.get("Authorization")))
-            self._send(201 if self._auth() else 401, "{}")
+            parsed = json.loads(body or b"{}")
+            self._send(201 if self._auth() else 401, json.dumps({"id": "item42", "title": parsed.get("title", "")}))
+        elif self.path == "/api/v4/unsafe":
+            self._send(200, json.dumps({"id": "../evil"}))
+        else:
+            self._send(404, "{}")
+
+    def do_PATCH(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if self.path == "/api/v4/things/item42":
+            parsed = json.loads(body or b"{}")
+            self._send(200 if self._auth() else 401, json.dumps({"id": "item42", "title": parsed.get("title", ""), "patched": True}))
+        else:
+            self._send(404, "{}")
+
+    def do_DELETE(self):
+        if self.path == "/api/v4/things/item42":
+            self._send(200 if self._auth() else 401, json.dumps({"status": "OK"}))
         else:
             self._send(404, "{}")
 
@@ -2724,3 +2757,94 @@ def test_prepare_and_ctx_work_on_release_tag_ranges(tmp_path, monkeypatch):
     assert run.cmd_base(hdir, state, "A") == {"calc::TestHuntA_ClampRangeAndIdentity": "NEW_PR_BUG"}
     with pytest.raises(prepare.AlreadyHunted):
         prepare.prepare(target)
+
+
+@needs_playwright
+def test_verify_api_write_methods_csrf_save_and_browserless_fast_path(tmp_path, ui_server):
+    plan = {
+        "name": "api writes",
+        "base_url": ui_server,
+        "login": True,
+        "steps": [
+            {"capture": {"api": {"method": "POST", "path": "/api/v4/things", "body": {"title": "hello"}}, "save": {"tid": "id"}}},
+            {"capture": {"api": {"method": "PATCH", "path": "/api/v4/things/$tid", "body": {"title": "patched-$tid"}}}},
+        ],
+        "expect": [
+            {"api": {"method": "DELETE", "path": "/api/v4/things/$tid", "status": 200, "json_has": {"status": "OK"}}},
+        ],
+    }
+    code, out = verify(tmp_path, plan, "--freeze", "api.spec.ts", auth="password")
+    assert code == 0 and "API-only, no browser" in out, out
+    # Frozen spec must pass tsc --strict AND replay cleanly with password+CSRF auth
+    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
+    (tmp_path / "tsconfig.json").write_text(json.dumps({"compilerOptions": {
+        "strict": True, "noEmit": True, "target": "es2022", "module": "esnext", "moduleResolution": "bundler",
+        "types": ["node"], "skipLibCheck": True}, "files": ["api.spec.ts"]}))
+    tc = subprocess.run(["node", str(VERIFY_DEPS / "typescript" / "bin" / "tsc"), "-p", "."], cwd=tmp_path,
+                        env=_node_env("none"), capture_output=True, text=True, timeout=180, check=False)
+    assert tc.returncode == 0, tc.stdout + tc.stderr
+    cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
+    p = subprocess.run(["node", str(cli), "test", "api.spec.ts", "--reporter=line"], cwd=tmp_path,
+                       env=_node_env("password"), capture_output=True, text=True, timeout=180, check=False)
+    assert p.returncode == 0 and "1 passed" in p.stdout, p.stdout + p.stderr
+    # Unsafe $var tokens cannot traverse outside /api/v4/
+    unsafe_plan = {"base_url": ui_server, "steps": [{"capture": {"api": {"method": "POST", "path": "/api/v4/unsafe"}, "save": {"bad": "id"}}}],
+                   "expect": [{"api": {"path": "/api/v4/things/$bad"}}]}
+    code, out = verify(tmp_path, unsafe_plan, auth="none")
+    assert code == 1 and "unsafe URL token" in out, out
+    # Invalid method and oversized body (>64 KiB) are INVALID_PLAN
+    for bad in ({"expect": [{"api": {"method": "TRACE", "path": "/api/v4/users/me"}}]},
+                {"expect": [{"api": {"method": "POST", "path": "/api/v4/things", "body": {"x": "a" * 70000}}}]}):
+        code, out = verify(tmp_path, {"base_url": ui_server, "steps": [], **bad}, auth="none")
+        assert code == 2 and "INVALID_PLAN" in out, (bad, out)
+
+
+@needs_playwright
+def test_verify_drag_release_false_mouse_up_and_freeze(tmp_path, ui_server):
+    plan = {
+        "name": "mid-drag unmount",
+        "base_url": ui_server,
+        "steps": [
+            {"goto": "/drag"},
+            {"drag": {"from": {"css": "#handle"}, "dx": 60, "dy": 0, "release": False}},
+            {"click": {"role": "button", "name": "Unmount"}},
+            {"mouse_up": True},
+        ],
+        "expect": [{"text": {"css": "#state"}, "contains": "down,dragged,up"}],
+    }
+    code, out = verify(tmp_path, plan, "--freeze", "drag.spec.ts", auth="none")
+    assert code == 0, out
+    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
+    (tmp_path / "tsconfig.json").write_text(json.dumps({"compilerOptions": {
+        "strict": True, "noEmit": True, "target": "es2022", "module": "esnext", "moduleResolution": "bundler",
+        "types": ["node"], "skipLibCheck": True}, "files": ["drag.spec.ts"]}))
+    tc = subprocess.run(["node", str(VERIFY_DEPS / "typescript" / "bin" / "tsc"), "-p", "."], cwd=tmp_path,
+                        env=_node_env("none"), capture_output=True, text=True, timeout=180, check=False)
+    assert tc.returncode == 0, tc.stdout + tc.stderr
+    cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
+    p = subprocess.run(["node", str(cli), "test", "drag.spec.ts", "--reporter=line"], cwd=tmp_path,
+                       env=_node_env("none"), capture_output=True, text=True, timeout=180, check=False)
+    assert p.returncode == 0 and "1 passed" in p.stdout, p.stdout + p.stderr
+    # Out-of-bounds drag offset is INVALID_PLAN
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"drag": {"from": {"css": "#handle"}, "dx": 5000}}],
+                                  "expect": [{"visible": {"role": "main"}}]}, auth="none")
+    assert code == 2 and "INVALID_PLAN" in out, out
+
+
+@needs_playwright
+def test_verify_strict_locators_and_fail_only_diagnostics(tmp_path, ui_server):
+    # Ambiguous locator fails loudly when `nth` is omitted, succeeds with explicit `nth: 1`
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/dup"}, {"click": {"role": "button", "name": "Submit"}}],
+                                  "expect": [{"text": {"css": "#r"}, "contains": "first"}]}, auth="none")
+    assert code == 1 and "strict mode violation" in out, out
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/dup"}, {"click": {"role": "button", "name": "Submit", "nth": 1}}],
+                                  "expect": [{"text": {"css": "#r"}, "contains": "second"}]}, auth="none")
+    assert code == 0, out
+    # console.error and 4xx /api/v4/ are silent on PASS, printed in diagnostics on FAIL
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/diag"}],
+                                  "expect": [{"text": {"css": "#m"}, "contains": "ready"}]}, auth="none")
+    assert code == 0 and "diagnostics at failure" not in out, out
+    code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"goto": "/diag"}],
+                                  "expect": [{"text": {"css": "#m"}, "contains": "never"}]}, auth="none")
+    assert code == 1 and "diagnostics at failure:" in out, out
+    assert "console.error: boom-console" in out and "HTTP 404 from GET /api/v4/missing404" in out, out

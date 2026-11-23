@@ -8,8 +8,9 @@ Generate inputs with a property loop: `testing/quick` or a seeded PRNG loop in G
 Property shapes to try on each changed function, where its callers support them (start `checks` with the shape's name):
 - round-trip: decode(encode(x)) == x (marshal/unmarshal, ToJSON/FromJSON, serialize/parse, escape/unescape).
 - idempotence: f(f(x)) == f(x) (sanitize, normalize, migrate, dedupe, PreSave/PreUpdate).
-- no-panic: nil, empty, zero, oversized and unicode inputs return an error or a value, never panic or throw.
+- no-panic: nil, empty, zero, oversized, deeply nested structures, malformed UTF-8 and unicode boundaries return an error or a value, never panic or throw.
 - monotonic: a caller with more roles or permissions never sees less; a superset filter never returns fewer rows.
+- sequence: 3-8 seeded operations over shared state, sessions, roles, reconnects, or mount/drag/unmount lifecycles; assert invariants hold after every step and cleanup leaves no stuck state.
 - lifted: generalize each literal example in `pr_tests_diff` into a loop over the same contract. Cite that test's
   `file:line` as the one allowed non-caller source.
 The reference model or expected value in every test is derived from the merge-base code and the callers, NEVER from the

@@ -11,12 +11,13 @@ single `failure.png` only if the run FAILs. Hand its path to the user and never 
 
 1. **Server and auth:** check that the target answers `GET /api/v4/system/ping`: the `base_url` the user gave, else
    `VERIFY_BASE_URL`, else `MM_URL`, else `http://localhost:8065`. If it doesn't, stop and report `INFRA_ERROR`; do not start or reconfigure servers unasked.
-   - **A PR's own build** (when the user asks to check a PR): never build it locally. `scripts/pr_server.py images <pr> --pull`
-     gives and pulls the enterprise images of the PR head and its merge-base (`/hunt` starts this at step 1 when the PR
+   - **A PR's or release's own build** (when the user asks to check a PR or release range): never build it locally. `scripts/pr_server.py images <pr | base...head> --pull`
+     gives and pulls the enterprise images of head and merge-base (`/hunt` starts this at step 1 when the diff
      touches `webapp/` or a server API a page calls; otherwise start it yourself, a cold pull is 10-15 min). `scripts/pr_server.py up <image>` runs the mattermost repo's
      own e2e stack on that image at `http://localhost:8065`, **replaces** a server running another build (`make stop-server`
-     drops its volumes: ask before running it over a stack the user is using), and seeds the
-     `VERIFY_USER` admin with the onboarding overlay off. One stack at a time: run the plan on head, then `up` the base
+     drops its volumes: ask before running it over a stack the user is using), and seeds both the
+     `VERIFY_USER` system admin and a non-admin `verify_member` (same `VERIFY_PASSWORD`, joined to team `verify`,
+     onboarding overlay off for both). Pass `VERIFY_USER=verify_member` to test non-admin / RBAC behavior. One stack at a time: run the plan on head, then `up` the base
      image and run it again, and compare the two verdicts (`--compare` needs both up at once). An image swap takes
      ~100 s, the plan seconds. A missing image = CI has not built that commit yet: say so, do not build it.
    - Logged-in pages: the runner authenticates through the API before the first step, so no step goes to the login
@@ -34,7 +35,15 @@ single `failure.png` only if the run FAILs. Hand its path to the user and never 
      repository has a `.claude/skills/verify/FEATURE_MAP.md` (or `$VERIFY_FEATURE_MAP`), it prints the matching
      sections: use their routes and stable `data-testid` / ARIA names instead of guessing. Without a map, plan from
      snapshots.
-   - Locate by role and accessible name first; use `testid`/`css` only when there is no accessible name.
+   - Locate by role and accessible name first; use `testid`/`css` only when there is no accessible name. Locators are
+     **strict by default** (an ambiguous locator fails instead of silently picking `.first()`; pass `"nth": 0` only when
+     multiple matches are intended).
+   - Pointer drag & mid-drag unmount: use `{"drag": {"from": LOC, "to": LOC | "dx": N, "dy": N, "release": false}}`
+     followed by navigation/click/Escape and `{"mouse_up": true}`.
+   - API calls (`capture.api` and `expect.api`): support `GET`, `POST`, `PUT`, `PATCH`, `DELETE` plus JSON `body`
+     (<= 64 KB); `X-CSRF-Token` is attached automatically from `MMCSRF` under password login. Use `capture.save`
+     (`{"capture": {"api": "/api/v4/teams", "save": {"team_id": "[0].id"}}}`) and `$team_id` in later paths or bodies.
+     Plans that contain only `capture` steps and `expect.api` checks skip Chromium automatically (<200 ms).
    - Add a `snapshot` step scoped to the region you need (e.g. `{"role": "dialog"}`), not the whole page. The default
      scope is `#app-content`. Open menus, dialogs and listboxes render in React portals outside it and are always
      appended as `portal [role=…]:` blocks, so click their items by role and name as usual.
@@ -44,8 +53,9 @@ single `failure.png` only if the run FAILs. Hand its path to the user and never 
      or the page answers "Please save unsaved changes first". Match the server's own error text in `expect`, never
      a prefix that the page's other messages share.
    - `expect` must hold at least one deterministic check: a DOM assertion (`visible`, `text` + `contains`,
-     `count` + `min`) or an `/api/v4/` read (`api.path`, `status`, `json_has`). Choose checks that would fail if
-     the change were broken.
+     `count` + `min`) or an `/api/v4/` check (`api.path`, `method?`, `body?`, `status?`, `json_has?`). Choose checks
+     that would fail if the change were broken. On `FAIL`, buffered `console.error` and `/api/v4/` 4xx responses are
+     printed automatically to speed up debugging.
 3. **Run:** `node <this dir>/scripts/verify_ui.mjs plan.json` from a directory where `require("playwright")` resolves
    (e.g. `mattermost/e2e-tests/playwright`), or with `NODE_PATH` pointing at a `node_modules` that has it.
    - Exit 0 `PASS`.

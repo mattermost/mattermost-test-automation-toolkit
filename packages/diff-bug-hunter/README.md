@@ -137,16 +137,19 @@ credentials never go to a host the plan chose. Claude writes the plan; plain Nod
 validated strictly (one action per step, one locator kind, known keys only) before a browser starts.
 
 - **Bounded:**
-  - At most `MAX_STEPS = 10` steps of `goto`/`click`/`fill`/`press`/`select`/`check`/`wait_for`/`snapshot`.
-  - Locators by role and accessible name first.
+  - At most `MAX_STEPS = 10` steps of `goto`/`click`/`fill`/`press`/`select`/`check`/`wait_for`/`drag`/`mouse_up`/`snapshot`/`capture`.
+  - Locators by role and accessible name first, **strict by default** (omitting `nth` requires a unique match; pass `nth: 0` when multiple matches are intended).
   - Allowed origins only (`base_url` plus `allow_origins`): other hosts are blocked and logged, a `goto` or
     `api.path` that resolves off the server (or out of `/api/v4/`) is refused, and a redirect, navigation or
     websocket toward another host fails the run. Chromium connects only through a local proxy that refuses other
     origins, so even a redirect hop never reaches them.
-- **API login:** `VERIFY_TOKEN`, or `VERIFY_USER` + `VERIFY_PASSWORD`, logs in through `/api/v4/` before the first step
+- **API login & writes:** `VERIFY_TOKEN`, or `VERIFY_USER` + `VERIFY_PASSWORD`, logs in through `/api/v4/` before the first step
   (password: the server's `MMAUTHTOKEN` / `MMUSERID` / `MMCSRF` cookies; token: a Bearer header on same-origin
   fetch/XHR only, no cookie session, so no CSRF, and no authenticated websocket, images or downloads), so all 10 steps
-  test the feature. Neither login follows redirects. Frozen specs embed the same login.
+  test the feature. Neither login follows redirects. `capture` and `expect.api` support `GET`/`POST`/`PUT`/`PATCH`/`DELETE`
+  with optional JSON `body` (<=64 KiB), automatic `X-CSRF-Token` from `MMCSRF` on writes, and `capture.save` (`$var`
+  substitution for chaining created IDs). Plans with only `capture` steps and `expect.api` checks skip Chromium and run
+  directly on Playwright's `APIRequestContext`. Frozen specs embed the same login and API/CSRF logic.
 - **Text, not pixels:** `snapshot` prints a scoped `locator.ariaSnapshot()` (default `#app-content`). Menus, dialogs
   and listboxes rendered in React portals outside the scope are appended, so they are never hidden. Passing runs never
   take a screenshot. `--screenshot-on-fail` writes exactly one `failure.png` when a run FAILs, as visual proof for a
@@ -156,17 +159,19 @@ validated strictly (one action per step, one locator kind, known keys only) befo
   feature>` prints the matching sections (from the nearest map above the current directory, or
   `$VERIFY_FEATURE_MAP`), so plans use names the app has. With a symlinked install, that path points into this toolkit
   checkout: use `--copy` or `VERIFY_FEATURE_MAP` for a repository's own map.
-- **Automatic failures:** any `pageerror`, any `/api/v4/` response >= 500, or a request still running at the settle
+- **Automatic failures & diagnostics:** any `pageerror`, any `/api/v4/` response >= 500, or a request still running at the settle
   deadline (`VERIFY_SETTLE_MS`, default 10 s) fails the run. Every step and the end of the run wait until in-flight
-  requests settle, so a late 500 is not missed. Exit codes: 0 PASS, 1 FAIL, 2 INVALID_PLAN / INFRA_ERROR.
+  requests settle, so a late 500 is not missed. `console.error` messages and `/api/v4/` 4xx responses are collected and
+  printed only when a run fails. Exit codes: 0 PASS, 1 FAIL, 2 INVALID_PLAN / INFRA_ERROR.
 - **Deterministic oracle:** `expect` must hold at least one DOM check (`visible`, `text` + `contains`,
-  `count` + `min`) or an `/api/v4/` read (`status`, `json_has`).
+  `count` + `min`) or an `/api/v4/` check (`method`, `path`, `body`, `status`, `json_has`).
 - **Compare (base vs head):** `verify_ui.mjs plan.json --compare <base_url>` runs the plan's capture steps against both
   servers. Verdicts `SAME`, `DIFF` or `REGRESSION`; a `DIFF` the PR does not explain is a finding.
-- **A PR's build, no local build:** `scripts/pr_server.py images <pr> --pull` pulls the published enterprise images of
-  the PR head and its merge-base (`/hunt` starts it at step 1, so the pull overlaps the hunt).
+- **A PR's or release's build, no local build:** `scripts/pr_server.py images <pr | base...head> --pull` pulls the published enterprise images of
+  the head and its merge-base (`/hunt` starts it at step 1, so the pull overlaps the hunt).
   `scripts/pr_server.py up <image>` runs the mattermost repo's own `e2e-tests` stack on that image at `:8065`, replaces a
-  server that runs another build (its volumes are dropped), and seeds an admin with the onboarding overlay off. Measured on PR 40094: image swap
+  server that runs another build (its volumes are dropped), checks `BuildHash`, and seeds both an admin (`$VERIFY_USER`)
+  and a non-admin regular member (`verify_member`, in team `verify`) with the onboarding overlay off. Measured on PR 40094: image swap
   102 s, plan seconds, 119 s end to end with the image cached. The stack uses host networking (Docker Desktop: enable it
   under Settings > Resources > Network).
 - **Freeze:** `--freeze specs/verify/<name>.spec.ts` turns a passing plan into a `@playwright/test` spec with the same oracle (allowed
@@ -231,7 +236,7 @@ those `node_modules` unless the PR changes `package-lock.json`.
 
 ## CI integration
 
-Package self-test: 249 tests (pytest), run by this repository's `.github/workflows/diff-bug-hunter.yml` when
+Package self-test: 252 tests (pytest), run by this repository's `.github/workflows/diff-bug-hunter.yml` when
 `packages/diff-bug-hunter/` changes. The /verify tests need the Chromium build that matches the pinned Playwright, installed from the fixture
 directory:
 

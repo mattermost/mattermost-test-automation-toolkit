@@ -63,6 +63,9 @@ class _Fake(http.server.BaseHTTPRequestHandler):
                 return self._send(400, {})
             st["teams"].add(body["name"])
             return self._send(201, {"id": "team"})
+        if self.path == "/api/v4/teams/team/members":
+            st["members"].add((body["team_id"], body["user_id"]))
+            return self._send(201, body)
         self._send(404, {})
 
     def do_PUT(self):
@@ -72,13 +75,20 @@ class _Fake(http.server.BaseHTTPRequestHandler):
         self._send(200, {"status": "OK"})
 
     def do_GET(self):
-        self._send(200, {"BuildHash": self.server.state["build"]})
+        st = self.server.state
+        if self.path == "/api/v4/teams/name/verify":
+            return self._send(200, {"id": "team"}) if "verify" in st["teams"] else self._send(404, {})
+        if self.path.startswith("/api/v4/users/username/"):
+            uname = self.path.rsplit("/", 1)[-1]
+            u = st["users"].get(uname)
+            return self._send(200, {"id": u["id"], "username": uname}) if u else self._send(404, {})
+        self._send(200, {"BuildHash": st["build"]})
 
 
 @pytest.fixture
 def fake():
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Fake)
-    srv.state = {"users": {}, "teams": set(), "prefs": [], "build": "5e62cb15e5"}
+    srv.state = {"users": {}, "teams": set(), "members": set(), "prefs": [], "build": "5e62cb15e5"}
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield srv, f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
@@ -88,10 +98,15 @@ def test_seeding_makes_the_first_user_an_admin_and_turns_the_onboarding_overlay_
     srv, url = fake
     pr_server.seed(url, "poster", "pw")
     assert srv.state["users"]["poster"]["roles"].startswith("system_admin") and "verify" in srv.state["teams"]
-    prefs = {(p["category"], p["name"]): p["value"] for p in srv.state["prefs"]}
-    assert prefs[("onboarding_task_list", "onboarding_task_list_show")] == "false"
-    assert all(p["user_id"] == "id-poster" for p in srv.state["prefs"])
-    pr_server.seed(url, "poster", "pw")  # a reused server: user and team exist already, seeding still succeeds
+    assert srv.state["users"][pr_server.MEMBER_USER]["roles"] == "system_user"
+    assert ("team", f"id-{pr_server.MEMBER_USER}") in srv.state["members"]
+    by_user = {}
+    for p in srv.state["prefs"]:
+        by_user.setdefault(p["user_id"], {})[(p["category"], p["name"])] = p["value"]
+    assert set(by_user) == {"id-poster", f"id-{pr_server.MEMBER_USER}"}
+    for uid in by_user:
+        assert by_user[uid][("onboarding_task_list", "onboarding_task_list_show")] == "false"
+    pr_server.seed(url, "poster", "pw")  # a reused server: users and team exist already, seeding still succeeds
 
 
 def test_seeding_refuses_a_user_that_is_not_an_admin(fake):
