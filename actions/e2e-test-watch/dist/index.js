@@ -553,6 +553,8 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
   const failedPRs = [...new Set(crossFailures.map(prOf))];
   const otherPasses = others.filter((o) => o.status === "passed" || o.status === "flaky").length;
   const failureSignatures = [...new Set([...trunk, ...others].filter((o) => FAILED_STATUSES.has(o.status)).map((o) => sameKey(o.error_excerpt)).filter((k) => Boolean(k)))];
+  const unstableTrunk = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
+  const trunkSameError = (ownKey.kind === "distinctive" || ownKey.kind === "stuck") && unstableTrunk.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)));
   const stats = {
     trunk: {
       runs: trunk.length,
@@ -560,6 +562,7 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
       flaky: trunkFlaky,
       passes: trunkPasses,
       latest: latestTrunk?.status ?? "",
+      ...trunkSameError ? { same_error: true } : {},
       lane_runs: laneRuns
     },
     cross_pr: {
@@ -608,12 +611,11 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
     );
   const laplace = (trunkFails + trunkFlaky + 1) / (trunk.length + 2);
   const notTrunksFlake = () => {
-    const unstable = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
-    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !unstable.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)))) {
-      const there = unstable.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
+    if ((ownKey.kind === "distinctive" || ownKey.kind === "stuck") && !trunkSameError) {
+      const there = unstableTrunk.map((o) => errorFirstLine(o.error_excerpt)).find(Boolean);
       return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but never with this error; ${there ? `there it failed with "${there.slice(0, 160)}"` : "there it left no error to compare"}.`, true);
     }
-    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran && !unstable.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
+    if ((ownKey.kind === "bare" || ownKey.kind === "unusable") && test.tries && test.tries.ran > 0 && test.tries.failed === test.tries.ran && !unstableTrunk.some((o) => failureKey(o.error_excerpt).kind === ownKey.kind)) {
       const how = ownKey.kind === "bare" ? "a timeout that names no step" : "no error to compare";
       return out("REGRESSION", `Unstable on trunk (${trunkFails} failures, ${trunkFlaky} flaky passes in ${trunk.length} runs), but this failed every try here with ${how}, and trunk never failed that way.`, true);
     }
@@ -2198,7 +2200,13 @@ function buildPack(finding, compareFiles, pr, others, ctx = NO_CHANGE_CONTEXT) {
   const pack = {
     test: { title: finding.title, full_title: finding.full_title ?? null, suite: finding.suite_title ?? null, file: finding.file, report_scope: finding.report_scope ?? null, report_name: finding.report_name ?? null, lane: pr.lane },
     error: compactError(finding.error),
-    trunk_history_14d: { runs: finding.trunk.runs, fails: finding.trunk.fails, flaky: finding.trunk.flaky, latest: finding.trunk.latest },
+    trunk_history_14d: {
+      runs: finding.trunk.runs,
+      fails: finding.trunk.fails,
+      flaky: finding.trunk.flaky,
+      latest: finding.trunk.latest,
+      ...finding.trunk.same_error ? { same_error: true } : {}
+    },
     cross_pr_failures_14d: { id: "cross_pr", other_prs_where_this_test_failed: finding.cross_pr.examples, other_pr_runs_where_it_passed: finding.cross_pr.passes },
     pr: { number: pr.number, repository: pr.repository, title: pr.title, changed_file_count: names.length, changed_files: names.slice(0, 200), spec_file_changed_by_pr: names.includes(ownPath), change_summary: changes },
     diff_hunks_of_files_named_in_error: hunks,
@@ -2747,6 +2755,7 @@ function commonSenseClear(f, pack) {
 }
 
 // ../e2e-test-triage/src/decision.ts
+var trunkSameFailure = (trunk) => Boolean(trunk?.same_error) && ((trunk?.fails ?? 0) > 0 || (trunk?.flaky ?? 0) > 0 || trunk?.latest === "failed");
 function unblocks(cause, cited, pack, cls = "") {
   const has = (...ids) => ids.some((id) => cited.includes(id));
   const trunk = pack.trunk_history_14d ?? {};
@@ -2755,7 +2764,7 @@ function unblocks(cause, cited, pack, cls = "") {
     return (cause === "flaky_environment" || cause === "bug_on_master") && has("cross_pr", "this_pr");
   }
   if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error) || has("earlier_failure_same_spec") && chainClears(pack);
-  if (cause === "bug_on_master") return has("cross_pr") || has("trunk_history_14d") && ((trunk.fails ?? 0) > 0 || (trunk.flaky ?? 0) > 0 || trunk.latest === "failed");
+  if (cause === "bug_on_master") return has("cross_pr") || has("trunk_history_14d") && trunkSameFailure(trunk);
   if (cause === "test_bug") return has("this_pr");
   return false;
 }
@@ -2797,9 +2806,7 @@ function canChange(cls, pack, isTrunkRun = false) {
   const hunk = ids.some((id) => id.startsWith("hunk_"));
   if (exoneratedSet(isTrunkRun).has(cls)) return hunk;
   if (cls === "INFRA_ERROR") return CLEARING(ids);
-  const trunk = pack.trunk_history_14d;
-  const trunkUnstable = (trunk?.fails ?? 0) > 0 || (trunk?.flaky ?? 0) > 0 || trunk?.latest === "failed";
-  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack) || trunkUnstable;
+  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack) || trunkSameFailure(pack.trunk_history_14d);
   return false;
 }
 function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
@@ -3010,7 +3017,7 @@ async function evaluateRun({
     });
     const nonProductOnly = Boolean(prNumber) && diff.ok && files.length > 0 && files.every((f) => {
       const cat = changeCategory(f.filename, changeContext);
-      return cat === "docs" || cat === "other" || cat === "ci" && !/e2e|cmt|test|playwright|cypress|detox|maestro/i.test(f.filename);
+      return cat === "docs" || cat === "other";
     });
     if (result.infra && (!isTrunkRun || Boolean(branchBase)) && !nonProductOnly) {
       const why = /infrastructure errors/.test(result.infra) ? "most of this run failed on its environment" : "many tests failed in this run";
@@ -3164,7 +3171,7 @@ function settlePR(findings, changed, ownershipKnown, flagged, files = [], minTru
     const trunkClean = Boolean(t && t.runs >= minTrunkRuns && (t.lane_runs ?? t.runs) >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
     const passedElsewhere = Boolean(f.other_lanes?.length) && f.other_lanes.some((l) => l.result === "passed") && !f.other_lanes.some((l) => l.result !== "passed" && l.result !== "skipped");
     const platformChange = changed.some((name) => /(?:^|\/)(?:ios|android|macos|windows|linux)\/|\.(?:ios|android|macos|win32|linux)\./i.test(name));
-    const judgeClearsEnv = Boolean(f.judge && (f.judge.cause === "flaky_environment" || f.judge.cause === "bug_on_master") && f.judge.confidence >= 0.7 && !f.judge.cited_evidence.some((c) => c.startsWith("hunk_")));
+    const judgeClearsEnv = !elsewhere && Boolean(f.judge && (f.judge.cause === "flaky_environment" || f.judge.cause === "bug_on_master") && f.judge.confidence >= 0.7 && !f.judge.cited_evidence.some((c) => c.startsWith("hunk_")));
     if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length && !(passedElsewhere && !platformChange) && !judgeClearsEnv) {
       Object.assign(f, {
         untouched: true,
@@ -3864,7 +3871,8 @@ async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runn
     }
     out.push(job);
   }
-  return { prefix, jobs: out };
+  const allJobs = byPrefix.map((j) => ({ id: j.id, short: j.name.slice(prefix.length) }));
+  return { prefix, jobs: out, allJobs };
 }
 
 // ../e2e-test-triage/src/lane-verdict.ts
@@ -3904,7 +3912,7 @@ async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRu
   if ((orchestration || noResults) && !allPassed(orchestration) && base) baseline = await readBaseline({ api, fetchImpl, tsio, id, context, base, trunkRun, log, historyLane: env.HISTORY_LANE || null });
   const verdict = diagnoseLane({ trunkRun, orchestration, orchestrationError, jobs: jobs?.jobs ?? null, jobsError, prFiles, baseline, lanePaths, staleRerun, judgedSpecs });
   const startName = env.LANE_START_JOB || "prepare-run";
-  const startJobId = jobs?.jobs.find((j) => j.short === startName)?.id ?? null;
+  const startJobId = (jobs?.allJobs ?? jobs?.jobs)?.find((j) => j.short === startName)?.id ?? null;
   return { verdict, orchestration, jobs, baseline, startJobId };
 }
 

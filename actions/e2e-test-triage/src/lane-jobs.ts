@@ -23,6 +23,8 @@ export interface LaneJobs {
   /** The lane's prefix in the run's job names ("e2e-cypress / cypress-full / "), or "" when the run has one lane. */
   prefix: string;
   jobs: LaneJob[];
+  /** Prefix-scoped jobs before any lane-job-filter is applied, so startJobId still resolves prepare-run. */
+  allJobs?: { id: number; short: string }[];
 }
 
 interface GhJob {
@@ -151,5 +153,6 @@ export async function readLaneJobs({ fetchImpl, token, repository, runId, attemp
     }
     out.push(job);
   }
-  return { prefix, jobs: out };
+  const allJobs = byPrefix.map((j) => ({ id: j.id, short: j.name.slice(prefix.length) }));
+  return { prefix, jobs: out, allJobs };
 }

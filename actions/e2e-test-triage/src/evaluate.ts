@@ -136,11 +136,11 @@ export async function evaluateRun({
       });
     });
     // A PR that breaks its own server fails every test on the environment, so on a flagged run only the judge clears
-    // an environment error. A trunk run (no PR, not a release branch) has no judge, and a PR touching only docs,
-    // repo metadata, or non-E2E CI workflows cannot break a remote test environment.
+    // an environment error. A trunk run (no PR, not a release branch) has no judge, and a PR touching only docs or
+    // repo metadata cannot break a remote test environment.
     const nonProductOnly = Boolean(prNumber) && diff.ok && files.length > 0 && files.every((f) => {
       const cat = changeCategory(f.filename, changeContext);
-      return cat === "docs" || cat === "other" || (cat === "ci" && !/e2e|cmt|test|playwright|cypress|detox|maestro/i.test(f.filename));
+      return cat === "docs" || cat === "other";
     });
     if (result.infra && (!isTrunkRun || Boolean(branchBase)) && !nonProductOnly) {
       const why = /infrastructure errors/.test(result.infra) ? "most of this run failed on its environment" : "many tests failed in this run";
@@ -354,7 +354,7 @@ export function settlePR(findings: Finding[], changed: string[], ownershipKnown:
     const trunkClean = Boolean(t && t.runs >= minTrunkRuns && (t.lane_runs ?? t.runs) >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
     const passedElsewhere = Boolean(f.other_lanes?.length) && f.other_lanes!.some((l) => l.result === "passed") && !f.other_lanes!.some((l) => l.result !== "passed" && l.result !== "skipped");
     const platformChange = changed.some((name) => /(?:^|\/)(?:ios|android|macos|windows|linux)\/|\.(?:ios|android|macos|win32|linux)\./i.test(name));
-    const judgeClearsEnv = Boolean(f.judge && (f.judge.cause === "flaky_environment" || f.judge.cause === "bug_on_master") && f.judge.confidence >= 0.7 && !f.judge.cited_evidence.some((c) => c.startsWith("hunk_")));
+    const judgeClearsEnv = !elsewhere && Boolean(f.judge && (f.judge.cause === "flaky_environment" || f.judge.cause === "bug_on_master") && f.judge.confidence >= 0.7 && !f.judge.cited_evidence.some((c) => c.startsWith("hunk_")));
     if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length && !(passedElsewhere && !platformChange) && !judgeClearsEnv) {
       Object.assign(f, {
         untouched: true,

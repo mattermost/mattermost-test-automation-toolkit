@@ -9,6 +9,9 @@ import { answerKey, cachedAnswer, expectedOutput, maxTokensFor, systemFor } from
 import { costOf, ledgerTotals, newLedger } from "./pricing.ts";
 import type { Answer, BatchResult, Config, Finding, Ledger, Pack } from "./types.ts";
 
+const trunkSameFailure = (trunk?: Partial<Pack["trunk_history_14d"]>): boolean =>
+  Boolean(trunk?.same_error) && ((trunk?.fails ?? 0) > 0 || (trunk?.flaky ?? 0) > 0 || trunk?.latest === "failed");
+
 /**
  * What a non-PR cause must cite before it can clear a judged finding, as the judge's rules
  * require. A related hunk is not on the list: it is evidence the PR may be the cause. Producer
@@ -24,7 +27,7 @@ export function unblocks(cause: string, cited: string[], pack: Pack, cls = ""): 
     return (cause === "flaky_environment" || cause === "bug_on_master") && has("cross_pr", "this_pr");
   }
   if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error) || (has("earlier_failure_same_spec") && chainClears(pack));
-  if (cause === "bug_on_master") return has("cross_pr") || (has("trunk_history_14d") && ((trunk.fails ?? 0) > 0 || (trunk.flaky ?? 0) > 0 || trunk.latest === "failed"));
+  if (cause === "bug_on_master") return has("cross_pr") || (has("trunk_history_14d") && trunkSameFailure(trunk));
   if (cause === "test_bug") return has("this_pr");
   return false;
 }
@@ -95,9 +98,7 @@ export function canChange(cls: string, pack: Pack, isTrunkRun = false): boolean 
   const hunk = ids.some((id) => id.startsWith("hunk_"));
   if (exoneratedSet(isTrunkRun).has(cls)) return hunk;
   if (cls === "INFRA_ERROR") return CLEARING(ids);
-  const trunk = pack.trunk_history_14d;
-  const trunkUnstable = (trunk?.fails ?? 0) > 0 || (trunk?.flaky ?? 0) > 0 || trunk?.latest === "failed";
-  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack) || trunkUnstable;
+  if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack) || trunkSameFailure(pack.trunk_history_14d);
   return false;
 }
 
