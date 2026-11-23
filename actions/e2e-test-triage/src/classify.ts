@@ -276,10 +276,12 @@ export function classify(
   const unstableTrunk = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
   const trunkSameError = (ownKey.kind === "distinctive" || ownKey.kind === "stuck") &&
     unstableTrunk.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)));
+  // Action-only timeouts ("action locator.click" without a target) do not identify a step for bug_on_master.
+  const trunkSameTarget = trunkSameError && (ownKey.kind === "distinctive" || (Boolean(ownKey.key) && !/^action \S+$/.test(ownKey.key!)));
   const stats = {
     trunk: {
       runs: trunk.length, fails: trunkFails, flaky: trunkFlaky, passes: trunkPasses, latest: latestTrunk?.status ?? "",
-      ...(trunkSameError ? { same_error: true } : {}),
+      ...(trunkSameTarget ? { same_error: true } : {}),
       lane_runs: laneRuns,
     },
     cross_pr: {

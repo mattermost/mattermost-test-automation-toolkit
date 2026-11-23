@@ -885,6 +885,7 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
   const failureSignatures = [...new Set([...trunk, ...others].filter((o) => FAILED_STATUSES.has(o.status)).map((o) => sameKey(o.error_excerpt)).filter((k) => Boolean(k)))];
   const unstableTrunk = trunk.filter((o) => FAILED_STATUSES.has(o.status) || o.status === "flaky");
   const trunkSameError = (ownKey.kind === "distinctive" || ownKey.kind === "stuck") && unstableTrunk.some((o) => sameFirstLine(maskIds(o.error_excerpt), maskIds(test.error)));
+  const trunkSameTarget = trunkSameError && (ownKey.kind === "distinctive" || Boolean(ownKey.key) && !/^action \S+$/.test(ownKey.key));
   const stats = {
     trunk: {
       runs: trunk.length,
@@ -892,7 +893,7 @@ function classify(test, observations, changedFiles, cfg = DEFAULTS, prNumber = n
       flaky: trunkFlaky,
       passes: trunkPasses,
       latest: latestTrunk?.status ?? "",
-      ...trunkSameError ? { same_error: true } : {},
+      ...trunkSameTarget ? { same_error: true } : {},
       lane_runs: laneRuns
     },
     cross_pr: {
@@ -2340,6 +2341,7 @@ var PLATFORM_FILES = {
   macos: /(^|[/_.-])(mac|macos|darwin|osx|dmg|mas)([/_.-]|$)|\.(entitlements|plist)$/i
 };
 var onlyOnPlatform = (platform, file) => Boolean(PLATFORM_FILES[platform]?.test(file));
+var isPlatformFile = (file) => Object.keys(PLATFORM_FILES).some((p) => onlyOnPlatform(p, file));
 var onlyElsewhere = (platform, file) => !onlyOnPlatform(platform, file) && Object.keys(PLATFORM_FILES).some((p) => p !== platform && onlyOnPlatform(p, file));
 function commonSenseClear(f, pack) {
   if (!pack || !f.blocking || !BORDERLINE.has(f.class) || f.identity_unresolved || f.out_of_date || f.pr_streak || f.decision === "evidence_incomplete") return null;
@@ -2772,8 +2774,8 @@ function settlePR(findings, changed, ownershipKnown, flagged, files = [], minTru
     const elsewhere = f.failed_everywhere?.length ? f.failed_everywhere : null;
     const trunkClean = Boolean(t && t.runs >= minTrunkRuns && (t.lane_runs ?? t.runs) >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
     const passedElsewhere = Boolean(f.other_lanes?.length) && f.other_lanes.some((l) => l.result === "passed") && !f.other_lanes.some((l) => l.result !== "passed" && l.result !== "skipped");
-    const platformChange = changed.some((name) => /(?:^|\/)(?:ios|android|macos|windows|linux)\/|\.(?:ios|android|macos|win32|linux)\./i.test(name));
-    const judgeClearsEnv = !elsewhere && Boolean(f.judge && (f.judge.cause === "flaky_environment" || f.judge.cause === "bug_on_master") && f.judge.confidence >= 0.7 && !f.judge.cited_evidence.some((c) => c.startsWith("hunk_")));
+    const platformChange = changed.some(isPlatformFile);
+    const judgeClearsEnv = !elsewhere && Boolean(f.judge && f.judge.cause === "flaky_environment" && f.judge.confidence >= 0.7 && !f.judge.cited_evidence.some((c) => c.startsWith("hunk_")));
     if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length && !(passedElsewhere && !platformChange) && !judgeClearsEnv) {
       Object.assign(f, {
         untouched: true,
@@ -3219,6 +3221,7 @@ function rowOf(f, secrets) {
     out_of_date: Boolean(f.out_of_date),
     tries: f.tries ? { ran: f.tries.ran, failed: f.tries.failed } : null,
     other_lanes_failed: (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform),
+    other_lanes_passed: (f.other_lanes ?? []).filter((o) => o.result === "passed").map((o) => o.platform),
     ai: { cause: judge2?.cause ?? null, confidence: judge2?.confidence ?? null, cited: judge2?.cited_evidence ?? [], cleared: f.decision === "adjudicator_unblock", explanation: judge2 ? clip(redact(judge2.explanation, secrets), 200) : null }
   };
 }

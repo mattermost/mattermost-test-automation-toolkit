@@ -5,7 +5,7 @@ import { identityKey, missingReports } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
 import { BORDERLINE, causedByPR, changeTouchesFailure, classify, classifyNotRun, errorSignature, holdFailedEverywhere, infraVerdict, isShardPlaceholder, isSpecNotRun, isSpecStopped, isProductChange, JUDGED, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, historyLane, repoPath } from "./config.ts";
-import { commonSenseClear } from "./common-sense.ts";
+import { commonSenseClear, isPlatformFile } from "./common-sense.ts";
 import { sameTestOnOtherReports } from "./enrich.ts";
 import { evidenceFor } from "./evidence.ts";
 import { buildPack, changeCategory, namesChangedFile, releasePack } from "./pack.ts";
@@ -353,8 +353,8 @@ export function settlePR(findings: Finding[], changed: string[], ownershipKnown:
     const elsewhere = f.failed_everywhere?.length ? f.failed_everywhere : null;
     const trunkClean = Boolean(t && t.runs >= minTrunkRuns && (t.lane_runs ?? t.runs) >= minTrunkRuns && t.fails === 0 && t.flaky === 0 && t.latest === "passed");
     const passedElsewhere = Boolean(f.other_lanes?.length) && f.other_lanes!.some((l) => l.result === "passed") && !f.other_lanes!.some((l) => l.result !== "passed" && l.result !== "skipped");
-    const platformChange = changed.some((name) => /(?:^|\/)(?:ios|android|macos|windows|linux)\/|\.(?:ios|android|macos|win32|linux)\./i.test(name));
-    const judgeClearsEnv = !elsewhere && Boolean(f.judge && (f.judge.cause === "flaky_environment" || f.judge.cause === "bug_on_master") && f.judge.confidence >= 0.7 && !f.judge.cited_evidence.some((c) => c.startsWith("hunk_")));
+    const platformChange = changed.some(isPlatformFile);
+    const judgeClearsEnv = !elsewhere && Boolean(f.judge && f.judge.cause === "flaky_environment" && f.judge.confidence >= 0.7 && !f.judge.cited_evidence.some((c) => c.startsWith("hunk_")));
     if (!unused && f.class !== "INFRA_ERROR" && everyTry && trunkClean && !f.cross_pr?.prs.length && !(passedElsewhere && !platformChange) && !judgeClearsEnv) {
       Object.assign(f, {
         untouched: true,

@@ -3447,7 +3447,7 @@ test("the findings file has one shape, and the shape check names what drifts fro
   const good = { schema: 2, repository: "o/r", commit_sha: "abc", pr: null, lane: null, status_context: null, run_id: null, run_attempt: null, mode: "report-only", verdict: null, counts: null, ai: { calls: 0, cost_usd: null, model: null }, triaged: false, not_triaged_reason: "error: x", findings: [] };
   assert.deepEqual(checkFindingsShape(good), []);
   assert.ok(checkFindingsShape({ ...good, schema: 1 }).length > 0, "a different schema is named");
-  const row = { title: "t", full_title: null, file: "a", class: "REGRESSION", label: "app bug", blocking: true, decision: "adjudicator_blame", reason: "r", error_first_line: "e", out_of_date: false, tries: null, other_lanes_failed: [], ai: { cause: "app_bug", confidence: 0.9, cited: ["error"], cleared: false, explanation: "x" } };
+  const row = { title: "t", full_title: null, file: "a", class: "REGRESSION", label: "app bug", blocking: true, decision: "adjudicator_blame", reason: "r", error_first_line: "e", out_of_date: false, tries: null, other_lanes_failed: [], other_lanes_passed: [], ai: { cause: "app_bug", confidence: 0.9, cited: ["error"], cleared: false, explanation: "x" } };
   assert.deepEqual(checkFindingsShape({ ...good, triaged: true, not_triaged_reason: null, verdict: "FAILURE", counts: { total: 1, passed: 0, failed: 1, flaky: 0, skipped: 0 }, findings: [row] }), []);
   const { label: _, ...noLabel } = row;
   assert.ok(checkFindingsShape({ ...good, findings: [noLabel] }).length > 0, "a row names its label");
@@ -5646,10 +5646,12 @@ test("settlePR: does not promote reproducible_regression when sibling platform p
   settlePR([siblingPass], ["app/components/post_list/post.tsx"], true, false, []);
   assert.deepEqual([siblingPass.blocking, siblingPass.decision], [false, "first_failure"]);
 
-  // Platform-specific diff still blocks even if sibling platform passed.
-  const iosDiff = firstFailure({ tries: { ran: 2, failed: 2 }, other_lanes: [{ platform: "detox-android", result: "passed" }] });
-  settlePR([iosDiff], ["ios/Mattermost/AppDelegate.mm"], true, false, []);
-  assert.deepEqual([iosDiff.blocking, iosDiff.decision], [true, "reproducible_regression"]);
+  // Platform-specific diff (including Podfile via shared PLATFORM_FILES) still blocks even if sibling platform passed.
+  for (const file of ["ios/Mattermost/AppDelegate.mm", "Podfile"]) {
+    const iosDiff = firstFailure({ tries: { ran: 2, failed: 2 }, other_lanes: [{ platform: "detox-android", result: "passed" }] });
+    settlePR([iosDiff], [file], true, false, []);
+    assert.deepEqual([iosDiff.blocking, iosDiff.decision], [true, "reproducible_regression"], `${file} is platform-specific`);
+  }
 
   // Replay of mobile PR #10253: external website title changed; advisory judge said flaky_environment without citing hunks.
   const judgedEnv = firstFailure({
@@ -5658,6 +5660,14 @@ test("settlePR: does not promote reproducible_regression when sibling platform p
   });
   settlePR([judgedEnv], ["app/screens/channel/index.tsx"], true, false, []);
   assert.deepEqual([judgedEnv.blocking, judgedEnv.decision], [false, "first_failure"]);
+
+  // Advisory bug_on_master without qualifying trunk evidence must NOT bypass reproducible_regression.
+  const advisoryMaster = firstFailure({
+    tries: { ran: 2, failed: 2 },
+    judge: { cause: "bug_on_master", confidence: 0.9, cited_evidence: ["trunk_history_14d"], explanation: "Advisory guess on clean trunk." },
+  });
+  settlePR([advisoryMaster], ["app/screens/channel/index.tsx"], true, false, []);
+  assert.deepEqual([advisoryMaster.blocking, advisoryMaster.decision], [true, "reproducible_regression"]);
 
   // A failure that failed_everywhere (all tries here AND on sibling platform) is never cleared by advisory judge text.
   const failedAll = firstFailure({
@@ -5755,6 +5765,20 @@ test("judge escalates borderline PR blame with hunk (0.60-0.84) and trunk-backed
   const diffErrPack = buildPack(diffErrFinding, [], { number: 43, repository: "o/r", title: "unrelated" }, []);
   assert.equal(canChange("REGRESSION", diffErrPack), false, "different-error trunk failures cannot carry a bug_on_master clear");
   assert.equal(unblocks("bug_on_master", ["trunk_history_14d"], diffErrPack, "REGRESSION"), false);
+  // Action-only timeout (no target) must NOT set same_error, whereas a targeted timeout DOES.
+  const actionOnlyTimeout = classify(
+    { file: "specs/s0.spec.ts", title: "t0", error: "locator.click: Timeout 30000ms exceeded." },
+    [{ file: "specs/s0.spec.ts", title: "t0", status: "failed", retry_count: 0, gh_pr_number: null, branch: "master", error_excerpt: "locator.click: Timeout 30000ms exceeded." }, ...trunkPasses(25)],
+    [],
+  );
+  assert.equal(actionOnlyTimeout.trunk.same_error, undefined, "action-only timeout has no target");
+  assert.equal(canChange("REGRESSION", buildPack(actionOnlyTimeout, [], { number: 43, repository: "o/r", title: "unrelated" }, [])), false);
+  const targetedTimeout = classify(
+    { file: "specs/s0.spec.ts", title: "t0", error: "locator.click: Timeout 30000ms exceeded.\n- waiting for getByTestId('post_textbox')" },
+    [{ file: "specs/s0.spec.ts", title: "t0", status: "failed", retry_count: 0, gh_pr_number: null, branch: "master", error_excerpt: "locator.click: Timeout 30000ms exceeded.\n- waiting for getByTestId('post_textbox')" }, ...trunkPasses(25)],
+    [],
+  );
+  assert.equal(targetedTimeout.trunk.same_error, true, "targeted timeout matches the same step");
   const askedMaster: string[] = [];
   const askMaster: AskFn = async (packs, model) => {
     askedMaster.push(model);

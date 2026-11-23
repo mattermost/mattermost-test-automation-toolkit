@@ -33,6 +33,7 @@ export interface FindingRow {
   out_of_date: boolean;
   tries: { ran: number; failed: number } | null;
   other_lanes_failed: string[];
+  other_lanes_passed: string[];
   ai: { cause: string | null; confidence: number | null; cited: string[]; cleared: boolean; explanation: string | null };
 }
 
@@ -110,6 +111,7 @@ function rowOf(f: Finding, secrets: string[]): FindingRow {
     out_of_date: Boolean(f.out_of_date),
     tries: f.tries ? { ran: f.tries.ran, failed: f.tries.failed } : null,
     other_lanes_failed: (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform),
+    other_lanes_passed: (f.other_lanes ?? []).filter((o) => o.result === "passed").map((o) => o.platform),
     ai: { cause: judge?.cause ?? null, confidence: judge?.confidence ?? null, cited: judge?.cited_evidence ?? [], cleared: f.decision === "adjudicator_unblock", explanation: judge ? clip(redact(judge.explanation, secrets), 200) : null },
   };
 }
@@ -167,7 +169,7 @@ export function writeFindings(facts: FindingsFacts, log: (message: string) => vo
 }
 
 const TOP_KEYS = ["schema", "repository", "commit_sha", "pr", "lane", "status_context", "run_id", "run_attempt", "mode", "verdict", "counts", "ai", "triaged", "not_triaged_reason", "findings"];
-const ROW_KEYS = ["title", "full_title", "file", "class", "label", "blocking", "decision", "reason", "error_first_line", "out_of_date", "tries", "other_lanes_failed", "ai"];
+const ROW_KEYS = ["title", "full_title", "file", "class", "label", "blocking", "decision", "reason", "error_first_line", "out_of_date", "tries", "other_lanes_failed", "other_lanes_passed", "ai"];
 const COUNT_KEYS = ["total", "passed", "failed", "flaky", "skipped"];
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -222,6 +224,7 @@ export function checkFindingsShape(value: unknown): string[] {
     need(isStr(row.error_first_line) && !row.error_first_line.includes("\n") && row.error_first_line.length <= 200, `${where}: error_first_line is one line of at most 200 characters`);
     need(row.tries === null || (isObj(row.tries) && isNum(row.tries.ran) && isNum(row.tries.failed)), `${where}: tries`);
     need(isStrs(row.other_lanes_failed), `${where}: other_lanes_failed is a list of platforms`);
+    need(isStrs(row.other_lanes_passed), `${where}: other_lanes_passed is a list of platforms`);
     const a = row.ai;
     if (isObj(a)) {
       exactKeys(a, ["cause", "confidence", "cited", "cleared", "explanation"], `${where}.ai`, problems);
