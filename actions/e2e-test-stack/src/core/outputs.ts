@@ -3,7 +3,9 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { redact } from "./redact.ts";
+import type { Env } from "../../../shared/src/github.ts";
+import { ActionError } from "./errors.ts";
+import { errorText, redact } from "./redact.ts";
 
 /** Escapes text for a workflow command, as @actions/core does, so a line break cannot start another command. */
 export const commandText = (text: string): string =>
@@ -79,4 +81,45 @@ export function masker(log: (message: string) => void): Masker {
         }
     },
   };
+}
+
+/**
+ * A failure with more said about it, as an ActionError: one already gains the text, keeping its cause; any other value
+ * becomes the cause. Messages are not assigned to, since some errors' cannot be.
+ */
+export function also(action: string, failure: unknown, text: string): ActionError {
+  if (failure instanceof ActionError)
+    return new ActionError(`${failure.message} Also, ${text}`, { cause: failure.cause });
+  return new ActionError(`${action} failed. Also, ${text}`, { cause: failure });
+}
+
+/**
+ * Writes the outputs and the summary whatever happened, then throws the failure, if any. A sink that cannot be
+ * written does not hide the failure being reported; with none, it is the failure.
+ */
+export function settle(
+  env: Env,
+  action: string,
+  outputs: Readonly<Record<string, string | undefined>>,
+  summary: readonly string[],
+  failure: unknown,
+): void {
+  const unwritten: string[] = [];
+  try {
+    writeOutputs(env.GITHUB_OUTPUT, outputs);
+  } catch (w) {
+    unwritten.push(`the outputs could not be written (${errorText(w)})`);
+  }
+  try {
+    appendSummary(env.GITHUB_STEP_SUMMARY, summary);
+  } catch (w) {
+    unwritten.push(`the summary could not be written (${errorText(w)})`);
+  }
+  let reported = failure;
+  if (unwritten.length && reported !== undefined) reported = also(action, reported, `${unwritten.join("; ")}.`);
+  if (reported !== undefined)
+    throw reported instanceof Error
+      ? reported
+      : new Error(`${action} failed with a value that is not an error`, { cause: reported });
+  if (unwritten.length) throw new ActionError(`${unwritten.join("; ")}.`);
 }

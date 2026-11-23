@@ -9,6 +9,7 @@ import type { Env, FetchImpl, Sleep } from "../../shared/src/github.ts";
 import { ActionError } from "./core/errors.ts";
 import { githubClient } from "./core/github.ts";
 import {
+  batchFrom,
   boolean,
   credentialsKeyFrom,
   input,
@@ -19,25 +20,24 @@ import {
   PROJECT,
   REGION,
   refuse,
+  runFrom,
   stackInputs,
 } from "./core/inputs.ts";
 import type { StackInputs } from "./core/inputs.ts";
 import { abortableSleep, alias, lambdaClient, lambdaInvoke } from "./core/lambda.ts";
 import type { Invoke, InvokeOutput } from "./core/lambda.ts";
 import { requestIdToken } from "./core/oidc.ts";
-import { appendSummary, cell, masker, writeFile, writeOutputs } from "./core/outputs.ts";
+import { also, cell, masker, settle, writeFile } from "./core/outputs.ts";
 import { errorText, handlerError, redact } from "./core/redact.ts";
-import { maskBatchSecrets, responseError } from "./core/response.ts";
+import { maskBatchSecrets, RESPONSE_FILE, responseError } from "./core/response.ts";
 import type { BatchSecrets, Lease, StackResponse } from "./core/response.ts";
 import { assumeRole, roleArnFrom, stsClient } from "./core/role.ts";
 import type { Credentials, StsSend } from "./core/role.ts";
-import { openSealed, SealedError } from "./core/sealed.ts";
+import { openBatchSecrets, SealedError } from "./core/sealed.ts";
 import { isServer, serverImage } from "./core/server-image.ts";
 
 /** The control plane's longest instance key. */
 export const MAX_INSTANCE_KEY = 44;
-/** The create response's file name, in the directory create writes it to. */
-export const RESPONSE_FILE = "e2e-test-stack-create.json";
 
 /** Every output the create step writes; action.yml reads only these. */
 export const CREATE_OUTPUTS = [
@@ -51,9 +51,7 @@ export const CREATE_OUTPUTS = [
 ] as const;
 type CreateOutputs = { [K in (typeof CREATE_OUTPUTS)[number]]?: string };
 
-/** A batch name: 1 to 20 lowercase letters, digits and hyphens, starting and ending with a letter or digit. */
-const BATCH = /^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$/;
-const RUN_ID = /^\d+$/;
+/** A service name: lowercase letters and digits, in parts joined by single hyphens. */
 const SERVICE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 // One part of a Go duration ("90m", "1h30m", ".5h", "1.h": a digit before or after the point), and a whole one.
 const DURATION_PART = /(?=\.?\d)(\d*)(?:\.(\d*))?(ns|us|µs|ms|s|m|h)/g;
@@ -175,18 +173,8 @@ export function readCreateInputs(env: Env): CreateInputs {
   const get = (name: string) => input(env, name);
   const common = stackInputs(env);
 
-  const batch = get("batch");
-  if (!batch) refuse("batch is required: it names the batch within the run, e.g. ios");
-  matching(
-    "batch",
-    batch,
-    BATCH,
-    "1 to 20 lowercase letters, digits and hyphens, starting and ending with a letter or digit",
-  );
-  const runId = (env.GITHUB_RUN_ID ?? "").trim();
-  const attempt = (env.GITHUB_RUN_ATTEMPT ?? "").trim();
-  if (!RUN_ID.test(runId) || !RUN_ID.test(attempt))
-    refuse("GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT must be set, as they are in a GitHub Actions job");
+  const batch = batchFrom(env);
+  const { runId, attempt } = runFrom(env);
   const instanceKey = `${common.callerKey}-${runId}-${batch}-${attempt}`;
   if (instanceKey.length > MAX_INSTANCE_KEY)
     refuse(
@@ -467,20 +455,15 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
         throw new ActionError(
           `batch ${batchId} came back with no sealed secrets${error ? ` (${error})` : ""}; without its batch token it cannot be destroyed, and is reaped at its ttl`,
         );
-      let value: unknown;
+      let opened: BatchSecrets;
       try {
-        value = await openSealed(response.batch.secrets, inputs.credentialsKey);
+        opened = await openBatchSecrets(response.batch.secrets, inputs.credentialsKey);
       } catch (e) {
         if (!(e instanceof SealedError)) throw e;
         throw new ActionError(
-          `batch ${batchId}: ${e.message} Without its batch token it cannot be destroyed; it is reaped at its ttl.`,
+          `batch ${batchId}: ${e.message}. Without its batch token it cannot be destroyed; it is reaped at its ttl.`,
         );
       }
-      if (value === null || typeof value !== "object" || Array.isArray(value))
-        throw new ActionError(
-          `batch ${batchId}'s secrets are not an object, so it has no batch token and cannot be destroyed; it is reaped at its ttl`,
-        );
-      const opened: BatchSecrets = value;
       maskBatchSecrets(secrets, opened);
       if (typeof opened.batch_token !== "string" || !opened.batch_token)
         throw new ActionError(
@@ -504,30 +487,10 @@ async function createBatch(env: Env, deps: CreateDeps): Promise<void> {
     outputs.indexes = JSON.stringify(Array.from({ length: expected }, (_, i) => i));
   } catch (e) {
     const reported = e instanceof Error && e.cause === responseWriteError;
-    failure = responseWriteError !== undefined && !reported ? also(e, writeFailure()) : e;
+    failure = responseWriteError !== undefined && !reported ? also("create", e, writeFailure()) : e;
     if (!summary.length) summary.push(...failedSummary(invoked));
   }
-  {
-    // Written whatever happened. A sink that cannot be written does not hide the failure being reported; with none, it
-    // is the failure.
-    const unwritten: string[] = [];
-    try {
-      writeOutputs(env.GITHUB_OUTPUT, outputs);
-    } catch (w) {
-      unwritten.push(`the outputs could not be written (${errorText(w)})`);
-    }
-    try {
-      appendSummary(env.GITHUB_STEP_SUMMARY, [...summary, ...serverTable]);
-    } catch (w) {
-      unwritten.push(`the summary could not be written (${errorText(w)})`);
-    }
-    if (unwritten.length && failure !== undefined) failure = also(failure, `${unwritten.join("; ")}.`);
-    if (failure !== undefined)
-      throw failure instanceof Error
-        ? failure
-        : new Error("create failed with a value that is not an error", { cause: failure });
-    if (unwritten.length) throw new ActionError(`${unwritten.join("; ")}.`);
-  }
+  settle(env, "create", outputs, [...summary, ...serverTable], failure);
 }
 
 /** The summary's heading and the batch table's header. */
@@ -543,16 +506,6 @@ const failedSummary = (invoked: boolean): string[] => [
     ? "| State | failed, with no batch named; one may have been created, and is reaped at its ttl. The step's error says why |"
     : "| State | failed before the create was sent, so no batch was created. The step's error says why |",
 ];
-
-/**
- * A failure with more said about it, as an ActionError: one already gains the text, keeping its cause; any other value
- * becomes the cause. Messages are not assigned to, since some errors' cannot be.
- */
-function also(failure: unknown, text: string): ActionError {
-  if (failure instanceof ActionError)
-    return new ActionError(`${failure.message} Also, ${text}`, { cause: failure.cause });
-  return new ActionError(`create failed. Also, ${text}`, { cause: failure });
-}
 
 /** Fetches in all, the first included. */
 export const FETCH_ATTEMPTS = 3;
