@@ -469,8 +469,10 @@ def archive_batch(hdir: Path, batch_num: int) -> Path:
     has_outputs = any(p for pat in _BATCH_OUTPUTS for p in hdir.glob(pat))
     if not has_outputs:
         return dst
-    if dst.exists():
-        shutil.rmtree(dst)
+    n = 1
+    while dst.exists():
+        n += 1
+        dst = hdir / "batches" / f"batch_{batch_num}.{n}"
     dst.mkdir(parents=True, exist_ok=True)
     for pattern in STALE:
         for p in sorted(hdir.glob(pattern)):

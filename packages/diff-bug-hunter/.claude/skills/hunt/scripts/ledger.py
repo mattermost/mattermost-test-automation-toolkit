@@ -83,12 +83,14 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
                 mode_gaps = True
 
             run_data = _read_optional_json(bdir / f"run_{tag}.json")
+            head_fails: set[str] = set()
             if isinstance(run_data, dict):
                 for k, v in run_data.items():
                     if v == "PASS":
                         counts["pass"] += 1
                     elif v == "FAIL_3_OF_3":
                         counts["fail_3_of_3"] += 1
+                        head_fails.add(str(k))
                     if v in _BAD_RUN or "::(package failed)" in str(k):
                         mode_gaps = True
             elif tag in ("A", "B") or (bdir / f"compile_{tag}.log").exists():
@@ -96,6 +98,8 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
 
             base_data = _read_optional_json(bdir / f"base_{tag}.json")
             if isinstance(base_data, dict):
+                if head_fails and any(str(base_data.get(t, "")) not in ("NEW_PR_BUG", "PRE_EXISTING") for t in head_fails):
+                    mode_gaps = True
                 for tname, v in base_data.items():
                     if tname in ("*", "detail", "new_api"):
                         if tname == "*" and v in _BAD_BASE:
@@ -112,6 +116,9 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
                         counts["pre_existing"] += 1
                     elif v in _BAD_BASE:
                         mode_gaps = True
+
+            elif head_fails:
+                mode_gaps = True
 
         diff_data = _read_optional_json(bdir / "diff_D.json")
         if isinstance(diff_data, dict):
@@ -164,7 +171,7 @@ def _confidence_tier(hdir: Path, counts: dict[str, int],
     if (
         counts["new_pr_bug"] > 0
         or has_r_bug
-        or bool(pr_vals & {"PR_TEST_FAILS_UNDER_CI", "PR_TEST_FAILS"})
+        or "PR_TEST_FAILS_UNDER_CI" in pr_vals
         or bool(old_vals & {"OLD_TEST_BREAKS", "OLD_TEST_SOMETIMES_BREAKS"})
     ):
         return "Bug Proven"
@@ -187,7 +194,7 @@ def _confidence_tier(hdir: Path, counts: dict[str, int],
         or r_gaps
         or (deferred_count > 0 and batches_hunted < batches_total)
         or counts["mode_a_empty"] > 0
-        or bool(pr_vals & {"NOT_RUN", "FLAKY"})
+        or bool(pr_vals & {"NOT_RUN", "FLAKY", "PR_TEST_FAILS"})
         or bool(old_vals & {"NOT_RUN", "NOT_RUN_ON_BASE", "FLAKY"})
         or (executable > 0 and reached == 0)
     )
@@ -242,7 +249,8 @@ def _export_escapes(hdir: Path, state: dict[str, Any], pr_key: str,
             "mode_a_coverage": cov_data,
         }
         safe_cid = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cid)).strip(".") or "claim"
-        fname = f"pr_{safe_key}_{safe_cid}.json"
+        head_tag = re.sub(r"[^A-Za-z0-9]+", "", str(state.get("head", "")))[:8]
+        fname = f"pr_{safe_key}_{head_tag}_{safe_cid}.json" if head_tag else f"pr_{safe_key}_{safe_cid}.json"
         write_json(under(escape_dir, fname), bundle)
         exported.append(fname)
     return exported

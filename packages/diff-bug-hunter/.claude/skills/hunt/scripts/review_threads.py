@@ -404,7 +404,23 @@ def build_review_context(pr: str, hdir: Path, state: dict[str, Any], ctx_data: d
     deleted_thread_paths = [t["path"] for t in included if t["path"] not in files]
     targets = review_targets(wt, files, extra_paths=deleted_thread_paths)
     meta = {"pr": pr, "included": included, "skipped": skipped, "targets": targets, "non_coderabbit": non_cr}
-    write_json(hdir / "R" / "threads.json", meta)
+    tpath = hdir / "R" / "threads.json"
+    if tpath.exists():
+        try:
+            prev_ids = [t.get("thread_id") for t in _read_json_dict(tpath).get("included", []) if isinstance(t, dict)]
+        except InfraError:
+            prev_ids = []
+        new_ids = [t.get("thread_id") for t in included]
+        if prev_ids != new_ids:
+            for stale in (
+                hdir / "R" / "response.json", hdir / "R" / "request.json",
+                hdir / "R" / "request.repair.json", hdir / "R" / "request.retry.json",
+                hdir / "run_R.json", hdir / "run_R.response.sha256",
+                hdir / "base_R.json", hdir / "base_R.response.sha256",
+                hdir / "compile_R.log", hdir / "review_verdicts.json",
+            ):
+                stale.unlink(missing_ok=True)
+    write_json(tpath, meta)
     if not included:
         return meta, None
     patches: dict[str, str] = {}
@@ -446,9 +462,9 @@ def _match_tests(claim_id: str, declared: list[str], run_results: dict[str, str]
 
 
 def _artifact_fresh(data_path: Path, sha_path: Path, expected_digest: str | None, fallback_ok: bool = True) -> bool:
-    if not data_path.exists():
+    if not data_path.exists() or expected_digest is None:
         return False
-    if sha_path.exists() and expected_digest is not None:
+    if sha_path.exists():
         return sha_path.read_text().strip() == expected_digest
     return fallback_ok
 

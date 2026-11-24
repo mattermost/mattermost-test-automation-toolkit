@@ -23,5 +23,6 @@ names of existing custom emoji, IDs and slugs), partially populated or sanitized
 missing fields must not overwrite the full object), NULL or legacy column values scanned into non-pointer fields, config
 values that were non-secret or defined before the PR, and old enum, role or JSON shapes. Each such test cites the base
 `file:line` that made the input valid plus any callers or stored data that
-still carry it. A new rule that rejects or rewrites data the base accepted is a finding even if the PR description
-promises it: the stored data cannot be changed by the PR.
+still carry it. A new rule that rejects or rewrites data the base stored, or values callers already hold, is a
+finding even if the PR description promises it: the stored data cannot be changed by the PR. A restriction scoped
+solely to new submissions (keeping existing records readable) is a finding only when the PR does not announce it.

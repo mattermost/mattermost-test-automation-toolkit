@@ -166,6 +166,8 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
         print(write(hdir, "R", review_system(meta["targets"], r_ctx), user, REVIEW_SCHEMA))
     elif what == "retry":
         tag = arg
+        if tag.upper() == "R":
+            sys.exit("retry is not supported for Mode R: empty files: [] is valid when all threads are untestable")
         prev = hdir / tag / "response.json"
         if not tag or not prev.exists():
             sys.exit(f"{prev} missing: hunter {tag!r} must have written a response first")

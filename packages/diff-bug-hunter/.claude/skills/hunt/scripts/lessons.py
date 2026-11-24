@@ -132,8 +132,8 @@ def prune(lessons: list[dict[str, Any]], log_lines: list[dict[str, Any]], window
     runs: dict[str, list[str]] = {}
     for line in log_lines:
         key = re.sub(r"/\d+$", "", str(line["run"]))
-        runs.pop(key, None)  # move a re-run or later batch of the same target to the end
-        runs[key] = line["matched"]
+        earlier = runs.pop(key, [])  # move a re-run or later batch of the same target to the end
+        runs[key] = sorted(set(earlier) | set(line["matched"]))
     recent = list(runs.values())[-window:]
     out = []
     for lsn in lessons:

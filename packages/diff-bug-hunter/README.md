@@ -78,15 +78,17 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
 
 ### Measuring `/hunt` on real bugs and self-improvement loop
 
-- `scripts/eval_bugs.py eval/bugs_2026.json --repo <full mattermost clone> [--signals hunters,diff,old,pr,review] [--skip-missing]`
-  (extending `scripts/eval_reverts.py` / `eval/revert_cases.json`) evaluates `/hunt` across reverts, `v12.x` RC
+Run from `packages/diff-bug-hunter/` (passing `--dispatch '<cmd>'` where `<cmd>` executes the request and writes `response_path` for fresh hunter benchmarks):
+
+- `.claude/skills/hunt/scripts/eval_bugs.py eval/bugs_2026.json --repo <full mattermost clone> [--signals hunters,diff,old,pr,review] [--skip-missing] [--dispatch '<cmd>']`
+  (extending `.claude/skills/hunt/scripts/eval_reverts.py` / `eval/revert_cases.json`) evaluates `/hunt` across reverts, `v12.x` RC
   hotfixes, pre-merge review regressions, and clean controls, tracking regression locks (`lock: true`).
-- `scripts/eval_bugs.py diff <baseline_scorecard.json> <candidate_scorecard.json>` enforces a monotonic quality gate
+- `.claude/skills/hunt/scripts/eval_bugs.py diff <baseline_scorecard.json> <candidate_scorecard.json>` enforces a monotonic quality gate
   before prompt/rule edits merge (`cand.vetted_recall >= base.vetted_recall`, bounded FP rate, 0 lock regressions).
-- `scripts/ledger.py record <pr>` appends compact telemetry to `$HUNT_SCRATCH/hunt_ledger.jsonl` and automatically
+- `.claude/skills/hunt/scripts/ledger.py record <pr>` appends compact telemetry to `$HUNT_SCRATCH/hunt_ledger.jsonl` and automatically
   exports verified false-negative bundles into `escapes/` whenever Mode R proves a bug that Modes A/B/D missed.
-- `scripts/mine_rules.py <repo> [-n 30]` proposes candidate `RELIABILITY.md` rules from reverts without mutating rules.
-- `scripts/lessons.py prune [--write]` retires unused or over-broad globs (including 2-segment monorepo roots such as
+- `.claude/skills/hunt/scripts/mine_rules.py <repo> [-n 30]` proposes candidate `RELIABILITY.md` rules from reverts without mutating rules.
+- `.claude/skills/hunt/scripts/lessons.py prune [--write]` retires unused or over-broad globs (including 2-segment monorepo roots such as
   `server/channels/*`); multi-batch hunts of the same target collapse to a single entry in `$HUNT_SCRATCH/lessons_hits.jsonl`.
 
 Hunters and mutant planters only ever see a request file built by `scripts/`; deterministic logic lives in tested

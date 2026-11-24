@@ -1,5 +1,5 @@
 {
-  "_about": "2026 MatterWolf benchmark manifest: merged v12.0/v12.1 RC hotfix pairs, 2026 PR regression locks & recall targets, and merged 2026 clean controls. Run with: scripts/eval_bugs.py eval/bugs_2026.json --repo <mattermost clone> [--skip-missing] --dispatch '<cmd>'.",
+  "_about": "2026 MatterWolf benchmark manifest: merged v12.0/v12.1 RC hotfix pairs, 2026 PR regression locks & recall targets, and merged 2026 clean controls. Run from packages/diff-bug-hunter with: .claude/skills/hunt/scripts/eval_bugs.py eval/bugs_2026.json --repo <mattermost clone> [--skip-missing] --dispatch '<cmd>'.",
   "thresholds": {"raw_recall_min": 0.4, "vetted_recall_min": 0.3, "fp_rate_max": 0.05},
   "cases": [
     {

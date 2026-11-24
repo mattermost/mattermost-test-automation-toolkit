@@ -65,6 +65,7 @@ if not _sys.pycache_prefix:
 import argparse
 import importlib
 import json
+import math
 import os
 import shlex
 import shutil
@@ -141,6 +142,8 @@ def load_manifest(path: Path, repo_override: Path | None,
                   extra_controls: list[dict[str, Any]] | None = None,
                   skip_missing: bool = False) -> dict[str, Any]:
     m = json.loads(path.read_text())
+    if not isinstance(m, dict):
+        raise ManifestError("manifest must be a JSON object")
     if not m.get("cases") or not isinstance(m["cases"], list):
         raise ManifestError("manifest needs a non-empty cases list")
     controls = (m.get("controls") or []) + (extra_controls or [])
@@ -405,8 +408,15 @@ def score(entry: dict[str, Any]) -> tuple[bool, bool]:
 def flags(entry: dict[str, Any], signals: tuple[str, ...] = SIGNALS) -> dict[str, bool]:
     """Which signals fired for one entry: any table of that kind holding one of the signal's verdicts."""
     results = entry.get("results", [])
-    return {name: group in signals and any(v in verdicts for r in results for v in r.get(key, {}).values())
-            for name, key, verdicts, group in FLAGS}
+    return {
+        name: group in signals and any(
+            isinstance(v, str) and v in verdicts
+            for r in results
+            for k, v in (r.get(key) or {}).items()
+            if k not in ("*", "detail", "new_api")
+        )
+        for name, key, verdicts, group in FLAGS
+    }
 
 
 def score_old(entry: dict[str, Any]) -> bool:
@@ -531,9 +541,21 @@ def render(card: dict[str, Any]) -> str:
 
 def diff_scorecards(base: dict[str, Any], cand: dict[str, Any], max_fp: float = 0.05) -> dict[str, Any]:
     """Monotonic gate comparing a candidate scorecard against a baseline."""
+    def _num(d: dict[str, Any], key: str) -> float:
+        raw = d[key]
+        if isinstance(raw, bool):
+            raise TypeError(f"{key} must be numeric, not bool")
+        val = float(raw)
+        if not math.isfinite(val):
+            raise ValueError(f"{key} must be finite")
+        return val
+
     bm, cm = base["metrics"], cand["metrics"]
     b_rows = {r["id"]: r for r in base.get("rows", []) if r.get("kind") == "case"}
     c_rows = {r["id"]: r for r in cand.get("rows", []) if r.get("kind") == "case"}
+    b_ctrls = {r["id"] for r in base.get("rows", []) if r.get("kind") == "control"}
+    c_ctrls = {r["id"] for r in cand.get("rows", []) if r.get("kind") == "control"}
+    population_ok = (set(b_rows) == set(c_rows)) and (b_ctrls == c_ctrls)
 
     def caught(r: dict[str, Any]) -> bool:
         return bool(r.get("vetted") or r.get("hunters_new_api") or r.get("review_proven"))
@@ -543,21 +565,24 @@ def diff_scorecards(base: dict[str, Any], cand: dict[str, Any], max_fp: float = 
         if (br.get("lock") or c_rows.get(cid, {}).get("lock")) and caught(br)
         and (cid not in c_rows or not caught(c_rows[cid]))
     )
+    base_recall, cand_recall = _num(bm, "vetted_recall"), _num(cm, "vetted_recall")
+    base_fp, cand_fp = _num(bm, "fp_rate"), _num(cm, "fp_rate")
     cand_ok = not cand.get("errors") and cand.get("verdict") != "ERROR"
-    recall_ok = float(cm["vetted_recall"]) >= float(bm["vetted_recall"])
-    fp_limit = max(max_fp, float(bm["fp_rate"]))
-    fp_ok = float(cm["fp_rate"]) <= fp_limit
-    passed = cand_ok and recall_ok and fp_ok and not lock_regressions
+    recall_ok = cand_recall >= base_recall
+    fp_limit = max(max_fp, base_fp)
+    fp_ok = cand_fp <= fp_limit
+    passed = cand_ok and population_ok and recall_ok and fp_ok and not lock_regressions
     return {
         "verdict": "PASS" if passed else "FAIL",
         "cand_ok": cand_ok,
+        "population_ok": population_ok,
         "recall_ok": recall_ok,
         "fp_ok": fp_ok,
         "fp_limit": fp_limit,
-        "base_vetted_recall": bm["vetted_recall"],
-        "cand_vetted_recall": cm["vetted_recall"],
-        "base_fp_rate": bm["fp_rate"],
-        "cand_fp_rate": cm["fp_rate"],
+        "base_vetted_recall": base_recall,
+        "cand_vetted_recall": cand_recall,
+        "base_fp_rate": base_fp,
+        "cand_fp_rate": cand_fp,
         "lock_regressions": lock_regressions,
     }
 
@@ -594,6 +619,9 @@ def main(argv: list[str]) -> int:
         print(f"VALID_MANIFEST cases={len(manifest['cases'])} controls={len(manifest['controls'])} "
               f"skipped_missing={len(manifest['skipped_missing'])}")
         return 0
+    if not (manifest["cases"] or manifest["controls"]):
+        print("INVALID_MANIFEST no entries selected after filtering")
+        return 2
     out = (a.out or Path(_tempfile.mkdtemp(prefix="eval-reverts-"))).resolve()
     out.mkdir(parents=True, exist_ok=True)
     os.environ["HUNT_SCRATCH"] = str(out)  # hunt_dir(n) == <out>/hunt<n>, so build_requests writes where we read

@@ -392,6 +392,7 @@ def test_pr_tests_caps_go_test_parallel_flag_and_clamps_minimum(tmp_path, monkey
         'package par\n\nimport (\n\t"flag"\n\t"os"\n\t"strconv"\n\t"testing"\n)\n\n'
         'var seenParallel int\n\n'
         'func TestMain(m *testing.M) {\n'
+        '\tflag.Parse()\n'
         '\tif f := flag.Lookup("test.parallel"); f != nil {\n'
         '\t\tseenParallel, _ = strconv.Atoi(f.Value.String())\n'
         '\t}\n'
@@ -414,6 +415,7 @@ def test_pr_tests_caps_go_test_parallel_flag_and_clamps_minimum(tmp_path, monkey
     state = {"repo": str(repo), "wt": str(wt), "wt_base": str(wt_base), "merge_base": mb,
              "head": _git(repo, "rev-parse", "feature")}
     monkeypatch.setenv("HUNT_PG_LOCK", str(tmp_path / "pg.lock"))
+    monkeypatch.setenv("GOMAXPROCS", "4")
     monkeypatch.delenv("HUNT_PR_TEST_PARALLEL", raising=False)
     monkeypatch.delenv(pr_tests.PARALLEL_ENV, raising=False)
 

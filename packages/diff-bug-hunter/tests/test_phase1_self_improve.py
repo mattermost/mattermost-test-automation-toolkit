@@ -80,8 +80,8 @@ def test_ledger_records_telemetry_and_exports_only_mode_r_escapes(tmp_path):
     assert row["modes"]["mode_a_empty"] == 1
     assert row["deferred_count"] == 1
     assert row["mode_r_summary"] == {"proven": 1, "disproven": 0, "unprovable": 1, "unprovable_high_severity": 1}
-    assert row["escapes"] == ["pr_40299_CR1.json"]
-    bundle = json.loads((out_ledger.parent / "escapes" / "pr_40299_CR1.json").read_text())
+    assert row["escapes"] == ["pr_40299_acb8f87_CR1.json"]
+    bundle = json.loads((out_ledger.parent / "escapes" / "pr_40299_acb8f87_CR1.json").read_text())
     assert bundle["deferred_or_excluded"] == "DEFERRED to batch 2"
     assert "webapp/channels/src/actions/hunt_r.test.tsx" in bundle["repro_files"]
     assert len(ledger.list_escapes(out_ledger)) == 1
@@ -239,7 +239,9 @@ def test_eval_bugs_kinds_skip_missing_locks_and_diff_gate(tmp_path, capsys):
     assert eval_bugs.main(["eval_bugs.py", "diff", str(base_card), str(cand_bad_fp)]) == 1
     assert eval_reverts.diff_scorecards(
         json.loads(base_card.read_text()),
-        {"metrics": {"vetted_recall": 1.0, "fp_rate": 0.0}, "rows": [], "errors": ["c1"]},
+        {"metrics": {"vetted_recall": 1.0, "fp_rate": 0.0},
+         "rows": [{"kind": "case", "id": "hotfix-1", "lock": True, "vetted": True, "hunters_new_api": False}],
+         "errors": ["c1"]},
     )["verdict"] == "FAIL"
     assert eval_reverts.diff_scorecards(
         json.loads(base_card.read_text()),
@@ -325,9 +327,79 @@ def test_audit_hardening_ledger_tiers_review_edges_and_empty_archive(tmp_path):
     ver = review_threads.compute_verdicts(h_r)["verdicts"]["CR1"]
     assert ver["verdict"] == "UNPROVABLE_DYNAMICALLY" and "run.py run 55 R" in ver["reason"]
 
-    # ctx.archive_batch with no hunter outputs never creates an empty batches/batch_N directory.
+    # ctx.archive_batch with no hunter outputs never creates an empty batches/batch_N directory,
+    # and repeat archival of a batch preserves prior completed archive as batch_1.2.
     h_arch = tmp_path / "h_arch"
     h_arch.mkdir()
     (h_arch / "ctx.json").write_text("{}")
     ctx.archive_batch(h_arch, 1)
     assert not (h_arch / "batches").exists()
+    (h_arch / "run_A.json").write_text('{"p::T": "PASS"}')
+    ctx.archive_batch(h_arch, 1)
+    (h_arch / "run_A.json").write_text('{"p::T2": "PASS"}')
+    ctx.archive_batch(h_arch, 1)
+    assert (h_arch / "batches" / "batch_1" / "run_A.json").exists()
+    assert (h_arch / "batches" / "batch_1.2" / "run_A.json").exists()
+
+
+def test_coderabbit_review_fixes_flags_scorecards_lessons_ledger_and_review_freshness(tmp_path, capsys):
+    # eval_reverts.flags handles nested new_api dict metadata without TypeError; diff_scorecards checks population & strings.
+    entry = {"results": [{"hunter": "A", "base": {"pkg::T": "NEW_API", "new_api": {"pkg::T": ["Sym"]}}}]}
+    assert eval_reverts.flags(entry)["hunters_new_api"] is True
+    base_c = {"metrics": {"vetted_recall": "0.5", "fp_rate": "0.0"}, "rows": [{"kind": "case", "id": "c1", "lock": False, "vetted": True}]}
+    same_c = {"metrics": {"vetted_recall": "0.5", "fp_rate": "0.0"}, "rows": [{"kind": "case", "id": "c1", "lock": False, "vetted": True}]}
+    pop_c = {"metrics": {"vetted_recall": 0.5, "fp_rate": 0.0}, "rows": [{"kind": "case", "id": "c2", "lock": False, "vetted": True}]}
+    assert eval_reverts.diff_scorecards(base_c, same_c)["cand_vetted_recall"] == 0.5
+    assert eval_reverts.diff_scorecards(base_c, pop_c)["population_ok"] is False
+    assert eval_reverts.diff_scorecards(base_c, pop_c)["verdict"] == "FAIL"
+
+    # lessons.prune merges hits across batches of one target so earlier matches are retained.
+    lsn = {"id": "L77", "pattern": "p", "applies_to": {"lang": ["go"], "path_globs": ["server/channels/app/*"]},
+           "keywords": ["k"], "symptom": "s", "check": "c", "source_pr": 1}
+    logs = [{"run": "40299", "matched": ["L77"]}, {"run": "40299", "matched": []}] + [
+        {"run": str(1000 + i), "matched": []} for i in range(29)
+    ]
+    assert lessons.prune([lsn], logs, window=30) == []
+
+    # ledger classifies unvetted FAIL_3_OF_3 or plain PR_TEST_FAILS as Partial or Unverified Coverage.
+    h_unv = tmp_path / "h_unv"
+    h_unv.mkdir()
+    (h_unv / "state.json").write_text(json.dumps({"pr": "12", "head": "aaa", "merge_base": "bbb", "batches": 1}))
+    (h_unv / "run_A.json").write_text('{"p::T": "PASS"}')
+    (h_unv / "run_B.json").write_text('{"p::T": "FAIL_3_OF_3"}')
+    (h_unv / "diff_D.json").write_text('{"p::D": "SAME"}')
+    assert ledger.record("12", hdir=h_unv, out_path=tmp_path / "lu.jsonl")["confidence_tier"] == "Partial or Unverified Coverage"
+    (h_unv / "run_B.json").write_text('{"p::T": "PASS"}')
+    (h_unv / "pr_tests.json").write_text('{"tests": {"ci::TestA": "PR_TEST_FAILS"}}')
+    assert ledger.record("12", hdir=h_unv, out_path=tmp_path / "lu.jsonl")["confidence_tier"] == "Partial or Unverified Coverage"
+
+    # review_threads rejects orphan run_R.json without R/response.json (expected_digest is None) & clears shifted thread IDs.
+    h_rt = tmp_path / "h_rt"
+    (h_rt / "R").mkdir(parents=True)
+    (h_rt / "R" / "threads.json").write_text(json.dumps({
+        "pr": "77",
+        "included": [{
+            "thread_id": "T1", "id": "CR1", "path": "pkg/a.go", "line": 1, "severity": "major",
+            "triage": "open_current", "is_resolved": False, "is_outdated": False, "title": "t", "url": "u",
+        }],
+    }))
+    (h_rt / "run_R.json").write_text('{"pkg::HuntR_CR1": "PASS"}')
+    assert review_threads.compute_verdicts(h_rt)["verdicts"]["CR1"]["verdict"] == "UNPROVABLE_DYNAMICALLY"
+    (h_rt / "R" / "response.json").write_text('{"files": []}')
+    repo = tmp_path / "repo_rt"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "master")
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "a.go").write_text("package pkg\nfunc F() {}\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+    mb = _git(repo, "rev-parse", "HEAD")
+    review_threads.build_review_context(
+        "77", h_rt, {"repo": str(repo), "wt": str(repo), "wt_base": str(repo), "merge_base": mb, "head": mb}, {},
+        raw_threads=[{
+            "id": "T2", "isResolved": False, "isOutdated": False, "path": "pkg/a.go", "line": 1,
+            "comments": {"nodes": [{"databaseId": 2, "url": "u", "author": {"login": "coderabbitai[bot]"},
+                                    "body": "**Major**\n\n**Shifted.**"}]},
+        }],
+    )
+    assert not (h_rt / "run_R.json").exists() and not (h_rt / "R" / "response.json").exists()

@@ -110,12 +110,13 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      - **`Bug Proven`** — at least one vetted `NEW_PR_BUG` (from Mode A, B, or R; note that a Mode R `PROVEN` thread with
        `base_verdict == "PRE_EXISTING"` reports under **Pre-Existing Bug** and does **not** escalate the PR's overall
        verdict to `Bug Proven`), an unannounced / existing-data-breaking /
-       normalization-breaking `OLD_TEST_BREAKS` / `OLD_TEST_SOMETIMES_BREAKS` / Mode D `DIFF`, a `PR_TEST_FAILS_UNDER_CI` /
-       `PR_TEST_FAILS`, or a confirmed `/verify` `REGRESSION` / unexplained `DIFF`.
+       normalization-breaking `OLD_TEST_BREAKS` / `OLD_TEST_SOMETIMES_BREAKS` / Mode D `DIFF`, a `PR_TEST_FAILS_UNDER_CI`,
+       or a confirmed `/verify` `REGRESSION` / unexplained `DIFF`.
      - **`Partial or Unverified Coverage`** — no bug proven, AND at least one coverage gap occurred: any batch deferred
        (`batch 1/N` with `N > 1` without `--all-batches`), any hunter `EMPTY` or failed repair, any `NOT_RUN` / `INFRA_ERROR`
-       / `BASE_UNCOMPILABLE` / `BASE_FAILED` / `RECORDER_FAILED` / `NO_RECORDS` / `NONDETERMINISTIC` / `FLAKY` / unresolved
-       `NEW_API`, any Mode R thread `UNPROVABLE_DYNAMICALLY` (including `UNVETTED`), or Mode A `0/Y` changed lines reached (`Y > 0`). List every
+       / `BASE_UNCOMPILABLE` / `BASE_FAILED` / `RECORDER_FAILED` / `NO_RECORDS` / `NONDETERMINISTIC` / `FLAKY` /
+       `PR_TEST_FAILS` / unresolved `NEW_API`, any Mode R thread `UNPROVABLE_DYNAMICALLY` (including `UNVETTED`), or Mode A
+       `0/Y` changed lines reached (`Y > 0`). List every
        specific gap explicitly so a reviewer knows exactly what was not proven clean.
      - **`High-Confidence Clean`** — no bug proven, AND every batch ran, Modes A/B/D (and R when qualifying threads exist)
        completed without `EMPTY`/compile/infra errors, `old_tests.py` and `pr_tests.py` had no `NOT_RUN`/flaky/failure, zero

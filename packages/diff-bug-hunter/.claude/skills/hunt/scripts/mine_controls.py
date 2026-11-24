@@ -123,16 +123,18 @@ def candidates(repo: Path, case: Commit, area: str) -> list[Commit]:
 
 def mine(repo: Path, manifest: dict[str, Any], per_case: int) -> tuple[list[dict[str, str]], dict[str, int]]:
     cases = manifest["cases"]
-    taken = {git(repo, "rev-parse", f"{e[k]}^{{commit}}") for e in cases for k in ("bug_sha", "fix_sha")}
+    taken = {git(repo, "rev-parse", f"{e[k]}^{{commit}}") for e in cases for k in ("bug_sha", "fix_sha") if e.get(k)}
     taken |= {git(repo, "rev-parse", f"{e['sha']}^{{commit}}") for e in manifest.get("controls") or []}
     used_ids = {e["id"] for e in cases + (manifest.get("controls") or [])}
     picked: list[dict[str, str]] = []
     filled: dict[str, int] = {}
     for case in cases:
         bug = git(repo, "rev-parse", f"{case['bug_sha']}^{{commit}}")
-        fix = git(repo, "rev-parse", f"{case['fix_sha']}^{{commit}}")
         c = read_commits(repo, [bug])[bug]
-        tickets = c.tickets | {t.upper() for t in TICKET.findall(git(repo, "log", "-1", "--format=%B", fix))}
+        tickets = set(c.tickets)
+        if case.get("fix_sha"):
+            fix = git(repo, "rev-parse", f"{case['fix_sha']}^{{commit}}")
+            tickets |= {t.upper() for t in TICKET.findall(git(repo, "log", "-1", "--format=%B", fix))}
         got = 0
         for cand in candidates(repo, c, case["area"]) if c.files and c.lines else []:
             if got == per_case:
