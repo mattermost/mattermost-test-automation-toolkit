@@ -6,6 +6,8 @@
 usage: build_requests.py <pr> hunters            -> A/, B/
        build_requests.py <pr> diff               -> D/ (differential recorders: no assertions; `run.py diff <pr> D` diffs the
                                                    recorded outputs of the merge-base and the PR head)
+       build_requests.py <pr> review             -> R/ (CodeRabbit review-claim verifier; skips writing request if 0 qualifying threads)
+       build_requests.py <pr> retry <tag>        -> <tag>/request.retry.json (one retry when a hunter returned empty files: [])
        build_requests.py <pr> mutants            -> M/ (3 visible faults)
        build_requests.py <pr> heldout            -> M2/ (2 held-back faults; needs M/response.json)
        build_requests.py <pr> strengthen <ids>   -> A2/ (needs A/response.json; ids = surviving mutants, e.g. M1,M3)
@@ -38,11 +40,14 @@ from typing import Any
 
 import lessons
 import reliability
+import review_threads
 import trusted
-from hunt_common import hunt_dir, load_json, read_state, write_json
+from hunt_common import InfraError, hunt_dir, load_json, read_state, write_json
 
 HUNTER_SCHEMA = {"type": "object", "required": ["files", "tests"],
                  "properties": {"files": {"type": "array"}, "tests": {"type": "array"}}}
+REVIEW_SCHEMA = {"type": "object", "required": ["files", "tests", "claims"],
+                 "properties": {"files": {"type": "array"}, "tests": {"type": "array"}, "claims": {"type": "array"}}}
 MUTANT_SCHEMA = {"type": "object", "required": ["mutants"], "properties": {"mutants": {"type": "array"}}}
 
 
@@ -102,7 +107,8 @@ def hunter_system(mode: str, state: dict[str, Any], ctx: dict[str, Any], strateg
     """System prompt for a hunter. `strategies` adds prompts/strategy_x.md: only first-pass hunters get it, so
     strengthen and repair rounds stay focused on their one job."""
     lang_rules = "".join(prompt(f"lang_{lang}") for lang in langs(state))
-    common = prompt("common").replace("{lang_rules}", lang_rules).replace("{lessons}", lessons.render(lessons.match(ctx)))
+    lesson_text = "" if mode.startswith("D") else lessons.render(lessons.match(ctx))
+    common = prompt("common").replace("{lang_rules}", lang_rules).replace("{lessons}", lesson_text)
     rules = reliability.render(reliability.match(ctx)) if mode.startswith("A") else ""
     extra = prompt("strategy_x") if strategies else ""
     if mode == "A" and "go" in langs(state) and os.environ.get("HUNT_FUZZ") != "0":
@@ -128,18 +134,62 @@ def mutant_system(state: dict[str, Any], count: int, ids: str, avoid: str = "") 
             .replace("{lang_name}", lang_name).replace("{avoid}", avoid))
 
 
+def review_system(targets: list[dict[str, str]], r_ctx: dict[str, Any]) -> str:
+    r_langs = sorted({t["lang"] for t in targets})
+    lang_rules = "".join(prompt(f"lang_{lang}") for lang in r_langs)
+    return prompt("mode_r").replace("{lang_rules}", lang_rules).replace("{lessons}", lessons.render(lessons.match(r_ctx)))
+
+
 def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
     hdir = hunt_dir(pr)
     state = read_state(hdir)
     ctx = json.loads((hdir / "ctx.json").read_text())
     if what == "hunters":
-        lessons.log_hits(f"{pr}/{state['batch']}", lessons.match(ctx))  # input for `lessons.py prune`
+        lessons.log_hits(str(pr), lessons.match(ctx))  # input for `lessons.py prune`
         for mode in ("A", "B"):
             print(write(hdir, mode, hunter_system(mode, state, ctx, strategies=True), hunter_user(mode, ctx),
                         HUNTER_SCHEMA))
     elif what == "diff":
         # Mode D gets Mode A's context but no strategies, reliability rules or fuzz rules: a recorder asserts nothing.
         print(write(hdir, "D", hunter_system("D", state, ctx), hunter_user("D", ctx), HUNTER_SCHEMA))
+    elif what == "review":
+        meta, user = review_threads.build_review_context(pr, hdir, state, ctx)
+        if user is None:
+            for stale in ("request.json", "request.md"):
+                (hdir / "R" / stale).unlink(missing_ok=True)
+            reason = meta.get("skipped_reason") or f"0 qualifying CodeRabbit threads ({len(meta.get('skipped', []))} skipped)"
+            print(f"[R] {reason}; no request written")
+            return
+        r_ctx = {"changed_files_head_source": user["thread_files_head_source"],
+                 "diff_production_code": user["diff_production_code"],
+                 "sibling_tests_and_helpers": user["sibling_tests_and_helpers"]}
+        print(write(hdir, "R", review_system(meta["targets"], r_ctx), user, REVIEW_SCHEMA))
+    elif what == "retry":
+        tag = arg
+        prev = hdir / tag / "response.json"
+        if not tag or not prev.exists():
+            sys.exit(f"{prev} missing: hunter {tag!r} must have written a response first")
+        prev_data = load_json(prev)
+        if not isinstance(prev_data, dict):
+            sys.exit(f"{prev} must be a JSON object")
+        if prev_data.get("files"):
+            sys.exit(f"{prev} is not empty: retry is only for hunters that returned files: []")
+        kept = hdir / tag / "response.prev.json"
+        kept.write_text(prev.read_text())
+        req_path = hdir / tag / "request.json"
+        if req_path.exists():
+            prev_req = json.loads(req_path.read_text())
+            system = prev_req["system"] + prompt("retry_empty")
+            user = {**json.loads(prev_req["user"]), "previous_response": prev_data}
+            schema = prev_req["schema"]
+        elif tag.upper() == "R":
+            sys.exit(f"{req_path} missing: run `build_requests.py <pr> review` before retrying R")
+        else:
+            system = hunter_system(tag[0], state, ctx, strategies=True) + prompt("retry_empty")
+            user = {**hunter_user(tag, ctx), "previous_response": prev_data}
+            schema = HUNTER_SCHEMA
+        write_request(hdir / tag / "request.retry.json", system, user, schema, prev)
+        print(hdir / tag / "request.retry.json")
     elif what == "mutants":
         print(write(hdir, "M", mutant_system(state, 3, "M1, M2, M3"), mutant_user(ctx), MUTANT_SCHEMA))
     elif what == "heldout":
@@ -176,14 +226,32 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
         prev = hdir / tag / "response.json"
         kept = hdir / tag / "response.prev.json"
         kept.write_text(prev.read_text())
-        user = {**hunter_user(tag, ctx), "your_previous_files": load_json(kept)["files"],
-                "compiler_error": log.read_text()[-4000:]}
-        system = hunter_system(tag[0], state, ctx) + prompt("repair")
-        write_request(hdir / tag / "request.repair.json", system, user, HUNTER_SCHEMA, prev)
+        req_path = hdir / tag / "request.json"
+        if tag == "R":
+            if not req_path.exists():
+                sys.exit(f"{req_path} missing: run `build_requests.py {pr} review` first")
+            prev_req = json.loads(req_path.read_text())
+            prev_resp = load_json(kept)
+            user = {**json.loads(prev_req["user"]), "your_previous_files": prev_resp["files"],
+                    "your_previous_tests": prev_resp.get("tests", []),
+                    "your_previous_claims": prev_resp.get("claims", []),
+                    "compiler_error": log.read_text()[-4000:]}
+            system = prev_req["system"] + prompt("repair")
+            schema = prev_req["schema"]
+        else:
+            user = {**hunter_user(tag, ctx), "your_previous_files": load_json(kept)["files"],
+                    "compiler_error": log.read_text()[-4000:]}
+            system = hunter_system(tag[0], state, ctx) + prompt("repair")
+            schema = HUNTER_SCHEMA
+        write_request(hdir / tag / "request.repair.json", system, user, schema, prev)
         print(hdir / tag / "request.repair.json")
     else:
         sys.exit(__doc__)
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:5])
+    try:
+        main(*sys.argv[1:5])
+    except InfraError as e:
+        print(f"INFRA_ERROR {e}")
+        sys.exit(2)

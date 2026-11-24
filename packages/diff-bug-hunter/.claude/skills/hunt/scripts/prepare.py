@@ -145,8 +145,9 @@ def deps(repo: Path, wt: Path, wt_base: Path, mb: str, head_ref: str) -> tuple[b
 
 
 # Outputs that cost a model call or a long test run. Any of them for the current head means the hunt is under way.
-RESULTS = ("A/response.json", "B/response.json", "D/response.json", "A2/response.json", "run_*.json", "diff_*.json",
-           "old_tests.json", "pr_tests.json")
+RESULTS = ("A/response.json", "B/response.json", "D/response.json", "R/response.json", "A2/response.json",
+           "run_*.json", "diff_*.json", "old_tests.json", "pr_tests.json", "review_verdicts.json",
+           "batches/batch_*/*/response.json", "batches/batch_*/run_*.json", "batches/batch_*/diff_*.json")
 
 
 class AlreadyHunted(RuntimeError):

@@ -2,9 +2,10 @@
 
 Diff-triggered invariants for `/hunt` Mode A. `scripts/reliability.py` reads this file from the trusted base ref and
 injects a rule only when a changed file matches one of its `paths` globs or a changed line matches its `diff` regex.
-Hunters must still back every invariant they test with at least 3 caller citations.
+Hunters must still back every invariant they test with concrete `file:line` evidence from the diff, callers, neighbours, or base code.
 
-Format per rule: `## Rnn Title`, then `paths:` (comma-separated globs, or `-` for diff-only rules), `diff:` (one regex, case-insensitive, matched
+Format per rule: `## Rnn Title`, then `paths:` (comma-separated globs, or `-` for diff-only rules), optional `lang:`
+(comma-separated `go` / `jest`; omitted means any language), `diff:` (one regex, case-insensitive, matched
 against added and removed lines), `invariant:` and `probe:` (one line each).
 
 ## R01 Guest account isolation
@@ -51,12 +52,14 @@ probe: Run the migration twice, run down then up, and run it against a table hol
 
 ## R08 Concurrency under -race
 paths: -
+lang: go
 diff: go func|sync\.|atomic\.|Mutex|RWMutex|\bchan\b|\.Store\(|\.Load\(|errgroup
 invariant: Shared state touched by more than one goroutine is synchronized; no goroutine outlives Stop/Close; concurrent callers of the changed API see consistent results under `go test -race`.
 probe: Drive the changed API from several goroutines with a seeded interleaving plus a concurrent shutdown; run with -race and assert final state and no leaked goroutines.
 
 ## R09 React async form error recovery
 paths: -
+lang: jest
 diff: async |await |\.then\(|\.catch\(|isSubmitting|setSaving|saving|serverError|onSubmit|handleSubmit
 invariant: After a failed request the form shows the server error, re-enables submit and keeps the user's input; a pending request blocks double submit; nothing updates state after unmount.
 probe: Mock the Client4/action call to reject, then resolve; assert error text, enabled submit, preserved input, single call on double click, and no act() warning after unmount.
@@ -66,3 +69,10 @@ paths: webapp/channels/src/selectors/**, webapp/channels/src/packages/mattermost
 diff: createSelector|makeGet|useSelector|reselect|createIdsSelector|memoize
 invariant: A selector returns the same reference while its inputs are unchanged and a new value when they change; factory selectors (makeGet*) are created per component instance.
 probe: Call the changed selector twice on identical state and once on state with an unrelated slice changed (expect identical references), then change a real input (expect a new value).
+
+## R11 Primary read for before-snapshot writes and cache invalidation
+paths: -
+lang: go
+diff: RequestContextWithMaster|WithMaster\(|DBXFromContext|GetReplica\(|GetMaster\(|Invalidate\w*Cache|Clear\w*Cache|Purge\w*Cache|refresh\w*View|existingByID|\bexisting\w*\s*(?:,\s*\w+\s*)?:=\s*\S+\.Get
+invariant: Any store read whose result governs a write-side diff (before-snapshot comparison), a synchronous cache or materialized-view refresh/invalidation, or a post-write read-back must route to the primary DB via `RequestContextWithMaster` (`app.RequestContextWithMaster` / `store.RequestContextWithMaster` / `sqlstore.RequestContextWithMaster`), never an ordinary `rctx` that can hit a lagging read replica.
+probe: Inspect every store read feeding a write decision, cache/view refresh, or post-commit read-back; using a store mock or context-master check (`store.HasMaster(rctx.Context())` / `sqlstore.HasMaster(rctx.Context())` / primary-only mock data), assert the read requests the master DB and still triggers invalidation or returns the committed state when a replica would be stale.

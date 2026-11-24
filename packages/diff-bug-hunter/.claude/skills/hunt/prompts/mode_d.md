@@ -9,7 +9,8 @@ Per recorder:
 2. Generate inputs with a fixed seed: 200 seeded inputs stratified roughly 50/50 between (a) inputs exercising the PR's
    changed conditions/branches and (b) untouched paths and existing stored-data shapes (to expose unintended blast radius),
    plus hand-picked edge cases from callers, fixtures and base code (empty, nil/null, zero, boundary, deeply nested,
-   oversized, malformed UTF-8/unicode, values callers or stored data carry). Shape the generator after real caller data
+   oversized, malformed UTF-8/unicode, sparse/partial patches and omitted/default/legacy-alias values that normalize to an
+   unchanged effective value, and values callers or stored data carry). Shape the generator after real caller data
    (field names, enum values, nesting), not after the PR. For stateful targets (stores, Redux reducers, lifecycle handlers),
    include 2-6 step operation sequences and record the canonical final state and error.
 3. Call the target once per input through the helper below. The helper appends one JSON line per input to the file named

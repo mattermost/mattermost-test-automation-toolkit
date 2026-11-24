@@ -27,9 +27,11 @@ if not _sys.pycache_prefix:
     _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
     _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
 
+import fcntl
 import os
 import signal
 import sys
+import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -40,23 +42,55 @@ from hunt_common import InfraError, git, hunt_dir, hunt_lock, read_state, write_
 from run import PACKAGE_FAILED, CompileError, Outcome, classify, ensure_clean, go_run
 
 FLAG = "ENABLE_FULLY_PARALLEL_TESTS"
+PARALLEL_ENV = "HUNT_GO_PARALLEL"
+DEFAULT_PARALLEL = 2  # TestMain enables RunParallel when test.parallel > 1; NewTestPool allocates 2 * parallel DBs
 MAX_UNITS = 20  # Go packages per hunt; the rest are listed as skipped
 RUNS = 3
 
 
+def parallelism() -> int:
+    """Cap -parallel for ENABLE_FULLY_PARALLEL_TESTS so NewTestPool does not exhaust Postgres max_connections on high-CPU
+    hosts (clamped >= 2 so TestMain still activates fully parallel mode)."""
+    raw = os.environ.get("HUNT_PR_TEST_PARALLEL", "").strip()
+    if not raw:
+        return DEFAULT_PARALLEL
+    try:
+        val = int(raw)
+    except ValueError as e:
+        raise InfraError(f"invalid HUNT_PR_TEST_PARALLEL={raw!r}: expected integer >= 2") from e
+    return max(2, val)
+
+
+@contextmanager
+def pg_pool_lock() -> Iterator[None]:
+    """Serialize parallel Postgres test-pool runs across concurrent hunts on the same host."""
+    lock_path = Path(os.environ.get("HUNT_PG_LOCK") or Path(tempfile.gettempdir()) / f"hunt-pg-pool-{os.getuid()}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 @contextmanager
 def ci_env(parallel: bool) -> Iterator[None]:
-    """The process environment go test inherits, with the flag on or (whatever the caller exported) off. The test
-    binary reads it in TestMain, and only goes parallel when -test.parallel > 1 (GOMAXPROCS by default), so a one-CPU
-    machine gets GOMAXPROCS=2 for the flagged runs."""
-    saved = {k: os.environ.get(k) for k in (FLAG, "GOMAXPROCS")}
+    """The process environment go test inherits, with the flag on or (whatever the caller exported) off. Mattermost's
+    TestMain reads flag.Lookup("test.parallel") BEFORE flag.Parse()/m.Run(), so it sees the flag's default value, which
+    Go initializes from GOMAXPROCS. Setting BOTH GOMAXPROCS and -parallel (via HUNT_GO_PARALLEL) to `parallelism()`
+    (default 2, >= 2) guarantees RunParallel activates while capping NewTestPool to 2*parallel Postgres stores instead
+    of 2*NCPUs (preventing MakeSqlSettings connection exhaustion on multi-core hosts)."""
+    saved = {k: os.environ.get(k) for k in (FLAG, "GOMAXPROCS", PARALLEL_ENV)}
     try:
         if parallel:
+            par = str(parallelism())
             os.environ[FLAG] = "true"
-            if (os.cpu_count() or 1) < 2:
-                os.environ.setdefault("GOMAXPROCS", "2")
+            os.environ["GOMAXPROCS"] = par
+            os.environ[PARALLEL_ENV] = par
         else:
             os.environ.pop(FLAG, None)
+            os.environ.pop(PARALLEL_ENV, None)
         yield
     finally:
         for k, v in saved.items():
@@ -83,7 +117,11 @@ def plan(repo: Path, mb: str, head: str) -> tuple[list[dict[str, Any]], list[str
 def _run(wt: Path, unit: dict[str, Any], tests: list[str], parallel: bool) -> Outcome:
     o = Outcome()
     with ci_env(parallel):
-        go_run(wt, {unit["dir"]: "^(" + "|".join(tests) + ")$"}, False, o)
+        if parallel:
+            with pg_pool_lock():
+                go_run(wt, {unit["dir"]: "^(" + "|".join(tests) + ")$"}, False, o)
+        else:
+            go_run(wt, {unit["dir"]: "^(" + "|".join(tests) + ")$"}, False, o)
     return o
 
 

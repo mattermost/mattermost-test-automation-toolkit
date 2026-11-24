@@ -82,34 +82,224 @@ def lang_of(path: str) -> str:
     return "go" if path.endswith(".go") else "jest"
 
 
-def sibling_rank(p: Path, stem: str, symbols: set[str]) -> int:
+SIBLING_TEST_SUFFIXES = ("_test.go", ".test.ts", ".test.tsx", ".test.js", ".test.jsx")
+SIBLING_SYM_BEFORE = 15
+SIBLING_SYM_AFTER = 30
+MIN_SIBLING_WINDOW = 25
+MAX_SECONDARY_SIBLINGS = 4
+
+
+def sibling_rank(p: Path, stems: str | list[str], symbols: set[str], body: str | None = None) -> int:
     """0 helpers (main/helper/setup), 1 same-name test, 2 mentions a changed symbol, 9 unrelated."""
     n = p.name
     if re.match(r"(main|helper|setup|utils?)[._]", n):
         return 0
-    if n.startswith((stem + "_test", stem + ".test")):
+    stem_list = [stems] if isinstance(stems, str) else stems
+    if any(n.startswith((s + "_test", s + ".test")) for s in stem_list):
         return 1
-    body = p.read_text(errors="replace")
-    return 2 if any(s in body for s in symbols) else 9
+    if not symbols:
+        return 9
+    text = p.read_text(errors="replace") if body is None else body
+    return 2 if any(s in text for s in symbols) else 9
+
+
+def _allocate_budgets(needs: dict[Any, int], total: int) -> dict[Any, int]:
+    """Water-filling budget split: items needing <= share get full need; larger items split the rest evenly."""
+    alloc: dict[Any, int] = {}
+    rem = dict(needs)
+    left = max(0, total)
+    while rem:
+        share = left // len(rem)
+        small = {k: n for k, n in rem.items() if n <= share}
+        if not small:
+            extra = left - share * len(rem)
+            for idx, k in enumerate(rem):
+                alloc[k] = share + (1 if idx < extra else 0)
+            break
+        for k, n in small.items():
+            alloc[k] = n
+            left -= n
+            del rem[k]
+    return alloc
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not spans:
+        return []
+    ordered = sorted(spans)
+    merged = [ordered[0]]
+    for a, b in ordered[1:]:
+        pa, pb = merged[-1]
+        if a <= pb + 1:
+            merged[-1] = (pa, max(pb, b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def _rendered_span_lines(spans: list[tuple[int, int]]) -> int:
+    return sum(b - a + 1 for a, b in spans) + max(0, len(spans) - 1)
+
+
+def _add_span(spans: list[tuple[int, int]], a: int, b: int, budget: int) -> list[tuple[int, int]]:
+    if a > b or budget <= 0:
+        return spans
+    merged = _merge_spans([*spans, (a, b)])
+    if _rendered_span_lines(merged) <= budget:
+        return merged
+    if _rendered_span_lines(_merge_spans([*spans, (a, a)])) > budget:
+        return spans
+    lo, hi = a, b
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _rendered_span_lines(_merge_spans([*spans, (a, mid)])) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return _merge_spans([*spans, (a, lo)])
+
+
+def _is_setup_helper(sym: str, lang: str) -> bool:
+    if lang != "go":
+        return True
+    name = sym.rsplit(".", 1)[-1]
+    return name == "TestMain" or not name.startswith(("Test", "Benchmark", "Fuzz", "Example"))
+
+
+def _windowed_sibling(lines: list[str], lang: str, symbols: set[str], budget: int) -> tuple[str, int]:
+    """Compact windowed excerpt of an oversized sibling test: package header + top setup helpers + symbol windows."""
+    n = len(lines)
+    if budget <= 0 or n == 0:
+        return "", 0
+    hits_by_sym: list[list[int]] = []
+    for sym in sorted(symbols):
+        rx = re.compile(rf"\b{re.escape(sym)}\b")
+        hits = [i for i, ln in enumerate(lines, 1) if rx.search(ln)] or [i for i, ln in enumerate(lines, 1) if sym in ln]
+        if hits:
+            hits_by_sym.append(hits)
+
+    blocks = top_blocks(lines, lang)
+    first_test = next((i for i, ln in enumerate(lines, 1)
+                       if (lang == "go" and ln.startswith("func "))
+                       or (lang != "go" and re.match(r"^(?:describe|test|it)\s*\(", ln))), n + 1)
+    first_decl = min([first_test] + ([blocks[0][1]] if blocks else []))
+    hdr_cap = min(80, max(1, budget // 4))
+    hdr_end = min(n, max(1, first_decl - 1) if first_decl > 1 else hdr_cap, hdr_cap)
+    spans = _add_span([], 1, hdr_end, budget)
+
+    sym_reserve = max(1, budget // 3) if hits_by_sym else 0
+    helper_budget = min(budget - sym_reserve, _rendered_span_lines(spans) + max(0, budget // 3))
+    helpers = [blk for blk in blocks if _is_setup_helper(blk[0], lang)]
+    if lang == "go":
+        helpers.sort(key=lambda blk: (0 if blk[0] == "TestMain" else 1, blk[1]))
+    for _, a, b in helpers:
+        if _rendered_span_lines(spans) >= helper_budget:
+            break
+        spans = _add_span(spans, a, min(b, a + MAX_BLOCK_LINES - 1), helper_budget)
+
+    sym_added = False
+    want_win = SIBLING_SYM_BEFORE + 1 + SIBLING_SYM_AFTER
+    for round_hits in itertools.zip_longest(*hits_by_sym):
+        if _rendered_span_lines(spans) >= budget:
+            break
+        for h in round_hits:
+            if h is None or any(sa <= h <= sb for sa, sb in spans):
+                continue
+            rem = budget - _rendered_span_lines(spans)
+            if rem <= 0:
+                break
+            sep = 0 if (not spans or any(sa - 1 <= h <= sb + 1 for sa, sb in spans)) else 1
+            avail = rem - sep
+            if avail <= 0:
+                continue
+            if avail >= want_win:
+                a, b = max(1, h - SIBLING_SYM_BEFORE), min(n, h + SIBLING_SYM_AFTER)
+            else:
+                pre = min(SIBLING_SYM_BEFORE, (avail - 1) // 3)
+                a = max(1, h - pre)
+                b = min(n, a + avail - 1)
+                a = max(1, b - avail + 1)
+            before = _rendered_span_lines(spans)
+            spans = _add_span(spans, a, b, budget)
+            if _rendered_span_lines(spans) > before:
+                sym_added = True
+
+    if not sym_added:
+        spans = _add_span(spans, 1, min(n, budget, max(hdr_end + 120, min(200, budget))), budget)
+
+    text = "\n   ...\n".join(numbered(lines, a, b) for a, b in spans)
+    return text, _rendered_span_lines(spans)
+
+
+def _emit_sibling_group(
+    wt: Path, group: list[tuple[int, Path, list[str]]], budget: int, symbols: set[str], out: list[dict[str, str]],
+) -> int:
+    budgets = _allocate_budgets({p: len(lines) for _, p, lines in group}, budget)
+    used_total = 0
+    for _, p, lines in group:
+        cap = budgets[p]
+        if cap <= 0:
+            continue
+        if len(lines) <= cap:
+            text, used = numbered(lines, 1, len(lines)), len(lines)
+        else:
+            text, used = _windowed_sibling(lines, lang_of(p.name), symbols, cap)
+        if text:
+            out.append({"file": str(p.relative_to(wt)), "source": text})
+            used_total += used
+    return used_total
 
 
 def sibling_tests(wt: Path, files: list[str], symbols: set[str]) -> list[dict[str, str]]:
-    """Sibling tests in rank order until the line budget is spent; unrelated tests are never included."""
-    out, budget, seen = [], MAX_SIBLING_LINES, set()
+    """Sibling tests in rank order, fairly budgeted across unique target directories; oversized rank 0/1/2 files
+    are emitted as compact windowed excerpts instead of being dropped, and unrelated tests are never included."""
+    file_set = {str(Path(f)) for f in files}
+    dir_stems: dict[Path, list[str]] = {}
     for f in files:
         d = (wt / f).parent
-        stem = Path(f).name.split(".")[0]
-        cands = sorted(d.glob("*_test.go")) + sorted(d.glob("*.test.ts*"))
-        ranked = sorted((sibling_rank(p, stem, symbols), p.name, p) for p in cands)
-        for rank, _, p in ranked:
-            if p in seen or rank == 9 or p.name.startswith("hunt_"):
+        if not d.is_dir():
+            continue
+        stems = dir_stems.setdefault(d, [])
+        for stem in (Path(f).stem, Path(f).name.split(".")[0]):
+            if stem and stem not in stems:
+                stems.append(stem)
+
+    dir_cands: dict[Path, list[tuple[int, Path, list[str]]]] = {}
+    dir_needs: dict[Path, int] = {}
+    for d, stems in dir_stems.items():
+        cands = sorted(p for p in d.iterdir()
+                       if not p.is_symlink() and p.is_file() and p.name.endswith(SIBLING_TEST_SUFFIXES)
+                       and not p.name.startswith("hunt_") and str(p.relative_to(wt)) not in file_set)
+        ranked: list[tuple[int, Path, list[str]]] = []
+        for p in cands:
+            rank = sibling_rank(p, stems, set())
+            if rank < 2:
+                lines = p.read_text(errors="replace").split("\n")
+            elif symbols:
+                body = p.read_text(errors="replace")
+                rank = sibling_rank(p, stems, symbols, body=body)
+                if rank == 9:
+                    continue
+                lines = body.split("\n")
+            else:
                 continue
-            lines = p.read_text(errors="replace").split("\n")
-            if len(lines) > budget:
-                continue
-            seen.add(p)
-            budget -= len(lines)
-            out.append({"file": str(p.relative_to(wt)), "source": numbered(lines, 1, len(lines))})
+            ranked.append((rank, p, lines))
+        ranked.sort(key=lambda item: (item[0], item[1].name))
+        if ranked:
+            dir_cands[d] = ranked
+            dir_needs[d] = sum(len(lines) for _, _, lines in ranked)
+
+    out: list[dict[str, str]] = []
+    dir_budgets = _allocate_budgets(dir_needs, MAX_SIBLING_LINES)
+    for d, ranked in dir_cands.items():
+        budget = dir_budgets[d]
+        primary = [item for item in ranked if item[0] <= 1]
+        secondary = [item for item in ranked if item[0] == 2]
+        used_total = _emit_sibling_group(wt, primary, budget, symbols, out)
+        rem = budget - used_total
+        if secondary and rem > 0 and (used_total == 0 or rem >= MIN_SIBLING_WINDOW):
+            sec_pool = secondary[:min(MAX_SECONDARY_SIBLINGS, max(1, rem // MIN_SIBLING_WINDOW))]
+            _emit_sibling_group(wt, sec_pool, rem, symbols, out)
     return out
 
 
@@ -261,10 +451,31 @@ def file_diffs(repo: Path, mb: str, head: str) -> list[prefilter.FileDiff]:
 
 
 # Outputs of an earlier hunt or batch. Left in place they would be reused (an old regenerated mutant, an old compile
-# log, old verdicts), so a new context removes them; prepare.json stays.
-STALE = ("A", "B", "D", "A2", "M", "M2", "R_*", "run_*", "base_*", "mutants_*", "compile_*", "fuzz_*", "diff_*", "ctx.json",
-         "state.json", "skipped.log")
-WHOLE_PR_STALE = ("old_tests.json", "old_tests.messages.json", "pr_tests.json", "pr_tests.messages.json")
+# log, old verdicts), so a new context removes them; prepare.json and whole-PR artifacts stay across batch switches.
+STALE = ("A", "B", "D", "A2", "M", "M2", "R_*", "run_A*", "run_B*", "run_D*", "base_A*", "base_B*", "base_D*",
+         "mutants_*", "compile_A*", "compile_B*", "compile_D*", "fuzz_*", "diff_*", "ctx.json", "state.json", "skipped.log")
+WHOLE_PR_STALE = ("old_tests.json", "old_tests.messages.json", "pr_tests.json", "pr_tests.messages.json",
+                  "R", "run_R*", "base_R*", "compile_R*", "review_verdicts.json", "batches")
+
+
+_BATCH_OUTPUTS = ("A/response.json", "B/response.json", "D/response.json", "A2/response.json",
+                  "run_A*.json", "run_B*.json", "diff_*.json", "mutants_*.json")
+
+
+def archive_batch(hdir: Path, batch_num: int) -> Path:
+    """Move completed batch-specific outputs into batches/batch_<N>/ so multi-batch hunts keep every batch's artifacts.
+    No-op when the active batch has no hunter outputs, and never overwrites an existing completed archive."""
+    dst = hdir / "batches" / f"batch_{batch_num}"
+    has_outputs = any(p for pat in _BATCH_OUTPUTS for p in hdir.glob(pat))
+    if not has_outputs:
+        return dst
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    for pattern in STALE:
+        for p in sorted(hdir.glob(pattern)):
+            shutil.move(str(p), str(dst / p.name))
+    return dst
 
 
 def reset_hunt_dir(hdir: Path, *, include_whole_pr: bool = False) -> None:
@@ -598,7 +809,7 @@ def neighbours_and_base(wt: Path, wt_base: Path, files: list[str], patches: dict
     return neigh, base
 
 
-def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
+def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any], *, all_batches: bool = False) -> dict[str, Any]:
     repo, wt, mb, head = Path(prep["repo"]), Path(prep["wt"]), prep["merge_base"], prep["head"]
     diffs = file_diffs(repo, mb, head)
     for f in diffs:
@@ -608,12 +819,30 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> di
     deleted = git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=D", mb, head).splitlines()
     plan.skipped += [(path, "deleted") for path in deleted]
     hdir = Path(prep.get("hunt_dir") or hunt_dir(pr))
-    reset_hunt_dir(hdir)
-    (hdir / "skipped.log").write_text("\n".join(prefilter.describe(plan, batch)) + "\n")
+    hdir.mkdir(parents=True, exist_ok=True)
     if not plan.batches:
+        reset_hunt_dir(hdir)
+        (hdir / "skipped.log").write_text("\n".join(prefilter.describe(plan, batch)) + "\n")
         raise InfraError("prefilter left no source files to hunt (see skipped.log)")
     if not 1 <= batch <= len(plan.batches):
         raise InfraError(f"batch {batch} requested; batches are 1..{len(plan.batches)}")
+    prev_state_path = hdir / "state.json"
+    head_changed = False
+    if prev_state_path.exists():
+        try:
+            prev = json.loads(prev_state_path.read_text())
+        except (OSError, ValueError):
+            prev = {}
+        prev_head = prev.get("head")
+        prev_batch = prev.get("batch")
+        if prev_head and prev_head != head:
+            head_changed = True
+        elif prev_head == head:
+            all_batches = all_batches or bool(prev.get("all_batches"))
+            if isinstance(prev_batch, int) and prev_batch != batch:
+                archive_batch(hdir, prev_batch)
+    reset_hunt_dir(hdir, include_whole_pr=head_changed)
+    (hdir / "skipped.log").write_text("\n".join(prefilter.describe(plan, batch)) + "\n")
     chosen = plan.batches[batch - 1]
     files = [f.path for f in chosen]
     patches = {f.path: "\n".join(f.patch.splitlines()[:prefilter.MAX_LINES + 20]) for f in chosen}
@@ -639,9 +868,10 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any]) -> di
     }
     ctx["neighbors_same_file"], ctx["changed_functions_base_source"] = neighbours_and_base(
         wt, Path(prep["wt_base"]), files, {f.path: f.patch for f in chosen}, set(all_changed))
-    state = {"pr": pr, "batch": batch, "batches": len(plan.batches), "repo": str(repo), "wt": str(wt),
-             "wt_base": prep["wt_base"], "merge_base": mb, "head": head, "changed": files, "targets": targets,
-             "own_tests": own_tests(repo, mb, head, {t["dir"] for t in targets})}
+    state = {"pr": pr, "batch": batch, "batches": len(plan.batches), "all_batches": all_batches,
+             "batch_plan": [[f.path for f in b] for b in plan.batches],
+             "repo": str(repo), "wt": str(wt), "wt_base": prep["wt_base"], "merge_base": mb, "head": head,
+             "changed": files, "targets": targets, "own_tests": own_tests(repo, mb, head, {t["dir"] for t in targets})}
     write_json(hdir / "ctx.json", ctx)
     write_json(hdir / "state.json", state)
     return state
@@ -658,8 +888,12 @@ def range_meta(repo: Path, mb: str, head: str, base_spec: str, head_spec: str) -
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("pr")
-    ap.add_argument("--batch", type=int, default=1)
+    grp = ap.add_mutually_exclusive_group()
+    grp.add_argument("--batch", type=int, default=None)
+    grp.add_argument("--all-batches", action="store_true",
+                     help="build batch 1 and print all batches (subsequent --batch N calls archive prior batches)")
     a = ap.parse_args()
+    batch = 1 if a.batch is None else a.batch
     with hunt_lock(hunt_dir(a.pr), a.pr):  # never rewrite state.json under a running run.py, nor read a half-made prep
         prep_path = hunt_dir(a.pr) / "prepare.json"
         if not prep_path.exists():
@@ -671,11 +905,15 @@ def main() -> None:
             meta = json.loads(sh(["gh", "api", f"repos/{REPO}/pulls/{a.pr}"], Path(".")).stdout)
             if meta.get("draft"):
                 print(f"note: PR #{a.pr} is a draft")
-        st = build(a.pr, a.batch, prep, meta)
+        st = build(a.pr, batch, prep, meta, all_batches=a.all_batches)
     ctx = json.loads((hunt_dir(a.pr) / "ctx.json").read_text())
     print(f"batch {st['batch']}/{st['batches']}: {len(st['changed'])} files, {len(ctx['callers'])} caller excerpts, "
           f"{len(ctx['sibling_tests_and_helpers'])} sibling test files, {len(ctx['neighbors_same_file'])} neighbour and "
           f"{len(ctx['changed_functions_base_source'])} merge-base functions; skipped.log has the rest")
+    if a.all_batches and st["batches"] > 1:
+        print(f"all-batches plan ({st['batches']} batches; run --batch 2..{st['batches']} after batch 1):")
+        for idx, bfiles in enumerate(st["batch_plan"], 1):
+            print(f"  batch {idx}: {', '.join(bfiles)}")
 
 
 if __name__ == "__main__":

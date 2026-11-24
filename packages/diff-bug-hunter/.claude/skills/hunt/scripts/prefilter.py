@@ -43,9 +43,10 @@ RISK: list[tuple[str, int]] = [
     (r"sanitiz|escape|parse|unmarshal|decode|regexp|validate|isvalid|upload|ssrf|markdown|html|signature|hmac", 9),
     (r"/api4/|/wsapi/|websocket|/plugin/|/web/|webhook|handler|router|http\.", 8),
     (r"sync\.|go func|atomic\.|mutex|lock\(|chan |select \{|cache|cluster|job|queue", 7),
+    (r"/public/model/", 6),
     (r"config|featureflag|audit|license", 5),
     (r"reducer|actions?/|selectors?/|dispatch\(", 4),
-    (r"/app/|/platform/", 3),
+    (r"/app/|/platform/|/cmd/mmctl/|/src/components/|/src/utils/", 3),
 ]
 
 

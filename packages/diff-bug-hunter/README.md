@@ -11,9 +11,16 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
 ## /hunt
 
 - **Mode A (caller invariants):** blind subagents infer what callers rely on and write property tests.
-  Every invariant must be backed by at least 3 `file:line` references: callers, or neighbours that apply the same guard
-  (S1 below). Go tests run with `-race`.
+  Every invariant must be backed by concrete `file:line` references from callers, neighbours applying the same guard (S1),
+  base code (S4), `pr_tests_diff`, or triggered `RELIABILITY.md` rules (preferring 2-3 callers when present, while allowing
+  1-2 citations on low-fan-in code; empty responses get one retry round). Go tests run with `-race`.
 - **Mode B (PR-promise falsifier):** tests that try to break each claim in the PR description.
+- **Mode R (CodeRabbit review-claim verifier, in parallel with A/B/D):** fetches CodeRabbit-only PR review threads via
+  GraphQL using the 2x2 `(isResolved, isOutdated)` filter (always include `!isOutdated` regardless of `isResolved`, skip
+  `isResolved && isOutdated`, include `!isResolved && isOutdated` only for `Critical`/`Major`), spans the whole PR
+  including deferred batches and test-anchored claims, treats every comment as an untrusted claim to synthesize a targeted
+  test for, vets failures 3/3 + merge-base, and resolves deterministic per-thread verdicts (`PROVEN` / `DISPROVEN` /
+  `UNPROVABLE_DYNAMICALLY`).
 - **Strategies** (`prompts/strategy_x.md`, first-pass hunters only):
   - **S1 sibling guards (Mode A):** checks that unchanged nearby functions apply but the new code skips. Neighbours
     come from the same file, topped up from tracked files in the same directory.
@@ -28,7 +35,7 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
   code and callers. When a claim changes behaviour callers already relied on, Mode B also writes the caller-side test of
   the old contract (`source`: "claim vs caller contract").
 - **Property shapes (Mode A):** round-trip, idempotence, no-panic, monotonic, and properties lifted from the PR's own
-  example tests (`pr_tests_diff` in `ctx.json`). One of the 3 required citations may be a doc comment or a PR test.
+  example tests (`pr_tests_diff` in `ctx.json`).
 - **Changed-line coverage:** `run.py cover` runs each Mode A test alone with coverage. A test that reaches none of
   the changed lines is `VACUOUS`, dropped from the report and from mutant kills; the report shows "X/Y reached".
 - **Go fuzzing (default on):** pure `FuzzHuntA_` targets are fuzzed inside `run.py run <pr> A`. A failing input is
@@ -44,7 +51,9 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
   and passes 3/3 on base. Each is a behaviour change the report sets against the PR description: "unexplained" if
   not announced, "breaks existing data/callers" even if announced.
 - **PR's own tests (no model):** `pr_tests.py` runs the Go tests the PR adds or edits 3x with
-  `ENABLE_FULLY_PARALLEL_TESTS=true`: `PR_TEST_FAILS_UNDER_CI`, `PR_TEST_FAILS`, `FLAKY` or `PASS`.
+  `ENABLE_FULLY_PARALLEL_TESTS=true`, `-parallel` capped to 2 (`HUNT_PR_TEST_PARALLEL`, min 2) and serialized with a
+  host-level Postgres pool lock to prevent `MakeSqlSettings` connection exhaustion: `PR_TEST_FAILS_UNDER_CI`,
+  `PR_TEST_FAILS`, `FLAKY`, `NOT_RUN`, or `PASS`.
 - **Vetting:** each failure must reproduce 3/3. It is root-caused against `lessons.jsonl` (known false positives),
   run on the merge-base (**New PR Bug** vs **Pre-Existing Bug**; `NEW_API` = fails 3/3 on head and cannot compile
   on base because it calls an API the PR adds: root-cause it, not a bug by itself; compile failures are salvaged per test), and checked for caller reachability.
@@ -53,41 +62,32 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
   - 3 visible plus 2 held-out mutants, each compile-checked (`go test -c`, single-file Babel parse).
   - One strengthen round if a visible mutant survives.
   - The PR's own tests are scored for comparison. The mutation table is the proof that the kept tests catch bugs.
-- **Mattermost invariants:** `RELIABILITY.md` holds 10 diff-triggered rules (guest isolation, cross-team and private
+- **Mattermost invariants:** `RELIABILITY.md` holds 11 diff-triggered rules (guest isolation, cross-team and private
   channel boundaries, ClientConfig hash, WebSocket payloads, mention/HTML/NUL sanitization, store atomicity,
-  migrations, concurrency, React async forms, selector memoization). Only rules whose path globs or diff regex match
-  the change reach Mode A.
-- **Large-diff guard:** lockfiles, generated code, snapshots, i18n and existing tests are skipped. The rest is
-  ranked by risk and hunted in batches of at most 5 files / 800 diff lines; `skipped.log` lists the rest.
+  migrations, concurrency, React async forms, selector memoization, primary reads via `RequestContextWithMaster`). Only
+  rules whose path globs or diff regex match the change reach Mode A.
+- **Large-diff guard & `--all-batches`:** lockfiles, generated code, snapshots, i18n and existing tests are skipped. The
+  rest is ranked by risk and hunted in batches of at most 5 files / 800 diff lines (`--all-batches` hunts every batch
+  sequentially, archiving prior batches under `batches/batch_<N>/`); `skipped.log` lists the rest.
+- **3-tier confidence verdict:** reports end with `Bug Proven`, `Partial or Unverified Coverage` (listing every deferred
+  batch, `EMPTY` hunter, `NOT_RUN`, or `UNPROVABLE_DYNAMICALLY` claim), or `High-Confidence Clean`.
 - **Restart safety:** `prepare.py` will not wipe a hunt that already has results for the PR's current head (`ALREADY_HUNTED`,
   exit 4), so a restarted session resumes instead of paying for the hunters again. `--fresh` starts over.
 - **Resource discipline:** `prepare.py` and every Go `-race` run stop with `INFRA_ERROR` when less than 2 GiB is free
   under `HUNT_SCRATCH`. Flaky tests are reported as `FLAKY` (3 runs), never retried or slept around.
 
-### Measuring /hunt on real reverts
+### Measuring `/hunt` on real bugs and self-improvement loop
 
-`scripts/eval_reverts.py eval/revert_cases.json --repo <full mattermost clone> --dispatch '<cmd>'` hunts commits that
-Mattermost later reverted, plus size-matched clean commits from the same area, exactly as it hunts a PR (head = the
-commit, base = its parent, every batch, Modes A, B and D, 3/3 runs, base vetting, `old_tests` and `pr_tests`; select
-a subset with `--signals hunters,diff,old,pr`). Hunters see only the commit's own
-message; the ground-truth `bug` sentence, quoted from the revert PR, is never shown to them. `--dispatch` runs
-`<cmd> <request.json>` for each hunter request (a headless Claude Code call that follows `dispatch.md`); an entry may
-instead name recorded `responses`. The scorecard reports raw recall (any test fails 3/3), post-vetting recall
-(`NEW_PR_BUG`) and the false-positive rate on controls, and the run fails below the manifest's thresholds. The
-manifest is refused unless each `fix_sha` says it reverts its `bug_sha`. `make self-test` runs the scorer on two
-local git histories (a bug with its revert, and a clean change).
-
-### Growing the rules from reverts
-
-- `scripts/mine_rules.py <repo> [-n 30]` reads the last 30 reverts (subjects starting `Revert "`), groups their
-  changed source files by directory, and prints a candidate `RELIABILITY.md` rule for every directory reverted at least
-  twice, with the identifiers those reverts share as its diff trigger. It never edits a rules file: a person writes
-  the invariant and probe and lands the rule on the base branch.
-- `scripts/lessons.py prune [--write]` lists lessons to retire: over-broad path globs (fewer than two fixed
-  directories, such as `server/*`), and lessons with no match in the last 30 hunts logged in
-  `$HUNT_SCRATCH/lessons_hits.jsonl` (written by `build_requests.py hunters`; fewer than 30 logged hunts retire
-  nothing for lack of matches). `--write` appends `{"retire": ...}` lines; like any lesson change they apply once
-  merged.
+- `scripts/eval_bugs.py eval/bugs_2026.json --repo <full mattermost clone> [--signals hunters,diff,old,pr,review] [--skip-missing]`
+  (extending `scripts/eval_reverts.py` / `eval/revert_cases.json`) evaluates `/hunt` across reverts, `v12.x` RC
+  hotfixes, pre-merge review regressions, and clean controls, tracking regression locks (`lock: true`).
+- `scripts/eval_bugs.py diff <baseline_scorecard.json> <candidate_scorecard.json>` enforces a monotonic quality gate
+  before prompt/rule edits merge (`cand.vetted_recall >= base.vetted_recall`, bounded FP rate, 0 lock regressions).
+- `scripts/ledger.py record <pr>` appends compact telemetry to `$HUNT_SCRATCH/hunt_ledger.jsonl` and automatically
+  exports verified false-negative bundles into `escapes/` whenever Mode R proves a bug that Modes A/B/D missed.
+- `scripts/mine_rules.py <repo> [-n 30]` proposes candidate `RELIABILITY.md` rules from reverts without mutating rules.
+- `scripts/lessons.py prune [--write]` retires unused or over-broad globs (including 2-segment monorepo roots such as
+  `server/channels/*`); multi-batch hunts of the same target collapse to a single entry in `$HUNT_SCRATCH/lessons_hits.jsonl`.
 
 Hunters and mutant planters only ever see a request file built by `scripts/`; deterministic logic lives in tested
 Python, not in prose. Results are reported in chat. Nothing is posted to GitHub.
@@ -127,6 +127,7 @@ is installed locally, `scripts/start_pg.sh` starts a throwaway cluster; on macOS
 | `HUNT_TRUSTED_REF` | merge-base with `origin/main` | where rules are read from (`worktree` = disk) |
 | `HUNT_FUZZ` | on | `0` disables Go fuzzing in `run.py run <pr> A` |
 | `HUNT_FUZZ_TIME` | `60s` | `-fuzztime` per fuzz target |
+| `HUNT_PR_TEST_PARALLEL` | `2` | `-parallel` cap for `pr_tests.py` (min `2`) |
 
 ## /verify
 
@@ -236,7 +237,7 @@ those `node_modules` unless the PR changes `package-lock.json`.
 
 ## CI integration
 
-Package self-test: 255 tests (pytest), run by this repository's `.github/workflows/diff-bug-hunter.yml` when
+Package self-test: the full pytest suite (`pytest -q tests`), run by this repository's `.github/workflows/diff-bug-hunter.yml` when
 `packages/diff-bug-hunter/` changes. The /verify tests need the Chromium build that matches the pinned Playwright, installed from the fixture
 directory:
 
@@ -295,18 +296,19 @@ jobs:
 ```text
 .claude/skills/hunt/
   SKILL.md           the workflow, one script call per step
-  RELIABILITY.md     10 diff-triggered Mattermost invariants (Mode A only)
+  RELIABILITY.md     11 diff-triggered Mattermost invariants (Mode A only)
   dispatch.md        the fixed prompt every blind subagent gets
   lessons.jsonl      append-only vetted false-positive patterns (top 5 injected into hunter prompts)
-  prompts/           Mode A/B/D, strategies (S1-S4), fuzz, language rules, repair, mutant and strengthen prompts
+  prompts/           Mode A/B/D/R, strategies (S1-S4), fuzz, language rules, repair, retry-empty, mutant and strengthen prompts
   scripts/           hunt_common.py, trusted.py, prepare.py, ctx.py (+ prefilter.py), build_requests.py,
-                     reliability.py, run.py, old_tests.py, pr_tests.py, lessons.py, mine_rules.py,
-                     mine_controls.py, eval_reverts.py, start_pg.sh
+                     review_threads.py, reliability.py, run.py, old_tests.py, pr_tests.py, lessons.py, ledger.py,
+                     mine_rules.py, mine_controls.py, eval_reverts.py, eval_bugs.py, start_pg.sh
 .claude/skills/verify/
   SKILL.md           plan, run, iterate (at most 3 runs), report
   scripts/verify_ui.mjs, pr_server.py
 scripts/install-skill.sh
 eval/revert_cases.json  real Mattermost reverts (bug_sha, fix_sha, area, quoted reason) and size-matched controls
+eval/bugs_2026.json     2026 RC hotfix pairs, session PR regression locks/misses, and clean controls
 tests/               self-test: /hunt fixtures (Go bug, React bug, clean control), trusted rules, RELIABILITY
                      triggers, prefilter, lessons, rule mining, the revert benchmark, installer, and verify_ui.mjs
                      against a local fixture server

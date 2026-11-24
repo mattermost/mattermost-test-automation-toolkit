@@ -693,7 +693,7 @@ def test_rules_come_from_base_branch_not_pr_head(tmp_path, monkeypatch):
     assert (skill / "lessons.jsonl").read_text() == ""  # what the PR head has on disk
     base_lessons = trusted.read("lessons.jsonl", skill)
     assert "Setup(t) stale client config" in base_lessons
-    assert len(reliability.parse(trusted.read("RELIABILITY.md", skill))) == 10
+    assert len(reliability.parse(trusted.read("RELIABILITY.md", skill))) == 11
     with pytest.raises(trusted.InfraError, match="RELIABILITY.md"):
         trusted.check(skill)
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
@@ -734,14 +734,20 @@ def _ctx(files: list[str], diff: str) -> dict:
 def test_reliability_rules_parse_and_trigger_only_on_matching_diffs(monkeypatch):
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
     rules = reliability.load()
-    assert [r.id for r in rules] == [f"R{i:02d}" for i in range(1, 11)]
+    assert [r.id for r in rules] == [f"R{i:02d}" for i in range(1, 12)]
     ids = lambda c: [r.id for r in reliability.match(c, rules)]  # noqa: E731
     assert ids(_ctx(["server/channels/app/platform/config.go"], "+\tps.regenerateClientConfig()")) == ["R03"]
     assert ids(_ctx(["webapp/channels/src/selectors/views/foo.ts"], "+export const getX = createSelector(")) == ["R10"]
     assert "R08" in ids(_ctx(["server/public/model/x.go"], "+\tgo func() {"))
     assert ids(_ctx(["server/public/model/x.go"], "+\tx := 1")) == []  # R08 is diff-triggered only
     assert ids(_ctx(["server/channels/db/migrations/postgres/000150_x.up.sql"], "+ALTER TABLE Posts")) == ["R07"]
-    assert ids(_ctx(["README.md"], "-\tgo func() {")) == ["R08"]  # removed lines count too
+    assert ids(_ctx(["server/public/model/x.go"], "-\tgo func() {")) == ["R08"]  # removed lines count too
+    assert ids(_ctx(["README.md"], "-\tgo func() {")) == []  # R08 is Go-only (lang: go)
+    assert ids(_ctx(["webapp/channels/src/foo.ts"], "-\tgo func() {")) == []
+    assert ids(_ctx(["server/channels/app/property_field.go"],
+                    "+\tif dropsOptions(f, existingByID[f.ID], updatedByID[f.ID]) {\n+\t\ta.refreshAttributeViews(rctx)\n")) == ["R11"]
+    assert ids(_ctx(["server/channels/api4/properties.go"],
+                    "+\tfield, err := c.App.GetPropertyField(RequestContextWithMaster(rctx), id)")) == ["R11"]
 
 
 def test_reliability_rules_go_to_mode_a_only(monkeypatch):
@@ -2203,7 +2209,9 @@ def test_lessons_prune_is_deterministic_and_append_only(tmp_path):
     log.append({"run": "0/1", "matched": []})  # a re-run of hunt 0 counts once, with its latest result
     out = lessons.prune(lessons_, log, window=30)
     assert [r["retire"] for r in out] == ["L002", "L003"] and "no match in the last 30" in out[1]["reason"]
-    assert [lessons.overbroad(g) for g in ("*", "**", "server/*", "webapp/**/*.ts", "server/channels/*")] == [True] * 4 + [False]
+    assert [lessons.overbroad(g) for g in (
+        "*", "**", "server/*", "webapp/**/*.ts", "server/channels/*", "server/channels/app/*",
+    )] == [True] * 5 + [False]
     # retirements are append-only lines: load() drops the retired lesson, ids are never reused
     f = tmp_path / "lessons.jsonl"
     f.write_text("".join(json.dumps(x) + "\n" for x in lessons_) + json.dumps(out[0]) + "\n")
@@ -2218,7 +2226,7 @@ def test_hunters_log_which_lessons_they_were_shown(tmp_path, monkeypatch):
     monkeypatch.setattr(build_requests, "hunt_dir", lambda pr: hdir)
     build_requests.main("1", "hunters")
     lines = [json.loads(x) for x in lessons.hits_log().read_text().splitlines()]
-    assert lines == [{"run": "1/1", "matched": lines[0]["matched"]}] and isinstance(lines[0]["matched"], list)
+    assert lines == [{"run": "1", "matched": lines[0]["matched"]}] and isinstance(lines[0]["matched"], list)
 
 
 # ------------------------------------------------------------------ Phase 2: revert-to-rule miner
@@ -2255,7 +2263,7 @@ def test_mine_rules_proposes_parseable_candidates_and_writes_nothing(tmp_path, c
     out = capsys.readouterr().out
     assert rules.read_text() == before  # never edits the rules
     parsed = reliability.parse(out)
-    assert [r.id for r in parsed] == ["R11"]  # numbered after R10; the webapp glob was reverted only once
+    assert [r.id for r in parsed] == ["R12"]  # numbered after R11; the webapp glob was reverted only once
     assert parsed[0].paths == ["server/channels/app/platform/*"]
     assert parsed[0].diff.search("+ BroadcastHook()") and parsed[0].diff.search("+ sendQueue")
     assert "Reverted 2 times" in out and 'Revert "change 0"' in out and "CANDIDATE" in parsed[0].invariant
@@ -2422,7 +2430,7 @@ def test_unstaging_the_skill_does_not_make_it_a_local_install(tmp_path, monkeypa
     (skill / "RELIABILITY.md").write_text("# weakened on disk\n")
     with pytest.raises(trusted.InfraError):
         trusted.check(skill)
-    assert len(reliability.parse(trusted.read("RELIABILITY.md", skill))) == 10  # the base copy, never the disk
+    assert len(reliability.parse(trusted.read("RELIABILITY.md", skill))) == 11  # the base copy, never the disk
 
 
 def test_place_cleans_up_when_terminated_mid_write(tmp_path, monkeypatch):

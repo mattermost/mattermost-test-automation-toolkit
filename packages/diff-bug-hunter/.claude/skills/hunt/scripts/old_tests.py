@@ -50,6 +50,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import prefilter
 from ctx import is_generated, top_blocks
 from hunt_common import InfraError, git, git_cmd, hunt_dir, hunt_lock, read_state, sh, under, write_json
 from run import PACKAGE_FAILED, CompileError, Outcome, classify, ensure_clean, go_root, go_run, jest_run
@@ -357,6 +358,35 @@ def _run_unit(wt: Path, wt_base: Path, unit: dict[str, Any], swap: Swap,
     return table, msgs
 
 
+def _dir_prod_risk(repo: Path, mb: str, head: str, target_dirs: set[str]) -> dict[str, float]:
+    """Max changed non-test source file risk per directory in `target_dirs`, for ranking overflow units."""
+    if not target_dirs:
+        return {}
+    by_dir: dict[str, float] = {}
+    for line in git(repo, "diff", "--numstat", "--no-renames", mb, head).splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        add_s, rem_s, path = parts
+        d = str(Path(path).parent)
+        if d not in target_dirs or prefilter.excluded(path) or not (add_s.isdigit() and rem_s.isdigit()):
+            continue
+        patch = git(repo, "diff", mb, head, "--", path, check=False)
+        r = prefilter.risk(prefilter.FileDiff(path, int(add_s), int(rem_s), patch))
+        by_dir[d] = max(by_dir.get(d, 0.0), r)
+    return by_dir
+
+
+def _balance_units(go_list: list[dict[str, Any]], jest_list: list[dict[str, Any]],
+                   cap: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Water-fill `cap` evenly across Go and Jest so Go packages cannot starve Jest specs on releases."""
+    go_cap = max(cap // 2, cap - len(jest_list))
+    chosen_go = go_list[:go_cap]
+    jest_cap = max(0, cap - len(chosen_go))
+    chosen_jest = jest_list[:jest_cap]
+    return chosen_go + chosen_jest, go_list[go_cap:] + jest_list[jest_cap:]
+
+
 def plan(repo: Path, mb: str, head: str) -> tuple[list[dict[str, Any]], list[str]]:
     """Units to run and what was left out, each as "<path or key> (reason)"."""
     files = edited_tests(repo, mb, head)
@@ -399,14 +429,22 @@ def plan(repo: Path, mb: str, head: str) -> tuple[list[dict[str, Any]], list[str
             u["tests"] |= set(callers)
             u["callers"] = sorted(set(u["callers"]) | set(callers.values()))
             u["swap"] += [(p, st) for p, st, _ in items if (p, st) not in u["swap"]]
-    units: list[dict[str, Any]] = [{**u, "tests": sorted(u["tests"])} for _, u in sorted(go_units.items())]
-    for path, status in files.items():
+    jest_list: list[dict[str, Any]] = []
+    for path, status in sorted(files.items()):
         if JEST_TEST.search(path) and status in "MD":
             snap = str(Path(path).parent / "__snapshots__" / f"{Path(path).name}.snap")
             swap = [(path, status)] + ([(snap, files[snap])] if snap in files else [])
-            units.append({"lang": "jest", "key": path, "file": path, "tests": [], "swap": swap})
-    skipped += [f"{u['key']} (over {MAX_UNITS} units)" for u in units[MAX_UNITS:]]
-    return units[:MAX_UNITS], skipped
+            jest_list.append({"lang": "jest", "key": path, "file": path, "tests": [], "swap": swap})
+    target_dirs = set(go_units) | {str(Path(u["file"]).parent) for u in jest_list}
+    risk_by_dir = _dir_prod_risk(repo, mb, head, target_dirs)
+    go_list = sorted(
+        ({**u, "tests": sorted(u["tests"])} for u in go_units.values()),
+        key=lambda u: (-risk_by_dir.get(u["dir"], 0.0), u["key"]),
+    )
+    jest_list.sort(key=lambda u: (-risk_by_dir.get(str(Path(u["file"]).parent), 0.0), u["key"]))
+    units, overflow = _balance_units(go_list, jest_list, MAX_UNITS)
+    skipped += [f"{u['key']} (over {MAX_UNITS} units)" for u in overflow]
+    return units, skipped
 
 
 def cmd_old(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:

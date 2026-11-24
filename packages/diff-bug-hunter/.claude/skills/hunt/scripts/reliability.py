@@ -30,6 +30,12 @@ import trusted
 
 HEADER = re.compile(r"^## (R\d+) (.+)$")
 FIELDS = ("paths", "diff", "invariant", "probe")
+OPT_FIELDS = ("lang",)
+LANG_EXTS: dict[str, tuple[str, ...]] = {
+    "go": (".go",),
+    "jest": (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"),
+}
+_DIFF_GIT = re.compile(r'^diff --git (?:"a/[^"]+"|a/\S+) (?:"b/([^"]+)"|b/(.+))$')
 
 
 @dataclass
@@ -40,6 +46,7 @@ class Rule:
     diff: re.Pattern[str]
     invariant: str
     probe: str
+    langs: tuple[str, ...] = ()
 
 
 def parse(text: str) -> list[Rule]:
@@ -52,8 +59,12 @@ def parse(text: str) -> list[Rule]:
         missing = [f for f in FIELDS if not cur.get(f)]
         if missing:
             raise ValueError(f"RELIABILITY.md {cur['id']}: missing {missing}")
+        raw_langs = [x.strip().lower() for x in cur.get("lang", "").split(",") if x.strip() not in ("", "-")]
+        bad_langs = [x for x in raw_langs if x not in LANG_EXTS]
+        if bad_langs:
+            raise ValueError(f"RELIABILITY.md {cur['id']}: unknown lang {bad_langs}")
         rules.append(Rule(cur["id"], cur["title"], [g.strip() for g in cur["paths"].split(",") if g.strip() not in ("", "-")],
-                          re.compile(cur["diff"], re.I), cur["invariant"], cur["probe"]))
+                          re.compile(cur["diff"], re.I), cur["invariant"], cur["probe"], tuple(raw_langs)))
 
     for line in text.splitlines():
         m = HEADER.match(line)
@@ -62,7 +73,7 @@ def parse(text: str) -> list[Rule]:
             cur = {"id": m.group(1), "title": m.group(2).strip()}
         elif cur and ":" in line:
             key, _, val = line.partition(":")
-            if key.strip() in FIELDS:
+            if key.strip() in (*FIELDS, *OPT_FIELDS):
                 cur[key.strip()] = val.strip()
     flush()
     return rules
@@ -77,6 +88,45 @@ def changed_lines(diff: str) -> str:
                      if line[:1] in "+-" and not line.startswith(("+++", "---")))
 
 
+def _file_lang(path: str) -> str | None:
+    low = path.lower()
+    for lang, exts in LANG_EXTS.items():
+        if low.endswith(exts):
+            return lang
+    return None
+
+
+def _diff_path(raw: str) -> str:
+    p = raw.strip().split("\t", 1)[0]
+    if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+        p = p[1:-1]
+    return p[2:] if p.startswith(("a/", "b/")) else p
+
+
+def _changed_lines_by_lang(diff: str) -> dict[str, str]:
+    by_lang: dict[str, list[str]] = {}
+    cur = ""  # "" = unscoped synthetic diff without file headers
+    in_hunk = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            in_hunk = False
+            m = _DIFF_GIT.match(line)
+            path = (m.group(1) or m.group(2)) if m else ""
+            cur = (_file_lang(path) or "other") if path else "other"
+        elif line.startswith("@@ "):
+            in_hunk = True
+        elif not in_hunk and line.startswith("--- "):
+            raw = line[4:]
+            cur = "other" if raw.strip() == "/dev/null" else (_file_lang(_diff_path(raw)) or "other")
+        elif not in_hunk and line.startswith("+++ "):
+            raw = line[4:]
+            if raw.strip() != "/dev/null":
+                cur = _file_lang(_diff_path(raw)) or "other"
+        elif line[:1] in "+-" and (in_hunk or not line.startswith(("+++", "---"))):
+            by_lang.setdefault(cur, []).append(line[1:])
+    return {k: "\n".join(v) for k, v in by_lang.items()}
+
+
 def _glob(path: str, pattern: str) -> bool:
     # '**' crosses directories; fnmatch's '*' already does, so '**/' only has to allow zero directories too.
     return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path, pattern.replace("**/", ""))
@@ -84,17 +134,33 @@ def _glob(path: str, pattern: str) -> bool:
 
 def match(ctx: dict[str, Any], rules: list[Rule] | None = None) -> list[Rule]:
     rules = load() if rules is None else rules
-    files = [c["file"] for c in ctx.get("changed_files_head_source", [])] + list(ctx.get("all_changed_files", []))
-    lines = changed_lines(ctx.get("diff_production_code", ""))
-    return [r for r in rules if any(_glob(f, g) for f in files for g in r.paths) or r.diff.search(lines)]
+    source_files = [c["file"] for c in ctx.get("changed_files_head_source", [])]
+    all_files = source_files + list(ctx.get("all_changed_files", []))
+    batch_langs = {lang for f in source_files if (lang := _file_lang(f))}
+    diff = ctx.get("diff_production_code", "")
+    all_lines = changed_lines(diff)
+    by_lang = _changed_lines_by_lang(diff)
+    out: list[Rule] = []
+    for r in rules:
+        if r.langs:
+            if not any(lang in batch_langs for lang in r.langs):
+                continue
+            path_files = [f for f in all_files if _file_lang(f) in r.langs]
+            lines = "\n".join(by_lang[k] for k in (*r.langs, "") if k in by_lang)
+        else:
+            path_files = all_files
+            lines = all_lines
+        if any(_glob(f, g) for f in path_files for g in r.paths) or r.diff.search(lines):
+            out.append(r)
+    return out
 
 
 def render(matched: list[Rule]) -> str:
     if not matched:
         return ""
     rows = "\n".join(f"- {r.id} {r.title}: {r.invariant} Probe: {r.probe}" for r in matched)
-    return ("\nMattermost reliability invariants triggered by this diff. Test those the callers confirm "
-            "(each still needs 3 caller citations):\n" + rows + "\n")
+    return ("\nMattermost reliability invariants triggered by this diff. Test those applicable to the changed code "
+            "(cite the rule ID plus the diff/caller/neighbour file:line):\n" + rows + "\n")
 
 
 if __name__ == "__main__":

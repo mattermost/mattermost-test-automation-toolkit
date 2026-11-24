@@ -1,7 +1,7 @@
 ---
 name: hunt
-description: Blind Mode A (caller invariants), Mode B (PR/release-promise falsifier) and Mode D (differential recorders) bug hunt on one mattermost/mattermost PR or release/commit range, with merge-base vetting and an opt-in (--mutants) compile-verified mutation gate. Use when asked to hunt, bug-hunt or falsify a Mattermost PR or release diff.
-argument-hint: <pr_number | base...head> [--batch N] [--mutants]
+description: Blind Mode A (caller invariants), Mode B (PR/release-promise falsifier), Mode D (differential recorders), and parallel Mode R (CodeRabbit review-claim verifier) bug hunt on one mattermost/mattermost PR or release/commit range, with merge-base vetting and an opt-in (--mutants) compile-verified mutation gate. Use when asked to hunt, bug-hunt or falsify a Mattermost PR or release diff.
+argument-hint: <pr_number | base...head> [--batch N | --all-batches] [--mutants]
 ---
 
 Hunt `$ARGUMENTS`. Target `<target>` is either a PR number (`40260`) or a git branch/tag/commit range (`release-11...release-12`, `release-12.0.0-rc1...release-12.1.0-rc3`, `base..head`; strip spaces around `..`/`...` so it is one shell argument). Scripts are in `scripts/` next to this file; run them with `cd <this dir>/scripts && python3 <script>`.
@@ -25,10 +25,15 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
    If the PR touches `webapp/` or a server API a page calls and `../../verify/scripts/pr_server.py` is installed, also start
    `python3 ../../verify/scripts/pr_server.py images <pr> --pull` (from `scripts/`) in the background now and check it
    printed the two image tags: the images for a `/verify` check are then pulled while the hunters work.
-2. **Context:** `ctx.py <pr> [--batch N]`. Quote its batch line. `skipped.log` lists every file not hunted; mention the
-   deferred batches in the report and hunt them only if the user asks.
-3. **Hunters (A, B and D in parallel):** `build_requests.py <pr> hunters && build_requests.py <pr> diff`, then dispatch
-   `A/request.json`, `B/request.json` and `D/request.json` in parallel.
+2. **Context:** `ctx.py <pr> [--batch N | --all-batches]`. Quote its batch line. `skipped.log` lists every file not hunted.
+   With `--all-batches`, hunt every batch `1..N` sequentially through steps 3-5 (`ctx.py <pr> --batch 2`, ... after finishing
+   batch 1; each batch switch automatically archives the previous batch's artifacts under `batches/batch_<k>/` while
+   preserving whole-PR outputs `R/`, `old_tests.*`, and `pr_tests.*`). Without `--all-batches`, mention deferred batches in
+   the report (deferred batches degrade step 7's confidence tier to `Partial or Unverified Coverage`).
+3. **Hunters (A, B, D and R in parallel):** `build_requests.py <pr> hunters && build_requests.py <pr> diff`, plus (once per
+   PR, on batch 1 only) `build_requests.py <pr> review`. Then dispatch `A/request.json`, `B/request.json`, `D/request.json`,
+   and `R/request.json` (when written; skipped automatically for range targets or PRs with 0 qualifying CodeRabbit threads)
+   in parallel.
    Modes A and B also get `prompts/strategy_x.md` (Mode A: S1 sibling guards, S2 adversarial callers and props, S4 existing-data compatibility; Mode B: S3
    merge-base differential) and the context it reads: `neighbors_same_file` (unchanged functions near the change, from
    the same file, topped up from the same directory) and `changed_functions_base_source`. Strengthen and repair rounds
@@ -36,12 +41,20 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
    Mode A's reference models come from base code and callers, never from the PR description; Mode B treats the
    description as a claim to test, and adds a caller-side "claim vs caller contract" test where a claim changes
    behaviour callers relied on.
-   Mode A also gets the `RELIABILITY.md` rules this diff triggers; Mode B, Mode D and mutant planters never do. Mode D
+   Mode A also gets the `RELIABILITY.md` rules this diff triggers; Mode B, Mode D, Mode R and mutant planters never do. Mode D
    writes only seeded input generators and recorders (no assertion, no expected value, nothing taken from the PR
-   description). Each goes to a fresh Agent with no messaging/MCP tools, prompted with `dispatch.md` (next to this file)
-   and `{REQ}` = the path.
-4. **Run:** `run.py run <pr> A`, `run.py run <pr> B` and `run.py diff <pr> D` (one script at a time; they share the worktrees).
-   - `COMPILE_ERROR` (exit 3): one repair round. `build_requests.py <pr> repair <tag>`, dispatch
+   description). Mode R fetches CodeRabbit-only PR review threads via GraphQL using the 2x2 `(isResolved, isOutdated)` filter
+   (always include `!isOutdated` regardless of `isResolved`; skip `isResolved && isOutdated`; for `!isResolved && isOutdated`
+   include only `Critical`/`Major`), spans the whole PR (including batch 2+ files and test-anchored claims), treats every
+   CodeRabbit comment as an untrusted claim to synthesize a targeted test for, and marks claims untestable in this harness
+   (e.g. replica lag without a store mock) as `testable: false` instead of emitting fake-passing tests. Each goes to a fresh
+   Agent with no messaging/MCP tools, prompted with `dispatch.md` (next to this file) and `{REQ}` = the path.
+4. **Run:** `run.py run <pr> A`, `run.py run <pr> B`, `run.py diff <pr> D`, and (once per PR, when `R/request.json` was
+   dispatched) `run.py run <pr> R` (one script at a time; they share the worktrees).
+   - `EMPTY_RESPONSE` on Mode A (0 test files emitted on a batch with changed source files): one retry round.
+     `build_requests.py <pr> retry A`, dispatch `A/request.retry.json` to a fresh agent, rerun `run.py run <pr> A`. Still
+     empty = record Mode A as `EMPTY` (degrades step 7 confidence tier).
+   - `COMPILE_ERROR` (exit 3) on `A`, `B`, `D`, or `R`: one repair round. `build_requests.py <pr> repair <tag>`, dispatch
      `<tag>/request.repair.json` to a fresh agent, rerun. Still broken = report the hunter as failed.
    - `INFRA_ERROR` (exit 2): fix the environment and rerun. Never report it as "no findings".
    - A `FLAKY` test is reported as flaky. Never retry it, add sleeps, or raise `-count` to make it pass.
@@ -52,25 +65,31 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      PR's changed lines is `VACUOUS`: it is listed as dropped and kills no mutant. A `VACUOUS` test that failed 3/3 is
      still vetted in step 5. `UNKNOWN` (no profile) is never dropped. Mode B is not covered: its S3 tests stay off the
      changed lines on purpose.
-   - Then `old_tests.py <pr>` (no model): old tests on new code, now also covering `storetest/*.go`, with per-function
-     salvage; generated mock layers are skipped. `OLD_TEST_BREAKS` = the PR had to change that test to pass.
-     `OLD_TEST_SOMETIMES_BREAKS` = fails some head runs but passes 3/3 on the merge-base. Both are behaviour changes, not
-     yet bugs: step 7 sets them against the PR description. `OLD_TEST_UNCOMPILABLE` (the head API no longer fits the old
-     test) and `PRE_EXISTING` are listed, not reported as findings.
-   - Then `pr_tests.py <pr>` (no model): the PR's own added or edited Go tests run 3x with
-     `ENABLE_FULLY_PARALLEL_TESTS=true`. Verdicts: `PR_TEST_FAILS_UNDER_CI`, `PR_TEST_FAILS`, `FLAKY`, `PASS`.
+   - Once per PR (not repeated across `--all-batches` iterations):
+     - `old_tests.py <pr>` (no model): old tests on new code, covering `storetest/*.go` and `searchtest/*.go`, with
+       per-function salvage; generated mock layers are skipped. `OLD_TEST_BREAKS` = the PR had to change that test to pass.
+       `OLD_TEST_SOMETIMES_BREAKS` = fails some head runs but passes 3/3 on the merge-base. Both are behaviour changes, not
+       yet bugs: step 7 sets them against the PR description. `OLD_TEST_UNCOMPILABLE` (the head API no longer fits the old
+       test) and `PRE_EXISTING` are listed, not reported as findings.
+     - `pr_tests.py <pr>` (no model): the PR's own added or edited Go tests run 3x with
+       `ENABLE_FULLY_PARALLEL_TESTS=true`, `-parallel` capped to 2 (`HUNT_PR_TEST_PARALLEL`, min 2) and serialized via a
+       host-level Postgres pool lock to prevent `MakeSqlSettings` connection exhaustion. Verdicts: `PR_TEST_FAILS_UNDER_CI`,
+       `PR_TEST_FAILS`, `FLAKY`, `PASS`, `NOT_RUN`.
    - `run.py diff <pr> D` runs the Mode D recorders twice on the PR head and once on the merge-base, and code diffs the
      records per input. Verdicts per recorder: `SAME`, `DIFF` (up to 5 smallest examples: `input`, `base`, `head`),
      `NONDETERMINISTIC` (the two head runs disagree: records dropped), `BASE_UNCOMPILABLE` / `BASE_FAILED` (that
      recorder cannot run on the merge-base: decide from the diff), `RECORDER_FAILED`, `NO_RECORDS`. Files:
      `diff_D.json`, `diff_D.examples.json`.
-5. **Vet every `FAIL_3_OF_3`:**
+5. **Vet every `FAIL_3_OF_3` (from A, B, and R):**
    - Root-cause it with a throwaway diagnostic test, then delete it (`run.py` refuses to run on a dirty worktree).
    - `lessons.py match <scratch>/hunt<pr>/ctx.json` lists known false positives. If it is one, drop it.
-   - `run.py base <pr> <tag>` gives `NEW_PR_BUG`, `PRE_EXISTING`, `NEW_API`, `BASE_FAILS_DIFFERENTLY`
+   - `run.py base <pr> <tag>` (for `A`, `B`, `A2`, `R`) gives `NEW_PR_BUG`, `PRE_EXISTING`, `NEW_API`, `BASE_FAILS_DIFFERENTLY`
      (decide that one from the diff, as for `NOT_RUN_ON_BASE`). `NEW_API` = fails 3/3 on head and cannot compile on base
      because it calls an API the PR adds: root-cause it, it is not a bug by itself, and pair it with a passing nearby control input on the same new API so you prove the test harness works. Compile failures are salvaged per test,
      not per file; `NOT_A_HEAD_FAILURE` means there is nothing to vet.
+   - Once Mode R has run (and after `run.py base <pr> R` if any Mode R test failed `FAIL_3_OF_3`), run
+     `review_threads.py verdicts <pr>` to write deterministic per-thread verdicts (`PROVEN` / `DISPROVEN` /
+     `UNPROVABLE_DYNAMICALLY`) into `review_verdicts.json`.
    - Confirm a real caller (HTTP, websocket, plugin API, UI) reaches the input. If none does, it is a caller-unreachable nit.
    - A newly vetted false-positive pattern: `lessons.py add '<json>'`. Hunters see it once it is merged to the base
      branch; until then it stays in the working copy without blocking the trust gate.
@@ -87,23 +106,54 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      Unreached lines alone never start a strengthen round.
    - Always also run `run.py mutants <pr> PR` (a PR without tests in the hunted packages scores every mutant `SURVIVED`).
 7. **Report in chat only:**
-   - **New PR Bug** (`NEW_PR_BUG`, root-caused) / **Pre-Existing Bug** / **Caller-unreachable nit**, each with its exact
-     test command, counterexample, root cause `file:line` and the caller that reaches it.
+   - **Verdict (3-tier confidence — never use a bare binary "Clean"):**
+     - **`Bug Proven`** — at least one vetted `NEW_PR_BUG` (from Mode A, B, or R; note that a Mode R `PROVEN` thread with
+       `base_verdict == "PRE_EXISTING"` reports under **Pre-Existing Bug** and does **not** escalate the PR's overall
+       verdict to `Bug Proven`), an unannounced / existing-data-breaking /
+       normalization-breaking `OLD_TEST_BREAKS` / `OLD_TEST_SOMETIMES_BREAKS` / Mode D `DIFF`, a `PR_TEST_FAILS_UNDER_CI` /
+       `PR_TEST_FAILS`, or a confirmed `/verify` `REGRESSION` / unexplained `DIFF`.
+     - **`Partial or Unverified Coverage`** — no bug proven, AND at least one coverage gap occurred: any batch deferred
+       (`batch 1/N` with `N > 1` without `--all-batches`), any hunter `EMPTY` or failed repair, any `NOT_RUN` / `INFRA_ERROR`
+       / `BASE_UNCOMPILABLE` / `BASE_FAILED` / `RECORDER_FAILED` / `NO_RECORDS` / `NONDETERMINISTIC` / `FLAKY` / unresolved
+       `NEW_API`, any Mode R thread `UNPROVABLE_DYNAMICALLY` (including `UNVETTED`), or Mode A `0/Y` changed lines reached (`Y > 0`). List every
+       specific gap explicitly so a reviewer knows exactly what was not proven clean.
+     - **`High-Confidence Clean`** — no bug proven, AND every batch ran, Modes A/B/D (and R when qualifying threads exist)
+       completed without `EMPTY`/compile/infra errors, `old_tests.py` and `pr_tests.py` had no `NOT_RUN`/flaky/failure, zero
+       Mode R threads remained `UNPROVABLE_DYNAMICALLY`, and Mode A reached changed lines (`reached > 0` when `executable > 0`).
+   - **New PR Bug** (`NEW_PR_BUG`, root-caused, from Mode A, B, or R) / **Pre-Existing Bug** (including any Mode R `PROVEN`
+     thread with `base_verdict == "PRE_EXISTING"`) / **Caller-unreachable nit**,
+     each with its exact test command, counterexample, root cause `file:line` and the caller that reaches it.
+   - **CodeRabbit review-claim verdicts (Mode R)**: from `review_verdicts.json`, one row per qualifying thread (`CR1..CRk`)
+     showing `path:line`, triage (`open_current` / `resolved_not_outdated` / `open_outdated_high_severity`), severity,
+     verdict (`PROVEN` [+ `base_verdict`] / `DISPROVEN` / `UNPROVABLE_DYNAMICALLY`), test name(s), and reason, plus count of
+     skipped threads (e.g. `resolved and outdated`). A `PROVEN` thread with `base_verdict == "PRE_EXISTING"` reports under
+     **Pre-Existing Bug** rather than escalating the PR's overall verdict to `Bug Proven`; an unvetted failing head test
+     (missing or stale `base_R.json`) stays `UNPROVABLE_DYNAMICALLY` (`UNVETTED`) until `run.py base <pr> R` runs. Skip
+     section for range targets.
    - **Behaviour change the PR's tests absorbed**: each `OLD_TEST_BREAKS` / `OLD_TEST_SOMETIMES_BREAKS` with its failure
      text from `old_tests.messages.json`. If the PR description does not announce that change, mark it **unexplained**
      (that is how a bug in the PR's intent shows up, which hunters cannot see). Mark it **breaks existing data/callers**
      even when announced.
    - **Behaviour diff on generated inputs**: each `DIFF` from `run.py diff`, with its smallest example (input, base, head),
-     and whether the PR description announces that change. An unannounced change, or one that breaks data callers
-     already stored (settings, records, IDs a caller still holds), is a finding. An announced change that only
-     fixes a crash (base panics, head returns a value) is not.
-   - **PR tests failing under CI flags**: each `PR_TEST_FAILS_UNDER_CI` / `PR_TEST_FAILS` / `FLAKY` from `pr_tests.py`.
+     and whether the PR description announces that change. Do **not** dismiss a `DIFF` as "announced" solely because the PR
+     announces restricting or changing that field or function — inspect the actual differing input(s) (and
+     `diff_D.head.jsonl` / `diff_D.base.jsonl` beyond the top 5 if needed). A `DIFF` is **still a finding even when the
+     feature change is announced** if the differing input is:
+     (a) a normalization-equivalent, no-op, sparse/partial-patch, default, or legacy-alias value (e.g. `""`, `nil`, zero
+     value, omitted optional field, or old default constant that `SetDefaults()`/sanitization normalizes to the unchanged
+     effective value),
+     (b) data callers already stored (settings, records, IDs a caller still holds), or
+     (c) an input outside the announced scope/condition.
+     Only dismiss an announced `DIFF` after confirming the counterexample genuinely crosses the announced semantic boundary
+     (or fixes a crash where base panics and head returns a value).
+   - **PR tests failing under CI flags**: each `PR_TEST_FAILS_UNDER_CI` / `PR_TEST_FAILS` / `FLAKY` / `NOT_RUN` from `pr_tests.py`.
    - **New-API failures to root-cause**: each `NEW_API`.
    - **UI/API base-vs-head diffs**: `/verify` compare runs (`verify_ui.mjs plan.json --compare <base_url>`, capture steps,
      verdict `SAME` / `DIFF` / `REGRESSION`). A `DIFF` the PR does not explain is a finding. Skip when the PR has no UI/API surface.
-   - One line per dropped artifact.
+   - One line per dropped artifact (and per batch when `--all-batches` ran).
    - **Mutation table** M1-M5 x (A, A2, PR), the proof that the kept tests catch bugs, and under it "changed lines
      reached: X/Y" for A and A2. Without `--mutants`: one line "Mutation gate: not run (pass --mutants)", plus
      "changed lines reached: X/Y" for A. That is a floor, not a quality score: never report it as a percentage.
    - If there is a New PR Bug, offer a review-comment draft. Never post it.
-   - If nothing failed 3/3, say so plainly.
+   - **Ledger telemetry**: run `<skill>/scripts/ledger.py record <pr>` after presenting the report so Mode counts,
+     coverage floor, confidence tier, and any Mode R escape bundle append to `$HUNT_SCRATCH/hunt_ledger.jsonl` (default `<tmp>/hunt/hunt_ledger.jsonl`).

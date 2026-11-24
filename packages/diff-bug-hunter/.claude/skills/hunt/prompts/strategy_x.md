@@ -5,7 +5,7 @@ S1 Sibling guards (Mode A). `neighbors_same_file` holds unchanged functions near
 changed files each was picked for. List the guards they apply: caller or session type checks, role or permission checks,
 nil/empty/default handling (`?? ''`, default props, zero values), feature-flag and license gates, early returns. For a
 guard the PR's new or changed code does NOT apply, write a test that drives the new code down that path and asserts the
-outcome the neighbours produce. Neighbour excerpts that apply the guard count toward the 3 required citations.
+outcome the neighbours produce. Cite the neighbour `file:line` excerpts that apply the guard.
 S2 Adversarial callers (Mode A). Go: call each changed entry point as each of SystemAdmin, TeamAdmin, plain Member,
 Guest, Bot, an OAuth app session and an integration/webhook session, and with any feature flag or license it reads both
 off and on; assert each caller gets what the neighbours or callers show that caller should get. React: for a prop the
@@ -22,6 +22,6 @@ valid and readable on head with the same meaning. Look for: values the old valid
 names of existing custom emoji, IDs and slugs), partially populated or sanitized objects merged into full ones (a copy
 missing fields must not overwrite the full object), NULL or legacy column values scanned into non-pointer fields, config
 values that were non-secret or defined before the PR, and old enum, role or JSON shapes. Each such test cites the base
-`file:line` that made the input valid (it counts toward the 3 required citations) plus the callers or stored data that
+`file:line` that made the input valid plus any callers or stored data that
 still carry it. A new rule that rejects or rewrites data the base accepted is a finding even if the PR description
 promises it: the stored data cannot be changed by the PR.

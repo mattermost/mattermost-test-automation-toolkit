@@ -28,6 +28,7 @@ if not _sys.pycache_prefix:
 import argparse
 import fnmatch
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -42,7 +43,8 @@ PRUNE_WINDOW = 30
 
 
 def hits_log() -> Path:
-    return scratch() / "lessons_hits.jsonl"
+    env = os.environ.get("HUNT_LESSONS_HITS", "").strip()
+    return Path(env).resolve() if env else scratch() / "lessons_hits.jsonl"
 
 
 def _records(path: Path | None) -> list[dict[str, Any]]:
@@ -81,13 +83,15 @@ def score(lesson: dict[str, Any], files: list[str], text: str) -> int:
         return 0
     path_hits = sum(1 for f in files if any(fnmatch.fnmatch(f, g) for g in globs))
     kw_hits = sum(1 for k in lesson["keywords"] if k.lower() in text)
+    if globs and lesson.get("keywords"):
+        return 3 * path_hits + kw_hits if (path_hits > 0 and kw_hits > 0) else 0
     return 3 * path_hits + kw_hits if (path_hits or kw_hits) else 0
 
 
 def match(ctx: dict[str, Any], lessons: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     lessons = load() if lessons is None else lessons
     files = [c["file"] for c in ctx.get("changed_files_head_source", [])]
-    text = (ctx.get("diff_production_code", "") + json.dumps(ctx.get("sibling_tests_and_helpers", []))).lower()
+    text = ctx.get("diff_production_code", "").lower()
     ranked = sorted(((score(lsn, files, text), i, lsn) for i, lsn in enumerate(lessons)), key=lambda t: (-t[0], t[1]))
     return [lsn for s, _, lsn in ranked if s > 0][:TOP]
 
@@ -108,23 +112,28 @@ def log_hits(run: str, matched: list[dict[str, Any]], log: Path | None = None) -
         fh.write(json.dumps({"run": run, "matched": [m["id"] for m in matched]}) + "\n")
 
 
+MONOREPO_ROOTS = {("server", "channels"), ("server", "public"), ("webapp", "channels"), ("webapp", "platform")}
+
+
 def overbroad(glob: str) -> bool:
-    """A glob that covers a whole top-level tree (or everything): '*', '**', 'server/*', 'webapp/**/*.ts'."""
+    """True for wildcards over top-level trees or Mattermost's 2-segment monorepo roots."""
     prefix = []
     for seg in glob.split("/"):
         if re.search(r"[*?\[]", seg):
             break
         prefix.append(seg)
-    return len(prefix) < 2  # fewer than two fixed directories before the first wildcard
+    min_depth = 3 if tuple(prefix[:2]) in MONOREPO_ROOTS else 2
+    return len(prefix) < min_depth
 
 
 def prune(lessons: list[dict[str, Any]], log_lines: list[dict[str, Any]], window: int = PRUNE_WINDOW) -> list[dict[str, Any]]:
     """Deterministic retirements: over-broad globs always; no match in the last `window` hunts only once the log holds
-    at least `window` hunts (fewer is not evidence). A re-run of the same hunt counts once, with its latest result."""
+    at least `window` hunts (fewer is not evidence). Multiple batches or re-runs of the same target count as one hunt."""
     runs: dict[str, list[str]] = {}
     for line in log_lines:
-        runs.pop(line["run"], None)  # move a re-run to the end
-        runs[line["run"]] = line["matched"]
+        key = re.sub(r"/\d+$", "", str(line["run"]))
+        runs.pop(key, None)  # move a re-run or later batch of the same target to the end
+        runs[key] = line["matched"]
     recent = list(runs.values())[-window:]
     out = []
     for lsn in lessons:
@@ -158,7 +167,8 @@ def main(argv: list[str]) -> None:
                 for r in retire:
                     if r["retire"] not in already:
                         fh.write(json.dumps(r) + "\n")
-        print(f"{len(retire)} to retire; {len({k for x in lines for k in [x['run']]})} hunts logged in {log}")
+        hunts_logged = len({re.sub(r"/\d+$", "", str(x["run"])) for x in lines if "run" in x})
+        print(f"{len(retire)} to retire; {hunts_logged} hunts logged in {log}")
     else:
         sys.exit(__doc__)
 

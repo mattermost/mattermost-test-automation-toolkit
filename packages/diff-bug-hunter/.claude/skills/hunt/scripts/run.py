@@ -3,8 +3,8 @@
 # See LICENSE.txt for license information.
 """Steps 4-5: run hunter tests, vet on the merge-base, score mutants. Go and Jest adapters.
 
-usage: run.py run <pr> <A|B|A2>        3 runs on unmodified PR head (Go with -race); writes run_<tag>.json
-       run.py base <pr> <A|B|A2>       the same tests once on the merge-base worktree; writes base_<tag>.json
+usage: run.py run <pr> <A|B|A2|R>      3 runs on unmodified PR head (Go with -race); writes run_<tag>.json
+       run.py base <pr> <A|B|A2|R>     the same tests once on the merge-base worktree; writes base_<tag>.json
        run.py diff <pr> D              differential recorders (build_requests.py <pr> diff): run on the PR head twice (records
                                        that differ = NONDETERMINISTIC, dropped) and once on the merge-base, then diff the
                                        records per (test, input). SAME | DIFF | NONDETERMINISTIC | BASE_UNCOMPILABLE |
@@ -269,7 +269,9 @@ def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome,
         root = go_root(wt, d)
         pkg = "./" + _rel(wt, d, root)
         cap = (timeouts or {}).get(d)
+        par = os.environ.get("HUNT_GO_PARALLEL", "").strip()
         args = (["go", "test", "-count=1", "-v", "-run", pattern] + (["-race"] if race else [])
+                + ([f"-parallel={par}"] if par else [])
                 + ([f"-timeout={cap}s"] if cap else []) + [pkg])
         p = sh(args, root, check=False, timeout=1800)
         out = p.stdout + p.stderr
@@ -393,12 +395,23 @@ def fingerprint(files: list[dict[str, str]]) -> str:
     return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
 
 
+def target_dirs_for(hdir: Path, state: dict[str, Any], tag: str) -> set[str]:
+    """Approved directories hunter `tag` may write hunt_* test files into (Mode R spans all CodeRabbit thread dirs)."""
+    dirs = {t["dir"] for t in state["targets"]}
+    if tag == "R" and (hdir / "R" / "threads.json").exists():
+        dirs |= {t["dir"] for t in load_json(hdir / "R" / "threads.json").get("targets", [])}
+    return dirs
+
+
 def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[str, Any]:
     wt = Path(state["wt"])
     ensure_clean(wt)
     files = load_json(hdir / tag / "response.json")["files"]
-    # `base` vets these exact files: a redispatched response must be run on head again first.
-    (hdir / f"run_{tag}.response.sha256").unlink(missing_ok=True)
+    # Clear outputs of any earlier run for this tag so a compile error or rerun never leaves stale head/base verdicts.
+    # Keep compile_<tag>.log as the audit record of any prior repair round (compute_verdicts checks run_R freshness).
+    for stale in (f"run_{tag}.json", f"run_{tag}.messages.json", f"run_{tag}.runtimes.json",
+                  f"run_{tag}.response.sha256", f"base_{tag}.json", f"base_{tag}.response.sha256"):
+        (hdir / stale).unlink(missing_ok=True)
     if not files:  # e.g. a Mode B hunter for a PR whose description promises nothing testable
         write_json(hdir / f"run_{tag}.json", {})
         (hdir / f"run_{tag}.response.sha256").write_text(fingerprint(files))
@@ -412,7 +425,7 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
     placed: list[Path] = []
     outcomes = []
     try:
-        placed = place(wt, files, {t["dir"] for t in state["targets"]})
+        placed = place(wt, files, target_dirs_for(hdir, state, tag))
         for _ in range(runs):
             outcomes.append(run_suite(wt, suite_for(tag, state, placed, wt), race=True))
     finally:
@@ -592,6 +605,19 @@ def base_table(head: dict[str, str], head_msgs: dict[str, str], o: Outcome) -> d
     return out
 
 
+def _failing_base_units(
+    files: list[dict[str, str]], failing: set[str],
+) -> list[tuple[str, list[dict[str, str]], set[str]]]:
+    """Group response files into independent base-vetting units (Go package dir or Jest file) that have FAIL_3_OF_3."""
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for f in files:
+        rel = str(f.get("path", ""))
+        key = str(Path(rel).parent) if rel.endswith(".go") else os.path.normpath(rel)
+        grouped.setdefault(key, []).append(f)
+    return [(k, grp, uf) for k, grp in grouped.items()
+            if (uf := {n for n in failing if n.startswith(f"{k}::")})]
+
+
 def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     """NEW_PR_BUG: failed 3/3 on head, passes on base. PRE_EXISTING: fails with the same normalized failure on base.
     NEW_API: failed 3/3 on head and cannot run on base because it uses an API the PR adds (a Go test the base compiler
@@ -604,8 +630,9 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     files = load_json(hdir / tag / "response.json")["files"]
     if not (hdir / f"run_{tag}.json").exists():
         raise InfraError(f"run_{tag}.json missing: run `run.py run <pr> {tag}` before `base`")
+    digest = fingerprint(files)
     sha = hdir / f"run_{tag}.response.sha256"
-    if not sha.exists() or sha.read_text().strip() != fingerprint(files):
+    if not sha.exists() or sha.read_text().strip() != digest:
         raise InfraError(f"{tag}/response.json changed since run_{tag}.json was written; run `run.py run <pr> {tag}` "
                          "again so base vets the tests that produced the head verdicts")
     head = load_json(hdir / f"run_{tag}.json")
@@ -615,27 +642,48 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     go_timeouts = timeout_caps(load_json(runtimes_path)) if runtimes_path.exists() else None
     failing = {n for n, v in head.items() if v == "FAIL_3_OF_3"}
     out: dict[str, Any] = {n: "NOT_A_HEAD_FAILURE" for n in head if n not in failing}
-    placed: list[Path] = []
-    try:
-        if files and failing:
-            placed = place(wt, files, {t["dir"] for t in state["targets"]})
-            o, gone = salvage_go(wt, state, tag, placed, failing=failing, go_timeouts=go_timeouts)
-            out.update(base_table(head, head_msgs, o))
-            new_api: dict[str, list[str]] = {}
+    approved_dirs = target_dirs_for(hdir, state, tag)
+    new_api: dict[str, list[str]] = {}
+    uncompilable: list[tuple[str, set[str], str]] = []
+    any_ran = False
+    units = _failing_base_units(files, failing) if files and failing else []
+    for unit_key, unit_files, unit_failing in units:
+        placed: list[Path] = []
+        try:
+            placed = place(wt, unit_files, approved_dirs)
+            o, gone = salvage_go(wt, state, tag, placed, failing=unit_failing, go_timeouts=go_timeouts)
+            out.update(base_table({n: head[n] for n in unit_failing}, head_msgs, o))
             for n, idents in gone.items():  # removed from the base copies: vetted by what head said about them
-                out[n] = "NEW_API" if head.get(n) == "FAIL_3_OF_3" else "NOT_A_HEAD_FAILURE"
-                if out[n] == "NEW_API":
+                if n in unit_failing:
+                    out[n] = "NEW_API"
                     new_api[n] = idents
-            for n, v in list(out.items()):
-                if v == "NEW_API" and n not in new_api:  # Jest: the failure text names what is missing
+            for n in unit_failing:
+                if out.get(n) == "NEW_API" and n not in new_api:  # Jest: the failure text names what is missing
                     new_api[n] = jest_missing(o.messages.get(n, ""))
-            if new_api:
-                out["new_api"] = new_api
-    except CompileError as e:
-        out = {"*": "BASE_UNCOMPILABLE", "detail": str(e)[-800:]}
-    finally:
-        unplace(placed)
+            any_ran = True
+        except CompileError as e:
+            uncompilable.append((unit_key, unit_failing, str(e)))
+        finally:
+            unplace(placed)
+    if uncompilable:
+        if not any_ran:
+            out = {"*": "BASE_UNCOMPILABLE", "detail": uncompilable[-1][2][-800:]}
+        else:
+            details: list[str] = []
+            for unit_key, unit_failing, err in uncompilable:
+                is_missing = bool(MISSING_ON_BASE.search(err))
+                for n in sorted(unit_failing):
+                    out[n] = "NEW_API" if is_missing else "BASE_UNCOMPILABLE"
+                    if is_missing:
+                        new_api[n] = jest_missing(err)
+                if not is_missing:
+                    details.append(f"{unit_key}: {err[-300:]}")
+            if details:
+                out["detail"] = "\n".join(details)[-800:]
+    if new_api and "*" not in out:
+        out["new_api"] = new_api
     write_json(hdir / f"base_{tag}.json", out)
+    (hdir / f"base_{tag}.response.sha256").write_text(digest)
     return out
 
 
@@ -1207,7 +1255,11 @@ def main(argv: list[str]) -> int:
                 for n, c in table.items():
                     print(f"[{tag}] {n}: {c}")
                 if not table:
-                    print(f"[{tag}] no tests in the hunter response")
+                    if tag == "A" and state.get("changed"):
+                        print(f"[{tag}] EMPTY_RESPONSE: Mode A emitted 0 test files despite {len(state['changed'])} "
+                              f"changed source file(s); run `build_requests.py {pr} retry A` once before accepting empty output")
+                    else:
+                        print(f"[{tag}] no tests in the hunter response")
             elif cmd == "base":
                 for n, c in cmd_base(hdir, state, tag).items():
                     shown = c[:300] if n == "detail" else c

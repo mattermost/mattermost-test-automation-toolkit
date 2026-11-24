@@ -78,13 +78,17 @@ import build_requests
 import ctx
 import old_tests
 import prepare
+import review_threads
 import run
 from hunt_common import InfraError, git, require_disk, write_json
 
 CASE_KEYS = ("id", "bug_sha", "fix_sha", "area", "bug", "source")
+NON_REVERT_KEYS = ("id", "bug_sha", "area", "bug", "source")
+VALID_KINDS = frozenset({"revert", "rc_hotfix", "fix_forward", "pre_merge_review", "release_range"})
 CONTROL_KEYS = ("id", "sha", "area")
 DEFAULT_THRESHOLDS = {"raw_recall_min": 0.0, "vetted_recall_min": 0.0, "fp_rate_max": 1.0}
 SIGNALS = ("hunters", "diff", "old", "pr")
+ALL_SIGNALS = (*SIGNALS, "review")
 # per-entry signal flags: (name, results key, verdicts that fire it, the --signals group it belongs to)
 FLAGS: tuple[tuple[str, str, frozenset[str], str], ...] = (
     ("hunters_vetted", "base", frozenset({"NEW_PR_BUG"}), "hunters"),
@@ -94,6 +98,7 @@ FLAGS: tuple[tuple[str, str, frozenset[str], str], ...] = (
     ("old_sometimes", "old", frozenset({"OLD_TEST_SOMETIMES_BREAKS"}), "old"),
     ("pr_ci", "pr", frozenset({"PR_TEST_FAILS_UNDER_CI"}), "pr"),
     ("pr_fails", "pr", frozenset({"PR_TEST_FAILS"}), "pr"),
+    ("review_proven", "review", frozenset({"PROVEN"}), "review"),
 )
 # metric prefix per flag: hunters_vetted keeps its historical names (vetted_recall, fp_rate)
 METRIC_NAMES = {"hunters_new_api": "new_api", "diff": "diff", "old": "old", "old_sometimes": "old_sometimes",
@@ -121,8 +126,20 @@ def load_controls(path: Path) -> list[dict[str, Any]]:
     return controls
 
 
+def _resolve_commit(repo: Path, rev: str, skip_missing: bool) -> str | None:
+    try:
+        if skip_missing:
+            return git(repo, "--no-lazy-fetch", "rev-parse", "--verify", f"{rev}^{{commit}}")
+        return git(repo, "rev-parse", f"{rev}^{{commit}}")
+    except InfraError:
+        if skip_missing:
+            return None
+        raise
+
+
 def load_manifest(path: Path, repo_override: Path | None,
-                  extra_controls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                  extra_controls: list[dict[str, Any]] | None = None,
+                  skip_missing: bool = False) -> dict[str, Any]:
     m = json.loads(path.read_text())
     if not m.get("cases") or not isinstance(m["cases"], list):
         raise ManifestError("manifest needs a non-empty cases list")
@@ -142,28 +159,72 @@ def load_manifest(path: Path, repo_override: Path | None,
             raise ManifestError(f"{e.get('id')}: no repo (set manifest repo or --repo)")
         return r if r.is_absolute() else (path.parent / r).resolve()
 
-    cases, ctrls = [], []
+    cases, ctrls, skipped_missing = [], [], []
     for e in m["cases"]:
-        missing = [k for k in CASE_KEYS if not str(e.get(k, "")).strip()]
+        kind = str(e.get("kind", "revert")).strip()
+        if kind not in VALID_KINDS:
+            raise ManifestError(f"case {e.get('id')}: invalid kind {kind!r}")
+        req_keys = CASE_KEYS if kind == "revert" else NON_REVERT_KEYS
+        missing = [k for k in req_keys if not str(e.get(k, "")).strip()]
         if missing:
             raise ManifestError(f"case {e.get('id')}: missing {missing}")
         repo = repo_of(e)
-        bug, fix = git(repo, "rev-parse", f"{e['bug_sha']}^{{commit}}"), git(repo, "rev-parse", f"{e['fix_sha']}^{{commit}}")
-        if bug not in git(repo, "log", "-1", "--format=%B", fix):
-            raise ManifestError(f"case {e['id']}: fix_sha {fix[:10]} does not say it reverts bug_sha {bug[:10]}")
-        cases.append({**e, "repo": repo, "head": bug})
+        bug = _resolve_commit(repo, e["bug_sha"], skip_missing)
+        if bug is None:
+            skipped_missing.append(str(e["id"]))
+            continue
+        resolved_base: str | None = None
+        if e.get("base_sha"):
+            resolved_base = _resolve_commit(repo, e["base_sha"], skip_missing)
+            if resolved_base is None:
+                skipped_missing.append(str(e["id"]))
+                continue
+        if kind == "revert":
+            fix = _resolve_commit(repo, e["fix_sha"], skip_missing)
+            if fix is None:
+                skipped_missing.append(str(e["id"]))
+                continue
+            if bug not in git(repo, "log", "-1", "--format=%B", fix):
+                raise ManifestError(f"case {e['id']}: fix_sha {fix[:10]} does not say it reverts bug_sha {bug[:10]}")
+        elif e.get("fix_sha"):
+            fix_res = _resolve_commit(repo, e["fix_sha"], skip_missing)
+            if fix_res is None:
+                skipped_missing.append(str(e["id"]))
+                continue
+        entry = {**e, "kind": kind, "repo": repo, "head": bug}
+        if resolved_base:
+            entry["base_sha"] = resolved_base
+        cases.append(entry)
     for e in controls:
         missing = [k for k in CONTROL_KEYS if not str(e.get(k, "")).strip()]
         if missing:
             raise ManifestError(f"control {e.get('id')}: missing {missing}")
         repo = repo_of(e)
-        ctrls.append({**e, "repo": repo, "head": git(repo, "rev-parse", f"{e['sha']}^{{commit}}")})
+        head = _resolve_commit(repo, e["sha"], skip_missing)
+        if head is None:
+            skipped_missing.append(str(e["id"]))
+            continue
+        resolved_base = None
+        if e.get("base_sha"):
+            resolved_base = _resolve_commit(repo, e["base_sha"], skip_missing)
+            if resolved_base is None:
+                skipped_missing.append(str(e["id"]))
+                continue
+        entry = {**e, "repo": repo, "head": head}
+        if resolved_base:
+            entry["base_sha"] = resolved_base
+        ctrls.append(entry)
     for e in cases + ctrls:
         if e.get("responses"):
             e["responses"] = (path.parent / e["responses"]).resolve()
             if not e["responses"].is_dir():
                 raise ManifestError(f"{e['id']}: responses directory {e['responses']} does not exist")
-    return {"cases": cases, "controls": ctrls, "thresholds": thresholds}
+        if e.get("mode_r_threads"):
+            tp = (path.parent / e["mode_r_threads"]).resolve()
+            if not tp.is_file():
+                raise ManifestError(f"{e['id']}: mode_r_threads file {tp} does not exist")
+            e["mode_r_threads"] = tp
+    return {"cases": cases, "controls": ctrls, "thresholds": thresholds, "skipped_missing": skipped_missing}
 
 
 def dispatch(cmd: str, request: Path) -> None:
@@ -256,12 +317,42 @@ def pr_signal(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
         return {"hunter": "PR", "pr": {}, "pr_error": str(err)[-400:]}
 
 
+def review_signal(num: int, hdir: Path, state: dict[str, Any], meta: dict[str, Any],
+                  e: dict[str, Any], dispatch_cmd: str | None) -> dict[str, Any]:
+    if not (hdir / "R" / "threads.json").exists():
+        if not e.get("mode_r_threads"):
+            return {"hunter": "R", "review": {}}
+        raw = json.loads(Path(e["mode_r_threads"]).read_text())
+        if not isinstance(raw, list):
+            raise ManifestError(f"{e['id']}: mode_r_threads must hold a JSON array of GraphQL thread nodes")
+        pr_num = int(e.get("pr") or num)
+        ctx_stub = {"pr": {"number": pr_num, "title": meta["title"], "description": meta["body"]}}
+        r_meta, user = review_threads.build_review_context(str(pr_num), hdir, state, ctx_stub, raw_threads=raw)
+        if user is not None and dispatch_cmd and not (hdir / "R" / "response.json").exists():
+            r_ctx = {"changed_files_head_source": user["thread_files_head_source"],
+                     "diff_production_code": user["diff_production_code"],
+                     "sibling_tests_and_helpers": user["sibling_tests_and_helpers"]}
+            build_requests.write(hdir, "R", build_requests.review_system(r_meta["targets"], r_ctx),
+                                 user, build_requests.REVIEW_SCHEMA)
+            dispatch(dispatch_cmd, hdir / "R" / "request.json")
+    if not (hdir / "R" / "response.json").exists():
+        return {"hunter": "R", "review": {}}
+    row = hunt_tag(num, hdir, state, "R", 1, dispatch_cmd)
+    if "run" in row:
+        row["review_run"] = row.pop("run")
+    if "base" in row:
+        row["review_base"] = row.pop("base")
+    verdicts = review_threads.compute_verdicts(hdir).get("verdicts", {})
+    row["review"] = {cid: v.get("verdict", "") for cid, v in verdicts.items() if isinstance(v, dict)}
+    return row
+
+
 def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None,
                signals: tuple[str, ...] = SIGNALS) -> dict[str, Any]:
     """Hunt one commit as if it were PR #num; returns its run and base tables per batch and hunter, then the model-free
     signals (old tests, the PR's own tests). Only a failure to prepare or read an entry raises."""
     repo, head = e["repo"], e["head"]
-    base = git(repo, "rev-parse", f"{head}^1")
+    base = str(e.get("base_sha") or git(repo, "rev-parse", f"{head}^1"))
     message = git(repo, "log", "-1", "--format=%s%x00%b", head).split("\x00", 1)
     meta = {"title": message[0], "body": message[1].strip() if len(message) > 1 else ""}  # never the ground truth
     require_disk(out)  # same gate as prepare.py: no worktrees or npm ci on a nearly full disk
@@ -275,7 +366,7 @@ def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None,
     while batch <= batches:
         state = ctx.build(str(num), batch, prep, meta)
         batches = state["batches"]
-        if "hunters" in signals or "diff" in signals:
+        if "hunters" in signals or "diff" in signals or "review" in signals:
             if e.get("responses") and batch == 1:
                 shutil.copytree(e["responses"], hdir, dirs_exist_ok=True)
             if "hunters" in signals:
@@ -295,6 +386,8 @@ def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None,
         else:
             batches = 1  # the whole-commit signals need only the state, not one per batch
         batch += 1
+    if "review" in signals:
+        results.append(review_signal(num, hdir, state, meta, e, dispatch_cmd))
     # whole-commit, model-free: once per entry, after every batch (each run leaves the worktrees clean)
     if "old" in signals:
         results.append(old_signal(hdir, state))
@@ -333,7 +426,8 @@ def scorecard(manifest: dict[str, Any], hunted: dict[str, dict[str, Any]],
             raw, _ = score(h)
             f = flags(h, signals)
             tag_errors = [f"{r['hunter']}: {r['error']}" for r in h.get("results", []) if r.get("error")]
-            rows.append({"kind": kind, "id": e["id"], "area": e["area"], "raw": raw and "hunters" in signals,
+            rows.append({"kind": kind, "id": e["id"], "area": e["area"], "lock": bool(e.get("lock")),
+                         "raw": raw and "hunters" in signals,
                          "vetted": f["hunters_vetted"], **f, "any": any(f[k] for k in FINDINGS),
                          "error": h.get("error"), "old_error": _first(h, "old_error"), "pr_error": _first(h, "pr_error"),
                          "hunter_errors": tag_errors,
@@ -355,22 +449,40 @@ def scorecard(manifest: dict[str, Any], hunted: dict[str, dict[str, Any]],
     for flag, name in METRIC_NAMES.items():
         metrics[f"{name}_recall"] = ratio(sum(r[flag] for r in cases), len(cases))
         metrics[f"{name}_fp_rate"] = ratio(sum(r[flag] for r in controls), len(controls))
+    if "review" in signals:
+        metrics["review_recall"] = ratio(sum(r["review_proven"] for r in cases), len(cases))
+        metrics["review_fp_rate"] = ratio(sum(r["review_proven"] for r in controls), len(controls))
     t = manifest["thresholds"]
     checks = {"raw_recall": metrics["raw_recall"] >= t["raw_recall_min"],
               "vetted_recall": metrics["vetted_recall"] >= t["vetted_recall_min"],
               "fp_rate": metrics["fp_rate"] <= t["fp_rate_max"]}
     errors = [r["id"] for r in rows if r["error"]]
     verdict = "ERROR" if errors else ("PASS" if all(checks.values()) else "FAIL")
-    return {"rows": rows, "metrics": metrics, "thresholds": t, "checks": checks, "errors": errors, "verdict": verdict,
-            "signals": list(signals), "cases": len(cases), "controls": len(controls)}
+    locked = [r for r in cases if r["lock"]]
+    locks_missed = [r["id"] for r in locked if not (r["vetted"] or r["hunters_new_api"] or r.get("review_proven"))]
+    summary = {
+        "vetted_plus_new_api_recall": ratio(sum(r["vetted"] or r["hunters_new_api"] for r in cases), len(cases)),
+        "hunter_only_fp_rate": ratio(sum(r["vetted"] for r in controls), len(controls)),
+        "locks_total": len(locked),
+        "locks_passed": len(locked) - len(locks_missed),
+        "locks_missed": locks_missed,
+        "skipped_missing": manifest.get("skipped_missing", []),
+    }
+    return {"rows": rows, "metrics": metrics, "summary": summary, "thresholds": t, "checks": checks,
+            "errors": errors, "verdict": verdict, "signals": list(signals),
+            "cases": len(cases), "controls": len(controls)}
 
 
 def render(card: dict[str, Any]) -> str:
     signals = card.get("signals", list(SIGNALS))
-    cols = (("raw", "hunters"), ("vetted", "hunters"), ("new_api", "hunters"), ("diff", "diff"), ("old", "old"),
-            ("old~", "old"), ("pr_ci", "pr"))
+    cols: list[tuple[str, str]] = [
+        ("raw", "hunters"), ("vetted", "hunters"), ("new_api", "hunters"), ("diff", "diff"), ("old", "old"),
+        ("old~", "old"), ("pr_ci", "pr"),
+    ]
+    if "review" in signals:
+        cols.append(("review", "review"))
     keys = {"raw": "raw", "vetted": "hunters_vetted", "new_api": "hunters_new_api", "diff": "diff", "old": "old",
-            "old~": "old_sometimes", "pr_ci": "pr_ci"}
+            "old~": "old_sometimes", "pr_ci": "pr_ci", "review": "review_proven"}
 
     def cell(r: dict[str, Any], col: str, group: str) -> str:
         return "-" if group not in signals else ("yes" if r.get(keys[col]) else "no")
@@ -397,11 +509,15 @@ def render(card: dict[str, Any]) -> str:
     lines.append(f"false-positive rate {m['fp_rate']:.2f} (max {t['fp_rate_max']:.2f}) "
                  f"{'ok' if c['fp_rate'] else 'ABOVE'}   (raw, before vetting: {m['raw_fp_rate']:.2f})")
     lines.append(f"{'signal':18} recall   fp-rate  ({card.get('cases', '?')} cases, {card.get('controls', '?')} controls)")
-    table = (("hunters vetted", "vetted", "hunters"), ("hunters new-api", "new_api", "hunters"),
-             ("diff (Mode D)", "diff", "diff"),
-             ("old tests", "old", "old"), ("old tests ~", "old_sometimes", "old"), ("pr tests (ci)", "pr_ci", "pr"),
-             ("pr tests (fail)", "pr_fails", "pr"),
-             ("combined (any)", "combined", None))
+    table: list[tuple[str, str, str | None]] = [
+        ("hunters vetted", "vetted", "hunters"), ("hunters new-api", "new_api", "hunters"),
+        ("diff (Mode D)", "diff", "diff"),
+        ("old tests", "old", "old"), ("old tests ~", "old_sometimes", "old"), ("pr tests (ci)", "pr_ci", "pr"),
+        ("pr tests (fail)", "pr_fails", "pr"),
+    ]
+    if "review" in signals:
+        table.append(("review (Mode R)", "review", "review"))
+    table.append(("combined (any)", "combined", None))
     for label, name, group in table:
         if group is not None and group not in signals:
             lines.append(f"{label:18} off")
@@ -413,6 +529,39 @@ def render(card: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def diff_scorecards(base: dict[str, Any], cand: dict[str, Any], max_fp: float = 0.05) -> dict[str, Any]:
+    """Monotonic gate comparing a candidate scorecard against a baseline."""
+    bm, cm = base["metrics"], cand["metrics"]
+    b_rows = {r["id"]: r for r in base.get("rows", []) if r.get("kind") == "case"}
+    c_rows = {r["id"]: r for r in cand.get("rows", []) if r.get("kind") == "case"}
+
+    def caught(r: dict[str, Any]) -> bool:
+        return bool(r.get("vetted") or r.get("hunters_new_api") or r.get("review_proven"))
+
+    lock_regressions = sorted(
+        cid for cid, br in b_rows.items()
+        if (br.get("lock") or c_rows.get(cid, {}).get("lock")) and caught(br)
+        and (cid not in c_rows or not caught(c_rows[cid]))
+    )
+    cand_ok = not cand.get("errors") and cand.get("verdict") != "ERROR"
+    recall_ok = float(cm["vetted_recall"]) >= float(bm["vetted_recall"])
+    fp_limit = max(max_fp, float(bm["fp_rate"]))
+    fp_ok = float(cm["fp_rate"]) <= fp_limit
+    passed = cand_ok and recall_ok and fp_ok and not lock_regressions
+    return {
+        "verdict": "PASS" if passed else "FAIL",
+        "cand_ok": cand_ok,
+        "recall_ok": recall_ok,
+        "fp_ok": fp_ok,
+        "fp_limit": fp_limit,
+        "base_vetted_recall": bm["vetted_recall"],
+        "cand_vetted_recall": cm["vetted_recall"],
+        "base_fp_rate": bm["fp_rate"],
+        "cand_fp_rate": cm["fp_rate"],
+        "lock_regressions": lock_regressions,
+    }
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="eval_reverts.py", description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("manifest", type=Path)
@@ -420,17 +569,20 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--out", type=Path)
     ap.add_argument("--dispatch")
     ap.add_argument("--only", nargs="*")
-    ap.add_argument("--signals", default=",".join(SIGNALS), help="comma list of hunters,diff,old,pr (default all)")
+    ap.add_argument("--signals", default=",".join(SIGNALS), help="comma list of hunters,diff,old,pr,review")
     ap.add_argument("--controls", type=Path, help="extra controls (mine_controls.py output), appended to the manifest's")
+    ap.add_argument("--skip-missing", action="store_true", help="skip entries whose commit SHAs are absent in --repo")
+    ap.add_argument("--validate-only", action="store_true", help="validate manifest/SHAs against --repo and exit")
     a = ap.parse_args(argv[1:])
-    signals = tuple(x for x in SIGNALS if x in {w.strip() for w in a.signals.split(",")})
-    unknown = {w.strip() for w in a.signals.split(",")} - set(SIGNALS)
+    signals = tuple(x for x in ALL_SIGNALS if x in {w.strip() for w in a.signals.split(",")})
+    unknown = {w.strip() for w in a.signals.split(",")} - set(ALL_SIGNALS)
     if unknown or not signals:
-        print(f"INVALID_SIGNALS {a.signals!r}: choose from {','.join(SIGNALS)}")
+        print(f"INVALID_SIGNALS {a.signals!r}: choose from {','.join(ALL_SIGNALS)}")
         return 2
     try:
         extra = load_controls(a.controls.resolve()) if a.controls else None
-        manifest = load_manifest(a.manifest.resolve(), a.repo.resolve() if a.repo else None, extra)
+        manifest = load_manifest(a.manifest.resolve(), a.repo.resolve() if a.repo else None, extra,
+                                 skip_missing=a.skip_missing)
     except (ManifestError, InfraError, OSError, KeyError, json.JSONDecodeError) as err:
         print(f"INVALID_MANIFEST {err}")
         return 2
@@ -438,6 +590,10 @@ def main(argv: list[str]) -> int:
         keep = set(a.only)
         manifest = {**manifest, "cases": [e for e in manifest["cases"] if e["id"] in keep],
                     "controls": [e for e in manifest["controls"] if e["id"] in keep]}
+    if a.validate_only:
+        print(f"VALID_MANIFEST cases={len(manifest['cases'])} controls={len(manifest['controls'])} "
+              f"skipped_missing={len(manifest['skipped_missing'])}")
+        return 0
     out = (a.out or Path(_tempfile.mkdtemp(prefix="eval-reverts-"))).resolve()
     out.mkdir(parents=True, exist_ok=True)
     os.environ["HUNT_SCRATCH"] = str(out)  # hunt_dir(n) == <out>/hunt<n>, so build_requests writes where we read
