@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 
@@ -141,6 +142,8 @@ def test_cmd_base_caps_timeout_and_skips_passing_tests(tmp_path, monkeypatch):
     assert out["calc::TestHuntA_ClampAllClamps"] == "NEW_API"
     assert out["calc::TestHuntA_ClampAllEmpty"] == "NOT_A_HEAD_FAILURE"
     # Passing test TestHuntA_ClampAllEmpty is excluded from the base -run pattern, and timeout cap is passed.
+    runtimes = json.loads((hdir / "run_A.runtimes.json").read_text())
+    expected_cap = max(run.MUTANT_TIMEOUT_MIN_S, math.ceil(run.MUTANT_TIMEOUT_FACTOR * runtimes["calc"]))
     assert seen and all("ClampAllEmpty" not in pat for pats, _ in seen for pat in pats.values())
-    assert all(caps and caps.get("calc", 0) >= run.MUTANT_TIMEOUT_MIN_S for _, caps in seen)
+    assert all(caps and caps.get("calc") == expected_cap for _, caps in seen)
     _clean(state)

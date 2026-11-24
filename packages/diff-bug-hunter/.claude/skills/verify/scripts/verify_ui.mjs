@@ -309,10 +309,10 @@ export function validatePlan(plan, env = process.env) {
     if ('ignore' in plan && !(Array.isArray(plan.ignore) && plan.ignore.every(nonEmpty))) {
         throw new PlanError('ignore must be an array of non-empty json-path strings');
     }
-    if ('covers' in plan && !(Array.isArray(plan.covers) && plan.covers.length > 0 && plan.covers.every((c) => nonEmpty(c) && !/[\r\n]/.test(c)))) {
+    if ('covers' in plan && !(Array.isArray(plan.covers) && plan.covers.length > 0 && plan.covers.every((c) => nonEmpty(c) && !/[\r\n\u2028\u2029]/.test(c)))) {
         throw new PlanError('covers must be a non-empty array of single-line file paths');
     }
-    if ('verified_at' in plan && !(nonEmpty(plan.verified_at) && !/[\r\n]/.test(plan.verified_at))) {
+    if ('verified_at' in plan && !(nonEmpty(plan.verified_at) && !/[\r\n\u2028\u2029]/.test(plan.verified_at))) {
         throw new PlanError('verified_at must be a non-empty single-line string');
     }
     const allowOrigins = plan.allow_origins ?? [];
@@ -813,16 +813,9 @@ async function runStep(page, base, origin, step, vars) {
 // returns at once on a page that already reached that state, missing requests a click starts.
 async function settle(page, limit) {
     const start = Date.now();
-    let quietSince = page.inflight.size ? 0 : Date.now();
-    while (Date.now() - start < limit) {
+    while (Date.now() - start < limit
+           && (page.inflight.size || Date.now() - Math.max(start, page.lastActivityAt ?? start) < QUIET_MS)) {
         await page.waitForTimeout(50);
-        if (page.inflight.size) {
-            quietSince = 0;
-        } else if (!quietSince) {
-            quietSince = Date.now();
-        } else if (Date.now() - quietSince >= QUIET_MS) {
-            return null;
-        }
     }
     if (!page.inflight.size) {
         return null;
@@ -902,12 +895,17 @@ async function apiCall(reqHost, base, origin, spec, env, vars) {
     const method = (rawSpec.method ?? 'GET').toUpperCase();
     const apiPath = expandPath(rawSpec.path, origin, vars, true);
     const body = 'body' in rawSpec ? expandBody(rawSpec.body, vars) : undefined;
+    const serialized = body !== undefined ? JSON.stringify(body) : undefined;
+    if (serialized !== undefined && Buffer.byteLength(serialized, 'utf8') > MAX_BODY_BYTES) {
+        throw new Error(`${method} ${apiPath}: expanded api.body exceeds ${MAX_BODY_BYTES} bytes`);
+    }
     const auth = env.VERIFY_TOKEN ? {Authorization: `Bearer ${env.VERIFY_TOKEN}`} : {};
     const csrf = method !== 'GET' ? await csrfHeader(reqHost, base, env) : {};
     const req = reqHost.request ?? reqHost;
-    const opts = {method, headers: {'X-Requested-With': 'XMLHttpRequest', ...auth, ...csrf}, maxRedirects: 0};
-    if (body !== undefined) {
-        opts.data = body;
+    const contentType = serialized !== undefined ? {'Content-Type': 'application/json'} : {};
+    const opts = {method, headers: {'X-Requested-With': 'XMLHttpRequest', ...contentType, ...auth, ...csrf}, maxRedirects: 0};
+    if (serialized !== undefined) {
+        opts.data = serialized;
     }
     const res = await req.fetch(new URL(apiPath, base).toString(), opts);
     return {res, method, apiPath};
@@ -1054,9 +1052,11 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
             });
             page = await context.newPage();
             page.inflight = new Set();
+            page.lastActivityAt = Date.now();
             const loading = new Set();  // frames with a navigation request in progress
             page.on('request', (r) => {
                 page.inflight.add(r);
+                page.lastActivityAt = Date.now();
                 if (r.isNavigationRequest()) {
                     loading.add(r.frame());
                 }
@@ -1071,8 +1071,14 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                     }
                 }
             });
-            page.on('requestfinished', (r) => page.inflight.delete(r));
-            page.on('requestfailed', (r) => page.inflight.delete(r));
+            page.on('requestfinished', (r) => {
+                page.inflight.delete(r);
+                page.lastActivityAt = Date.now();
+            });
+            page.on('requestfailed', (r) => {
+                page.inflight.delete(r);
+                page.lastActivityAt = Date.now();
+            });
             // A request the page cancels by loading another document never gets requestfinished/requestfailed; forget it
             // then. Only a real load counts: an in-page URL change (history.pushState) cancels nothing.
             page.on('framenavigated', (frame) => {
@@ -1082,6 +1088,7 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                 for (const r of page.inflight) {
                     if (r.frame() === frame && !r.isNavigationRequest()) {
                         page.inflight.delete(r);
+                        page.lastActivityAt = Date.now();
                     }
                 }
             });
@@ -1159,6 +1166,9 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                     const got = await captureApi(reqHost, base, origin, step.capture, env, vars);
                     record?.captures.push({step: i + 1, ...got});
                     log(`${label} captured: HTTP ${got.status}, ${got.json === undefined ? 'not JSON' : 'JSON'}`);
+                    if (!record && got.status >= 500) {
+                        return await finish(1, `${label}: HTTP ${got.status} from ${got.method} ${got.path}`, await failSnap());
+                    }
                     continue;
                 }
                 await runStep(page, base, origin, step, vars);
@@ -1244,7 +1254,7 @@ const CLOCK_RE = /\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AP]M)?\b/gi;  // times of day
 const DAY_RE = /\b(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day, (?:January|February|March|April|May|June|July|August|September|October|November|December) \d{1,2}\b/g;
 const LOCAL_ORIGIN_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/g;
 const TIME_KEY_RE = /(?:_at|At|^timestamp|^Timestamp)$/;
-const VERSION_KEY_RE = /version|^build|^Build/i;
+const VERSION_KEY_RE = /^(?:[a-z_]+_)?version$|^[a-zA-Z0-9]*Version$|^build(?:[A-Z_]|$)|^Build(?:[A-Z_]|$)/;
 
 const escapeRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -1278,15 +1288,24 @@ export function normalizeJson(value, origins = [], key = '') {
             grouped.get(nk).push(normalizeJson(v, origins, k));
         }
         const out = {};
+        const multi = [];
         for (const [nk, vals] of grouped) {
             if (vals.length === 1) {
                 out[nk] = vals[0];
             } else {
-                const sorted = vals.map((val) => [JSON.stringify(val), val])
-                    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-                sorted.forEach(([, val], idx) => {
-                    out[`${nk}#${idx}`] = val;
-                });
+                multi.push([nk, vals]);
+            }
+        }
+        for (const [nk, vals] of multi) {
+            const sorted = vals.map((val) => [JSON.stringify(val), val])
+                .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+            let slot = 0;
+            for (const [, val] of sorted) {
+                while (Object.hasOwn(out, `${nk}#${slot}`)) {
+                    slot += 1;
+                }
+                out[`${nk}#${slot}`] = val;
+                slot += 1;
             }
         }
         return out;
@@ -1328,22 +1347,55 @@ export function diffJson(base, head, ignore = [], at = '') {
     return JSON.stringify(base) === JSON.stringify(head) ? [] : [{path: at || '$', base, head}];
 }
 
-// Line-level difference of two normalised snapshots: lines only in one side, paired in order.
-function diffLines(base, head) {
-    const count = (lines) => lines.reduce((m, l) => m.set(l, (m.get(l) ?? 0) + 1), new Map());
-    const take = (from, other) => {
-        const left = count(other);
-        return from.filter((l) => {
-            const n = left.get(l) ?? 0;
-            left.set(l, n - 1);
-            return n <= 0;
-        });
-    };
-    const a = base.split('\n');
-    const b = head.split('\n');
-    const onlyBase = take(a, b);
-    const onlyHead = take(b, a);
-    return Array.from({length: Math.max(onlyBase.length, onlyHead.length)}, (_, i) => ({base: onlyBase[i], head: onlyHead[i]}));
+// Line-level difference of two normalised snapshots: LCS hunk pairing so reordered lines are still reported.
+export function diffLines(base, head) {
+    const aLines = base.split('\n');
+    const bLines = head.split('\n');
+    let lo = 0;
+    let aHi = aLines.length;
+    let bHi = bLines.length;
+    while (lo < aHi && lo < bHi && aLines[lo] === bLines[lo]) {
+        lo++;
+    }
+    while (aHi > lo && bHi > lo && aLines[aHi - 1] === bLines[bHi - 1]) {
+        aHi--;
+        bHi--;
+    }
+    const a = aLines.slice(lo, aHi);
+    const b = bLines.slice(lo, bHi);
+    const m = a.length;
+    const n = b.length;
+    if (!m && !n) {
+        return [];
+    }
+    const dp = Array.from({length: m + 1}, () => new Int32Array(n + 1));
+    for (let i = m - 1; i >= 0; i--) {
+        for (let j = n - 1; j >= 0; j--) {
+            dp[i][j] = a[i] === b[j] ? 1 + dp[i + 1][j + 1] : Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+    }
+    const out = [];
+    let i = 0;
+    let j = 0;
+    while (i < m || j < n) {
+        const del = [];
+        const ins = [];
+        while (i < m && j < n ? a[i] !== b[j] : (i < m || j < n)) {
+            if (i < m && (j >= n || dp[i + 1][j] >= dp[i][j + 1])) {
+                del.push(a[i++]);
+            } else {
+                ins.push(b[j++]);
+            }
+        }
+        for (let k = 0; k < Math.max(del.length, ins.length); k++) {
+            out.push({base: del[k], head: ins[k]});
+        }
+        if (i < m && j < n && a[i] === b[j]) {
+            i++;
+            j++;
+        }
+    }
+    return out;
 }
 
 // All differences between two recorded runs, as {step, path, base, head} (strings already shown).
@@ -1553,6 +1605,7 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
             }
             const bodyArg = 'body' in rawApi ? `, expandBody(${q(rawApi.body)})` : '';
             lines.push('{', `  const res = await apiCall(page, expandPath(${q(rawApi.path)}, true), ${q(method)}${bodyArg});`);
+            lines.push("  expect(res.status(), 'no server error').toBeLessThan(500);");
             if (s.capture.save) {
                 lines.push('  const data: unknown = await res.json();');
                 for (const [k, dotPath] of Object.entries(s.capture.save)) {
@@ -1622,6 +1675,7 @@ const ALLOWED = new Set([new URL(BASE).origin, ...${q(allowOrigins)}.map((o: str
 const SETTLE_MS = Number(process.env.VERIFY_SETTLE_MS ?? ${DEFAULT_SETTLE_MS});
 const QUIET_MS = ${QUIET_MS};
 const TIMEOUT = ${ACTION_TIMEOUT_MS};
+const MAX_BODY_BYTES = ${MAX_BODY_BYTES};
 
 const originOf: (url: string) => string | null = ${originOf.toString()};
 ${typedSubset()}
@@ -1637,13 +1691,18 @@ async function apiCall(page: Page, path: string, method = 'GET', body?: unknown)
       csrf = {'X-CSRF-Token': c.value};
     }
   }
-  const opts: {method: string; headers: Record<string, string>; maxRedirects: number; data?: unknown} = {
+  const serialized = body !== undefined ? JSON.stringify(body) : undefined;
+  if (serialized !== undefined) {
+    expect(new TextEncoder().encode(serialized).length, \`expanded api.body exceeds \${MAX_BODY_BYTES} bytes\`).toBeLessThanOrEqual(MAX_BODY_BYTES);
+  }
+  const contentType: Record<string, string> = serialized !== undefined ? {'Content-Type': 'application/json'} : {};
+  const opts: {method: string; headers: Record<string, string>; maxRedirects: number; data?: string} = {
     method,
-    headers: {'X-Requested-With': 'XMLHttpRequest', ...auth, ...csrf},
+    headers: {'X-Requested-With': 'XMLHttpRequest', ...contentType, ...auth, ...csrf},
     maxRedirects: 0,
   };
-  if (body !== undefined) {
-    opts.data = body;
+  if (serialized !== undefined) {
+    opts.data = serialized;
   }
   try {
     return await page.request.fetch(new URL(path, BASE).toString(), opts);
@@ -1735,6 +1794,7 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async () => {
   const page = await context.newPage();
   const problems: string[] = [];
   const inflight = new Set<Request>();
+  let lastActivityAt = Date.now();
   await context.route('**/*', (route) => {
     const origin = originOf(route.request().url());
     return origin === null || ALLOWED.has(origin) ? route.continue() : route.abort('blockedbyclient');
@@ -1742,6 +1802,7 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async () => {
   const loading = new Set<unknown>();
   page.on('request', (r) => {
     inflight.add(r);
+    lastActivityAt = Date.now();
     if (r.isNavigationRequest()) {
       loading.add(r.frame());
     }
@@ -1752,8 +1813,14 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async () => {
       problems.push(\`navigated to a non-allowed origin: \${origin}\`);
     }
   });
-  page.on('requestfinished', (r) => inflight.delete(r));
-  page.on('requestfailed', (r) => inflight.delete(r));
+  page.on('requestfinished', (r) => {
+    inflight.delete(r);
+    lastActivityAt = Date.now();
+  });
+  page.on('requestfailed', (r) => {
+    inflight.delete(r);
+    lastActivityAt = Date.now();
+  });
   page.on('framenavigated', (frame) => {
     if (!loading.delete(frame)) {
       return; // an in-page URL change (history.pushState) cancels nothing
@@ -1761,6 +1828,7 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async () => {
     for (const r of inflight) {
       if (r.frame() === frame && !r.isNavigationRequest()) {
         inflight.delete(r);
+        lastActivityAt = Date.now();
       }
     }
   });
@@ -1780,11 +1848,7 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async () => {
   // Wait until nothing has been in flight for QUIET_MS (at most SETTLE_MS), then apply the oracle, as verify_ui.mjs does.
   const settle = async () => {
     const start = Date.now();
-    let quiet = Date.now();
-    while (Date.now() - start < SETTLE_MS && (inflight.size || Date.now() - quiet < QUIET_MS)) {
-      if (inflight.size) {
-        quiet = Date.now();
-      }
+    while (Date.now() - start < SETTLE_MS && (inflight.size || Date.now() - Math.max(start, lastActivityAt) < QUIET_MS)) {
       await page.waitForTimeout(50);
     }
     expect(inflight.size, 'requests still in flight at the settle deadline').toBe(0);

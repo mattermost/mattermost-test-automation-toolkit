@@ -1,6 +1,6 @@
 line-length = 130
 target-version = "py310"
-extend-exclude = ["eval/legacy_hunt", "ui/node_modules", "vendor", "tests/hunt_fixtures/jestdeps", "bench/fixtures/.jestdeps"]
+extend-exclude = ["tests/hunt_fixtures/jestdeps"]
 
 [lint]
 # Pyflakes, pycodestyle, bugbear, imports, pyupgrade, simplify, plus the checks that catch silent failures:
@@ -9,5 +9,6 @@ select = ["E", "F", "W", "B", "I", "UP", "SIM", "C4", "PIE", "ISC", "DTZ", "BLE"
 ignore = ["E501", "C408", "UP031"]  # long prompt strings, dict() calls, %-format: style only
 
 [lint.per-file-ignores]
-# entry scripts redirect the bytecode cache before importing skill modules (see the guard at their top)
+# entry scripts set bytecode guards / sys.path before importing sibling skill modules
 ".claude/skills/hunt/scripts/*.py" = ["E402"]
+"eval/*.py" = ["E402"]

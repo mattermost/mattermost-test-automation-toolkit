@@ -15,22 +15,20 @@ CANDIDATE: a person writes the real ones and lands the rule on the base branch i
 """
 from __future__ import annotations
 
-import atexit as _atexit
-import shutil as _shutil
-import sys as _sys
-import tempfile as _tempfile
+import sys
 
-# Never load bytecode from the skill directory: a committed __pycache__/*.pyc (an unchecked-hash .pyc, say) would run
-# code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
-if not _sys.pycache_prefix:
-    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
-    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
+sys.dont_write_bytecode = True
+if not sys.pycache_prefix:
+    sys.pycache_prefix = "/dev/null/hunt-pyc"
 
 import argparse
 import re
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+_SCRIPTS = Path(__file__).resolve().parent.parent / ".claude" / "skills" / "hunt" / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
 
 import prefilter
 from hunt_common import SKILL_DIR, git
@@ -72,8 +70,16 @@ def read_reverts(repo: Path, n: int) -> list[Revert]:
     for sha, subject in picked:
         r = Revert(sha, subject)
         current = None
+        in_hunk = False
         for d in git(repo, "show", "--no-renames", "--unified=0", "--format=", sha).splitlines():
-            if d.startswith(("--- ", "+++ ")):
+            if d.startswith("diff --git "):
+                in_hunk = False
+                current = None
+                continue
+            if d.startswith("@@ "):
+                in_hunk = True
+                continue
+            if not in_hunk and d.startswith(("--- ", "+++ ")):
                 path = d[6:] if d[4:6] in ("a/", "b/") else ""  # "/dev/null" for an added or deleted file
                 if path:
                     current = glob_of(path) if wanted(path) else None
@@ -82,7 +88,7 @@ def read_reverts(repo: Path, n: int) -> list[Revert]:
                 elif d.startswith("--- "):
                     current = None  # an added file: its "+++ b/..." line follows
                 continue
-            if current and d[:1] in "+-":
+            if in_hunk and current and d[:1] in "+-":
                 r.tokens.setdefault(current, set()).update(t for t in IDENT.findall(d[1:]) if t not in STOP)
         if r.globs:
             out.append(r)

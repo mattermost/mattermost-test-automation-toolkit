@@ -1,6 +1,6 @@
 # Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 # See LICENSE.txt for license information.
-"""Self-test for eval_reverts.py's per-signal scoring, repair round and per-tag isolation, and for mine_controls.py.
+"""Self-test for eval_bugs.py's per-signal scoring, repair round and per-tag isolation, and for mine_controls.py.
 
 The signal functions (old_tests.cmd_old, pr_tests.cmd_pr) are stubbed: they are tested on their own elsewhere. The hunter
 path runs for real on the same fixture repos as test_hunt_engine.py's eval tests."""
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import types
@@ -16,12 +17,9 @@ from typing import Any
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-SCRIPTS = ROOT / ".claude" / "skills" / "hunt" / "scripts"
 FIX = Path(__file__).resolve().parent / "hunt_fixtures"
-sys.path.insert(0, str(SCRIPTS))
 
-import eval_reverts  # noqa: E402
+import eval_bugs  # noqa: E402
 import hunt_common  # noqa: E402
 import mine_controls  # noqa: E402
 import old_tests  # noqa: E402
@@ -33,10 +31,7 @@ GIT_ENV = {**hunt_common.git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": 
 
 
 @pytest.fixture(autouse=True)
-def _isolated(monkeypatch, tmp_path):
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
+def _isolated(monkeypatch):
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
 
 
@@ -60,7 +55,7 @@ def _manifest() -> dict[str, Any]:
     ids = [("case", "c1"), ("case", "c2"), ("case", "c3"), ("control", "k1"), ("control", "k2")]
     return {"cases": [{"id": i, "area": "a"} for k, i in ids if k == "case"],
             "controls": [{"id": i, "area": "a"} for k, i in ids if k == "control"],
-            "thresholds": dict(eval_reverts.DEFAULT_THRESHOLDS)}
+            "thresholds": dict(eval_bugs.DEFAULT_THRESHOLDS)}
 
 
 def test_scorecard_reports_recall_and_fp_for_each_signal_and_combined():
@@ -71,7 +66,7 @@ def test_scorecard_reports_recall_and_fp_for_each_signal_and_combined():
         "k1": _entry(pr={"p": "PR_TEST_FAILS"}, old={"o": "PASS"}),  # pr_fails: reported, not a finding
         "k2": _entry(run={"t": "FAIL_3_OF_3"}, base={"t": "PRE_EXISTING"}),
     }
-    card = eval_reverts.scorecard(_manifest(), hunted)
+    card = eval_bugs.scorecard(_manifest(), hunted)
     m = card["metrics"]
     third = round(1 / 3, 4)
     assert (m["raw_recall"], m["vetted_recall"], m["fp_rate"], m["raw_fp_rate"]) == (round(2 / 3, 4), third, 0.0, 0.5)
@@ -87,7 +82,7 @@ def test_scorecard_reports_recall_and_fp_for_each_signal_and_combined():
     assert rows["c1"]["vetted"] is True and rows["k2"]["raw"] is True and rows["k2"]["any"] is False
     # the thresholds still judge the hunters' raw and vetted metrics only
     assert card["checks"] == {"raw_recall": True, "vetted_recall": True, "fp_rate": True} and card["verdict"] == "PASS"
-    text = eval_reverts.render(card)
+    text = eval_bugs.render(card)
     assert "hunters new-api" in text and "pr tests (ci)" in text and "combined (any)" in text
     assert "(3 cases, 2 controls)" in text
 
@@ -95,9 +90,9 @@ def test_scorecard_reports_recall_and_fp_for_each_signal_and_combined():
 def test_scorecard_ignores_a_signal_that_was_switched_off():
     hunted = {"c1": _entry(run={"t": "FAIL_3_OF_3"}, base={"t": "NEW_PR_BUG"}, old={"o": "OLD_TEST_BREAKS"})}
     manifest = {**_manifest(), "cases": [{"id": "c1", "area": "a"}], "controls": []}
-    card = eval_reverts.scorecard(manifest, hunted, ("old",))
+    card = eval_bugs.scorecard(manifest, hunted, ("old",))
     assert card["metrics"]["vetted_recall"] == 0.0 and card["metrics"]["old_recall"] == 1.0
-    assert card["signals"] == ["old"] and "hunters vetted     off" in eval_reverts.render(card)
+    assert card["signals"] == ["old"] and "hunters vetted     off" in eval_bugs.render(card)
 
 
 # ------------------------------------------------------------------ the real hunter path, stubbed model-free signals
@@ -148,7 +143,7 @@ def test_eval_scores_each_signal_from_the_stubbed_checks(tmp_path, monkeypatch, 
     path, _ = _fixture_manifest(tmp_path)
     _stub_signals(monkeypatch, {"hunt1": {"T::a": "OLD_TEST_BREAKS", "T::b": "OLD_TEST_SOMETIMES_BREAKS"}},
                   {"hunt1": {"P::a": "PR_TEST_FAILS_UNDER_CI"}, "hunt2": {"P::b": "PR_TEST_FAILS"}})
-    code = eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out")])
+    code = eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out")])
     assert code == 0, capsys.readouterr().out
     card = _card(tmp_path)
     m = card["metrics"]
@@ -167,11 +162,11 @@ def test_eval_signals_flag_runs_only_the_chosen_signals(tmp_path, monkeypatch, c
         raise AssertionError("hunters must not run")
 
     monkeypatch.setattr(run, "cmd_run", boom)
-    code = eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out"), "--signals", "old,pr"])
+    code = eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out"), "--signals", "old,pr"])
     assert code == 0, capsys.readouterr().out
     m = _card(tmp_path)["metrics"]
     assert (m["raw_recall"], m["vetted_recall"], m["old_recall"], m["pr_ci_recall"]) == (0.0, 0.0, 1.0, 1.0)
-    assert eval_reverts.main(["eval_reverts.py", str(path), "--signals", "old,bogus"]) == 2
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--signals", "old,bogus"]) == 2
     assert "INVALID_SIGNALS" in capsys.readouterr().out
 
 
@@ -179,7 +174,7 @@ def test_eval_records_a_missing_or_failing_pr_signal_and_keeps_the_entry(tmp_pat
     path, _ = _fixture_manifest(tmp_path)
     monkeypatch.setattr(old_tests, "cmd_old", lambda hdir, state: {"tests": {}})
     monkeypatch.setitem(sys.modules, "pr_tests", None)  # import raises ImportError
-    assert eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out")]) == 0
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out")]) == 0
     rows = {r["id"]: r for r in _card(tmp_path)["rows"]}
     assert "signal not available" in rows["clamp"]["pr_error"] and rows["clamp"]["error"] is None
     assert rows["clamp"]["vetted"] is True  # the hunters' result stands
@@ -190,7 +185,7 @@ def test_eval_records_a_missing_or_failing_pr_signal_and_keeps_the_entry(tmp_pat
     fake = types.ModuleType("pr_tests")
     fake.cmd_pr = infra  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "pr_tests", fake)
-    assert eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out2")]) == 0
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out2")]) == 0
     rows = {r["id"]: r for r in _card(tmp_path, "out2")["rows"]}
     assert rows["clamp"]["pr_error"] == "no CI config here" and rows["clamp"]["error"] is None
     assert "pr-tests ERROR no CI config here" in capsys.readouterr().out
@@ -215,7 +210,7 @@ def test_eval_an_infra_error_in_one_hunter_keeps_the_other_hunter_and_signals(tm
         return real(hdir, state, tag, runs)
 
     monkeypatch.setattr(run, "cmd_run", flaky)
-    code = eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out")])
+    code = eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out")])
     out = capsys.readouterr().out
     card = _card(tmp_path)
     rows = {r["id"]: r for r in card["rows"]}
@@ -236,8 +231,8 @@ def test_eval_entries_that_cannot_prepare_still_count_as_errors(tmp_path, monkey
     def no_deps(*_a: Any, **_k: Any) -> None:
         raise hunt_common.InfraError("npm ci failed")
 
-    monkeypatch.setattr(eval_reverts.prepare, "deps", no_deps)
-    assert eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out")]) == 2
+    monkeypatch.setattr(eval_bugs.prepare, "deps", no_deps)
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out")]) == 2
     assert "VERDICT: ERROR" in capsys.readouterr().out and set(_card(tmp_path)["errors"]) == {"clamp", "percent"}
 
 
@@ -258,14 +253,14 @@ def _dispatcher(tmp: Path, repair_fixes: bool) -> tuple[str, Path]:
         f"    if {not repair_fixes!r} or sys.argv[1].endswith('request.json'):\n"
         "        out['files'][0]['content'] += '\\nvar _ = undefinedHuntSymbol\\n'\n"
         "json.dump(out, open(req['response_path'], 'w'))\n")
-    return f"{sys.executable} {script}", log
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}", log
 
 
 def test_eval_gives_a_compile_error_one_repair_round_when_dispatching(tmp_path, monkeypatch, capsys):
     path, _ = _fixture_manifest(tmp_path / "m", responses=False)
     _stub_signals(monkeypatch, {}, {})
     cmd, log = _dispatcher(tmp_path, repair_fixes=True)
-    code = eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out"), "--dispatch", cmd])
+    code = eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out"), "--dispatch", cmd])
     out = capsys.readouterr().out
     assert code == 0, out
     rows = {r["id"]: r for r in _card(tmp_path)["rows"]}
@@ -285,8 +280,8 @@ def test_eval_a_repair_that_still_does_not_compile_is_a_miss(tmp_path, monkeypat
     path, _ = _fixture_manifest(tmp_path / "m", responses=False)
     _stub_signals(monkeypatch, {}, {})
     cmd, log = _dispatcher(tmp_path, repair_fixes=False)
-    code = eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out"), "--dispatch", cmd,
-                              "--signals", "hunters"])
+    code = eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out"), "--dispatch", cmd,
+                           "--signals", "hunters"])
     capsys.readouterr()
     card = _card(tmp_path)
     rows = {r["id"]: r for r in card["rows"]}
@@ -309,7 +304,7 @@ def test_eval_without_dispatch_a_compile_error_is_a_miss_with_no_repair(tmp_path
     m["cases"][0]["responses"] = str(broken.parent)
     path.write_text(json.dumps(m))
     _stub_signals(monkeypatch, {}, {})
-    eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out"), "--signals", "hunters"])
+    eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out"), "--signals", "hunters"])
     capsys.readouterr()
     row = next(r for r in json.loads((tmp_path / "out" / "entry_1_clamp.json").read_text())["results"]
                if r["hunter"] == "A")
@@ -324,13 +319,13 @@ def test_eval_appends_extra_controls_and_keeps_ids_unique(tmp_path, monkeypatch,
     sha = _git(repo, "rev-parse", "HEAD~1")  # any commit with a parent: the bug commit
     extra = tmp_path / "extra.json"
     extra.write_text(json.dumps({"controls": [{"id": "extra-1", "repo": str(repo), "area": "calc", "sha": sha, "matches": "clamp"}]}))
-    assert eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out"), "--signals", "old",
-                              "--controls", str(extra)]) == 0
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out"), "--signals", "old",
+                           "--controls", str(extra)]) == 0
     assert [r["id"] for r in _card(tmp_path)["rows"]] == ["clamp", "percent", "extra-1"]
     extra.write_text(json.dumps([{"id": "percent", "repo": str(repo), "area": "calc", "sha": sha}]))  # a bare list, with a clashing id
-    assert eval_reverts.main(["eval_reverts.py", str(path), "--controls", str(extra)]) == 2
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--controls", str(extra)]) == 2
     assert "ids must be unique" in capsys.readouterr().out
-    assert eval_reverts.main(["eval_reverts.py", str(path), "--controls", str(tmp_path / "nope.json")]) == 2
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--controls", str(tmp_path / "nope.json")]) == 2
 
 
 # ------------------------------------------------------------------ mine_controls
@@ -447,7 +442,7 @@ def test_eval_scores_mode_d_diff_signal_from_responses_and_dispatch(tmp_path, mo
     }
     mpath = tmp_path / "manifest.json"
     mpath.write_text(json.dumps(manifest))
-    code = eval_reverts.main(["eval_reverts.py", str(mpath), "--out", str(tmp_path / "out"), "--signals", "diff"])
+    code = eval_bugs.main(["eval_bugs.py", str(mpath), "--out", str(tmp_path / "out"), "--signals", "diff"])
     out = capsys.readouterr().out
     assert code == 0, out
     card = _card(tmp_path)
@@ -456,3 +451,20 @@ def test_eval_scores_mode_d_diff_signal_from_responses_and_dispatch(tmp_path, mo
     assert "diff (Mode D)" in out
     rows = {r["id"]: r for r in card["rows"]}
     assert rows["diff-case"]["diff"] is True and rows["diff-ctl"]["diff"] is False
+
+
+def test_mine_controls_finds_in_window_commit_under_out_of_order_child_date(tmp_path):
+    repo = tmp_path / "skew"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "master")
+    _commit(repo, "init", {"b/init.go": 1}, "init", "2024-05-01T00:00:00Z")
+    bug = _commit(repo, "bug", {"a/x.go": 5}, "bug commit", "2024-06-01T00:00:00Z")
+    _git(repo, "revert", "--no-edit", "HEAD", when="2024-06-02T00:00:00Z")
+    fix = _git(repo, "rev-parse", "HEAD")
+    target = _commit(repo, "target", {"a/y.go": 5}, "clean change in window", "2024-06-05T00:00:00Z")
+    # Skewed timestamp older than case - 90d; git log --after would cut off traversal before reaching target.
+    _commit(repo, "skewed", {"b/skew.go": 1}, "rebased old timestamp", "2024-01-01T00:00:00Z")
+    _commit(repo, "tip", {"b/tip.go": 1}, "tip", "2024-06-10T00:00:00Z")
+    manifest = {"cases": [{"id": "c1", "bug_sha": bug, "fix_sha": fix, "area": "a"}], "controls": []}
+    picked, _ = mine_controls.mine(repo, manifest, 5)
+    assert any(c["sha"] == target for c in picked)

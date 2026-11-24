@@ -10,7 +10,7 @@ read screenshots. The one exception: when the user asks for visual proof, add `-
 single `failure.png` only if the run FAILs. Hand its path to the user and never read it yourself.
 
 1. **Server and auth:** check that the target answers `GET /api/v4/system/ping`: the `base_url` the user gave, else
-   `VERIFY_BASE_URL`, else `MM_URL`, else `http://localhost:8065`. If it doesn't, stop and report `INFRA_ERROR`; do not start or reconfigure servers unasked.
+   `VERIFY_BASE_URL`, else `MM_URL`, else `http://localhost:8065`. If it doesn't, stop and report `INFRA_ERROR`; do not start or reconfigure servers unasked. If `VERIFY_TOKEN` or `VERIFY_USER`/`VERIFY_PASSWORD` are set against a non-default URL, set `VERIFY_BASE_URL` to that origin too (`base_url` in a plan cannot override the trusted origin once credentials are set).
    - **A PR's or release's own build** (when the user asks to check a PR or release range): never build it locally. `scripts/pr_server.py images <pr | base...head> --pull`
      gives and pulls the enterprise images of head and merge-base (`/hunt` starts this at step 1 when the diff
      touches `webapp/` or a server API a page calls; otherwise start it yourself, a cold pull is 10-15 min). `scripts/pr_server.py up <image>` runs the mattermost repo's
@@ -18,7 +18,7 @@ single `failure.png` only if the run FAILs. Hand its path to the user and never 
      drops its volumes: ask before running it over a stack the user is using), and seeds both the
      `VERIFY_USER` system admin and a non-admin `verify_member` (same `VERIFY_PASSWORD`, joined to team `verify`,
      onboarding overlay off for both). Pass `VERIFY_USER=verify_member` to test non-admin / RBAC behavior. One stack at a time: run the plan on head, then `up` the base
-     image and run it again, and compare the two verdicts (`--compare` needs both up at once). An image swap takes
+     image and run it again, and compare the two verdicts (`--compare` needs both up at once; two standalone `PASS` verdicts only show assertions held on each build, not whether captured values changed). An image swap takes
      ~100 s, the plan seconds. A missing image = CI has not built that commit yet: say so, do not build it.
    - Logged-in pages: the runner authenticates through the API before the first step, so no step goes to the login
      form. Put `"login": true` in the plan so missing credentials fail as `INFRA_ERROR`.

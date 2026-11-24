@@ -17,7 +17,17 @@ import sys
 import threading
 from pathlib import Path
 
+import build_requests
+import ctx
+import hunt_common
+import lessons
+import old_tests
+import prefilter
+import prepare
 import pytest
+import reliability
+import run
+import trusted
 
 ROOT = Path(__file__).resolve().parent.parent
 SKILL = ROOT / ".claude" / "skills" / "hunt"
@@ -26,29 +36,10 @@ VERIFY_UI = ROOT / ".claude" / "skills" / "verify" / "scripts" / "verify_ui.mjs"
 VERIFY_DEPS = Path(__file__).resolve().parent / "verify_fixtures" / "node_modules"
 FIX = Path(__file__).resolve().parent / "hunt_fixtures"
 JESTDEPS = FIX / "jestdeps" / "node_modules"
-sys.path.insert(0, str(SCRIPTS))
-
-import build_requests  # noqa: E402
-import ctx  # noqa: E402
-import hunt_common  # noqa: E402
-import lessons  # noqa: E402
-import old_tests  # noqa: E402
-import prefilter  # noqa: E402
-import prepare  # noqa: E402
-import reliability  # noqa: E402
-import run  # noqa: E402
-import trusted  # noqa: E402
 
 # Fixture repos ignore the developer's git config (signing, hooks, templates) and inherited repository locations.
 GIT_ENV = {**hunt_common.git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
            "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
-
-
-@pytest.fixture(autouse=True)
-def _no_user_git_config(monkeypatch, tmp_path):
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))  # logs and caches never leave the test's own dir
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -890,6 +881,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             import time
             time.sleep(2)
             self._send(200, "{}")
+        elif self.path == "/api/v4/things/item42":
+            authed = self._auth() is not None
+            title = getattr(self.server, "things", {}).get("item42", "")
+            self._send(200 if authed else 401, json.dumps({"id": "item42", "title": title}))
         else:
             self._send(404, "{}")
 
@@ -921,7 +916,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         if self.path == "/api/v4/things/item42":
             parsed = json.loads(body or b"{}")
-            self._send(200 if self._auth() else 401, json.dumps({"id": "item42", "title": parsed.get("title", ""), "patched": True}))
+            if not hasattr(self.server, "things"):
+                self.server.things = {}
+            title = parsed.get("title", "") if isinstance(parsed, dict) else parsed
+            if self._auth():
+                self.server.things["item42"] = title
+            self._send(200 if self._auth() else 401, json.dumps({"id": "item42", "title": title, "patched": True}))
         else:
             self._send(404, "{}")
 
@@ -966,8 +966,16 @@ def _playwright_available() -> bool:
     return p.returncode == 0
 
 
+def _node_available() -> bool:
+    try:
+        return subprocess.run(["node", "-v"], env=_node_env("none"), capture_output=True, check=False).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
 # CI sets HUNT_REQUIRE_DEPS=1 so missing dependencies fail loudly instead of skipping.
 REQUIRE_DEPS = bool(os.environ.get("HUNT_REQUIRE_DEPS"))
+needs_node = pytest.mark.skipif(not REQUIRE_DEPS and not _node_available(), reason="node not on PATH")
 needs_playwright = pytest.mark.skipif(not REQUIRE_DEPS and not _playwright_available(), reason="run `make verify-deps` first")
 
 
@@ -1577,6 +1585,7 @@ def test_frozen_spec_type_checks_strictly(tmp_path, ui_server):
     assert p.returncode == 0, p.stdout + p.stderr
 
 
+@needs_node
 def test_json_has_matches_like_to_match_object():
     assert _module("[m.subset({roles: ['a']}, {roles: ['a', 'b']}), m.subset({a: {b: 1}}, {a: {b: 1, c: 2}}),"
                    " m.subset({x: [1]}, {x: [1]}), m.subset({x: null}, {x: null}), m.subset({x: 1}, {x: '1'})]") == \
@@ -2191,7 +2200,7 @@ def test_low_disk_is_infra_error_before_any_work(tmp_path, monkeypatch):
 
 def test_runner_never_sleeps_or_retries_tests():
     # flaky tests are reported (FLAKY, 3 runs), never retried into a pass or slept around
-    for name in ("run.py", "prepare.py", "eval_reverts.py"):
+    for name in ("run.py", "prepare.py", "eval_bugs.py"):
         src = (SCRIPTS / name).read_text()
         assert not re.search(r"\bsleep\(|--retries|retryTimes|-count=[2-9]", src), name
 
@@ -2316,11 +2325,11 @@ def _eval_manifest(tmp: Path, **thresholds: float) -> tuple[Path, str]:
     return path, truth
 
 
-def test_eval_reverts_scores_a_real_bug_and_a_clean_control(tmp_path, monkeypatch, capsys):
-    import eval_reverts
+def test_eval_bugs_scores_a_real_bug_and_a_clean_control(tmp_path, monkeypatch, capsys):
+    import eval_bugs
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
     path, _ = _eval_manifest(tmp_path, raw_recall_min=1.0, vetted_recall_min=1.0, fp_rate_max=0.0)
-    code = eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out")])
+    code = eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out")])
     out = capsys.readouterr().out
     assert code == 0 and "VERDICT: PASS" in out, out
     card = json.loads((tmp_path / "out" / "scorecard.json").read_text())
@@ -2331,25 +2340,25 @@ def test_eval_reverts_scores_a_real_bug_and_a_clean_control(tmp_path, monkeypatc
                                "old_sometimes_fp_rate": 0.0, "pr_ci_recall": 0.0, "pr_ci_fp_rate": 0.0,
                                "pr_fails_recall": 0.0, "pr_fails_fp_rate": 0.0}
     # the same responses always give the same scorecard
-    assert eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out2")]) == 0
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out2")]) == 0
     assert json.loads((tmp_path / "out2" / "scorecard.json").read_text()) == card
     # a threshold the run misses fails the benchmark
     path2, _ = _eval_manifest(tmp_path / "strict", fp_rate_max=-1.0)
-    assert eval_reverts.main(["eval_reverts.py", str(path2), "--out", str(tmp_path / "out3")]) == 1
+    assert eval_bugs.main(["eval_bugs.py", str(path2), "--out", str(tmp_path / "out3")]) == 1
 
 
-def test_eval_reverts_refuses_a_manifest_whose_fix_is_not_the_revert(tmp_path, capsys):
-    import eval_reverts
+def test_eval_bugs_refuses_a_manifest_whose_fix_is_not_the_revert(tmp_path, capsys):
+    import eval_bugs
     path, _ = _eval_manifest(tmp_path)
     m = json.loads(path.read_text())
     m["cases"][0]["fix_sha"] = m["cases"][0]["bug_sha"]  # a commit cannot revert itself
     path.write_text(json.dumps(m))
-    assert eval_reverts.main(["eval_reverts.py", str(path)]) == 2
+    assert eval_bugs.main(["eval_bugs.py", str(path)]) == 2
     assert "does not say it reverts" in capsys.readouterr().out
 
 
-def test_eval_reverts_dispatch_never_shows_the_ground_truth(tmp_path, monkeypatch, capsys):
-    import eval_reverts
+def test_eval_bugs_dispatch_never_shows_the_ground_truth(tmp_path, monkeypatch, capsys):
+    import eval_bugs
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
     path, truth = _eval_manifest(tmp_path)
     m = json.loads(path.read_text())
@@ -2365,8 +2374,8 @@ def test_eval_reverts_dispatch_never_shows_the_ground_truth(tmp_path, monkeypatc
         f"if '/A/' in req['response_path'] and 'Clamp' in req['user']:\n"
         f"    out = json.load(open({str(FIX / 'go_bug' / 'responses' / 'A' / 'response.json')!r}))\n"
         "json.dump(out, open(req['response_path'], 'w'))\n")
-    code = eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out"),
-                              "--dispatch", f"{sys.executable} {dispatcher}"])
+    code = eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out"),
+                           "--dispatch", f"{sys.executable} {dispatcher}"])
     out = capsys.readouterr().out
     assert code == 0 and "clamp" in out and "VERDICT: PASS" in out, out
     text = seen.read_text()
@@ -2522,20 +2531,20 @@ def test_frozen_replay_rechecks_the_cookie_rule_for_its_new_target(tmp_path, ui_
 
 
 def test_shipped_revert_manifest_is_well_formed():
-    import eval_reverts
+    import eval_bugs
     m = json.loads((ROOT / "eval" / "revert_cases.json").read_text())
     ids = [e["id"] for e in m["cases"] + m["controls"]]
     assert len(ids) == len(set(ids)) and len(m["cases"]) >= 5
     # exactly one size-matched control per case
     assert sorted(c["matches"] for c in m["controls"]) == sorted(e["id"] for e in m["cases"])
     for e in m["cases"]:
-        assert all(str(e.get(k, "")).strip() for k in eval_reverts.CASE_KEYS), e
+        assert all(str(e.get(k, "")).strip() for k in eval_bugs.CASE_KEYS), e
         assert re.fullmatch(r"[0-9a-f]{40}", e["bug_sha"]) and re.fullmatch(r"[0-9a-f]{40}", e["fix_sha"]), e
         assert e["source"].startswith("https://github.com/mattermost/mattermost/pull/"), e
     case_ids = {e["id"] for e in m["cases"]}
     for e in m["controls"]:
         assert re.fullmatch(r"[0-9a-f]{40}", e["sha"]) and e["matches"] in case_ids, e
-    assert set(m["thresholds"]) == set(eval_reverts.DEFAULT_THRESHOLDS)
+    assert set(m["thresholds"]) == set(eval_bugs.DEFAULT_THRESHOLDS)
 
 
 # ------------------------------------------------------------------ revert benchmark: the disk gate and per-entry failures
@@ -2543,20 +2552,20 @@ def test_shipped_revert_manifest_is_well_formed():
 def test_eval_checks_disk_before_creating_any_worktree(tmp_path, monkeypatch, capsys):
     import collections
 
-    import eval_reverts
+    import eval_bugs
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
     usage = collections.namedtuple("usage", "total used free")
     monkeypatch.setattr(hunt_common.shutil, "disk_usage", lambda p: usage(10 * 1024**3, 9 * 1024**3, 1024**3))
     path, _ = _eval_manifest(tmp_path)
     out = tmp_path / "out"
-    assert eval_reverts.main(["eval_reverts.py", str(path), "--out", str(out)]) == 2
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(out)]) == 2
     text = capsys.readouterr().out
     assert "VERDICT: ERROR" in text and "GiB free" in text, text
     assert not (out / "wt1").exists() and not (out / "wt1.base").exists()  # nothing was checked out
 
 
 def test_eval_records_a_broken_entry_and_still_hunts_the_rest(tmp_path, monkeypatch, capsys):
-    import eval_reverts
+    import eval_bugs
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
     path, _ = _eval_manifest(tmp_path)
     broken = tmp_path / "broken_responses" / "A"
@@ -2565,7 +2574,7 @@ def test_eval_records_a_broken_entry_and_still_hunts_the_rest(tmp_path, monkeypa
     m = json.loads(path.read_text())
     m["cases"][0]["responses"] = str(broken.parent)
     path.write_text(json.dumps(m))
-    code = eval_reverts.main(["eval_reverts.py", str(path), "--out", str(tmp_path / "out")])
+    code = eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out")])
     text = capsys.readouterr().out
     assert code == 2 and "VERDICT: ERROR" in text, text
     card = json.loads((tmp_path / "out" / "scorecard.json").read_text())
@@ -2575,12 +2584,12 @@ def test_eval_records_a_broken_entry_and_still_hunts_the_rest(tmp_path, monkeypa
 
 
 def test_eval_refuses_a_responses_directory_that_does_not_exist(tmp_path, capsys):
-    import eval_reverts
+    import eval_bugs
     path, _ = _eval_manifest(tmp_path)
     m = json.loads(path.read_text())
     m["cases"][0]["responses"] = str(tmp_path / "no_such_dir")
     path.write_text(json.dumps(m))
-    assert eval_reverts.main(["eval_reverts.py", str(path)]) == 2
+    assert eval_bugs.main(["eval_bugs.py", str(path)]) == 2
     assert "responses directory" in capsys.readouterr().out
 
 
@@ -2778,6 +2787,7 @@ def test_verify_api_write_methods_csrf_save_and_browserless_fast_path(tmp_path, 
             {"capture": {"api": {"method": "PATCH", "path": "/api/v4/things/$tid", "body": {"title": "patched-$tid"}}}},
         ],
         "expect": [
+            {"api": {"method": "GET", "path": "/api/v4/things/$tid", "status": 200, "json_has": {"title": "patched-item42"}}},
             {"api": {"method": "DELETE", "path": "/api/v4/things/$tid", "status": 200, "json_has": {"status": "OK"}}},
         ],
     }
@@ -2815,13 +2825,14 @@ def test_verify_drag_release_false_mouse_up_and_freeze(tmp_path, ui_server):
         "steps": [
             {"goto": "/drag"},
             {"drag": {"from": {"css": "#handle"}, "dx": 60, "dy": 0, "release": False}},
-            {"click": {"role": "button", "name": "Unmount"}},
+            {"press": "Enter", "on": {"role": "button", "name": "Unmount"}},
+            {"snapshot": {"css": "#state"}},
             {"mouse_up": True},
         ],
         "expect": [{"text": {"css": "#state"}, "contains": "down,dragged,up"}],
     }
     code, out = verify(tmp_path, plan, "--freeze", "drag.spec.ts", auth="none")
-    assert code == 0, out
+    assert code == 0 and "- paragraph: down,dragged\n" in out, out
     (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
     (tmp_path / "tsconfig.json").write_text(json.dumps({"compilerOptions": {
         "strict": True, "noEmit": True, "target": "es2022", "module": "esnext", "moduleResolution": "bundler",
@@ -2921,3 +2932,169 @@ def test_verify_freeze_emits_covers_and_verified_at_and_rejects_multiline(tmp_pa
         bad_plan = {"base_url": ui_server, "steps": [], "expect": [{"api": {"path": "/api/v4/users/me", "status": 401}}], **bad}
         bcode, bout = verify(tmp_path, bad_plan, auth="none")
         assert bcode == 2 and "INVALID_PLAN" in bout, (bad, bout)
+
+
+def test_prepare_worktrees_refuses_non_worktree_dir(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "master")
+    _overlay(FIX / "go_bug" / "base", repo)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    mb = _git(repo, "rev-parse", "HEAD")
+    _overlay(FIX / "go_bug" / "head", repo)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "head")
+    head = _git(repo, "rev-parse", "HEAD")
+    wt, wt_base = tmp_path / "wt", tmp_path / "wt_base"
+    wt.mkdir()
+    keep = wt / "keep.txt"
+    keep.write_text("do not delete")
+    with pytest.raises(hunt_common.InfraError, match="not a git worktree"):
+        prepare.worktrees(repo, head, mb, wt, wt_base)
+    assert keep.read_text() == "do not delete"
+
+
+def test_run_clears_stale_coverage_and_records_jest_package_failed(tmp_path, monkeypatch):
+    go_dir = tmp_path / "go"
+    go_dir.mkdir()
+    hdir, state = make_hunt(go_dir, "go_bug")
+    cov = hdir / "run_A.coverage.json"
+    cov.write_text('{"stale": true}')
+    run.cmd_run(hdir, state, "A", runs=1)
+    assert not cov.exists()
+
+    web_dir = tmp_path / "web"
+    web_dir.mkdir()
+    _, wstate = make_hunt(web_dir, "react_bug")
+    wt = Path(wstate["wt"])
+    tfile = wt / "web" / "src" / "hunt_a.test.tsx"
+    tfile.write_text("test('HuntA_ok', () => {});\n")
+    real_run = subprocess.run
+
+    def fake_jest(cmd, **kw):
+        for i, arg in enumerate(cmd):
+            s = str(arg)
+            out_arg = s.split("=", 1)[1] if s.startswith("--outputFile=") else (str(cmd[i + 1]) if s == "--outputFile" else None)
+            if out_arg:
+                Path(out_arg).write_text(json.dumps({"testResults": [{
+                    "name": str(tfile.resolve()), "status": "failed", "message": "afterAll exploded",
+                    "assertionResults": [{"title": "HuntA_ok", "fullName": "HuntA HuntA_ok", "status": "passed"}],
+                }]}))
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(subprocess, "run", fake_jest)
+    into = run.Outcome()
+    try:
+        run.jest_run(wt, ["web/src/hunt_a.test.tsx"], "HuntA", into)
+    finally:
+        tfile.unlink(missing_ok=True)
+    assert into.results == {
+        "web/src/hunt_a.test.tsx::HuntA HuntA_ok": "PASS",
+        f"web/src/hunt_a.test.tsx::{run.PACKAGE_FAILED}": "FAIL",
+    }
+    assert into.packages == {"web/src/hunt_a.test.tsx": "FAIL"}
+    pkg_fail = f"web/src/hunt_a.test.tsx::{run.PACKAGE_FAILED}"
+    assert "afterAll exploded" in into.messages[pkg_fail]
+    pass_base = run.Outcome(packages={"web/src/hunt_a.test.tsx": "PASS"})
+    assert run.is_kill(pkg_fail, "FAIL", pass_base) is True
+    assert run.base_table({pkg_fail: "FAIL_3_OF_3"}, {}, pass_base) == {pkg_fail: "NEW_PR_BUG"}
+
+
+@needs_node
+def test_verify_ui_rejects_unicode_separators_long_expanded_body_and_503_capture(tmp_path):
+    import http.server
+    import threading
+
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            if self.path == "/api/v4/big":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"big": "x" * 70000}).encode())
+            elif self.path == "/api/v4/fail503":
+                self.send_response(503)
+                self.end_headers()
+                self.wfile.write(b"{}")
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            seen.append((self.path, self.headers.get("Content-Type", ""), raw))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}')
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        for bad in ({"verified_at": "a\u2028b"}, {"verified_at": "a\u2029b"}, {"covers": ["ok\u2028bad"]}):
+            bplan = {"base_url": url, "steps": [], "expect": [{"api": {"path": "/api/v4/ok", "status": 200}}], **bad}
+            bcode, bout = verify(tmp_path, bplan, auth="none")
+            assert bcode == 2 and "INVALID_PLAN" in bout, (bad, bout)
+
+        ok_plan = {
+            "base_url": url,
+            "steps": [{"capture": {"api": {"method": "POST", "path": "/api/v4/echo", "body": "hello"}}}],
+            "expect": [{"api": {"path": "/api/v4/ok", "status": 200}}],
+        }
+        code, out = verify(tmp_path, ok_plan, auth="none")
+        assert code == 0 and seen == [("/api/v4/echo", "application/json", b'"hello"')], (out, seen)
+        fcode, fout = verify(tmp_path, ok_plan, "--freeze", "cap.spec.ts", auth="none")
+        assert fcode == 0 and "toBeLessThan(500)" in (tmp_path / "cap.spec.ts").read_text(), fout
+
+        seen.clear()
+        big_plan = {
+            "base_url": url,
+            "steps": [
+                {"capture": {"api": "/api/v4/big", "save": {"big": "big"}}},
+                {"capture": {"api": {"method": "POST", "path": "/api/v4/echo", "body": {"v": "$big"}}}},
+            ],
+            "expect": [{"api": {"path": "/api/v4/ok", "status": 200}}],
+        }
+        bcode, bout = verify(tmp_path, big_plan, auth="none")
+        assert bcode != 0 and "exceeds" in bout and seen == [], (bcode, bout, seen)
+
+        s503_plan = {
+            "base_url": url,
+            "steps": [{"capture": {"api": "/api/v4/fail503"}}],
+            "expect": [{"api": {"path": "/api/v4/ok", "status": 200}}],
+        }
+        scode, sout = verify(tmp_path, s503_plan, auth="none")
+        assert scode == 1 and "503" in sout, (scode, sout)
+    finally:
+        srv.shutdown()
+
+
+def test_mine_rules_ignores_sql_comment_headers_inside_hunk(tmp_path, capsys):
+    import mine_rules
+    repo = tmp_path / "sqlrepo"
+    sql = repo / "server" / "channels" / "store" / "sqlstore" / "q.sql"
+    sql.parent.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "master")
+    sql.write_text("-- base\nSELECT safeFunc();\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+    for idx in range(2):
+        # Reverting removes "-- comment" (producing "--- comment" inside the hunk) and adds buggyQueryGuard().
+        sql.write_text(f"-- base\nSELECT buggyQueryGuard({idx});\n")
+        _git(repo, "commit", "-qam", f"setup {idx}")
+        sql.write_text(f"-- section {idx}\nSELECT other({idx});\n")
+        _git(repo, "commit", "-qam", f"sql change {idx}")
+        _git(repo, "revert", "--no-edit", "HEAD")
+    assert mine_rules.main(["mine_rules.py", str(repo), "-n", "10", "--min", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "buggyQueryGuard" in out and "sqlstore/*" in out

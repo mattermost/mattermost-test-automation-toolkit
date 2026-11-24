@@ -147,6 +147,22 @@ def git_cmd(*args: str) -> list[str]:
     return ["git", "-c", "core.quotePath=false", "-c", "color.ui=never", "-c", "diff.noprefix=false", *args]
 
 
+def terminate_handler(signum: int, _frame: Any) -> None:
+    """Turn SIGTERM/SIGHUP into SystemExit so finally cleanup runs instead of leaving dirty worktrees."""
+    raise SystemExit(128 + signum)
+
+
+def clean_untracked(wt: Path) -> None:
+    """Remove untracked files left by tests without choking on spaces or quoted paths."""
+    raw = sh(git_cmd("status", "--porcelain", "-z", "--untracked-files=all"), wt).stdout
+    for entry in raw.split("\0"):
+        if not entry.startswith("?? "):
+            continue
+        rel = entry[3:]
+        if "node_modules" not in rel and "go.work" not in rel:
+            under(wt, rel).unlink(missing_ok=True)
+
+
 def load_json(path: Path) -> Any:
     """Load JSON written by a model. Repairs only invalid backslash escapes, the one defect seen in practice."""
     raw = path.read_text()

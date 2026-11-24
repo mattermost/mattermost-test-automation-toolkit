@@ -26,6 +26,6 @@ $(VERIFYDEPS)/node_modules/.package-lock.json: $(VERIFYDEPS)/package.json $(VERI
 
 lint:
 	ruff check .
-	mypy --ignore-missing-imports $(SKILL_SCRIPTS) .claude/skills/verify/scripts/pr_server.py
+	mypy --ignore-missing-imports $(SKILL_SCRIPTS) .claude/skills/verify/scripts/pr_server.py eval/mine_rules.py eval/mine_controls.py
 	shellcheck scripts/*.sh $(SKILL_SCRIPTS)/*.sh
 	node --check .claude/skills/verify/scripts/verify_ui.mjs

@@ -21,33 +21,27 @@ import time
 from pathlib import Path
 from typing import Any
 
+import build_requests
+import ctx
+import hunt_common
+import pr_tests
+import prepare
 import pytest
+import reliability
+import review_threads
+import run
+import trusted
+from test_hunt_engine import JESTDEPS, _git, make_hunt
 
 ROOT = Path(__file__).resolve().parent.parent
 SKILL = ROOT / ".claude" / "skills" / "hunt"
-SCRIPTS = SKILL / "scripts"
-sys.path.insert(0, str(SCRIPTS))
-
-import build_requests  # noqa: E402
-import ctx  # noqa: E402
-import hunt_common  # noqa: E402
-import pr_tests  # noqa: E402
-import prepare  # noqa: E402
-import reliability  # noqa: E402
-import review_threads  # noqa: E402
-import run  # noqa: E402
-import trusted  # noqa: E402
-from test_hunt_engine import JESTDEPS, _git, make_hunt  # noqa: E402
 
 needs_jest = pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(),
                                 reason="run `make jest-deps` first")
 
 
 @pytest.fixture(autouse=True)
-def _isolated(monkeypatch, tmp_path):
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
+def _isolated(monkeypatch):
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
 
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 # See LICENSE.txt for license information.
-"""Mine more clean controls for eval_reverts.py: size-matched commits that were never reverted. Prints a summary; writes
+"""Mine more clean controls for eval_bugs.py: size-matched commits that were never reverted. Prints a summary; writes
 only --out.
 
-usage: mine_controls.py <repo> <manifest.json> --per-case N --out eval/controls_extra.json
+usage: mine_controls.py <repo> <manifest.json> --per-case N --out eval/extra_controls.json
 
 Rule (the manifest's "_about"), applied to every case's bug_sha, on the history reachable from the repo's HEAD:
   - a non-merge commit committed within 90 days of the case, that changes a non-test source file (prefilter.excluded,
@@ -15,30 +15,29 @@ Rule (the manifest's "_about"), applied to every case's bug_sha, on the history 
   - sharing no MM-<n> ticket with the case (its commit message or its revert's);
   - not a case's bug or fix commit, not one of the manifest's controls, not picked for another case.
 Closest size first (|ln files ratio| + |ln lines ratio|), then closest in time, then sha: deterministic. Output is
-{"controls": [{"id", "area", "sha", "matches"}]}, the shape of the manifest's controls, which eval_reverts.py --controls
+{"controls": [{"id", "area", "sha", "matches"}]}, the shape of the manifest's controls, which eval_bugs.py --controls
 appends. A case with fewer than N matches gets what exists; the summary names it.
 """
 from __future__ import annotations
 
-import atexit as _atexit
-import shutil as _shutil
-import sys as _sys
-import tempfile as _tempfile
+import sys
 
-# Never load bytecode from the skill directory (see eval_reverts.py): caches go to a private temp dir.
-if not _sys.pycache_prefix:
-    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
-    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
+sys.dont_write_bytecode = True
+if not sys.pycache_prefix:
+    sys.pycache_prefix = "/dev/null/hunt-pyc"
 
 import argparse
 import json
 import math
 import re
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+_SCRIPTS = Path(__file__).resolve().parent.parent / ".claude" / "skills" / "hunt" / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
 
 import prefilter
 from hunt_common import git, write_json
@@ -105,11 +104,12 @@ def ratio_ok(n: float, case: float) -> bool:
 
 
 def candidates(repo: Path, case: Commit, area: str) -> list[Commit]:
-    lo = datetime.fromtimestamp(case.ts, timezone.utc) - timedelta(days=WINDOW_DAYS)
     hi = datetime.fromtimestamp(case.ts, timezone.utc) + timedelta(days=WINDOW_DAYS)
-    log = git(repo, "log", "--no-merges", f"--after={lo.isoformat()}", f"--before={hi.isoformat()}", "--format=%H", "HEAD",
-              "--", area)
-    commits = read_commits(repo, log.split())
+    # Do not pass --after to git log: it acts as a traversal cutoff if a child commit has an earlier timestamp.
+    log = git(repo, "log", "--no-merges", f"--before={hi.isoformat()}", "--format=%H %ct", "HEAD", "--", area)
+    shas = [sha for line in log.splitlines() if line for sha, ts in [line.split()]
+            if abs(int(ts) - case.ts) <= WINDOW_DAYS * 86400]
+    commits = read_commits(repo, shas)
     keep = [c for c in commits.values()
             if abs(c.ts - case.ts) <= WINDOW_DAYS * 86400 and any(p.startswith(area.rstrip("/") + "/") for p in c.files)
             and ratio_ok(len(c.files), len(case.files)) and ratio_ok(c.lines, case.lines)]

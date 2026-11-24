@@ -171,8 +171,8 @@ def seed(url: str, user: str, password: str) -> None:
         try:
             _, team = request("GET", f"{url}/api/v4/teams/name/verify", token=token)
             team_id = (team or {}).get("id") or ""
-        except urllib.error.HTTPError:
-            team_id = ""
+        except urllib.error.HTTPError as lookup_err:
+            raise InfraError(f"looking up team verify: HTTP {lookup_err.code}") from lookup_err
     prefs = [{"user_id": me["id"], "category": c, "name": n, "value": v} for c, n, v in ONBOARDING_OFF]
     request("PUT", f"{url}/api/v4/users/{me['id']}/preferences", prefs, token)
     if user != MEMBER_USER:
@@ -259,9 +259,14 @@ def main(argv: list[str]) -> None:
         imgs = pr_images(args[1])
         print(json.dumps(imgs))
         if pull_too:
+            failed = []
             with ThreadPoolExecutor(2) as ex:
                 for side, err in zip(imgs, ex.map(pull, imgs.values()), strict=True):
                     print(f"{side} {imgs[side]}: {'pulled' if err is None else 'NOT AVAILABLE: ' + err}")
+                    if err is not None:
+                        failed.append(f"{side} ({imgs[side]}): {err}")
+            if failed:
+                raise InfraError(f"image pull failed: {'; '.join(failed)}")
     elif args[:1] == ["up"] and len(args) == 2:
         up(args[1], e2e)
     elif args == ["down"]:

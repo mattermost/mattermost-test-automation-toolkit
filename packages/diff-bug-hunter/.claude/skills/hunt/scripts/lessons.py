@@ -14,23 +14,17 @@ build_requests.py appends one line per hunt to $HUNT_SCRATCH/lessons_hits.jsonl 
 """
 from __future__ import annotations
 
-import atexit as _atexit
-import shutil as _shutil
-import sys as _sys
-import tempfile as _tempfile
+import sys
 
-# Never load bytecode from the skill directory: a committed __pycache__/*.pyc (an unchecked-hash .pyc, say) would run
-# code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
-if not _sys.pycache_prefix:
-    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
-    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
+sys.dont_write_bytecode = True
+if not sys.pycache_prefix:
+    sys.pycache_prefix = "/dev/null/hunt-pyc"
 
 import argparse
 import fnmatch
 import json
 import os
 import re
-import sys
 from pathlib import Path
 from typing import Any
 

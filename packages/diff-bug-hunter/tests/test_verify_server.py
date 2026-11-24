@@ -156,6 +156,7 @@ def test_up_replaces_a_server_running_another_build_and_never_seeds_the_wrong_on
     assert calls == []  # already on that build: no restart
 
     monkeypatch.setattr(pr_server, "make", lambda *a: None)  # a start that leaves the old build running
+    monkeypatch.setattr(pr_server, "seed", lambda *a: pytest.fail("seed() must not be called on build mismatch"))
     with pytest.raises(pr_server.InfraError, match="expected"):
         pr_server.up("mattermostdevelopment/mattermost-enterprise-edition:5e62cb1", tmp_path)
 
@@ -226,3 +227,48 @@ def test_pr_images_supports_release_ranges(monkeypatch):
     imgs = pr_server.pr_images("release-12.0.0-rc1...release-12.1.0-rc3")
     assert imgs == {"head": f"{pr_server.IMAGE_REPO}:2222222", "base": f"{pr_server.IMAGE_REPO}:1111111"}
     assert any("release-12.0.0-rc1...release-12.1.0-rc3" in c for c in calls)
+
+
+def test_seed_raises_infra_error_on_team_lookup_failure():
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            if self.path == "/api/v4/users":
+                self.send_response(201)
+                self.end_headers()
+                self.wfile.write(json.dumps({"id": "u1"}).encode())
+            elif self.path == "/api/v4/users/login":
+                self.send_response(200)
+                self.send_header("Token", "tok")
+                self.end_headers()
+                self.wfile.write(json.dumps({"id": "u1", "roles": "system_admin"}).encode())
+            elif self.path == "/api/v4/teams":
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        def do_GET(self):
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with pytest.raises(pr_server.InfraError, match="looking up team verify: HTTP 500"):
+            pr_server.seed(f"http://127.0.0.1:{srv.server_address[1]}", "poster", "pw")
+    finally:
+        srv.shutdown()
+
+
+def test_images_pull_failure_raises_infra_error(monkeypatch):
+    monkeypatch.setattr(pr_server, "pr_images", lambda _pr: {"head": "r:aaa", "base": "r:bbb"})
+    monkeypatch.setattr(pr_server, "pull", lambda img: "manifest unknown" if img == "r:aaa" else None)
+    with pytest.raises(pr_server.InfraError, match="image pull failed"):
+        pr_server.main(["images", "40100", "--pull"])
+    with pytest.raises(SystemExit) as exc:
+        pr_server.run_cli(["images", "40100", "--pull"])
+    assert exc.value.code == 2

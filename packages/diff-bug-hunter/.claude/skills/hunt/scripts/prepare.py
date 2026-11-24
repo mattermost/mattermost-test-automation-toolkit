@@ -13,21 +13,17 @@ throw away paid-for work (a restarted session does exactly this), so it prints A
 """
 from __future__ import annotations
 
-import atexit as _atexit
-import shutil as _shutil
-import sys as _sys
-import tempfile as _tempfile
+import sys
 
 # Never load bytecode from the skill directory: a committed __pycache__/*.pyc (an unchecked-hash .pyc, say) would run
-# code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
-if not _sys.pycache_prefix:
-    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
-    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
+# code the trust gate never compares with the reviewed source. Disabling writes + non-existent prefix blocks loading too.
+sys.dont_write_bytecode = True
+if not sys.pycache_prefix:
+    sys.pycache_prefix = "/dev/null/hunt-pyc"
 
 import hashlib
 import json
 import shutil
-import sys
 from pathlib import Path
 
 from ctx import reset_hunt_dir
@@ -59,12 +55,21 @@ def ensure_clone(mm: Path) -> None:
         sh(["git", "clone", "--filter=blob:none", "--no-checkout", f"https://github.com/{REPO}", str(mm)], mm.parent)
 
 
+def _registered_worktrees(repo: Path) -> set[Path]:
+    out = git(repo, "worktree", "list", "--porcelain")
+    return {Path(line[9:]).resolve() for line in out.splitlines() if line.startswith("worktree ")}
+
+
 def worktrees(repo: Path, head_ref: str, base_ref: str, wt: Path, wt_base: Path) -> str:
     """Head worktree at head_ref, base worktree at merge-base(head_ref, base_ref). Returns the merge-base sha.
     Re-running resets both to the same commits (no stale hunt files survive)."""
     mb = git(repo, "merge-base", head_ref, base_ref)
+    git(repo, "worktree", "prune")
+    registered = _registered_worktrees(repo)
     for path, ref in ((wt, head_ref), (wt_base, mb)):
         if path.exists():
+            if not (path / ".git").is_file() or path.resolve() not in registered:
+                raise InfraError(f"{path} exists but is not a git worktree of {repo}")
             # Discard leftovers (an interrupted mutant, hunt files) before switching, or checkout refuses.
             git(path, "reset", "-q", "--hard")
             git(path, "clean", "-qfd", "-e", "node_modules", "-e", "go.work*")
@@ -90,7 +95,10 @@ def services_up() -> None:
     if sh(["redis-cli", "ping"], Path("."), check=False).stdout.strip() != "PONG":
         sh(["redis-server", "--daemonize", "yes", "--port", "6379", "--save", "", "--appendonly", "no",
             "--dir", str(scratch())], Path("."))
-        sh(["redis-cli", "ping"], Path("."))
+        for _ in range(30):
+            if sh(["redis-cli", "ping"], Path("."), check=False).stdout.strip() == "PONG":
+                return
+        raise InfraError("Redis not reachable on localhost:6379 after daemon start")
 
 
 def npm_ci_for_lock(webapp: Path) -> None:
@@ -130,7 +138,7 @@ def webapp_deps(wt: Path, wt_base: Path, mb: str, head: str) -> None:
 
 def deps(repo: Path, wt: Path, wt_base: Path, mb: str, head_ref: str) -> tuple[bool, bool]:
     """What the changed files need: go.work for Go, Postgres and Redis for stateful server code, npm ci for the webapp.
-    Returns (go_changed, web_changed). Shared with eval_reverts.py, which hunts historical commits instead of PRs."""
+    Returns (go_changed, web_changed). Shared with eval_bugs.py, which hunts historical commits instead of PRs."""
     changed = git(repo, "diff", "--name-only", "--no-renames", mb, head_ref).splitlines()
     go_changed = any(f.startswith("server/") and f.endswith(".go") for f in changed)
     web_changed = any(f.startswith("webapp/") for f in changed)

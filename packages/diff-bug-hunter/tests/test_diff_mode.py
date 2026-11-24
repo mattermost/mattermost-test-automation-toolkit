@@ -7,14 +7,10 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 
-import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / ".claude" / "skills" / "hunt" / "scripts"))
-
 import build_requests
+import pytest
 import run
 import trusted
 from test_hunt_engine import JESTDEPS, make_hunt
@@ -55,8 +51,8 @@ def test_go_behaviour_change_is_a_diff_with_base_vs_head_examples(tmp_path):
     assert sizes == sorted(sizes)
     assert all(e["base"] != e["head"] and e["input"][0] % 7 == 0 for e in total["examples"])
     ratio = ex["calc::TestHuntD_Ratio"]["examples"]
-    assert all(e["input"][1] == 0 and e["base"] == 0 and e["head"] == {"panic": "runtime error: integer divide by zero"}
-               for e in ratio)
+    assert ratio and all(e["input"][1] == 0 and e["base"] == 0 and e["head"] == {"panic": "runtime error: integer divide by zero"}
+                          for e in ratio)
     assert "Bonus" in ex["calc::TestHuntD_Bonus"]["detail"]
     assert "calc::TestHuntD_Label" not in ex
     _clean(state)
@@ -253,3 +249,38 @@ def test_a_recorder_labelled_go_style_still_matches_its_jest_test(tmp_path):
     assert run.read_records(f) == {"HuntD_x": {0: {"input": 1, "output": 2}}}
     assert run.record_name("web/a.test.ts::HuntD HuntD_x") == "HuntD_x"
     assert run.record_name("server/m::TestHuntD_x") == "HuntD_x"
+
+
+def test_diff_records_distinguishes_bool_and_int():
+    assert len(run.diff_records({0: {"input": 1, "output": True}}, {0: {"input": 1, "output": 1}})) == 1
+    assert len(run.diff_records({0: {"input": 1, "output": False}}, {0: {"input": 1, "output": 0}})) == 1
+
+
+def test_cmd_diff_isolates_same_named_recorders_across_packages(tmp_path):
+    from test_hunt_engine import _git
+    hdir, state = make_hunt(tmp_path, "diff_go")
+    wt, wt_base = Path(state["wt"]), Path(state["wt_base"])
+    for root, expr in ((wt_base, "return x"), (wt, "return x + 1")):
+        (root / "extra").mkdir()
+        (root / "extra" / "extra.go").write_text(f"package extra\nfunc Val(x int) int {{ {expr} }}\n")
+        _git(root, "add", "extra/extra.go")
+        _git(root, "commit", "-qm", "add extra pkg")
+    state["targets"].append({"dir": "extra"})
+    recorder = (
+        'package {pkg}\nimport (\n\t"encoding/json"\n\t"os"\n\t"testing"\n)\n'
+        'func TestHuntD_Val(t *testing.T) {{\n'
+        '\tf, err := os.OpenFile(os.Getenv("HUNT_DIFF_OUT"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)\n'
+        '\tif err != nil {{ panic(err) }}\n\tdefer f.Close()\n'
+        '\tfor i := 0; i < 3; i++ {{\n'
+        '\t\tb, _ := json.Marshal(map[string]any{{"test": "TestHuntD_Val", "i": i, "input": i, "output": {call}}})\n'
+        '\t\t_, _ = f.Write(append(b, \'\\n\'))\n\t}}\n}}\n'
+    )
+    (hdir / "D" / "response.json").write_text(json.dumps({
+        "files": [
+            {"path": "calc/hunt_huntd_test.go", "content": recorder.format(pkg="calc", call="Label(i)")},
+            {"path": "extra/hunt_huntd_test.go", "content": recorder.format(pkg="extra", call="Val(i)")},
+        ],
+        "tests": [],
+    }))
+    out = run.cmd_diff(hdir, state)
+    assert out == {"calc::TestHuntD_Val": "SAME", "extra::TestHuntD_Val": "DIFF"}

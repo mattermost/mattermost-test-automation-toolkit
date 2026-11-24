@@ -5,37 +5,27 @@
 - lessons.py (path+keyword AND scoring, diff-only scanning, monorepo overbroad(), target-keyed prune, Mode D opt-out)
 - prefilter.py (calibrated weights for server/public/model/, cmd/mmctl/, webapp components & utils)
 - old_tests.py (language-balanced Go/Jest water-filling quotas + production risk prioritization)
-- eval_bugs.py / eval_reverts.py (multi-kind manifests, --skip-missing, regression locks, monotonic diff_scorecards)
+- eval_bugs.py (multi-kind manifests, --skip-missing, regression locks, monotonic diff_scorecards)
 """
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 
+import build_requests
+import ctx
+import eval_bugs
+import ledger
+import lessons
+import old_tests
+import prefilter
 import pytest
-
-ROOT = Path(__file__).resolve().parent.parent
-SKILL = ROOT / ".claude" / "skills" / "hunt"
-SCRIPTS = SKILL / "scripts"
-sys.path.insert(0, str(SCRIPTS))
-
-import build_requests  # noqa: E402
-import ctx  # noqa: E402
-import eval_bugs  # noqa: E402
-import eval_reverts  # noqa: E402
-import ledger  # noqa: E402
-import lessons  # noqa: E402
-import old_tests  # noqa: E402
-import prefilter  # noqa: E402
-import review_threads  # noqa: E402
-import trusted  # noqa: E402
-from test_hunt_engine import _git  # noqa: E402
+import review_threads
+import trusted
+from test_hunt_engine import _git
 
 
 @pytest.fixture(autouse=True)
-def _iso(monkeypatch, tmp_path):
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
+def _iso(monkeypatch):
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
 
 
@@ -226,7 +216,7 @@ def test_eval_bugs_kinds_skip_missing_locks_and_diff_gate(tmp_path, capsys):
     }))
     assert eval_bugs.main(["eval_bugs.py", "diff", str(base_card), str(cand_card)]) == 0
     capsys.readouterr()
-    assert eval_reverts.diff_scorecards(
+    assert eval_bugs.diff_scorecards(
         json.loads(base_card.read_text()),
         {"metrics": {"vetted_recall": 0.5, "fp_rate": 0.0},
          "rows": [{"kind": "case", "id": "hotfix-1", "lock": True, "vetted": False, "hunters_new_api": False}]},
@@ -237,13 +227,13 @@ def test_eval_bugs_kinds_skip_missing_locks_and_diff_gate(tmp_path, capsys):
         "rows": [{"kind": "case", "id": "hotfix-1", "lock": True, "vetted": True, "hunters_new_api": False}],
     }))
     assert eval_bugs.main(["eval_bugs.py", "diff", str(base_card), str(cand_bad_fp)]) == 1
-    assert eval_reverts.diff_scorecards(
+    assert eval_bugs.diff_scorecards(
         json.loads(base_card.read_text()),
         {"metrics": {"vetted_recall": 1.0, "fp_rate": 0.0},
          "rows": [{"kind": "case", "id": "hotfix-1", "lock": True, "vetted": True, "hunters_new_api": False}],
          "errors": ["c1"]},
     )["verdict"] == "FAIL"
-    assert eval_reverts.diff_scorecards(
+    assert eval_bugs.diff_scorecards(
         json.loads(base_card.read_text()),
         {"metrics": {"vetted_recall": 1.0, "fp_rate": 0.0}, "rows": []},
     )["lock_regressions"] == ["hotfix-1"]
@@ -268,14 +258,14 @@ def test_review_signal_verdicts_do_not_leak_into_hunter_metrics(tmp_path, monkey
     }))
     (hdir / "run_R.json").write_text(json.dumps({"pkg::TestR": "FAIL_3_OF_3"}))
     (hdir / "base_R.json").write_text(json.dumps({"pkg::TestR": "NEW_PR_BUG"}))
-    monkeypatch.setattr(eval_reverts, "hunt_tag", lambda *a, **kw: {
+    monkeypatch.setattr(eval_bugs, "hunt_tag", lambda *a, **kw: {
         "batch": 1, "hunter": "R", "run": {"pkg::TestR": "FAIL_3_OF_3"}, "base": {"pkg::TestR": "NEW_PR_BUG"},
     })
-    row = eval_reverts.review_signal(1, hdir, {"targets": []}, {"title": "", "body": ""}, {"id": "c1"}, None)
+    row = eval_bugs.review_signal(1, hdir, {"targets": []}, {"title": "", "body": ""}, {"id": "c1"}, None)
     assert "run" not in row and "base" not in row
     assert row["review"] == {"CR1": "PROVEN"}
-    f = eval_reverts.flags({"results": [row]}, eval_reverts.ALL_SIGNALS)
-    raw, vetted = eval_reverts.score({"results": [row]})
+    f = eval_bugs.flags({"results": [row]}, eval_bugs.ALL_SIGNALS)
+    raw, vetted = eval_bugs.score({"results": [row]})
     assert f["review_proven"] is True
     assert f["hunters_vetted"] is False and raw is False and vetted is False
 
@@ -343,15 +333,15 @@ def test_audit_hardening_ledger_tiers_review_edges_and_empty_archive(tmp_path):
 
 
 def test_coderabbit_review_fixes_flags_scorecards_lessons_ledger_and_review_freshness(tmp_path, capsys):
-    # eval_reverts.flags handles nested new_api dict metadata without TypeError; diff_scorecards checks population & strings.
+    # eval_bugs.flags handles nested new_api dict metadata without TypeError; diff_scorecards checks population & strings.
     entry = {"results": [{"hunter": "A", "base": {"pkg::T": "NEW_API", "new_api": {"pkg::T": ["Sym"]}}}]}
-    assert eval_reverts.flags(entry)["hunters_new_api"] is True
+    assert eval_bugs.flags(entry)["hunters_new_api"] is True
     base_c = {"metrics": {"vetted_recall": "0.5", "fp_rate": "0.0"}, "rows": [{"kind": "case", "id": "c1", "lock": False, "vetted": True}]}
     same_c = {"metrics": {"vetted_recall": "0.5", "fp_rate": "0.0"}, "rows": [{"kind": "case", "id": "c1", "lock": False, "vetted": True}]}
     pop_c = {"metrics": {"vetted_recall": 0.5, "fp_rate": 0.0}, "rows": [{"kind": "case", "id": "c2", "lock": False, "vetted": True}]}
-    assert eval_reverts.diff_scorecards(base_c, same_c)["cand_vetted_recall"] == 0.5
-    assert eval_reverts.diff_scorecards(base_c, pop_c)["population_ok"] is False
-    assert eval_reverts.diff_scorecards(base_c, pop_c)["verdict"] == "FAIL"
+    assert eval_bugs.diff_scorecards(base_c, same_c)["cand_vetted_recall"] == 0.5
+    assert eval_bugs.diff_scorecards(base_c, pop_c)["population_ok"] is False
+    assert eval_bugs.diff_scorecards(base_c, pop_c)["verdict"] == "FAIL"
 
     # lessons.prune merges hits across batches of one target so earlier matches are retained.
     lsn = {"id": "L77", "pattern": "p", "applies_to": {"lang": ["go"], "path_globs": ["server/channels/app/*"]},

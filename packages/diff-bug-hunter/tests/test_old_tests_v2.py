@@ -6,10 +6,7 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / ".claude" / "skills" / "hunt" / "scripts"))
 
 import old_tests
 import pr_tests
@@ -259,3 +256,42 @@ def test_pr_tests_retests_package_failure_without_ci_flag(tmp_path, monkeypatch)
     monkeypatch.setattr(pr_tests, "go_run", fake_go_run)
     out = pr_tests.cmd_pr(hdir, state)
     assert out["tests"] == {f"ci::{pr_tests.PACKAGE_FAILED}": "PR_TEST_FAILS_UNDER_CI"}
+
+
+def test_single_line_go_candidate_swap_crlf_clean_untracked_and_invalid_parallel(tmp_path, monkeypatch):
+    import hunt_common
+
+    base_go = "package calc\nfunc helper() int { return 1 }\nfunc TestSingle(t *testing.T) { _ = helper() }\n"
+    head_go = "package calc\nfunc helper() int { return 2 }\nfunc TestSingle(t *testing.T) { _ = helper() }\n"
+    assert old_tests.go_candidates(base_go, head_go) == ["TestSingle"]
+
+    repo = tmp_path / "crlf"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "master")
+    f = repo / "calc_test.go"
+    f.write_bytes(b"package calc\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    f.write_bytes(b"package calc\r\n// head\r\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "head")
+    swap = old_tests.Swap(repo, repo, base_sha)
+    swap.apply("calc_test.go", "M")
+    assert f.read_bytes() == b"package calc\n"
+    swap.restore()
+    assert f.read_bytes() == b"package calc\r\n// head\r\n"
+
+    spaced = repo / "sub dir" / "tmp file.txt"
+    spaced.parent.mkdir(parents=True)
+    spaced.write_text("junk")
+    hunt_common.clean_untracked(repo)
+    assert not spaced.exists()
+
+    pr_dir = tmp_path / "pr"
+    pr_dir.mkdir()
+    hdir, state = make_hunt(pr_dir, "pr_ci_flag")
+    monkeypatch.setenv("HUNT_PR_TEST_PARALLEL", "two")
+    with pytest.raises(pr_tests.InfraError, match="HUNT_PR_TEST_PARALLEL"):
+        pr_tests.cmd_pr(hdir, state)
+    assert _clean(state["wt"])

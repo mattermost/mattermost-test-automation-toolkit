@@ -32,27 +32,37 @@ Exit codes: 0 ok, 2 INFRA_ERROR.
 """
 from __future__ import annotations
 
-import atexit as _atexit
-import shutil as _shutil
-import sys as _sys
-import tempfile as _tempfile
+import sys
 
 # Never load bytecode from the skill directory: a committed __pycache__/*.pyc (an unchecked-hash .pyc, say) would run
-# code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
-if not _sys.pycache_prefix:
-    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
-    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
+# code the trust gate never compares with the reviewed source. Disabling writes + non-existent prefix blocks loading too.
+sys.dont_write_bytecode = True
+if not sys.pycache_prefix:
+    sys.pycache_prefix = "/dev/null/hunt-pyc"
 
 import os
 import re
 import signal
-import sys
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import prefilter
 from ctx import is_generated, top_blocks
-from hunt_common import InfraError, git, git_cmd, hunt_dir, hunt_lock, read_state, sh, under, write_json
+from hunt_common import (
+    InfraError,
+    clean_untracked,
+    git,
+    git_cmd,
+    git_env,
+    hunt_dir,
+    hunt_lock,
+    read_state,
+    sh,
+    terminate_handler,
+    under,
+    write_json,
+)
 from run import PACKAGE_FAILED, CompileError, Outcome, classify, ensure_clean, go_root, go_run, jest_run
 
 GO_TEST = re.compile(r"^func (Test(?:[A-Z_0-9]\w*)?)\((?:\w+ )?\*(?:\w+\.)?T\)")
@@ -97,7 +107,7 @@ def go_candidates(base_src: str, head_src: str | None) -> list[str]:
     helpers = {n.split(".")[-1] for n in changed if n not in tests}
     out = set()
     for name, (test, body) in tests.items():
-        rest = body.split("\n", 1)[1] if "\n" in body else ""
+        rest = body.split("{", 1)[1] if "{" in body else ""
         if name in changed or any(re.search(rf"\b{re.escape(h)}\(", rest) for h in helpers):
             out.add(test)
     return sorted(out)
@@ -180,21 +190,25 @@ class Swap:
 
     def __init__(self, wt: Path, repo: Path, mb: str):
         self.wt, self.repo, self.mb = wt, repo, mb
-        self.saved: list[tuple[Path, str | None]] = []  # path, head content (None: the file did not exist at head)
+        self.saved: list[tuple[Path, bytes | None]] = []  # path, exact head bytes (None: absent at head)
 
     def apply(self, path: str, status: str) -> None:
         p = under(self.wt, path)
-        self.saved.append((p, p.read_text() if p.exists() else None))
+        self.saved.append((p, p.read_bytes() if p.exists() else None))
         if status == "A":
             p.unlink(missing_ok=True)  # PR-added test file: may depend on the PR's new helpers
         else:
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(sh(git_cmd("show", f"{self.mb}:{path}"), self.repo).stdout)  # exact bytes, no strip
+            res = subprocess.run(git_cmd("show", f"{self.mb}:{path}"), cwd=self.repo,
+                                 capture_output=True, check=False, env=git_env())
+            if res.returncode != 0:
+                raise InfraError(f"git show {self.mb}:{path} failed:\n{res.stderr.decode(errors='replace')[-1500:]}")
+            p.write_bytes(res.stdout)  # preserve exact bytes (including CRLF)
 
     def write(self, p: Path, text: str) -> None:
         """Change a file in the worktree (a function removed from a swapped copy); restore() puts the head content back."""
         if not any(q == p for q, _ in self.saved):
-            self.saved.append((p, p.read_text() if p.exists() else None))
+            self.saved.append((p, p.read_bytes() if p.exists() else None))
         p.write_text(text)
 
     def restore(self) -> None:
@@ -202,14 +216,9 @@ class Swap:
             if content is None:
                 p.unlink(missing_ok=True)
             else:
-                p.write_text(content)
+                p.write_bytes(content)
         self.saved = []
-        # A run can write new snapshots or a fuzz cache next to the tests: remove anything left untracked there.
-        status = git(self.wt, "status", "--porcelain", "--untracked-files=all")
-        for line in status.splitlines():
-            rel = line[3:]
-            if line.startswith("??") and "node_modules" not in rel and "go.work" not in rel:
-                under(self.wt, rel).unlink(missing_ok=True)
+        clean_untracked(self.wt)
 
 
 def verdict(head: list[str], base: str | None, pkg_base: str | None, name: str) -> str:
@@ -470,16 +479,12 @@ def cmd_old(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _terminate(signum: int, _frame: Any) -> None:
-    raise SystemExit(128 + signum)  # unwind through Swap.restore
-
-
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(__doc__)
         return 1
     for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, _terminate)
+        signal.signal(sig, terminate_handler)
     hdir = hunt_dir(argv[1])
     try:
         with hunt_lock(hdir, argv[1]):

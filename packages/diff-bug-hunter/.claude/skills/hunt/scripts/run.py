@@ -23,16 +23,11 @@ the repair round fixes it).
 """
 from __future__ import annotations
 
-import atexit as _atexit
-import shutil as _shutil
-import sys as _sys
-import tempfile as _tempfile
+import sys
 
-# Never load bytecode from the skill directory: a committed __pycache__/*.pyc (an unchecked-hash .pyc, say) would run
-# code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
-if not _sys.pycache_prefix:
-    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
-    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
+sys.dont_write_bytecode = True
+if not sys.pycache_prefix:
+    sys.pycache_prefix = "/dev/null/hunt-pyc"
 
 import contextlib
 import hashlib
@@ -40,8 +35,8 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
-import sys
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -60,6 +55,7 @@ from hunt_common import (
     require_disk,
     scratch,
     sh,
+    terminate_handler,
     under,
     write_json,
 )
@@ -341,17 +337,29 @@ def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
                 if f.get("message"):
                     raise CompileError(f"{rel}:\n{f['message'][-2500:]}")
                 raise InfraError(f"0 tests executed in {rel}")
+            file_failed = False
             for a in f["assertionResults"]:
                 if prefix and not a["title"].startswith(prefix):
                     continue
                 found += 1
                 # file + full name: equal titles in two describe blocks or files never overwrite each other
                 key = f"{rel}::{a.get('fullName') or a['title']}"
-                into.results[key] = {"passed": "PASS", "failed": "FAIL"}.get(a["status"], "SKIP")
+                status = {"passed": "PASS", "failed": "FAIL"}.get(a["status"], "SKIP")
+                if status == "FAIL":
+                    file_failed = True
+                into.results[key] = status
                 failures = a.get("failureMessages") or []
                 if failures:
                     into.messages[key] = normalize_failure("\n".join(failures), wt)
                     into.log += "\n".join(failures) + "\n"
+            into.packages[rel] = "FAIL" if f.get("status") == "failed" else "PASS"
+            if f.get("status") == "failed" and not file_failed and found:
+                # e.g. afterAll threw or an unhandled error hit after passing assertions
+                pkey = f"{rel}::{PACKAGE_FAILED}"
+                into.results[pkey] = "FAIL"
+                msg = f.get("message") or f"{rel}: Jest suite failed after assertions passed"
+                into.messages[pkey] = normalize_failure(msg, wt)
+                into.log += msg + "\n"
         if not found:
             # Checked per file: a passing file must not hide one whose tests were all filtered out.
             raise CompileError(f"{rel}: no test title starts with {prefix!r}; rename the tests")
@@ -410,7 +418,8 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
     # Clear outputs of any earlier run for this tag so a compile error or rerun never leaves stale head/base verdicts.
     # Keep compile_<tag>.log as the audit record of any prior repair round (compute_verdicts checks run_R freshness).
     for stale in (f"run_{tag}.json", f"run_{tag}.messages.json", f"run_{tag}.runtimes.json",
-                  f"run_{tag}.response.sha256", f"base_{tag}.json", f"base_{tag}.response.sha256"):
+                  f"run_{tag}.coverage.json", f"run_{tag}.response.sha256",
+                  f"base_{tag}.json", f"base_{tag}.response.sha256"):
         (hdir / stale).unlink(missing_ok=True)
     if not files:  # e.g. a Mode B hunter for a PR whose description promises nothing testable
         write_json(hdir / f"run_{tag}.json", {})
@@ -605,14 +614,17 @@ def base_table(head: dict[str, str], head_msgs: dict[str, str], o: Outcome) -> d
     return out
 
 
+def _unit_key(rel: str) -> str:
+    return str(Path(rel).parent) if rel.endswith(".go") else os.path.normpath(rel)
+
+
 def _failing_base_units(
     files: list[dict[str, str]], failing: set[str],
 ) -> list[tuple[str, list[dict[str, str]], set[str]]]:
     """Group response files into independent base-vetting units (Go package dir or Jest file) that have FAIL_3_OF_3."""
     grouped: dict[str, list[dict[str, str]]] = {}
     for f in files:
-        rel = str(f.get("path", ""))
-        key = str(Path(rel).parent) if rel.endswith(".go") else os.path.normpath(rel)
+        key = _unit_key(str(f.get("path", "")))
         grouped.setdefault(key, []).append(f)
     return [(k, grp, uf) for k, grp in grouped.items()
             if (uf := {n for n in failing if n.startswith(f"{k}::")})]
@@ -737,6 +749,11 @@ def record_name(identity: str) -> str:
     return canon_record_name(identity.split("::", 1)[1].split(" ")[-1])
 
 
+def _json_eq(a: Any, b: Any) -> bool:
+    """Compare decoded JSON values strictly by JSON type/structure (unlike Python's == where True == 1)."""
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
 def diff_records(head: dict[int, dict[str, Any]], base: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
     """Every (test, i) whose record differs, smallest input (by JSON length) first. An input that differs between the two
     sides (a generator that reads the code under test) is shown as `base_input` next to `input`."""
@@ -748,13 +765,54 @@ def diff_records(head: dict[int, dict[str, Any]], base: dict[int, dict[str, Any]
     found = []
     for i in sorted(set(head) | set(base)):
         h, b = head.get(i), base.get(i)
-        if h == b:
+        if _json_eq(h, b):
             continue
         ex: dict[str, Any] = {"i": i, "input": (h or b or {}).get("input"), "base": side(b), "head": side(h)}
-        if h is not None and b is not None and h.get("input") != b.get("input"):
+        if h is not None and b is not None and not _json_eq(h.get("input"), b.get("input")):
             ex["base_input"] = b.get("input")
         found.append(ex)
     return sorted(found, key=lambda e: (len(json.dumps(e["input"], sort_keys=True)), e["i"]))
+
+
+def _merge_outcome(dst: Outcome, src: Outcome) -> None:
+    dst.results.update(src.results)
+    dst.messages.update(src.messages)
+    dst.packages.update(src.packages)
+    dst.runtimes.update(src.runtimes)
+    dst.log += src.log
+
+
+def _diff_unit_pass(
+    wt: Path, state: dict[str, Any], tag: str, units: list[tuple[str, list[Path]]],
+    td: Path, stem: str, *, base: bool = False,
+) -> tuple[Outcome, dict[tuple[str, str], dict[int, dict[str, Any]]], dict[str, str], dict[str, list[str]], list[str]]:
+    """Execute Mode D units one at a time so identically named recorders across packages never overwrite each other."""
+    merged = Outcome()
+    recs: dict[tuple[str, str], dict[int, dict[str, Any]]] = {}
+    errors: dict[str, str] = {}
+    gone: dict[str, list[str]] = {}
+    raw_lines: list[str] = []
+    for idx, (u_key, u_placed) in enumerate(units):
+        uf = td / f"{stem}_{idx}.jsonl"
+        try:
+            with diff_out(uf):
+                if base:
+                    o, u_gone = salvage_go(wt, state, tag, u_placed, race=False)
+                    gone.update(u_gone)
+                else:
+                    o = run_suite(wt, suite_for(tag, state, u_placed, wt), race=False)
+            _merge_outcome(merged, o)
+            if uf.exists():
+                text = uf.read_text()
+                if text:
+                    raw_lines.append(text.rstrip("\n") + "\n")
+            for cname, u_recs in read_records(uf).items():
+                recs[(u_key, cname)] = u_recs
+        except CompileError as e:
+            if not base:
+                raise
+            errors[u_key] = str(e)[-800:]
+    return merged, recs, errors, gone, raw_lines
 
 
 def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str]:
@@ -779,70 +837,89 @@ def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str
         write_json(hdir / f"diff_{tag}.examples.json", detail)
         return verdicts
     targets = {t["dir"] for t in state["targets"]}
-    with tempfile.TemporaryDirectory() as td:
-        h1, h2, bf = Path(td) / "head1.jsonl", Path(td) / "head2.jsonl", Path(td) / "base.jsonl"
-        placed: list[Path] = []
+    by_unit: dict[str, list[dict[str, str]]] = {}
+    for f in files:
+        by_unit.setdefault(_unit_key(str(f.get("path", ""))), []).append(f)
+
+    def _place_units(root: Path) -> list[tuple[str, list[Path]]]:
+        all_placed: list[Path] = []
+        units: list[tuple[str, list[Path]]] = []
+        try:
+            for uk, ufiles in by_unit.items():
+                up = place(root, ufiles, targets)
+                all_placed.extend(up)
+                units.append((uk, up))
+        except BaseException:
+            unplace(all_placed)
+            raise
+        return units
+
+    with tempfile.TemporaryDirectory() as td_str:
+        td = Path(td_str)
         runs: list[Outcome] = []
+        head_recs: list[dict[tuple[str, str], dict[int, dict[str, Any]]]] = []
+        head_raw: list[str] = []
+        head_units = _place_units(wt)
         try:
-            placed = place(wt, files, targets)
-            for out in (h1, h2):
-                with diff_out(out):
-                    runs.append(run_suite(wt, suite_for(tag, state, placed, wt), race=False))
+            for pass_i in range(2):
+                o, recs, _, _, raw = _diff_unit_pass(wt, state, tag, head_units, td, f"head{pass_i + 1}")
+                runs.append(o)
+                head_recs.append(recs)
+                if pass_i == 0:
+                    head_raw = raw
         finally:
-            unplace(placed)
-        head_recs = [read_records(h1), read_records(h2)]
+            unplace([p for _, ps in head_units for p in ps])
+
         gone: dict[str, list[str]] = {}
-        base: Outcome | None = None
-        base_error = ""
-        placed = []
+        base_errors: dict[str, str] = {}
+        base = Outcome()
+        base_recs: dict[tuple[str, str], dict[int, dict[str, Any]]] = {}
+        base_raw: list[str] = []
+        base_units = _place_units(wt_base)
         try:
-            placed = place(wt_base, files, targets)
-            with diff_out(bf):
-                base, gone = salvage_go(wt_base, state, tag, placed, race=False)
-        except CompileError as e:
-            base_error = str(e)[-800:]
+            base, base_recs, base_errors, gone, base_raw = _diff_unit_pass(wt_base, state, tag, base_units, td, "base", base=True)
         finally:
-            unplace(placed)
-        base_recs = read_records(bf)
-        for src, side in ((h1, "head"), (bf, "base")):  # every record, for triage beyond the 5 examples per test
-            (hdir / f"diff_{tag}.{side}.jsonl").write_text(src.read_text() if src.exists() else "")
+            unplace([p for _, ps in base_units for p in ps])
+
+        (hdir / f"diff_{tag}.head.jsonl").write_text("".join(head_raw))
+        (hdir / f"diff_{tag}.base.jsonl").write_text("".join(base_raw))
     for ident in sorted(set(runs[0].results) | set(runs[1].results)):
-        name = record_name(ident)
+        u_key = ident.split("::", 1)[0]
+        rkey = (u_key, record_name(ident))
         statuses = [r.results.get(ident, "MISSING") for r in runs]
-        a, b = head_recs[0].get(name, {}), head_recs[1].get(name, {})
+        a, b = head_recs[0].get(rkey, {}), head_recs[1].get(rkey, {})
         if any(s != "PASS" for s in statuses):
             verdicts[ident] = "RECORDER_FAILED"
             msg = runs[0].messages.get(ident) or runs[1].messages.get(ident, "")
             detail[ident] = {"detail": f"head runs: {statuses}; {normalize_failure(msg, wt)[-600:]}"}
         elif not a and not b:
             verdicts[ident] = "NO_RECORDS"
-        elif a != b:
+        elif not _json_eq(a, b):
             verdicts[ident] = "NONDETERMINISTIC"
             keys = set(a) | set(b)
-            detail[ident] = {"detail": f"{len([i for i in keys if a.get(i) != b.get(i)])} of {len(keys)} records differ "
+            detail[ident] = {"detail": f"{len([i for i in keys if not _json_eq(a.get(i), b.get(i))])} of {len(keys)} records differ "
                                        "between two runs on the PR head; dropped"}
-        elif base_error:
+        elif u_key in base_errors:
             verdicts[ident] = "BASE_UNCOMPILABLE"
-            detail[ident] = {"detail": base_error}
+            detail[ident] = {"detail": base_errors[u_key]}
         elif ident in gone:
             verdicts[ident] = "BASE_UNCOMPILABLE"
             detail[ident] = {"detail": "undefined on the merge-base: " + ", ".join(gone[ident])}
         else:
-            assert base is not None
             status = base.results.get(ident, "MISSING")
             msg = base.messages.get(ident, "")
             if status != "PASS":
                 missing = MISSING_ON_BASE.search(msg) or TARGET_MISSING.search(msg)
                 verdicts[ident] = "BASE_UNCOMPILABLE" if missing else "BASE_FAILED"
                 detail[ident] = {"detail": f"base run: {status}; {normalize_failure(msg, wt_base)[-600:]}"}
-            elif not base_recs.get(name):
+            elif not base_recs.get(rkey):
                 verdicts[ident] = "BASE_FAILED"
                 detail[ident] = {"detail": "the recorder passed on the merge-base but wrote no records"}
             else:
-                diffs = diff_records(a, base_recs[name])
+                diffs = diff_records(a, base_recs[rkey])
                 verdicts[ident] = "DIFF" if diffs else "SAME"
                 if diffs:
-                    detail[ident] = {"differing": len(diffs), "compared": len(set(a) | set(base_recs[name])),
+                    detail[ident] = {"differing": len(diffs), "compared": len(set(a) | set(base_recs[rkey])),
                                      "examples": diffs[:DIFF_EXAMPLES]}
     write_json(hdir / f"diff_{tag}.json", verdicts)
     write_json(hdir / f"diff_{tag}.examples.json", detail)
@@ -1221,7 +1298,7 @@ def cmd_fuzz(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
                 # The corpus lands next to the package; remove only what this run created so the worktree stays clean.
                 for c in reversed(created):
                     if c.exists():
-                        _shutil.rmtree(c)
+                        shutil.rmtree(c)
     finally:
         unplace(placed)
     if additions:
@@ -1233,19 +1310,13 @@ def cmd_fuzz(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     return report
 
 
-def _terminate(signum: int, _frame: Any) -> None:
-    # SIGTERM / SIGHUP (a tool timeout, a closed terminal) unwind through the finally blocks, so a mutated file is
-    # restored and hunt files are removed instead of being left in the worktree.
-    raise SystemExit(128 + signum)
-
-
 def main(argv: list[str]) -> int:
     if len(argv) != 4 or argv[1] not in ("run", "base", "mutants", "cover", "fuzz", "diff"):
         print(__doc__)
         return 1
     cmd, pr, tag = argv[1], argv[2], argv[3]
     for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, _terminate)
+        signal.signal(sig, terminate_handler)
     hdir = hunt_dir(pr)
     try:
         with hunt_lock(hdir, pr):

@@ -8,20 +8,16 @@ usage: ledger.py record <pr> [--out <path>]   append one compact JSONL telemetry
 """
 from __future__ import annotations
 
-import atexit as _atexit
-import shutil as _shutil
-import sys as _sys
-import tempfile as _tempfile
+import sys
 
-if not _sys.pycache_prefix:
-    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
-    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
+sys.dont_write_bytecode = True
+if not sys.pycache_prefix:
+    sys.pycache_prefix = "/dev/null/hunt-pyc"
 
 import argparse
 import json
 import os
 import re
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any

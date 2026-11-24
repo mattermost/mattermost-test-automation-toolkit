@@ -81,13 +81,13 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
 Run from `packages/diff-bug-hunter/` (passing `--dispatch '<cmd>'` where `<cmd>` executes the request and writes `response_path` for fresh hunter benchmarks):
 
 - `.claude/skills/hunt/scripts/eval_bugs.py eval/bugs_2026.json --repo <full mattermost clone> [--signals hunters,diff,old,pr,review] [--skip-missing] [--dispatch '<cmd>']`
-  (extending `.claude/skills/hunt/scripts/eval_reverts.py` / `eval/revert_cases.json`) evaluates `/hunt` across reverts, `v12.x` RC
+  (plus `eval/revert_cases.json`) evaluates `/hunt` across reverts, `v12.x` RC
   hotfixes, pre-merge review regressions, and clean controls, tracking regression locks (`lock: true`).
 - `.claude/skills/hunt/scripts/eval_bugs.py diff <baseline_scorecard.json> <candidate_scorecard.json>` enforces a monotonic quality gate
   before prompt/rule edits merge (`cand.vetted_recall >= base.vetted_recall`, bounded FP rate, 0 lock regressions).
 - `.claude/skills/hunt/scripts/ledger.py record <pr>` appends compact telemetry to `$HUNT_SCRATCH/hunt_ledger.jsonl` and automatically
   exports verified false-negative bundles into `escapes/` whenever Mode R proves a bug that Modes A/B/D missed.
-- `.claude/skills/hunt/scripts/mine_rules.py <repo> [-n 30]` proposes candidate `RELIABILITY.md` rules from reverts without mutating rules.
+- `eval/mine_rules.py <repo> [-n 30]` proposes candidate `RELIABILITY.md` rules from reverts without mutating rules.
 - `.claude/skills/hunt/scripts/lessons.py prune [--write]` retires unused or over-broad globs (including 2-segment monorepo roots such as
   `server/channels/*`); multi-batch hunts of the same target collapse to a single entry in `$HUNT_SCRATCH/lessons_hits.jsonl`.
 
@@ -106,7 +106,7 @@ holds the skill, never from the checked-out head.
   change it. A symlink install (the installer's default) resolves into this toolkit checkout, where the skill is
   tracked, so its rules come from the toolkit's `origin/main`: keep that checkout on `origin/main` (fetched), or use
   `--copy`.
-- Bytecode is never loaded from the skill directory (each script keeps its cache in a private temp dir), and committed
+- Bytecode is never loaded from the skill directory (scripts disable bytecode writes and redirect `__pycache__`), and committed
   `__pycache__` files fail the trust gate.
 - People editing the rules themselves set `HUNT_TRUSTED_REF=worktree`; `HUNT_TRUSTED_REF=<ref>` pins another ref.
 - New lessons apply once they are merged.
@@ -283,9 +283,8 @@ jobs:
       - run: sudo apt-get install -y postgresql-client redis-tools
       - run: packages/diff-bug-hunter/scripts/install-skill.sh --copy .
       - uses: anthropics/claude-code-action@6d5ae526d25ce88daa2200be073e1a373167f064  # v1.0.265
-        env:
-          GH_TOKEN: ${{ github.token }}
         with:
+          github_token: ${{ github.token }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
             /hunt ${{ github.event.pull_request.number }}
@@ -304,13 +303,14 @@ jobs:
   prompts/           Mode A/B/D/R, strategies (S1-S4), fuzz, language rules, repair, retry-empty, mutant and strengthen prompts
   scripts/           hunt_common.py, trusted.py, prepare.py, ctx.py (+ prefilter.py), build_requests.py,
                      review_threads.py, reliability.py, run.py, old_tests.py, pr_tests.py, lessons.py, ledger.py,
-                     mine_rules.py, mine_controls.py, eval_reverts.py, eval_bugs.py, start_pg.sh
+                     eval_bugs.py, start_pg.sh
 .claude/skills/verify/
   SKILL.md           plan, run, iterate (at most 3 runs), report
   scripts/verify_ui.mjs, pr_server.py
 scripts/install-skill.sh
 eval/revert_cases.json  real Mattermost reverts (bug_sha, fix_sha, area, quoted reason) and size-matched controls
 eval/bugs_2026.json     2026 RC hotfix pairs, session PR regression locks/misses, and clean controls
+eval/mine_rules.py, eval/mine_controls.py   offline revert rule & control mining helpers
 tests/               self-test: /hunt fixtures (Go bug, React bug, clean control), trusted rules, RELIABILITY
                      triggers, prefilter, lessons, rule mining, the revert benchmark, installer, and verify_ui.mjs
                      against a local fixture server

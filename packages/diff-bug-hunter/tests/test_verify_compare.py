@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 import pytest
-from test_hunt_engine import VERIFY_UI, _module, _node_env, needs_playwright
+from test_hunt_engine import VERIFY_UI, _module, _node_env, needs_node, needs_playwright
 
 ID_ALPHABET = "ybndrfg8ejkmcpqxot1uwisza345h769"  # the characters Mattermost ids are made of
 SECRET = "*" * 32
@@ -211,15 +211,20 @@ def test_runner_skips_the_desktop_app_landing_page(tmp_path, servers):
     assert p.returncode == 0 and "VERDICT: PASS" in p.stdout, p.stdout + p.stderr
 
 
+@needs_node
 def test_normalisation_and_diff_functions():
     i1, i2 = "ybndrfg8ejkmcpqxot1uwisza3", "h769h769h769h769h769h769h7"
     assert len(i1) == len(i2) == 26
     origins = '["http://localhost:8112", "http://localhost:8110"]'
     norm = _module(f"m.normalizeJson({{id: '{i1}', create_at: 1700000000000, delete_at: 0, last_login_at: 5, "
-                   f"Version: '11.2.0', BuildNumber: 9, url: 'http://localhost:8112/x?u={i1}', "
+                   f"Version: '11.2.0', BuildNumber: 9, server_version: '11.2', serverVersion: '11.2.0', "
+                   f"buildNumber: 9, conversion_rate: 0.42, "
+                   f"url: 'http://localhost:8112/x?u={i1}', "
                    "when: '2024-01-02T03:04:05Z', note: 'keep me', nested: [{update_at: 7}]}, " + origins + ")")
     assert json.loads(norm) == {"id": "<id>", "create_at": "<time>", "delete_at": 0, "last_login_at": "<time>",
-                                "Version": "<version>", "BuildNumber": "<version>", "url": "<origin>/x?u=<id>",
+                                "Version": "<version>", "BuildNumber": "<version>", "server_version": "<version>",
+                                "serverVersion": "<version>", "buildNumber": "<version>",
+                                "conversion_rate": 0.42, "url": "<origin>/x?u=<id>",
                                 "when": "<date>", "note": "keep me", "nested": [{"update_at": "<time>"}]}
     assert json.loads(_module("m.diffJson({a: {b: 1, c: [1, 2]}, d: 1}, {a: {b: 2, c: [1, 3]}, e: 1})")) == [
         {"path": "a.b", "base": 1, "head": 2}, {"path": "a.c[1]", "base": 2, "head": 3}, {"path": "d", "base": 1},
@@ -227,6 +232,7 @@ def test_normalisation_and_diff_functions():
     assert _module("m.diffJson({a: {b: 1}, c: 1}, {a: {b: 2}, c: 2}, ['a'])").count("path") == 1
 
 
+@needs_node
 def test_normalize_json_preserves_multiple_id_keyed_entries():
     a1, a2 = "ybndrfg8ejkmcpqxot1uwisza3", "h769h769h769h769h769h769h7"
     b1, b2 = "345h769ybndrfg8ejkmcpqxot1", "uwisza345h769ybndrfg8ejkmc"
@@ -240,3 +246,10 @@ def test_normalize_json_preserves_multiple_id_keyed_entries():
         f"m.normalizeJson({{posts: {{'{b1}': {{msg: 'one'}}, '{b2}': {{msg: 'BROKEN'}}}}}}))"
     ))
     assert changed and any("BROKEN" in json.dumps(d) for d in changed)
+    # A literal "<id>#0" key must coexist with grouped 26-char ID keys without collision.
+    no_collide = json.loads(_module(
+        f"m.normalizeJson({{posts: {{'<id>#0': {{msg: 'literal'}}, '{a1}': {{msg: 'one'}}, '{a2}': {{msg: 'two'}}}}}})"
+    ))
+    assert len(no_collide["posts"]) == 3 and {"msg": "literal"} in no_collide["posts"].values()
+    reordered = json.loads(_module("m.diffLines('First\\nSecond', 'Second\\nFirst')"))
+    assert reordered and any("First" in json.dumps(d) for d in reordered)

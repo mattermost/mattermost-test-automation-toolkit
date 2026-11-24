@@ -16,21 +16,15 @@ Exit codes: 0 ok, 2 INFRA_ERROR.
 """
 from __future__ import annotations
 
-import atexit as _atexit
-import shutil as _shutil
-import sys as _sys
-import tempfile as _tempfile
+import sys
 
-# Never load bytecode from the skill directory: a committed __pycache__/*.pyc (an unchecked-hash .pyc, say) would run
-# code the trust gate never compares with the reviewed source. Bytecode caches go to a private temp dir instead.
-if not _sys.pycache_prefix:
-    _sys.pycache_prefix = _tempfile.mkdtemp(prefix="hunt-pyc-")
-    _atexit.register(_shutil.rmtree, _sys.pycache_prefix, True)
+sys.dont_write_bytecode = True
+if not sys.pycache_prefix:
+    sys.pycache_prefix = "/dev/null/hunt-pyc"
 
 import fcntl
 import os
 import signal
-import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -38,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from ctx import changed_go_tests
-from hunt_common import InfraError, git, hunt_dir, hunt_lock, read_state, write_json
+from hunt_common import InfraError, clean_untracked, git, hunt_dir, hunt_lock, read_state, terminate_handler, write_json
 from run import PACKAGE_FAILED, CompileError, Outcome, classify, ensure_clean, go_run
 
 FLAG = "ENABLE_FULLY_PARALLEL_TESTS"
@@ -154,6 +148,8 @@ def cmd_pr(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
     wt, repo = Path(state["wt"]), Path(state["repo"])
     ensure_clean(wt)
     units, skipped = plan(repo, state["merge_base"], state["head"])
+    if any(u.get("lang") == "go" for u in units):
+        parallelism()  # validate config before per-unit error isolation turns it into NOT_RUN
     table: dict[str, str] = {}
     msgs: dict[str, str] = {}
     try:
@@ -165,7 +161,7 @@ def cmd_pr(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
             table.update(t)
             msgs.update(m)
     finally:
-        _clean(wt)
+        clean_untracked(wt)
     ensure_clean(wt)
     out = {"tests": table, "units": [{k: u[k] for k in ("lang", "key", "tests")} for u in units], "skipped": skipped}
     write_json(hdir / "pr_tests.json", out)
@@ -173,24 +169,12 @@ def cmd_pr(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _clean(wt: Path) -> None:
-    """A run can leave untracked files (a fuzz cache, a test's output) next to the tests: remove them."""
-    for line in git(wt, "status", "--porcelain", "--untracked-files=all").splitlines():
-        rel = line[3:]
-        if line.startswith("??") and "node_modules" not in rel and "go.work" not in rel:
-            (wt / rel).unlink(missing_ok=True)
-
-
-def _terminate(signum: int, _frame: Any) -> None:
-    raise SystemExit(128 + signum)  # unwind through ci_env, which puts the environment back
-
-
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(__doc__)
         return 1
     for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, _terminate)
+        signal.signal(sig, terminate_handler)
     hdir = hunt_dir(argv[1])
     try:
         with hunt_lock(hdir, argv[1]):
