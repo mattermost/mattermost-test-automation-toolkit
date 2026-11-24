@@ -275,43 +275,54 @@ function inferRelease(id, env = {}, rows = [], summaryContext) {
   if (summaryContext) return releaseFromDescriptions([rows.find((r) => r.context === summaryContext)?.description]);
   return void 0;
 }
+var statusKey = (r) => JSON.stringify([r.state, r.description ?? "", r.target_url ?? ""]);
 function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease }) {
   let validated;
   let lastWritten = null;
+  const staleKeys = /* @__PURE__ */ new Set();
+  let sawMissingPreWrite = false;
   const owner = () => validated ??= publishingOwner(id, env);
   const snapshotOwner = () => {
     const snapshot = runOf(id, env, "1");
     if (!positive(snapshot.run) || !positive(snapshot.attempt)) throw new Error("Invalid status publishing run/attempt");
     return snapshot;
   };
-  const allowed = async (operation) => {
+  const checkAllowed = async (operation) => {
     const rows = await readStatuses(api, id);
     const ok = mayPublish(rows, id, context, owner(), operation);
-    if (!ok) log(`Status ${context} belongs to another run/attempt or has no known owner; publication skipped`);
-    return ok;
+    if (!ok) {
+      log(`Status ${context} belongs to another run/attempt or has no known owner; publication skipped`);
+      return null;
+    }
+    return rows;
   };
+  const allowed = async (operation) => await checkAllowed(operation) !== null;
   const post = (row, by = owner()) => api("POST", `/repos/${id.repository}/statuses/${id.commit_sha}`, {
     ...row,
     description: row.description.slice(0, 140),
     target_url: ownedURL(row.target_url, by, id.repository)
   });
   const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease) => {
-    if (!summaryContext || !lanes.length) return;
+    if (!summaryContext || !lanes.length) return false;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
     const fetched = await readStatuses(api, id);
     const currentInRead = fetched.find((r) => r.context === context);
+    const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
+    const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
+    const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
     const staleSelfRead = Boolean(
-      lastWritten && (!currentInRead || currentInRead.state !== lastWritten.state || currentInRead.description !== lastWritten.description || currentInRead.target_url !== lastWritten.target_url)
+      lastWritten && !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten))
     );
     const rows = staleSelfRead ? [lastWritten, ...fetched] : fetched;
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
-    if (!latest.some((lane) => lane.status)) return;
+    if (!latest.some((lane) => lane.status)) return false;
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
     const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
     const pr = Number(id.gh_pr_number || 0) > 0;
     await post({ ...summarizeLanes(latest, untriaged, resolvedRelease, pr), context: summaryContext }, snapshotOwner());
+    return true;
   };
   return {
     allowed,
@@ -320,7 +331,9 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     // statuses without claiming a lane or pretending to be its test run.
     summarize,
     async write(row, operation = "finish") {
-      if (!await allowed(operation)) return false;
+      const preRows = await checkAllowed(operation);
+      if (!preRows) return false;
+      const prior = preRows.find((r) => r.context === context) ?? null;
       const payload = {
         context,
         state: row.state,
@@ -328,6 +341,8 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
         target_url: ownedURL(row.target_url, owner(), id.repository)
       };
       await post({ ...row, context });
+      if (prior && statusKey(prior) !== statusKey(payload)) staleKeys.add(statusKey(prior));
+      else if (!prior) sawMissingPreWrite = true;
       lastWritten = payload;
       return true;
     },
@@ -337,8 +352,8 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
       return true;
     },
     async refresh(lanes, summaryContext, summarizeLanes, release = defaultRelease) {
-      if (!summaryContext || !lanes.includes(context) || !await allowed("finish")) return;
-      await summarize(lanes, summaryContext, summarizeLanes, release);
+      if (!summaryContext || !lanes.includes(context) || !await allowed("finish")) return false;
+      return summarize(lanes, summaryContext, summarizeLanes, release);
     }
   };
 }
@@ -413,18 +428,35 @@ var NoResultsError = class extends Error {
     this.name = "NoResultsError";
   }
 };
-async function listReportGroups(fetchImpl, base, params, maxPages = 2, pageSize = 100) {
+function effectiveAttemptOf(idAttempt, runAttempt) {
+  const base = String(idAttempt ?? "");
+  return runAttempt != null && /^\d+$/.test(String(runAttempt)) && /^\d+$/.test(base) && Number(runAttempt) > Number(base) ? String(runAttempt) : base;
+}
+function groupMatches(g, id, runId, attempt) {
+  return g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name && String(g.gh_run_id) === runId && String(g.gh_run_attempt) === attempt;
+}
+async function listReportGroups(fetchImpl, base, params, maxPages = 2, pageSize = 100, stopWhen) {
   const all = [];
   for (let page = 0; page < maxPages; page++) {
     const q = new URLSearchParams({ ...params, limit: String(pageSize), ...page > 0 ? { offset: String(page * pageSize) } : {} });
     const { reports = [] } = await tsioJson(fetchImpl, base, `/reports?${q}`);
     all.push(...reports);
-    if (reports.length < pageSize) break;
+    if (reports.length < pageSize || stopWhen?.(all)) break;
   }
   return all;
 }
 async function fetchRun(fetchImpl, base, id, reportName = null, wait = { attempts: 6, ms: 2e4 }, runAttempt) {
-  const groups = await listReportGroups(fetchImpl, base, { repository: id.repository, commit: id.commit_sha, name: String(id.name) });
+  const runId = String(id.gh_run_id ?? "");
+  const idAttempt = String(id.gh_run_attempt ?? "");
+  const effectiveAttempt = effectiveAttemptOf(idAttempt, runAttempt);
+  const groups = await listReportGroups(
+    fetchImpl,
+    base,
+    { repository: id.repository, commit: id.commit_sha, name: String(id.name) },
+    2,
+    100,
+    runId && idAttempt ? (all) => all.some((g) => groupMatches(g, id, runId, effectiveAttempt)) : void 0
+  );
   return runFromGroups(fetchImpl, base, id, groups, reportName, wait, runAttempt);
 }
 async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wait = { attempts: 6, ms: 2e4 }, runAttempt) {
@@ -433,10 +465,8 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
   const idAttempt = String(id.gh_run_attempt ?? "");
   if (!runId || !idAttempt)
     throw new Error(`composite identity is missing gh_run_id or gh_run_attempt; refusing to guess which run to read (run_id=${runId || "-"} attempt=${idAttempt || "-"})`);
-  const effectiveAttempt = runAttempt != null && /^\d+$/.test(String(runAttempt)) && /^\d+$/.test(idAttempt) && Number(runAttempt) > Number(idAttempt) ? String(runAttempt) : idAttempt;
-  const matchAttempt = (att) => groups.find(
-    (g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name && String(g.gh_run_id) === runId && String(g.gh_run_attempt) === att
-  );
+  const effectiveAttempt = effectiveAttemptOf(idAttempt, runAttempt);
+  const matchAttempt = (att) => groups.find((g) => groupMatches(g, id, runId, att));
   const group = (effectiveAttempt !== idAttempt ? matchAttempt(effectiveAttempt) : void 0) ?? matchAttempt(idAttempt);
   const attempt = effectiveAttempt;
   if (!group) {
@@ -548,7 +578,7 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
     } else if (status === "skipped") skipped++;
     else if (status === "flaky") flaky++;
   }
-  return { group_id: group.id, failing, missing, outcomes, elsewhere, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
+  return { group_id: group.id, attempt: String(group.gh_run_attempt), failing, missing, outcomes, elsewhere, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
 }
 
 // src/publish.ts

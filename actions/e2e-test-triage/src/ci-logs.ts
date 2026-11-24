@@ -84,15 +84,16 @@ export function stepLines(log: string, from: number | null, to: number | null): 
 }
 
 /** The step's error lines, most repeated first: digits folded so "after 10000ms" and "after 4000ms" count as one. */
-export function errorLines(lines: string[], max = 5): string[] {
+export function errorLines(lines: string[], max = 5, secrets: string[] = []): string[] {
   const counts = new Map<string, { n: number; line: string }>();
   for (const l of lines) {
     const line = l.trim();
     if (!ERROR_LINE.test(line) || NOISE.test(line) || line.length < 8) continue;
-    const key = line.replace(/\d+/g, "#").slice(0, 160);
+    const clean = redact(line, secrets);
+    const key = clean.replace(/\d+/g, "#").slice(0, 160);
     const seen = counts.get(key);
     if (seen) seen.n++;
-    else counts.set(key, { n: 1, line: line.slice(0, 240) });
+    else counts.set(key, { n: 1, line: clean.slice(0, 240) });
   }
   return [...counts.values()]
     .sort((a, b) => b.n - a.n)
@@ -100,22 +101,24 @@ export function errorLines(lines: string[], max = 5): string[] {
     .map((c) => c.line);
 }
 
-async function ghRawGet(fetchImpl: FetchImpl, token: string, path: string, timeoutMs = 60_000): Promise<Response> {
+async function ghRawGet(fetchImpl: FetchImpl, token: string, path: string, timeoutMs = 60_000, deadline?: number): Promise<Response> {
   let last: Error | null = null;
   for (let i = 0; i < 3; i++) {
+    if (deadline !== undefined && Date.now() >= deadline) break;
+    const remaining = deadline !== undefined ? Math.max(1000, Math.min(timeoutMs, deadline - Date.now())) : timeoutMs;
     const res = await fetchImpl(`https://api.github.com${path}`, {
       headers: {
         authorization: `Bearer ${token}`,
         accept: "application/vnd.github+json",
         "user-agent": "mattermost-e2e-triage",
       },
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.timeout(remaining),
     });
     if (res.ok) return res;
     last = new Error(`GitHub GET ${path.split("?")[0]}: ${res.status}`);
     if (res.status < 500 && res.status !== 429) break;
   }
-  throw last ?? new Error(`GitHub GET ${path}`);
+  throw last ?? new Error(`GitHub GET ${path.split("?")[0]}: deadline exceeded`);
 }
 
 /** Lists all jobs on `(runId, attempt)` via paginated GitHub Actions API. */
@@ -126,6 +129,7 @@ export async function fetchRunJobs({
   runId,
   attempt,
   maxPages = 10,
+  deadline,
 }: {
   fetchImpl: FetchImpl;
   token: string;
@@ -133,11 +137,13 @@ export async function fetchRunJobs({
   runId: string;
   attempt: string;
   maxPages?: number;
+  deadline?: number;
 }): Promise<GhJob[]> {
   const all: GhJob[] = [];
   for (let page = 1; page <= maxPages; page++) {
+    if (deadline !== undefined && Date.now() >= deadline) break;
     const { total_count: total = 0, jobs: rows = [] } = (await (
-      await ghRawGet(fetchImpl, token, `/repos/${repository}/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=100&page=${page}`)
+      await ghRawGet(fetchImpl, token, `/repos/${repository}/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=100&page=${page}`, 60_000, deadline)
     ).json()) as { total_count?: number; jobs?: GhJob[] };
     all.push(...rows);
     if (!rows.length || all.length >= total) break;
@@ -152,14 +158,16 @@ export async function fetchJobLog({
   repository,
   jobId,
   timeoutMs = 30_000,
+  deadline,
 }: {
   fetchImpl: FetchImpl;
   token: string;
   repository: string;
   jobId: number;
   timeoutMs?: number;
+  deadline?: number;
 }): Promise<string> {
-  return (await ghRawGet(fetchImpl, token, `/repos/${repository}/actions/jobs/${jobId}/logs`, timeoutMs)).text();
+  return (await ghRawGet(fetchImpl, token, `/repos/${repository}/actions/jobs/${jobId}/logs`, timeoutMs, deadline)).text();
 }
 
 /** Filters run jobs to a lane by prefix and comma-separated include/exclude tokens (`!exclude`). */
@@ -200,7 +208,22 @@ function findingSearchTerms(f: Pick<Finding, "file" | "title" | "full_title">): 
   return [...new Set(terms)];
 }
 
-function extractMatchingWindow(lines: string[], terms: string[], maxChars: number): string {
+export const OS_GROUPS = [/\b(?:ubuntu|linux)\b/, /\bwindows\b/, /\bmacos\b/] as const;
+const SUITE_GROUPS = [/\bcypress\b/, /\bplaywright\b/, /\bdetox\b/, /\bmaestro\b/] as const;
+const MOBILE_GROUPS = [/\bios\b/, /\bandroid\b/, /\bipad\b/] as const;
+
+function conflictingGroup(laneStr: string, targetStr: string, groups: readonly RegExp[]): boolean {
+  const mine = groups.filter((re) => re.test(laneStr));
+  if (!mine.length) return false;
+  const hits = groups.filter((re) => re.test(targetStr));
+  return hits.length > 0 && hits.some((re) => !mine.includes(re));
+}
+
+export function hasLaneTagConflict(laneStr: string, targetStr: string): boolean {
+  return conflictingGroup(laneStr, targetStr, OS_GROUPS) || conflictingGroup(laneStr, targetStr, SUITE_GROUPS) || conflictingGroup(laneStr, targetStr, MOBILE_GROUPS);
+}
+
+function extractMatchingWindow(lines: string[], terms: string[], maxChars: number, secrets: string[] = []): string {
   if (!terms.length || !lines.length) return "";
   const lowerTerms = terms.map((t) => t.toLowerCase());
   const snippets: string[] = [];
@@ -210,13 +233,13 @@ function extractMatchingWindow(lines: string[], terms: string[], maxChars: numbe
     if (!lowerTerms.some((t) => lower.includes(t))) continue;
     const from = Math.max(0, i - 4);
     const to = Math.min(lines.length, i + 7);
-    const chunk = lines.slice(from, to).join("\n");
+    const chunk = redact(lines.slice(from, to).join("\n"), secrets);
     if (used + chunk.length > maxChars && snippets.length > 0) break;
     snippets.push(chunk);
     used += chunk.length + 5;
     i = to;
   }
-  return snippets.join("\n---\n").slice(0, maxChars);
+  return redact(snippets.join("\n---\n"), secrets).slice(0, maxChars);
 }
 
 /**
@@ -258,19 +281,17 @@ export async function skimCiLogsForFindings({
   if (!token || !repository || !runId || !findings.length) return empty;
   const deadline = Date.now() + deadlineMs;
   try {
-    const allJobs = await fetchRunJobs({ fetchImpl, token, repository, runId, attempt });
+    const allJobs = await fetchRunJobs({ fetchImpl, token, repository, runId, attempt, deadline });
     const { lane: filtered } = filterLaneJobs(allJobs, prefix, filter);
     let scoped = filtered.filter((j) => !OWN_RESULT_JOB.test(j.name));
     if (![prefix, filter, reportName, lane].some((s) => /\bsubpath\b/i.test(String(s ?? "")))) {
       scoped = scoped.filter((j) => !/\bsubpath\b/i.test(j.name));
     }
-    // If no explicit prefix/filter was given, try narrowing by OS/platform hint from reportName or lane.
-    if (!prefix && !filter && scoped.length > maxJobs) {
-      const hint = [reportName, lane]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase()
-        .match(/\b(ubuntu|linux|windows|macos|cypress|playwright|detox-ios|detox-android|detox-ipad|maestro-ios|maestro-android)\b/);
+    // If no explicit prefix/filter was given, drop conflicting OS/suite/mobile jobs and narrow by hint from reportName or lane.
+    const laneStr = [reportName, lane].filter(Boolean).join(" ").toLowerCase();
+    if (!prefix && !filter && laneStr) {
+      scoped = scoped.filter((j) => !hasLaneTagConflict(laneStr, j.name.toLowerCase()));
+      const hint = laneStr.match(/\b(ubuntu|linux|windows|macos|cypress|playwright|detox-ios|detox-android|detox-ipad|maestro-ios|maestro-android)\b/);
       if (hint) {
         const matched = scoped.filter((j) => j.name.toLowerCase().includes(hint[1]));
         if (matched.length) scoped = matched;
@@ -293,18 +314,19 @@ export async function skimCiLogsForFindings({
           repository,
           jobId: j.id,
           timeoutMs: Math.max(1000, deadline - Date.now()),
+          deadline,
         });
         const trimmed = raw.length > MAX_RAW_LOG_CHARS ? raw.slice(-MAX_RAW_LOG_CHARS) : raw;
         const step = failedStepOf(j);
         const focusedLines = step ? stepLines(trimmed, toMs(step.started_at), toMs(step.completed_at)) : [];
         const allLines = focusedLines.length ? focusedLines : stepLines(trimmed, null, null);
-        for (const err of errorLines(allLines, 5)) {
+        for (const err of errorLines(allLines, 5, secrets)) {
           const line = `[${j.name}] ${err}`;
           if (!runErrors.includes(line)) runErrors.push(line);
         }
         for (let i = 0; i < findings.length; i++) {
           if (byFinding.has(i)) continue;
-          const hit = extractMatchingWindow(allLines, termsByFinding[i], FINDING_EXCERPT_MAX);
+          const hit = extractMatchingWindow(allLines, termsByFinding[i], FINDING_EXCERPT_MAX, secrets);
           if (hit) byFinding.set(i, redact(`[${j.name}]\n${hit}`, secrets).slice(0, FINDING_EXCERPT_MAX));
         }
       } catch (e) {

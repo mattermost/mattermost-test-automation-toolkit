@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { FetchImpl } from "../../shared/src/github.ts";
-import { CI_CODE_PATTERNS, CI_INFRA_RE, filterLaneJobs, skimCiLogsForFindings } from "./ci-logs.ts";
+import { CI_CODE_PATTERNS, CI_INFRA_RE, errorLines, filterLaneJobs, skimCiLogsForFindings } from "./ci-logs.ts";
 import type { Finding } from "./types.ts";
 
 const makeFinding = (over: Partial<Finding>): Finding => ({
@@ -173,4 +173,104 @@ test("skimCiLogsForFindings ignores git checkout HEAD is now at and Previous HEA
   });
   assert.doesNotMatch(skimmed.runExcerpt, /HEAD is now at|Previous HEAD position was/);
   assert.match(skimmed.runExcerpt, /real assertion failed on #postTextbox/);
+});
+
+test("skimCiLogsForFindings respects deadline during job listing", async () => {
+  const pages: number[] = [];
+  const fetchImpl = (async (url: string) => {
+    const page = Number(new URL(String(url)).searchParams.get("page") ?? "1");
+    pages.push(page);
+    await new Promise((r) => setTimeout(r, 25));
+    return Response.json({
+      total_count: 200,
+      jobs: [{ id: 1, name: "dispatch-run-1", status: "completed", conclusion: "failure" }],
+    });
+  }) as FetchImpl;
+
+  const skimmed = await skimCiLogsForFindings({
+    fetchImpl,
+    token: "TOK",
+    repository: "o/r",
+    runId: "105",
+    attempt: "1",
+    findings: [makeFinding({})],
+    deadlineMs: 10,
+  });
+  assert.deepEqual(pages, [1]);
+  assert.equal(skimmed.runExcerpt, "");
+});
+
+test("skimCiLogsForFindings excludes conflicting lane jobs even when total job count is below maxJobs", async () => {
+  const fetched: number[] = [];
+  const fetchImpl = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/jobs?")) {
+      return Response.json({
+        total_count: 2,
+        jobs: [
+          { id: 1, name: "detox-ios-1", status: "completed", conclusion: "success" },
+          { id: 2, name: "detox-android-1", status: "completed", conclusion: "failure" },
+        ],
+      });
+    }
+    const id = Number(/\/jobs\/(\d+)\/logs/.exec(u)?.[1]);
+    fetched.push(id);
+    if (id === 1) return new Response("2026-11-20T10:00:00.0000000Z All tests passed");
+    return new Response("2026-11-20T10:00:00.0000000Z Error: android emulator crashed");
+  }) as FetchImpl;
+
+  const skimmed = await skimCiLogsForFindings({
+    fetchImpl,
+    token: "TOK",
+    repository: "o/r",
+    runId: "106",
+    attempt: "1",
+    lane: "detox-ios",
+    findings: [makeFinding({})],
+  });
+  assert.deepEqual(fetched, [1]);
+  assert.equal(skimmed.runExcerpt, "");
+});
+
+test("errorLines and extractMatchingWindow redact secrets crossing clip boundaries", async () => {
+  const secret = "MY_BOUNDARY_SECRET_9876543210";
+  const prefix = secret.slice(0, 10);
+  const longError = `Error: failed ${"x".repeat(220)} token=${secret} tail`;
+  const [line] = errorLines([longError], 5, [secret]);
+  assert.ok(line);
+  assert.doesNotMatch(line, new RegExp(prefix));
+
+  const paddingLine = `2026-11-20T10:00:01.0000000Z ${"y".repeat(230)}`;
+  const rawLog = [
+    "2026-11-20T10:00:00.0000000Z Running incoming_webhook_spec.ts",
+    paddingLine,
+    paddingLine,
+    paddingLine,
+    paddingLine,
+    `2026-11-20T10:00:02.0000000Z ${"z".repeat(160)} secret=${secret}`,
+  ].join("\n");
+  const fetchImpl = (async (url: string) => {
+    if (String(url).includes("/jobs?")) {
+      return Response.json({
+        total_count: 1,
+        jobs: [{ id: 88, name: "playwright-full-1", status: "completed", conclusion: "failure" }],
+      });
+    }
+    if (String(url).includes("/jobs/88/logs")) return new Response(rawLog);
+    throw new Error(`unexpected ${url}`);
+  }) as FetchImpl;
+
+  const skimmed = await skimCiLogsForFindings({
+    fetchImpl,
+    token: "TOK",
+    repository: "o/r",
+    runId: "107",
+    attempt: "1",
+    lane: "playwright-full",
+    findings: [makeFinding({})],
+    secrets: [secret],
+  });
+  const excerpt = skimmed.byFinding.get(0) ?? "";
+  assert.ok(excerpt.length > 0);
+  assert.doesNotMatch(excerpt, new RegExp(prefix));
 });

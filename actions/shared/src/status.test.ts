@@ -101,3 +101,94 @@ test("statusPublisher overlays its own just-written status when GitHub /statuses
     ],
   );
 });
+
+test("statusPublisher does not overlay lastWritten over a newer run, unowned override, or different same-run status", async () => {
+  const ctx = "e2e-test/playwright-full/enterprise";
+  const other = "e2e-test/cypress-full/enterprise";
+  const runUrl = "https://github.com/o/r/actions/runs/55";
+  const staleLane: CommitStatus = {
+    context: ctx,
+    state: "failure",
+    description: "1 failed",
+    target_url: `${runUrl}?status_run_id=55&status_run_attempt=1`,
+  };
+  const greenOther: CommitStatus = {
+    context: other,
+    state: "success",
+    description: "100% passed",
+    target_url: `${runUrl}?status_run_id=55&status_run_attempt=1`,
+  };
+
+  for (const [label, foreignRow] of [
+    ["newer run", { context: ctx, state: "failure", description: "run 56 failed", target_url: "https://github.com/o/r/actions/runs/56?status_run_id=56&status_run_attempt=1" }],
+    ["unowned override", { context: ctx, state: "failure", description: "manual override", target_url: "https://example.com/override" }],
+    ["different same-run writer", { context: ctx, state: "failure", description: "other writer failed", target_url: `${runUrl}?status_run_id=55&status_run_attempt=1` }],
+  ] as const) {
+    let reads = 0;
+    const posted: { context: string; state: string; description: string }[] = [];
+    const api: GhApi = async (method, path, body) => {
+      if (method === "GET" && path.includes("/statuses")) {
+        reads++;
+        // write() sees staleLane; refresh()'s summarize() sees foreignRow (or allowed() sees staleLane then summarize() sees foreignRow).
+        return [reads <= 2 ? staleLane : foreignRow, greenOther];
+      }
+      if (method === "POST" && path.includes("/statuses/")) {
+        posted.push(body as { context: string; state: string; description: string });
+        return {};
+      }
+      throw new Error(`unexpected ${method} ${path}`);
+    };
+    const pub = statusPublisher({
+      api,
+      id: { repository: "o/r", commit_sha: "sha", gh_run_id: "55", gh_run_attempt: "1" },
+      context: ctx,
+      env: { GITHUB_RUN_ID: "55", GITHUB_RUN_ATTEMPT: "1" },
+      log: () => {},
+    });
+    assert.equal(await pub.write({ state: "success", description: "(1 flaky) 99% passed", target_url: runUrl }, "triage"), true, label);
+    assert.equal(await pub.refresh([ctx, other], summary, (lanes) => ({
+      state: lanes.every((l) => l.status?.state === "success") ? "success" : "failure",
+      description: lanes.every((l) => l.status?.state === "success") ? "All green" : "Still red",
+    })), true, label);
+    assert.deepEqual(
+      posted.map((p) => [p.context, p.state, p.description]),
+      [
+        [ctx, "success", "(1 flaky) 99% passed"],
+        [summary, "failure", "Still red"],
+      ],
+      label,
+    );
+  }
+});
+
+test("statusPublisher.refresh returns true only when aggregate status is written, and false when skipped", async () => {
+  const ctx = "e2e-test/playwright-full/enterprise";
+  const other = "e2e-test/cypress-full/enterprise";
+  const runUrl = "https://github.com/o/r/actions/runs/55";
+  const ownStatus: CommitStatus = { context: ctx, state: "success", description: "ok", target_url: `${runUrl}?status_run_id=55&status_run_attempt=1` };
+  const newerStatus: CommitStatus = { context: ctx, state: "success", description: "ok", target_url: "https://github.com/o/r/actions/runs/99?status_run_id=99&status_run_attempt=1" };
+  let rows: CommitStatus[] = [];
+  const api: GhApi = async (method, path) => {
+    if (method === "GET" && path.includes("/statuses")) return rows;
+    if (method === "POST" && path.includes("/statuses/")) return {};
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+  const pub = statusPublisher({
+    api,
+    id: { repository: "o/r", commit_sha: "sha", gh_run_id: "55", gh_run_attempt: "1" },
+    context: ctx,
+    env: { GITHUB_RUN_ID: "55", GITHUB_RUN_ATTEMPT: "1" },
+    log: () => {},
+  });
+  const summarizer = () => ({ state: "success", description: "All green" });
+
+  assert.equal(await pub.refresh([ctx], undefined, summarizer), false);
+  assert.equal(await pub.refresh([other], summary, summarizer), false);
+  rows = [newerStatus];
+  assert.equal(await pub.refresh([ctx, other], summary, summarizer), false);
+  rows = [ownStatus];
+  assert.equal(await pub.refresh([ctx, other], summary, summarizer), true);
+  assert.equal(await pub.summarize([ctx, other], summary, () => ({ state: "success", description: "ok" })), true);
+  rows = [];
+  assert.equal(await pub.summarize([ctx, other], summary, summarizer), false);
+});

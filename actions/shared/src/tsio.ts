@@ -194,6 +194,7 @@ export interface FailingTest {
 
 export interface RunResult {
   group_id: TsioId;
+  attempt?: string;
   failing: FailingTest[];
   missing: Missing | null;
   outcomes: Map<string, string>;
@@ -248,6 +249,24 @@ export function missingArrived(missing: Missing | null): string | null {
   return `${received ?? "?"} reports arrived (the expected count is unknown)`;
 }
 
+/** Picks `runAttempt` when it is a valid numeric attempt newer than `idAttempt`, else `idAttempt`. */
+export function effectiveAttemptOf(idAttempt: string | number | null | undefined, runAttempt?: string | number | null): string {
+  const base = String(idAttempt ?? "");
+  return runAttempt != null && /^\d+$/.test(String(runAttempt)) && /^\d+$/.test(base) && Number(runAttempt) > Number(base)
+    ? String(runAttempt)
+    : base;
+}
+
+function groupMatches(g: TsioGroup, id: CompositeIdentity, runId: string, attempt: string): boolean {
+  return (
+    g.repository === id.repository &&
+    g.commit === id.commit_sha &&
+    g.name === id.name &&
+    String(g.gh_run_id) === runId &&
+    String(g.gh_run_attempt) === attempt
+  );
+}
+
 /** Lists TSIO report groups with offset pagination so multi-group commits are never truncated at 20 rows. */
 export async function listReportGroups(
   fetchImpl: FetchImpl,
@@ -255,13 +274,14 @@ export async function listReportGroups(
   params: Record<string, string>,
   maxPages = 2,
   pageSize = 100,
+  stopWhen?: (all: TsioGroup[]) => boolean,
 ): Promise<TsioGroup[]> {
   const all: TsioGroup[] = [];
   for (let page = 0; page < maxPages; page++) {
     const q = new URLSearchParams({ ...params, limit: String(pageSize), ...(page > 0 ? { offset: String(page * pageSize) } : {}) });
     const { reports = [] } = await tsioJson<{ reports?: TsioGroup[] }>(fetchImpl, base, `/reports?${q}`);
     all.push(...reports);
-    if (reports.length < pageSize) break;
+    if (reports.length < pageSize || stopWhen?.(all)) break;
   }
   return all;
 }
@@ -278,7 +298,17 @@ export async function fetchRun(
   wait: Wait = { attempts: 6, ms: 20000 },
   runAttempt?: string | number | null,
 ): Promise<RunResult> {
-  const groups = await listReportGroups(fetchImpl, base, { repository: id.repository, commit: id.commit_sha, name: String(id.name) });
+  const runId = String(id.gh_run_id ?? "");
+  const idAttempt = String(id.gh_run_attempt ?? "");
+  const effectiveAttempt = effectiveAttemptOf(idAttempt, runAttempt);
+  const groups = await listReportGroups(
+    fetchImpl,
+    base,
+    { repository: id.repository, commit: id.commit_sha, name: String(id.name) },
+    2,
+    100,
+    runId && idAttempt ? (all) => all.some((g) => groupMatches(g, id, runId, effectiveAttempt)) : undefined,
+  );
   return runFromGroups(fetchImpl, base, id, groups, reportName, wait, runAttempt);
 }
 
@@ -302,19 +332,8 @@ export async function runFromGroups(
   const idAttempt = String(id.gh_run_attempt ?? "");
   if (!runId || !idAttempt)
     throw new Error(`composite identity is missing gh_run_id or gh_run_attempt; refusing to guess which run to read (run_id=${runId || "-"} attempt=${idAttempt || "-"})`);
-  const effectiveAttempt =
-    runAttempt != null && /^\d+$/.test(String(runAttempt)) && /^\d+$/.test(idAttempt) && Number(runAttempt) > Number(idAttempt)
-      ? String(runAttempt)
-      : idAttempt;
-  const matchAttempt = (att: string): TsioGroup | undefined =>
-    groups.find(
-      (g) =>
-        g.repository === id.repository &&
-        g.commit === id.commit_sha &&
-        g.name === id.name &&
-        String(g.gh_run_id) === runId &&
-        String(g.gh_run_attempt) === att,
-    );
+  const effectiveAttempt = effectiveAttemptOf(idAttempt, runAttempt);
+  const matchAttempt = (att: string): TsioGroup | undefined => groups.find((g) => groupMatches(g, id, runId, att));
   const group = (effectiveAttempt !== idAttempt ? matchAttempt(effectiveAttempt) : undefined) ?? matchAttempt(idAttempt);
   const attempt = effectiveAttempt;
   if (!group) {
@@ -454,7 +473,7 @@ export async function runFromGroups(
     else if (status === "flaky") flaky++;
   }
   // Passed includes retry-recovered tests, as the E2E statuses count them.
-  return { group_id: group.id, failing, missing, outcomes, elsewhere, counts:{ total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
+  return { group_id: group.id, attempt: String(group.gh_run_attempt), failing, missing, outcomes, elsewhere, counts:{ total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
 }
 
 /** What a run is missing when some reports never arrived, long and short; null if complete. */

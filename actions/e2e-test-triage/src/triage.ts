@@ -302,11 +302,12 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   // the repository's default branch. Until GitHub names that branch (the lookup failed, or never ran because nothing
   // failed) it stays undefined, and the publisher infers it from the tested identity and the statuses.
   let releaseRun: boolean | undefined = isTrunkRun ? undefined : false;
-  const settleLaneSummary = async (): Promise<void> => {
+  const settleLaneSummary = async (): Promise<boolean> => {
     try {
-      await publisher.refresh(lanes, triageContext ?? undefined, laneSummary, releaseRun);
+      return await publisher.refresh(lanes, triageContext ?? undefined, laneSummary, releaseRun);
     } catch (e) {
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
+      return false;
     }
   };
   const announceTriagePending = announce && (!lanes.length || lanes.includes(String(context)));
@@ -412,8 +413,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const apiKey = env.ANTHROPIC_API_KEY;
     const ask: AskFn | null = apiKey && !prSpendUnknown ? (packs, model) => askModelBatch(fetchImpl, apiKey, model, packs) : null;
     const secrets = secretsOf(env);
-    const attemptStr = String(Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1));
-    const runIdStr = String(env.GITHUB_RUN_ID || id.gh_run_id);
+    const sameRun = !env.GITHUB_RUN_ID || String(env.GITHUB_RUN_ID) === String(id.gh_run_id);
+    const attemptStr = String(sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : run.attempt ?? (id.gh_run_attempt || 1));
+    const runIdStr = String(id.gh_run_id || env.GITHUB_RUN_ID);
     const artifactEvidenceEnabled = env.ARTIFACT_EVIDENCE !== "false";
     const artifactPatterns = String(env.ARTIFACT_PATTERNS ?? "").split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
     const skimRuntimeEvidence = ask && env.GITHUB_TOKEN
@@ -469,7 +471,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       skimRuntimeEvidence,
       // A release run's matrix (OS x server version) is wider than a PR's platforms.
-      otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log, limit: branchBase ? 20 : 5 }),
+      otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, runAttempt: run.attempt, log, limit: branchBase ? 20 : 5 }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths, fetchFileDiffs: Boolean(branchBase) }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
@@ -617,7 +619,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         log(`triage's line not written on ${context}: ${String(e).slice(0, 200)}`);
       }
     }
-    if (announce && lanes.length) await settleLaneSummary();
+    let aggregatePublished = false;
+    if (announce && lanes.length) aggregatePublished = await settleLaneSummary();
     else if (announce) {
       // The same labels as the E2E check's text (see statusDescription), and its re-run wording.
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
@@ -625,7 +628,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         ? `${run.counts.failed} failed · not triaged, ${runFlag(flag)}`
         : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
-    if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
+    if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\naggregate-published=${aggregatePublished}\n`);
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));
     log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;
@@ -637,7 +640,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       } catch {
         // The lane's own failure is what the PR shows; a write that fails here changes nothing.
       }
-      await settleLaneSummary();
+      const aggregatePublished = await settleLaneSummary();
+      if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `aggregate-published=${aggregatePublished}\n`);
     } else if (announce) await postTriageCheck("error", "Triage could not finish; the E2E result stands");
     throw e;
   }

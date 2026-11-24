@@ -13,7 +13,7 @@ import type { OutOfDateResult } from "./history.ts";
 import { OUT_OF_DATE_DIR_CAP, dropStormRuns, fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markFixedOnTrunk, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { commonSenseClear, onlyOnPlatform, platformOf } from "./common-sense.ts";
 import { codeExcerpt, enrichFindings, failingLine, prChangedSince, sameTestOnOtherReports, siblingPlatforms } from "./enrich.ts";
-import { evidenceFor, loadEvidence } from "./evidence.ts";
+import { evidenceFor, loadEvidence, mergeEvidence } from "./evidence.ts";
 import { CLEARING, PACK_IMAGES, PATCH_MAX, buildPack, chainClears, changeCategory, changeSummary, compactError, evidenceIds, namesChangedFile, patchExcerpt, releasePack, serverOf } from "./pack.ts";
 import type { OtherFailure } from "./pack.ts";
 import { PRICES, costOf, newLedger, priceFor } from "./pricing.ts";
@@ -5898,4 +5898,194 @@ test("reliability fixes: unlisted lane does not wedge triage-context pending, re
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("INFRA_ERROR with infraClears: true requires citing error when relying on pack.error alone", () => {
+  const f = classify({ file: "e2e/specs/calls.test.ts", title: "MM-T5001", error: SERVER_DOWN }, [], [], { ...DEFAULTS, infraClears: true });
+  f.blocking = true;
+  const pack = buildPack(f, [], { number: 4107, repository: "mattermost/desktop", title: "fix" }, []);
+  assert.equal(unblocks("flaky_environment", [], pack, "INFRA_ERROR", true), false);
+  assert.equal(
+    decide("INFRA_ERROR", { cause: "flaky_environment", confidence: 0.95, cited_evidence: ["fake"], explanation: "x" }, pack, { ...DEFAULTS, infraClears: true }).blocking,
+    true,
+  );
+  assert.equal(unblocks("flaky_environment", ["error"], pack, "INFRA_ERROR", true), true);
+});
+
+test("trunkRunsOn excludes reportUnknownFor keys so unknown-report rows on one test do not block default-branch fallback", async () => {
+  const rows = Object.assign(
+    new Map<string, Observation[]>([
+      ["a", Array.from({ length: 6 }, (_, i) => obs({ branch: "feature/base", commit_sha: `a${i}` }))],
+      ["b", [obs({ branch: "feature/base", commit_sha: "b0" })]],
+    ]),
+    { reportUnknownFor: new Set(["a"]) },
+  );
+  assert.equal(trunkRunsOn(rows, "feature/base"), 1);
+
+  await inTmp(async (dir) => {
+    const summaryPath = join(dir, "s.md");
+    const history = (i: RequestInit): Response => {
+      const b = parsed<HistoryBody>(bodyText(i)).branch;
+      if (b === "feature/base") {
+        return Response.json({
+          observations: [
+            ...Array.from({ length: 5 }, (_, k) =>
+              obs({ file: "specs/a.spec.ts", title: "ta", branch: "feature/base", report_name: null, group_id: `ga${k}`, commit_sha: `ca${k}` }),
+            ),
+            obs({ file: "specs/b.spec.ts", title: "tb", branch: "feature/base", report_name: "e2e-on-windows-12.0", group_id: "gb0", commit_sha: "cb0" }),
+          ],
+        });
+      }
+      if (b === "master") {
+        return Response.json({
+          observations: trunkFailsAll(6).map((o, k) => ({
+            ...o,
+            file: "specs/b.spec.ts",
+            title: "tb",
+            report_name: "e2e-on-windows-12.0",
+            group_id: `gm${k}`,
+          })),
+        });
+      }
+      return Response.json({ observations: [] });
+    };
+    const fetchImpl = withDefaultBranch(
+      fakeFetch([
+        ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+        ["/reports/g1/suites", () => Response.json({ suites: [
+          { id: "sa", file_path: "specs/a.spec.ts", report_name: "e2e-on-windows-12.0" },
+          { id: "sb", file_path: "specs/b.spec.ts", report_name: "e2e-on-windows-12.0" },
+        ] })],
+        ["/reports/g1/cases", () => Response.json([caseRow("ta", "failed", 0, "sa"), caseRow("tb", "failed", 0, "sb")])],
+        ["/reports/history", history],
+        ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+        ["/pulls/5", () => Response.json({ title: "stacked", base: { ref: "feature/base" } })],
+        statusSink([]),
+      ]),
+      "master",
+    );
+    const result = await triage({
+      env: { ...env, REPORT_NAME: "e2e-on-windows", TRIAGE_CONTEXT: "off", ANTHROPIC_API_KEY: "", GITHUB_STEP_SUMMARY: summaryPath },
+      fetchImpl,
+      log: () => {},
+    });
+    assert.equal(fetchImpl.calls.filter((c) => /\/repos\/o\/r$/.test(c.url)).length, 1);
+    const fb = result.findings.find((f) => f.title === "tb")!;
+    assert.equal(fb.class, "BROKEN_ON_TRUNK");
+    assert.equal(fb.trunk.runs, 6);
+  });
+});
+
+test("siblingPlatforms uses the selected runAttempt per sibling while preserving attempt-1-only partial re-run siblings", async () => {
+  const id: CompositeIdentity = { repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "mobile-pr-detox-ios" };
+  const fetchImpl = fakeFetch([
+    ["/reports?", () => Response.json({
+      reports: [
+        { id: "g-ios-2", repository: "o/r", commit: "abc", name: "mobile-pr-detox-ios", gh_run_id: "12", gh_run_attempt: "2", status: "completed" },
+        { id: "g-and-1", repository: "o/r", commit: "abc", name: "mobile-pr-detox-android", gh_run_id: "12", gh_run_attempt: "1", status: "completed" },
+        { id: "g-and-2", repository: "o/r", commit: "abc", name: "mobile-pr-detox-android", gh_run_id: "12", gh_run_attempt: "2", status: "completed" },
+        { id: "g-mae-1", repository: "o/r", commit: "abc", name: "mobile-pr-maestro-ios", gh_run_id: "12", gh_run_attempt: "1", status: "completed" },
+      ],
+    })],
+    ["/reports/g-and-1/suites", () => Response.json({ suites: [{ id: "sa1", file_path: "specs/a.spec.ts" }] })],
+    ["/reports/g-and-1/cases", () => Response.json([{ suite_id: "sa1", title: "t1", status: "failed", retry_count: 0, ordinal: 0 }])],
+    ["/reports/g-and-2/suites", () => Response.json({ suites: [{ id: "sa2", file_path: "specs/a.spec.ts" }] })],
+    ["/reports/g-and-2/cases", () => Response.json([{ suite_id: "sa2", title: "t1", status: "passed", retry_count: 0, ordinal: 0 }])],
+    ["/reports/g-mae-1/suites", () => Response.json({ suites: [{ id: "sm1", file_path: "specs/a.spec.ts" }] })],
+    ["/reports/g-mae-1/cases", () => Response.json([{ suite_id: "sm1", title: "t1", status: "passed", retry_count: 0, ordinal: 0 }])],
+  ]);
+  const f = classify(failing, [], []);
+  await siblingPlatforms({ findings: [f], fetchImpl, base: "http://tsio", id, runAttempt: "2", log: () => {} });
+  assert.deepEqual(f.other_lanes, [
+    { platform: "detox-android", result: "passed" },
+    { platform: "maestro-ios", result: "passed" },
+  ]);
+});
+
+test("mergeEvidence deduplicates duplicate images by sha256 even when creating a new entry", () => {
+  const imgA = { name: "a.png", media_type: "image/png", data: "QQ==", sha256: "hash-a" };
+  const imgB = { name: "b.png", media_type: "image/png", data: "Qg==", sha256: "hash-b" };
+  const merged = mergeEvidence(
+    [],
+    [
+      { file: "specs/a.spec.ts", title: "t1", full_title: null, notes: "first", images: [imgA, imgA] },
+      { file: "specs/a.spec.ts", title: "t1", full_title: null, notes: "second", images: [imgB] },
+    ],
+  );
+  assert.equal(merged.length, 1);
+  assert.deepEqual(merged[0].images.map((i) => i.sha256), ["hash-a", "hash-b"]);
+  assert.equal(merged[0].notes, "first\nsecond");
+});
+
+test("triage targets id.gh_run_id rather than GITHUB_RUN_ID for CI log and artifact skimming", async () => {
+  const requestedRuns: string[] = [];
+  const fetchImpl = fakeFetch([
+    ...runRoutes([spec("t1", "failed")]),
+    ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
+    ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+    ["/pulls/5", () => Response.json({ title: "fix", base: { ref: "master" }, labels: [] })],
+    ["/actions/runs/", (init) => {
+      void init;
+      return Response.json({ total_count: 0, jobs: [], artifacts: [] });
+    }],
+    ["api.anthropic.com", (init) => modelReply(init, { cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "test" })],
+  ]);
+  const wrapped: FetchImpl = async (url, init) => {
+    const m = /\/actions\/runs\/(\d+)\//.exec(String(url));
+    if (m) requestedRuns.push(m[1]);
+    return fetchImpl(url, init);
+  };
+  await triage({
+    env: { ...env, MODE: "report-only", TRIAGE_CONTEXT: "off", GITHUB_RUN_ID: "999", GITHUB_RUN_ATTEMPT: "3" },
+    fetchImpl: wrapped,
+    log: () => {},
+  });
+  assert.ok(requestedRuns.length >= 2);
+  assert.ok(requestedRuns.every((r) => r === "12"), `expected run 12 only, got ${JSON.stringify(requestedRuns)}`);
+});
+
+test("triage emits aggregate-published output true only when aggregate status is written, and false otherwise", async () => {
+  await inTmp(async (dir) => {
+    const out1 = join(dir, "out1");
+    await triage({
+      env: {
+        ...env,
+        MODE: "enforce",
+        ANTHROPIC_API_KEY: "",
+        TRIAGE_CONTEXT: "e2e-test/triage",
+        TRIAGE_LANES: "e2e-test/playwright,e2e-test/cypress",
+        GITHUB_OUTPUT: out1,
+      },
+      fetchImpl: fakeFetch([
+        ...runRoutes([spec("t1", "failed")]),
+        ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
+        ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+        ["/pulls/5", () => Response.json({ title: "fix", base: { ref: "master" }, labels: [] })],
+        statusSink([]),
+      ]),
+      log: () => {},
+    });
+    assert.match(readFileSync(out1, "utf8"), /^aggregate-published=true$/m);
+
+    const out2 = join(dir, "out2");
+    await triage({
+      env: {
+        ...env,
+        MODE: "enforce",
+        ANTHROPIC_API_KEY: "",
+        TRIAGE_CONTEXT: "e2e-test/triage",
+        TRIAGE_LANES: "e2e-test/cypress",
+        GITHUB_OUTPUT: out2,
+      },
+      fetchImpl: fakeFetch([
+        ...runRoutes([spec("t1", "failed")]),
+        ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
+        ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+        ["/pulls/5", () => Response.json({ title: "fix", base: { ref: "master" }, labels: [] })],
+        statusSink([]),
+      ]),
+      log: () => {},
+    });
+    assert.match(readFileSync(out2, "utf8"), /^aggregate-published=false$/m);
+  });
 });

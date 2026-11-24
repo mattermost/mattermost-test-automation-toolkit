@@ -184,5 +184,52 @@ test("listReportGroups paginates past 100 groups using offset", async () => {
   }) as FetchImpl;
   const rows = await listReportGroups(fetchImpl, "http://tsio", { repository: "o/r", commit: commit });
   assert.equal(rows.length, 101);
-  assert.equal(urls.length, 2);
+  assert.deepEqual(urls.map((u) => new URL(u).searchParams.get("offset") ?? "0"), ["0", "100"]);
+  assert.ok(urls.every((u) => new URL(u).searchParams.get("limit") === "100"));
+});
+
+test("fetchRun stops paging once page 1 has exact effectiveAttempt, but reads page 2 when only older fallback is on page 1", async () => {
+  const pageCallsA: string[] = [];
+  const fetchA = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/reports?")) {
+      pageCallsA.push(u);
+      const offset = Number(new URL(u).searchParams.get("offset") ?? "0");
+      if (offset === 0) {
+        return Response.json({
+          reports: [group(ours.gh_run_id, "1"), ...Array.from({ length: 99 }, (_, i) => group(String(1000 + i)))],
+        });
+      }
+      return new Response("boom", { status: 500 });
+    }
+    if (u.endsWith("/suites")) return Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] });
+    if (u.includes("/cases")) return Response.json([{ suite_id: "s1", title: "t1", status: "passed", retry_count: 0, ordinal: 0 }]);
+    throw new Error(`unexpected ${u}`);
+  }) as FetchImpl;
+  const runA = await fetchRun(fetchA, "http://tsio", ours, null, { attempts: 1, ms: 0 });
+  assert.equal(pageCallsA.length, 1);
+  assert.equal(runA.attempt, "1");
+  assert.equal(runA.counts.passed, 1);
+
+  const pageCallsB: string[] = [];
+  const fetchB = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/reports?")) {
+      pageCallsB.push(u);
+      const offset = Number(new URL(u).searchParams.get("offset") ?? "0");
+      if (offset === 0) {
+        return Response.json({
+          reports: [group(ours.gh_run_id, "1"), ...Array.from({ length: 99 }, (_, i) => group(String(2000 + i)))],
+        });
+      }
+      return Response.json({ reports: [group(ours.gh_run_id, "2")] });
+    }
+    if (u.endsWith("/suites")) return Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] });
+    if (u.includes("/cases")) return Response.json([{ suite_id: "s1", title: "t1", status: "passed", retry_count: 0, ordinal: 0 }]);
+    throw new Error(`unexpected ${u}`);
+  }) as FetchImpl;
+  const runB = await fetchRun(fetchB, "http://tsio", ours, null, { attempts: 1, ms: 0 }, "2");
+  assert.equal(pageCallsB.length, 2);
+  assert.equal(runB.attempt, "2");
+  assert.equal(runB.counts.passed, 1);
 });

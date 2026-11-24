@@ -2,8 +2,8 @@
 // See LICENSE.txt for license information.
 
 import type { FetchImpl, GhApi } from "../../shared/src/github.ts";
-import { FAILED_STATUSES, elsewhereKey, listReportGroups, runFromGroups } from "../../shared/src/tsio.ts";
-import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
+import { FAILED_STATUSES, effectiveAttemptOf, elsewhereKey, listReportGroups, runFromGroups } from "../../shared/src/tsio.ts";
+import type { CompositeIdentity, RunResult, TsioGroup } from "../../shared/src/tsio.ts";
 import { COMPARE_FILE_CAP, laneOf, laneOfReport, osOfReport, repoPath } from "./config.ts";
 import { namesChangedFile } from "./pack.ts";
 import type { Finding } from "./types.ts";
@@ -91,6 +91,7 @@ export async function siblingPlatforms({
   fetchImpl,
   base,
   id,
+  runAttempt,
   log = () => {},
   deadlineMs = SIBLING_DEADLINE_MS,
   limit = 5,
@@ -99,6 +100,7 @@ export async function siblingPlatforms({
   fetchImpl: FetchImpl;
   base: string;
   id: CompositeIdentity;
+  runAttempt?: string | number | null;
   log?: (message: string) => void;
   deadlineMs?: number;
   /** The most sibling groups read. */
@@ -120,10 +122,26 @@ export async function siblingPlatforms({
       listReportGroups(fetchImpl, base, { repository: id.repository, commit: id.commit_sha }),
     );
     if (listed === "late") return log(`${laterMessage}; none was read`);
-    const siblings = listed.filter((g) => String(g.gh_run_id) === String(id.gh_run_id) && String(g.gh_run_attempt) === String(id.gh_run_attempt) && g.name !== id.name).slice(0, limit);
+    const idAttempt = String(id.gh_run_attempt ?? "");
+    const preferredAttempt = effectiveAttemptOf(idAttempt, runAttempt);
+    const bySibling = new Map<string, TsioGroup[]>();
+    for (const g of listed) {
+      if (String(g.gh_run_id) !== String(id.gh_run_id) || g.name === id.name) continue;
+      const list = bySibling.get(g.name) ?? [];
+      list.push(g);
+      bySibling.set(g.name, list);
+    }
+    const siblings: TsioGroup[] = [];
+    for (const list of bySibling.values()) {
+      const picked =
+        (preferredAttempt !== idAttempt ? list.find((g) => String(g.gh_run_attempt) === preferredAttempt) : undefined) ??
+        list.find((g) => String(g.gh_run_attempt) === idAttempt);
+      if (picked) siblings.push(picked);
+      if (siblings.length >= limit) break;
+    }
     for (const g of siblings) {
       if (Date.now() >= deadline) return log(`${laterMessage}; ${g.name} and the rest were not read`);
-      const read = await bySomeDeadline(runFromGroups(fetchImpl, base, { ...id, name: g.name }, listed, null, { attempts: 1, ms: 0 }).catch((e: unknown) => (log(`results of ${g.name} unavailable: ${String(e).slice(0, 160)}`), null)));
+      const read = await bySomeDeadline(runFromGroups(fetchImpl, base, { ...id, name: g.name }, listed, null, { attempts: 1, ms: 0 }, preferredAttempt).catch((e: unknown) => (log(`results of ${g.name} unavailable: ${String(e).slice(0, 160)}`), null)));
       if (read === "late") return log(`${laterMessage}; ${g.name} and the rest were not read`);
       if (!read) continue;
       // Matched by file and full title, as the run's own tests are: a same-named test in another block is another test.

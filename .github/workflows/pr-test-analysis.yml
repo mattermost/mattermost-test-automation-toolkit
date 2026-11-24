@@ -18,7 +18,7 @@ on:
         type: string
         default: "claude-sonnet-5-5"
       allowed_bots:
-        description: "Comma-separated bot actor logins allowed to trigger analysis (e.g. cursor[bot],unified-ci-app[bot],dependabot[bot])"
+        description: "Comma-separated bot actor logins allowed to trigger analysis (e.g. cursor[bot],unified-ci-app[bot],dependabot[bot]). Dependabot-triggered runs require ANTHROPIC_API_KEY configured as a Dependabot secret (Actions secrets are not exposed to Dependabot runs; otherwise analysis skips with unavailable status)."
         required: false
         type: string
         default: "cursor[bot],unified-ci-app[bot],dependabot[bot]"
@@ -27,7 +27,7 @@ on:
         description: "GitHub token for API/git against target_repo (caller github.token if same repo; PAT if target_repo is another repo)"
         required: false
       ANTHROPIC_API_KEY:
-        description: "Anthropic API key for Claude analysis"
+        description: "Anthropic API key for Claude analysis. Dependabot-triggered runs require this as a Dependabot secret (Actions secrets are not exposed to Dependabot runs; otherwise analysis skips with unavailable status)."
         required: false
       WEBHOOK_URL:
         description: "Optional Mattermost webhook URL for notifications"

@@ -278,9 +278,10 @@ export async function fetchHistory(
  * The most runs of one failing test that ran on `branch` with no PR, in a history read: what the trunk rules can count
  * for it. The trunk rules need minTrunkRuns of them, so a base branch with fewer is not read as trunk (see triage).
  */
-export function trunkRunsOn(history: Map<string, Observation[]>, branch: string): number {
+export function trunkRunsOn(history: Map<string, Observation[]> & { reportUnknownFor?: Set<string> }, branch: string): number {
   let most = 0;
-  for (const rows of history.values()) {
+  for (const [key, rows] of history.entries()) {
+    if (history.reportUnknownFor?.has(key)) continue;
     const runs = rows.filter((o) => (o.gh_pr_number == null || o.gh_pr_number === "") && o.branch === branch).length;
     most = Math.max(most, runs);
   }

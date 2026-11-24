@@ -5,6 +5,7 @@ import { posix } from "node:path";
 import type { FetchImpl } from "../../shared/src/github.ts";
 import { listZipEntries, readZipEntry } from "../../shared/src/zip.ts";
 import type { ZipEntry } from "../../shared/src/zip.ts";
+import { hasLaneTagConflict, OS_GROUPS } from "./ci-logs.ts";
 import { EVIDENCE_LIMITS, evidenceFor, mergeEvidence, parseImageBuffer } from "./evidence.ts";
 import { redact } from "./findings.ts";
 import type { Evidence, EvidenceImage, Finding } from "./types.ts";
@@ -32,13 +33,22 @@ const HIGH_SIGNAL_LOG_RE =
 const MAX_LOG_ENTRY_BYTES = 2_000_000;
 const MAX_NESTED_ZIP_BYTES = 5_000_000;
 const SERVICE_LOGS_MAX_CHARS = 2500;
+export const MAX_SCAN_IMAGE_BYTES = 20_000_000;
+export const MAX_SCAN_IMAGES = 24;
+const TEST_ID_RE = /(?:^|[^a-z0-9])(mm-t\d+)(?!\d)/gi;
+
+interface ScanBudget {
+  imageBytes: number;
+  images: number;
+  warned?: boolean;
+}
 
 function normalizeZipPath(p: string): string {
   return posix.normalize(p.replace(/\\/g, "/")).replace(/^\.\//, "");
 }
 
-function artifactTokens(reportName: string | null, lane: string | null, patterns: string[]): string[] {
-  const raw = [...patterns, reportName ?? "", lane ?? ""]
+function artifactTokens(reportName: string | null, lane: string | null): string[] {
+  const raw = [reportName ?? "", lane ?? ""]
     .flatMap((s) => String(s).split(/[,\s]+/))
     .map((s) => s.trim().toLowerCase())
     .filter((s) => s.length >= 3);
@@ -55,22 +65,10 @@ function workerIdsFromFindings(findings: Finding[]): string[] {
   return [...ids];
 }
 
-function conflictingGroup(laneStr: string, artStr: string, groups: readonly RegExp[]): boolean {
-  const mine = groups.filter((re) => re.test(laneStr));
-  if (!mine.length) return false;
-  const artHits = groups.filter((re) => re.test(artStr));
-  return artHits.length > 0 && artHits.some((re) => !mine.includes(re));
-}
-
 function hasLaneConflict(artifactName: string, reportName: string | null, lane: string | null): boolean {
   const laneStr = [reportName ?? "", lane ?? ""].join(" ").toLowerCase();
   const artStr = artifactName.toLowerCase();
-  const OS_GROUPS = [/\b(?:ubuntu|linux)\b/, /\bwindows\b/, /\bmacos\b/];
-  const SUITE_GROUPS = [/\bcypress\b/, /\bplaywright\b/, /\bdetox\b/, /\bmaestro\b/];
-  const MOBILE_GROUPS = [/\bios\b/, /\bandroid\b/, /\bipad\b/];
-  if (conflictingGroup(laneStr, artStr, OS_GROUPS)) return true;
-  if (conflictingGroup(laneStr, artStr, SUITE_GROUPS)) return true;
-  if (conflictingGroup(laneStr, artStr, MOBILE_GROUPS)) return true;
+  if (hasLaneTagConflict(laneStr, artStr)) return true;
   if (/^e2e-failure-/i.test(artStr) && reportName) {
     const repLower = reportName.toLowerCase();
     const myOs = OS_GROUPS.find((re) => re.test(laneStr));
@@ -109,8 +107,12 @@ function scoreArtifact(
 function findingMatchScore(entryName: string, f: Finding): number {
   const lower = entryName.toLowerCase();
   let score = 0;
-  const mm = /\b(MM-T\d+)\b/i.exec(`${f.full_title ?? ""} ${f.title}`);
-  if (mm && lower.includes(mm[1].toLowerCase())) score += 100;
+  const entryIds = [...lower.matchAll(TEST_ID_RE)].map((m) => m[1]);
+  if (entryIds.length > 0) {
+    const findingIds = [...`${f.full_title ?? ""} ${f.title}`.toLowerCase().matchAll(TEST_ID_RE)].map((m) => m[1]);
+    if (!findingIds.some((id) => entryIds.includes(id))) return 0;
+    score += 100;
+  }
   const base = (String(f.file ?? "").split(/[\\/]/).pop() ?? "").toLowerCase();
   const stem = base.replace(/\.(?:spec|test|e2e)\.[^.]+$|\.[^.]+$/, "");
   if (base.length >= 5 && lower.includes(base)) score += 60;
@@ -136,7 +138,7 @@ function serviceLogPriority(nameOrLine: string): number {
   return 3;
 }
 
-function extractServiceLogLines(filename: string, content: string): string[] {
+function extractServiceLogLines(filename: string, content: string, secrets: string[] = []): string[] {
   const base = filename.split("/").pop() ?? filename;
   const lines = content.split(/\r?\n/);
   if (/error-context\.md$/i.test(base)) {
@@ -144,7 +146,7 @@ function extractServiceLogLines(filename: string, content: string): string[] {
       .map((l) => l.trimEnd())
       .filter(Boolean)
       .slice(0, 25)
-      .map((l) => `[${base}] ${l.slice(0, 240)}`);
+      .map((l) => `[${base}] ${redact(l, secrets).slice(0, 240)}`);
     return compact;
   }
   const seen = new Set<string>();
@@ -152,10 +154,11 @@ function extractServiceLogLines(filename: string, content: string): string[] {
   for (const raw of lines) {
     const line = raw.trim();
     if (!line || !HIGH_SIGNAL_LOG_RE.test(line)) continue;
-    const dedupe = line.replace(/\d+/g, "#").slice(0, 140);
+    const clean = redact(line, secrets);
+    const dedupe = clean.replace(/\d+/g, "#").slice(0, 140);
     if (seen.has(dedupe)) continue;
     seen.add(dedupe);
-    out.push(`[${base}] ${line.slice(0, 260)}`);
+    out.push(`[${base}] ${clean.slice(0, 260)}`);
     if (out.length >= 12) break;
   }
   return out;
@@ -168,6 +171,9 @@ function inspectZipArchive({
   warn,
   serviceLines,
   evidence,
+  structuredEvidence,
+  secrets = [],
+  budget = { imageBytes: 0, images: 0 },
   depth = 0,
 }: {
   zip: Buffer;
@@ -176,11 +182,37 @@ function inspectZipArchive({
   warn: (m: string) => void;
   serviceLines: string[];
   evidence: Evidence[];
+  structuredEvidence?: Evidence[];
+  secrets?: string[];
+  budget?: ScanBudget;
   depth?: number;
 }): void {
   const entries = listZipEntries(zip);
   const byPath = new Map<string, ZipEntry>(entries.map((e) => [normalizeZipPath(e.name), e]));
   const matchedScreenshots = new Set<string>();
+  const decodedImages = new Map<string, EvidenceImage | null>();
+  const decodeImage = (entry: ZipEntry): EvidenceImage | null => {
+    if (decodedImages.has(entry.name)) return decodedImages.get(entry.name) ?? null;
+    if (budget.images >= MAX_SCAN_IMAGES || budget.imageBytes + entry.size > MAX_SCAN_IMAGE_BYTES) {
+      if (!budget.warned) {
+        budget.warned = true;
+        warn(`artifact image scan budget reached (${budget.images} images, ${budget.imageBytes} bytes); skipping remaining images`);
+      }
+      return null;
+    }
+    try {
+      const buf = readZipEntry(zip, entry, EVIDENCE_LIMITS.imageBytes);
+      budget.images++;
+      budget.imageBytes += buf.length;
+      const img = parseImageBuffer(`${artifactName}/${entry.name}`, buf, warn);
+      decodedImages.set(entry.name, img);
+      return img;
+    } catch (e) {
+      warn(`artifact image ${artifactName}/${entry.name} skipped: ${String(e).slice(0, 120)}`);
+      decodedImages.set(entry.name, null);
+      return null;
+    }
+  };
 
   // 1. Structured evidence*.json manifests (e.g. mobile triage-evidence-*).
   for (const entry of entries) {
@@ -199,7 +231,7 @@ function inspectZipArchive({
           const resolved = normalizeZipPath(baseDir === "." ? rel : posix.join(baseDir, rel));
           const target = byPath.get(resolved) ?? entries.find((e) => normalizeZipPath(e.name).endsWith(`/${rel.replace(/^\.\//, "")}`));
           if (!target) continue;
-          const img = parseImageBuffer(`${artifactName}/${target.name}`, readZipEntry(zip, target, EVIDENCE_LIMITS.imageBytes), warn);
+          const img = decodeImage(target);
           if (img) {
             images.push(img);
             matchedScreenshots.add(target.name);
@@ -207,13 +239,15 @@ function inspectZipArchive({
         }
         const notes = typeof item.notes === "string" ? item.notes.slice(0, EVIDENCE_LIMITS.notes) : "";
         if (notes || images.length) {
-          evidence.push({
+          const ev: Evidence = {
             file: item.file,
             title: item.title,
             full_title: typeof item.full_title === "string" ? item.full_title : null,
             notes,
             images,
-          });
+          };
+          evidence.push(ev);
+          structuredEvidence?.push(ev);
         }
       }
     } catch (e) {
@@ -228,7 +262,7 @@ function inspectZipArchive({
   for (const entry of logEntries) {
     try {
       const text = readZipEntry(zip, entry, MAX_LOG_ENTRY_BYTES).toString("utf8");
-      serviceLines.push(...extractServiceLogLines(entry.name, text));
+      serviceLines.push(...extractServiceLogLines(entry.name, text, secrets));
     } catch (e) {
       warn(`artifact log ${artifactName}/${entry.name} skipped: ${String(e).slice(0, 120)}`);
     }
@@ -248,12 +282,8 @@ function inspectZipArchive({
       }
     }
     if (bestIdx >= 0 && (imagesPerFinding.get(bestIdx)?.length ?? 0) < EVIDENCE_LIMITS.imagesPerTest) {
-      try {
-        const img = parseImageBuffer(`${artifactName}/${imgEntry.name}`, readZipEntry(zip, imgEntry, EVIDENCE_LIMITS.imageBytes), warn);
-        if (img) (imagesPerFinding.get(bestIdx) ?? imagesPerFinding.set(bestIdx, []).get(bestIdx)!).push(img);
-      } catch (e) {
-        warn(`artifact image ${artifactName}/${imgEntry.name} skipped: ${String(e).slice(0, 120)}`);
-      }
+      const img = decodeImage(imgEntry);
+      if (img) (imagesPerFinding.get(bestIdx) ?? imagesPerFinding.set(bestIdx, []).get(bestIdx)!).push(img);
     }
   }
 
@@ -262,12 +292,8 @@ function inspectZipArchive({
     const numbered = imageEntries.filter((e) => /(?:^|\/)\d+-test-failed-\d+\.(?:png|jpe?g)$/i.test(e.name)).slice(0, EVIDENCE_LIMITS.imagesPerTest);
     const sharedImgs: EvidenceImage[] = [];
     for (const imgEntry of numbered) {
-      try {
-        const img = parseImageBuffer(`${artifactName}/${imgEntry.name}`, readZipEntry(zip, imgEntry, EVIDENCE_LIMITS.imageBytes), warn);
-        if (img) sharedImgs.push(img);
-      } catch (e) {
-        warn(`artifact image ${artifactName}/${imgEntry.name} skipped: ${String(e).slice(0, 120)}`);
-      }
+      const img = decodeImage(imgEntry);
+      if (img) sharedImgs.push(img);
     }
     if (sharedImgs.length) {
       for (let i = 0; i < findings.length; i++) imagesPerFinding.set(i, sharedImgs);
@@ -291,11 +317,42 @@ function inspectZipArchive({
       if (!/blob-report\/[^/]+\.zip$/i.test(entry.name) || entry.size === 0 || entry.size > MAX_NESTED_ZIP_BYTES) continue;
       try {
         const inner = readZipEntry(zip, entry, MAX_NESTED_ZIP_BYTES);
-        inspectZipArchive({ zip: inner, artifactName: `${artifactName}/${entry.name}`, findings, warn, serviceLines, evidence, depth: 1 });
+        inspectZipArchive({ zip: inner, artifactName: `${artifactName}/${entry.name}`, findings, warn, serviceLines, evidence, structuredEvidence, secrets, budget, depth: 1 });
       } catch (e) {
         warn(`nested blob-report ${artifactName}/${entry.name} skipped: ${String(e).slice(0, 120)}`);
       }
     }
+  }
+}
+
+async function readResponseCapped(res: Response, maxBytes: number): Promise<Buffer | null> {
+  const contentLength = Number(res.headers?.get("content-length") ?? "");
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    return null;
+  }
+  if (!res.body) {
+    const buf = Buffer.from(await res.arrayBuffer());
+    return buf.length <= maxBytes ? buf : null;
+  }
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks, total);
+  } finally {
+    reader.releaseLock();
   }
 }
 
@@ -339,21 +396,28 @@ export async function skimRunArtifacts({
     const all: GhArtifact[] = [];
     for (let page = 1; page <= 5; page++) {
       if (Date.now() >= deadline) break;
-      const res = await fetchImpl(`https://api.github.com/repos/${repository}/actions/runs/${runId}/artifacts?per_page=100&page=${page}`, {
-        headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "mattermost-e2e-triage" },
-        signal: AbortSignal.timeout(Math.max(1000, deadline - Date.now())),
-      });
-      if (!res.ok) {
-        log(`artifacts list unavailable (${res.status})`);
-        return empty;
+      try {
+        const res = await fetchImpl(`https://api.github.com/repos/${repository}/actions/runs/${runId}/artifacts?per_page=100&page=${page}`, {
+          headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "mattermost-e2e-triage" },
+          signal: AbortSignal.timeout(Math.max(1000, deadline - Date.now())),
+        });
+        if (!res.ok) {
+          log(`artifacts list unavailable (${res.status})`);
+          if (all.length === 0) return empty;
+          break;
+        }
+        const data = (await res.json()) as { total_count?: number; artifacts?: GhArtifact[] };
+        const rows = data.artifacts ?? [];
+        all.push(...rows);
+        if (!rows.length || all.length >= (data.total_count ?? 0)) break;
+      } catch (e) {
+        log(`artifacts list page ${page} failed: ${String(e).slice(0, 120)}`);
+        if (all.length === 0) return empty;
+        break;
       }
-      const data = (await res.json()) as { total_count?: number; artifacts?: GhArtifact[] };
-      const rows = data.artifacts ?? [];
-      all.push(...rows);
-      if (!rows.length || all.length >= (data.total_count ?? 0)) break;
     }
 
-    const tokens = artifactTokens(reportName, lane, patterns);
+    const tokens = artifactTokens(reportName, lane);
     const workerIds = workerIdsFromFindings(findings);
     const selected = all
       .filter((a) => !a.expired && a.size_in_bytes > 0 && a.size_in_bytes <= maxZipBytes)
@@ -366,8 +430,10 @@ export async function skimRunArtifacts({
     if (!selected.length) return empty;
 
     const evidence: Evidence[] = [];
+    const structuredEvidence: Evidence[] = [];
     const serviceLines: string[] = [];
     const artifactsScanned: string[] = [];
+    const budget: ScanBudget = { imageBytes: 0, images: 0 };
 
     for (const art of selected) {
       if (Date.now() >= deadline) break;
@@ -380,11 +446,25 @@ export async function skimRunArtifacts({
           log(`artifact ${art.name} download skipped (${res.status})`);
           continue;
         }
-        const zip = Buffer.from(await res.arrayBuffer());
-        if (zip.length > maxZipBytes) continue;
-        inspectZipArchive({ zip, artifactName: art.name, findings, warn: log, serviceLines, evidence });
+        const zip = await readResponseCapped(res, maxZipBytes);
+        if (!zip) {
+          log(`artifact ${art.name} exceeded ${maxZipBytes} bytes; skipped`);
+          continue;
+        }
+        const isTriageEvidence = /^triage-evidence-/i.test(art.name);
+        inspectZipArchive({
+          zip,
+          artifactName: art.name,
+          findings,
+          warn: log,
+          serviceLines,
+          evidence,
+          structuredEvidence: isTriageEvidence ? structuredEvidence : undefined,
+          secrets,
+          budget,
+        });
         artifactsScanned.push(art.name);
-        if (/^triage-evidence-/i.test(art.name) && findings.every((f) => evidenceFor(f, evidence) != null)) break;
+        if (isTriageEvidence && findings.every((f) => evidenceFor(f, structuredEvidence) != null)) break;
       } catch (e) {
         log(`artifact ${art.name} skim skipped: ${String(e).slice(0, 120)}`);
       }

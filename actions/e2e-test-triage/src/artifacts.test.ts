@@ -76,6 +76,7 @@ test("skimRunArtifacts extracts mattermost service logs, nested blob-report erro
     { name: "e2e-tests/playwright/results/blob-report/report-1.zip", data: innerBlob },
     { name: "worker-artifacts/1/output/incoming_webhook_spec.ts/MM-T633 (failed).png", data: PNG },
   ]);
+  const downloadedIds: number[] = [];
   const fetchImpl = (async (url: string) => {
     const u = String(url);
     if (u.endsWith("/artifacts?per_page=100&page=1")) {
@@ -87,7 +88,11 @@ test("skimRunArtifacts extracts mattermost service logs, nested blob-report erro
         ],
       });
     }
-    if (u.endsWith("/artifacts/2/zip")) return new Response(new Uint8Array(debugZip));
+    const m = /\/artifacts\/(\d+)\/zip$/.exec(u);
+    if (m) {
+      downloadedIds.push(Number(m[1]));
+      if (Number(m[1]) === 2) return new Response(new Uint8Array(debugZip));
+    }
     throw new Error(`unexpected ${u}`);
   }) as FetchImpl;
 
@@ -96,8 +101,10 @@ test("skimRunArtifacts extracts mattermost service logs, nested blob-report erro
     token: "TOK",
     repository: "mattermost/mattermost",
     runId: "99",
+    patterns: ["e2e-triage-findings"],
     findings: [finding({ report_name: "playwright-full-1" })],
   });
+  assert.deepEqual(downloadedIds, [2]);
   assert.deepEqual(skimmed.artifactsScanned, ["playwright-full--debug-1"]);
   assert.match(skimmed.serviceLogs, /\[mattermost\.log\].*ECONNREFUSED/);
   assert.match(skimmed.serviceLogs, /\[error-context\.md\].*502 Bad Gateway/);
@@ -346,4 +353,276 @@ test("skimRunArtifacts stops downloading secondary artifacts once triage-evidenc
   assert.deepEqual(downloadedPartial, [1, 3]);
   assert.deepEqual(partial.artifactsScanned, ["triage-evidence-detox-ios-1", "detox-ios-results-1"]);
   assert.equal(partial.evidence.length, 2);
+});
+
+test("skimRunArtifacts matches exact MM-T test IDs before attributing screenshots", async () => {
+  const f12 = finding({ file: "specs/channels/shared_spec.ts", title: "MM-T12 short id" });
+  const f123 = finding({ file: "specs/channels/shared_spec.ts", title: "MM-T123 longer id" });
+  const zip = makeZip([{ name: "shared_spec.ts/MM-T123 (failed).png", data: PNG }]);
+  const fetchImpl = (async (url: string) => {
+    if (String(url).includes("/artifacts?")) {
+      return Response.json({ total_count: 1, artifacts: [{ id: 1, name: "playwright-full--debug-1", size_in_bytes: zip.length }] });
+    }
+    return new Response(new Uint8Array(zip));
+  }) as FetchImpl;
+
+  const skimmed = await skimRunArtifacts({
+    fetchImpl,
+    token: "TOK",
+    repository: "mattermost/mattermost",
+    runId: "60",
+    lane: "playwright-full",
+    findings: [f12, f123],
+  });
+  assert.equal(skimmed.evidence.length, 1);
+  assert.equal(skimmed.evidence[0].title, "MM-T123 longer id");
+});
+
+test("skimRunArtifacts redacts secrets crossing 240/260-char line clip boundaries", async () => {
+  const secret = "SECRET_CROSSING_BOUNDARY_XYZ123";
+  const prefix = secret.slice(0, 12);
+  const zip = makeZip([
+    { name: "logs/mattermost.log", data: `ERROR ${"a".repeat(250)}${secret}_tail` },
+    { name: "blob-report/r.zip", data: makeZip([{ name: "error-context.md", data: `heading ${"b".repeat(230)}${secret}_end` }]) },
+  ]);
+  const fetchImpl = (async (url: string) => {
+    if (String(url).includes("/artifacts?")) {
+      return Response.json({ total_count: 1, artifacts: [{ id: 1, name: "playwright-full--debug-1", size_in_bytes: zip.length }] });
+    }
+    return new Response(new Uint8Array(zip));
+  }) as FetchImpl;
+
+  const skimmed = await skimRunArtifacts({
+    fetchImpl,
+    token: "TOK",
+    repository: "mattermost/mattermost",
+    runId: "61",
+    lane: "playwright-full",
+    secrets: [secret],
+    findings: [finding({})],
+  });
+  assert.doesNotMatch(skimmed.serviceLogs, new RegExp(prefix));
+  assert.match(skimmed.serviceLogs, /\[mattermost\.log\]/);
+  assert.match(skimmed.serviceLogs, /\[error-context\.md\]/);
+});
+
+test("skimRunArtifacts memoizes duplicate zip images and enforces scan-wide image count and byte budgets", async () => {
+  // 30 manifest items all pointing to the same image: memoization lets all 30 succeed within MAX_SCAN_IMAGES=24.
+  const dupItems = Array.from({ length: 30 }, (_, i) => ({
+    file: `specs/dup_${i}.ts`,
+    title: `dup ${i}`,
+    notes: `note ${i}`,
+    images: ["./shared.png"],
+  }));
+  const dupZip = makeZip([
+    { name: "evidence-1.json", data: JSON.stringify(dupItems) },
+    { name: "shared.png", data: PNG },
+  ]);
+  const dupRes = await skimRunArtifacts({
+    fetchImpl: (async (url: string) =>
+      String(url).includes("/artifacts?")
+        ? Response.json({ total_count: 1, artifacts: [{ id: 1, name: "triage-evidence-detox-ios-1", size_in_bytes: dupZip.length }] })
+        : new Response(new Uint8Array(dupZip))) as FetchImpl,
+    token: "TOK",
+    repository: "mattermost/mattermost-mobile",
+    runId: "62",
+    lane: "detox-ios",
+    findings: [finding({ file: "specs/dup_0.ts", title: "dup 0" })],
+  });
+  assert.equal(dupRes.evidence.length, 30);
+  assert.ok(dupRes.evidence.every((e) => e.images.length === 1));
+
+  // Exceeding MAX_SCAN_IMAGE_BYTES (20MB) keeps earlier images, later manifest notes, and service logs.
+  const bigPng = Buffer.concat([PNG, Buffer.alloc(3_000_000)]);
+  const byteItems = Array.from({ length: 8 }, (_, i) => ({
+    file: `specs/big_${i}.ts`,
+    title: `big ${i}`,
+    notes: `note ${i}`,
+    images: [`./img_${i}.png`],
+  }));
+  const byteZip = makeZip([
+    { name: "evidence-1.json", data: JSON.stringify(byteItems) },
+    ...Array.from({ length: 8 }, (_, i) => ({ name: `img_${i}.png`, data: bigPng })),
+    { name: "logs/mattermost.log", data: "ERROR server kept alive" },
+  ]);
+  const byteRes = await skimRunArtifacts({
+    fetchImpl: (async (url: string) =>
+      String(url).includes("/artifacts?")
+        ? Response.json({ total_count: 1, artifacts: [{ id: 2, name: "triage-evidence-detox-ios-1", size_in_bytes: byteZip.length }] })
+        : new Response(new Uint8Array(byteZip))) as FetchImpl,
+    token: "TOK",
+    repository: "mattermost/mattermost-mobile",
+    runId: "63",
+    lane: "detox-ios",
+    findings: [finding({ file: "specs/big_0.ts", title: "big 0" })],
+  });
+  assert.equal(byteRes.evidence.length, 8);
+  assert.equal(byteRes.evidence.filter((e) => e.images.length === 1).length, 6);
+  assert.equal(byteRes.evidence[7].notes, "note 7");
+  assert.equal(byteRes.evidence[7].images.length, 0);
+  assert.match(byteRes.serviceLogs, /server kept alive/);
+});
+
+test("skimRunArtifacts cancels streaming download when response body exceeds maxZipBytes", async () => {
+  let canceled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(new Uint8Array(600));
+    },
+    cancel() {
+      canceled = true;
+    },
+  });
+  const fetchImpl = (async (url: string) => {
+    if (String(url).includes("/artifacts?")) {
+      return Response.json({ total_count: 1, artifacts: [{ id: 1, name: "playwright-full--debug-1", size_in_bytes: 500 }] });
+    }
+    return new Response(stream);
+  }) as FetchImpl;
+
+  const skimmed = await skimRunArtifacts({
+    fetchImpl,
+    token: "TOK",
+    repository: "mattermost/mattermost",
+    runId: "64",
+    lane: "playwright-full",
+    maxZipBytes: 1000,
+    findings: [finding({})],
+  });
+  assert.equal(canceled, true);
+  assert.deepEqual(skimmed.artifactsScanned, []);
+});
+
+test("skimRunArtifacts keeps multi-word artifact-patterns intact instead of splitting on whitespace", async () => {
+  const downloaded: string[] = [];
+  const zip = makeZip([{ name: "logs/mattermost.log", data: "ERROR custom matched" }]);
+  const fetchImpl = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/artifacts?")) {
+      return Response.json({
+        total_count: 2,
+        artifacts: [
+          { id: 1, name: "ui-cache", size_in_bytes: zip.length },
+          { id: 2, name: "app-ui debug-1", size_in_bytes: zip.length },
+        ],
+      });
+    }
+    downloaded.push(u);
+    return new Response(new Uint8Array(zip));
+  }) as FetchImpl;
+
+  const skimmed = await skimRunArtifacts({
+    fetchImpl,
+    token: "TOK",
+    repository: "mattermost/mattermost",
+    runId: "65",
+    patterns: ["ui debug"],
+    findings: [finding({})],
+  });
+  assert.equal(downloaded.length, 1);
+  assert.deepEqual(skimmed.artifactsScanned, ["app-ui debug-1"]);
+});
+
+test("skimRunArtifacts retains page 1 artifacts when page 2 listing fails", async () => {
+  const zip = makeZip([{ name: "logs/mattermost.log", data: "ERROR from page 1" }]);
+  const fetchImpl = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("&page=1")) {
+      return Response.json({
+        total_count: 150,
+        artifacts: [{ id: 10, name: "playwright-full--debug-1", size_in_bytes: zip.length }],
+      });
+    }
+    if (u.includes("&page=2")) return new Response("server error", { status: 500 });
+    return new Response(new Uint8Array(zip));
+  }) as FetchImpl;
+
+  const skimmed = await skimRunArtifacts({
+    fetchImpl,
+    token: "TOK",
+    repository: "mattermost/mattermost",
+    runId: "66",
+    lane: "playwright-full",
+    findings: [finding({})],
+  });
+  assert.deepEqual(skimmed.artifactsScanned, ["playwright-full--debug-1"]);
+  assert.match(skimmed.serviceLogs, /from page 1/);
+});
+
+test("skimRunArtifacts skips an oversized manifest image without dropping item notes or later manifest items", async () => {
+  const oversized = Buffer.concat([PNG, Buffer.alloc(3_600_000)]);
+  const zip = makeZip([
+    {
+      name: "evidence-1.json",
+      data: JSON.stringify([
+        { file: "specs/a.ts", title: "test a", notes: "kept notes", images: ["./oversized.png", "./valid.png"] },
+        { file: "specs/b.ts", title: "test b", notes: "second item", images: ["./valid2.png"] },
+      ]),
+    },
+    { name: "oversized.png", data: oversized },
+    { name: "valid.png", data: PNG },
+    { name: "valid2.png", data: PNG },
+  ]);
+  const fetchImpl = (async (url: string) =>
+    String(url).includes("/artifacts?")
+      ? Response.json({ total_count: 1, artifacts: [{ id: 1, name: "triage-evidence-detox-ios-1", size_in_bytes: zip.length }] })
+      : new Response(new Uint8Array(zip))) as FetchImpl;
+
+  const skimmed = await skimRunArtifacts({
+    fetchImpl,
+    token: "TOK",
+    repository: "mattermost/mattermost-mobile",
+    runId: "67",
+    lane: "detox-ios",
+    findings: [finding({ file: "specs/a.ts", title: "test a" }), finding({ file: "specs/b.ts", title: "test b" })],
+  });
+  assert.equal(skimmed.evidence.length, 2);
+  assert.equal(skimmed.evidence[0].notes, "kept notes");
+  assert.equal(skimmed.evidence[0].images.length, 1);
+  assert.equal(skimmed.evidence[1].notes, "second item");
+  assert.equal(skimmed.evidence[1].images.length, 1);
+});
+
+test("skimRunArtifacts only stops early when structured triage-evidence-* manifests cover all findings", async () => {
+  const f1 = finding({ file: "detox/e2e/test/alpha.e2e.ts", title: "MM-T101 alpha" });
+  const f2 = finding({ file: "detox/e2e/test/beta.e2e.ts", title: "MM-T102 beta" });
+  const customZip = makeZip([{ name: "alpha.e2e.ts/MM-T101 (failed).png", data: PNG }]);
+  const ev2 = makeZip([
+    { name: "evidence-2.json", data: JSON.stringify([{ file: f2.file, title: f2.title, notes: "beta notes", images: ["./b.png"] }]) },
+    { name: "b.png", data: PNG },
+  ]);
+  const ev1 = makeZip([
+    { name: "evidence-1.json", data: JSON.stringify([{ file: f1.file, title: f1.title, notes: "alpha notes", images: ["./a.png"] }]) },
+    { name: "a.png", data: PNG },
+  ]);
+  const downloaded: number[] = [];
+  const fetchImpl = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/artifacts?")) {
+      return Response.json({
+        total_count: 3,
+        artifacts: [
+          { id: 1, name: "custom--debug-1", size_in_bytes: customZip.length },
+          { id: 2, name: "triage-evidence-2", size_in_bytes: ev2.length },
+          { id: 3, name: "triage-evidence-1", size_in_bytes: ev1.length },
+        ],
+      });
+    }
+    const id = Number(/\/artifacts\/(\d+)\/zip$/.exec(u)?.[1]);
+    downloaded.push(id);
+    if (id === 1) return new Response(new Uint8Array(customZip));
+    if (id === 2) return new Response(new Uint8Array(ev2));
+    return new Response(new Uint8Array(ev1));
+  }) as FetchImpl;
+
+  const skimmed = await skimRunArtifacts({
+    fetchImpl,
+    token: "TOK",
+    repository: "mattermost/mattermost-mobile",
+    runId: "68",
+    patterns: ["custom"],
+    findings: [f1, f2],
+  });
+  assert.deepEqual(downloaded, [1, 2, 3]);
+  assert.equal(skimmed.evidence.find((e) => e.title === f1.title)?.notes, "alpha notes");
 });

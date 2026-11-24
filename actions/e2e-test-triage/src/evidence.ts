@@ -43,14 +43,17 @@ export function mergeEvidence(primary: Evidence[], secondary: Evidence[]): Evide
         (e.full_title == null || item.full_title == null || e.full_title === item.full_title),
     );
   for (const item of secondary) {
-    const existing = findMatch(item);
+    let existing = findMatch(item);
     if (!existing) {
-      out.push({
+      existing = {
         ...item,
         notes: item.notes.slice(0, EVIDENCE_LIMITS.notes),
-        images: item.images.slice(0, EVIDENCE_LIMITS.imagesPerTest),
-      });
-      continue;
+        images: [],
+      };
+      out.push(existing);
+    } else if (item.notes && existing.notes.length < EVIDENCE_LIMITS.notes) {
+      const mergedNotes = existing.notes ? `${existing.notes}\n${item.notes}` : item.notes;
+      existing.notes = mergedNotes.slice(0, EVIDENCE_LIMITS.notes);
     }
     const seen = new Set(existing.images.map((img) => img.sha256));
     for (const img of item.images) {
@@ -58,10 +61,6 @@ export function mergeEvidence(primary: Evidence[], secondary: Evidence[]): Evide
       if (seen.has(img.sha256)) continue;
       seen.add(img.sha256);
       existing.images.push(img);
-    }
-    if (item.notes && existing.notes.length < EVIDENCE_LIMITS.notes) {
-      const mergedNotes = existing.notes ? `${existing.notes}\n${item.notes}` : item.notes;
-      existing.notes = mergedNotes.slice(0, EVIDENCE_LIMITS.notes);
     }
   }
   return out;

@@ -154,7 +154,7 @@ inputs:
     required: false
     default: prepare-run
   artifact-evidence:
-    description: '"true" (default) skims failing run debug/evidence/failure artifacts for screenshots and server/app error logs; "false" disables artifact downloads'
+    description: '"true" (default) skims failing run debug/evidence/failure artifacts for screenshots and server/app error logs (needs actions: read on github-token); "false" disables artifact downloads'
     required: false
     default: "true"
   artifact-patterns:
@@ -165,6 +165,9 @@ outputs:
   published:
     description: Whether triage wrote its verdict to the required status
     value: ${{ steps.triage.outputs.published }}
+  aggregate-published:
+    description: Whether triage wrote the PR-wide aggregate check in this run
+    value: ${{ steps.triage.outputs.aggregate-published }}
   effective-mode:
     description: enforce or report-only, after applying the PR's report-only label
     value: ${{ steps.triage.outputs.effective_mode }}

@@ -25,7 +25,7 @@ export function unblocks(cause: string, cited: string[], pack: Pack, cls = "", i
   if (cls === "INFRA_ERROR") {
     if (cause === "test_bug") return has("this_pr");
     const infraSupported =
-      infraClears && !cited.some((c) => c.startsWith("hunk_")) && (has("ci_logs", "service_logs") || isInfraError(pack.error));
+      infraClears && !cited.some((c) => c.startsWith("hunk_")) && (has("ci_logs", "service_logs") || (has("error") && isInfraError(pack.error)));
     return (cause === "flaky_environment" || cause === "bug_on_master") && (has("cross_pr", "this_pr") || infraSupported);
   }
   if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error) || (has("earlier_failure_same_spec") && chainClears(pack));
