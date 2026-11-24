@@ -342,6 +342,12 @@ test("errorLines ignores code frames and fastlane bullets and prioritizes compil
   assert.match(ranked[0], /Too many personality routines|linker command failed/);
   assert.ok(ranked.some((l) => /linker command failed/.test(l)));
   assert.ok(ranked.some((l) => /\*\* BUILD FAILED \*\*/.test(l)));
+  assert.equal(CI_INFRA_RE.test("Cache not found for input keys: pods-ios-123"), false);
+  const withoutCacheMiss = errorLines([
+    "Cache not found for input keys: pods-ios-123",
+    "clang++: error: linker command failed with exit code 1",
+  ]);
+  assert.deepEqual(withoutCacheMiss, ["clang++: error: linker command failed with exit code 1"]);
 });
 
 test("fetchJobLog range-reads large redirected blob logs without forwarding auth headers and rejects unsafe redirects", async () => {
