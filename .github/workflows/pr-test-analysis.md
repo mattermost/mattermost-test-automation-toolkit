@@ -92,8 +92,8 @@ GitHub resolves the `uses` ref when the workflow runs.
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `GH_TOKEN` | Yes | Credential for `gh`/GitHub API against `target_repo`. Use **`${{ github.token }}`** when the caller passes `target_repo: ${{ github.repository }}` (same repo as the workflow). Use a **PAT** in **`secrets.GH_TOKEN`** only when `target_repo` is a *different* repository—the default `GITHUB_TOKEN` is limited to the caller repo and cannot act on another repo's PRs, statuses, or labels. |
-| `ANTHROPIC_API_KEY` | Yes | Anthropic API key for Claude analysis. Must be provided by the caller. Dependabot-triggered runs require `ANTHROPIC_API_KEY` as a **Dependabot secret** (Actions secrets are not exposed to Dependabot runs; otherwise analysis skips with unavailable status). |
+| `GH_TOKEN` | No | Optional credential for `gh`/GitHub API against `target_repo`; falls back to `${{ github.token }}` when omitted (sufficient when `target_repo` is `${{ github.repository }}`). Use a **PAT** in **`secrets.GH_TOKEN`** only when `target_repo` is a *different* repository—the default `GITHUB_TOKEN` is limited to the caller repo and cannot act on another repo's PRs, statuses, or labels. |
+| `ANTHROPIC_API_KEY` | No | Optional Anthropic API key for Claude analysis. Dependabot-triggered runs require `ANTHROPIC_API_KEY` as a **Dependabot secret** because Actions secrets are not exposed to Dependabot runs. When `ANTHROPIC_API_KEY` is missing, analysis is skipped and the workflow posts a **`success`** status with an unavailable description (`Analysis unavailable — manual review required`), which can pass a required check without running AI analysis. |
 | `WEBHOOK_URL` | No | Optional Mattermost webhook URL for notifications. If omitted, no webhook notification is sent. |
 
 ## Repository Environment Variables

@@ -190,17 +190,15 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     const fetched = await readStatuses(api, id);
     // GitHub's /statuses endpoint is eventually consistent right after a POST: overlay this publisher's own write only
     // when the self-read still shows the exact pre-write row (or missing row) owned by no newer/unknown writer.
-    const currentInRead = fetched.find((r) => r.context === context);
-    const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
-    const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
-    const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
-    const staleSelfRead = Boolean(
-      lastWritten &&
-      !newerOrUnknownOwner &&
-      matchesPreWrite &&
-      (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten)),
-    );
-    const rows = staleSelfRead ? [lastWritten!, ...fetched] : fetched;
+    let rows = fetched;
+    if (lastWritten) {
+      const currentInRead = fetched.find((r) => r.context === context);
+      const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
+      const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
+      const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
+      const staleSelfRead = !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten));
+      if (staleSelfRead) rows = [lastWritten, ...fetched];
+    }
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return false;
     // The other E2E checks under the aggregate's prefix (an upgrade lane, a policy lane): named when red.

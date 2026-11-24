@@ -31,6 +31,11 @@ export function parseImageBuffer(
   };
 }
 
+// Producers and TSIO may root paths differently, so a tail of at least one
+// directory matches; a bare file name could be any spec of that name.
+const tail = (long: string, short: string): boolean => short.includes("/") && long.endsWith(`/${short}`);
+const sameEvidenceFile = (a: string, b: string): boolean => a === b || tail(a, b) || tail(b, a);
+
 /** Merges secondary (e.g. artifact-discovered) evidence into primary without duplicating images by sha256. */
 export function mergeEvidence(primary: Evidence[], secondary: Evidence[]): Evidence[] {
   if (!secondary.length) return primary;
@@ -38,7 +43,7 @@ export function mergeEvidence(primary: Evidence[], secondary: Evidence[]): Evide
   const findMatch = (item: Evidence): Evidence | undefined =>
     out.find(
       (e) =>
-        e.file === item.file &&
+        sameEvidenceFile(e.file, item.file) &&
         e.title === item.title &&
         (e.full_title == null || item.full_title == null || e.full_title === item.full_title),
     );
@@ -173,12 +178,9 @@ export function loadEvidence(dir: string, warn: (message: string) => void = () =
 /** The producer evidence recorded for this test, matched on title, qualified title and spec path. */
 export function evidenceFor(finding: { file: string; title: string; full_title?: string | null; repo_path?: string | null }, evidence: Evidence[]): Evidence | null {
   const path = finding.repo_path ?? finding.file;
-  // Producers and TSIO may root paths differently, so a tail of at least one
-  // directory matches; a bare file name could be any spec of that name.
-  const tail = (long: string, short: string): boolean => short.includes("/") && long.endsWith(`/${short}`);
   return evidence.find((e) =>
     e.title === finding.title &&
     (e.full_title == null || finding.full_title == null || e.full_title === finding.full_title) &&
-    (path === e.file || tail(path, e.file) || tail(e.file, path)),
+    sameEvidenceFile(path, e.file),
   ) ?? null;
 }

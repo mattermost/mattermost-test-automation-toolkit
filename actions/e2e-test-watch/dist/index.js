@@ -1384,13 +1384,13 @@ function brokeByText(b) {
 var PERCENT = (n) => `${Math.round(n * 100)}%`;
 var failedElsewhere = (f) => (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform);
 var fewOf = (names) => names.length > 4 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
-var alsoFailed = (f, tail) => {
+var alsoFailed = (f, tail2) => {
   const other = f.other_lanes ?? [];
   const failed = fewOf(other.filter((o) => FAILED_STATUSES.has(o.result)).map((o) => o.platform));
   const once = fewOf(other.filter((o) => o.result === "flaky").map((o) => o.platform));
-  if (failed && once) return ` Also failed on ${failed}, and once on ${once} (passed on retry), in this run${tail}`;
-  if (once) return ` Also failed once on ${once} in this run (passed on retry)${tail}`;
-  if (failed) return ` Also failed on ${failed} in this run${tail}`;
+  if (failed && once) return ` Also failed on ${failed}, and once on ${once} (passed on retry), in this run${tail2}`;
+  if (once) return ` Also failed once on ${once} in this run (passed on retry)${tail2}`;
+  if (failed) return ` Also failed on ${failed} in this run${tail2}`;
   return "";
 };
 var SHARED_CAUSE = ": likely environment or a shared cause.";
@@ -2030,14 +2030,15 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     if (!summaryContext || !lanes.length) return false;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
     const fetched = await readStatuses(api, id);
-    const currentInRead = fetched.find((r) => r.context === context);
-    const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
-    const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
-    const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
-    const staleSelfRead = Boolean(
-      lastWritten && !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten))
-    );
-    const rows = staleSelfRead ? [lastWritten, ...fetched] : fetched;
+    let rows = fetched;
+    if (lastWritten) {
+      const currentInRead = fetched.find((r) => r.context === context);
+      const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
+      const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
+      const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
+      const staleSelfRead = !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten));
+      if (staleSelfRead) rows = [lastWritten, ...fetched];
+    }
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return false;
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
@@ -2501,11 +2502,13 @@ function parseImageBuffer(name, bytes, warn = () => {
     sha256: (0, import_node_crypto.createHash)("sha256").update(bytes).digest("hex")
   };
 }
+var tail = (long, short) => short.includes("/") && long.endsWith(`/${short}`);
+var sameEvidenceFile = (a, b) => a === b || tail(a, b) || tail(b, a);
 function mergeEvidence(primary, secondary2) {
   if (!secondary2.length) return primary;
   const out = primary.map((e) => ({ ...e, images: [...e.images] }));
   const findMatch = (item) => out.find(
-    (e) => e.file === item.file && e.title === item.title && (e.full_title == null || item.full_title == null || e.full_title === item.full_title)
+    (e) => sameEvidenceFile(e.file, item.file) && e.title === item.title && (e.full_title == null || item.full_title == null || e.full_title === item.full_title)
   );
   for (const item of secondary2) {
     let existing = findMatch(item);
@@ -2628,9 +2631,8 @@ function loadEvidence(dir, warn = () => {
 }
 function evidenceFor(finding, evidence) {
   const path = finding.repo_path ?? finding.file;
-  const tail = (long, short) => short.includes("/") && long.endsWith(`/${short}`);
   return evidence.find(
-    (e) => e.title === finding.title && (e.full_title == null || finding.full_title == null || e.full_title === finding.full_title) && (path === e.file || tail(path, e.file) || tail(e.file, path))
+    (e) => e.title === finding.title && (e.full_title == null || finding.full_title == null || e.full_title === finding.full_title) && sameEvidenceFile(path, e.file)
   ) ?? null;
 }
 
@@ -4131,14 +4133,14 @@ async function readDeadJobs({ fetchImpl, token, repository, runId, attempt, log 
   const out = [];
   for (const j of dead) {
     const step = failedStepOf(j);
-    let tail = "";
+    let tail2 = "";
     try {
       const text = await fetchJobLog({ fetchImpl, token, repository, jobId: j.id, timeoutMs: 6e4 });
-      tail = lastLines(stepLines(text, toMs(step?.started_at), toMs(step?.completed_at)).join("\n"), TAIL_LINES);
+      tail2 = lastLines(stepLines(text, toMs(step?.started_at), toMs(step?.completed_at)).join("\n"), TAIL_LINES);
     } catch (e) {
       log(`log of ${j.name} unavailable: ${String(e).slice(0, 160)}`);
     }
-    out.push({ id: j.id, name: j.name, conclusion: String(j.conclusion), step: step?.name ?? null, tail });
+    out.push({ id: j.id, name: j.name, conclusion: String(j.conclusion), step: step?.name ?? null, tail: tail2 });
   }
   return out;
 }
@@ -4768,10 +4770,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
   const testRoot = env.TEST_ROOT ? env.TEST_ROOT : null;
   const reportName = env.REPORT_NAME || null;
   const historyReport = cfg.historyReport || reportName;
+  const sameRun = !env.GITHUB_RUN_ID || String(env.GITHUB_RUN_ID) === String(id.gh_run_id);
   let laneOnly = null;
   let run;
   try {
-    run = await fetchRun(fetchImpl, base, id, reportName, wait, env.GITHUB_RUN_ATTEMPT);
+    run = await fetchRun(fetchImpl, base, id, reportName, wait, sameRun ? env.GITHUB_RUN_ATTEMPT : null);
   } catch (e) {
     if (!(e instanceof NoResultsError) && !/reported no test cases/.test(String(e))) throw e;
     laneOnly = String(e instanceof Error ? e.message : e).slice(0, 200);
@@ -4915,7 +4918,6 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const apiKey = env.ANTHROPIC_API_KEY;
     const ask = apiKey && !prSpendUnknown ? (packs, model) => askModelBatch(fetchImpl, apiKey, model, packs) : null;
     const secrets = secretsOf(env);
-    const sameRun = !env.GITHUB_RUN_ID || String(env.GITHUB_RUN_ID) === String(id.gh_run_id);
     const attemptStr = String(sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : run.attempt ?? (id.gh_run_attempt || 1));
     const runIdStr = String(id.gh_run_id || env.GITHUB_RUN_ID);
     const artifactEvidenceEnabled = env.ARTIFACT_EVIDENCE !== "false";

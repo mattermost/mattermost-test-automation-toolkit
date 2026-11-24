@@ -192,3 +192,40 @@ test("statusPublisher.refresh returns true only when aggregate status is written
   rows = [];
   assert.equal(await pub.summarize([ctx, other], summary, summarizer), false);
 });
+
+test("statusPublisher.summarize does not call owner() when lastWritten is null (read-only verification run)", async () => {
+  const ctx = "e2e-test/playwright-full/enterprise";
+  const other = "e2e-test/cypress-full/enterprise";
+  const testedUrl = "https://github.com/o/r/actions/runs/55";
+  const testedStatus: CommitStatus = {
+    context: ctx,
+    state: "success",
+    description: "100% passed",
+    target_url: `${testedUrl}?status_run_id=55&status_run_attempt=1`,
+  };
+  for (const runEnv of [{}, { GITHUB_RUN_ID: "999", GITHUB_RUN_ATTEMPT: "2" }] as const) {
+    const posted: CommitStatus[] = [];
+    const api: GhApi = async (method, path, body) => {
+      if (method === "GET" && path.includes("/statuses")) return [testedStatus];
+      if (method === "POST" && path.includes("/statuses/")) {
+        posted.push(body as CommitStatus);
+        return {};
+      }
+      throw new Error(`unexpected ${method} ${path}`);
+    };
+    const pub = statusPublisher({
+      api,
+      id: { repository: "o/r", commit_sha: "sha", gh_run_id: "55", gh_run_attempt: "1" },
+      context: ctx,
+      env: runEnv,
+      log: () => {},
+    });
+    const ok = await pub.summarize([ctx, other], summary, () => ({ state: "success", description: "All green" }));
+    assert.equal(ok, true);
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].context, summary);
+    const expectedRun = runEnv.GITHUB_RUN_ID ?? "55";
+    const expectedAttempt = runEnv.GITHUB_RUN_ATTEMPT ?? "1";
+    assert.match(String(posted[0].target_url), new RegExp(`status_run_id=${expectedRun}&status_run_attempt=${expectedAttempt}`));
+  }
+});

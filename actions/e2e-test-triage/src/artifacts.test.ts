@@ -382,8 +382,10 @@ test("skimRunArtifacts redacts secrets crossing 240/260-char line clip boundarie
   const secret = "SECRET_CROSSING_BOUNDARY_XYZ123";
   const prefix = secret.slice(0, 12);
   const zip = makeZip([
-    { name: "logs/mattermost.log", data: `ERROR ${"a".repeat(250)}${secret}_tail` },
-    { name: "blob-report/r.zip", data: makeZip([{ name: "error-context.md", data: `heading ${"b".repeat(230)}${secret}_end` }]) },
+    // "ERROR " (6) + 240 = 246 -> 14 chars of secret before 260-char clip, remainder after.
+    { name: "logs/mattermost.log", data: `ERROR ${"a".repeat(240)}${secret}_tail` },
+    // "heading " (8) + 218 = 226 -> 14 chars of secret before 240-char clip, remainder after.
+    { name: "blob-report/r.zip", data: makeZip([{ name: "error-context.md", data: `heading ${"b".repeat(218)}${secret}_end` }]) },
   ]);
   const fetchImpl = (async (url: string) => {
     if (String(url).includes("/artifacts?")) {

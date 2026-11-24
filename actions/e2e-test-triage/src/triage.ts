@@ -229,10 +229,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   const historyReport = cfg.historyReport || reportName;
   // No results to judge test by test (no TSIO group, or a group with no test cases: every worker died before it
   // reported): the lane is judged from its orchestration and its jobs alone (see judgeLane).
+  const sameRun = !env.GITHUB_RUN_ID || String(env.GITHUB_RUN_ID) === String(id.gh_run_id);
   let laneOnly: string | null = null;
   let run: RunResult;
   try {
-    run = await fetchRun(fetchImpl, base, id, reportName, wait, env.GITHUB_RUN_ATTEMPT);
+    run = await fetchRun(fetchImpl, base, id, reportName, wait, sameRun ? env.GITHUB_RUN_ATTEMPT : null);
   } catch (e) {
     if (!(e instanceof NoResultsError) && !/reported no test cases/.test(String(e))) throw e;
     laneOnly = String(e instanceof Error ? e.message : e).slice(0, 200);
@@ -413,7 +414,6 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const apiKey = env.ANTHROPIC_API_KEY;
     const ask: AskFn | null = apiKey && !prSpendUnknown ? (packs, model) => askModelBatch(fetchImpl, apiKey, model, packs) : null;
     const secrets = secretsOf(env);
-    const sameRun = !env.GITHUB_RUN_ID || String(env.GITHUB_RUN_ID) === String(id.gh_run_id);
     const attemptStr = String(sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : run.attempt ?? (id.gh_run_attempt || 1));
     const runIdStr = String(id.gh_run_id || env.GITHUB_RUN_ID);
     const artifactEvidenceEnabled = env.ARTIFACT_EVIDENCE !== "false";

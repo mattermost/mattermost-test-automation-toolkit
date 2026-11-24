@@ -306,14 +306,15 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     if (!summaryContext || !lanes.length) return false;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
     const fetched = await readStatuses(api, id);
-    const currentInRead = fetched.find((r) => r.context === context);
-    const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
-    const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
-    const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
-    const staleSelfRead = Boolean(
-      lastWritten && !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten))
-    );
-    const rows = staleSelfRead ? [lastWritten, ...fetched] : fetched;
+    let rows = fetched;
+    if (lastWritten) {
+      const currentInRead = fetched.find((r) => r.context === context);
+      const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
+      const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
+      const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
+      const staleSelfRead = !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten));
+      if (staleSelfRead) rows = [lastWritten, ...fetched];
+    }
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return false;
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);

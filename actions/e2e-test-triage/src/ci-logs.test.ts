@@ -233,13 +233,15 @@ test("skimCiLogsForFindings excludes conflicting lane jobs even when total job c
 });
 
 test("errorLines and extractMatchingWindow redact secrets crossing clip boundaries", async () => {
-  const secret = "MY_BOUNDARY_SECRET_9876543210";
+  const secret = "ghp_BoundarySecret9876543210abcdef";
   const prefix = secret.slice(0, 10);
-  const longError = `Error: failed ${"x".repeat(220)} token=${secret} tail`;
+  // "Error: failed " (14) + 214 + " " (1) = 229 -> 11 chars of secret before 240, remainder after.
+  const longError = `Error: failed ${"x".repeat(214)} ${secret} tail`;
   const [line] = errorLines([longError], 5, [secret]);
   assert.ok(line);
   assert.doesNotMatch(line, new RegExp(prefix));
 
+  // Line 0 ("Running incoming_webhook_spec.ts": 32) + "\n" + 4 * (230 + "\n") = 957; 957 + 227 + " " (1) = 1185 -> 15 chars before 1200 (10 before outer [p1]\n 1200 cut).
   const paddingLine = `2026-11-20T10:00:01.0000000Z ${"y".repeat(230)}`;
   const rawLog = [
     "2026-11-20T10:00:00.0000000Z Running incoming_webhook_spec.ts",
@@ -247,13 +249,13 @@ test("errorLines and extractMatchingWindow redact secrets crossing clip boundari
     paddingLine,
     paddingLine,
     paddingLine,
-    `2026-11-20T10:00:02.0000000Z ${"z".repeat(160)} secret=${secret}`,
+    `2026-11-20T10:00:02.0000000Z ${"z".repeat(227)} ${secret} tail`,
   ].join("\n");
   const fetchImpl = (async (url: string) => {
     if (String(url).includes("/jobs?")) {
       return Response.json({
         total_count: 1,
-        jobs: [{ id: 88, name: "playwright-full-1", status: "completed", conclusion: "failure" }],
+        jobs: [{ id: 88, name: "p1", status: "completed", conclusion: "failure" }],
       });
     }
     if (String(url).includes("/jobs/88/logs")) return new Response(rawLog);
@@ -266,7 +268,6 @@ test("errorLines and extractMatchingWindow redact secrets crossing clip boundari
     repository: "o/r",
     runId: "107",
     attempt: "1",
-    lane: "playwright-full",
     findings: [makeFinding({})],
     secrets: [secret],
   });

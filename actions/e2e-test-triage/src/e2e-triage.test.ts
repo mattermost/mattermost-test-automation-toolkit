@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { crc32 } from "node:zlib";
 import { canChange, decide, decideRelease, judge, unblocks } from "./decision.ts";
 import { EXONERATED_ON_TRUNK, changeTouchesFailure, classify, classifyNotRun, errorSignature, failureAnchors, holdFailedEverywhere, infraVerdict, isInfraError, isShardPlaceholder, markEarlierFailures, sameFailure } from "./classify.ts";
 import { DEFAULTS, PR_SPEND_KEY, configFrom, historyLane, laneOf, laneOfReport, repoPath } from "./config.ts";
@@ -6088,4 +6089,116 @@ test("triage emits aggregate-published output true only when aggregate status is
     });
     assert.match(readFileSync(out2, "utf8"), /^aggregate-published=false$/m);
   });
+});
+
+test("triage evaluates id.gh_run_attempt rather than GITHUB_RUN_ATTEMPT when GITHUB_RUN_ID differs from id.gh_run_id", async () => {
+  const result = await triage({
+    env: {
+      ...env,
+      COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "12", gh_run_attempt: "1", name: "playwright-full", branch: "pr-5", gh_pr_number: 5 }),
+      MODE: "report-only",
+      TRIAGE_CONTEXT: "off",
+      ANTHROPIC_API_KEY: "",
+      GITHUB_RUN_ID: "999",
+      GITHUB_RUN_ATTEMPT: "3",
+    },
+    fetchImpl: fakeFetch([
+      ["/reports?", () => Response.json({
+        reports: [
+          { id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "completed" },
+          { id: "g3", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "3", status: "completed" },
+        ],
+        total: 2,
+      })],
+      ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+      ["/reports/g1/cases", () => Response.json(spec("attempt-1-test", "failed"))],
+      ["/reports/g3/suites", () => Response.json({ suites: [{ id: "s3", file_path: "specs/b.spec.ts" }] })],
+      ["/reports/g3/cases", () => Response.json([caseRow("attempt-3-test", "failed", 0, "s3")])],
+      ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
+      ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+      ["/pulls/5", () => Response.json({ title: "fix", base: { ref: "master" }, labels: [] })],
+    ]),
+    log: () => {},
+  });
+  assert.deepEqual(result.findings.map((f) => f.title), ["attempt-1-test"]);
+});
+
+test("mergeEvidence and triage merge producer evidence and artifact evidence across relative path prefixes", async () => {
+  const imgA = { name: "a.png", media_type: "image/png", data: "QQ==", sha256: "hash-a" };
+  const direct = mergeEvidence(
+    [{ file: "e2e-tests/playwright/specs/foo.spec.ts", title: "foo test", full_title: null, notes: "producer note", images: [] }],
+    [{ file: "specs/foo.spec.ts", title: "foo test", full_title: null, notes: "artifact note", images: [imgA] }],
+  );
+  assert.equal(direct.length, 1);
+  assert.equal(direct[0].file, "e2e-tests/playwright/specs/foo.spec.ts");
+  assert.equal(direct[0].notes, "producer note\nartifact note");
+  assert.deepEqual(direct[0].images.map((i) => i.sha256), ["hash-a"]);
+
+  const storedZip = (entries: { name: string; data: Buffer | string }[]): Buffer => {
+    const locals: Buffer[] = [];
+    const centrals: Buffer[] = [];
+    let offset = 0;
+    for (const e of entries) {
+      const name = Buffer.from(e.name, "utf8");
+      const raw = Buffer.isBuffer(e.data) ? e.data : Buffer.from(e.data, "utf8");
+      const crc = crc32(raw);
+      const lh = Buffer.alloc(30 + name.length);
+      lh.writeUInt32LE(0x04034b50, 0);
+      lh.writeUInt16LE(20, 4);
+      lh.writeUInt32LE(crc, 14);
+      lh.writeUInt32LE(raw.length, 18);
+      lh.writeUInt32LE(raw.length, 22);
+      lh.writeUInt16LE(name.length, 26);
+      name.copy(lh, 30);
+      locals.push(lh, raw);
+      const ch = Buffer.alloc(46 + name.length);
+      ch.writeUInt32LE(0x02014b50, 0);
+      ch.writeUInt16LE(20, 4);
+      ch.writeUInt16LE(20, 6);
+      ch.writeUInt32LE(crc, 16);
+      ch.writeUInt32LE(raw.length, 20);
+      ch.writeUInt32LE(raw.length, 24);
+      ch.writeUInt16LE(name.length, 28);
+      ch.writeUInt32LE(offset, 42);
+      name.copy(ch, 46);
+      centrals.push(ch);
+      offset += lh.length + raw.length;
+    }
+    const cd = Buffer.concat(centrals);
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(entries.length, 8);
+    eocd.writeUInt16LE(entries.length, 10);
+    eocd.writeUInt32LE(cd.length, 12);
+    eocd.writeUInt32LE(offset, 16);
+    return Buffer.concat([...locals, cd, eocd]);
+  };
+
+  const dir = evidenceDir([{ file: "e2e-tests/playwright/specs/foo.spec.ts", title: "foo test", notes: "producer note", images: [] }]);
+  const zip = storedZip([
+    { name: "evidence-1.json", data: JSON.stringify([{ file: "specs/foo.spec.ts", title: "foo test", notes: "artifact note", images: ["./shot.png"] }]) },
+    { name: "shot.png", data: PNG(9) },
+  ]);
+  try {
+    const result = await triage({
+      env: { ...env, MODE: "report-only", TRIAGE_CONTEXT: "off", TEST_ROOT: "e2e-tests/playwright", EVIDENCE_DIR: dir },
+      fetchImpl: fakeFetch([
+        ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+        ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/foo.spec.ts" }] })],
+        ["/reports/g1/cases", () => Response.json(spec("foo test", "failed"))],
+        ["/reports/history", () => Response.json({ observations: trunkPasses(8).map((o) => ({ ...o, file: "specs/foo.spec.ts", title: "foo test" })) })],
+        ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+        ["/pulls/5", () => Response.json({ title: "fix", base: { ref: "master" }, labels: [] })],
+        ["/actions/runs/12/attempts/1/jobs", () => Response.json({ total_count: 0, jobs: [] })],
+        ["/actions/runs/12/artifacts?", () => Response.json({ total_count: 1, artifacts: [{ id: 1, name: "triage-evidence-playwright-1", size_in_bytes: zip.length, expired: false }] })],
+        ["/actions/artifacts/1/zip", () => new Response(new Uint8Array(zip))],
+        ["api.anthropic.com", (init) => modelReply(init, { cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "test" })],
+      ]),
+      log: () => {},
+    });
+    assert.equal(result.findings[0].producer?.notes, "producer note\nartifact note");
+    assert.equal(result.findings[0].producer?.images.length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
