@@ -85,3 +85,38 @@ test("ZIP reader enforces size caps, CRC checks, and rejects encrypted or ZIP64 
   zip64.writeUInt32LE(0xffffffff, zip64.length - 22 + 16);
   assert.throws(() => listZipEntries(zip64), /ZIP64/);
 });
+
+test("ZIP reader validates EOCD comment bounds, ZIP64 disk/size sentinels, central dir tail bounds, and stored sizes", () => {
+  // EOCD signature embedded inside an archive comment must not hijack the true EOCD.
+  const base = makeZip([{ name: "a.txt", data: "hello", stored: true }]);
+  const fakeEocd = Buffer.alloc(22);
+  fakeEocd.writeUInt32LE(0x06054b50, 0);
+  fakeEocd.writeUInt16LE(99, 20);
+  const withComment = Buffer.from(base);
+  withComment.writeUInt16LE(fakeEocd.length, withComment.length - 22 + 20);
+  const commentedArchive = Buffer.concat([withComment, fakeEocd]);
+  assert.equal(readZipMember(commentedArchive, "a.txt", 100)?.toString(), "hello");
+
+  // ZIP64 sentinels in diskEntries (offset +8) and cdSize (offset +12).
+  for (const [offset, size, val] of [
+    [8, 2, 0xffff],
+    [12, 4, 0xffffffff],
+  ] as const) {
+    const z = Buffer.from(base);
+    if (size === 2) z.writeUInt16LE(val, z.length - 22 + offset);
+    else z.writeUInt32LE(val, z.length - 22 + offset);
+    assert.throws(() => listZipEntries(z), /ZIP64/);
+  }
+
+  // Central directory entry whose extraLength + commentLength runs past archive length.
+  const truncCd = Buffer.from(base);
+  const cdStart = truncCd.lastIndexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+  truncCd.writeUInt16LE(200, cdStart + 30);
+  assert.throws(() => listZipEntries(truncCd), /malformed central directory/);
+
+  // Stored member with compressed !== size fails before Buffer.from(raw).
+  const mismatch = Buffer.from(base);
+  const cdPos = mismatch.lastIndexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+  mismatch.writeUInt32LE(2, cdPos + 20);
+  assert.throws(() => readZipMember(mismatch, "a.txt", 100), /does not match its size and CRC-32/);
+});

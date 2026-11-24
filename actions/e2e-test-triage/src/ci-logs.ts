@@ -199,7 +199,7 @@ const FINDING_EXCERPT_MAX = 1200;
 
 function findingSearchTerms(f: Pick<Finding, "file" | "title" | "full_title">): string[] {
   const terms: string[] = [];
-  const mm = /\b(MM-T\d+)\b/i.exec(`${f.full_title ?? ""} ${f.title}`);
+  const mm = /(?:^|[^a-z0-9])(mm-t\d+)(?!\d)/i.exec(`${f.full_title ?? ""} ${f.title}`);
   if (mm) terms.push(mm[1]);
   const base = String(f.file ?? "").split(/[\\/]/).pop() ?? "";
   if (base.length >= 4) terms.push(base);
@@ -225,19 +225,26 @@ export function hasLaneTagConflict(laneStr: string, targetStr: string): boolean 
 
 function extractMatchingWindow(lines: string[], terms: string[], maxChars: number, secrets: string[] = []): string {
   if (!terms.length || !lines.length) return "";
-  const lowerTerms = terms.map((t) => t.toLowerCase());
+  const matchers = terms.map((t) => {
+    const low = t.toLowerCase();
+    if (/^mm-t\d+$/.test(low)) {
+      const re = new RegExp(`(?:^|[^a-z0-9])${low}(?!\\d)`);
+      return (line: string) => re.test(line);
+    }
+    return (line: string) => line.includes(low);
+  });
   const snippets: string[] = [];
   let used = 0;
   for (let i = 0; i < lines.length && snippets.length < 2; i++) {
     const lower = lines[i].toLowerCase();
-    if (!lowerTerms.some((t) => lower.includes(t))) continue;
+    if (!matchers.some((m) => m(lower))) continue;
     const from = Math.max(0, i - 4);
     const to = Math.min(lines.length, i + 7);
     const chunk = redact(lines.slice(from, to).join("\n"), secrets);
     if (used + chunk.length > maxChars && snippets.length > 0) break;
     snippets.push(chunk);
     used += chunk.length + 5;
-    i = to;
+    i = to - 1;
   }
   return redact(snippets.join("\n---\n"), secrets).slice(0, maxChars);
 }

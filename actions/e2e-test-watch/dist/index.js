@@ -265,7 +265,7 @@ function missingArrived(missing) {
 }
 function effectiveAttemptOf(idAttempt, runAttempt) {
   const base = String(idAttempt ?? "");
-  return runAttempt != null && /^\d+$/.test(String(runAttempt)) && /^\d+$/.test(base) && Number(runAttempt) > Number(base) ? String(runAttempt) : base;
+  return runAttempt != null && /^\d+$/.test(String(runAttempt)) && /^\d+$/.test(base) && Number(runAttempt) > Number(base) ? String(Number(runAttempt)) : base;
 }
 function groupMatches(g, id, runId, attempt) {
   return g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name && String(g.gh_run_id) === runId && String(g.gh_run_attempt) === attempt;
@@ -274,7 +274,8 @@ async function listReportGroups(fetchImpl, base, params, maxPages = 2, pageSize 
   const all = [];
   for (let page = 0; page < maxPages; page++) {
     const q = new URLSearchParams({ ...params, limit: String(pageSize), ...page > 0 ? { offset: String(page * pageSize) } : {} });
-    const { reports = [] } = await tsioJson(fetchImpl, base, `/reports?${q}`);
+    const data = await tsioJson(fetchImpl, base, `/reports?${q}`);
+    const reports = data.reports ?? [];
     all.push(...reports);
     if (reports.length < pageSize || stopWhen?.(all)) break;
   }
@@ -329,10 +330,11 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
       missing = { expected, received, status: detail.status };
     }
   }
-  const [{ suites: uploaded = [] }, allCases] = await Promise.all([
+  const [suitesRes, allCases] = await Promise.all([
     get(`/reports/${group.id}/suites`),
     get(`/reports/${group.id}/cases`)
   ]);
+  const uploaded = suitesRes.suites ?? [];
   const newest = /* @__PURE__ */ new Map();
   for (const s of uploaded) if (s.report_name && s.report_id && (newest.get(s.report_name) ?? "") < s.report_id) newest.set(s.report_name, s.report_id);
   const suites = uploaded.filter((s) => !s.report_name || (s.report_id ? newest.get(s.report_name) === s.report_id : !newest.has(s.report_name)));
@@ -2011,8 +2013,17 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     if (!positive(snapshot.run) || !positive(snapshot.attempt)) throw new Error("Invalid status publishing run/attempt");
     return snapshot;
   };
+  const overlayStale = (fetched) => {
+    if (!lastWritten) return fetched;
+    const currentInRead = fetched.find((r) => r.context === context);
+    const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
+    const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
+    const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
+    const staleSelfRead = !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten));
+    return staleSelfRead ? [lastWritten, ...fetched] : fetched;
+  };
   const checkAllowed = async (operation) => {
-    const rows = await readStatuses(api, id);
+    const rows = overlayStale(await readStatuses(api, id));
     const ok = mayPublish(rows, id, context, owner(), operation);
     if (!ok) {
       log(`Status ${context} belongs to another run/attempt or has no known owner; publication skipped`);
@@ -2029,16 +2040,7 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
   const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease) => {
     if (!summaryContext || !lanes.length) return false;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
-    const fetched = await readStatuses(api, id);
-    let rows = fetched;
-    if (lastWritten) {
-      const currentInRead = fetched.find((r) => r.context === context);
-      const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
-      const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
-      const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
-      const staleSelfRead = !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten));
-      if (staleSelfRead) rows = [lastWritten, ...fetched];
-    }
+    const rows = overlayStale(await readStatuses(api, id));
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return false;
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
@@ -2068,6 +2070,7 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
       await post({ ...row, context });
       if (prior && statusKey(prior) !== statusKey(payload)) staleKeys.add(statusKey(prior));
       else if (!prior) sawMissingPreWrite = true;
+      if (lastWritten && statusKey(lastWritten) !== statusKey(payload)) staleKeys.add(statusKey(lastWritten));
       lastWritten = payload;
       return true;
     },
@@ -2103,15 +2106,18 @@ var defaultErrorText = (e) => {
 function listZipEntries(zip) {
   let end = -1;
   for (let i = zip.length - 22; i >= Math.max(0, zip.length - EOCD_SEARCH); i--) {
-    if (zip.readUInt32LE(i) === EOCD) {
+    if (zip.readUInt32LE(i) === EOCD && i + 22 + zip.readUInt16LE(i + 20) === zip.length) {
       end = i;
       break;
     }
   }
   if (end < 0) throw new ZipError("not a ZIP archive: no end of central directory");
+  const diskEntries = zip.readUInt16LE(end + 8);
   const entries = zip.readUInt16LE(end + 10);
+  const cdSize = zip.readUInt32LE(end + 12);
   const offset = zip.readUInt32LE(end + 16);
-  if (entries === 65535 || offset === 4294967295) throw new ZipError("a ZIP64 archive, which is not read");
+  if (diskEntries === 65535 || entries === 65535 || cdSize === 4294967295 || offset === 4294967295)
+    throw new ZipError("a ZIP64 archive, which is not read");
   const out = [];
   let p = offset;
   for (let i = 0; i < entries; i++) {
@@ -2125,7 +2131,7 @@ function listZipEntries(zip) {
     const extraLength = zip.readUInt16LE(p + 30);
     const commentLength = zip.readUInt16LE(p + 32);
     const local = zip.readUInt32LE(p + 42);
-    if (p + 46 + nameLength > zip.length) throw new ZipError("a malformed central directory");
+    if (p + 46 + nameLength + extraLength + commentLength > zip.length) throw new ZipError("a malformed central directory");
     const name = zip.subarray(p + 46, p + 46 + nameLength).toString("utf8");
     p += 46 + nameLength + extraLength + commentLength;
     out.push({ name, flags, method, crc, compressed, size, local });
@@ -2144,8 +2150,10 @@ function readZipEntry(zip, entry, max, formatError = defaultErrorText) {
   if (start + compressed > zip.length) throw new ZipError(`${name} runs past the end of the archive`);
   const raw = zip.subarray(start, start + compressed);
   let data;
-  if (method === 0) data = Buffer.from(raw);
-  else if (method === 8) {
+  if (method === 0) {
+    if (compressed !== size) throw new ZipError(`${name} does not match its size and CRC-32 in the archive`);
+    data = Buffer.from(raw);
+  } else if (method === 8) {
     try {
       data = (0, import_node_zlib.inflateRawSync)(raw, { maxOutputLength: Math.max(1, max) });
     } catch (e) {
@@ -2362,7 +2370,7 @@ var RUN_EXCERPT_MAX = 1500;
 var FINDING_EXCERPT_MAX = 1200;
 function findingSearchTerms(f) {
   const terms = [];
-  const mm = /\b(MM-T\d+)\b/i.exec(`${f.full_title ?? ""} ${f.title}`);
+  const mm = /(?:^|[^a-z0-9])(mm-t\d+)(?!\d)/i.exec(`${f.full_title ?? ""} ${f.title}`);
   if (mm) terms.push(mm[1]);
   const base = String(f.file ?? "").split(/[\\/]/).pop() ?? "";
   if (base.length >= 4) terms.push(base);
@@ -2384,19 +2392,26 @@ function hasLaneTagConflict(laneStr, targetStr) {
 }
 function extractMatchingWindow(lines, terms, maxChars, secrets = []) {
   if (!terms.length || !lines.length) return "";
-  const lowerTerms = terms.map((t) => t.toLowerCase());
+  const matchers = terms.map((t) => {
+    const low = t.toLowerCase();
+    if (/^mm-t\d+$/.test(low)) {
+      const re = new RegExp(`(?:^|[^a-z0-9])${low}(?!\\d)`);
+      return (line) => re.test(line);
+    }
+    return (line) => line.includes(low);
+  });
   const snippets = [];
   let used = 0;
   for (let i = 0; i < lines.length && snippets.length < 2; i++) {
     const lower = lines[i].toLowerCase();
-    if (!lowerTerms.some((t) => lower.includes(t))) continue;
+    if (!matchers.some((m) => m(lower))) continue;
     const from = Math.max(0, i - 4);
     const to = Math.min(lines.length, i + 7);
     const chunk = redact(lines.slice(from, to).join("\n"), secrets);
     if (used + chunk.length > maxChars && snippets.length > 0) break;
     snippets.push(chunk);
     used += chunk.length + 5;
-    i = to;
+    i = to - 1;
   }
   return redact(snippets.join("\n---\n"), secrets).slice(0, maxChars);
 }
@@ -2667,6 +2682,7 @@ function hasLaneConflict(artifactName, reportName, lane) {
   const laneStr = [reportName ?? "", lane ?? ""].join(" ").toLowerCase();
   const artStr = artifactName.toLowerCase();
   if (hasLaneTagConflict(laneStr, artStr)) return true;
+  if (!/\bsubpath\b/i.test(laneStr) && /\bsubpath\b/i.test(artStr)) return true;
   if (/^e2e-failure-/i.test(artStr) && reportName) {
     const repLower = reportName.toLowerCase();
     const myOs = OS_GROUPS.find((re) => re.test(laneStr));
@@ -2714,7 +2730,7 @@ function findingMatchScore(entryName, f) {
   return score;
 }
 function serviceLogPriority(nameOrLine) {
-  const base = /^\[([^\]]+)\]/.exec(nameOrLine)?.[1] ?? nameOrLine.split(/[\\/]/).pop() ?? nameOrLine;
+  const base = /^\[([^\]]+)\] /.exec(nameOrLine)?.[1] ?? nameOrLine.split(/[\\/]/).pop() ?? nameOrLine;
   if (/^mattermost\.log$/i.test(base)) return 0;
   if (/^(?:error-context\.md|(?:calls|electron|detox|maestro)[^/]*\.log)$/i.test(base)) return 1;
   if (/^(?:postgres|nginx)\.log$/i.test(base)) return 2;
@@ -2791,7 +2807,8 @@ function inspectZipArchive({
         if (typeof item.file !== "string" || typeof item.title !== "string") continue;
         const images = [];
         for (const rel of Array.isArray(item.images) ? item.images : []) {
-          if (images.length >= EVIDENCE_LIMITS.imagesPerTest || typeof rel !== "string") break;
+          if (images.length >= EVIDENCE_LIMITS.imagesPerTest) break;
+          if (typeof rel !== "string" || !rel) continue;
           const resolved = normalizeZipPath(baseDir === "." ? rel : import_node_path2.posix.join(baseDir, rel));
           const target = byPath.get(resolved) ?? entries.find((e) => normalizeZipPath(e.name).endsWith(`/${rel.replace(/^\.\//, "")}`));
           if (!target) continue;
@@ -2801,7 +2818,7 @@ function inspectZipArchive({
             matchedScreenshots.add(target.name);
           }
         }
-        const notes = typeof item.notes === "string" ? item.notes.slice(0, EVIDENCE_LIMITS.notes) : "";
+        const notes = typeof item.notes === "string" ? redact(item.notes, secrets).slice(0, EVIDENCE_LIMITS.notes) : "";
         if (notes || images.length) {
           const ev = {
             file: item.file,
@@ -2867,7 +2884,7 @@ function inspectZipArchive({
   }
   if (depth === 0) {
     for (const entry of entries) {
-      if (!/blob-report\/[^/]+\.zip$/i.test(entry.name) || entry.size === 0 || entry.size > MAX_NESTED_ZIP_BYTES) continue;
+      if (!/(?:^|\/)blob-report\/[^/]+\.zip$/i.test(entry.name) || entry.size === 0 || entry.size > MAX_NESTED_ZIP_BYTES) continue;
       try {
         const inner = readZipEntry(zip, entry, MAX_NESTED_ZIP_BYTES);
         inspectZipArchive({ zip: inner, artifactName: `${artifactName}/${entry.name}`, findings, warn, serviceLines, evidence, structuredEvidence, secrets, budget, depth: 1 });
@@ -3663,7 +3680,7 @@ function unblocks(cause, cited, pack, cls = "", infraClears = false) {
   const trunk = pack.trunk_history_14d ?? {};
   if (cls === "INFRA_ERROR") {
     if (cause === "test_bug") return has("this_pr");
-    const infraSupported = infraClears && !cited.some((c) => c.startsWith("hunk_")) && (has("ci_logs", "service_logs") || has("error") && isInfraError(pack.error));
+    const infraSupported = infraClears && cause === "flaky_environment" && !cited.some((c) => c.startsWith("hunk_")) && (has("ci_logs", "service_logs") || has("error") && isInfraError(pack.error));
     return (cause === "flaky_environment" || cause === "bug_on_master") && (has("cross_pr", "this_pr") || infraSupported);
   }
   if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error) || has("earlier_failure_same_spec") && chainClears(pack);
@@ -4624,7 +4641,9 @@ async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRu
     orchestrationError = String(e instanceof Error ? e.message : e).slice(0, 160);
     log(`orchestration unavailable: ${orchestrationError}`);
   }
-  const runAttempt = String(env.GITHUB_RUN_ATTEMPT || id.gh_run_attempt || "1");
+  const sameRun = !env.GITHUB_RUN_ID || String(env.GITHUB_RUN_ID) === String(id.gh_run_id);
+  const runId = String(id.gh_run_id || env.GITHUB_RUN_ID || "");
+  const runAttempt = String((sameRun ? env.GITHUB_RUN_ATTEMPT : void 0) || id.gh_run_attempt || "1");
   const staleRerun = Number(runAttempt) > Number(id.gh_run_attempt || 1);
   let jobs = null;
   let jobsError = null;
@@ -4633,7 +4652,7 @@ async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRu
       fetchImpl,
       token: String(env.GITHUB_TOKEN ?? ""),
       repository: id.repository,
-      runId: String(env.GITHUB_RUN_ID || id.gh_run_id),
+      runId,
       attempt: runAttempt,
       runnerName: env.RUNNER_NAME ?? null,
       prefix: env.LANE_JOB_PREFIX || null,
@@ -4675,7 +4694,7 @@ async function unreadHistory(read, log) {
   }
 }
 async function triage(options) {
-  const written = { summary: false };
+  const written = { summary: false, aggregateOutput: false };
   const seen = { run: null, result: null, enforce: null };
   const { env } = options;
   const log = options.log ?? console.error;
@@ -4708,6 +4727,13 @@ async function triage(options) {
         (0, import_node_fs3.appendFileSync)(summaryPath, text + "\n");
       } catch (writeError) {
         log(`triage's summary not written: ${String(writeError).slice(0, 160)}`);
+      }
+    }
+    if (!written.aggregateOutput && env.GITHUB_OUTPUT) {
+      try {
+        (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, "aggregate-published=false\n");
+      } catch (writeError) {
+        log(`triage's output not written: ${String(writeError).slice(0, 160)}`);
       }
     }
     writeFindings({ env, id, mode: effective(), run: seen.run, result: seen.result, notTriaged }, log);
@@ -4918,9 +4944,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const apiKey = env.ANTHROPIC_API_KEY;
     const ask = apiKey && !prSpendUnknown ? (packs, model) => askModelBatch(fetchImpl, apiKey, model, packs) : null;
     const secrets = secretsOf(env);
-    const attemptStr = String(sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : run.attempt ?? (id.gh_run_attempt || 1));
-    const runIdStr = String(id.gh_run_id || env.GITHUB_RUN_ID);
-    const artifactEvidenceEnabled = env.ARTIFACT_EVIDENCE !== "false";
+    const attemptStr = String(run.attempt ?? (sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : id.gh_run_attempt || 1));
+    const runIdStr = String(id.gh_run_id || env.GITHUB_RUN_ID || "");
+    const artifactEvidenceEnabled = String(env.ARTIFACT_EVIDENCE ?? "").trim().toLowerCase() !== "false";
     const artifactPatterns = String(env.ARTIFACT_PATTERNS ?? "").split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
     const skimRuntimeEvidence = ask && env.GITHUB_TOKEN ? async (targets) => {
       if (!targets.length) return;
@@ -4956,9 +4982,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
         const ci = ciLogs.byFinding.get(idx) || ciLogs.runExcerpt;
         if (ci) f.ci_logs = ci;
         if (skimmedArtifacts.serviceLogs) f.service_logs = skimmedArtifacts.serviceLogs;
-        const matched = evidenceFor(f, skimmedArtifacts.evidence);
-        if (matched) {
-          const merged = mergeEvidence(f.producer ? [f.producer] : [], [matched]);
+        const matched = skimmedArtifacts.evidence.filter((e) => evidenceFor(f, [e]) != null);
+        if (matched.length) {
+          const base2 = f.producer ?? matched[0];
+          const normalized = matched.map((m) => ({ ...m, file: base2.file, title: base2.title, full_title: base2.full_title }));
+          const merged = mergeEvidence(f.producer ? [f.producer] : [], normalized);
           if (merged[0]) f.producer = merged[0];
         }
       }
@@ -5024,7 +5052,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       }
       log(`e2e-test-triage: lane ${lane ? "verdict" : "read (tests decide)"}: ${judged.verdict.label} (${judged.verdict.fault}): ${judged.verdict.what}`);
     }
-    const attempt = Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1);
+    const attempt = sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : Number(id.gh_run_attempt) || 1;
     const onlyNoResults = (result.unnamed || result.missing || result.findings.some((f) => f.class === "NOT_RUN")) && !result.findings.some((f) => f.blocking && f.class !== "NOT_RUN");
     const onlyDeadJobs = redWhy === "upstream" && !run.failing.length && !result.findings.some((f) => f.blocking);
     let rerunCheck = null;
@@ -5052,7 +5080,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const laneRed = redWhy === "outside" || redWhy === "upstream";
     if (flakyOnly)
       notes.push(`No test failed: the ${run.counts.flaky === 1 ? "1 test that failed a try" : `${run.counts.flaky} tests that failed a try`} passed on a retry. The lane counted ${run.counts.flaky === 1 ? "it" : "them"} as failed.`);
-    const laneRerun = lane && lane.verdict.rerun !== "none" && attempt <= cfg.rerunAttempts && Number(env.GITHUB_RUN_ATTEMPT || attempt) <= cfg.rerunAttempts ? lane.verdict.rerun : null;
+    const laneRerun = lane && lane.verdict.rerun !== "none" && attempt <= cfg.rerunAttempts ? lane.verdict.rerun : null;
     const rerun = (lane ? laneRerun : rerunCheck?.rerun) ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = lane ? null : rerunCheck?.held ?? null;
     if (lane && lane.verdict.fault === "base branch") {
@@ -5117,9 +5145,12 @@ ai_output_tokens=${spend.output_tokens}
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
       await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", lane ? description : flakyOnly ? `${run.counts.flaky} flaky, passed on retry \xB7 no test failed` : (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).map((l) => l === RERUN ? again : l).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${again}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
     }
-    if (env.GITHUB_OUTPUT) (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
+    if (env.GITHUB_OUTPUT) {
+      (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
 aggregate-published=${aggregatePublished}
 `);
+      written.aggregateOutput = true;
+    }
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));
     log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;
@@ -5130,8 +5161,11 @@ aggregate-published=${aggregatePublished}
       } catch {
       }
       const aggregatePublished = await settleLaneSummary();
-      if (env.GITHUB_OUTPUT) (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `aggregate-published=${aggregatePublished}
+      if (env.GITHUB_OUTPUT) {
+        (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `aggregate-published=${aggregatePublished}
 `);
+        written.aggregateOutput = true;
+      }
     } else if (announce) await postTriageCheck("error", "Triage could not finish; the E2E result stands");
     throw e;
   }

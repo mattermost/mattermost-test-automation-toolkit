@@ -69,6 +69,7 @@ function hasLaneConflict(artifactName: string, reportName: string | null, lane: 
   const laneStr = [reportName ?? "", lane ?? ""].join(" ").toLowerCase();
   const artStr = artifactName.toLowerCase();
   if (hasLaneTagConflict(laneStr, artStr)) return true;
+  if (!/\bsubpath\b/i.test(laneStr) && /\bsubpath\b/i.test(artStr)) return true;
   if (/^e2e-failure-/i.test(artStr) && reportName) {
     const repLower = reportName.toLowerCase();
     const myOs = OS_GROUPS.find((re) => re.test(laneStr));
@@ -131,7 +132,7 @@ function findingMatchScore(entryName: string, f: Finding): number {
 }
 
 function serviceLogPriority(nameOrLine: string): number {
-  const base = /^\[([^\]]+)\]/.exec(nameOrLine)?.[1] ?? nameOrLine.split(/[\\/]/).pop() ?? nameOrLine;
+  const base = /^\[([^\]]+)\] /.exec(nameOrLine)?.[1] ?? nameOrLine.split(/[\\/]/).pop() ?? nameOrLine;
   if (/^mattermost\.log$/i.test(base)) return 0;
   if (/^(?:error-context\.md|(?:calls|electron|detox|maestro)[^/]*\.log)$/i.test(base)) return 1;
   if (/^(?:postgres|nginx)\.log$/i.test(base)) return 2;
@@ -227,7 +228,8 @@ function inspectZipArchive({
         if (typeof item.file !== "string" || typeof item.title !== "string") continue;
         const images: EvidenceImage[] = [];
         for (const rel of Array.isArray(item.images) ? item.images : []) {
-          if (images.length >= EVIDENCE_LIMITS.imagesPerTest || typeof rel !== "string") break;
+          if (images.length >= EVIDENCE_LIMITS.imagesPerTest) break;
+          if (typeof rel !== "string" || !rel) continue;
           const resolved = normalizeZipPath(baseDir === "." ? rel : posix.join(baseDir, rel));
           const target = byPath.get(resolved) ?? entries.find((e) => normalizeZipPath(e.name).endsWith(`/${rel.replace(/^\.\//, "")}`));
           if (!target) continue;
@@ -237,7 +239,7 @@ function inspectZipArchive({
             matchedScreenshots.add(target.name);
           }
         }
-        const notes = typeof item.notes === "string" ? item.notes.slice(0, EVIDENCE_LIMITS.notes) : "";
+        const notes = typeof item.notes === "string" ? redact(item.notes, secrets).slice(0, EVIDENCE_LIMITS.notes) : "";
         if (notes || images.length) {
           const ev: Evidence = {
             file: item.file,
@@ -314,7 +316,7 @@ function inspectZipArchive({
   // 4. Nested Playwright blob-report/*.zip (one level deep).
   if (depth === 0) {
     for (const entry of entries) {
-      if (!/blob-report\/[^/]+\.zip$/i.test(entry.name) || entry.size === 0 || entry.size > MAX_NESTED_ZIP_BYTES) continue;
+      if (!/(?:^|\/)blob-report\/[^/]+\.zip$/i.test(entry.name) || entry.size === 0 || entry.size > MAX_NESTED_ZIP_BYTES) continue;
       try {
         const inner = readZipEntry(zip, entry, MAX_NESTED_ZIP_BYTES);
         inspectZipArchive({ zip: inner, artifactName: `${artifactName}/${entry.name}`, findings, warn, serviceLines, evidence, structuredEvidence, secrets, budget, depth: 1 });

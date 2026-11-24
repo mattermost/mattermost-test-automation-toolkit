@@ -287,8 +287,17 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     if (!positive(snapshot.run) || !positive(snapshot.attempt)) throw new Error("Invalid status publishing run/attempt");
     return snapshot;
   };
+  const overlayStale = (fetched) => {
+    if (!lastWritten) return fetched;
+    const currentInRead = fetched.find((r) => r.context === context);
+    const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
+    const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
+    const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
+    const staleSelfRead = !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten));
+    return staleSelfRead ? [lastWritten, ...fetched] : fetched;
+  };
   const checkAllowed = async (operation) => {
-    const rows = await readStatuses(api, id);
+    const rows = overlayStale(await readStatuses(api, id));
     const ok = mayPublish(rows, id, context, owner(), operation);
     if (!ok) {
       log(`Status ${context} belongs to another run/attempt or has no known owner; publication skipped`);
@@ -305,16 +314,7 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
   const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease) => {
     if (!summaryContext || !lanes.length) return false;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
-    const fetched = await readStatuses(api, id);
-    let rows = fetched;
-    if (lastWritten) {
-      const currentInRead = fetched.find((r) => r.context === context);
-      const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
-      const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
-      const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
-      const staleSelfRead = !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten));
-      if (staleSelfRead) rows = [lastWritten, ...fetched];
-    }
+    const rows = overlayStale(await readStatuses(api, id));
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return false;
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
@@ -344,6 +344,7 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
       await post({ ...row, context });
       if (prior && statusKey(prior) !== statusKey(payload)) staleKeys.add(statusKey(prior));
       else if (!prior) sawMissingPreWrite = true;
+      if (lastWritten && statusKey(lastWritten) !== statusKey(payload)) staleKeys.add(statusKey(lastWritten));
       lastWritten = payload;
       return true;
     },
@@ -431,7 +432,7 @@ var NoResultsError = class extends Error {
 };
 function effectiveAttemptOf(idAttempt, runAttempt) {
   const base = String(idAttempt ?? "");
-  return runAttempt != null && /^\d+$/.test(String(runAttempt)) && /^\d+$/.test(base) && Number(runAttempt) > Number(base) ? String(runAttempt) : base;
+  return runAttempt != null && /^\d+$/.test(String(runAttempt)) && /^\d+$/.test(base) && Number(runAttempt) > Number(base) ? String(Number(runAttempt)) : base;
 }
 function groupMatches(g, id, runId, attempt) {
   return g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name && String(g.gh_run_id) === runId && String(g.gh_run_attempt) === attempt;
@@ -440,7 +441,8 @@ async function listReportGroups(fetchImpl, base, params, maxPages = 2, pageSize 
   const all = [];
   for (let page = 0; page < maxPages; page++) {
     const q = new URLSearchParams({ ...params, limit: String(pageSize), ...page > 0 ? { offset: String(page * pageSize) } : {} });
-    const { reports = [] } = await tsioJson(fetchImpl, base, `/reports?${q}`);
+    const data = await tsioJson(fetchImpl, base, `/reports?${q}`);
+    const reports = data.reports ?? [];
     all.push(...reports);
     if (reports.length < pageSize || stopWhen?.(all)) break;
   }
@@ -495,10 +497,11 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
       missing = { expected, received, status: detail.status };
     }
   }
-  const [{ suites: uploaded = [] }, allCases] = await Promise.all([
+  const [suitesRes, allCases] = await Promise.all([
     get(`/reports/${group.id}/suites`),
     get(`/reports/${group.id}/cases`)
   ]);
+  const uploaded = suitesRes.suites ?? [];
   const newest = /* @__PURE__ */ new Map();
   for (const s of uploaded) if (s.report_name && s.report_id && (newest.get(s.report_name) ?? "") < s.report_id) newest.set(s.report_name, s.report_id);
   const suites = uploaded.filter((s) => !s.report_name || (s.report_id ? newest.get(s.report_name) === s.report_id : !newest.has(s.report_name)));

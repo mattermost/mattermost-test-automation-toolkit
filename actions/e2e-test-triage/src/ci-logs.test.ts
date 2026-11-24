@@ -275,3 +275,54 @@ test("errorLines and extractMatchingWindow redact secrets crossing clip boundari
   assert.ok(excerpt.length > 0);
   assert.doesNotMatch(excerpt, new RegExp(prefix));
 });
+
+test("skimCiLogsForFindings uses exact MM-T boundaries and does not skip line `to` after a matched window", async () => {
+  const filler = (n: number) => `2026-11-20T10:00:${String(n).padStart(2, "0")}.0000000Z filler line ${n}`;
+  const rawLog = [
+    "2026-11-20T10:00:00.0000000Z Running MM-T123 unrelated test",
+    filler(1),
+    filler(2),
+    filler(3),
+    filler(4),
+    filler(5),
+    filler(6),
+    filler(7),
+    filler(8),
+    filler(9),
+    "2026-11-20T10:00:10.0000000Z Match alpha_target_one.ts",
+    filler(11),
+    filler(12),
+    filler(13),
+    filler(14),
+    filler(15),
+    filler(16),
+    // Line 17 is exactly `to` (i=10 + 7 = 17) of window 1; must not be skipped!
+    "2026-11-20T10:00:17.0000000Z Match alpha_target_two at boundary",
+  ].join("\n");
+  const fetchImpl = (async (url: string) => {
+    if (String(url).includes("/jobs?")) {
+      return Response.json({
+        total_count: 1,
+        jobs: [{ id: 99, name: "p1", status: "completed", conclusion: "failure" }],
+      });
+    }
+    if (String(url).includes("/jobs/99/logs")) return new Response(rawLog);
+    throw new Error(`unexpected ${url}`);
+  }) as FetchImpl;
+
+  const skimmed = await skimCiLogsForFindings({
+    fetchImpl,
+    token: "TOK",
+    repository: "o/r",
+    runId: "108",
+    attempt: "1",
+    findings: [
+      makeFinding({ file: "specs/other.ts", title: "MM-T12" }),
+      makeFinding({ file: "specs/alpha_target_one.ts", title: "alpha_target_two" }),
+    ],
+  });
+  assert.equal(skimmed.byFinding.get(0), undefined, "MM-T12 must not match MM-T123");
+  const boundaryExcerpt = skimmed.byFinding.get(1) ?? "";
+  assert.match(boundaryExcerpt, /alpha_target_one/);
+  assert.match(boundaryExcerpt, /alpha_target_two at boundary/);
+});

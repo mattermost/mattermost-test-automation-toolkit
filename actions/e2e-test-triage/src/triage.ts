@@ -102,7 +102,7 @@ async function unreadHistory(read: Promise<HistoryLike>, log: (message: string) 
  * ends (FINDINGS_FILE): judged, superseded, with no results, or broken off.
  */
 export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
-  const written = { summary: false };
+  const written = { summary: false, aggregateOutput: false };
   const seen: Seen = { run: null, result: null, enforce: null };
   const { env } = options;
   const log = options.log ?? console.error;
@@ -140,6 +140,13 @@ export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
         appendFileSync(summaryPath, text + "\n");
       } catch (writeError) {
         log(`triage's summary not written: ${String(writeError).slice(0, 160)}`);
+      }
+    }
+    if (!written.aggregateOutput && env.GITHUB_OUTPUT) {
+      try {
+        appendFileSync(env.GITHUB_OUTPUT, "aggregate-published=false\n");
+      } catch (writeError) {
+        log(`triage's output not written: ${String(writeError).slice(0, 160)}`);
       }
     }
     writeFindings({ env, id, mode: effective(), run: seen.run, result: seen.result, notTriaged }, log);
@@ -215,7 +222,7 @@ async function defaultBranchOf(api: GhApi, repository: string, log: (message: st
 }
 
 /** Fetches the run, its history and diff, evaluates the findings, and writes the summary and commit statuses. */
-async function decideRun({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait, retryWait }: TriageOptions, written: { summary: boolean }, seen: Seen): Promise<EvaluatedRun> {
+async function decideRun({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait, retryWait }: TriageOptions, written: { summary: boolean; aggregateOutput: boolean }, seen: Seen): Promise<EvaluatedRun> {
   const cfg: Config = configFrom(env, log);
   const id = compositeIdentityFrom<TriageIdentity>(env.COMPOSITE_IDENTITY);
   const prNumber = Number(id.gh_pr_number || 0) || null;
@@ -414,9 +421,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     const apiKey = env.ANTHROPIC_API_KEY;
     const ask: AskFn | null = apiKey && !prSpendUnknown ? (packs, model) => askModelBatch(fetchImpl, apiKey, model, packs) : null;
     const secrets = secretsOf(env);
-    const attemptStr = String(sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : run.attempt ?? (id.gh_run_attempt || 1));
-    const runIdStr = String(id.gh_run_id || env.GITHUB_RUN_ID);
-    const artifactEvidenceEnabled = env.ARTIFACT_EVIDENCE !== "false";
+    const attemptStr = String(run.attempt ?? (sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : id.gh_run_attempt || 1));
+    const runIdStr = String(id.gh_run_id || env.GITHUB_RUN_ID || "");
+    const artifactEvidenceEnabled = String(env.ARTIFACT_EVIDENCE ?? "").trim().toLowerCase() !== "false";
     const artifactPatterns = String(env.ARTIFACT_PATTERNS ?? "").split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
     const skimRuntimeEvidence = ask && env.GITHUB_TOKEN
       ? async (targets: Finding[]): Promise<void> => {
@@ -455,9 +462,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
             const ci = ciLogs.byFinding.get(idx) || ciLogs.runExcerpt;
             if (ci) f.ci_logs = ci;
             if (skimmedArtifacts.serviceLogs) f.service_logs = skimmedArtifacts.serviceLogs;
-            const matched = evidenceFor(f, skimmedArtifacts.evidence);
-            if (matched) {
-              const merged = mergeEvidence(f.producer ? [f.producer] : [], [matched]);
+            const matched = skimmedArtifacts.evidence.filter((e) => evidenceFor(f, [e]) != null);
+            if (matched.length) {
+              const base = f.producer ?? matched[0];
+              const normalized = matched.map((m) => ({ ...m, file: base.file, title: base.title, full_title: base.full_title }));
+              const merged = mergeEvidence(f.producer ? [f.producer] : [], normalized);
               if (merged[0]) f.producer = merged[0];
             }
           }
@@ -514,7 +523,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // read: one the change broke (build, test server) holds the re-run (see decideRerun).
     // The later of the run's own attempt and the identity's: a re-run of failed jobs keeps the first attempt's TSIO
     // identity (gh_run_attempt 1), so the identity alone would promise a re-run the listener will not make.
-    const attempt = Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1);
+    const attempt = sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : Number(id.gh_run_attempt) || 1;
     // A spec that never ran (NOT_RUN) is no test's result either: re-running its shard is how it runs.
     const onlyNoResults = (result.unnamed || result.missing || result.findings.some((f) => f.class === "NOT_RUN")) && !result.findings.some((f) => f.blocking && f.class !== "NOT_RUN");
     // Every report arrived and no test failed, but a job outside the tests died (a worker whose specs the others ran):
@@ -551,7 +560,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       notes.push(`No test failed: the ${run.counts.flaky === 1 ? "1 test that failed a try" : `${run.counts.flaky} tests that failed a try`} passed on a retry. The lane counted ${run.counts.flaky === 1 ? "it" : "them"} as failed.`);
     // The lane's own re-run: only for a machine failure, and only within the repo's allowance. A lane whose orchestration
     // began is re-run whole, from its first job: re-running its failed jobs alone finds that run closed.
-    const laneRerun = lane && lane.verdict.rerun !== "none" && attempt <= cfg.rerunAttempts && Number(env.GITHUB_RUN_ATTEMPT || attempt) <= cfg.rerunAttempts ? lane.verdict.rerun : null;
+    const laneRerun = lane && lane.verdict.rerun !== "none" && attempt <= cfg.rerunAttempts ? lane.verdict.rerun : null;
     const rerun = (lane ? laneRerun : rerunCheck?.rerun) ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = lane ? null : rerunCheck?.held ?? null;
     // A bulk failure the base branch explains (the lane fails the same way there) is not the PR's: its tests are cleared
@@ -628,7 +637,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         ? `${run.counts.failed} failed · not triaged, ${runFlag(flag)}`
         : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
-    if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\naggregate-published=${aggregatePublished}\n`);
+    if (env.GITHUB_OUTPUT) {
+      appendFileSync(env.GITHUB_OUTPUT, `published=${published}\naggregate-published=${aggregatePublished}\n`);
+      written.aggregateOutput = true;
+    }
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));
     log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;
@@ -641,7 +653,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         // The lane's own failure is what the PR shows; a write that fails here changes nothing.
       }
       const aggregatePublished = await settleLaneSummary();
-      if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `aggregate-published=${aggregatePublished}\n`);
+      if (env.GITHUB_OUTPUT) {
+        appendFileSync(env.GITHUB_OUTPUT, `aggregate-published=${aggregatePublished}\n`);
+        written.aggregateOutput = true;
+      }
     } else if (announce) await postTriageCheck("error", "Triage could not finish; the E2E result stands");
     throw e;
   }

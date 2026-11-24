@@ -6202,3 +6202,186 @@ test("mergeEvidence and triage merge producer evidence and artifact evidence acr
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("triage uses run.attempt for CI logs on sameRun fallback, merges disjoint producer/artifact prefixes, emits aggregate-published=false on early errors, and restricts infraSupported to flaky_environment", async () => {
+  // 1. sameRun fallback to attempt 1 when TSIO only has attempt 1 group.
+  const jobPaths: string[] = [];
+  const trackedFetch: FetchImpl = async (url, init) => {
+    const u = String(url);
+    if (u.includes("/actions/runs/")) jobPaths.push(u);
+    return fakeFetch([
+      ...runRoutes([spec("t1", "failed")]),
+      ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
+      ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+      ["/pulls/5", () => Response.json({ title: "fix", base: { ref: "master" }, labels: [] })],
+      ["/actions/runs/", () => Response.json({ total_count: 0, jobs: [], artifacts: [] })],
+      ["api.anthropic.com", (i) => modelReply(i, { cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "test" })],
+    ])(url, init);
+  };
+  await triage({
+    env: {
+      ...env,
+      MODE: "report-only",
+      TRIAGE_CONTEXT: "off",
+      GITHUB_RUN_ID: "12",
+      GITHUB_RUN_ATTEMPT: "2",
+    },
+    fetchImpl: trackedFetch,
+    log: () => {},
+  });
+  assert.ok(jobPaths.some((u) => u.includes("/actions/runs/12/attempts/1/jobs")));
+  assert.ok(!jobPaths.some((u) => u.includes("/actions/runs/12/attempts/2/jobs")));
+
+  // 2. Disjoint producer-root/ and multiple artifact-root*/ prefixes over TEST_ROOT: "." merge cleanly.
+  const storedZip = (entries: { name: string; data: Buffer | string }[]): Buffer => {
+    const locals: Buffer[] = [];
+    const centrals: Buffer[] = [];
+    let offset = 0;
+    for (const e of entries) {
+      const name = Buffer.from(e.name, "utf8");
+      const raw = Buffer.isBuffer(e.data) ? e.data : Buffer.from(e.data, "utf8");
+      const crc = crc32(raw);
+      const lh = Buffer.alloc(30 + name.length);
+      lh.writeUInt32LE(0x04034b50, 0);
+      lh.writeUInt16LE(20, 4);
+      lh.writeUInt32LE(crc, 14);
+      lh.writeUInt32LE(raw.length, 18);
+      lh.writeUInt32LE(raw.length, 22);
+      lh.writeUInt16LE(name.length, 26);
+      name.copy(lh, 30);
+      locals.push(lh, raw);
+      const ch = Buffer.alloc(46 + name.length);
+      ch.writeUInt32LE(0x02014b50, 0);
+      ch.writeUInt16LE(20, 4);
+      ch.writeUInt16LE(20, 6);
+      ch.writeUInt32LE(crc, 16);
+      ch.writeUInt32LE(raw.length, 20);
+      ch.writeUInt32LE(raw.length, 24);
+      ch.writeUInt16LE(name.length, 28);
+      ch.writeUInt32LE(offset, 42);
+      name.copy(ch, 46);
+      centrals.push(ch);
+      offset += lh.length + raw.length;
+    }
+    const cd = Buffer.concat(centrals);
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(entries.length, 8);
+    eocd.writeUInt16LE(entries.length, 10);
+    eocd.writeUInt32LE(cd.length, 12);
+    eocd.writeUInt32LE(offset, 16);
+    return Buffer.concat([...locals, cd, eocd]);
+  };
+  const dir = evidenceDir([{ file: "producer-root/specs/foo.spec.ts", title: "foo test", notes: "producer note", images: [] }]);
+  const zip = storedZip([
+    {
+      name: "evidence-1.json",
+      data: JSON.stringify([
+        { file: "artifact-root-1/specs/foo.spec.ts", title: "foo test", notes: "artifact note 1", images: ["./s1.png"] },
+        { file: "artifact-root-2/specs/foo.spec.ts", title: "foo test", notes: "artifact note 2", images: ["./s2.png"] },
+      ]),
+    },
+    { name: "s1.png", data: PNG(1) },
+    { name: "s2.png", data: PNG(2) },
+  ]);
+  try {
+    const mergedRes = await triage({
+      env: { ...env, MODE: "report-only", TRIAGE_CONTEXT: "off", TEST_ROOT: ".", EVIDENCE_DIR: dir },
+      fetchImpl: fakeFetch([
+        ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+        ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/foo.spec.ts" }] })],
+        ["/reports/g1/cases", () => Response.json(spec("foo test", "failed"))],
+        ["/reports/history", () => Response.json({ observations: trunkPasses(8).map((o) => ({ ...o, file: "specs/foo.spec.ts", title: "foo test" })) })],
+        ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+        ["/pulls/5", () => Response.json({ title: "fix", base: { ref: "master" }, labels: [] })],
+        ["/actions/runs/12/attempts/1/jobs", () => Response.json({ total_count: 0, jobs: [] })],
+        ["/actions/runs/12/artifacts?", () => Response.json({ total_count: 1, artifacts: [{ id: 1, name: "triage-evidence-playwright-1", size_in_bytes: zip.length, expired: false }] })],
+        ["/actions/artifacts/1/zip", () => new Response(new Uint8Array(zip))],
+        ["api.anthropic.com", (init) => modelReply(init, { cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "test" })],
+      ]),
+      log: () => {},
+    });
+    assert.equal(mergedRes.findings[0].producer?.notes, "producer note\nartifact note 1\nartifact note 2");
+    assert.equal(mergedRes.findings[0].producer?.images.length, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  // 3. Early exit (SupersededRunError) still emits aggregate-published=false to GITHUB_OUTPUT.
+  await inTmp(async (tmpDir) => {
+    const outFile = join(tmpDir, "out");
+    await assert.rejects(
+      () =>
+        triage({
+          env: { ...env, GITHUB_OUTPUT: outFile, ANTHROPIC_API_KEY: "" },
+          fetchImpl: fakeFetch([
+            ["/reports?", () => Response.json({ reports: [{ id: "g2", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "99", gh_run_attempt: "1", status: "completed" }], total: 1 })],
+          ]),
+          log: () => {},
+        }),
+      (e: unknown) => e instanceof NotTriagedError,
+    );
+    assert.match(readFileSync(outFile, "utf8"), /^aggregate-published=false$/m);
+  });
+
+  // 4. decision.ts: infraSupported only unblocks flaky_environment, not bug_on_master.
+  const infraF = classify({ file: "e2e/specs/calls.test.ts", title: "MM-T5002", error: SERVER_DOWN }, [], [], { ...DEFAULTS, infraClears: true });
+  infraF.blocking = true;
+  infraF.service_logs = "[calls.log] 503 Service Unavailable";
+  const infraPack = buildPack(infraF, [], { number: 4108, repository: "mattermost/desktop", title: "fix" }, []);
+  assert.equal(unblocks("bug_on_master", ["service_logs"], infraPack, "INFRA_ERROR", true), false);
+  assert.equal(unblocks("flaky_environment", ["service_logs"], infraPack, "INFRA_ERROR", true), true);
+});
+
+test("judgeLane and laneRerun target id.gh_run_id/id.gh_run_attempt rather than external GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT on NoResultsError", async () => {
+  await inTmp(async (dir) => {
+    const outFile = join(dir, "out");
+    const requestedRuns: string[] = [];
+    const baseFetch = fakeFetch([
+      ["/reports?", () => Response.json({ reports: [], total: 0 })],
+      ["/pulls/5/files", () => Response.json([{ filename: "server/x.go" }])],
+      ["/pulls/5", () => Response.json({ title: "fix", base: { ref: "master" }, labels: [] })],
+      ["/orchestration/status", () => Response.json({
+        status: "completed",
+        total_units: 1,
+        tests: { passed: 0, failed: 0, total: 0 },
+        units: [{ spec_path: "specs/a.spec.ts", state: "abandoned", attempts: [] }],
+      })],
+      ["/actions/runs/100/attempts/1/jobs", () => Response.json({
+        total_count: 3,
+        jobs: [
+          { id: 1, name: "e2e-playwright / playwright-full / prepare-run", status: "completed", conclusion: "success", steps: [] },
+          { id: 2, name: "e2e-playwright / playwright-full / dispatch-run-playwright--chrome-1", status: "completed", conclusion: "success", steps: [] },
+          { id: 14, name: "e2e-playwright / playwright-full / dispatch-run-playwright--chrome-14", status: "completed", conclusion: "failure", steps: [{ name: "ci/start-server", conclusion: "failure" }] },
+        ],
+      })],
+      ["/actions/jobs/14/logs", () => new Response("Mattermost container not healthy, retry attempts exhausted. Giving up.")],
+      ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/playwright", state: "failure", target_url: "https://github.com/o/r/actions/runs/100" }])],
+    ]);
+    const fetchImpl: FetchImpl = async (url, init) => {
+      const u = String(url);
+      if (u.includes("/actions/runs/")) requestedRuns.push(u);
+      return baseFetch(url, init);
+    };
+    await triage({
+      env: {
+        ...env,
+        COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "100", gh_run_attempt: "1", name: "playwright-full", branch: "pr-5", gh_pr_number: 5 }),
+        MODE: "report-only",
+        TRIAGE_CONTEXT: "off",
+        ANTHROPIC_API_KEY: "",
+        GITHUB_RUN_ID: "999",
+        GITHUB_RUN_ATTEMPT: "5",
+        RERUN_ATTEMPTS: "2",
+        GITHUB_OUTPUT: outFile,
+      },
+      fetchImpl,
+      log: () => {},
+    });
+    assert.ok(requestedRuns.some((u) => u.includes("/actions/runs/100/attempts/1/jobs")), `expected /actions/runs/100/attempts/1/jobs in ${JSON.stringify(requestedRuns)}`);
+    assert.ok(!requestedRuns.some((u) => u.includes("/runs/999/")), `unexpected /runs/999/ request in ${JSON.stringify(requestedRuns)}`);
+    const out = readFileSync(outFile, "utf8");
+    assert.match(out, /^rerun=true$/m);
+    assert.match(out, /^aggregate-published=false$/m);
+  });
+});

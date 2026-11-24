@@ -229,3 +229,126 @@ test("statusPublisher.summarize does not call owner() when lastWritten is null (
     assert.match(String(posted[0].target_url), new RegExp(`status_run_id=${expectedRun}&status_run_attempt=${expectedAttempt}`));
   }
 });
+
+test("statusPublisher records superseded lastWritten in staleKeys across multiple writes (2nd and 3rd write)", async () => {
+  const ctx = "e2e-test/playwright-full/enterprise";
+  const other = "e2e-test/cypress-full/enterprise";
+  const runUrl = "https://github.com/o/r/actions/runs/55";
+  const row = (state: string, description: string): CommitStatus => ({
+    context: ctx,
+    state,
+    description,
+    target_url: `${runUrl}?status_run_id=55&status_run_attempt=1`,
+  });
+  const s0 = row("failure", "initial fail");
+  const s1 = row("success", "100% passed");
+  const s2 = row("failure", "1 failed");
+  const greenOther: CommitStatus = { ...row("success", "ok"), context: other };
+
+  let readStatus: CommitStatus = s0;
+  const posted: { context: string; state: string; description: string }[] = [];
+  const api: GhApi = async (method, path, body) => {
+    if (method === "GET" && path.includes("/statuses")) return [readStatus, greenOther];
+    if (method === "POST" && path.includes("/statuses/")) {
+      posted.push(body as { context: string; state: string; description: string });
+      return {};
+    }
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+  const pub = statusPublisher({
+    api,
+    id: { repository: "o/r", commit_sha: "sha", gh_run_id: "55", gh_run_attempt: "1" },
+    context: ctx,
+    env: { GITHUB_RUN_ID: "55", GITHUB_RUN_ATTEMPT: "1" },
+    log: () => {},
+  });
+  const summarizer = (lanes: { status: { state: string } | null }[]) => ({
+    state: lanes.every((l) => l.status?.state === "success") ? "success" : "failure",
+    description: lanes.every((l) => l.status?.state === "success") ? "All green" : "Still red",
+  });
+
+  // 1st write: S1 (success) while GET sees S0 (pending).
+  assert.equal(await pub.write({ state: "success", description: "100% passed", target_url: runUrl }, "triage"), true);
+  // 2nd write: S2 (failure) while GET still returns stale S0; summarize GET then returns stale S1.
+  assert.equal(await pub.write({ state: "failure", description: "1 failed", target_url: runUrl }, "triage"), true);
+  readStatus = s1;
+  assert.equal(await pub.refresh([ctx, other], summary, summarizer), true);
+
+  // 3rd write: S3 (S1 again) while GET still returns stale S1; summarize GET then returns stale S2.
+  assert.equal(await pub.write({ state: "success", description: "100% passed", target_url: runUrl }, "triage"), true);
+  readStatus = s2;
+  assert.equal(await pub.refresh([ctx, other], summary, summarizer), true);
+
+  assert.deepEqual(
+    posted.filter((p) => p.context === summary).map((p) => p.state),
+    ["failure", "success"],
+  );
+});
+
+test("statusPublisher.refresh applies stale overlay inside allowed('finish') after cross-run claim", async () => {
+  const ctx = "e2e-test/playwright-full/enterprise";
+  const other = "e2e-test/cypress-full/enterprise";
+  const run54Url = "https://github.com/o/r/actions/runs/54";
+  const run55Url = "https://github.com/o/r/actions/runs/55";
+  const run54Row: CommitStatus = {
+    context: ctx,
+    state: "failure",
+    description: "old run failed",
+    target_url: `${run54Url}?status_run_id=54&status_run_attempt=1`,
+  };
+  const run56Row: CommitStatus = {
+    context: ctx,
+    state: "failure",
+    description: "newer run failed",
+    target_url: "https://github.com/o/r/actions/runs/56?status_run_id=56&status_run_attempt=1",
+  };
+  const greenOther: CommitStatus = {
+    context: other,
+    state: "success",
+    description: "ok",
+    target_url: `${run55Url}?status_run_id=55&status_run_attempt=1`,
+  };
+
+  let currentRow = run54Row;
+  const posted: { context: string; state: string; description: string }[] = [];
+  const api: GhApi = async (method, path, body) => {
+    if (method === "GET" && path.includes("/statuses")) return [currentRow, greenOther];
+    if (method === "POST" && path.includes("/statuses/")) {
+      posted.push(body as { context: string; state: string; description: string });
+      return {};
+    }
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+  const pub = statusPublisher({
+    api,
+    id: { repository: "o/r", commit_sha: "sha", gh_run_id: "55", gh_run_attempt: "1" },
+    context: ctx,
+    env: { GITHUB_RUN_ID: "55", GITHUB_RUN_ATTEMPT: "1" },
+    log: () => {},
+  });
+
+  assert.equal(await pub.write({ state: "pending", description: "running", target_url: run55Url }, "claim"), true);
+  // Stale read still returns run 54's row: refresh() -> allowed("finish") must overlay run 55 and post pending.
+  assert.equal(
+    await pub.refresh([ctx, other], summary, (lanes) => ({
+      state: lanes.some((l) => l.status?.state === "pending") ? "pending" : "failure",
+      description: "Waiting",
+    })),
+    true,
+  );
+  assert.deepEqual(
+    posted.map((p) => [p.context, p.state]),
+    [
+      [ctx, "pending"],
+      [summary, "pending"],
+    ],
+  );
+
+  // Newer run (56) on GET must still be refused by refresh() -> allowed("finish").
+  currentRow = run56Row;
+  assert.equal(
+    await pub.refresh([ctx, other], summary, () => ({ state: "pending", description: "Waiting" })),
+    false,
+  );
+  assert.equal(posted.length, 2);
+});

@@ -253,7 +253,7 @@ export function missingArrived(missing: Missing | null): string | null {
 export function effectiveAttemptOf(idAttempt: string | number | null | undefined, runAttempt?: string | number | null): string {
   const base = String(idAttempt ?? "");
   return runAttempt != null && /^\d+$/.test(String(runAttempt)) && /^\d+$/.test(base) && Number(runAttempt) > Number(base)
-    ? String(runAttempt)
+    ? String(Number(runAttempt))
     : base;
 }
 
@@ -279,7 +279,8 @@ export async function listReportGroups(
   const all: TsioGroup[] = [];
   for (let page = 0; page < maxPages; page++) {
     const q = new URLSearchParams({ ...params, limit: String(pageSize), ...(page > 0 ? { offset: String(page * pageSize) } : {}) });
-    const { reports = [] } = await tsioJson<{ reports?: TsioGroup[] }>(fetchImpl, base, `/reports?${q}`);
+    const data = await tsioJson<{ reports?: TsioGroup[] | null }>(fetchImpl, base, `/reports?${q}`);
+    const reports = data.reports ?? [];
     all.push(...reports);
     if (reports.length < pageSize || stopWhen?.(all)) break;
   }
@@ -372,10 +373,11 @@ export async function runFromGroups(
       missing = { expected, received, status: detail.status };
     }
   }
-  const [{ suites: uploaded = [] }, allCases] = await Promise.all([
-    get<{ suites?: TsioSuite[] }>(`/reports/${group.id}/suites`),
+  const [suitesRes, allCases] = await Promise.all([
+    get<{ suites?: TsioSuite[] | null }>(`/reports/${group.id}/suites`),
     get<TsioCase[]>(`/reports/${group.id}/cases`),
   ]);
+  const uploaded = suitesRes.suites ?? [];
   // A re-run uploads its jobs' reports again under the same names: the newest report of a name replaces the earlier
   // attempt's (report ids are UUIDv7, so they sort by upload time). No run uploads two reports of one name otherwise.
   const newest = new Map<string, string>();

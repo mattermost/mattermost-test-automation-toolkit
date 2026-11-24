@@ -38,15 +38,18 @@ const defaultErrorText = (e: unknown): string => {
 export function listZipEntries(zip: Buffer): ZipEntry[] {
   let end = -1;
   for (let i = zip.length - 22; i >= Math.max(0, zip.length - EOCD_SEARCH); i--) {
-    if (zip.readUInt32LE(i) === EOCD) {
+    if (zip.readUInt32LE(i) === EOCD && i + 22 + zip.readUInt16LE(i + 20) === zip.length) {
       end = i;
       break;
     }
   }
   if (end < 0) throw new ZipError("not a ZIP archive: no end of central directory");
+  const diskEntries = zip.readUInt16LE(end + 8);
   const entries = zip.readUInt16LE(end + 10);
+  const cdSize = zip.readUInt32LE(end + 12);
   const offset = zip.readUInt32LE(end + 16);
-  if (entries === 0xffff || offset === 0xffffffff) throw new ZipError("a ZIP64 archive, which is not read");
+  if (diskEntries === 0xffff || entries === 0xffff || cdSize === 0xffffffff || offset === 0xffffffff)
+    throw new ZipError("a ZIP64 archive, which is not read");
 
   const out: ZipEntry[] = [];
   let p = offset;
@@ -61,7 +64,7 @@ export function listZipEntries(zip: Buffer): ZipEntry[] {
     const extraLength = zip.readUInt16LE(p + 30);
     const commentLength = zip.readUInt16LE(p + 32);
     const local = zip.readUInt32LE(p + 42);
-    if (p + 46 + nameLength > zip.length) throw new ZipError("a malformed central directory");
+    if (p + 46 + nameLength + extraLength + commentLength > zip.length) throw new ZipError("a malformed central directory");
     const name = zip.subarray(p + 46, p + 46 + nameLength).toString("utf8");
     p += 46 + nameLength + extraLength + commentLength;
     out.push({ name, flags, method, crc, compressed, size, local });
@@ -85,8 +88,10 @@ export function readZipEntry(zip: Buffer, entry: ZipEntry, max: number, formatEr
   if (start + compressed > zip.length) throw new ZipError(`${name} runs past the end of the archive`);
   const raw = zip.subarray(start, start + compressed);
   let data: Buffer;
-  if (method === 0) data = Buffer.from(raw);
-  else if (method === 8) {
+  if (method === 0) {
+    if (compressed !== size) throw new ZipError(`${name} does not match its size and CRC-32 in the archive`);
+    data = Buffer.from(raw);
+  } else if (method === 8) {
     try {
       data = inflateRawSync(raw, { maxOutputLength: Math.max(1, max) });
     } catch (e) {

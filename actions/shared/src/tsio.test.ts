@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { FetchImpl } from "./github.ts";
-import { DEFAULT_TSIO_BASE_URL, NoResultsError, STAGING_TSIO_BASE_URL, SupersededRunError, compositeIdentityFrom, fetchRun, listReportGroups, missingReports, missingArrived, outcomeWithDuplicates, tsioBase } from "./tsio.ts";
+import { DEFAULT_TSIO_BASE_URL, NoResultsError, STAGING_TSIO_BASE_URL, SupersededRunError, compositeIdentityFrom, effectiveAttemptOf, fetchRun, listReportGroups, missingReports, missingArrived, outcomeWithDuplicates, tsioBase } from "./tsio.ts";
 
 test("use-staging unset, false or empty keeps the shared instance or the given base URL", () => {
   assert.equal(tsioBase({}), DEFAULT_TSIO_BASE_URL);
@@ -232,4 +232,21 @@ test("fetchRun stops paging once page 1 has exact effectiveAttempt, but reads pa
   assert.equal(pageCallsB.length, 2);
   assert.equal(runB.attempt, "2");
   assert.equal(runB.counts.passed, 1);
+});
+
+test("effectiveAttemptOf normalizes leading zeros and TSIO list/suites null fields do not throw TypeError", async () => {
+  assert.equal(effectiveAttemptOf("1", "02"), "2");
+  assert.equal(effectiveAttemptOf("2", "01"), "2");
+
+  const empty = await listReportGroups((async () => Response.json({ reports: null })) as FetchImpl, "http://tsio", { repository: "o/r" });
+  assert.deepEqual(empty, []);
+
+  const nullSuitesFetch = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/reports?")) return Response.json({ reports: [group(ours.gh_run_id, "2")] });
+    if (u.endsWith("/suites")) return Response.json({ suites: null });
+    if (u.includes("/cases")) return Response.json([]);
+    throw new Error(`unexpected ${u}`);
+  }) as FetchImpl;
+  await assert.rejects(() => fetchRun(nullSuitesFetch, "http://tsio", ours, null, { attempts: 1, ms: 0 }, "02"), /reported no test cases/);
 });

@@ -285,8 +285,10 @@ jobs:
               -f context="${STATUS_CONTEXT}" \
               -f description="[${SHORT_SHA}] Analysis unavailable — manual review required" \
               -f target_url="${RUN_URL}"
-            echo "state=success" >> "$GITHUB_OUTPUT"
-            echo "status_desc=Analysis unavailable — manual review required" >> "$GITHUB_OUTPUT"
+            {
+              echo "state=success"
+              echo "status_desc=Analysis unavailable — manual review required"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -307,8 +309,10 @@ jobs:
               -f context="${STATUS_CONTEXT}" \
               -f description="[${SHORT_SHA}] Analysis complete — see details" \
               -f target_url="${RUN_URL}"
-            echo "state=success" >> "$GITHUB_OUTPUT"
-            echo "status_desc=Analysis complete — see details" >> "$GITHUB_OUTPUT"
+            {
+              echo "state=success"
+              echo "status_desc=Analysis complete — see details"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -327,25 +331,12 @@ jobs:
               -f context="${STATUS_CONTEXT}" \
               -f description="[${SHORT_SHA}] Analysis complete — see details" \
               -f target_url="${RUN_URL}"
-            echo "state=success" >> "$GITHUB_OUTPUT"
-            echo "status_desc=Analysis complete — see details" >> "$GITHUB_OUTPUT"
+            {
+              echo "state=success"
+              echo "status_desc=Analysis complete — see details"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          # Export verdict for downstream steps (heredoc-safe for multi-line values)
-          echo "verdict_type=${VERDICT_TYPE}" >> "$GITHUB_OUTPUT"
-
-          echo "status_desc<<GHOUTPUT_DELIM" >> "$GITHUB_OUTPUT"
-          echo "${STATUS_DESC}" >> "$GITHUB_OUTPUT"
-          echo "GHOUTPUT_DELIM" >> "$GITHUB_OUTPUT"
-
-          echo "short_summary<<GHOUTPUT_DELIM" >> "$GITHUB_OUTPUT"
-          echo "${SHORT_SUMMARY}" >> "$GITHUB_OUTPUT"
-          echo "GHOUTPUT_DELIM" >> "$GITHUB_OUTPUT"
-
-          echo "recommendation<<GHOUTPUT_DELIM" >> "$GITHUB_OUTPUT"
-          echo "${RECOMMENDATION}" >> "$GITHUB_OUTPUT"
-          echo "GHOUTPUT_DELIM" >> "$GITHUB_OUTPUT"
 
           case "$VERDICT_TYPE" in
             PASS|PASS_NOT_NEEDED)
@@ -360,7 +351,20 @@ jobs:
               ;;
           esac
 
-          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
+          # Export verdict for downstream steps (heredoc-safe for multi-line values)
+          {
+            echo "verdict_type=${VERDICT_TYPE}"
+            echo "status_desc<<GHOUTPUT_DELIM"
+            echo "${STATUS_DESC}"
+            echo "GHOUTPUT_DELIM"
+            echo "short_summary<<GHOUTPUT_DELIM"
+            echo "${SHORT_SUMMARY}"
+            echo "GHOUTPUT_DELIM"
+            echo "recommendation<<GHOUTPUT_DELIM"
+            echo "${RECOMMENDATION}"
+            echo "GHOUTPUT_DELIM"
+            echo "state=${STATE}"
+          } >> "$GITHUB_OUTPUT"
 
           # Prefix status description with short commit SHA
           STATUS_DESC="[${SHORT_SHA}] ${STATUS_DESC}"

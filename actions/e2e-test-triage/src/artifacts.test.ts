@@ -628,3 +628,66 @@ test("skimRunArtifacts only stops early when structured triage-evidence-* manife
   assert.deepEqual(downloaded, [1, 2, 3]);
   assert.equal(skimmed.evidence.find((e) => e.title === f1.title)?.notes, "alpha notes");
 });
+
+test("skimRunArtifacts excludes subpath artifacts for non-subpath lanes", async () => {
+  const downloaded: string[] = [];
+  const zip = makeZip([{ name: "logs/mattermost.log", data: "ERROR subpath only" }]);
+  const fetchImpl = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/artifacts?")) {
+      return Response.json({
+        total_count: 2,
+        artifacts: [
+          { id: 1, name: "playwright-subpath--debug-1", size_in_bytes: zip.length },
+          { id: 2, name: "playwright-full--debug-1", size_in_bytes: zip.length },
+        ],
+      });
+    }
+    downloaded.push(u);
+    return new Response(new Uint8Array(zip));
+  }) as FetchImpl;
+
+  const skimmed = await skimRunArtifacts({
+    fetchImpl,
+    token: "TOK",
+    repository: "mattermost/mattermost",
+    runId: "69",
+    lane: "playwright-full",
+    findings: [finding({})],
+  });
+  assert.deepEqual(skimmed.artifactsScanned, ["playwright-full--debug-1"]);
+  assert.equal(downloaded.length, 1);
+});
+
+test("skimRunArtifacts prioritizes mattermost.log even under bracketed zip directories and redacts manifest notes before slicing", async () => {
+  const secret = "ghp_ManifestSecretCrossing1500Boundary";
+  const longNotes = `${"n".repeat(1485)}${secret}_tail`;
+  const zip = makeZip([
+    { name: "[shard-1]/inbucket.log", data: Array.from({ length: 12 }, (_, i) => `ERROR inb_${i}_${"x".repeat(200)}`).join("\n") },
+    { name: "[shard-1]/mattermost.log", data: '{"level":"error","msg":"primary bracketed dir"}' },
+    {
+      name: "evidence-1.json",
+      data: JSON.stringify([{ file: "specs/channels/incoming_webhook_spec.ts", title: "MM-T633", notes: longNotes, images: ["", "./shot.png"] }]),
+    },
+    { name: "shot.png", data: PNG },
+  ]);
+  const fetchImpl = (async (url: string) =>
+    String(url).includes("/artifacts?")
+      ? Response.json({ total_count: 1, artifacts: [{ id: 1, name: "playwright-full--debug-1", size_in_bytes: zip.length }] })
+      : new Response(new Uint8Array(zip))) as FetchImpl;
+
+  const skimmed = await skimRunArtifacts({
+    fetchImpl,
+    token: "TOK",
+    repository: "mattermost/mattermost",
+    runId: "70",
+    lane: "playwright-full",
+    secrets: [secret],
+    findings: [finding({})],
+  });
+  assert.match(skimmed.serviceLogs, /^\[mattermost\.log\].*primary bracketed dir/);
+  assert.equal(skimmed.evidence.length, 1);
+  assert.equal(skimmed.evidence[0].images.length, 1);
+  assert.doesNotMatch(skimmed.evidence[0].notes, new RegExp(secret.slice(0, 12)));
+  assert.match(skimmed.evidence[0].notes, /\[redacted\]/);
+});

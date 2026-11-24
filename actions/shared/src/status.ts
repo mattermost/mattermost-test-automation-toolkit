@@ -171,8 +171,17 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     if (!positive(snapshot.run) || !positive(snapshot.attempt)) throw new Error("Invalid status publishing run/attempt");
     return snapshot;
   };
+  const overlayStale = (fetched: CommitStatus[]): CommitStatus[] => {
+    if (!lastWritten) return fetched;
+    const currentInRead = fetched.find((r) => r.context === context);
+    const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
+    const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
+    const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
+    const staleSelfRead = !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten));
+    return staleSelfRead ? [lastWritten, ...fetched] : fetched;
+  };
   const checkAllowed = async (operation: string): Promise<CommitStatus[] | null> => {
-    const rows = await readStatuses(api, id);
+    const rows = overlayStale(await readStatuses(api, id));
     const ok = mayPublish(rows, id, context, owner(), operation);
     if (!ok) {
       log(`Status ${context} belongs to another run/attempt or has no known owner; publication skipped`);
@@ -187,18 +196,9 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
   const summarize = async (lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release = defaultRelease): Promise<boolean> => {
     if (!summaryContext || !lanes.length) return false;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
-    const fetched = await readStatuses(api, id);
     // GitHub's /statuses endpoint is eventually consistent right after a POST: overlay this publisher's own write only
     // when the self-read still shows the exact pre-write row (or missing row) owned by no newer/unknown writer.
-    let rows = fetched;
-    if (lastWritten) {
-      const currentInRead = fetched.find((r) => r.context === context);
-      const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
-      const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
-      const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
-      const staleSelfRead = !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten));
-      if (staleSelfRead) rows = [lastWritten, ...fetched];
-    }
+    const rows = overlayStale(await readStatuses(api, id));
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return false;
     // The other E2E checks under the aggregate's prefix (an upgrade lane, a policy lane): named when red.
@@ -230,6 +230,7 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
       await post({ ...row, context });
       if (prior && statusKey(prior) !== statusKey(payload)) staleKeys.add(statusKey(prior));
       else if (!prior) sawMissingPreWrite = true;
+      if (lastWritten && statusKey(lastWritten) !== statusKey(payload)) staleKeys.add(statusKey(lastWritten));
       lastWritten = payload;
       return true;
     },

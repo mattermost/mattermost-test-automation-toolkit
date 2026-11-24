@@ -48,13 +48,15 @@ export async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, 
   }
   // The attempt this job runs in, against the attempt the TSIO identity was made in: a "re-run failed jobs" keeps the
   // first attempt's identity, so its workers find that run closed.
-  const runAttempt = String(env.GITHUB_RUN_ATTEMPT || id.gh_run_attempt || "1");
+  const sameRun = !env.GITHUB_RUN_ID || String(env.GITHUB_RUN_ID) === String(id.gh_run_id);
+  const runId = String(id.gh_run_id || env.GITHUB_RUN_ID || "");
+  const runAttempt = String((sameRun ? env.GITHUB_RUN_ATTEMPT : undefined) || id.gh_run_attempt || "1");
   const staleRerun = Number(runAttempt) > Number(id.gh_run_attempt || 1);
   let jobs: LaneJobs | null = null;
   let jobsError: string | null = null;
   try {
     jobs = await readLaneJobs({
-      fetchImpl, token: String(env.GITHUB_TOKEN ?? ""), repository: id.repository, runId: String(env.GITHUB_RUN_ID || id.gh_run_id), attempt: runAttempt,
+      fetchImpl, token: String(env.GITHUB_TOKEN ?? ""), repository: id.repository, runId, attempt: runAttempt,
       runnerName: env.RUNNER_NAME ?? null, prefix: env.LANE_JOB_PREFIX || null, filter: env.LANE_JOB_FILTER || null, log,
     });
   } catch (e) {

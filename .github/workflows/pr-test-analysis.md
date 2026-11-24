@@ -183,5 +183,5 @@ Available hashtags for filtering:
 - `#pass-test-analysis` — passing results
 - `#fail-test-analysis` — failing results
 - `#override-test-analysis` — manual overrides
-- `#unavailable-test-analysis` — analysis unavailable (AI error/timeout)
+- `#unavailable-test-analysis` — analysis unavailable (AI error, timeout, or missing `ANTHROPIC_API_KEY`)
 - `#<repo>-pr-<number>` — specific PR (e.g., `#mattermost-pr-1234`)
