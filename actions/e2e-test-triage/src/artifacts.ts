@@ -227,12 +227,14 @@ function inspectZipArchive({
         const item = rawItem as Record<string, unknown>;
         if (typeof item.file !== "string" || typeof item.title !== "string") continue;
         const images: EvidenceImage[] = [];
+        const seenImages = new Set<string>();
         for (const rel of Array.isArray(item.images) ? item.images : []) {
           if (images.length >= EVIDENCE_LIMITS.imagesPerTest) break;
           if (typeof rel !== "string" || !rel) continue;
           const resolved = normalizeZipPath(baseDir === "." ? rel : posix.join(baseDir, rel));
           const target = byPath.get(resolved) ?? entries.find((e) => normalizeZipPath(e.name).endsWith(`/${rel.replace(/^\.\//, "")}`));
-          if (!target) continue;
+          if (!target || seenImages.has(target.name)) continue;
+          seenImages.add(target.name);
           const img = decodeImage(target);
           if (img) {
             images.push(img);

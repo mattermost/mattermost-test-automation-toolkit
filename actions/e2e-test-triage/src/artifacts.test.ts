@@ -691,3 +691,31 @@ test("skimRunArtifacts prioritizes mattermost.log even under bracketed zip direc
   assert.doesNotMatch(skimmed.evidence[0].notes, new RegExp(secret.slice(0, 12)));
   assert.match(skimmed.evidence[0].notes, /\[redacted\]/);
 });
+
+test("skimRunArtifacts deduplicates manifest images before applying the per-test limit", async () => {
+  const f = finding({ file: "detox/e2e/test/dup.e2e.ts", title: "MM-T700 dup" });
+  const pngB = Buffer.concat([PNG, Buffer.from([1])]);
+  const zip = makeZip([
+    {
+      name: "evidence.json",
+      data: JSON.stringify([{ file: f.file, title: f.title, notes: "dup refs", images: ["opaque-a.png", "./opaque-a.png", "opaque-b.png"] }]),
+    },
+    { name: "opaque-a.png", data: PNG },
+    { name: "opaque-b.png", data: pngB },
+  ]);
+  const fetchImpl = (async (url: string) =>
+    String(url).includes("/artifacts?")
+      ? Response.json({ total_count: 1, artifacts: [{ id: 1, name: "triage-evidence-detox-ios-1", size_in_bytes: zip.length }] })
+      : new Response(new Uint8Array(zip))) as FetchImpl;
+
+  const skimmed = await skimRunArtifacts({
+    fetchImpl,
+    token: "TOK",
+    repository: "mattermost/mattermost-mobile",
+    runId: "71",
+    lane: "detox-ios",
+    findings: [f],
+  });
+  assert.equal(skimmed.evidence.length, 1);
+  assert.equal(skimmed.evidence[0].images.length, 2);
+});

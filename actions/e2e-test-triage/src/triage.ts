@@ -498,7 +498,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       const judged = await judgeLane({
         env, fetchImpl, api, tsio: base, id, context, base: laneBase, trunkRun: isTrunkRun,
         prFiles: diff.ok ? diff.files.map((f) => f.filename) : null, lanePaths: lanePathsOf(testRoot, cfg.supportPaths),
-        judgedSpecs: run.failing.map((t) => t.file), noResults: Boolean(laneOnly), log,
+        judgedSpecs: run.failing.map((t) => t.file), noResults: Boolean(laneOnly), reportAttempt: run.attempt ?? null, log,
       });
       const mass = ["broken on main", "fixed on main", "caused by PR"].includes(judged.verdict.label);
       const testsBlock = result.findings.some((f) => f.blocking);

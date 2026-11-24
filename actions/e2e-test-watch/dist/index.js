@@ -2806,12 +2806,14 @@ function inspectZipArchive({
         const item = rawItem;
         if (typeof item.file !== "string" || typeof item.title !== "string") continue;
         const images = [];
+        const seenImages = /* @__PURE__ */ new Set();
         for (const rel of Array.isArray(item.images) ? item.images : []) {
           if (images.length >= EVIDENCE_LIMITS.imagesPerTest) break;
           if (typeof rel !== "string" || !rel) continue;
           const resolved = normalizeZipPath(baseDir === "." ? rel : import_node_path2.posix.join(baseDir, rel));
           const target = byPath.get(resolved) ?? entries.find((e) => normalizeZipPath(e.name).endsWith(`/${rel.replace(/^\.\//, "")}`));
-          if (!target) continue;
+          if (!target || seenImages.has(target.name)) continue;
+          seenImages.add(target.name);
           const img = decodeImage(target);
           if (img) {
             images.push(img);
@@ -4632,11 +4634,12 @@ async function readLaneJobs({ fetchImpl, token, repository, runId, attempt, runn
 function lanePathsOf(testRoot, supportPaths) {
   return [testRoot, ...supportPaths].filter((p) => Boolean(p && p !== "."));
 }
-async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRun, prFiles, lanePaths, judgedSpecs, noResults = false, log }) {
+async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRun, prFiles, lanePaths, judgedSpecs, noResults = false, reportAttempt = null, log }) {
   let orchestration = null;
   let orchestrationError = null;
+  const orchId = reportAttempt != null ? { ...id, gh_run_attempt: String(reportAttempt) } : id;
   try {
-    orchestration = await fetchOrchestration(fetchImpl, tsio, id);
+    orchestration = await fetchOrchestration(fetchImpl, tsio, orchId);
   } catch (e) {
     orchestrationError = String(e instanceof Error ? e.message : e).slice(0, 160);
     log(`orchestration unavailable: ${orchestrationError}`);
@@ -4644,7 +4647,7 @@ async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRu
   const sameRun = !env.GITHUB_RUN_ID || String(env.GITHUB_RUN_ID) === String(id.gh_run_id);
   const runId = String(id.gh_run_id || env.GITHUB_RUN_ID || "");
   const runAttempt = String((sameRun ? env.GITHUB_RUN_ATTEMPT : void 0) || id.gh_run_attempt || "1");
-  const staleRerun = Number(runAttempt) > Number(id.gh_run_attempt || 1);
+  const staleRerun = Number(runAttempt) > Number(reportAttempt ?? (id.gh_run_attempt || 1));
   let jobs = null;
   let jobsError = null;
   try {
@@ -5035,6 +5038,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
         lanePaths: lanePathsOf(testRoot, cfg.supportPaths),
         judgedSpecs: run.failing.map((t) => t.file),
         noResults: Boolean(laneOnly),
+        reportAttempt: run.attempt ?? null,
         log
       });
       const mass = ["broken on main", "fixed on main", "caused by PR"].includes(judged.verdict.label);

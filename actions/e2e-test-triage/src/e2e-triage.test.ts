@@ -6203,8 +6203,8 @@ test("mergeEvidence and triage merge producer evidence and artifact evidence acr
   }
 });
 
-test("triage uses run.attempt for CI logs on sameRun fallback, merges disjoint producer/artifact prefixes, emits aggregate-published=false on early errors, and restricts infraSupported to flaky_environment", async () => {
-  // 1. sameRun fallback to attempt 1 when TSIO only has attempt 1 group.
+test("triage uses run.attempt for CI logs on both attempt-2 selection and sameRun fallback, merges disjoint producer/artifact prefixes, emits aggregate-published=false on early errors, and restricts infraSupported to flaky_environment", async () => {
+  // 1a. sameRun fallback to attempt 1 when TSIO only has attempt 1 group (proves run.attempt overrides GITHUB_RUN_ATTEMPT=2).
   const jobPaths: string[] = [];
   const trackedFetch: FetchImpl = async (url, init) => {
     const u = String(url);
@@ -6231,6 +6231,36 @@ test("triage uses run.attempt for CI logs on sameRun fallback, merges disjoint p
   });
   assert.ok(jobPaths.some((u) => u.includes("/actions/runs/12/attempts/1/jobs")));
   assert.ok(!jobPaths.some((u) => u.includes("/actions/runs/12/attempts/2/jobs")));
+
+  // 1b. Attempt-2 TSIO selection with id.gh_run_attempt="1" uses attempt 2 for CI logs (proves run.attempt overrides id.gh_run_attempt=1).
+  const jobPathsAtt2: string[] = [];
+  const trackedAtt2Fetch: FetchImpl = async (url, init) => {
+    const u = String(url);
+    if (u.includes("/actions/runs/")) jobPathsAtt2.push(u);
+    return fakeFetch([
+      ["/reports?", () => Response.json({ reports: [{ id: "g2", repository: "o/r", commit: "abc", name: "playwright-full", gh_run_id: "12", gh_run_attempt: "2", status: "completed" }], total: 1 })],
+      ["/reports/g2/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+      ["/reports/g2/cases", () => Response.json(spec("t1", "failed"))],
+      ["/reports/history", () => Response.json({ observations: trunkPasses(8) })],
+      ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts", patch: "@@" }])],
+      ["/pulls/5", () => Response.json({ title: "fix", base: { ref: "master" }, labels: [] })],
+      ["/actions/runs/", () => Response.json({ total_count: 0, jobs: [], artifacts: [] })],
+      ["api.anthropic.com", (i) => modelReply(i, { cause: "caused_by_pr", confidence: 0.9, cited_evidence: [], explanation: "test" })],
+    ])(url, init);
+  };
+  await triage({
+    env: {
+      ...env,
+      MODE: "report-only",
+      TRIAGE_CONTEXT: "off",
+      GITHUB_RUN_ID: "12",
+      GITHUB_RUN_ATTEMPT: "2",
+    },
+    fetchImpl: trackedAtt2Fetch,
+    log: () => {},
+  });
+  assert.ok(jobPathsAtt2.some((u) => u.includes("/actions/runs/12/attempts/2/jobs")));
+  assert.ok(!jobPathsAtt2.some((u) => u.includes("/actions/runs/12/attempts/1/jobs")));
 
   // 2. Disjoint producer-root/ and multiple artifact-root*/ prefixes over TEST_ROOT: "." merge cleanly.
   const storedZip = (entries: { name: string; data: Buffer | string }[]): Buffer => {
@@ -6384,4 +6414,76 @@ test("judgeLane and laneRerun target id.gh_run_id/id.gh_run_attempt rather than 
     assert.match(out, /^rerun=true$/m);
     assert.match(out, /^aggregate-published=false$/m);
   });
+});
+
+test("judgeLane reads orchestration for the selected attempt-2 TSIO report even when composite identity names attempt 1", async () => {
+  const orchAttempts: string[] = [];
+  const posted: StatusBody[] = [];
+  const baseFetch = fakeFetch([
+    ["/reports?", () => Response.json({
+      reports: [{
+        id: "g2",
+        repository: "o/r",
+        commit: "abc",
+        name: "playwright-full",
+        gh_run_id: "12",
+        gh_run_attempt: "2",
+        status: "running",
+        total_reports_expected: 2,
+        reports: [{ id: "r1" }],
+      }],
+      total: 1,
+    })],
+    ["/reports/g2/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+    ["/reports/g2/cases", () => Response.json([caseRow("t1", "passed")])],
+    ["/pulls/5/files", () => Response.json([{ filename: "app/x.ts" }])],
+    ["/pulls/5", () => Response.json({ title: "fix", base: { ref: "master" }, labels: [] })],
+    ["/repos/o/r/statuses/abc", (init) => {
+      if (init.method === "POST" && typeof init.body === "string") posted.push(JSON.parse(init.body) as StatusBody);
+      return Response.json({});
+    }],
+    ["/actions/runs/12/attempts/2/jobs", () => Response.json({
+      total_count: 2,
+      jobs: [
+        { id: 1, name: "playwright-full / prepare-run", status: "completed", conclusion: "success", steps: [] },
+        { id: 2, name: "playwright-full / worker-2", status: "completed", conclusion: "failure", steps: [{ name: "Run tests", conclusion: "failure" }] },
+      ],
+    })],
+    ["/actions/jobs/2/logs", () => new Response("Error: worker crashed before upload")],
+    ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/playwright", state: "failure", description: "results incomplete: 1 of 2 reports", target_url: "https://github.com/o/r/actions/runs/12" }])],
+    ["/repos/o/r", () => Response.json({ default_branch: "master" })],
+  ]);
+  const fetchImpl: FetchImpl = async (url, init) => {
+    const u = String(url);
+    if (u.includes("/orchestration/status")) {
+      const q = new URL(u).searchParams;
+      const att = q.get("gh_run_attempt") ?? "";
+      orchAttempts.push(att);
+      if (att === "1") {
+        return Response.json({
+          status: "completed",
+          total_units: 1,
+          tests: { passed: 1, failed: 0, total: 1 },
+          units: [{ spec_path: "specs/a.spec.ts", state: "completed_pass", attempts: [{ status: "passed" }] }],
+        });
+      }
+      return new Response("Not found", { status: 404 });
+    }
+    return baseFetch(url, init);
+  };
+  await triage({
+    env: {
+      ...env,
+      MODE: "enforce",
+      TRIAGE_CONTEXT: "off",
+      ANTHROPIC_API_KEY: "",
+      GITHUB_RUN_ID: "12",
+      GITHUB_RUN_ATTEMPT: "2",
+    },
+    wait: { attempts: 0, ms: 0 },
+    fetchImpl,
+    log: () => {},
+  });
+  assert.deepEqual(orchAttempts, ["2"]);
+  assert.ok(posted.filter((s) => s.context === "e2e-test/playwright").every((s) => s.state !== "success"), `unexpected success status: ${JSON.stringify(posted)}`);
 });
