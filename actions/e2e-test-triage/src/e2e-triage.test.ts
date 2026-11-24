@@ -3566,14 +3566,14 @@ test("a row that blames this PR never says the cause is environmental: the other
   assert.doesNotMatch(row, /environment|shared cause/, "a change to this PR is not steered toward the environment");
 });
 
-test("the answer-cache key ignores the other-platform evidence, and is the v7 key for the same pack", () => {
+test("the answer-cache key ignores the other-platform evidence, and is the v8 key for the same pack", () => {
   const pack = { test: { title: "t1", full_title: null, suite: null, file: "specs/a.spec.ts", report_scope: null, report_name: null }, error: "Error: expected visible", trunk_history_14d: { runs: 8, fails: 0, flaky: 0, latest: "passed" }, cross_pr_failures_14d: { id: "cross_pr", other_prs_where_this_test_failed: [], other_pr_runs_where_it_passed: 0 }, pr: { number: 5, repository: "o/r", title: "t", changed_file_count: 1, changed_files: ["app/x.ts"], spec_file_changed_by_pr: false }, diff_hunks_of_files_named_in_error: [], other_failures_in_same_run: [] } as unknown as Pack;
   const withOthers = { ...pack, same_test_other_platforms_this_run: { id: "other_platforms", results: [{ platform: "windows", result: "failed" }] } } as unknown as Pack;
   assert.equal(answerKey("claude-sonnet-5-5", withOthers), answerKey("claude-sonnet-5-5", pack), "the evidence is not part of the key");
-  // v7 for this pack: answers carry a fix and SYSTEM gained the PR-streak rule, so every v6 answer is a miss by design.
-  // A cached v7 answer keeps this key, so no call is paid again.
-  assert.match(answerKey("claude-sonnet-5-5", pack), /^v7:/);
-  assert.equal(answerKey("claude-sonnet-5-5", pack), "v7:912ca05e46c073925f2f77e4459ed93ad20f506b0a80095069524447ca1985f4");
+  // v8 for this pack: packs carry ci_logs and service_logs and prompts instruct models on logs + screenshots, so every v7 answer is a miss.
+  // A cached v8 answer keeps this key, so no call is paid again.
+  assert.match(answerKey("claude-sonnet-5-5", pack), /^v8:/);
+  assert.equal(answerKey("claude-sonnet-5-5", pack), "v8:96679da784bbf7958215992701b823ddd01cedab7d686360a87eff4ff99c890c");
 });
 
 test("a sibling's same leaf title in another describe block is another test: no other-platform line", async () => {
@@ -5796,4 +5796,106 @@ test("judge escalates borderline PR blame with hunk (0.60-0.84) and trunk-backed
   await judge([fMaster], [masterPack], askMaster, { ...DEFAULTS, model: "claude-sonnet-5-5", escalationModel: "claude-opus-5-5" });
   assert.deepEqual(askedMaster, ["claude-sonnet-5-5", "claude-opus-5-5"]);
   assert.deepEqual([fMaster.blocking, fMaster.decision, fMaster.escalated], [false, "adjudicator_unblock", true]);
+});
+
+test("INFRA_ERROR with infraClears: true unblocks via service_logs/ci_logs/infra error and escalates low-confidence Sonnet 5.5 to Opus 5.5", async () => {
+  const f = classify({ file: "e2e/specs/calls.test.ts", title: "MM-T5000", error: SERVER_DOWN }, [], [], { ...DEFAULTS, infraClears: true });
+  f.blocking = true;
+  f.service_logs = "[calls.log] 503 Service Unavailable from rtcd";
+  f.ci_logs = "[e2e-linux] Calls container timed out";
+  const pack = buildPack(f, [], { number: 4106, repository: "mattermost/desktop", title: "fix" }, []);
+  assert.equal(canChange("INFRA_ERROR", pack, false, true), true);
+  assert.equal(unblocks("flaky_environment", ["service_logs"], pack, "INFRA_ERROR", true), true);
+  assert.equal(unblocks("flaky_environment", ["service_logs"], pack, "INFRA_ERROR", false), false);
+  const models: string[] = [];
+  await judge([f], [pack], async (packs, model) => {
+    models.push(model);
+    return {
+      answers: packs.map(() => ({
+        cause: "flaky_environment" as const,
+        confidence: model === "claude-opus-5-5" ? 0.92 : 0.55,
+        cited_evidence: ["service_logs", "ci_logs"],
+        explanation: "RTCD service returned 503 in Calls logs.",
+      })),
+      usage: { input_tokens: 100, output_tokens: 50 },
+      served_model: model,
+    };
+  }, { ...DEFAULTS, infraClears: true, model: "claude-sonnet-5-5", escalationModel: "claude-opus-5-5" });
+  assert.deepEqual(models, ["claude-sonnet-5-5", "claude-opus-5-5"]);
+  assert.deepEqual([f.blocking, f.decision, f.escalated], [false, "adjudicator_unblock", true]);
+});
+
+test("reliability fixes: unlisted lane does not wedge triage-context pending, release PR base stays isolated, Windows paths normalize, 4-6 models priced, and reportUnknown is scoped per test", async () => {
+  // Bug T6: Windows backslash normalization in repoPath
+  assert.equal(repoPath("e2e\\specs", "channels\\post.spec.ts"), "e2e/specs/channels/post.spec.ts");
+  // Bug T5: claude-sonnet-4-6 and claude-opus-4-6 have built-in pricing
+  assert.ok(priceFor("claude-sonnet-4-6") != null);
+  assert.ok(priceFor("claude-opus-4-6") != null);
+
+  // Bug T7: one test with null report_name does not blind another test with valid report_name
+  const tUnknown: TestRef = { file: "specs/u.spec.ts", title: "u1" };
+  const tKnown: TestRef = { file: "specs/k.spec.ts", title: "k1" };
+  const h = await fetchHistory(
+    fakeFetch([
+      ["/reports/history", () => Response.json({
+        observations: [
+          obs({ file: "specs/u.spec.ts", title: "u1", group_id: "g1" }),
+          obs({ file: "specs/k.spec.ts", title: "k1", group_id: "g2", report_name: "e2e-on-windows-12.0", status: "passed" }),
+        ],
+      })],
+    ]),
+    "http://tsio",
+    "o/r",
+    [tUnknown, tKnown],
+    "2026-11-20T00:00:00Z",
+    DEFAULTS,
+    "master",
+    "e2e-on-windows",
+  );
+  assert.equal(h.reportUnknown, false);
+  assert.equal(h.reportUnknownFor.has(identityKey(tUnknown)), true);
+  assert.equal(h.reportUnknownFor.has(identityKey(tKnown)), false);
+
+  // Bug T1 & T4: unlisted lane skips pending post to triageContext, and release-12.2 PR base does not fall back to master
+  const postedContexts: { context: string; state: string }[] = [];
+  let askedDefaultBranch = false;
+  const dir = mkdtempSync(join(tmpdir(), "triage-fixes-"));
+  try {
+    const summaryPath = join(dir, "summary.md");
+    await triage({
+      env: {
+        COMPOSITE_IDENTITY: JSON.stringify({ repository: "o/r", commit_sha: "abc", gh_run_id: "77", gh_run_attempt: "1", name: "upgrade-from-11", branch: "pr-9", gh_pr_number: 9 }),
+        STATUS_CONTEXT: "e2e-test/upgrade-from-11",
+        TRIAGE_CONTEXT: "e2e-test/triage",
+        TRIAGE_LANES: "e2e-test/cypress-full/enterprise,e2e-test/playwright-full/enterprise",
+        TEST_ROOT: ".",
+        MODE: "enforce",
+        GITHUB_TOKEN: "GH",
+        TSIO_BASE_URL: "http://tsio",
+        GITHUB_STEP_SUMMARY: summaryPath,
+      },
+      fetchImpl: fakeFetch([
+        ["/reports?", () => Response.json({ reports: [{ id: "g1", repository: "o/r", commit: "abc", name: "upgrade-from-11", gh_run_id: "77", gh_run_attempt: "1", status: "completed" }] })],
+        ["/reports/g1/suites", () => Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] })],
+        ["/reports/g1/cases", () => Response.json([{ suite_id: "s1", title: "t1", status: "failed", retry_count: 0, ordinal: 0, error_message: "Error: boom" }])],
+        ["/reports/history", () => Response.json({ observations: [] })],
+        ["/pulls/9/files", () => Response.json([])],
+        ["/pulls/9", () => Response.json({ title: "fix", base: { ref: "release-12.2" }, labels: [] })],
+        ["/compare/", () => Response.json({ ahead_by: 0, files: [], commits: [] })],
+        ["/commits/abc/statuses", () => Response.json([{ context: "e2e-test/upgrade-from-11", state: "failure", target_url: "https://github.com/o/r/actions/runs/77" }])],
+        ["/statuses/abc", (init) => { postedContexts.push(JSON.parse(String(init.body))); return Response.json({}); }],
+        ["/repos/o/r", () => {
+          askedDefaultBranch = true;
+          return Response.json({ default_branch: "master" });
+        }],
+      ]),
+      log: () => {},
+      wait: { attempts: 1, ms: 0 },
+    });
+    assert.equal(askedDefaultBranch, false, "release PR base must not fall back to default branch");
+    assert.equal(postedContexts.some((p) => p.context === "e2e-test/triage" && p.state === "pending"), false, "unlisted lane must not wedge shared triageContext pending");
+    assert.match(readFileSync(summaryPath, "utf8"), /default branch history is not substituted for a release branch/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

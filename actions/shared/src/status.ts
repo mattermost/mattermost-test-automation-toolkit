@@ -158,6 +158,7 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
 }): StatusPublisher {
   // Validated when a lane is written, not when the publisher is built: a verification run only summarizes.
   let validated: Owner | undefined;
+  let lastWritten: CommitStatus | null = null;
   const owner = (): Owner => (validated ??= publishingOwner(id, env));
   // The aggregate is a projection of the lanes, owned by whichever run refreshed it.
   const snapshotOwner = (): Owner => {
@@ -177,7 +178,15 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
   const summarize = async (lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release = defaultRelease): Promise<void> => {
     if (!summaryContext || !lanes.length) return;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
-    const rows = await readStatuses(api, id);
+    const fetched = await readStatuses(api, id);
+    // GitHub's /statuses endpoint is eventually consistent right after a POST: overlay this publisher's own write if a
+    // self-read immediately afterward still sees the pre-write row for `context`.
+    const currentInRead = fetched.find((r) => r.context === context);
+    const staleSelfRead = Boolean(
+      lastWritten &&
+      (!currentInRead || currentInRead.state !== lastWritten.state || currentInRead.description !== lastWritten.description || currentInRead.target_url !== lastWritten.target_url),
+    );
+    const rows = staleSelfRead ? [lastWritten!, ...fetched] : fetched;
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return;
     // The other E2E checks under the aggregate's prefix (an upgrade lane, a policy lane): named when red.
@@ -197,7 +206,14 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     summarize,
     async write(row, operation = "finish") {
       if (!await allowed(operation)) return false;
+      const payload: CommitStatus = {
+        context,
+        state: row.state,
+        description: row.description.slice(0, 140),
+        target_url: ownedURL(row.target_url, owner(), id.repository),
+      };
       await post({ ...row, context });
+      lastWritten = payload;
       return true;
     },
     async info(row) {

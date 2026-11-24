@@ -6,11 +6,66 @@ import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Evidence, EvidenceImage } from "./types.ts";
 
-const EVIDENCE_LIMITS = { files: 50, entries: 200, imagesPerTest: 2, imageBytes: 3_500_000, notes: 1500 };
+export const EVIDENCE_LIMITS = { files: 50, entries: 200, imagesPerTest: 2, imageBytes: 3_500_000, notes: 1500 };
 const IMAGE_TYPES = [
   { media_type: "image/png", magic: [0x89, 0x50, 0x4e, 0x47] },
   { media_type: "image/jpeg", magic: [0xff, 0xd8, 0xff] },
 ];
+
+/** Validates raw PNG/JPEG bytes within the size cap and encodes them for the model. */
+export function parseImageBuffer(
+  name: string,
+  bytes: Buffer,
+  warn: (message: string) => void = () => {},
+): EvidenceImage | null {
+  const type = IMAGE_TYPES.find((t) => bytes.length >= t.magic.length && t.magic.every((b, i) => bytes[i] === b));
+  if (!type || bytes.length > EVIDENCE_LIMITS.imageBytes) {
+    warn(`evidence image ${JSON.stringify(name)} is not a PNG or JPEG within ${EVIDENCE_LIMITS.imageBytes} bytes; skipped`);
+    return null;
+  }
+  return {
+    name,
+    media_type: type.media_type,
+    data: bytes.toString("base64"),
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
+}
+
+/** Merges secondary (e.g. artifact-discovered) evidence into primary without duplicating images by sha256. */
+export function mergeEvidence(primary: Evidence[], secondary: Evidence[]): Evidence[] {
+  if (!secondary.length) return primary;
+  const out = primary.map((e) => ({ ...e, images: [...e.images] }));
+  const findMatch = (item: Evidence): Evidence | undefined =>
+    out.find(
+      (e) =>
+        e.file === item.file &&
+        e.title === item.title &&
+        (e.full_title == null || item.full_title == null || e.full_title === item.full_title),
+    );
+  for (const item of secondary) {
+    const existing = findMatch(item);
+    if (!existing) {
+      out.push({
+        ...item,
+        notes: item.notes.slice(0, EVIDENCE_LIMITS.notes),
+        images: item.images.slice(0, EVIDENCE_LIMITS.imagesPerTest),
+      });
+      continue;
+    }
+    const seen = new Set(existing.images.map((img) => img.sha256));
+    for (const img of item.images) {
+      if (existing.images.length >= EVIDENCE_LIMITS.imagesPerTest) break;
+      if (seen.has(img.sha256)) continue;
+      seen.add(img.sha256);
+      existing.images.push(img);
+    }
+    if (item.notes && existing.notes.length < EVIDENCE_LIMITS.notes) {
+      const mergedNotes = existing.notes ? `${existing.notes}\n${item.notes}` : item.notes;
+      existing.notes = mergedNotes.slice(0, EVIDENCE_LIMITS.notes);
+    }
+  }
+  return out;
+}
 
 /**
  * Screenshots and notes the test run recorded: JSON files of
@@ -105,12 +160,8 @@ export function loadEvidence(dir: string, warn: (message: string) => void = () =
           warn(`evidence image ${JSON.stringify(rel)} cannot be read (${String(e).slice(0, 120)}); skipped`);
           continue;
         }
-        const type = IMAGE_TYPES.find((t) => t.magic.every((b, i) => bytes[i] === b));
-        if (!type || bytes.length > EVIDENCE_LIMITS.imageBytes) {
-          warn(`evidence image ${JSON.stringify(rel)} is not a PNG or JPEG within ${EVIDENCE_LIMITS.imageBytes} bytes; skipped`);
-          continue;
-        }
-        images.push({ name: relative(root, path), media_type: type.media_type, data: bytes.toString("base64"), sha256: createHash("sha256").update(bytes).digest("hex") });
+        const img = parseImageBuffer(relative(root, path), bytes, warn);
+        if (img) images.push(img);
       }
       const notes = typeof entry.notes === "string" ? entry.notes.slice(0, EVIDENCE_LIMITS.notes) : "";
       if (notes || images.length)

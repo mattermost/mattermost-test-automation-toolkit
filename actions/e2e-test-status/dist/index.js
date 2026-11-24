@@ -277,6 +277,7 @@ function inferRelease(id, env = {}, rows = [], summaryContext) {
 }
 function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease }) {
   let validated;
+  let lastWritten = null;
   const owner = () => validated ??= publishingOwner(id, env);
   const snapshotOwner = () => {
     const snapshot = runOf(id, env, "1");
@@ -297,7 +298,12 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
   const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease) => {
     if (!summaryContext || !lanes.length) return;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
-    const rows = await readStatuses(api, id);
+    const fetched = await readStatuses(api, id);
+    const currentInRead = fetched.find((r) => r.context === context);
+    const staleSelfRead = Boolean(
+      lastWritten && (!currentInRead || currentInRead.state !== lastWritten.state || currentInRead.description !== lastWritten.description || currentInRead.target_url !== lastWritten.target_url)
+    );
+    const rows = staleSelfRead ? [lastWritten, ...fetched] : fetched;
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return;
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
@@ -315,7 +321,14 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     summarize,
     async write(row, operation = "finish") {
       if (!await allowed(operation)) return false;
+      const payload = {
+        context,
+        state: row.state,
+        description: row.description.slice(0, 140),
+        target_url: ownedURL(row.target_url, owner(), id.repository)
+      };
       await post({ ...row, context });
+      lastWritten = payload;
       return true;
     },
     async info(row) {
@@ -400,20 +413,32 @@ var NoResultsError = class extends Error {
     this.name = "NoResultsError";
   }
 };
-async function fetchRun(fetchImpl, base, id, reportName = null, wait = { attempts: 6, ms: 2e4 }) {
-  const q = new URLSearchParams({ repository: id.repository, commit: id.commit_sha, name: String(id.name), limit: "20" });
-  const { reports: groups = [] } = await tsioJson(fetchImpl, base, `/reports?${q}`);
-  return runFromGroups(fetchImpl, base, id, groups, reportName, wait);
+async function listReportGroups(fetchImpl, base, params, maxPages = 2, pageSize = 100) {
+  const all = [];
+  for (let page = 0; page < maxPages; page++) {
+    const q = new URLSearchParams({ ...params, limit: String(pageSize), ...page > 0 ? { offset: String(page * pageSize) } : {} });
+    const { reports = [] } = await tsioJson(fetchImpl, base, `/reports?${q}`);
+    all.push(...reports);
+    if (reports.length < pageSize) break;
+  }
+  return all;
 }
-async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wait = { attempts: 6, ms: 2e4 }) {
+async function fetchRun(fetchImpl, base, id, reportName = null, wait = { attempts: 6, ms: 2e4 }, runAttempt) {
+  const groups = await listReportGroups(fetchImpl, base, { repository: id.repository, commit: id.commit_sha, name: String(id.name) });
+  return runFromGroups(fetchImpl, base, id, groups, reportName, wait, runAttempt);
+}
+async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wait = { attempts: 6, ms: 2e4 }, runAttempt) {
   const get = (path) => tsioJson(fetchImpl, base, path);
   const runId = String(id.gh_run_id ?? "");
-  const attempt = String(id.gh_run_attempt ?? "");
-  if (!runId || !attempt)
-    throw new Error(`composite identity is missing gh_run_id or gh_run_attempt; refusing to guess which run to read (run_id=${runId || "-"} attempt=${attempt || "-"})`);
-  const group = groups.find(
-    (g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name && String(g.gh_run_id) === runId && String(g.gh_run_attempt) === attempt
+  const idAttempt = String(id.gh_run_attempt ?? "");
+  if (!runId || !idAttempt)
+    throw new Error(`composite identity is missing gh_run_id or gh_run_attempt; refusing to guess which run to read (run_id=${runId || "-"} attempt=${idAttempt || "-"})`);
+  const effectiveAttempt = runAttempt != null && /^\d+$/.test(String(runAttempt)) && /^\d+$/.test(idAttempt) && Number(runAttempt) > Number(idAttempt) ? String(runAttempt) : idAttempt;
+  const matchAttempt = (att) => groups.find(
+    (g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name && String(g.gh_run_id) === runId && String(g.gh_run_attempt) === att
   );
+  const group = (effectiveAttempt !== idAttempt ? matchAttempt(effectiveAttempt) : void 0) ?? matchAttempt(idAttempt);
+  const attempt = effectiveAttempt;
   if (!group) {
     const noGroup = `TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`;
     const newest2 = /^\d+$/.test(runId) && /^\d+$/.test(attempt) ? groups.filter((g) => g.repository === id.repository && g.commit === id.commit_sha && g.name === id.name).map((g) => ({

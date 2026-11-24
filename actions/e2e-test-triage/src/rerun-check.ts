@@ -1,9 +1,12 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 import type { FetchImpl } from "../../shared/src/github.ts";
+import { CI_CODE_PATTERNS, CI_INFRA_RE, DEAD_CONCLUSIONS, failedStepOf, fetchJobLog, fetchRunJobs, lastLines, stepLines, toMs } from "./ci-logs.ts";
 import { maxTokensFor, requestModel } from "./judge.ts";
 import { costOf } from "./pricing.ts";
 import type { Ledger, Prices } from "./types.ts";
+
+export { lastLines };
 
 /** A job of the run that failed or was cancelled before triage: its failed step, and that step's last log lines. */
 export interface DeadJob {
@@ -31,16 +34,6 @@ export interface RerunDecision {
 /** The model's read of the jobs the rules could not settle, one answer per job id. */
 export type AskCause = (jobs: DeadJob[]) => Promise<{ id: number; cause: "infrastructure" | "change" | "unclear"; reason: string }[]>;
 
-// The runner, the network, the host or an outside service failed: nothing the change wrote. "Failed to get ID Token" is
-// GitHub's OIDC token service failing a job's request (a dispatch-run worker that crashed before running a spec).
-const INFRA_RE =
-  /Failed to get ID Token|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|socket hang up|network (?:error|aborted|timeout)|Could not resolve host|TLS handshake timeout|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|429 Too Many Requests|rate limit exceeded|The runner has received a shutdown signal|lost communication with the server|hosted runner encountered an error|No space left on device|Unable to download artifact|Failed to download action|<!DOCTYPE html|answered with an HTML page/i;
-// What the change can break before a test runs, with the words the check uses for it.
-const HOLDS: [RegExp, string][] = [
-  [/\*\* BUILD FAILED \*\*|error TS\d{4}:|Module not found|SyntaxError:|xcodebuild: error|Execution failed for task|Compilation failed|BUILD FAILURE|cannot find symbol/i, "the build failed"],
-  [/npm (?:ERR!|error) (?:code )?(?:ERESOLVE|ETARGET)|No matching version found|Could not find a version that satisfies|`npm ci` can only install packages when your package\.json and package-lock\.json/i, "the dependencies did not install"],
-  [/server (?:is )?not healthy|server at "[^"]*" is not healthy|failed to start (?:the )?(?:test )?server|server did not (?:start|become ready)|health ?check failed|Timed out waiting for the server|panic:/i, "the test server did not start"],
-];
 const SERVER_STEP = /start[- ]?server|\bserver\b|docker[- ]?compose/i;
 const BUILD_STEP = /\bbuild\b|compile|\btsc\b|bundle|archive|assemble|gradle|webpack/i;
 const SETUP_STEP = /checkout|set ?up|install|cache|download|npm ci|prepare|\bdeps\b|\bpod\b|\bgems?\b|simulator|emulator|artifact|upload|login/i;
@@ -51,38 +44,24 @@ const AGGREGATE_STEP = /commit status|post .*status|summary|notify|flip/i;
 const MAX_JOBS = 10;
 const TAIL_LINES = 60;
 
-export const lastLines = (text: string, n: number): string => text.split("\n").slice(-n).join("\n");
-
 /** What one dead job's failed step says: the network or the runner (re-run), the change (hold), or neither. */
 export function classifyDeadJob(job: DeadJob): JobCall {
   const step = job.step ?? "an unnamed step";
   const how = job.conclusion === "cancelled" ? "hung" : "failed";
-  const infra = INFRA_RE.exec(job.tail);
+  const infra = CI_INFRA_RE.exec(job.tail);
   if (infra) return { verdict: "rerun", short: null, reason: `${job.name}: ${step} failed on the network or the runner (${infra[0]})` };
   const lines = job.tail.split("\n").map((l) => l.trim()).filter(Boolean);
-  for (const [re, short] of HOLDS) {
+  for (const [re, short] of CI_CODE_PATTERNS) {
     const line = lines.find((l) => re.test(l));
     if (line) return { verdict: "hold", short, reason: `${job.name}: step "${step}" failed: ${line.slice(0, 200)}` };
   }
   const last = (lines.at(-1) ?? "no log").slice(0, 200);
   // A build or server step whose log names no failure holds nothing: only a log line that shows the change broke it
-  // does (HOLDS above). The rest is re-run once, which tells the machine from the change.
+  // does (CI_CODE_PATTERNS above). The rest is re-run once, which tells the machine from the change.
   if (SERVER_STEP.test(step) || BUILD_STEP.test(step)) return { verdict: "unclear", short: null, reason: `${job.name}: step "${step}" ${how}: ${last}` };
   if (SETUP_STEP.test(step)) return { verdict: "rerun", short: null, reason: `${job.name}: setup step "${step}" ${how}` };
   return { verdict: "unclear", short: null, reason: `${job.name}: step "${step}" ${how}` };
 }
-
-interface GhJob {
-  id: number;
-  name: string;
-  status: string;
-  conclusion: string | null;
-  steps?: { name: string; conclusion: string | null; started_at?: string | null; completed_at?: string | null }[];
-}
-
-// Log lines start with an ISO time with 7 fractional digits; Date.parse reads 3.
-const STAMP = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,3})\d*)?Z (.*)$/;
-const toMs = (iso: string | null | undefined): number | null => (iso ? Date.parse(iso) : null);
 
 /**
  * The run's failed and cancelled jobs on this attempt, aggregate jobs left out, each with its failed step and that step's
@@ -90,49 +69,18 @@ const toMs = (iso: string | null | undefined): number | null => (iso ? Date.pars
  * empty: the step's name still decides.
  */
 export async function readDeadJobs({ fetchImpl, token, repository, runId, attempt, log }: { fetchImpl: FetchImpl; token: string; repository: string; runId: string; attempt: string; log: (message: string) => void }): Promise<DeadJob[]> {
-  const get = async (path: string): Promise<Response> => {
-    const res = await fetchImpl(`https://api.github.com${path}`, { headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "mattermost-e2e-triage" }, signal: AbortSignal.timeout(60000) });
-    if (!res.ok) throw new Error(`GitHub GET ${path}: ${res.status}`);
-    return res;
-  };
-  const jobs: GhJob[] = [];
-  for (let page = 1; ; page++) {
-    const { total_count: total = 0, jobs: rows = [] } = (await (await get(`/repos/${repository}/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=100&page=${page}`)).json()) as { total_count?: number; jobs?: GhJob[] };
-    jobs.push(...rows);
-    if (!rows.length || jobs.length >= total) break;
-  }
-  const failedStep = (j: GhJob) => j.steps?.find((s) => s.conclusion === "failure") ?? j.steps?.find((s) => s.conclusion === "cancelled") ?? null;
+  const jobs = await fetchRunJobs({ fetchImpl, token, repository, runId, attempt, maxPages: 100 });
   const dead = jobs
-    .filter((j) => j.status === "completed" && (j.conclusion === "failure" || j.conclusion === "cancelled" || j.conclusion === "timed_out"))
-    .filter((j) => !AGGREGATE_JOB.test(j.name) && !AGGREGATE_STEP.test(failedStep(j)?.name ?? ""))
+    .filter((j) => j.status === "completed" && DEAD_CONCLUSIONS.has(String(j.conclusion)))
+    .filter((j) => !AGGREGATE_JOB.test(j.name) && !AGGREGATE_STEP.test(failedStepOf(j)?.name ?? ""))
     .slice(0, MAX_JOBS);
   const out: DeadJob[] = [];
   for (const j of dead) {
-    const step = failedStep(j);
+    const step = failedStepOf(j);
     let tail = "";
     try {
-      const text = await (await get(`/repos/${repository}/actions/jobs/${j.id}/logs`)).text();
-      const from = toMs(step?.started_at);
-      const to = toMs(step?.completed_at);
-      const kept: string[] = [];
-      // A step's header (its command and env) is the group "##[group]Run ...": not the step's output. A script's own
-      // groups (::group::name) hold its output, so only their markers go.
-      let header = false;
-      for (const raw of text.split(/\r?\n/)) {
-        const m = STAMP.exec(raw);
-        const line = (m ? m[3] : raw).replace(/\x1b\[[0-9;]*m/g, "");
-        if (line.startsWith("##[group]Run ")) header = true;
-        if (header) {
-          if (line.startsWith("##[endgroup]")) header = false;
-          continue;
-        }
-        if (/^##\[(?:end)?group\]/.test(line)) continue;
-        if (!line.trim() || line.startsWith("[command]") || /^##\[(?:start|end)-action/.test(line)) continue;
-        const at = m ? Date.parse(`${m[1]}.${(m[2] ?? "0").padEnd(3, "0")}Z`) : null;
-        if (from != null && to != null && at != null && (at < from - 1000 || at > to + 1000)) continue;
-        kept.push(line);
-      }
-      tail = lastLines(kept.join("\n"), TAIL_LINES);
+      const text = await fetchJobLog({ fetchImpl, token, repository, jobId: j.id, timeoutMs: 60_000 });
+      tail = lastLines(stepLines(text, toMs(step?.started_at), toMs(step?.completed_at)).join("\n"), TAIL_LINES);
     } catch (e) {
       log(`log of ${j.name} unavailable: ${String(e).slice(0, 160)}`);
     }

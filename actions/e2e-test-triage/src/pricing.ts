@@ -6,6 +6,8 @@ import type { CallRecord, Ledger, Prices, Price, Usage } from "./types.ts";
 // List prices, USD per million tokens, as of 2026-10-02. AI_PRICES overrides or adds.
 export const PRICES: Prices = {
   "claude-haiku-4-5": { input: 1, output: 5, cache_write: 1.25, cache_read: 0.1 },
+  "claude-sonnet-4-6": { input: 3, output: 15, cache_write: 3.75, cache_read: 0.3 },
+  "claude-opus-4-6": { input: 5, output: 25, cache_write: 6.25, cache_read: 0.5 },
   "claude-sonnet-5-5": { input: 2, output: 10, cache_write: 2.5, cache_read: 0.2 },
   "claude-opus-5-5": { input: 4, output: 20, cache_write: 5, cache_read: 0.2 },
   "claude-fable-5-1": { input: 10, output: 50, cache_write: 12.5, cache_read: 0.25 },

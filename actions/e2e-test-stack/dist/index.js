@@ -31718,7 +31718,7 @@ async function fetchReady(invoke, target, named, batchId, batchToken, expected, 
 }
 var create = createWith();
 
-// src/core/zip.ts
+// ../shared/src/zip.ts
 var import_node_zlib = require("zlib");
 var ZipError = class extends Error {
 };
@@ -31727,17 +31727,24 @@ var EOCD = 101010256;
 var CENTRAL = 33639248;
 var LOCAL = 67324752;
 var EOCD_SEARCH = 22 + 65535;
-function readZipMember(zip, name, max) {
+var defaultErrorText = (e7) => {
+  const name = e7?.name || "Error";
+  const message = String(e7?.message ?? e7).split("\n")[0].slice(0, 200);
+  return `${name}: ${message}`;
+};
+function listZipEntries(zip) {
   let end = -1;
-  for (let i8 = zip.length - 22; i8 >= Math.max(0, zip.length - EOCD_SEARCH); i8--)
+  for (let i8 = zip.length - 22; i8 >= Math.max(0, zip.length - EOCD_SEARCH); i8--) {
     if (zip.readUInt32LE(i8) === EOCD) {
       end = i8;
       break;
     }
+  }
   if (end < 0) throw new ZipError("not a ZIP archive: no end of central directory");
   const entries2 = zip.readUInt16LE(end + 10);
   const offset = zip.readUInt32LE(end + 16);
   if (entries2 === 65535 || offset === 4294967295) throw new ZipError("a ZIP64 archive, which is not read");
+  const out = [];
   let p5 = offset;
   for (let i8 = 0; i8 < entries2; i8++) {
     if (p5 + 46 > zip.length || zip.readUInt32LE(p5) !== CENTRAL) throw new ZipError("a malformed central directory");
@@ -31750,32 +31757,45 @@ function readZipMember(zip, name, max) {
     const extraLength = zip.readUInt16LE(p5 + 30);
     const commentLength = zip.readUInt16LE(p5 + 32);
     const local = zip.readUInt32LE(p5 + 42);
-    const entryName = zip.subarray(p5 + 46, p5 + 46 + nameLength).toString("utf8");
+    if (p5 + 46 + nameLength > zip.length) throw new ZipError("a malformed central directory");
+    const name = zip.subarray(p5 + 46, p5 + 46 + nameLength).toString("utf8");
     p5 += 46 + nameLength + extraLength + commentLength;
-    if (entryName !== name) continue;
-    if (flags & 1) throw new ZipError(`${name} is encrypted`);
-    if (compressed === 4294967295 || size === 4294967295 || local === 4294967295)
-      throw new ZipError(`${name} is a ZIP64 member, which is not read`);
-    if (size > max) throw new ZipError(`${name} is ${size} bytes, more than ${max}`);
-    if (local + 30 > zip.length || zip.readUInt32LE(local) !== LOCAL)
-      throw new ZipError(`${name} has no local header where the directory says`);
-    const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
-    if (start + compressed > zip.length) throw new ZipError(`${name} runs past the end of the archive`);
-    const raw = zip.subarray(start, start + compressed);
-    let data;
-    if (method === 0) data = Buffer.from(raw);
-    else if (method === 8) {
-      try {
-        data = (0, import_node_zlib.inflateRawSync)(raw, { maxOutputLength: Math.max(1, max) });
-      } catch (e7) {
-        throw new ZipError(`${name} does not inflate: ${errorText(e7)}`);
-      }
-    } else throw new ZipError(`${name} uses compression method ${method}, which is not read`);
-    if (data.length !== size || (0, import_node_zlib.crc32)(data) !== crc)
-      throw new ZipError(`${name} does not match its size and CRC-32 in the archive`);
-    return data;
+    out.push({ name, flags, method, crc, compressed, size, local });
   }
-  return void 0;
+  return out;
+}
+function readZipEntry(zip, entry, max, formatError = defaultErrorText) {
+  const { name, flags, method, crc, compressed, size, local } = entry;
+  if (flags & 1) throw new ZipError(`${name} is encrypted`);
+  if (compressed === 4294967295 || size === 4294967295 || local === 4294967295)
+    throw new ZipError(`${name} is a ZIP64 member, which is not read`);
+  if (size > max) throw new ZipError(`${name} is ${size} bytes, more than ${max}`);
+  if (local + 30 > zip.length || zip.readUInt32LE(local) !== LOCAL)
+    throw new ZipError(`${name} has no local header where the directory says`);
+  const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
+  if (start + compressed > zip.length) throw new ZipError(`${name} runs past the end of the archive`);
+  const raw = zip.subarray(start, start + compressed);
+  let data;
+  if (method === 0) data = Buffer.from(raw);
+  else if (method === 8) {
+    try {
+      data = (0, import_node_zlib.inflateRawSync)(raw, { maxOutputLength: Math.max(1, max) });
+    } catch (e7) {
+      throw new ZipError(`${name} does not inflate: ${formatError(e7)}`);
+    }
+  } else throw new ZipError(`${name} uses compression method ${method}, which is not read`);
+  if (data.length !== size || (0, import_node_zlib.crc32)(data) !== crc)
+    throw new ZipError(`${name} does not match its size and CRC-32 in the archive`);
+  return data;
+}
+function readZipMember(zip, name, max, formatError = defaultErrorText) {
+  const entry = listZipEntries(zip).find((e7) => e7.name === name);
+  return entry ? readZipEntry(zip, entry, max, formatError) : void 0;
+}
+
+// src/core/zip.ts
+function readZipMember2(zip, name, max) {
+  return readZipMember(zip, name, max, errorText);
 }
 
 // src/core/artifacts.ts
@@ -31822,7 +31842,7 @@ async function readResponse(github, run2, artifact, what) {
   }
   let response;
   try {
-    response = readZipMember(archive, RESPONSE_FILE, MAX_RESPONSE_BYTES);
+    response = readZipMember2(archive, RESPONSE_FILE, MAX_RESPONSE_BYTES);
   } catch (e7) {
     if (!(e7 instanceof ZipError)) throw e7;
     throw new ActionError(`${what} could not be read: ${e7.message}`, { cause: e7 });

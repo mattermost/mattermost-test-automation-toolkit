@@ -85,8 +85,9 @@ export const osOfReport = (name: string): string | null => OS_OF_REPORT.find(([r
  */
 export const repoPath = (testRoot: string | null | undefined, file: string): string | null => {
   if (testRoot == null || testRoot === "") return null;
-  const root = String(testRoot).replace(/^\.?\/*/, "").replace(/\/+$/, "");
-  return root === "" ? file : `${root}/${file}`;
+  const normalizedFile = String(file).replace(/\\/g, "/").replace(/^\.?\//, "");
+  const root = String(testRoot).replace(/\\/g, "/").replace(/^\.?\/*/, "").replace(/\/+$/, "");
+  return root === "" ? normalizedFile : `${root}/${normalizedFile}`;
 };
 
 /**

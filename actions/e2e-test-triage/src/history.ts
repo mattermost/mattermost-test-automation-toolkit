@@ -12,6 +12,7 @@ import type { BrokeBy, ChangedFile, Config, Finding, Observation, OutOfDate, Spe
 export interface History extends Map<string, Observation[]> {
   truncated: boolean;
   reportUnknown: boolean;
+  reportUnknownFor: Set<string>;
   ambiguous: Set<string>;
 }
 
@@ -119,7 +120,8 @@ export async function fetchHistory(
 ): Promise<History> {
   const byTest = Object.assign(new Map<string, Observation[]>(), {
     truncated: false,
-    reportUnknown: false, // rows can't say which report (platform) they came from
+    reportUnknown: false, // every test's rows lacked report_name
+    reportUnknownFor: new Set<string>(), // tests whose rows can't say which report (platform) they came from
     ambiguous: new Set<string>(), // tests whose rows can't be tied to them alone
   });
   const files = [...new Set(tests.map((t) => t.file).filter(Boolean))].slice(0, HISTORY_MAX_FILES);
@@ -162,10 +164,7 @@ export async function fetchHistory(
         // Another lane's rows are never evidence, nor grounds for ambiguity.
         if (lane != null && o.name != null && laneOf(o.name) !== lane) continue;
         if (qi === 0 && o.group_id != null) laneTrunkRuns.add(String(o.group_id));
-        if (reportName) {
-          if (!o.report_name) byTest.reportUnknown = true;
-          else if (!String(o.report_name).startsWith(reportName)) continue;
-        }
+        if (reportName && o.report_name && !String(o.report_name).startsWith(reportName)) continue;
         const ancestry = o.full_title || o.suite_title;
         if (ancestry) {
           if (!ancestryByLeaf.has(leaf)) ancestryByLeaf.set(leaf, new Set());
@@ -178,13 +177,17 @@ export async function fetchHistory(
           test = candidates.find((c) => c.full_title === o.full_title) ?? null;
           if (!test) continue;
         } else if (candidates.length > 1 || candidates[0].identity_ambiguous) {
-          for (const c of candidates) byTest.ambiguous.add(identityKey(c));
+          for (const c of candidates) {
+            byTest.ambiguous.add(identityKey(c));
+            if (reportName && !o.report_name) byTest.reportUnknownFor.add(identityKey(c));
+          }
           continue;
         } else {
           test = candidates[0];
           // One qualified side cannot prove the ancestry of a legacy leaf row.
           if (Boolean(test.full_title) !== Boolean(o.full_title)) {
             byTest.ambiguous.add(identityKey(test));
+            if (reportName && !o.report_name) byTest.reportUnknownFor.add(identityKey(test));
             continue;
           }
           if (!fallbackByLeaf.has(leaf)) fallbackByLeaf.set(leaf, new Set());
@@ -193,6 +196,7 @@ export async function fetchHistory(
             byTest.ambiguous.add(identityKey(test));
         }
         const k = identityKey(test);
+        if (reportName && !o.report_name) byTest.reportUnknownFor.add(k);
         if (dedupe && o.group_id != null) {
           const rowKey = JSON.stringify([o.group_id, o.report_name, o.full_title, o.suite_title, k, o.retry_count, o.ordinal ?? 0]);
           const previous = seen.get(rowKey);
@@ -218,6 +222,9 @@ export async function fetchHistory(
       warn(`only ${laneTrunkRuns.size} run(s) of ${lane} among ${trunkBranch}'s last ${cfg.trunkRuns}; reading ${trunkBranch}'s history since ${since.slice(0, 10)}`);
       queries.splice(1, 0, { branch: trunkBranch, since });
     }
+  }
+  if (byTest.reportUnknownFor.size > 0 && tests.every((t) => byTest.reportUnknownFor.has(identityKey(t)))) {
+    byTest.reportUnknown = true;
   }
   // Rows are attempts; the rules count runs. Collapse each run's attempts to one outcome.
   for (const [key, rows] of byTest) {
@@ -439,7 +446,7 @@ export async function markFixedOnTrunk({ findings, api, id, baseBranch, log = ()
   log?: (message: string) => void;
 }): Promise<void> {
   if (!findings.length) return;
-  const cmp = baseBranch ? (await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`)) as CompareResult | null : null;
+  const cmp = baseBranch ? (await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=250`)) as CompareResult | null : null;
   const lacking = new Map((cmp?.commits ?? []).map((c): [string, CommitRow] => [c.sha, c]));
   const complete = cmp != null && (cmp.ahead_by ?? 0) <= lacking.size;
   for (const f of findings) {
@@ -502,7 +509,7 @@ export async function markOutOfDate({
   fetchFileDiffs?: boolean;
 }): Promise<OutOfDateResult> {
   if (!findings.length || !baseBranch) return { truncated: false };
-  const cmp = (await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=100`)) as CompareResult | null;
+  const cmp = (await api("GET", `/repos/${id.repository}/compare/${id.commit_sha}...${encodeURIComponent(baseBranch)}?per_page=250`)) as CompareResult | null;
   if (!cmp?.ahead_by) return { truncated: false };
   const files = cmp.files ?? [];
   const truncated = files.length >= COMPARE_FILE_CAP;

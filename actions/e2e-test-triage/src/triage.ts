@@ -9,8 +9,10 @@ import { FAILED_TESTS, isReportsIncomplete, isUpstreamFailed, readStatuses, stat
 import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, SupersededRunError, tsioBase } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.ts";
 import { isShardPlaceholder, isSpecNotRun, isSpecStopped } from "./classify.ts";
+import { skimRunArtifacts } from "./artifacts.ts";
+import { skimCiLogsForFindings } from "./ci-logs.ts";
 import { configFrom, DEFAULTS, historyLane, PR_SPEND_KEY } from "./config.ts";
-import { loadEvidence } from "./evidence.ts";
+import { evidenceFor, loadEvidence, mergeEvidence } from "./evidence.ts";
 import { dropStormRuns, fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markFixedOnTrunk, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { enrichFindings, siblingPlatforms } from "./enrich.ts";
 import { askModelBatch } from "./judge.ts";
@@ -25,7 +27,7 @@ import type { JudgedLane } from "./lane-verdict.ts";
 import type { RerunDecision } from "./rerun-check.ts";
 import { ledgerTotals } from "./pricing.ts";
 import { activeFlag, noResultsText, otherRunText, passLine, renderLane, renderNotTriaged, renderSummary, renderUnfinished, RERUN, RERUNNING, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
-import type { AskFn, Config, Diff, HistoryLike, Observation, SpecHistory } from "./types.ts";
+import type { AskFn, Config, Diff, Finding, HistoryLike, Observation, SpecHistory } from "./types.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
 export interface TriageIdentity extends CompositeIdentity {
@@ -230,7 +232,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   let laneOnly: string | null = null;
   let run: RunResult;
   try {
-    run = await fetchRun(fetchImpl, base, id, reportName, wait);
+    run = await fetchRun(fetchImpl, base, id, reportName, wait, env.GITHUB_RUN_ATTEMPT);
   } catch (e) {
     if (!(e instanceof NoResultsError) && !/reported no test cases/.test(String(e))) throw e;
     laneOnly = String(e instanceof Error ? e.message : e).slice(0, 200);
@@ -307,7 +309,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
     }
   };
-  if (announce) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : flakyOnly ? `${run.counts.flaky} flaky · triage is checking them` : `${run.counts.failed} failed · triage is checking them`);
+  const announceTriagePending = announce && (!lanes.length || lanes.includes(String(context)));
+  if (announceTriagePending) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : flakyOnly ? `${run.counts.flaky} flaky · triage is checking them` : `${run.counts.failed} failed · triage is checking them`);
   try {
     let history: HistoryLike = new Map();
     let diff: Diff = { files: [], ok: false };
@@ -340,12 +343,17 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         }
       }
       const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;
+      const isReleasePrBase = Boolean(prBase && /^(?:build-)?release[-/]/i.test(prBase));
       if (prBase && baseRuns < cfg.minTrunkRuns) {
-        const fallback = await defaultBranchOf(api, id.repository, log);
-        if (fallback && fallback !== prBase) {
-          trunkBranch = fallback;
-          notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-          history = await unreadHistory(fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log);
+        if (isReleasePrBase) {
+          notes.push(`Trunk history stays on ${prBase} (${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}); default branch history is not substituted for a release branch.`);
+        } else {
+          const fallback = await defaultBranchOf(api, id.repository, log);
+          if (fallback && fallback !== prBase) {
+            trunkBranch = fallback;
+            notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
+            history = await unreadHistory(fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log);
+          }
         }
       }
       await dropStormRuns({ history, fetchImpl, base, minFailures: cfg.infraMinFailures, trunkBranch, own: run.group_id, pr: prNumber, log });
@@ -403,12 +411,63 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     }
     const apiKey = env.ANTHROPIC_API_KEY;
     const ask: AskFn | null = apiKey && !prSpendUnknown ? (packs, model) => askModelBatch(fetchImpl, apiKey, model, packs) : null;
+    const secrets = secretsOf(env);
+    const attemptStr = String(Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1));
+    const runIdStr = String(env.GITHUB_RUN_ID || id.gh_run_id);
+    const artifactEvidenceEnabled = env.ARTIFACT_EVIDENCE !== "false";
+    const artifactPatterns = String(env.ARTIFACT_PATTERNS ?? "").split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+    const skimRuntimeEvidence = ask && env.GITHUB_TOKEN
+      ? async (targets: Finding[]): Promise<void> => {
+          if (!targets.length) return;
+          const [ciLogs, skimmedArtifacts] = await Promise.all([
+            skimCiLogsForFindings({
+              fetchImpl,
+              token: String(env.GITHUB_TOKEN),
+              repository: id.repository,
+              runId: runIdStr,
+              attempt: attemptStr,
+              findings: targets,
+              prefix: env.LANE_JOB_PREFIX || null,
+              filter: env.LANE_JOB_FILTER || null,
+              reportName,
+              lane: env.LANE || id.name,
+              secrets,
+              log,
+            }),
+            artifactEvidenceEnabled
+              ? skimRunArtifacts({
+                  fetchImpl,
+                  token: String(env.GITHUB_TOKEN),
+                  repository: id.repository,
+                  runId: runIdStr,
+                  findings: targets,
+                  reportName,
+                  lane: env.LANE || id.name,
+                  patterns: artifactPatterns,
+                  secrets,
+                  log,
+                })
+              : Promise.resolve({ evidence: [], serviceLogs: "", artifactsScanned: [] }),
+          ]);
+          for (const [idx, f] of targets.entries()) {
+            const ci = ciLogs.byFinding.get(idx) || ciLogs.runExcerpt;
+            if (ci) f.ci_logs = ci;
+            if (skimmedArtifacts.serviceLogs) f.service_logs = skimmedArtifacts.serviceLogs;
+            const matched = evidenceFor(f, skimmedArtifacts.evidence);
+            if (matched) {
+              const merged = mergeEvidence(f.producer ? [f.producer] : [], [matched]);
+              if (merged[0]) f.producer = merged[0];
+            }
+          }
+        }
+      : null;
     const result = await evaluateRun({
       run, id, prNumber, history, diff, trunkBranch, branchBase, branchName: branchBase ? id.branch ?? null : null, testRoot, cfg,
       prTitle: pull.title ?? "", lane: env.LANE || id.name, log,
       ask,
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
+      skimRuntimeEvidence,
       // A release run's matrix (OS x server version) is wider than a PR's platforms.
       otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log, limit: branchBase ? 20 : 5 }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths, fetchFileDiffs: Boolean(branchBase) }),
@@ -440,7 +499,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         decides = true;
         if (enforce && !announce) {
           announce = true;
-          await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : "Triage is checking this lane");
+          if (!lanes.length || lanes.includes(String(context))) {
+            await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : "Triage is checking this lane");
+          }
         }
       }
       log(`e2e-test-triage: lane ${lane ? "verdict" : "read (tests decide)"}: ${judged.verdict.label} (${judged.verdict.fault}): ${judged.verdict.what}`);

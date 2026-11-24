@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { CommitStatus } from "./github.ts";
 import { releaseFromDescriptions } from "./lane.ts";
-import { inferRelease } from "./status.ts";
+import { inferRelease, statusPublisher } from "./status.ts";
+import type { GhApi } from "./github.ts";
 import type { CompositeIdentity } from "./tsio.ts";
 
 const id: CompositeIdentity = { repository: "o/r", commit_sha: "sha" };
@@ -49,4 +50,54 @@ test("release from status text: PR-only labels, then release-only labels, then t
   assert.equal(releaseFromDescriptions(["(1 fixed on main) 50% passed", null]), undefined);
   assert.equal(releaseFromDescriptions(["(1 broken on branch) 50% passed"]), true);
   assert.equal(releaseFromDescriptions(["(1 app bug) 50% passed", undefined, ""]), undefined);
+});
+
+test("statusPublisher overlays its own just-written status when GitHub /statuses returns a stale pre-write read", async () => {
+  const ctx = "e2e-test/playwright-full/enterprise";
+  const other = "e2e-test/cypress-full/enterprise";
+  const runUrl = "https://github.com/o/r/actions/runs/55";
+  const staleLane: CommitStatus = {
+    context: ctx,
+    state: "failure",
+    description: "1 failed",
+    target_url: `${runUrl}?status_run_id=55&status_run_attempt=1`,
+  };
+  const greenOther: CommitStatus = {
+    context: other,
+    state: "success",
+    description: "100% passed",
+    target_url: `${runUrl}?status_run_id=55&status_run_attempt=1`,
+  };
+  const posted: { context: string; state: string; description: string }[] = [];
+  const api: GhApi = async (method, path, body) => {
+    if (method === "GET" && path.includes("/statuses")) {
+      // Simulate GitHub eventual consistency still returning staleLane even after write().
+      return [staleLane, greenOther];
+    }
+    if (method === "POST" && path.includes("/statuses/")) {
+      posted.push(body as { context: string; state: string; description: string });
+      return {};
+    }
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+  const pub = statusPublisher({
+    api,
+    id: { repository: "o/r", commit_sha: "sha", gh_run_id: "55", gh_run_attempt: "1" },
+    context: ctx,
+    env: { GITHUB_RUN_ID: "55", GITHUB_RUN_ATTEMPT: "1" },
+    log: () => {},
+  });
+  const ok = await pub.write({ state: "success", description: "(1 flaky) 99% passed", target_url: runUrl }, "triage");
+  assert.equal(ok, true);
+  await pub.refresh([ctx, other], summary, (lanes) => ({
+    state: lanes.every((l) => l.status?.state === "success") ? "success" : "failure",
+    description: lanes.every((l) => l.status?.state === "success") ? "All green" : "Still red",
+  }));
+  assert.deepEqual(
+    posted.map((p) => [p.context, p.state, p.description]),
+    [
+      [ctx, "success", "(1 flaky) 99% passed"],
+      [summary, "success", "All green"],
+    ],
+  );
 });

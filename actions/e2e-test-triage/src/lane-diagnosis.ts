@@ -4,6 +4,7 @@ import { allPassed, longestRun } from "../../shared/src/orchestration.ts";
 import type { Orchestration, OrchestrationUnit } from "../../shared/src/orchestration.ts";
 import { trunkBroken, trunkGreen } from "./baseline.ts";
 import type { Baseline } from "./baseline.ts";
+import { CI_CODE_PATTERNS, CI_INFRA_RE } from "./ci-logs.ts";
 import type { LaneJob } from "./lane-jobs.ts";
 
 /**
@@ -59,14 +60,10 @@ export interface LaneFacts {
   judgedSpecs?: string[];
 }
 
-// The runner, the network, GitHub or another outside service failed: nothing the change under test wrote.
-const INFRA_RE =
-  /Failed to get ID Token|Egress is over the account limit|Failed to GetCacheEntryDownloadURL|Failed to restore:|Cache not found for input keys|HttpError: (?:Server Error|Bad Gateway|Service Unavailable)|\b50[0234]\b.*(?:Server Error|Bad Gateway|Service Unavailable|Gateway Time-?out)|GitHub (?:GET|POST) [^:]+: 5\d\d|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|network (?:error|aborted|timeout)|Could not resolve host|TLS handshake timeout|429 Too Many Requests|rate limit exceeded|The runner has received a shutdown signal|lost communication with the server|hosted runner encountered an error|No space left on device|Unable to download (?:artifact|action)|Failed to download action|could not fetch [0-9a-f]+ from promisor remote|fatal: (?:unable to access|early EOF|the remote end hung up)|RPC failed|Error: Unable to process command .* successfully|The operation was canceled/i;
 // What only the code under test (or the base branch it carries) can break before a spec runs.
 const CODE_RE: [RegExp, string][] = [
-  [/npm (?:ERR!|error) (?:code )?(?:ERESOLVE|ETARGET|EUSAGE)|`npm ci` can only install packages when your package\.json and package-lock\.json|No matching version found|lock file'?s? .* does not satisfy/i, "the dependencies did not install"],
-  [/error TS\d{4}:|Module not found|SyntaxError:|Compilation failed|BUILD FAILURE|Build failed|cannot find symbol|Cannot find module/i, "the build failed"],
-  [/server (?:is )?not healthy|(?:is|container) not healthy|failed to start (?:the )?(?:test )?server|server did not (?:start|become ready)|Timed out waiting for the server|panic:|exited with code [1-9]/i, "the test server did not start"],
+  ...CI_CODE_PATTERNS,
+  [/exited with code [1-9]/i, "the test server did not start"],
   [/Unknown [A-Z_]+ entry|Error: No tests found|Error: Project\(s\) .* not found/i, "the test setup failed"],
 ];
 const AFTER_TESTS_STEP = /upload-debug-artifacts|upload-artifact|debug artifacts|teardown/i;
@@ -93,7 +90,7 @@ export function jobCause(job: LaneJob): JobCause {
   const text = [job.tail, ...job.errors].join("\n");
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
   const first = (re: RegExp): string | null => lines.find((l) => re.test(l)) ?? null;
-  const infra = first(INFRA_RE);
+  const infra = first(CI_INFRA_RE);
   if (infra) return { kind: "infra", short: null, line: infra };
   if (job.step && AFTER_TESTS_STEP.test(job.step)) return { kind: "after-tests", short: null, line: job.errors[0] ?? lines.at(-1) ?? "" };
   const timeout = first(TIMED_OUT);
@@ -240,7 +237,7 @@ export function diagnoseLane(facts: LaneFacts): LaneVerdict {
   if (massTests || allWorkersSetup || hiddenAll || (setupJob && finished === 0)) {
     const call = baselineCall(facts, !massTests, (setupJob ?? codeDead[0])?.cause.short ?? null);
     // The error the failed specs share, as the dead workers' logs give it: an assertion or error line, the most repeated first.
-    const errs = deadWorkers.flatMap((c) => c.job.errors).filter((l) => !INFRA_RE.test(l));
+    const errs = deadWorkers.flatMap((c) => c.job.errors).filter((l) => !CI_INFRA_RE.test(l));
     const top = massTests ? (errs.find((l) => /AssertionError|Error:|Expected|Timed out|toBe|not found/.test(l)) ?? errs[0] ?? null) : null;
     const what = massTests
       ? `${o!.failed.length} of ${finished} specs failed${top ? `: ${quote(top)}` : ""}`

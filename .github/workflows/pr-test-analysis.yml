@@ -16,14 +16,19 @@ on:
         description: "Claude model (input; falls back to vars.CLAUDE_MODEL then default in env)"
         required: false
         type: string
-        default: "claude-sonnet-4-6"
+        default: "claude-sonnet-5-5"
+      allowed_bots:
+        description: "Comma-separated bot actor logins allowed to trigger analysis (e.g. cursor[bot],unified-ci-app[bot],dependabot[bot])"
+        required: false
+        type: string
+        default: "cursor[bot],unified-ci-app[bot],dependabot[bot]"
     secrets:
       GH_TOKEN:
         description: "GitHub token for API/git against target_repo (caller github.token if same repo; PAT if target_repo is another repo)"
-        required: true
+        required: false
       ANTHROPIC_API_KEY:
         description: "Anthropic API key for Claude analysis"
-        required: true
+        required: false
       WEBHOOK_URL:
         description: "Optional Mattermost webhook URL for notifications"
         required: false
@@ -35,7 +40,7 @@ permissions:
   id-token: write  # Required by claude-code-action for OIDC authentication
 
 env:
-  CLAUDE_MODEL: ${{ inputs.claude_model || vars.CLAUDE_MODEL || 'claude-sonnet-4-6' }}
+  CLAUDE_MODEL: ${{ inputs.claude_model || vars.CLAUDE_MODEL || 'claude-sonnet-5-5' }}
   STATUS_CONTEXT: "Tests/analysis"
   ANALYSIS_FILE: "pr-test-analysis-result.txt"
   OVERRIDE_COMMAND: "/test-analysis-override"
@@ -51,8 +56,9 @@ jobs:
       - name: ci/resolve-pr-info
         id: pr-info
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
         run: |
           PR_JSON=$(gh pr view "$PR_NUMBER" --repo "${{ env.TARGET_REPO }}" --json headRefOid,headRepository,headRepositoryOwner,body,baseRefName)
           HEAD_SHA=$(echo "$PR_JSON" | jq -r '.headRefOid')
@@ -65,6 +71,7 @@ jobs:
             echo "head_sha=${HEAD_SHA}"
             echo "head_repo=${HEAD_REPO_OWNER}/${HEAD_REPO_NAME}"
             echo "base_branch=${BASE_BRANCH}"
+            echo "has_anthropic_key=${HAS_ANTHROPIC_KEY}"
           } >> "$GITHUB_OUTPUT"
 
           # Write PR body to a temp path that survives checkout
@@ -78,8 +85,9 @@ jobs:
 
       - name: ci/prep-analysis-data
         id: prep
+        if: ${{ steps.pr-info.outputs.has_anthropic_key == 'true' }}
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
         run: |
           PR_NUM=${{ steps.pr-info.outputs.pr_number }}
           BASE_BRANCH=${{ steps.pr-info.outputs.base_branch }}
@@ -147,10 +155,12 @@ jobs:
 
       - name: ci/analyze-tests
         id: ai-analysis
+        if: ${{ steps.pr-info.outputs.has_anthropic_key == 'true' }}
         continue-on-error: true
         uses: anthropics/claude-code-action@a874e9ecd7bb36efdad65429c6b35815f5a08f10  # v1.0.210
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          allowed_bots: ${{ inputs.allowed_bots }}
           use_sticky_comment: "true"
           prompt: |
             REPO: ${{ env.TARGET_REPO }}
@@ -253,7 +263,7 @@ jobs:
         if: always()
         id: post-results
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
           COMMIT_SHA: ${{ steps.pr-info.outputs.head_sha }}
           AI_OUTCOME: ${{ steps.ai-analysis.outcome }}
           PR_NUMBER: ${{ steps.pr-info.outputs.pr_number }}

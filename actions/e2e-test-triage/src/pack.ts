@@ -127,6 +127,8 @@ export function buildPack(finding: Finding, compareFiles: { filename: string; pa
     diff_hunks_of_files_named_in_error: hunks,
     other_failures_in_same_run: neighbours.slice(0, 8).map(({ class: cls, title }) => ({ class: cls, title })),
     ...(finding.producer ? { producer_evidence: { id: "producer" as const, notes: finding.producer.notes, screenshots: finding.producer.images.map(({ name, sha256 }) => ({ name, sha256 })) } } : {}),
+    ...(finding.ci_logs ? { ci_logs: { id: "ci_logs" as const, excerpt: finding.ci_logs } } : {}),
+    ...(finding.service_logs ? { service_logs: { id: "service_logs" as const, excerpt: finding.service_logs } } : {}),
     ...(finding.this_pr?.runs ? { this_pr_history: thisPrHistory(finding) } : {}),
     ...(finding.other_lanes?.length ? { same_test_other_platforms_this_run: { id: "other_platforms" as const, results: finding.other_lanes } } : {}),
     ...(finding.earlier_failure ? { earlier_failure_same_spec: { id: "earlier_failure_same_spec" as const, title: finding.earlier_failure.title, error: finding.earlier_failure.error, class: finding.earlier_failure.class } } : {}),
@@ -227,6 +229,8 @@ export const evidenceIds = (pack: Pack): string[] => [
   ...(pack.release ? ["release", ...(pack.base_change ? ["base_change"] : [])] : ["pr.changed_files"]),
   ...pack.diff_hunks_of_files_named_in_error.filter((h) => h.related).map((h) => h.id),
   ...(pack.producer_evidence?.notes || pack.producer_evidence?.screenshots?.length ? ["producer"] : []),
+  ...(pack.ci_logs?.excerpt ? ["ci_logs"] : []),
+  ...(pack.service_logs?.excerpt ? ["service_logs"] : []),
   // Citable only when this PR's most recent earlier run of the test passed (a pass before a later failure does not count),
   // and the complete list of what changed since that pass shows nothing related that the PR changed. A related change
   // the base branch brought in is allowed only while trunk's latest run of the test passed with it.

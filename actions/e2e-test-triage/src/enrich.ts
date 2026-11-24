@@ -2,8 +2,8 @@
 // See LICENSE.txt for license information.
 
 import type { FetchImpl, GhApi } from "../../shared/src/github.ts";
-import { FAILED_STATUSES, elsewhereKey, runFromGroups } from "../../shared/src/tsio.ts";
-import type { CompositeIdentity, RunResult, TsioGroup } from "../../shared/src/tsio.ts";
+import { FAILED_STATUSES, elsewhereKey, listReportGroups, runFromGroups } from "../../shared/src/tsio.ts";
+import type { CompositeIdentity, RunResult } from "../../shared/src/tsio.ts";
 import { COMPARE_FILE_CAP, laneOf, laneOfReport, osOfReport, repoPath } from "./config.ts";
 import { namesChangedFile } from "./pack.ts";
 import type { Finding } from "./types.ts";
@@ -117,11 +117,7 @@ export async function siblingPlatforms({
   const laterMessage = `other platforms' reads ran past the ${deadlineMs / 1000}s deadline`;
   try {
     const listed = await bySomeDeadline(
-      (async () => {
-        const res = await fetchImpl(`${base}/api/v1/reports?${new URLSearchParams({ repository: id.repository, commit: id.commit_sha, limit: "20" })}`, { signal: AbortSignal.timeout(60000) });
-        if (!res.ok) throw new Error(`TSIO ${res.status}`);
-        return ((await res.json()) as { reports?: TsioGroup[] }).reports ?? [];
-      })(),
+      listReportGroups(fetchImpl, base, { repository: id.repository, commit: id.commit_sha }),
     );
     if (listed === "late") return log(`${laterMessage}; none was read`);
     const siblings = listed.filter((g) => String(g.gh_run_id) === String(id.gh_run_id) && String(g.gh_run_attempt) === String(id.gh_run_attempt) && g.name !== id.name).slice(0, limit);

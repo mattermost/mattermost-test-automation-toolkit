@@ -118,6 +118,8 @@ export interface Finding extends TestRef {
   /** For a PR streak: the PR's changed product files most likely behind it (at most 3), for the summary to name. */
   suspects?: string[];
   producer?: Evidence;
+  ci_logs?: string;
+  service_logs?: string;
   out_of_date?: OutOfDate;
   broke_by?: BrokeBy;
   since_last_pass?: SinceLastPass;
@@ -220,6 +222,8 @@ export interface Pack {
   diff_hunks_of_files_named_in_error: Hunk[];
   other_failures_in_same_run: { class: string; title: string }[];
   producer_evidence?: { id: "producer"; notes: string; screenshots: { name: string; sha256: string }[] };
+  ci_logs?: { id: "ci_logs"; excerpt: string };
+  service_logs?: { id: "service_logs"; excerpt: string };
   this_pr_history?: ThisPRHistory;
   same_test_other_platforms_this_run?: { id: "other_platforms"; results: { platform: string; result: string }[] };
   earlier_failure_same_spec?: { id: "earlier_failure_same_spec" } & EarlierFailure;
@@ -459,6 +463,7 @@ export interface HistoryLike extends Map<string, Observation[]> {
   /** Why TSIO's history could not be read after its retries (see unreadHistory): the run is judged without it. */
   unavailable?: string;
   reportUnknown?: boolean;
+  reportUnknownFor?: Set<string>;
   ambiguous?: Set<string>;
 }
 

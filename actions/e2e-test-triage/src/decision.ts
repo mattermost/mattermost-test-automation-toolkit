@@ -17,14 +17,16 @@ const trunkSameFailure = (trunk?: Partial<Pack["trunk_history_14d"]>): boolean =
  * require. A related hunk is not on the list: it is evidence the PR may be the cause. Producer
  * evidence is not either: the PR's own CI wrote it, so it supports a clear but cannot carry one.
  */
-export function unblocks(cause: string, cited: string[], pack: Pack, cls = ""): boolean {
+export function unblocks(cause: string, cited: string[], pack: Pack, cls = "", infraClears = false): boolean {
   const has = (...ids: string[]): boolean => ids.some((id) => cited.includes(id));
   const trunk: Partial<Pack["trunk_history_14d"]> = pack.trunk_history_14d ?? {};
   // A PR that breaks the server fails every test with an environment error, so its text never clears one; nor do trunk's
   // failures, which classify does not read for one and so need not be this failure.
   if (cls === "INFRA_ERROR") {
     if (cause === "test_bug") return has("this_pr");
-    return (cause === "flaky_environment" || cause === "bug_on_master") && has("cross_pr", "this_pr");
+    const infraSupported =
+      infraClears && !cited.some((c) => c.startsWith("hunk_")) && (has("ci_logs", "service_logs") || isInfraError(pack.error));
+    return (cause === "flaky_environment" || cause === "bug_on_master") && (has("cross_pr", "this_pr") || infraSupported);
   }
   if (cause === "flaky_environment") return has("cross_pr", "this_pr") || isInfraError(pack.error) || (has("earlier_failure_same_spec") && chainClears(pack));
   if (cause === "bug_on_master") return has("cross_pr") || (has("trunk_history_14d") && trunkSameFailure(trunk));
@@ -79,7 +81,7 @@ export function decide(cls: string, answer: Answer | null | undefined, pack: Pac
     return { blocking: false, decision: "engine", answer: a };
   }
   // An unblock always needs a citation that exists in the pack.
-  if (JUDGED.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && unblocks(a.cause, cited, pack, cls))
+  if (JUDGED.has(cls) && a.cause !== "caused_by_pr" && a.confidence >= cfg.minConfidence && unblocks(a.cause, cited, pack, cls, cfg.infraClears))
     return { blocking: false, decision: "adjudicator_unblock", answer: a };
   // Naming the PR takes the same bar as clearing it: sure enough, and a change in the
   // diff to point to. A weaker guess keeps the failure red as "needs a look".
@@ -91,13 +93,13 @@ export function decide(cls: string, answer: Answer | null | undefined, pack: Pac
 /**
  * Whether any answer could change the outcome (see decide): a veto needs a related
  * hunk; an unblock needs a cross-PR recurrence, a pass earlier on this PR, or (flaky_environment) an infrastructure error
- * or an earlier environment failure in the spec with a pass on another platform (not for a held environment error).
+ * or an earlier environment failure in the spec with a pass on another platform (not for a held environment error unless infraClears).
  */
-export function canChange(cls: string, pack: Pack, isTrunkRun = false): boolean {
+export function canChange(cls: string, pack: Pack, isTrunkRun = false, infraClears = false): boolean {
   const ids = evidenceIds(pack);
   const hunk = ids.some((id) => id.startsWith("hunk_"));
   if (exoneratedSet(isTrunkRun).has(cls)) return hunk;
-  if (cls === "INFRA_ERROR") return CLEARING(ids);
+  if (cls === "INFRA_ERROR") return CLEARING(ids) || (infraClears && (ids.includes("ci_logs") || ids.includes("service_logs") || isInfraError(pack.error)));
   if (JUDGED.has(cls)) return CLEARING(ids) || isInfraError(pack.error) || chainClears(pack) || trunkSameFailure(pack.trunk_history_14d);
   return false;
 }
@@ -115,10 +117,13 @@ function nearMiss(cls: string, answer: Answer | null | undefined, pack: Pack, cf
   }
   const hunk = cited.some((c) => c.startsWith("hunk_"));
   if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && !hunk) return true;
-  if (answer.confidence < cfg.escalateMin) return false;
+  if (answer.confidence < cfg.escalateMin) {
+    const richRuntime = Boolean(pack.ci_logs || pack.service_logs || (pack.producer_evidence?.screenshots.length ?? 0) > 0);
+    return richRuntime && !exoneratedSet(isTrunkRun).has(cls) && canChange(cls, pack, isTrunkRun, cfg.infraClears);
+  }
   if (exoneratedSet(isTrunkRun).has(cls)) return answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.vetoMin;
   if (JUDGED.has(cls) && answer.cause === "caused_by_pr" && hunk && answer.confidence < cfg.minConfidence) return true;
-  return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && unblocks(answer.cause, cited, pack, cls);
+  return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && unblocks(answer.cause, cited, pack, cls, cfg.infraClears);
 }
 
 /** A group of findings that share one question to the model: the first is asked, the others take its answer. */
@@ -167,7 +172,7 @@ export async function judge(
     if (!pack || f.identity_unresolved || !(pack.release ? f.blocking : (JUDGED.has(f.class) && f.blocking) || exoneratedSet(isTrunkRun).has(f.class))) continue;
     // A held streak with a related hunk is asked: the one change an answer can make is to blame the PR from it.
     const blamable = Boolean(f.pr_streak) && evidenceIds(pack).some((id) => id.startsWith("hunk_"));
-    const advisory = !pack.release && !blamable && !canChange(f.class, pack, isTrunkRun);
+    const advisory = !pack.release && !blamable && !canChange(f.class, pack, isTrunkRun, cfg.infraClears);
     if (advisory && !(cfg.advise && f.blocking && JUDGED.has(f.class))) {
       ledger.skipped.no_effect++;
       f.ai = { skipped: "nothing the model could change" };

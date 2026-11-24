@@ -248,36 +248,75 @@ export function missingArrived(missing: Missing | null): string | null {
   return `${received ?? "?"} reports arrived (the expected count is unknown)`;
 }
 
+/** Lists TSIO report groups with offset pagination so multi-group commits are never truncated at 20 rows. */
+export async function listReportGroups(
+  fetchImpl: FetchImpl,
+  base: string,
+  params: Record<string, string>,
+  maxPages = 2,
+  pageSize = 100,
+): Promise<TsioGroup[]> {
+  const all: TsioGroup[] = [];
+  for (let page = 0; page < maxPages; page++) {
+    const q = new URLSearchParams({ ...params, limit: String(pageSize), ...(page > 0 ? { offset: String(page * pageSize) } : {}) });
+    const { reports = [] } = await tsioJson<{ reports?: TsioGroup[] }>(fetchImpl, base, `/reports?${q}`);
+    all.push(...reports);
+    if (reports.length < pageSize) break;
+  }
+  return all;
+}
+
 /**
  * The run's results, optionally narrowed to one report in the group (desktop
  * uploads one per OS). `reportName` is a prefix: names end in a release version.
  */
-export async function fetchRun(fetchImpl: FetchImpl, base: string, id: CompositeIdentity, reportName: string | null = null, wait: Wait = { attempts: 6, ms: 20000 }): Promise<RunResult> {
-  const q = new URLSearchParams({ repository: id.repository, commit: id.commit_sha, name: String(id.name), limit: "20" });
-  const { reports: groups = [] } = await tsioJson<{ reports?: TsioGroup[] }>(fetchImpl, base, `/reports?${q}`);
-  return runFromGroups(fetchImpl, base, id, groups, reportName, wait);
+export async function fetchRun(
+  fetchImpl: FetchImpl,
+  base: string,
+  id: CompositeIdentity,
+  reportName: string | null = null,
+  wait: Wait = { attempts: 6, ms: 20000 },
+  runAttempt?: string | number | null,
+): Promise<RunResult> {
+  const groups = await listReportGroups(fetchImpl, base, { repository: id.repository, commit: id.commit_sha, name: String(id.name) });
+  return runFromGroups(fetchImpl, base, id, groups, reportName, wait, runAttempt);
 }
 
 /**
  * The run's results from a group list already read. fetchRun is this after its one list call; a caller that reads
  * several runs from one list (the sibling groups of a run) calls it directly, so the list is read once.
  */
-export async function runFromGroups(fetchImpl: FetchImpl, base: string, id: CompositeIdentity, groups: TsioGroup[], reportName: string | null = null, wait: Wait = { attempts: 6, ms: 20000 }): Promise<RunResult> {
+export async function runFromGroups(
+  fetchImpl: FetchImpl,
+  base: string,
+  id: CompositeIdentity,
+  groups: TsioGroup[],
+  reportName: string | null = null,
+  wait: Wait = { attempts: 6, ms: 20000 },
+  runAttempt?: string | number | null,
+): Promise<RunResult> {
   const get = <T>(path: string): Promise<T> => tsioJson<T>(fetchImpl, base, path);
   // Match the full identity ourselves: never trust the server's filtering, and
   // run id + attempt are what tell two runs of one suite on one commit apart.
   const runId = String(id.gh_run_id ?? "");
-  const attempt = String(id.gh_run_attempt ?? "");
-  if (!runId || !attempt)
-    throw new Error(`composite identity is missing gh_run_id or gh_run_attempt; refusing to guess which run to read (run_id=${runId || "-"} attempt=${attempt || "-"})`);
-  const group = groups.find(
-    (g) =>
-      g.repository === id.repository &&
-      g.commit === id.commit_sha &&
-      g.name === id.name &&
-      String(g.gh_run_id) === runId &&
-      String(g.gh_run_attempt) === attempt,
-  );
+  const idAttempt = String(id.gh_run_attempt ?? "");
+  if (!runId || !idAttempt)
+    throw new Error(`composite identity is missing gh_run_id or gh_run_attempt; refusing to guess which run to read (run_id=${runId || "-"} attempt=${idAttempt || "-"})`);
+  const effectiveAttempt =
+    runAttempt != null && /^\d+$/.test(String(runAttempt)) && /^\d+$/.test(idAttempt) && Number(runAttempt) > Number(idAttempt)
+      ? String(runAttempt)
+      : idAttempt;
+  const matchAttempt = (att: string): TsioGroup | undefined =>
+    groups.find(
+      (g) =>
+        g.repository === id.repository &&
+        g.commit === id.commit_sha &&
+        g.name === id.name &&
+        String(g.gh_run_id) === runId &&
+        String(g.gh_run_attempt) === att,
+    );
+  const group = (effectiveAttempt !== idAttempt ? matchAttempt(effectiveAttempt) : undefined) ?? matchAttempt(idAttempt);
+  const attempt = effectiveAttempt;
   if (!group) {
     const noGroup = `TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`;
     // A newer run or attempt of this commit and suite took the group: this run is superseded, and the newest replacement is named.
