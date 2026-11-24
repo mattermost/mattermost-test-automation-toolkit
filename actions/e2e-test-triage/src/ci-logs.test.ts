@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { FetchImpl } from "../../shared/src/github.ts";
-import { CI_CODE_PATTERNS, CI_INFRA_RE, errorLines, filterLaneJobs, skimCiLogsForFindings } from "./ci-logs.ts";
+import { CI_CODE_PATTERNS, CI_INFRA_RE, errorLines, fetchJobLog, filterLaneJobs, skimCiLogsForFindings } from "./ci-logs.ts";
 import type { Finding } from "./types.ts";
 
 const makeFinding = (over: Partial<Finding>): Finding => ({
@@ -325,4 +325,68 @@ test("skimCiLogsForFindings uses exact MM-T boundaries and does not skip line `t
   const boundaryExcerpt = skimmed.byFinding.get(1) ?? "";
   assert.match(boundaryExcerpt, /alpha_target_one/);
   assert.match(boundaryExcerpt, /alpha_target_two at boundary/);
+});
+
+test("errorLines ignores code frames and fastlane bullets and prioritizes compiler/linker build signals", () => {
+  const lines = [
+    ...Array.from({ length: 15 }, (_, i) => `18 | /// The error message body (${i})`),
+    "* [action] verify_pod_keys: fail with the message of a failed pod keys command (#30548) via Jerome Lacoste (@lacostej)",
+    "* Fix undefined `class_name` in the no-run-method error message (#30257) via Ary Rabelo (@aryrabelo)",
+    ...Array.from({ length: 10 }, () => "warning: Run script build phase error: deprecated flag"),
+    "ld: Too many personality routines for compact unwind to encode. Found routines:",
+    "clang++: error: linker command failed with exit code 1 (use -v to see invocation)",
+    "** BUILD FAILED **",
+  ];
+  const ranked = errorLines(lines, 5);
+  assert.doesNotMatch(ranked.join("\n"), /The error message body|verify_pod_keys|no-run-method/);
+  assert.match(ranked[0], /Too many personality routines|linker command failed/);
+  assert.ok(ranked.some((l) => /linker command failed/.test(l)));
+  assert.ok(ranked.some((l) => /\*\* BUILD FAILED \*\*/.test(l)));
+});
+
+test("fetchJobLog range-reads large redirected blob logs without forwarding auth headers and rejects unsafe redirects", async () => {
+  const seen: { url: string; method: string; auth: string | null; range: string | null }[] = [];
+  const blobUrl = "https://pipelines.actions.githubusercontent.com/logs/42?sig=secret_sas";
+  const fetchImpl = (async (url: string, init: RequestInit = {}) => {
+    const u = String(url);
+    const h = new Headers(init.headers);
+    seen.push({ url: u, method: init.method ?? "GET", auth: h.get("authorization"), range: h.get("range") });
+    if (u.startsWith("https://api.github.com/")) {
+      return new Response(null, { status: 302, headers: { location: blobUrl } });
+    }
+    if ((init.method ?? "GET") === "HEAD") {
+      return new Response(null, { status: 200, headers: { "content-length": "5000", "accept-ranges": "bytes" } });
+    }
+    if (h.get("range") === "bytes=4900-4999") {
+      return new Response("partial_line_prefix\nclang++: error: linker command failed\n** BUILD FAILED **\n", { status: 206 });
+    }
+    return new Response("unexpected full body", { status: 200 });
+  }) as FetchImpl;
+
+  const tail = await fetchJobLog({ fetchImpl, token: "SECRET_GH", repository: "o/r", jobId: 42, maxBytes: 100 });
+  assert.equal(tail, "clang++: error: linker command failed\n** BUILD FAILED **\n");
+  assert.equal(seen.length, 3);
+  assert.equal(seen[0].auth, "Bearer SECRET_GH");
+  assert.equal(seen[1].auth, null);
+  assert.equal(seen[2].auth, null);
+  assert.equal(seen[2].range, "bytes=4900-4999");
+
+  // Rejects non-https redirect without leaking the Location URL or SAS query string.
+  const badRedirect = (async () => new Response(null, { status: 302, headers: { location: "http://evil.example/log?sig=secret_sas" } })) as FetchImpl;
+  await assert.rejects(
+    () => fetchJobLog({ fetchImpl: badRedirect, token: "SECRET_GH", repository: "o/r", jobId: 9 }),
+    (err: Error) => !err.message.includes("secret_sas") && /unsupported protocol/.test(err.message),
+  );
+
+  // 416 Range fallback streams full response capped cleanly to maxBytes.
+  const fallbackFetch = (async (url: string, init: RequestInit = {}) => {
+    const u = String(url);
+    const h = new Headers(init.headers);
+    if (u.startsWith("https://api.github.com/")) return new Response(null, { status: 302, headers: { location: blobUrl } });
+    if ((init.method ?? "GET") === "HEAD") return new Response(null, { status: 200, headers: { "content-length": "500", "accept-ranges": "bytes" } });
+    if (h.get("range")) return new Response(null, { status: 416 });
+    return new Response(`${"a".repeat(200)}\nkept_line_1\nkept_line_2\n`, { status: 200 });
+  }) as FetchImpl;
+  const capped = await fetchJobLog({ fetchImpl: fallbackFetch, token: "SECRET_GH", repository: "o/r", jobId: 10, maxBytes: 40 });
+  assert.equal(capped, "kept_line_1\nkept_line_2\n");
 });

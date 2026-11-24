@@ -1,7 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 import type { FetchImpl } from "../../shared/src/github.ts";
-import { CI_CODE_PATTERNS, CI_INFRA_RE, DEAD_CONCLUSIONS, failedStepOf, fetchJobLog, fetchRunJobs, lastLines, stepLines, toMs } from "./ci-logs.ts";
+import { CI_CODE_PATTERNS, CI_INFRA_RE, DEAD_CONCLUSIONS, errorLines, failedStepOf, fetchJobLog, fetchRunJobs, lastLines, stepLines, toMs } from "./ci-logs.ts";
 import { maxTokensFor, requestModel } from "./judge.ts";
 import { costOf } from "./pricing.ts";
 import type { Ledger, Prices } from "./types.ts";
@@ -15,6 +15,7 @@ export interface DeadJob {
   conclusion: string;
   step: string | null;
   tail: string;
+  errors?: string[];
 }
 
 /** What one dead job says about a re-run. `short` names a hold on the check; `reason` is the summary's line. */
@@ -48,14 +49,15 @@ const TAIL_LINES = 60;
 export function classifyDeadJob(job: DeadJob): JobCall {
   const step = job.step ?? "an unnamed step";
   const how = job.conclusion === "cancelled" ? "hung" : "failed";
-  const infra = CI_INFRA_RE.exec(job.tail);
+  const text = [job.tail, ...(job.errors ?? [])].join("\n");
+  const infra = CI_INFRA_RE.exec(text);
   if (infra) return { verdict: "rerun", short: null, reason: `${job.name}: ${step} failed on the network or the runner (${infra[0]})` };
-  const lines = job.tail.split("\n").map((l) => l.trim()).filter(Boolean);
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
   for (const [re, short] of CI_CODE_PATTERNS) {
     const line = lines.find((l) => re.test(l));
     if (line) return { verdict: "hold", short, reason: `${job.name}: step "${step}" failed: ${line.slice(0, 200)}` };
   }
-  const last = (lines.at(-1) ?? "no log").slice(0, 200);
+  const last = (job.tail.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? "no log").slice(0, 200);
   // A build or server step whose log names no failure holds nothing: only a log line that shows the change broke it
   // does (CI_CODE_PATTERNS above). The rest is re-run once, which tells the machine from the change.
   if (SERVER_STEP.test(step) || BUILD_STEP.test(step)) return { verdict: "unclear", short: null, reason: `${job.name}: step "${step}" ${how}: ${last}` };
@@ -78,13 +80,16 @@ export async function readDeadJobs({ fetchImpl, token, repository, runId, attemp
   for (const j of dead) {
     const step = failedStepOf(j);
     let tail = "";
+    let errors: string[] = [];
     try {
       const text = await fetchJobLog({ fetchImpl, token, repository, jobId: j.id, timeoutMs: 60_000 });
-      tail = lastLines(stepLines(text, toMs(step?.started_at), toMs(step?.completed_at)).join("\n"), TAIL_LINES);
+      const lines = stepLines(text, toMs(step?.started_at), toMs(step?.completed_at));
+      tail = lastLines(lines.join("\n"), TAIL_LINES);
+      errors = errorLines(lines);
     } catch (e) {
       log(`log of ${j.name} unavailable: ${String(e).slice(0, 160)}`);
     }
-    out.push({ id: j.id, name: j.name, conclusion: String(j.conclusion), step: step?.name ?? null, tail });
+    out.push({ id: j.id, name: j.name, conclusion: String(j.conclusion), step: step?.name ?? null, tail, errors });
   }
   return out;
 }

@@ -1781,11 +1781,15 @@ var STAMP = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,3})\d*)?Z (.*)$/;
 var toMs = (iso) => iso ? Date.parse(iso) : null;
 var lastLines = (text, n) => text.split("\n").slice(-n).join("\n");
 var ERROR_LINE = /##\[error\]|\b(?:Error|AssertionError|TypeError|ReferenceError|TimeoutError|HttpError)\b:|\berror\b[: ]|\bfailed\b|not healthy|timed out|Timed out|exceeded|ECONNRESET|ETIMEDOUT|Egress|panic:|fatal:/;
-var NOISE = /^(?:shell:|env:|with:|\s*\* \[new (?:branch|tag)\]|(?:HEAD is now at|Previous HEAD position was) [0-9a-fA-F]+\b)|Process completed with exit code|##\[warning\]|reported \((?:failed|passed)\) →|\[queue: |^[✖✔│┌└├]|\b\d+ of \d+ failed \(\d+%\)|^\s*\d+ failing\s*$/;
+var NOISE = /^(?:shell:|env:|with:|\s*\* \[new (?:branch|tag)\]|(?:HEAD is now at|Previous HEAD position was) [0-9a-fA-F]+\b|\d+\s*\||\*\s+(?:\[[^\]]+\]\s+|Fix\b).*\(#\d+\)\s+via\s+)|Process completed with exit code|##\[warning\]|reported \((?:failed|passed)\) →|\[queue: |^[✖✔│┌└├]|\b\d+ of \d+ failed \(\d+%\)|^\s*\d+ failing\s*$/;
 var CI_INFRA_RE = /Failed to get ID Token|Egress is over the account limit|Failed to GetCacheEntryDownloadURL|Failed to restore:|Cache not found for input keys|HttpError: (?:Server Error|Bad Gateway|Service Unavailable)|\b50[0234]\b.*(?:Server Error|Bad Gateway|Service Unavailable|Gateway Time-?out)|GitHub (?:GET|POST) [^:]+: 5\d\d|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|socket hang up|network (?:error|aborted|timeout)|Could not resolve host|TLS handshake timeout|429 Too Many Requests|rate limit exceeded|The runner has received a shutdown signal|lost communication with the server|hosted runner encountered an error|No space left on device|Unable to download (?:artifact|action)|Failed to download action|could not fetch [0-9a-f]+ from promisor remote|fatal: (?:unable to access|early EOF|the remote end hung up)|RPC failed|Error: Unable to process command .* successfully|The operation was canceled|<!DOCTYPE html|answered with an HTML page/i;
 var CI_CODE_PATTERNS = [
   [
-    /\*\* BUILD FAILED \*\*|error TS\d{4}:|Module not found|SyntaxError:|xcodebuild: error|Execution failed for task|Compilation failed|BUILD FAILURE|Build failed|cannot find symbol|Cannot find module/i,
+    /(?:clang(?:\+\+)?|swiftc|rustc): error:|linker command failed|ld: (?:Too many personality routines|symbol\(s\) not found|library not found|framework not found|Undefined symbols|[^\n]*\berror:)|Undefined symbols for architecture|error TS\d{4}:|Module not found|Cannot find module|cannot find symbol|SyntaxError:|xcodebuild: error|Execution failed for task|Compilation failed/i,
+    "the build failed"
+  ],
+  [
+    /\*\* BUILD FAILED \*\*|BUILD FAILURE|Build failed/i,
     "the build failed"
   ],
   [
@@ -1817,37 +1821,97 @@ function stepLines(log, from, to) {
   }
   return kept;
 }
+var MAX_RAW_LOG_CHARS = 2e6;
+function signalTier(line) {
+  if (CI_INFRA_RE.test(line) || CI_CODE_PATTERNS[0][0].test(line)) return 3;
+  if (CI_CODE_PATTERNS.some(([re]) => re.test(line))) return 2;
+  return ERROR_LINE.test(line) ? 1 : 0;
+}
 function errorLines(lines, max = 5, secrets = []) {
   const counts = /* @__PURE__ */ new Map();
   for (const l of lines) {
     const line = l.trim();
-    if (!ERROR_LINE.test(line) || NOISE.test(line) || line.length < 8) continue;
+    const tier = signalTier(line);
+    if (!tier || NOISE.test(line) || line.length < 8) continue;
     const clean = redact(line, secrets);
     const key = clean.replace(/\d+/g, "#").slice(0, 160);
     const seen = counts.get(key);
     if (seen) seen.n++;
-    else counts.set(key, { n: 1, line: clean.slice(0, 240) });
+    else counts.set(key, { n: 1, tier, line: clean.slice(0, 240) });
   }
-  return [...counts.values()].sort((a, b) => b.n - a.n).slice(0, max).map((c) => c.line);
+  return [...counts.values()].sort((a, b) => b.tier - a.tier || b.n - a.n).slice(0, max).map((c) => c.line);
 }
-async function ghRawGet(fetchImpl, token, path, timeoutMs = 6e4, deadline) {
+function stepTimeout(timeoutMs, deadline) {
+  const remaining = deadline !== void 0 ? Math.max(1e3, Math.min(timeoutMs, deadline - Date.now())) : timeoutMs;
+  return AbortSignal.timeout(remaining);
+}
+async function ghRawGet(fetchImpl, token, path, timeoutMs = 6e4, deadline, redirect) {
   let last = null;
   for (let i = 0; i < 3; i++) {
     if (deadline !== void 0 && Date.now() >= deadline) break;
-    const remaining = deadline !== void 0 ? Math.max(1e3, Math.min(timeoutMs, deadline - Date.now())) : timeoutMs;
     const res = await fetchImpl(`https://api.github.com${path}`, {
       headers: {
         authorization: `Bearer ${token}`,
         accept: "application/vnd.github+json",
         "user-agent": "mattermost-e2e-triage"
       },
-      signal: AbortSignal.timeout(remaining)
+      ...redirect ? { redirect } : {},
+      signal: stepTimeout(timeoutMs, deadline)
     });
-    if (res.ok) return res;
+    if (res.ok || redirect === "manual" && res.status >= 300 && res.status < 400) return res;
+    await res.body?.cancel().catch(() => {
+    });
     last = new Error(`GitHub GET ${path.split("?")[0]}: ${res.status}`);
     if (res.status < 500 && res.status !== 429) break;
   }
   throw last ?? new Error(`GitHub GET ${path.split("?")[0]}: deadline exceeded`);
+}
+async function readTailBounded(res, maxBytes, forceDropFirstLine) {
+  let text;
+  let truncated = false;
+  if (!res.body) {
+    const raw = await res.text();
+    if (raw.length > maxBytes) {
+      text = raw.slice(-maxBytes);
+      truncated = true;
+    } else {
+      text = raw;
+    }
+  } else {
+    const reader = res.body.getReader();
+    const chunks = [];
+    let buffered = 0;
+    try {
+      for (; ; ) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value?.byteLength) continue;
+        chunks.push(value);
+        buffered += value.byteLength;
+        while (buffered > maxBytes && chunks.length) {
+          truncated = true;
+          const head = chunks[0];
+          const excess = buffered - maxBytes;
+          if (head.byteLength <= excess) {
+            chunks.shift();
+            buffered -= head.byteLength;
+          } else {
+            chunks[0] = head.subarray(excess);
+            buffered = maxBytes;
+            break;
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    text = Buffer.concat(chunks).toString("utf8");
+  }
+  if (forceDropFirstLine || truncated) {
+    const nl = text.indexOf("\n");
+    if (nl >= 0) text = text.slice(nl + 1);
+  }
+  return text;
 }
 async function fetchRunJobs({
   fetchImpl,
@@ -1873,9 +1937,56 @@ async function fetchJobLog({
   repository,
   jobId,
   timeoutMs = 3e4,
-  deadline
+  deadline,
+  maxBytes = MAX_RAW_LOG_CHARS
 }) {
-  return (await ghRawGet(fetchImpl, token, `/repos/${repository}/actions/jobs/${jobId}/logs`, timeoutMs, deadline)).text();
+  const res = await ghRawGet(fetchImpl, token, `/repos/${repository}/actions/jobs/${jobId}/logs`, timeoutMs, deadline, "manual");
+  if (res.status < 300 || res.status >= 400) return await readTailBounded(res, maxBytes, false);
+  const loc = res.headers.get("location");
+  await res.body?.cancel().catch(() => {
+  });
+  let url;
+  try {
+    url = new URL(loc ?? "");
+  } catch {
+    throw new Error(`GitHub job log redirect missing valid Location for job ${jobId}`);
+  }
+  if (url.protocol !== "https:") {
+    throw new Error(`GitHub job log redirect uses unsupported protocol ${url.protocol} for job ${jobId}`);
+  }
+  let len = NaN;
+  let acceptsBytes = false;
+  try {
+    const head = await fetchImpl(url.href, { method: "HEAD", signal: stepTimeout(timeoutMs, deadline) });
+    await head.body?.cancel().catch(() => {
+    });
+    if (head.ok) {
+      len = Number(head.headers.get("content-length") ?? "");
+      acceptsBytes = /\bbytes\b/i.test(head.headers.get("accept-ranges") ?? "");
+    }
+  } catch {
+  }
+  if (Number.isFinite(len) && len > maxBytes && acceptsBytes) {
+    const start = len - maxBytes;
+    const rangeRes = await fetchImpl(url.href, {
+      headers: { range: `bytes=${start}-${len - 1}` },
+      signal: stepTimeout(timeoutMs, deadline)
+    });
+    if (rangeRes.status === 206) return await readTailBounded(rangeRes, maxBytes, true);
+    if (rangeRes.ok) return await readTailBounded(rangeRes, maxBytes, false);
+    await rangeRes.body?.cancel().catch(() => {
+    });
+    if (rangeRes.status !== 416) {
+      throw new Error(`GitHub job log download failed for job ${jobId}: ${rangeRes.status}`);
+    }
+  }
+  const fullRes = await fetchImpl(url.href, { signal: stepTimeout(timeoutMs, deadline) });
+  if (!fullRes.ok) {
+    await fullRes.body?.cancel().catch(() => {
+    });
+    throw new Error(`GitHub job log download failed for job ${jobId}: ${fullRes.status}`);
+  }
+  return await readTailBounded(fullRes, maxBytes, false);
 }
 function filterLaneJobs(jobs, prefix, filter) {
   const p = prefix ?? "";
@@ -1890,7 +2001,6 @@ function filterLaneJobs(jobs, prefix, filter) {
   });
   return { byPrefix, lane };
 }
-var MAX_RAW_LOG_CHARS = 2e6;
 var RUN_EXCERPT_MAX = 1500;
 var FINDING_EXCERPT_MAX = 1200;
 function findingSearchTerms(f) {
@@ -4132,14 +4242,15 @@ var TAIL_LINES = 60;
 function classifyDeadJob(job) {
   const step = job.step ?? "an unnamed step";
   const how = job.conclusion === "cancelled" ? "hung" : "failed";
-  const infra = CI_INFRA_RE.exec(job.tail);
+  const text = [job.tail, ...job.errors ?? []].join("\n");
+  const infra = CI_INFRA_RE.exec(text);
   if (infra) return { verdict: "rerun", short: null, reason: `${job.name}: ${step} failed on the network or the runner (${infra[0]})` };
-  const lines = job.tail.split("\n").map((l) => l.trim()).filter(Boolean);
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
   for (const [re, short] of CI_CODE_PATTERNS) {
     const line = lines.find((l) => re.test(l));
     if (line) return { verdict: "hold", short, reason: `${job.name}: step "${step}" failed: ${line.slice(0, 200)}` };
   }
-  const last = (lines.at(-1) ?? "no log").slice(0, 200);
+  const last = (job.tail.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? "no log").slice(0, 200);
   if (SERVER_STEP.test(step) || BUILD_STEP.test(step)) return { verdict: "unclear", short: null, reason: `${job.name}: step "${step}" ${how}: ${last}` };
   if (SETUP_STEP.test(step)) return { verdict: "rerun", short: null, reason: `${job.name}: setup step "${step}" ${how}` };
   return { verdict: "unclear", short: null, reason: `${job.name}: step "${step}" ${how}` };
@@ -4151,13 +4262,16 @@ async function readDeadJobs({ fetchImpl, token, repository, runId, attempt, log 
   for (const j of dead) {
     const step = failedStepOf(j);
     let tail2 = "";
+    let errors = [];
     try {
       const text = await fetchJobLog({ fetchImpl, token, repository, jobId: j.id, timeoutMs: 6e4 });
-      tail2 = lastLines(stepLines(text, toMs(step?.started_at), toMs(step?.completed_at)).join("\n"), TAIL_LINES);
+      const lines = stepLines(text, toMs(step?.started_at), toMs(step?.completed_at));
+      tail2 = lastLines(lines.join("\n"), TAIL_LINES);
+      errors = errorLines(lines);
     } catch (e) {
       log(`log of ${j.name} unavailable: ${String(e).slice(0, 160)}`);
     }
-    out.push({ id: j.id, name: j.name, conclusion: String(j.conclusion), step: step?.name ?? null, tail: tail2 });
+    out.push({ id: j.id, name: j.name, conclusion: String(j.conclusion), step: step?.name ?? null, tail: tail2, errors });
   }
   return out;
 }

@@ -469,3 +469,23 @@ test("readLaneJobs filters flat-job workflows by lane-job-filter while preservin
   });
   assert.deepEqual(detoxAndroid.jobs.map((j) => j.name), ["build-android-apk"]);
 });
+
+test("diagnoseLane surfaces caused by PR linker failure despite code-frame repeats and trailing fastlane noise", () => {
+  const stepOut = [
+    ...Array.from({ length: 12 }, (_, i) => `18 | /// The error message body ${i}`),
+    "ld: Too many personality routines for compact unwind to encode. Found routines:",
+    "clang++: error: linker command failed with exit code 1 (use -v to see invocation)",
+    "** BUILD FAILED **",
+    ...Array.from({ length: 70 }, (_, i) => `* Fix undefined action (${10000 + i}) via User`),
+  ];
+  const errs = errorLines(stepOut);
+  const cause = jobCause(job({ short: "build-ios-simulator", step: "Build iOS Simulator", conclusion: "failure", tail: stepOut.slice(-60).join("\n"), errors: errs }));
+  assert.deepEqual([cause.kind, cause.short], ["code", "the build failed"]);
+  const v = diagnoseLane(facts({
+    orchestration: null,
+    jobs: [job({ short: "build-ios-simulator", step: "Build iOS Simulator", conclusion: "failure", worker: false, tail: stepOut.slice(-60).join("\n"), errors: errs })],
+  }));
+  assert.deepEqual([v.label, v.fault, v.rerun], ["caused by PR", "PR", "none"]);
+  assert.match(v.what, /linker command failed|Too many personality routines/);
+  assert.doesNotMatch(v.what, /The error message body/);
+});
