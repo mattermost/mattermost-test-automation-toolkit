@@ -27,7 +27,8 @@ export const isReportsIncomplete = (text: string): boolean => text.startsWith(RE
 
 // GitHub commit statuses have no compare-and-swap API. Every caller MUST hold
 // the same non-cancelling, SHA-scoped job concurrency lock across these reads
-// and writes, including triage and the cross-lane summary. See the action README.
+// and writes, including the cross-lane summary. The only exception is per-lane
+// triage with its aggregate off; the e2e-test-status README states its race window.
 
 /** The run and attempt that own a lane's status. Strings: they are compared as big integers. */
 export interface Owner {

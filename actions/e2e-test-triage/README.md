@@ -636,13 +636,13 @@ Enforcing triage now requires a recognized raw lane status owned by the same
 run, and cannot clear a pending raw status. It shares the guard with
 [`e2e-test-status`](../e2e-test-status/README.md). All producers of a given SHA's statuses
 must hold the publication-job lock documented there, including this action and
-its cross-lane summary. Ownership checks alone cannot prevent a check/write
+its cross-lane summary. The one exception, parallel per-lane triage with
+`triage-status-context: "off"` plus the consolidate sub-action, and its race
+window are documented there. Ownership checks alone cannot prevent a check/write
 race. Stale runs still produce diagnostic summaries but cannot update statuses.
 The fixed Mattermost caller refreshes the factual lane summary even when AI
 triage is report-only; the AI action still writes no statuses in that mode. The
 `aggregate-published` output is `"true"` only when triage wrote the PR-wide
-aggregate check in that run, and `"false"` otherwise (including on early exits
-The `aggregate-published` output is `"true"` only when triage wrote the PR-wide
 aggregate check in that run, and `"false"` otherwise (including on early exits
 or non-announcing errors).
 

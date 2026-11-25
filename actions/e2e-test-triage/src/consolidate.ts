@@ -16,7 +16,7 @@ export type RecommendedAction = "merge_base" | "fix_pr" | "fix_test" | "rerun" |
 
 export interface ConsolidatedLane {
   lane: string;
-  status_context: string |Partial<FindingsRecord> | null;
+  status_context: string | null;
   verdict: string | null;
   basis: string | null;
   description: string | null;
@@ -142,7 +142,8 @@ export function buildTriageSummary(records: FindingsRecord[], aggregate: LaneSum
       rerun: cleanRerun,
     });
 
-    for (const f of blockingRows) {
+    // A superseded run's retained findings are obsolete: they never reach the Agent Fix Brief.
+    for (const f of superseded ? [] : blockingRows) {
       blockingItems.push({
         lane,
         kind: "test",

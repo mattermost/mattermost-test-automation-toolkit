@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { CommitStatus, GhApi } from "../../shared/src/github.ts";
+import type { CommitStatus } from "../../shared/src/github.ts";
 import { buildTriageSummary, consolidate, loadFindingsDir, renderTriageSummaryMarkdown } from "./consolidate.ts";
 import { FINDINGS_SCHEMA } from "./findings.ts";
 import type { FindingsRecord } from "./findings.ts";
@@ -145,6 +145,39 @@ test("buildTriageSummary surfaces both blocking test failures and lane-level bui
   assert.match(md, /### Agent Fix Brief/);
   assert.match(md, /ld: Too many personality routines/);
   assert.match(md, /\*\*\[fix_pr\]\*\*/);
+});
+
+test("buildTriageSummary keeps a superseded record's retained blocking finding out of the Agent Fix Brief", () => {
+  const supersededRecord = record({
+    lane: "detox-ios",
+    triaged: false,
+    not_triaged_reason: "superseded: run 101 replaced this run",
+    verdict: "FAILURE",
+    ai: { calls: 1, cost_usd: 0.01, model: "claude-sonnet-5-5" },
+    findings: [{
+      title: "send post",
+      full_title: "Chat > send post",
+      file: "detox/e2e/test/smoke.e2e.ts",
+      class: "REGRESSION",
+      label: "caused by PR",
+      blocking: true,
+      decision: "adjudicator_blame",
+      reason: "PR changed post composer",
+      error_first_line: "Timeout waiting for composer",
+      out_of_date: false,
+      tries: { ran: 2, failed: 2 },
+      other_lanes_failed: [],
+      ai: { cause: "caused_by_pr", confidence: 0.9, cited: [], cleared: false, explanation: "Composer testID removed" },
+    }],
+  });
+
+  const summary = buildTriageSummary([supersededRecord], null);
+  assert.equal(summary.totals.blocking, 0);
+  assert.equal(summary.totals.failing_lanes, 0);
+  assert.equal(summary.lanes[0].blocking, 0);
+  assert.deepEqual(summary.blocking_items, [], "a superseded blocker is not recommended for a fix");
+  assert.equal(summary.totals.ai_calls, 1, "AI accounting still counts the superseded run");
+  assert.doesNotMatch(renderTriageSummaryMarkdown(summary), /### Agent Fix Brief/);
 });
 
 test("consolidate settles aggregate status, respects only-if-exists, and writes JSON + summary without status when context is empty", async () => {

@@ -1786,7 +1786,7 @@ function buildTriageSummary(records, aggregate, secrets = []) {
       lane_diagnosis: cleanDiag,
       rerun: cleanRerun
     });
-    for (const f of blockingRows) {
+    for (const f of superseded ? [] : blockingRows) {
       blockingItems.push({
         lane,
         kind: "test",
