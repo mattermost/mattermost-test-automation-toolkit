@@ -311,10 +311,20 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     description: row.description.slice(0, 140),
     target_url: ownedURL(row.target_url, by, id.repository)
   });
-  const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease) => {
+  const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease, options = {}) => {
     if (!summaryContext || !lanes.length) return false;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
     const rows = overlayStale(await readStatuses(api, id));
+    const currentAgg = rows.find((r) => r.context === summaryContext) ?? null;
+    const by = snapshotOwner();
+    const currentOwner = currentAgg ? statusOwner(currentAgg.target_url, id.repository) : null;
+    if (currentOwner && compareOwners(currentOwner, by) > 0) {
+      log(`Aggregate ${summaryContext} belongs to a newer run (${currentOwner.run}#${currentOwner.attempt}); publication skipped`);
+      return false;
+    }
+    if (options.onlyIfExists && (!currentAgg || !currentOwner || currentOwner.run !== by.run)) {
+      return false;
+    }
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return false;
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
@@ -322,7 +332,9 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
     const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
     const pr = Number(id.gh_pr_number || 0) > 0;
-    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease, pr), context: summaryContext }, snapshotOwner());
+    const summary = summarizeLanes(latest, untriaged, resolvedRelease, pr);
+    options.onSummary?.(summary);
+    await post({ ...summary, context: summaryContext }, by);
     return true;
   };
   return {

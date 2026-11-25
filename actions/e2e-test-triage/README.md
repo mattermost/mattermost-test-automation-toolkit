@@ -551,6 +551,10 @@ characters at most). Fields, in `schema` 2:
   "run_id": "39637355358", "run_attempt": "1",
   "mode": "enforce | report-only",
   "verdict": "SUCCESS | FAILURE | ACTION_REQUIRED | null",
+  "basis": "tests | orchestration | lane | null",
+  "description": "commit-status summary line | null",
+  "lane_diagnosis": { "label": "caused by PR", "fault": "PR", "what": "", "action": "" },
+  "rerun": { "requested": false, "of": null, "held": null },
   "counts": { "total": 0, "passed": 0, "failed": 0, "flaky": 0, "skipped": 0 },
   "ai": { "calls": 0, "cost_usd": 0, "model": "claude-sonnet-5-5 | null" },
   "triaged": true,
@@ -637,4 +641,10 @@ The fixed Mattermost caller refreshes the factual lane summary even when AI
 triage is report-only; the AI action still writes no statuses in that mode. The
 `aggregate-published` output is `"true"` only when triage wrote the PR-wide
 aggregate check in that run, and `"false"` otherwise (including on early exits
+The `aggregate-published` output is `"true"` only when triage wrote the PR-wide
+aggregate check in that run, and `"false"` otherwise (including on early exits
 or non-announcing errors).
+
+### Consolidate sub-action (`actions/e2e-test-triage/consolidate`)
+
+For parallel per-lane callers running with `triage-status-context: "off"`, run `actions/e2e-test-triage/consolidate` once at the end under the SHA status lock to settle `triage-status-context` (supporting `only-if-exists: "true"` for Attempt-2 all-pass cleanup) and emit a unified Human Markdown table (`GITHUB_STEP_SUMMARY`) plus Agent JSON (`summary-file`) and Fix Brief from downloaded `findings-dir` artifacts. Inputs: `composite-identity`, `github-token`, `triage-status-context`, `triage-lanes`, `only-if-exists`, `release`, `findings-dir`, `summary-file`, `write-summary`, `cancelled`. Outputs: `state`, `description`, `published`, `blocking`, `exonerated`, `ai-calls`, `ai-cost-usd`.

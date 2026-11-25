@@ -2037,10 +2037,20 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     description: row.description.slice(0, 140),
     target_url: ownedURL(row.target_url, by, id.repository)
   });
-  const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease) => {
+  const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease, options = {}) => {
     if (!summaryContext || !lanes.length) return false;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
     const rows = overlayStale(await readStatuses(api, id));
+    const currentAgg = rows.find((r) => r.context === summaryContext) ?? null;
+    const by = snapshotOwner();
+    const currentOwner = currentAgg ? statusOwner(currentAgg.target_url, id.repository) : null;
+    if (currentOwner && compareOwners(currentOwner, by) > 0) {
+      log(`Aggregate ${summaryContext} belongs to a newer run (${currentOwner.run}#${currentOwner.attempt}); publication skipped`);
+      return false;
+    }
+    if (options.onlyIfExists && (!currentAgg || !currentOwner || currentOwner.run !== by.run)) {
+      return false;
+    }
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return false;
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
@@ -2048,7 +2058,9 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
     const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
     const pr = Number(id.gh_pr_number || 0) > 0;
-    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease, pr), context: summaryContext }, snapshotOwner());
+    const summary = summarizeLanes(latest, untriaged, resolvedRelease, pr);
+    options.onSummary?.(summary);
+    await post({ ...summary, context: summaryContext }, by);
     return true;
   };
   return {
@@ -2213,7 +2225,7 @@ function findingLogLine(f, n, of, secrets) {
   return clip(line.replace(/\s+/g, " "), 500);
 }
 var secretsOf = (env) => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY].filter((s) => Boolean(s));
-function findingsRecord({ env, id, mode, run, result, notTriaged }) {
+function findingsRecord({ env, id, mode, run, result, notTriaged, basis = null, description = null, laneDiagnosis = null, rerun = null }) {
   const secrets = secretsOf(env);
   const ai = result?.ai ?? newLedger();
   const spend = ledgerTotals(ai);
@@ -2230,6 +2242,15 @@ function findingsRecord({ env, id, mode, run, result, notTriaged }) {
     run_attempt: text(id?.gh_run_attempt),
     mode,
     verdict: result?.verdict ?? null,
+    basis: basis ?? null,
+    description: description ? clip(redact(description, secrets), 200) : null,
+    lane_diagnosis: laneDiagnosis ? {
+      label: redact(laneDiagnosis.label, secrets),
+      fault: redact(laneDiagnosis.fault, secrets),
+      what: clip(redact(laneDiagnosis.what, secrets), 300),
+      action: clip(redact(laneDiagnosis.action, secrets), 200)
+    } : null,
+    rerun: rerun ? { requested: Boolean(rerun.requested), of: rerun.of ?? null, held: rerun.held ? redact(rerun.held, secrets) : null } : null,
     counts: run?.counts ?? null,
     ai: { calls: spend.calls, cost_usd: spend.cost_usd, model: served.length ? served.join(", ") : null },
     triaged: notTriaged == null,
@@ -4812,14 +4833,14 @@ async function unreadHistory(read, log) {
 }
 async function triage(options) {
   const written = { summary: false, aggregateOutput: false };
-  const seen = { run: null, result: null, enforce: null };
+  const seen = { run: null, result: null, enforce: null, basis: null, description: null, laneDiagnosis: null, rerun: null };
   const { env } = options;
   const log = options.log ?? console.error;
   const requested = String(env.MODE ?? "").trim() === "enforce" ? "enforce" : "report-only";
   const effective = () => seen.enforce === null ? requested : seen.enforce ? "enforce" : "report-only";
   try {
     const result = await decideRun(options, written, seen);
-    writeFindings({ env, id: identityOrNull(env), mode: effective(), run: seen.run, result, notTriaged: null }, log);
+    writeFindings({ env, id: identityOrNull(env), mode: effective(), run: seen.run, result, notTriaged: null, basis: seen.basis, description: seen.description, laneDiagnosis: seen.laneDiagnosis, rerun: seen.rerun }, log);
     return result;
   } catch (e) {
     const id = identityOrNull(env);
@@ -4853,7 +4874,7 @@ async function triage(options) {
         log(`triage's output not written: ${String(writeError).slice(0, 160)}`);
       }
     }
-    writeFindings({ env, id, mode: effective(), run: seen.run, result: seen.result, notTriaged }, log);
+    writeFindings({ env, id, mode: effective(), run: seen.run, result: seen.result, notTriaged, basis: seen.basis, description: seen.description, laneDiagnosis: seen.laneDiagnosis, rerun: seen.rerun }, log);
     if (e instanceof SupersededRunError) throw new NotTriagedError(notTriaged);
     throw e;
   }
@@ -5213,6 +5234,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const testsSummary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
     const summary = lane && !result.findings.length ? laneSection : [laneSection, testsSummary].filter(Boolean).join("\n");
     const description = lane ? laneDescription(lane.verdict, Boolean(rerun), lane.baseline?.base ?? prBase ?? "main") : flakyOnly ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}` : onlyDeadJobs ? `(${held ? `not re-run: ${held}` : `machine failure, ${rerun ? RERUNNING : RERUN}`}) ${passLine(run.counts)}` : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
+    const basis = lane ? lane.verdict.label === "all specs ran" ? "orchestration" : "lane" : "tests";
+    seen.basis = basis;
+    seen.description = description;
+    seen.laneDiagnosis = lane ? { label: lane.verdict.label, fault: lane.verdict.fault, what: lane.verdict.what, action: lane.verdict.action } : null;
+    seen.rerun = { requested: Boolean(rerun), of: rerun?.of ?? null, held };
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
       (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}
@@ -5226,7 +5252,7 @@ rerun_held=${held ?? ""}
 rerun_job=${rerun && laneRerun === "lane" ? String(lane?.startJobId ?? 0) : ""}
 lane_label=${lane?.verdict.label ?? ""}
 lane_fault=${lane?.verdict.fault ?? ""}
-basis=${lane ? lane.verdict.label === "all specs ran" ? "orchestration" : "lane" : "tests"}
+basis=${basis}
 ai_calls=${spend.calls}
 ai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}
 ai_input_tokens=${spend.input_tokens}

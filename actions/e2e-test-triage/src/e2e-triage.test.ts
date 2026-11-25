@@ -3445,11 +3445,11 @@ test("a run that breaks off writes a findings file that says why, with no token 
 
 test("the findings file has one shape, and the shape check names what drifts from it", () => {
   assert.equal(FINDINGS_SCHEMA, 2);
-  const good = { schema: 2, repository: "o/r", commit_sha: "abc", pr: null, lane: null, status_context: null, run_id: null, run_attempt: null, mode: "report-only", verdict: null, counts: null, ai: { calls: 0, cost_usd: null, model: null }, triaged: false, not_triaged_reason: "error: x", findings: [] };
+  const good = { schema: 2, repository: "o/r", commit_sha: "abc", pr: null, lane: null, status_context: null, run_id: null, run_attempt: null, mode: "report-only", verdict: null, basis: null, description: null, lane_diagnosis: null, rerun: null, counts: null, ai: { calls: 0, cost_usd: null, model: null }, triaged: false, not_triaged_reason: "error: x", findings: [] };
   assert.deepEqual(checkFindingsShape(good), []);
   assert.ok(checkFindingsShape({ ...good, schema: 1 }).length > 0, "a different schema is named");
   const row = { title: "t", full_title: null, file: "a", class: "REGRESSION", label: "app bug", blocking: true, decision: "adjudicator_blame", reason: "r", error_first_line: "e", out_of_date: false, tries: null, other_lanes_failed: [], ai: { cause: "app_bug", confidence: 0.9, cited: ["error"], cleared: false, explanation: "x" } };
-  assert.deepEqual(checkFindingsShape({ ...good, triaged: true, not_triaged_reason: null, verdict: "FAILURE", counts: { total: 1, passed: 0, failed: 1, flaky: 0, skipped: 0 }, findings: [row] }), []);
+  assert.deepEqual(checkFindingsShape({ ...good, triaged: true, not_triaged_reason: null, verdict: "FAILURE", basis: "tests", description: "(1 app bug) 0% passed", lane_diagnosis: { label: "caused by PR", fault: "PR", what: "linker failed", action: "fix build" }, rerun: { requested: false, of: null, held: "build failed" }, counts: { total: 1, passed: 0, failed: 1, flaky: 0, skipped: 0 }, findings: [row] }), []);
   const { label: _, ...noLabel } = row;
   assert.ok(checkFindingsShape({ ...good, findings: [noLabel] }).length > 0, "a row names its label");
   assert.ok(checkFindingsShape({ ...good, triaged: true, not_triaged_reason: null }).length > 0, "a triaged run has its verdict");

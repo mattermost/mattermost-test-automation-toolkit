@@ -46,9 +46,17 @@ export interface StatusRow {
 /** Summarizes the latest status of each lane into the aggregate's state and description. */
 export type LaneSummarizer = (lanes: LaneStatus[], untriaged?: LaneStatus[], release?: boolean, pr?: boolean) => LaneSummary;
 
+/** Options controlling aggregate status publication in `summarize`. */
+export interface SummarizeOptions {
+  /** Only update an existing aggregate owned by the same run (avoids creating phantom checks on clean re-runs). */
+  onlyIfExists?: boolean;
+  /** Receives the computed summary state and description when checked. */
+  onSummary?: (summary: LaneSummary) => void;
+}
+
 export interface StatusPublisher {
   allowed(operation: string): Promise<boolean>;
-  summarize(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean): Promise<boolean>;
+  summarize(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean, options?: SummarizeOptions): Promise<boolean>;
   write(row: StatusRow, operation?: string): Promise<boolean>;
   info(row: StatusRow): Promise<boolean>;
   refresh(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean): Promise<boolean>;
@@ -193,12 +201,23 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
   const post = (row: StatusRow, by: Owner = owner()): Promise<unknown> => api("POST", `/repos/${id.repository}/statuses/${id.commit_sha}`, {
     ...row, description: row.description.slice(0, 140), target_url: ownedURL(row.target_url, by, id.repository),
   });
-  const summarize = async (lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release = defaultRelease): Promise<boolean> => {
+  const summarize = async (lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release = defaultRelease, options: SummarizeOptions = {}): Promise<boolean> => {
     if (!summaryContext || !lanes.length) return false;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
     // GitHub's /statuses endpoint is eventually consistent right after a POST: overlay this publisher's own write only
     // when the self-read still shows the exact pre-write row (or missing row) owned by no newer/unknown writer.
     const rows = overlayStale(await readStatuses(api, id));
+    const currentAgg = rows.find((r) => r.context === summaryContext) ?? null;
+    const by = snapshotOwner();
+    const currentOwner = currentAgg ? statusOwner(currentAgg.target_url, id.repository) : null;
+    // Never let an older run's late consolidate step overwrite a newer run's aggregate status.
+    if (currentOwner && compareOwners(currentOwner, by) > 0) {
+      log(`Aggregate ${summaryContext} belongs to a newer run (${currentOwner.run}#${currentOwner.attempt}); publication skipped`);
+      return false;
+    }
+    if (options.onlyIfExists && (!currentAgg || !currentOwner || currentOwner.run !== by.run)) {
+      return false;
+    }
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return false;
     // The other E2E checks under the aggregate's prefix (an upgrade lane, a policy lane): named when red.
@@ -208,7 +227,9 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
     // A run with no PR (main, a release branch) names its failures against the commit, not a PR.
     const pr = Number(id.gh_pr_number || 0) > 0;
-    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease, pr), context: summaryContext }, snapshotOwner());
+    const summary = summarizeLanes(latest, untriaged, resolvedRelease, pr);
+    options.onSummary?.(summary);
+    await post({ ...summary, context: summaryContext }, by);
     return true;
   };
   return {

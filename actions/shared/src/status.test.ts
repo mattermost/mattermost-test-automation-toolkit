@@ -352,3 +352,42 @@ test("statusPublisher.refresh applies stale overlay inside allowed('finish') aft
   );
   assert.equal(posted.length, 2);
 });
+
+test("statusPublisher.summarize refuses older run takeover and honors onlyIfExists", async () => {
+  const ctx = "e2e-test/detox-ios";
+  const other = "e2e-test/detox-android";
+  const run55Green: CommitStatus = { context: ctx, state: "success", description: "ok", target_url: "https://github.com/o/r/actions/runs/55?status_run_id=55&status_run_attempt=2" };
+  const otherGreen: CommitStatus = { context: other, state: "success", description: "ok", target_url: "https://github.com/o/r/actions/runs/55?status_run_id=55&status_run_attempt=2" };
+  const posted: CommitStatus[] = [];
+  let rows: CommitStatus[] = [];
+  const api: GhApi = async (method, path, body) => {
+    if (method === "GET" && path.includes("/statuses")) return rows;
+    if (method === "POST" && path.includes("/statuses/")) {
+      posted.push(body as CommitStatus);
+      return {};
+    }
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+  const logs: string[] = [];
+  const pub54 = statusPublisher({ api, id: { repository: "o/r", commit_sha: "sha", gh_run_id: "54", gh_run_attempt: "1" }, context: summary, env: { GITHUB_RUN_ID: "54", GITHUB_RUN_ATTEMPT: "1" }, log: (m) => logs.push(m) });
+  const pub55a2 = statusPublisher({ api, id: { repository: "o/r", commit_sha: "sha", gh_run_id: "55", gh_run_attempt: "1" }, context: summary, env: { GITHUB_RUN_ID: "55", GITHUB_RUN_ATTEMPT: "2" }, log: (m) => logs.push(m) });
+
+  // 1. Newer run 55 owns aggregate: older run 54 cannot overwrite it.
+  rows = [run55Green, otherGreen, { context: summary, state: "success", description: "All green", target_url: "https://github.com/o/r/actions/runs/55?status_run_id=55&status_run_attempt=1" }];
+  assert.equal(await pub54.summarize([ctx, other], summary, () => ({ state: "failure", description: "stale" })), false);
+  assert.equal(posted.length, 0);
+  assert.match(logs[0] ?? "", /belongs to a newer run/);
+
+  // 2. onlyIfExists skips when no aggregate was ever posted (clean PR).
+  rows = [run55Green, otherGreen];
+  assert.equal(await pub55a2.summarize([ctx, other], summary, () => ({ state: "success", description: "All green" }), false, { onlyIfExists: true }), false);
+  assert.equal(posted.length, 0);
+
+  // 3. onlyIfExists clears same run's stale Attempt-1 pending/failure aggregate on Attempt 2.
+  rows = [run55Green, otherGreen, { context: summary, state: "pending", description: "waiting", target_url: "https://github.com/o/r/actions/runs/55?status_run_id=55&status_run_attempt=1" }];
+  let observed = "";
+  assert.equal(await pub55a2.summarize([ctx, other], summary, () => ({ state: "success", description: "All lanes green" }), false, { onlyIfExists: true, onSummary: (s) => { observed = s.description; } }), true);
+  assert.equal(observed, "All lanes green");
+  assert.equal(posted.length, 1);
+  assert.match(String(posted[0].target_url), /status_run_id=55&status_run_attempt=2/);
+});

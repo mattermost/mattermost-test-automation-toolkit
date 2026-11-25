@@ -19,6 +19,7 @@ import { askModelBatch } from "./judge.ts";
 import { evaluateRun } from "./evaluate.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
 import { findingLogLine, redact, secretsOf, writeFindings } from "./findings.ts";
+import type { LaneDiagnosisSummary, RerunSummary } from "./findings.ts";
 import { askCauseWith, decideRerun, readDeadJobs } from "./rerun-check.ts";
 import { laneDescription } from "./lane-diagnosis.ts";
 import { laneTurnsGreen } from "./lane-diagnosis.ts";
@@ -68,6 +69,10 @@ interface Seen {
   run: RunResult | null;
   result: EvaluatedRun | null;
   enforce: boolean | null;
+  basis: "tests" | "orchestration" | "lane" | null;
+  description: string | null;
+  laneDiagnosis: LaneDiagnosisSummary | null;
+  rerun: RerunSummary | null;
 }
 
 /** The composite identity, or null when it cannot be read: the findings file then names what it can. */
@@ -103,7 +108,7 @@ async function unreadHistory(read: Promise<HistoryLike>, log: (message: string) 
  */
 export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
   const written = { summary: false, aggregateOutput: false };
-  const seen: Seen = { run: null, result: null, enforce: null };
+  const seen: Seen = { run: null, result: null, enforce: null, basis: null, description: null, laneDiagnosis: null, rerun: null };
   const { env } = options;
   const log = options.log ?? console.error;
   const requested: "enforce" | "report-only" = String(env.MODE ?? "").trim() === "enforce" ? "enforce" : "report-only";
@@ -111,7 +116,7 @@ export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
   const effective = (): "enforce" | "report-only" => (seen.enforce === null ? requested : seen.enforce ? "enforce" : "report-only");
   try {
     const result = await decideRun(options, written, seen);
-    writeFindings({ env, id: identityOrNull(env), mode: effective(), run: seen.run, result, notTriaged: null }, log);
+    writeFindings({ env, id: identityOrNull(env), mode: effective(), run: seen.run, result, notTriaged: null, basis: seen.basis, description: seen.description, laneDiagnosis: seen.laneDiagnosis, rerun: seen.rerun }, log);
     return result;
   } catch (e) {
     const id = identityOrNull(env);
@@ -149,7 +154,7 @@ export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
         log(`triage's output not written: ${String(writeError).slice(0, 160)}`);
       }
     }
-    writeFindings({ env, id, mode: effective(), run: seen.run, result: seen.result, notTriaged }, log);
+    writeFindings({ env, id, mode: effective(), run: seen.run, result: seen.result, notTriaged, basis: seen.basis, description: seen.description, laneDiagnosis: seen.laneDiagnosis, rerun: seen.rerun }, log);
     if (e instanceof SupersededRunError) throw new NotTriagedError(notTriaged);
     throw e;
   }
@@ -587,11 +592,16 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       : onlyDeadJobs
       ? `(${held ? `not re-run: ${held}` : `machine failure, ${rerun ? RERUNNING : RERUN}`}) ${passLine(run.counts)}`
       : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
+    const basis: "tests" | "orchestration" | "lane" = lane ? (lane.verdict.label === "all specs ran" ? "orchestration" : "lane") : "tests";
+    seen.basis = basis;
+    seen.description = description;
+    seen.laneDiagnosis = lane ? { label: lane.verdict.label, fault: lane.verdict.fault, what: lane.verdict.what, action: lane.verdict.action } : null;
+    seen.rerun = { requested: Boolean(rerun), of: rerun?.of ?? null, held };
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
       appendFileSync(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}\nverdict=${result.verdict}\nblocking=${flag ? run.counts.failed : result.findings.filter((f) => f.blocking).length + (result.unnamed ?? 0)}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\nrerun=${Boolean(rerun)}\nrerun_of=${rerun?.of ?? ""}\nrerun_held=${held ?? ""}\n` +
-        `rerun_job=${rerun && laneRerun === "lane" ? String(lane?.startJobId ?? 0) : ""}\nlane_label=${lane?.verdict.label ?? ""}\nlane_fault=${lane?.verdict.fault ?? ""}\nbasis=${lane ? (lane.verdict.label === "all specs ran" ? "orchestration" : "lane") : "tests"}\n` +
+        `rerun_job=${rerun && laneRerun === "lane" ? String(lane?.startJobId ?? 0) : ""}\nlane_label=${lane?.verdict.label ?? ""}\nlane_fault=${lane?.verdict.fault ?? ""}\nbasis=${basis}\n` +
         `ai_calls=${spend.calls}\nai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}\nai_input_tokens=${spend.input_tokens}\nai_output_tokens=${spend.output_tokens}\n`);
     // A lane with nothing failed or missing has nothing to report, so it writes no job
     // summary: the run page then shows only the lanes someone needs to read.

@@ -59,7 +59,7 @@ jobs:
       pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
       target_repo: ${{ github.repository }}
       # Order: workflow_dispatch input → repository variable CLAUDE_MODEL → default (matches reusable workflow env).
-      claude_model: ${{ inputs.claude_model || vars.CLAUDE_MODEL || 'claude-sonnet-5-5' }}
+      claude_model: ${{ inputs.claude_model }}
     secrets:
       # When target_repo is this repo, github.token is enough (see Secrets below).
       GH_TOKEN: ${{ github.token }}
@@ -68,7 +68,7 @@ jobs:
       WEBHOOK_URL: ${{ secrets.WEBHOOK_URL_TEST_PR_ANALYSIS_HUB }}
 ```
 
-**`PR_TEST_ANALYSIS_DRY_RUN`** is **not** a field in this workflow file. Set it as a **repository variable** on the **calling** repository (see [Repository Environment Variables](#repository-environment-variables)); defaults apply if you skip them. **`CLAUDE_MODEL`** works the same way for `pull_request` runs and is already combined in `with.claude_model` above.
+**`PR_TEST_ANALYSIS_DRY_RUN`** is **not** a field in this workflow file. Set it as a **repository variable** on the **calling** repository (see [Repository Environment Variables](#repository-environment-variables)); defaults apply if you skip them. **`CLAUDE_MODEL`** falls back inside the reusable workflow when callers omit `claude_model` on `pull_request` runs.
 
 Replace the placeholder SHA after `@` with a real commit from [mattermost-test-automation-toolkit](https://github.com/mattermost/mattermost-test-automation-toolkit). This repository is not versioned with release tags for this workflow—**pin the `uses` ref to a full SHA** so behavior stays stable until you bump it on purpose.
 
@@ -85,7 +85,7 @@ GitHub resolves the `uses` ref when the workflow runs.
 |-------|----------|---------|-------------|
 | `pr_number` | Yes | — | PR number to analyze |
 | `target_repo` | Yes | — | Full repo name (e.g., `mattermost/mattermost`) |
-| `claude_model` | No | `claude-sonnet-5-5` | Effective model: this **`workflow_call` input**, then repository variable **`CLAUDE_MODEL`**, then `claude-sonnet-5-5` (see `env.CLAUDE_MODEL` in the reusable workflow). In the Usage example, the caller supplies the same order using `workflow_dispatch` input where applicable. |
+| `claude_model` | No | `""` (falls back to `vars.CLAUDE_MODEL` then `claude-sonnet-5-5`) | Effective model: this **`workflow_call` input**, then repository variable **`CLAUDE_MODEL`**, then `claude-sonnet-5-5` (see `env.CLAUDE_MODEL` in the reusable workflow). Leave empty in callers so repository variable `CLAUDE_MODEL` takes effect without editing workflow YAML. |
 | `allowed_bots` | No | `cursor[bot],unified-ci-app[bot],dependabot[bot]` | Comma-separated bot actor logins allowed to trigger analysis. Dependabot-triggered runs require `ANTHROPIC_API_KEY` as a Dependabot secret (Actions secrets are not exposed to Dependabot runs; otherwise analysis skips with unavailable status). |
 
 ## Secrets
@@ -183,5 +183,5 @@ Available hashtags for filtering:
 - `#pass-test-analysis` — passing results
 - `#fail-test-analysis` — failing results
 - `#override-test-analysis` — manual overrides
-- `#unavailable-test-analysis` — analysis unavailable (AI error, timeout, or missing `ANTHROPIC_API_KEY`)
+- `#unavailable-test-analysis` — analysis unavailable (AI error, timeout, or missing `ANTHROPIC_API_KEY`; never posted for external/forked PRs without secrets)
 - `#<repo>-pr-<number>` — specific PR (e.g., `#mattermost-pr-1234`)

@@ -36,6 +36,21 @@ export interface FindingRow {
   ai: { cause: string | null; confidence: number | null; cited: string[]; cleared: boolean; explanation: string | null };
 }
 
+/** Lane-level diagnosis when a run fails outside individual test cases (e.g., build/provision failure). */
+export interface LaneDiagnosisSummary {
+  label: string;
+  fault: string;
+  what: string;
+  action: string;
+}
+
+/** Whether triage requested or held an automatic re-run for this lane. */
+export interface RerunSummary {
+  requested: boolean;
+  of: number | null;
+  held: string | null;
+}
+
 /** The whole file. A run that was not triaged has no verdict or findings, and says why in not_triaged_reason. */
 export interface FindingsRecord {
   schema: typeof FINDINGS_SCHEMA;
@@ -48,6 +63,10 @@ export interface FindingsRecord {
   run_attempt: string | null;
   mode: "enforce" | "report-only";
   verdict: string | null;
+  basis: "tests" | "orchestration" | "lane" | null;
+  description: string | null;
+  lane_diagnosis: LaneDiagnosisSummary | null;
+  rerun: RerunSummary | null;
   counts: Counts | null;
   ai: { calls: number; cost_usd: number | null; model: string | null };
   triaged: boolean;
@@ -63,6 +82,10 @@ export interface FindingsFacts {
   run: RunResult | null;
   result: EvaluatedRun | null;
   notTriaged: string | null;
+  basis?: "tests" | "orchestration" | "lane" | null;
+  description?: string | null;
+  laneDiagnosis?: LaneDiagnosisSummary | null;
+  rerun?: RerunSummary | null;
 }
 
 const SECRET_PATTERNS = [/gh[pousr]_[A-Za-z0-9]{20,}/g, /github_pat_[A-Za-z0-9_]{20,}/g, /sk-ant-[A-Za-z0-9_-]{8,}/g, /\bBearer\s+[^\s"']+/gi];
@@ -130,7 +153,7 @@ export function findingLogLine(f: Finding, n: number, of: number, secrets: strin
 export const secretsOf = (env: Env): string[] => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY].filter((s): s is string => Boolean(s));
 
 /** The findings file's contents for one run. */
-export function findingsRecord({ env, id, mode, run, result, notTriaged }: FindingsFacts): FindingsRecord {
+export function findingsRecord({ env, id, mode, run, result, notTriaged, basis = null, description = null, laneDiagnosis = null, rerun = null }: FindingsFacts): FindingsRecord {
   const secrets = secretsOf(env);
   const ai = result?.ai ?? newLedger();
   const spend = ledgerTotals(ai);
@@ -147,6 +170,17 @@ export function findingsRecord({ env, id, mode, run, result, notTriaged }: Findi
     run_attempt: text(id?.gh_run_attempt),
     mode,
     verdict: result?.verdict ?? null,
+    basis: basis ?? null,
+    description: description ? clip(redact(description, secrets), 200) : null,
+    lane_diagnosis: laneDiagnosis
+      ? {
+          label: redact(laneDiagnosis.label, secrets),
+          fault: redact(laneDiagnosis.fault, secrets),
+          what: clip(redact(laneDiagnosis.what, secrets), 300),
+          action: clip(redact(laneDiagnosis.action, secrets), 200),
+        }
+      : null,
+    rerun: rerun ? { requested: Boolean(rerun.requested), of: rerun.of ?? null, held: rerun.held ? redact(rerun.held, secrets) : null } : null,
     counts: run?.counts ?? null,
     ai: { calls: spend.calls, cost_usd: spend.cost_usd, model: served.length ? served.join(", ") : null },
     triaged: notTriaged == null,
@@ -166,7 +200,7 @@ export function writeFindings(facts: FindingsFacts, log: (message: string) => vo
   }
 }
 
-const TOP_KEYS = ["schema", "repository", "commit_sha", "pr", "lane", "status_context", "run_id", "run_attempt", "mode", "verdict", "counts", "ai", "triaged", "not_triaged_reason", "findings"];
+const TOP_KEYS = ["schema", "repository", "commit_sha", "pr", "lane", "status_context", "run_id", "run_attempt", "mode", "verdict", "basis", "description", "lane_diagnosis", "rerun", "counts", "ai", "triaged", "not_triaged_reason", "findings"];
 const ROW_KEYS = ["title", "full_title", "file", "class", "label", "blocking", "decision", "reason", "error_first_line", "out_of_date", "tries", "other_lanes_failed", "ai"];
 const COUNT_KEYS = ["total", "passed", "failed", "flaky", "skipped"];
 
@@ -192,7 +226,22 @@ export function checkFindingsShape(value: unknown): string[] {
   };
   exactKeys(value, TOP_KEYS, "record", problems);
   need(value.schema === FINDINGS_SCHEMA, `schema: must be ${FINDINGS_SCHEMA}`);
-  for (const k of ["repository", "commit_sha", "lane", "status_context", "run_id", "run_attempt", "verdict", "not_triaged_reason"]) need(orNull(isStr)(value[k]), `${k}: string or null`);
+  for (const k of ["repository", "commit_sha", "lane", "status_context", "run_id", "run_attempt", "verdict", "description", "not_triaged_reason"]) need(orNull(isStr)(value[k]), `${k}: string or null`);
+  need(value.basis === null || value.basis === "tests" || value.basis === "orchestration" || value.basis === "lane", "basis: tests, orchestration, lane, or null");
+  const ld = value.lane_diagnosis;
+  if (ld !== null) {
+    if (isObj(ld)) {
+      exactKeys(ld, ["label", "fault", "what", "action"], "lane_diagnosis", problems);
+      need(isStr(ld.label) && isStr(ld.fault) && isStr(ld.what) && isStr(ld.action), "lane_diagnosis: label, fault, what, action strings");
+    } else problems.push("lane_diagnosis: object or null");
+  }
+  const rr = value.rerun;
+  if (rr !== null) {
+    if (isObj(rr)) {
+      exactKeys(rr, ["requested", "of", "held"], "rerun", problems);
+      need(isBool(rr.requested) && orNull(isNum)(rr.of) && orNull(isStr)(rr.held), "rerun: requested, of, held");
+    } else problems.push("rerun: object or null");
+  }
   need(orNull(isNum)(value.pr), "pr: number or null");
   need(value.mode === "enforce" || value.mode === "report-only", "mode: enforce or report-only");
   const counts = value.counts;

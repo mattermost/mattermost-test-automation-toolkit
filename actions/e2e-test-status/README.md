@@ -14,9 +14,7 @@ are left alone. API errors or truncated history fail closed.
 
 ## Required caller serialization
 
-GitHub statuses have no atomic compare-and-swap. **The guard alone is not a
-lock.** All prepare/claim, skip, report/triage, and aggregate-publication jobs
-for the tested commit must use this same repository-wide mutex:
+All producers of a given SHA's statuses must hold this same repository-wide mutex across reads and writes. The one exception is parallel per-lane triage running with `triage-status-context: "off"` (while keeping `triage-lanes` set so per-PR budget splitting still applies), followed by a single downstream consolidation job (`actions/e2e-test-triage/consolidate`) holding the SHA lock to project the aggregate check and summaries. Note that unlocked per-lane triage leaves a narrow simultaneous-write window against manual `E2E/Override` updates to the same lane; `mayPublish` still prevents overwriting any already-completed manual override.
 
 ```yaml
 concurrency:

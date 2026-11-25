@@ -1,7 +1,8 @@
 "use strict";
 
-// src/triage.ts
-var import_node_fs3 = require("fs");
+// src/consolidate.ts
+var import_node_fs2 = require("fs");
+var import_node_path = require("path");
 
 // ../shared/src/github.ts
 var sleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
@@ -138,7 +139,7 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
     ...judged.length && otherRed.length ? [[[[], []], ["none"]]] : []
   ];
   const otherCount = judged.length ? `${judged.length + otherRed.length} other E2E check(s) red${rerunNote(judged.map((l) => otherReason(l, "none")))}` : `not triaged: ${otherRed.length} red`;
-  const join2 = (...parts) => parts.filter(Boolean).join(" \xB7 ");
+  const join3 = (...parts) => parts.filter(Boolean).join(" \xB7 ");
   const fit = (texts, fewer = []) => {
     const fits = (text) => text.length <= STATUS_LIMIT;
     const own = [...new Set(texts)];
@@ -146,7 +147,7 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
       for (const [[shownJudged, shownRed], wordings] of otherSteps) {
         for (const text of own) {
           for (const wording of wordings) {
-            const candidate = join2(text, otherNamed(wording, shownJudged, shownRed));
+            const candidate = join3(text, otherNamed(wording, shownJudged, shownRed));
             if (fits(candidate)) return candidate;
           }
         }
@@ -155,11 +156,11 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
     const other = redOthers.length ? otherCount : "";
     const all = [...own, ...fewer];
     for (const text of all) {
-      const candidate = join2(text, other);
+      const candidate = join3(text, other);
       if (fits(candidate)) return candidate;
     }
     const room = STATUS_LIMIT - (other ? other.length + 3 : 0);
-    return join2(`${(all[all.length - 1] ?? "").slice(0, room - 1)}\u2026`, other);
+    return join3(`${(all[all.length - 1] ?? "").slice(0, room - 1)}\u2026`, other);
   };
   const waiting = seen.filter((l) => l.status.state === "pending").map((l) => laneName(l.context));
   if (waiting.length) {
@@ -179,23 +180,23 @@ function laneSummary(lanes, untriaged = [], release, pr = true) {
       const rs = reasons(wording);
       const rest = rs.slice(shown).map((r) => r.reason);
       const counted = rest.length ? `${shown ? "+" : ""}${rest.length}${shown ? " more" : ""} lane(s) red${rerunNote(rest)}` : "";
-      return join2(...rs.slice(0, shown).map((r) => `${r.name}: ${r.reason}`), counted);
+      return join3(...rs.slice(0, shown).map((r) => `${r.name}: ${r.reason}`), counted);
     };
     const texts = [
-      ...CLEARED_WORDINGS.map((wording) => join2(named(wording, red.length), clearedText)),
-      join2(named("none", red.length), clearedCount),
+      ...CLEARED_WORDINGS.map((wording) => join3(named(wording, red.length), clearedText)),
+      join3(named("none", red.length), clearedCount),
       named("none", red.length)
     ];
     const fewer = [];
     for (let shown = red.length; shown >= 0; shown--) {
       for (const wording of ["none", "action"]) {
-        if (shown || wording === "action") fewer.push(join2(named(wording, shown), clearedCount), named(wording, shown));
+        if (shown || wording === "action") fewer.push(join3(named(wording, shown), clearedCount), named(wording, shown));
       }
     }
     return { state: "failure", description: fit(texts, fewer) };
   }
   if (redOthers.length) {
-    return { state: "success", description: fit([join2(clearedText, "triaged lanes green"), join2(clearedCount, "triaged lanes green"), "triaged lanes green"]) };
+    return { state: "success", description: fit([join3(clearedText, "triaged lanes green"), join3(clearedCount, "triaged lanes green"), "triaged lanes green"]) };
   }
   if (clearedText) return { state: "success", description: fit([`${clearedText} \xB7 all lanes green`, `${clearedCount} \xB7 all lanes green`]) };
   return { state: "success", description: "All lanes green" };
@@ -214,9 +215,9 @@ function statusOwner(target, repository) {
   try {
     const url = new URL(String(target));
     const path = url.pathname.match(/^\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)(?:\/attempts\/(\d+))?\/?$/);
-    const run = url.searchParams.get("status_run_id") || (path && url.hostname === "github.com" && path[1] === repository ? path[2] : url.searchParams.get("gh_run_id"));
+    const run2 = url.searchParams.get("status_run_id") || (path && url.hostname === "github.com" && path[1] === repository ? path[2] : url.searchParams.get("gh_run_id"));
     const attempt = url.searchParams.get("status_run_attempt") || path?.[3] || url.searchParams.get("gh_run_attempt") || "1";
-    return positive(run) && positive(attempt) ? { run: String(run), attempt: String(attempt) } : null;
+    return positive(run2) && positive(attempt) ? { run: String(run2), attempt: String(attempt) } : null;
   } catch {
     return null;
   }
@@ -315,10 +316,20 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     description: row.description.slice(0, 140),
     target_url: ownedURL(row.target_url, by, id.repository)
   });
-  const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease) => {
+  const summarize = async (lanes, summaryContext, summarizeLanes, release = defaultRelease, options = {}) => {
     if (!summaryContext || !lanes.length) return false;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
     const rows = overlayStale(await readStatuses(api, id));
+    const currentAgg = rows.find((r) => r.context === summaryContext) ?? null;
+    const by = snapshotOwner();
+    const currentOwner = currentAgg ? statusOwner(currentAgg.target_url, id.repository) : null;
+    if (currentOwner && compareOwners(currentOwner, by) > 0) {
+      log(`Aggregate ${summaryContext} belongs to a newer run (${currentOwner.run}#${currentOwner.attempt}); publication skipped`);
+      return false;
+    }
+    if (options.onlyIfExists && (!currentAgg || !currentOwner || currentOwner.run !== by.run)) {
+      return false;
+    }
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
     if (!latest.some((lane) => lane.status)) return false;
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
@@ -326,7 +337,9 @@ function statusPublisher({ api, id, context, env = {}, log = console.error, rele
     const untriaged = others.map((c) => ({ context: c, status: rows.find((r) => r.context === c) ?? null }));
     const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
     const pr = Number(id.gh_pr_number || 0) > 0;
-    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease, pr), context: summaryContext }, snapshotOwner());
+    const summary = summarizeLanes(latest, untriaged, resolvedRelease, pr);
+    options.onSummary?.(summary);
+    await post({ ...summary, context: summaryContext }, by);
     return true;
   };
   return {
@@ -418,8 +431,8 @@ var finished = (g) => {
   return o?.status === "completed" && !o.counts?.pending && !o.counts?.leased && !o.counts?.abandoned && typeof ran === "number" && ran === g.test_stats?.total;
 };
 var newerRun = (a, b) => {
-  const run = BigInt(a.gh_run_id) - BigInt(b.gh_run_id);
-  return run !== BigInt(0) ? run > BigInt(0) : BigInt(a.gh_run_attempt) > BigInt(b.gh_run_attempt);
+  const run2 = BigInt(a.gh_run_id) - BigInt(b.gh_run_id);
+  return run2 !== BigInt(0) ? run2 > BigInt(0) : BigInt(a.gh_run_attempt) > BigInt(b.gh_run_attempt);
 };
 var SupersededRunError = class extends Error {
   replacement;
@@ -604,6 +617,9 @@ function missingReports(missing) {
   if (expected == null) return { text: `the run's results are incomplete (${received ?? "?"} reports arrived; the expected count is unknown; TSIO group ${state})`, short: "results incomplete" };
   return { text: `the run's results are incomplete (${received ?? "?"} of ${expected} reports arrived; TSIO group ${state})`, short: `results incomplete: ${received ?? "?"} of ${expected} reports` };
 }
+
+// src/findings.ts
+var import_node_fs = require("fs");
 
 // src/pricing.ts
 var PRICES = {
@@ -1213,88 +1229,6 @@ function infraVerdict(failing, cfg = DEFAULTS, total) {
   return null;
 }
 
-// src/artifacts.ts
-var import_node_path2 = require("path");
-
-// ../shared/src/zip.ts
-var import_node_zlib = require("zlib");
-var ZipError = class extends Error {
-};
-ZipError.prototype.name = "ZipError";
-var EOCD = 101010256;
-var CENTRAL = 33639248;
-var LOCAL = 67324752;
-var EOCD_SEARCH = 22 + 65535;
-var defaultErrorText = (e) => {
-  const name = e?.name || "Error";
-  const message = String(e?.message ?? e).split("\n")[0].slice(0, 200);
-  return `${name}: ${message}`;
-};
-function listZipEntries(zip) {
-  let end = -1;
-  for (let i = zip.length - 22; i >= Math.max(0, zip.length - EOCD_SEARCH); i--) {
-    if (zip.readUInt32LE(i) === EOCD && i + 22 + zip.readUInt16LE(i + 20) === zip.length) {
-      end = i;
-      break;
-    }
-  }
-  if (end < 0) throw new ZipError("not a ZIP archive: no end of central directory");
-  const diskEntries = zip.readUInt16LE(end + 8);
-  const entries = zip.readUInt16LE(end + 10);
-  const cdSize = zip.readUInt32LE(end + 12);
-  const offset = zip.readUInt32LE(end + 16);
-  if (diskEntries === 65535 || entries === 65535 || cdSize === 4294967295 || offset === 4294967295)
-    throw new ZipError("a ZIP64 archive, which is not read");
-  const out = [];
-  let p = offset;
-  for (let i = 0; i < entries; i++) {
-    if (p + 46 > zip.length || zip.readUInt32LE(p) !== CENTRAL) throw new ZipError("a malformed central directory");
-    const flags = zip.readUInt16LE(p + 8);
-    const method = zip.readUInt16LE(p + 10);
-    const crc = zip.readUInt32LE(p + 16);
-    const compressed = zip.readUInt32LE(p + 20);
-    const size = zip.readUInt32LE(p + 24);
-    const nameLength = zip.readUInt16LE(p + 28);
-    const extraLength = zip.readUInt16LE(p + 30);
-    const commentLength = zip.readUInt16LE(p + 32);
-    const local = zip.readUInt32LE(p + 42);
-    if (p + 46 + nameLength + extraLength + commentLength > zip.length) throw new ZipError("a malformed central directory");
-    const name = zip.subarray(p + 46, p + 46 + nameLength).toString("utf8");
-    p += 46 + nameLength + extraLength + commentLength;
-    out.push({ name, flags, method, crc, compressed, size, local });
-  }
-  return out;
-}
-function readZipEntry(zip, entry, max, formatError = defaultErrorText) {
-  const { name, flags, method, crc, compressed, size, local } = entry;
-  if (flags & 1) throw new ZipError(`${name} is encrypted`);
-  if (compressed === 4294967295 || size === 4294967295 || local === 4294967295)
-    throw new ZipError(`${name} is a ZIP64 member, which is not read`);
-  if (size > max) throw new ZipError(`${name} is ${size} bytes, more than ${max}`);
-  if (local + 30 > zip.length || zip.readUInt32LE(local) !== LOCAL)
-    throw new ZipError(`${name} has no local header where the directory says`);
-  const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
-  if (start + compressed > zip.length) throw new ZipError(`${name} runs past the end of the archive`);
-  const raw = zip.subarray(start, start + compressed);
-  let data;
-  if (method === 0) {
-    if (compressed !== size) throw new ZipError(`${name} does not match its size and CRC-32 in the archive`);
-    data = Buffer.from(raw);
-  } else if (method === 8) {
-    try {
-      data = (0, import_node_zlib.inflateRawSync)(raw, { maxOutputLength: Math.max(1, max) });
-    } catch (e) {
-      throw new ZipError(`${name} does not inflate: ${formatError(e)}`);
-    }
-  } else throw new ZipError(`${name} uses compression method ${method}, which is not read`);
-  if (data.length !== size || (0, import_node_zlib.crc32)(data) !== crc)
-    throw new ZipError(`${name} does not match its size and CRC-32 in the archive`);
-  return data;
-}
-
-// src/findings.ts
-var import_node_fs = require("fs");
-
 // src/render.ts
 var CODE_ESCAPES = { "|": "&#124;", "<": "&lt;", ">": "&gt;", "`": "&#96;" };
 var mdCode = (s) => String(s).replace(/[|<>`]/g, (c) => CODE_ESCAPES[c]).replace(/\r?\n/g, " ");
@@ -1738,7 +1672,7 @@ function findingLogLine(f, n, of, secrets) {
   return clip(line.replace(/\s+/g, " "), 500);
 }
 var secretsOf = (env) => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY].filter((s) => Boolean(s));
-function findingsRecord({ env, id, mode, run, result, notTriaged }) {
+function findingsRecord({ env, id, mode, run: run2, result, notTriaged, basis = null, description = null, laneDiagnosis = null, rerun = null }) {
   const secrets = secretsOf(env);
   const ai = result?.ai ?? newLedger();
   const spend = ledgerTotals(ai);
@@ -1755,7 +1689,16 @@ function findingsRecord({ env, id, mode, run, result, notTriaged }) {
     run_attempt: text(id?.gh_run_attempt),
     mode,
     verdict: result?.verdict ?? null,
-    counts: run?.counts ?? null,
+    basis: basis ?? null,
+    description: description ? clip(redact(description, secrets), 200) : null,
+    lane_diagnosis: laneDiagnosis ? {
+      label: redact(laneDiagnosis.label, secrets),
+      fault: redact(laneDiagnosis.fault, secrets),
+      what: clip(redact(laneDiagnosis.what, secrets), 300),
+      action: clip(redact(laneDiagnosis.action, secrets), 200)
+    } : null,
+    rerun: rerun ? { requested: Boolean(rerun.requested), of: rerun.of ?? null, held: rerun.held ? redact(rerun.held, secrets) : null } : null,
+    counts: run2?.counts ?? null,
     ai: { calls: spend.calls, cost_usd: spend.cost_usd, model: served.length ? served.join(", ") : null },
     triaged: notTriaged == null,
     not_triaged_reason: notTriaged == null ? null : redact(notTriaged, secrets),
@@ -1771,6 +1714,277 @@ function writeFindings(facts, log) {
   } catch (e) {
     log(`findings file not written: ${String(e).slice(0, 160)}`);
   }
+}
+
+// src/consolidate.ts
+var mdCell = (s) => String(s ?? "").replace(/[|<>`]/g, "\\$&").replace(/\r?\n/g, " ");
+function recommendedAction(label, fault, rerunRequested) {
+  if (label === "out of date" || label === "fixed on main") return "merge_base";
+  if (label === "caused by PR" || label === "app bug") return "fix_pr";
+  if (label === "test bug") return "fix_test";
+  if (label === "machine failure" || fault === "infrastructure" || rerunRequested) return "rerun";
+  return "investigate";
+}
+function loadFindingsDir(dir, log = console.warn) {
+  if (!dir || !(0, import_node_fs2.existsSync)(dir)) return [];
+  const files = (0, import_node_fs2.readdirSync)(dir, { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map((entry) => (0, import_node_path.join)(entry.parentPath ?? entry.path ?? dir, entry.name)).sort();
+  const out = [];
+  for (const file of files) {
+    try {
+      const parsed = JSON.parse((0, import_node_fs2.readFileSync)(file, "utf8"));
+      if (parsed?.schema === FINDINGS_SCHEMA && typeof parsed.lane === "string" && Array.isArray(parsed.findings)) {
+        out.push(parsed);
+      } else {
+        log(`e2e-test-triage consolidate: skipped non-findings JSON ${file}`);
+      }
+    } catch (e) {
+      log(`e2e-test-triage consolidate: failed reading ${file}: ${String(e).slice(0, 160)}`);
+    }
+  }
+  return out.sort((a, b) => String(a.lane ?? "").localeCompare(String(b.lane ?? "")));
+}
+function buildTriageSummary(records, aggregate, secrets = []) {
+  let blockingTotal = 0;
+  let exoneratedTotal = 0;
+  let aiCalls = 0;
+  let aiCost = 0;
+  let costUnknown = false;
+  let failingLanes = 0;
+  const lanes = [];
+  const blockingItems = [];
+  for (const r of records) {
+    const lane = r.lane ?? "unknown";
+    const superseded = !r.triaged && Boolean(r.not_triaged_reason?.startsWith("superseded:"));
+    const findings = r.findings ?? [];
+    const blockingRows = findings.filter((f) => f.blocking);
+    const laneCleared = findings.filter((f) => !f.blocking).length;
+    const laneFailed = !superseded && (!r.triaged || blockingRows.length > 0 || Boolean(r.verdict && r.verdict !== "SUCCESS"));
+    const laneBlocked = superseded ? 0 : blockingRows.length > 0 ? blockingRows.length : !r.triaged || r.verdict && r.verdict !== "SUCCESS" ? 1 : 0;
+    if (laneFailed) failingLanes++;
+    blockingTotal += laneBlocked;
+    exoneratedTotal += laneCleared;
+    aiCalls += r.ai?.calls ?? 0;
+    if (r.ai?.calls && r.ai.cost_usd == null) costUnknown = true;
+    else aiCost += r.ai?.cost_usd ?? 0;
+    const cleanDiag = r.lane_diagnosis ? {
+      label: redact(r.lane_diagnosis.label, secrets),
+      fault: redact(r.lane_diagnosis.fault, secrets),
+      what: redact(r.lane_diagnosis.what, secrets),
+      action: redact(r.lane_diagnosis.action, secrets)
+    } : null;
+    const cleanRerun = r.rerun ? { requested: Boolean(r.rerun.requested), of: r.rerun.of ?? null, held: r.rerun.held ? redact(r.rerun.held, secrets) : null } : null;
+    lanes.push({
+      lane,
+      status_context: r.status_context ?? null,
+      verdict: r.verdict ?? null,
+      basis: r.basis ?? null,
+      description: r.description ? redact(r.description, secrets) : null,
+      triaged: Boolean(r.triaged),
+      not_triaged_reason: r.not_triaged_reason ? redact(r.not_triaged_reason, secrets) : null,
+      blocking: laneBlocked,
+      exonerated: laneCleared,
+      lane_diagnosis: cleanDiag,
+      rerun: cleanRerun
+    });
+    for (const f of blockingRows) {
+      blockingItems.push({
+        lane,
+        kind: "test",
+        title: redact(f.full_title ?? f.title, secrets),
+        file: f.file ? redact(f.file, secrets) : null,
+        label: f.label,
+        recommended_action: recommendedAction(f.label, null, Boolean(r.rerun?.requested)),
+        error_first_line: redact(f.error_first_line ?? "", secrets),
+        ai_explanation: f.ai?.explanation ? redact(f.ai.explanation, secrets) : null,
+        ai_confidence: f.ai?.confidence ?? null,
+        cited: f.ai?.cited ?? []
+      });
+    }
+    if (blockingRows.length === 0 && laneFailed) {
+      blockingItems.push({
+        lane,
+        kind: "lane",
+        title: redact(cleanDiag ? cleanDiag.label : r.not_triaged_reason ?? "lane failed", secrets),
+        file: null,
+        label: cleanDiag?.label ?? (r.triaged ? "needs investigation" : "not triaged"),
+        recommended_action: recommendedAction(cleanDiag?.label ?? "", cleanDiag?.fault ?? null, Boolean(r.rerun?.requested)),
+        error_first_line: redact(cleanDiag?.what || r.description || r.not_triaged_reason || "", secrets),
+        ai_explanation: cleanDiag?.action ?? null,
+        ai_confidence: null,
+        cited: []
+      });
+    }
+  }
+  const derivedState = failingLanes > 0 || blockingTotal > 0 ? "failure" : "success";
+  const derivedDesc = failingLanes > 0 ? `${failingLanes} lane(s) blocking (${blockingTotal} issue(s))` : records.length ? `All ${records.length} triaged lane(s) cleared (${exoneratedTotal} cleared)` : "All lanes green";
+  return {
+    schema: 1,
+    overall_state: aggregate?.state ?? derivedState,
+    overall_description: redact(aggregate?.description ?? derivedDesc, secrets),
+    totals: { lanes: records.length, failing_lanes: failingLanes, blocking: blockingTotal, exonerated: exoneratedTotal, ai_calls: aiCalls, ai_cost_usd: costUnknown ? null : Number(aiCost.toFixed(6)) },
+    lanes,
+    blocking_items: blockingItems
+  };
+}
+function renderTriageSummaryMarkdown(summary) {
+  const icon = summary.overall_state === "success" ? "\u2705" : summary.overall_state === "pending" ? "\u23F3" : "\u274C";
+  const cost = summary.totals.ai_cost_usd == null ? "unknown" : `$${summary.totals.ai_cost_usd.toFixed(4)}`;
+  const lines = [
+    `## ${icon} E2E Triage Consolidated Summary`,
+    "",
+    `**Status:** \`${summary.overall_state}\` \u2014 ${mdCell(summary.overall_description)}`,
+    `**Totals:** ${summary.totals.lanes} lane(s) triaged \xB7 ${summary.totals.blocking} blocking \xB7 ${summary.totals.exonerated} cleared \xB7 AI calls: ${summary.totals.ai_calls} (${cost})`
+  ];
+  if (summary.lanes.length) {
+    lines.push("", "| Lane | Verdict | Blocking | Cleared | Cause / Summary |", "|---|---|---:|---:|---|");
+    for (const l of summary.lanes) {
+      const verdict = l.triaged ? l.verdict ?? "\u2014" : `not triaged`;
+      const cause = l.description ?? l.lane_diagnosis?.what ?? l.not_triaged_reason ?? "\u2014";
+      lines.push(`| ${mdCell(l.lane)} | ${mdCell(verdict)} | ${l.blocking} | ${l.exonerated} | ${mdCell(cause)} |`);
+    }
+  }
+  if (summary.blocking_items.length) {
+    lines.push("", "### Agent Fix Brief", "");
+    for (const item of summary.blocking_items) {
+      const loc = item.file ? ` (${mdCell(item.file)})` : "";
+      const why = item.ai_explanation ? ` \u2014 ${mdCell(item.ai_explanation)}` : "";
+      const err = item.error_first_line ? ` \`${mdCell(item.error_first_line.slice(0, 140))}\`` : "";
+      lines.push(`- **[${item.recommended_action}]** \`${mdCell(item.lane)}\` \xB7 ${mdCell(item.label)} \xB7 ${mdCell(item.title)}${loc}${err}${why}`);
+    }
+  }
+  return lines.join("\n");
+}
+async function consolidate({ env, fetchImpl = fetch, log = console.error, retryWait }) {
+  if (env.CANCELLED === "true") return null;
+  const secrets = secretsOf(env);
+  const records = loadFindingsDir(env.FINDINGS_DIR, log);
+  const triageContext = String(env.TRIAGE_CONTEXT ?? "").trim();
+  const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const onlyIfExists = String(env.ONLY_IF_EXISTS ?? "").trim().toLowerCase() === "true";
+  const rawRelease = String(env.RELEASE ?? "").trim().toLowerCase();
+  const release = rawRelease === "true" ? true : rawRelease === "false" ? false : void 0;
+  let published = false;
+  let aggregate = null;
+  if (triageContext && lanes.length && env.GITHUB_TOKEN && env.COMPOSITE_IDENTITY) {
+    const id = compositeIdentityFrom(env.COMPOSITE_IDENTITY);
+    const publisher = statusPublisher({ api: gh(fetchImpl, env.GITHUB_TOKEN, retryWait), id, context: triageContext, env, log, release });
+    published = await publisher.summarize(lanes, triageContext, laneSummary, release, {
+      onlyIfExists,
+      onSummary: (s) => {
+        aggregate = s;
+      }
+    });
+  } else if (triageContext) {
+    log("e2e-test-triage consolidate: triage-status-context set without github-token, composite-identity, or triage-lanes; status not published");
+  }
+  const summary = buildTriageSummary(records, aggregate, secrets);
+  if (env.SUMMARY_FILE) {
+    (0, import_node_fs2.mkdirSync)((0, import_node_path.dirname)(env.SUMMARY_FILE), { recursive: true });
+    (0, import_node_fs2.writeFileSync)(env.SUMMARY_FILE, `${JSON.stringify(summary, null, 2)}
+`);
+  }
+  if (env.GITHUB_STEP_SUMMARY && String(env.WRITE_SUMMARY ?? "true").trim().toLowerCase() !== "false" && (records.length > 0 || published)) {
+    (0, import_node_fs2.appendFileSync)(env.GITHUB_STEP_SUMMARY, `${renderTriageSummaryMarkdown(summary)}
+`);
+  }
+  if (env.GITHUB_OUTPUT) {
+    const desc = summary.overall_description.replace(/[\r\n]+/g, " ");
+    const costOut = summary.totals.ai_cost_usd == null ? "unknown" : summary.totals.ai_cost_usd.toFixed(6);
+    (0, import_node_fs2.appendFileSync)(
+      env.GITHUB_OUTPUT,
+      `state=${summary.overall_state}
+description=${desc}
+published=${published}
+blocking=${summary.totals.blocking}
+exonerated=${summary.totals.exonerated}
+ai_calls=${summary.totals.ai_calls}
+ai_cost_usd=${costOut}
+`
+    );
+  }
+  return summary;
+}
+
+// src/triage.ts
+var import_node_fs4 = require("fs");
+
+// src/artifacts.ts
+var import_node_path3 = require("path");
+
+// ../shared/src/zip.ts
+var import_node_zlib = require("zlib");
+var ZipError = class extends Error {
+};
+ZipError.prototype.name = "ZipError";
+var EOCD = 101010256;
+var CENTRAL = 33639248;
+var LOCAL = 67324752;
+var EOCD_SEARCH = 22 + 65535;
+var defaultErrorText = (e) => {
+  const name = e?.name || "Error";
+  const message = String(e?.message ?? e).split("\n")[0].slice(0, 200);
+  return `${name}: ${message}`;
+};
+function listZipEntries(zip) {
+  let end = -1;
+  for (let i = zip.length - 22; i >= Math.max(0, zip.length - EOCD_SEARCH); i--) {
+    if (zip.readUInt32LE(i) === EOCD && i + 22 + zip.readUInt16LE(i + 20) === zip.length) {
+      end = i;
+      break;
+    }
+  }
+  if (end < 0) throw new ZipError("not a ZIP archive: no end of central directory");
+  const diskEntries = zip.readUInt16LE(end + 8);
+  const entries = zip.readUInt16LE(end + 10);
+  const cdSize = zip.readUInt32LE(end + 12);
+  const offset = zip.readUInt32LE(end + 16);
+  if (diskEntries === 65535 || entries === 65535 || cdSize === 4294967295 || offset === 4294967295)
+    throw new ZipError("a ZIP64 archive, which is not read");
+  const out = [];
+  let p = offset;
+  for (let i = 0; i < entries; i++) {
+    if (p + 46 > zip.length || zip.readUInt32LE(p) !== CENTRAL) throw new ZipError("a malformed central directory");
+    const flags = zip.readUInt16LE(p + 8);
+    const method = zip.readUInt16LE(p + 10);
+    const crc = zip.readUInt32LE(p + 16);
+    const compressed = zip.readUInt32LE(p + 20);
+    const size = zip.readUInt32LE(p + 24);
+    const nameLength = zip.readUInt16LE(p + 28);
+    const extraLength = zip.readUInt16LE(p + 30);
+    const commentLength = zip.readUInt16LE(p + 32);
+    const local = zip.readUInt32LE(p + 42);
+    if (p + 46 + nameLength + extraLength + commentLength > zip.length) throw new ZipError("a malformed central directory");
+    const name = zip.subarray(p + 46, p + 46 + nameLength).toString("utf8");
+    p += 46 + nameLength + extraLength + commentLength;
+    out.push({ name, flags, method, crc, compressed, size, local });
+  }
+  return out;
+}
+function readZipEntry(zip, entry, max, formatError = defaultErrorText) {
+  const { name, flags, method, crc, compressed, size, local } = entry;
+  if (flags & 1) throw new ZipError(`${name} is encrypted`);
+  if (compressed === 4294967295 || size === 4294967295 || local === 4294967295)
+    throw new ZipError(`${name} is a ZIP64 member, which is not read`);
+  if (size > max) throw new ZipError(`${name} is ${size} bytes, more than ${max}`);
+  if (local + 30 > zip.length || zip.readUInt32LE(local) !== LOCAL)
+    throw new ZipError(`${name} has no local header where the directory says`);
+  const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
+  if (start + compressed > zip.length) throw new ZipError(`${name} runs past the end of the archive`);
+  const raw = zip.subarray(start, start + compressed);
+  let data;
+  if (method === 0) {
+    if (compressed !== size) throw new ZipError(`${name} does not match its size and CRC-32 in the archive`);
+    data = Buffer.from(raw);
+  } else if (method === 8) {
+    try {
+      data = (0, import_node_zlib.inflateRawSync)(raw, { maxOutputLength: Math.max(1, max) });
+    } catch (e) {
+      throw new ZipError(`${name} does not inflate: ${formatError(e)}`);
+    }
+  } else throw new ZipError(`${name} uses compression method ${method}, which is not read`);
+  if (data.length !== size || (0, import_node_zlib.crc32)(data) !== crc)
+    throw new ZipError(`${name} does not match its size and CRC-32 in the archive`);
+  return data;
 }
 
 // src/ci-logs.ts
@@ -2131,8 +2345,8 @@ ${hit}`, secrets).slice(0, FINDING_EXCERPT_MAX));
 
 // src/evidence.ts
 var import_node_crypto = require("crypto");
-var import_node_fs2 = require("fs");
-var import_node_path = require("path");
+var import_node_fs3 = require("fs");
+var import_node_path2 = require("path");
 var EVIDENCE_LIMITS = { files: 50, entries: 200, imagesPerTest: 2, imageBytes: 35e5, notes: 1500 };
 var IMAGE_TYPES = [
   { media_type: "image/png", magic: [137, 80, 78, 71] },
@@ -2188,37 +2402,37 @@ function loadEvidence(dir, warn = () => {
 }) {
   let root;
   try {
-    root = (0, import_node_fs2.realpathSync)(dir);
+    root = (0, import_node_fs3.realpathSync)(dir);
   } catch {
     warn(`evidence directory ${JSON.stringify(dir)} does not exist; no producer evidence`);
     return [];
   }
   const insideRoot = (path) => {
-    const rel = (0, import_node_path.relative)(root, path);
-    return !(0, import_node_path.isAbsolute)(rel) && rel !== ".." && !rel.startsWith(`..${import_node_path.sep}`);
+    const rel = (0, import_node_path2.relative)(root, path);
+    return !(0, import_node_path2.isAbsolute)(rel) && rel !== ".." && !rel.startsWith(`..${import_node_path2.sep}`);
   };
   const jsonFiles = [];
   const walk = (d, depth) => {
     let names;
     try {
-      names = (0, import_node_fs2.readdirSync)(d).sort();
+      names = (0, import_node_fs3.readdirSync)(d).sort();
     } catch (e) {
-      warn(`evidence directory ${JSON.stringify((0, import_node_path.relative)(root, d))} cannot be read: ${String(e).slice(0, 120)}`);
+      warn(`evidence directory ${JSON.stringify((0, import_node_path2.relative)(root, d))} cannot be read: ${String(e).slice(0, 120)}`);
       return;
     }
     for (const name of names) {
-      const full = (0, import_node_path.join)(d, name);
+      const full = (0, import_node_path2.join)(d, name);
       let st;
       try {
-        st = (0, import_node_fs2.statSync)(full);
+        st = (0, import_node_fs3.statSync)(full);
       } catch {
-        warn(`evidence entry ${JSON.stringify((0, import_node_path.relative)(root, full))} cannot be read (a dangling link?); skipped`);
+        warn(`evidence entry ${JSON.stringify((0, import_node_path2.relative)(root, full))} cannot be read (a dangling link?); skipped`);
         continue;
       }
       const isEvidenceJson = st.isFile() && name.endsWith(".json");
       if (!st.isDirectory() && !isEvidenceJson) continue;
-      if (!insideRoot((0, import_node_fs2.realpathSync)(full))) {
-        warn(`evidence entry ${JSON.stringify((0, import_node_path.relative)(root, full))} links outside the evidence directory; skipped`);
+      if (!insideRoot((0, import_node_fs3.realpathSync)(full))) {
+        warn(`evidence entry ${JSON.stringify((0, import_node_path2.relative)(root, full))} links outside the evidence directory; skipped`);
         continue;
       }
       if (st.isDirectory()) {
@@ -2231,9 +2445,9 @@ function loadEvidence(dir, warn = () => {
   for (const file of jsonFiles) {
     let entries;
     try {
-      entries = JSON.parse((0, import_node_fs2.readFileSync)(file, "utf8"));
+      entries = JSON.parse((0, import_node_fs3.readFileSync)(file, "utf8"));
     } catch (e) {
-      warn(`evidence file ${(0, import_node_path.relative)(root, file)} is not JSON: ${String(e).slice(0, 120)}`);
+      warn(`evidence file ${(0, import_node_path2.relative)(root, file)} is not JSON: ${String(e).slice(0, 120)}`);
       continue;
     }
     if (!Array.isArray(entries)) continue;
@@ -2249,27 +2463,27 @@ function loadEvidence(dir, warn = () => {
         if (images.length >= EVIDENCE_LIMITS.imagesPerTest || typeof rel !== "string") break;
         let path;
         try {
-          path = (0, import_node_fs2.realpathSync)((0, import_node_path.resolve)((0, import_node_path.dirname)(file), rel));
+          path = (0, import_node_fs3.realpathSync)((0, import_node_path2.resolve)((0, import_node_path2.dirname)(file), rel));
         } catch {
           warn(`evidence image ${JSON.stringify(rel)} not found`);
           continue;
         }
-        if ((0, import_node_path.relative)(root, path).startsWith("..")) {
+        if ((0, import_node_path2.relative)(root, path).startsWith("..")) {
           warn(`evidence image ${JSON.stringify(rel)} is outside the evidence directory; skipped`);
           continue;
         }
         let bytes;
         try {
-          if (!(0, import_node_fs2.statSync)(path).isFile()) {
+          if (!(0, import_node_fs3.statSync)(path).isFile()) {
             warn(`evidence image ${JSON.stringify(rel)} is not a file, so it is not a PNG or JPEG; skipped`);
             continue;
           }
-          bytes = (0, import_node_fs2.readFileSync)(path);
+          bytes = (0, import_node_fs3.readFileSync)(path);
         } catch (e2) {
           warn(`evidence image ${JSON.stringify(rel)} cannot be read (${String(e2).slice(0, 120)}); skipped`);
           continue;
         }
-        const img = parseImageBuffer((0, import_node_path.relative)(root, path), bytes, warn);
+        const img = parseImageBuffer((0, import_node_path2.relative)(root, path), bytes, warn);
         if (img) images.push(img);
       }
       const notes = typeof entry.notes === "string" ? entry.notes.slice(0, EVIDENCE_LIMITS.notes) : "";
@@ -2298,7 +2512,7 @@ var MAX_SCAN_IMAGE_BYTES = 2e7;
 var MAX_SCAN_IMAGES = 24;
 var TEST_ID_RE2 = /(?:^|[^a-z0-9])(mm-t\d+)(?!\d)/gi;
 function normalizeZipPath(p) {
-  return import_node_path2.posix.normalize(p.replace(/\\/g, "/")).replace(/^\.\//, "");
+  return import_node_path3.posix.normalize(p.replace(/\\/g, "/")).replace(/^\.\//, "");
 }
 function artifactTokens(reportName, lane) {
   const raw = [reportName ?? "", lane ?? ""].flatMap((s) => String(s).split(/[,\s]+/)).map((s) => s.trim().toLowerCase()).filter((s) => s.length >= 3);
@@ -2435,7 +2649,7 @@ function inspectZipArchive({
     try {
       const parsed = JSON.parse(readZipEntry(zip, entry, MAX_LOG_ENTRY_BYTES).toString("utf8"));
       if (!Array.isArray(parsed)) continue;
-      const baseDir = import_node_path2.posix.dirname(normalizeZipPath(entry.name));
+      const baseDir = import_node_path3.posix.dirname(normalizeZipPath(entry.name));
       for (const rawItem of parsed) {
         if (!rawItem || typeof rawItem !== "object") continue;
         const item = rawItem;
@@ -2445,7 +2659,7 @@ function inspectZipArchive({
         for (const rel of Array.isArray(item.images) ? item.images : []) {
           if (images.length >= EVIDENCE_LIMITS.imagesPerTest) break;
           if (typeof rel !== "string" || !rel) continue;
-          const resolved = normalizeZipPath(baseDir === "." ? rel : import_node_path2.posix.join(baseDir, rel));
+          const resolved = normalizeZipPath(baseDir === "." ? rel : import_node_path3.posix.join(baseDir, rel));
           const target = byPath.get(resolved) ?? entries.find((e) => normalizeZipPath(e.name).endsWith(`/${rel.replace(/^\.\//, "")}`));
           if (!target || seenImages.has(target.name)) continue;
           seenImages.add(target.name);
@@ -2691,12 +2905,12 @@ async function fetchSpecRuns(fetchImpl, base, repository, files, until, cfg = DE
       const byGroup = runs.get(o.file);
       const group = String(o.group_id);
       if (!byGroup.has(group)) byGroup.set(group, { notRun: false, tests: /* @__PURE__ */ new Map() });
-      const run = byGroup.get(group);
-      if (o.title === "spec did not run") run.notRun = true;
+      const run2 = byGroup.get(group);
+      if (o.title === "spec did not run") run2.notRun = true;
       else {
         const key = JSON.stringify([o.report_name ?? "", o.full_title || o.title]);
-        if (!run.tests.has(key)) run.tests.set(key, []);
-        run.tests.get(key).push(o);
+        if (!run2.tests.has(key)) run2.tests.set(key, []);
+        run2.tests.get(key).push(o);
       }
     }
     if (!hasMore) break;
@@ -2704,9 +2918,9 @@ async function fetchSpecRuns(fetchImpl, base, repository, files, until, cfg = DE
   }
   for (const [file, byGroup] of runs) {
     const outcomes = [];
-    for (const [group_id, run] of byGroup) {
-      const results = [...run.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0)), (a) => a.report_name ?? null).status);
-      const status = run.notRun ? "not_run" : results.some((s) => FAILED_STATUSES.has(s)) ? "failed" : results.every((s) => s === "skipped") ? "skipped" : "passed";
+    for (const [group_id, run2] of byGroup) {
+      const results = [...run2.tests.values()].map((attempts) => outcomeWithDuplicates([...attempts].sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0)), (a) => a.report_name ?? null).status);
+      const status = run2.notRun ? "not_run" : results.some((s) => FAILED_STATUSES.has(s)) ? "failed" : results.every((s) => s === "skipped") ? "skipped" : "passed";
       outcomes.push({ group_id, status });
     }
     history.byFile.set(file, outcomes);
@@ -2828,9 +3042,9 @@ ${o.title}`;
         collapsed.push(row);
         continue;
       }
-      const run = JSON.stringify([row.group_id, reportName ? row.report_name ?? "" : ""]);
-      if (!runs.has(run)) runs.set(run, []);
-      runs.get(run).push(row);
+      const run2 = JSON.stringify([row.group_id, reportName ? row.report_name ?? "" : ""]);
+      if (!runs.has(run2)) runs.set(run2, []);
+      runs.get(run2).push(row);
     }
     for (const attempts of runs.values()) {
       attempts.sort((a, b) => a.retry_count - b.retry_count || (a.ordinal ?? 0) - (b.ordinal ?? 0));
@@ -3316,17 +3530,17 @@ function addOtherLane(f, platform, result) {
   }
   (f.other_lanes ??= []).push({ platform, result });
 }
-function sameTestOnOtherReports(findings, run, everyReport = false) {
+function sameTestOnOtherReports(findings, run2, everyReport = false) {
   for (const f of findings) {
     const own = f.report_name ?? "";
     if (everyReport) {
       const lane = (report) => report.replace(/-\d+-of-\d+$/, "");
-      const others2 = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? []).filter((o) => o.report !== "" && lane(o.report) !== lane(own));
+      const others2 = (run2.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? []).filter((o) => o.report !== "" && lane(o.report) !== lane(own));
       for (const o of others2.sort((a, b) => a.report.localeCompare(b.report))) addOtherLane(f, o.report.replace(/^e2e-on-/, ""), o.status);
       continue;
     }
     const ownOs = osOfReport(own);
-    const others = (run.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? []).filter((o) => ownOs != null && o.report !== "" && o.report !== own && osOfReport(o.report) != null && osOfReport(o.report) !== ownOs);
+    const others = (run2.elsewhere.get(elsewhereKey(f.file, f.full_title || f.title)) ?? []).filter((o) => ownOs != null && o.report !== "" && o.report !== own && osOfReport(o.report) != null && osOfReport(o.report) !== ownOs);
     const sorted = [...others].sort((a, b) => laneOfReport(a.report).localeCompare(laneOfReport(b.report)));
     for (const o of sorted) addOtherLane(f, laneOfReport(o.report), o.status);
   }
@@ -3992,7 +4206,7 @@ var verdictOf = (findings, infra) => {
   return blocked ? "FAILURE" : "SUCCESS";
 };
 async function evaluateRun({
-  run,
+  run: run2,
   id,
   prNumber,
   history,
@@ -4017,20 +4231,20 @@ async function evaluateRun({
   specHistory = null
 }) {
   const isTrunkRun = prNumber == null;
-  const tests = run.failing.filter((t) => !isShardPlaceholder(t));
-  const executed = Math.max(0, run.counts.total - run.counts.skipped);
-  const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg, executed || void 0), counts: run.counts, ai: newLedger(), missing: null };
+  const tests = run2.failing.filter((t) => !isShardPlaceholder(t));
+  const executed = Math.max(0, run2.counts.total - run2.counts.skipped);
+  const result = { verdict: "SUCCESS", findings: [], infra: infraVerdict(tests, cfg, executed || void 0), counts: run2.counts, ai: newLedger(), missing: null };
   const changedFiles = new Set((diff.files ?? []).map((f) => f.filename));
   const editedBy = (file) => {
     const path = repoPath(testRoot, file);
     return diff.ok && path != null ? changedFiles.has(path) : null;
   };
-  const judgedNotRun = run.failing.filter(isSpecStopped).map((t) => classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run.group_id, editedBy(t.file)));
-  const placeholders = run.failing.length - tests.length - judgedNotRun.length;
+  const judgedNotRun = run2.failing.filter(isSpecStopped).map((t) => classifyNotRun(t, specHistory && !specHistory.truncated ? specHistory.byFile.get(t.file) ?? [] : null, cfg, run2.group_id, editedBy(t.file)));
+  const placeholders = run2.failing.length - tests.length - judgedNotRun.length;
   if (placeholders) result.unnamed = placeholders;
-  const notRunRerun = run.failing.filter((t) => isSpecNotRun(t) && !isSpecStopped(t)).length;
+  const notRunRerun = run2.failing.filter((t) => isSpecNotRun(t) && !isSpecStopped(t)).length;
   if (notRunRerun) result.notRunRerun = notRunRerun;
-  const notRun = run.failing.filter(isSpecNotRun).length;
+  const notRun = run2.failing.filter(isSpecNotRun).length;
   if (notRun) result.notRun = notRun;
   if (tests.length) {
     const files = (diff.files ?? []).map((f) => ({ filename: f.filename, patch: f.patch }));
@@ -4042,7 +4256,7 @@ async function evaluateRun({
       const key = identityKey(t);
       return classify(unresolved(t, key) ? { ...t, identity_unresolved: true } : t, history.get(key) ?? [], changed, cfg, prNumber, historyLane(id, cfg), {
         isTrunkRun,
-        groupId: run.group_id,
+        groupId: run2.group_id,
         trunkBranch,
         commitSha: id.commit_sha,
         // A cut-off list could hide the change: only a complete one may name the PR's line.
@@ -4086,7 +4300,7 @@ async function evaluateRun({
         }
       }
     }
-    sameTestOnOtherReports(result.findings, run, Boolean(branchBase));
+    sameTestOnOtherReports(result.findings, run2, Boolean(branchBase));
     if (otherPlatforms && !result.infra) {
       try {
         await otherPlatforms(result.findings);
@@ -4180,7 +4394,7 @@ async function evaluateRun({
   }
   result.findings.push(...judgedNotRun);
   result.verdict = verdictOf(result.findings, result.infra);
-  result.missing = missingReports(run.missing);
+  result.missing = missingReports(run2.missing);
   if ((result.missing || result.unnamed) && result.verdict === "SUCCESS") result.verdict = "FAILURE";
   return result;
 }
@@ -4439,15 +4653,15 @@ var nameInLink = (url) => {
     return null;
   }
 };
-function trunkBroken(run) {
-  if (!run || run.state !== "failure" && run.state !== "error" && !(run.state === "pending" && run.orchestration)) return false;
-  const o = run.orchestration;
-  if (!o) return isUpstreamFailed(run.description) || isReportsIncomplete(run.description) || /reports unavailable|upstream execution failed|broken on main|caused by|many failures|investigation required/.test(run.description);
+function trunkBroken(run2) {
+  if (!run2 || run2.state !== "failure" && run2.state !== "error" && !(run2.state === "pending" && run2.orchestration)) return false;
+  const o = run2.orchestration;
+  if (!o) return isUpstreamFailed(run2.description) || isReportsIncomplete(run2.description) || /reports unavailable|upstream execution failed|broken on main|caused by|many failures|investigation required/.test(run2.description);
   const finished2 = o.units.length - o.unfinished.length;
   if (finished2 === 0) return true;
   return o.failed.length >= 20 && o.failed.length * 4 >= finished2;
 }
-var trunkGreen = (run) => run?.state === "success";
+var trunkGreen = (run2) => run2?.state === "success";
 async function firstFinished(api, fetchImpl, tsio, repository, context, name, shas, log, asOf = null) {
   for (const sha of shas) {
     let rows;
@@ -4473,19 +4687,19 @@ async function firstFinished(api, fetchImpl, tsio, repository, context, name, sh
       }
       continue;
     }
-    const run = { sha, exact: sha === shas[0], state: row.state, description: String(row.description ?? ""), orchestration: null };
+    const run2 = { sha, exact: sha === shas[0], state: row.state, description: String(row.description ?? ""), orchestration: null };
     if (row.state !== "success") {
       const owner = statusOwner(row.target_url, repository);
       if (owner) {
         const id = { repository, commit_sha: sha, name: nameInLink(row.target_url) ?? name, gh_run_id: owner.run, gh_run_attempt: owner.attempt };
         try {
-          run.orchestration = await fetchOrchestration(fetchImpl, tsio, id);
+          run2.orchestration = await fetchOrchestration(fetchImpl, tsio, id);
         } catch (e) {
           log(`orchestration of the trunk run on ${sha.slice(0, 7)} unavailable: ${String(e).slice(0, 120)}`);
         }
       }
     }
-    return run;
+    return run2;
   }
   return null;
 }
@@ -4810,14 +5024,14 @@ async function unreadHistory(read, log) {
 }
 async function triage(options) {
   const written = { summary: false, aggregateOutput: false };
-  const seen = { run: null, result: null, enforce: null };
+  const seen = { run: null, result: null, enforce: null, basis: null, description: null, laneDiagnosis: null, rerun: null };
   const { env } = options;
   const log = options.log ?? console.error;
   const requested = String(env.MODE ?? "").trim() === "enforce" ? "enforce" : "report-only";
   const effective = () => seen.enforce === null ? requested : seen.enforce ? "enforce" : "report-only";
   try {
     const result = await decideRun(options, written, seen);
-    writeFindings({ env, id: identityOrNull(env), mode: effective(), run: seen.run, result, notTriaged: null }, log);
+    writeFindings({ env, id: identityOrNull(env), mode: effective(), run: seen.run, result, notTriaged: null, basis: seen.basis, description: seen.description, laneDiagnosis: seen.laneDiagnosis, rerun: seen.rerun }, log);
     return result;
   } catch (e) {
     const id = identityOrNull(env);
@@ -4839,19 +5053,19 @@ async function triage(options) {
     if (!written.summary && summaryPath) {
       try {
         const text = body ? renderNotTriaged({ text: body, lane: env.LANE || id?.name || null }) : renderUnfinished({ reason, lane: env.LANE || null });
-        (0, import_node_fs3.appendFileSync)(summaryPath, text + "\n");
+        (0, import_node_fs4.appendFileSync)(summaryPath, text + "\n");
       } catch (writeError) {
         log(`triage's summary not written: ${String(writeError).slice(0, 160)}`);
       }
     }
     if (!written.aggregateOutput && env.GITHUB_OUTPUT) {
       try {
-        (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, "aggregate-published=false\n");
+        (0, import_node_fs4.appendFileSync)(env.GITHUB_OUTPUT, "aggregate-published=false\n");
       } catch (writeError) {
         log(`triage's output not written: ${String(writeError).slice(0, 160)}`);
       }
     }
-    writeFindings({ env, id, mode: effective(), run: seen.run, result: seen.result, notTriaged }, log);
+    writeFindings({ env, id, mode: effective(), run: seen.run, result: seen.result, notTriaged, basis: seen.basis, description: seen.description, laneDiagnosis: seen.laneDiagnosis, rerun: seen.rerun }, log);
     if (e instanceof SupersededRunError) throw new NotTriagedError(notTriaged);
     throw e;
   }
@@ -4913,16 +5127,16 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
   const historyReport = cfg.historyReport || reportName;
   const sameRun = !env.GITHUB_RUN_ID || String(env.GITHUB_RUN_ID) === String(id.gh_run_id);
   let laneOnly = null;
-  let run;
+  let run2;
   try {
-    run = await fetchRun(fetchImpl, base, id, reportName, wait, sameRun ? env.GITHUB_RUN_ATTEMPT : null);
+    run2 = await fetchRun(fetchImpl, base, id, reportName, wait, sameRun ? env.GITHUB_RUN_ATTEMPT : null);
   } catch (e) {
     if (!(e instanceof NoResultsError) && !/reported no test cases/.test(String(e))) throw e;
     laneOnly = String(e instanceof Error ? e.message : e).slice(0, 200);
     log(`no test results to triage (${laneOnly}); judging the lane from its orchestration and jobs`);
-    run = { group_id: "", failing: [], missing: { expected: null, received: 0, status: "no results" }, outcomes: /* @__PURE__ */ new Map(), elsewhere: /* @__PURE__ */ new Map(), counts: { total: 0, passed: 0, failed: 0, flaky: 0, skipped: 0 } };
+    run2 = { group_id: "", failing: [], missing: { expected: null, received: 0, status: "no results" }, outcomes: /* @__PURE__ */ new Map(), elsewhere: /* @__PURE__ */ new Map(), counts: { total: 0, passed: 0, failed: 0, flaky: 0, skipped: 0 } };
   }
-  seen.run = laneOnly ? null : run;
+  seen.run = laneOnly ? null : run2;
   const context = env.STATUS_CONTEXT;
   const runURL = `https://github.com/${id.repository}/actions/runs/${id.gh_run_id}`;
   const publisher = statusPublisher({ api, id, context, env, log });
@@ -4956,10 +5170,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     notes.push(`Report only on this PR: it has the ${cfg.reportOnlyLabel} label, so triage leaves the E2E check as the tests set it.`);
   }
   seen.enforce = enforce;
-  const redWhy = !run.failing.length && !run.missing && context ? await laneRedWhy(api, id, context, run.counts.flaky, log) : null;
+  const redWhy = !run2.failing.length && !run2.missing && context ? await laneRedWhy(api, id, context, run2.counts.flaky, log) : null;
   const flakyOnly = redWhy === "flaky";
-  const outsideTests = Boolean(laneOnly) || Boolean(run.missing) || redWhy === "upstream" || redWhy === "outside";
-  let decides = run.failing.length > 0 || Boolean(run.missing) || flakyOnly || redWhy === "upstream";
+  const outsideTests = Boolean(laneOnly) || Boolean(run2.missing) || redWhy === "upstream" || redWhy === "outside";
+  let decides = run2.failing.length > 0 || Boolean(run2.missing) || flakyOnly || redWhy === "upstream";
   let announce = enforce && decides;
   const lanes = String(env.TRIAGE_LANES ?? "").split(",").map((c) => c.trim()).filter(Boolean);
   let branchBase = null;
@@ -4973,22 +5187,22 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     }
   };
   const announceTriagePending = announce && (!lanes.length || lanes.includes(String(context)));
-  if (announceTriagePending) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : flakyOnly ? `${run.counts.flaky} flaky \xB7 triage is checking them` : `${run.counts.failed} failed \xB7 triage is checking them`);
+  if (announceTriagePending) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : flakyOnly ? `${run2.counts.flaky} flaky \xB7 triage is checking them` : `${run2.counts.failed} failed \xB7 triage is checking them`);
   try {
     let history = /* @__PURE__ */ new Map();
     let diff = { files: [], ok: false };
     const prBase = isTrunkRun ? null : pull.base?.ref ?? null;
     let trunkBranch = isTrunkRun ? id.branch : prBase;
-    if (isTrunkRun && id.branch && run.failing.length) {
+    if (isTrunkRun && id.branch && run2.failing.length) {
       const defaultBranch = await defaultBranchOf(api, id.repository, log);
       if (defaultBranch) {
         releaseRun = defaultBranch !== id.branch;
         if (releaseRun) branchBase = defaultBranch;
       }
     }
-    if (run.failing.some((t) => !isShardPlaceholder(t))) {
+    if (run2.failing.some((t) => !isShardPlaceholder(t))) {
       [history, diff] = await Promise.all([
-        unreadHistory(fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log),
+        unreadHistory(fetchHistory(fetchImpl, base, id.repository, run2.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log),
         fetchChangedFiles(api, id, prNumber, log)
       ]);
       if (branchBase && id.branch) {
@@ -4996,7 +5210,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
         if (ownRuns < cfg.minTrunkRuns) {
           trunkBranch = branchBase;
           notes.push(`History is read from ${branchBase}, the default branch: ${id.branch} has ${ownRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-          history = await unreadHistory(fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log);
+          history = await unreadHistory(fetchHistory(fetchImpl, base, id.repository, run2.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log);
         }
       }
       const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;
@@ -5009,18 +5223,18 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
           if (fallback && fallback !== prBase) {
             trunkBranch = fallback;
             notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-            history = await unreadHistory(fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log);
+            history = await unreadHistory(fetchHistory(fetchImpl, base, id.repository, run2.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log);
           }
         }
       }
-      await dropStormRuns({ history, fetchImpl, base, minFailures: cfg.infraMinFailures, trunkBranch, own: run.group_id, pr: prNumber, log });
-    } else if (run.failing.some(isSpecStopped)) {
+      await dropStormRuns({ history, fetchImpl, base, minFailures: cfg.infraMinFailures, trunkBranch, own: run2.group_id, pr: prNumber, log });
+    } else if (run2.failing.some(isSpecStopped)) {
       diff = await fetchChangedFiles(api, id, prNumber, log);
     }
     let specHistory = null;
-    if (run.failing.some(isSpecStopped)) {
+    if (run2.failing.some(isSpecStopped)) {
       try {
-        specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, run.failing.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), historyReport);
+        specHistory = await fetchSpecRuns(fetchImpl, base, id.repository, run2.failing.map((t) => t.file), now.toISOString(), cfg, historyLane(id, cfg), historyReport);
       } catch (e) {
         log(`history of the specs that did not run unavailable: ${String(e).slice(0, 200)}`);
       }
@@ -5028,7 +5242,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     let unknownSpend = null;
     if (env.ANSWERS_CACHE) {
       try {
-        const loaded = (0, import_node_fs3.existsSync)(env.ANSWERS_CACHE) ? JSON.parse((0, import_node_fs3.readFileSync)(env.ANSWERS_CACHE, "utf8")) : {};
+        const loaded = (0, import_node_fs4.existsSync)(env.ANSWERS_CACHE) ? JSON.parse((0, import_node_fs4.readFileSync)(env.ANSWERS_CACHE, "utf8")) : {};
         if (isPlainObject2(loaded)) cfg.answers = loaded;
         else {
           cfg.answers = {};
@@ -5059,7 +5273,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     const apiKey = env.ANTHROPIC_API_KEY;
     const ask = apiKey && !prSpendUnknown ? (packs, model) => askModelBatch(fetchImpl, apiKey, model, packs) : null;
     const secrets = secretsOf(env);
-    const attemptStr = String(run.attempt ?? (sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : id.gh_run_attempt || 1));
+    const attemptStr = String(run2.attempt ?? (sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : id.gh_run_attempt || 1));
     const runIdStr = String(id.gh_run_id || env.GITHUB_RUN_ID || "");
     const artifactEvidenceEnabled = String(env.ARTIFACT_EVIDENCE ?? "").trim().toLowerCase() !== "false";
     const artifactPatterns = String(env.ARTIFACT_PATTERNS ?? "").split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
@@ -5107,7 +5321,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       }
     } : null;
     const result = await evaluateRun({
-      run,
+      run: run2,
       id,
       prNumber,
       history,
@@ -5125,7 +5339,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
       skimRuntimeEvidence,
       // A release run's matrix (OS x server version) is wider than a PR's platforms.
-      otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, runAttempt: run.attempt, log, limit: branchBase ? 20 : 5 }),
+      otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, runAttempt: run2.attempt, log, limit: branchBase ? 20 : 5 }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths, fetchFileDiffs: Boolean(branchBase) }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
@@ -5148,9 +5362,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
         trunkRun: isTrunkRun,
         prFiles: diff.ok ? diff.files.map((f) => f.filename) : null,
         lanePaths: lanePathsOf(testRoot, cfg.supportPaths),
-        judgedSpecs: run.failing.map((t) => t.file),
+        judgedSpecs: run2.failing.map((t) => t.file),
         noResults: Boolean(laneOnly),
-        reportAttempt: run.attempt ?? null,
+        reportAttempt: run2.attempt ?? null,
         log
       });
       const mass = ["broken on main", "fixed on main", "caused by PR"].includes(judged.verdict.label);
@@ -5170,7 +5384,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     }
     const attempt = sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : Number(id.gh_run_attempt) || 1;
     const onlyNoResults = (result.unnamed || result.missing || result.findings.some((f) => f.class === "NOT_RUN")) && !result.findings.some((f) => f.blocking && f.class !== "NOT_RUN");
-    const onlyDeadJobs = redWhy === "upstream" && !run.failing.length && !result.findings.some((f) => f.blocking);
+    const onlyDeadJobs = redWhy === "upstream" && !run2.failing.length && !result.findings.some((f) => f.blocking);
     let rerunCheck = null;
     if (!lane && (onlyNoResults || onlyDeadJobs)) {
       try {
@@ -5187,7 +5401,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     if (env.ANSWERS_CACHE && cfg.answers) {
       if (prNumber) cfg.answers[PR_SPEND_KEY] = { pr: prNumber, usd: prSpent + (spend.cost_usd ?? 0) };
       try {
-        (0, import_node_fs3.writeFileSync)(env.ANSWERS_CACHE, JSON.stringify(cfg.answers));
+        (0, import_node_fs4.writeFileSync)(env.ANSWERS_CACHE, JSON.stringify(cfg.answers));
       } catch (e) {
         log(`answers cache not saved: ${String(e).slice(0, 160)}`);
       }
@@ -5195,7 +5409,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     if (cfg.budgetLabel) result.ai.budgetLabel = cfg.budgetLabel;
     const laneRed = redWhy === "outside" || redWhy === "upstream";
     if (flakyOnly)
-      notes.push(`No test failed: the ${run.counts.flaky === 1 ? "1 test that failed a try" : `${run.counts.flaky} tests that failed a try`} passed on a retry. The lane counted ${run.counts.flaky === 1 ? "it" : "them"} as failed.`);
+      notes.push(`No test failed: the ${run2.counts.flaky === 1 ? "1 test that failed a try" : `${run2.counts.flaky} tests that failed a try`} passed on a retry. The lane counted ${run2.counts.flaky === 1 ? "it" : "them"} as failed.`);
     const laneRerun = lane && lane.verdict.rerun !== "none" && attempt <= cfg.rerunAttempts ? lane.verdict.rerun : null;
     const rerun = (lane ? laneRerun : rerunCheck?.rerun) ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = lane ? null : rerunCheck?.held ?? null;
@@ -5204,18 +5418,23 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
     }
     if (lane && laneTurnsGreen(lane.verdict, outsideTests) && !result.findings.some((f) => f.blocking)) result.verdict = "SUCCESS";
     else if (lane) result.verdict = "FAILURE";
-    if (decides && result.verdict === "SUCCESS" && lane?.verdict.label !== "all specs ran" && context && (outsideTests || run.failing.length > 0 && await redOutsideTests(api, id, context, log)))
+    if (decides && result.verdict === "SUCCESS" && lane?.verdict.label !== "all specs ran" && context && (outsideTests || run2.failing.length > 0 && await redOutsideTests(api, id, context, log)))
       result.verdict = "FAILURE";
     if (enforce && lane && lane.verdict.state === "success" && result.verdict !== "SUCCESS") lane = { ...lane, verdict: { ...lane.verdict, state: "failure" } };
     const laneSection = lane ? renderLane({ verdict: lane.verdict, rerunning: Boolean(rerun), lane: env.LANE || id.name, runURL, base: lane.baseline?.base ?? prBase ?? trunkBranch ?? null }) : "";
-    const testsSummary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
+    const testsSummary = renderSummary({ mode: enforce ? "enforce" : "report-only", verdict: result.verdict, findings: result.findings, infra: result.infra, runURL, counts: run2.counts, ai: result.ai, missing: result.missing, lane: env.LANE || id.name, trunkBranch, pr: Boolean(prNumber), branchRun: branchBase ? id.branch ?? null : null, notes, laneRed, reportsArrived: missingArrived(run2.missing), unnamed: result.unnamed ?? null, notRun: result.notRun ?? null, notRunRerun: result.notRunRerun ?? null, rerun, rerunCheck });
     const summary = lane && !result.findings.length ? laneSection : [laneSection, testsSummary].filter(Boolean).join("\n");
-    const description = lane ? laneDescription(lane.verdict, Boolean(rerun), lane.baseline?.base ?? prBase ?? "main") : flakyOnly ? `(${run.counts.flaky} flaky, passed on retry) ${passLine(run.counts)}` : onlyDeadJobs ? `(${held ? `not re-run: ${held}` : `machine failure, ${rerun ? RERUNNING : RERUN}`}) ${passLine(run.counts)}` : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
+    const description = lane ? laneDescription(lane.verdict, Boolean(rerun), lane.baseline?.base ?? prBase ?? "main") : flakyOnly ? `(${run2.counts.flaky} flaky, passed on retry) ${passLine(run2.counts)}` : onlyDeadJobs ? `(${held ? `not re-run: ${held}` : `machine failure, ${rerun ? RERUNNING : RERUN}`}) ${passLine(run2.counts)}` : statusDescription(result.verdict, result.findings, result.infra, run2.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
+    const basis = lane ? lane.verdict.label === "all specs ran" ? "orchestration" : "lane" : "tests";
+    seen.basis = basis;
+    seen.description = description;
+    seen.laneDiagnosis = lane ? { label: lane.verdict.label, fault: lane.verdict.fault, what: lane.verdict.what, action: lane.verdict.action } : null;
+    seen.rerun = { requested: Boolean(rerun), of: rerun?.of ?? null, held };
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
-      (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}
+      (0, import_node_fs4.appendFileSync)(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}
 verdict=${result.verdict}
-blocking=${flag ? run.counts.failed : result.findings.filter((f) => f.blocking).length + (result.unnamed ?? 0)}
+blocking=${flag ? run2.counts.failed : result.findings.filter((f) => f.blocking).length + (result.unnamed ?? 0)}
 exonerated=${result.findings.filter((f) => !f.blocking).length}
 description=${description}
 rerun=${Boolean(rerun)}
@@ -5224,14 +5443,14 @@ rerun_held=${held ?? ""}
 rerun_job=${rerun && laneRerun === "lane" ? String(lane?.startJobId ?? 0) : ""}
 lane_label=${lane?.verdict.label ?? ""}
 lane_fault=${lane?.verdict.fault ?? ""}
-basis=${lane ? lane.verdict.label === "all specs ran" ? "orchestration" : "lane" : "tests"}
+basis=${basis}
 ai_calls=${spend.calls}
 ai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}
 ai_input_tokens=${spend.input_tokens}
 ai_output_tokens=${spend.output_tokens}
 `);
     if (env.GITHUB_STEP_SUMMARY && (decides || laneRed || lane)) {
-      (0, import_node_fs3.appendFileSync)(env.GITHUB_STEP_SUMMARY, summary + "\n");
+      (0, import_node_fs4.appendFileSync)(env.GITHUB_STEP_SUMMARY, summary + "\n");
       written.summary = true;
     }
     const mode = String(env.MODE ?? "").trim();
@@ -5259,26 +5478,26 @@ ai_output_tokens=${spend.output_tokens}
     if (announce && lanes.length) aggregatePublished = await settleLaneSummary();
     else if (announce) {
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
-      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", lane ? description : flakyOnly ? `${run.counts.flaky} flaky, passed on retry \xB7 no test failed` : (flag && !result.findings.length ? `${run.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run.counts.failed} failed \u2192 ${statusLabels(result.findings, run.counts.failed).map((l) => l === RERUN ? again : l).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${again}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
+      await postTriageCheck(result.verdict === "SUCCESS" ? "success" : "failure", lane ? description : flakyOnly ? `${run2.counts.flaky} flaky, passed on retry \xB7 no test failed` : (flag && !result.findings.length ? `${run2.counts.failed} failed \xB7 not triaged, ${runFlag(flag)}` : `${run2.counts.failed} failed \u2192 ${statusLabels(result.findings, run2.counts.failed).map((l) => l === RERUN ? again : l).join(", ") || "none cleared"}${flag ? ` \xB7 ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` \xB7 ${again}` : ""}`) + (result.missing ? ` \xB7 ${result.missing.short}` : ""));
     }
     if (env.GITHUB_OUTPUT) {
-      (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
+      (0, import_node_fs4.appendFileSync)(env.GITHUB_OUTPUT, `published=${published}
 aggregate-published=${aggregatePublished}
 `);
       written.aggregateOutput = true;
     }
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));
-    log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
+    log(`e2e-test-triage: ${result.verdict} (${run2.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;
   } catch (e) {
     if (announce && lanes.length && context) {
       try {
-        await publisher.write({ state: "failure", context, description: `(not triaged: triage could not finish) ${passLine(run.counts)}`, target_url: runURL }, "triage");
+        await publisher.write({ state: "failure", context, description: `(not triaged: triage could not finish) ${passLine(run2.counts)}`, target_url: runURL }, "triage");
       } catch {
       }
       const aggregatePublished = await settleLaneSummary();
       if (env.GITHUB_OUTPUT) {
-        (0, import_node_fs3.appendFileSync)(env.GITHUB_OUTPUT, `aggregate-published=${aggregatePublished}
+        (0, import_node_fs4.appendFileSync)(env.GITHUB_OUTPUT, `aggregate-published=${aggregatePublished}
 `);
         written.aggregateOutput = true;
       }
@@ -5288,7 +5507,8 @@ aggregate-published=${aggregatePublished}
 }
 
 // src/index.ts
-triage({ env: process.env }).catch((e) => {
+var run = process.argv[2] === "consolidate" ? consolidate({ env: process.env }) : triage({ env: process.env });
+run.catch((e) => {
   if (e instanceof NotTriagedError) {
     console.error(`e2e-test-triage: ${e.message}`);
     return;
