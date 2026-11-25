@@ -123,7 +123,7 @@ inputs:
     required: false
     default: ""
   findings-file:
-    description: Optional path of a JSON file triage writes after every run, judged or not, for measuring its accuracy (schema 2, see the README). Holds no secret and only the first line of each error. Empty turns it off
+    description: Optional path of a JSON file triage writes after every run, judged or not, for measuring its accuracy (schema 3, see the README). Holds no secret and only the first line of each error. Empty turns it off
     required: false
     default: ""
   rerun-attempts:

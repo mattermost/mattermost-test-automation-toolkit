@@ -16,7 +16,8 @@ import type { Counts, Finding } from "./types.ts";
 
 /** The schema version. A consumer checks it before it reads any other field. */
 // 2: each row has its check label, and the model's explanation.
-export const FINDINGS_SCHEMA = 2 as const;
+// 3: top-level basis, description, lane_diagnosis, and rerun.
+export const FINDINGS_SCHEMA = 3 as const;
 
 /** One failed test: the decision, the facts it rests on, and the model's part when it was asked. */
 export interface FindingRow {

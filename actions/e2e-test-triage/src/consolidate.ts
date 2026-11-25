@@ -67,7 +67,7 @@ export function recommendedAction(label: string, fault: string | null, rerunRequ
   return "investigate";
 }
 
-/** Reads schema-2 FindingsRecord files recursively from `dir`, sorted by lane name. */
+/** Reads FINDINGS_SCHEMA FindingsRecord files recursively from `dir`, sorted by lane name. */
 export function loadFindingsDir(dir: string | undefined, log: (message: string) => void = console.warn): FindingsRecord[] {
   if (!dir || !existsSync(dir)) return [];
   const files = readdirSync(dir, { recursive: true, withFileTypes: true })

@@ -1626,7 +1626,7 @@ function statusDescription(verdict, findings, runInfra, counts, missing = null, 
 }
 
 // src/findings.ts
-var FINDINGS_SCHEMA = 2;
+var FINDINGS_SCHEMA = 3;
 var SECRET_PATTERNS = [/gh[pousr]_[A-Za-z0-9]{20,}/g, /github_pat_[A-Za-z0-9_]{20,}/g, /sk-ant-[A-Za-z0-9_-]{8,}/g, /\bBearer\s+[^\s"']+/gi];
 var ANSI = /\x1b\[[0-9;]*m/g;
 var CREDENTIAL_KV = /([A-Za-z0-9_.-]*(?:token|password|secret|passwd|api[_-]?key|apikey|license|authorization)[A-Za-z0-9_.-]*)(\s*[=:]\s*)((?:Bearer\s+)?[^\s"',;&]+)/gi;

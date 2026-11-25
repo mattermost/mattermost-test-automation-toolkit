@@ -3416,7 +3416,7 @@ test("the findings file is written for a judged run, with one shape and the fail
     await triage({ env: { ...env, MODE: "enforce", ANTHROPIC_API_KEY: "", FINDINGS_FILE: findingsPath }, fetchImpl, log: () => {} });
     const record = parsed<Record<string, unknown>>(readFileSync(findingsPath, "utf8"));
     assert.deepEqual(checkFindingsShape(record), []);
-    assert.equal(record.schema, 2);
+    assert.equal(record.schema, 3);
     assert.deepEqual([record.triaged, record.not_triaged_reason, record.verdict, record.mode], [true, null, "SUCCESS", "enforce"]);
     assert.deepEqual([record.repository, record.commit_sha, record.pr, record.lane, record.status_context, record.run_id, record.run_attempt], ["o/r", "abc", 5, "playwright-full", "e2e-test/playwright", "12", "1"]);
     assert.deepEqual(record.counts, { total: 1, passed: 0, failed: 1, flaky: 0, skipped: 0 });
@@ -3444,8 +3444,8 @@ test("a run that breaks off writes a findings file that says why, with no token 
 });
 
 test("the findings file has one shape, and the shape check names what drifts from it", () => {
-  assert.equal(FINDINGS_SCHEMA, 2);
-  const good = { schema: 2, repository: "o/r", commit_sha: "abc", pr: null, lane: null, status_context: null, run_id: null, run_attempt: null, mode: "report-only", verdict: null, basis: null, description: null, lane_diagnosis: null, rerun: null, counts: null, ai: { calls: 0, cost_usd: null, model: null }, triaged: false, not_triaged_reason: "error: x", findings: [] };
+  assert.equal(FINDINGS_SCHEMA, 3);
+  const good = { schema: 3, repository: "o/r", commit_sha: "abc", pr: null, lane: null, status_context: null, run_id: null, run_attempt: null, mode: "report-only", verdict: null, basis: null, description: null, lane_diagnosis: null, rerun: null, counts: null, ai: { calls: 0, cost_usd: null, model: null }, triaged: false, not_triaged_reason: "error: x", findings: [] };
   assert.deepEqual(checkFindingsShape(good), []);
   assert.ok(checkFindingsShape({ ...good, schema: 1 }).length > 0, "a different schema is named");
   const row = { title: "t", full_title: null, file: "a", class: "REGRESSION", label: "app bug", blocking: true, decision: "adjudicator_blame", reason: "r", error_first_line: "e", out_of_date: false, tries: null, other_lanes_failed: [], ai: { cause: "app_bug", confidence: 0.9, cited: ["error"], cleared: false, explanation: "x" } };

@@ -541,11 +541,11 @@ the reason.
 every run: judged, superseded, with no results, or broken off. It is for measuring
 how often triage's answers are right, so a consumer can join it to the verdicts
 later. Nothing in it is a secret, and each error is only its first line (200
-characters at most). Fields, in `schema` 2:
+characters at most). Fields, in `schema` 3:
 
 ```json
 {
-  "schema": 2,
+  "schema": 3,
   "repository": "mattermost/mattermost", "commit_sha": "<sha>", "pr": 5,
   "lane": "playwright-full-enterprise", "status_context": "<context>",
   "run_id": "39637355358", "run_attempt": "1",
@@ -583,6 +583,7 @@ characters at most). Fields, in `schema` 2:
   main, test bug, server compat, caused by PR, app bug, broken on branch, or machine
   failure. Files written before held "out of date" and "needs investigation" too.
 - Schema 2 added `label` and `ai.explanation`.
+- Schema 3 added `basis`, `description`, `lane_diagnosis`, and `rerun`. Consumers on schema 2 skip schema 3 records until they upgrade.
 
 Consumers check `schema` first. A future change to the shape bumps it.
 
