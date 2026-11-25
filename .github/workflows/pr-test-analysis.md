@@ -31,7 +31,7 @@ on:
         required: true
         type: number
       claude_model:
-        description: "Claude model to use (default: claude-sonnet-4-6)"
+        description: "Claude model to use (default: claude-sonnet-5-5)"
         required: false
         type: string
 
@@ -59,7 +59,7 @@ jobs:
       pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
       target_repo: ${{ github.repository }}
       # Order: workflow_dispatch input → repository variable CLAUDE_MODEL → default (matches reusable workflow env).
-      claude_model: ${{ inputs.claude_model || vars.CLAUDE_MODEL || 'claude-sonnet-4-6' }}
+      claude_model: ${{ inputs.claude_model }}
     secrets:
       # When target_repo is this repo, github.token is enough (see Secrets below).
       GH_TOKEN: ${{ github.token }}
@@ -68,7 +68,7 @@ jobs:
       WEBHOOK_URL: ${{ secrets.WEBHOOK_URL_TEST_PR_ANALYSIS_HUB }}
 ```
 
-**`PR_TEST_ANALYSIS_DRY_RUN`** is **not** a field in this workflow file. Set it as a **repository variable** on the **calling** repository (see [Repository Environment Variables](#repository-environment-variables)); defaults apply if you skip them. **`CLAUDE_MODEL`** works the same way for `pull_request` runs and is already combined in `with.claude_model` above.
+**`PR_TEST_ANALYSIS_DRY_RUN`** is **not** a field in this workflow file. Set it as a **repository variable** on the **calling** repository (see [Repository Environment Variables](#repository-environment-variables)); defaults apply if you skip them. **`CLAUDE_MODEL`** falls back inside the reusable workflow when callers omit `claude_model` on `pull_request` runs.
 
 Replace the placeholder SHA after `@` with a real commit from [mattermost-test-automation-toolkit](https://github.com/mattermost/mattermost-test-automation-toolkit). This repository is not versioned with release tags for this workflow—**pin the `uses` ref to a full SHA** so behavior stays stable until you bump it on purpose.
 
@@ -85,14 +85,15 @@ GitHub resolves the `uses` ref when the workflow runs.
 |-------|----------|---------|-------------|
 | `pr_number` | Yes | — | PR number to analyze |
 | `target_repo` | Yes | — | Full repo name (e.g., `mattermost/mattermost`) |
-| `claude_model` | No | `claude-sonnet-4-6` | Effective model: this **`workflow_call` input**, then repository variable **`CLAUDE_MODEL`**, then `claude-sonnet-4-6` (see `env.CLAUDE_MODEL` in the reusable workflow). In the Usage example, the caller supplies the same order using `workflow_dispatch` input where applicable. |
+| `claude_model` | No | `""` (falls back to `vars.CLAUDE_MODEL` then `claude-sonnet-5-5`) | Effective model: this **`workflow_call` input**, then repository variable **`CLAUDE_MODEL`**, then `claude-sonnet-5-5` (see `env.CLAUDE_MODEL` in the reusable workflow). Leave empty in callers so repository variable `CLAUDE_MODEL` takes effect without editing workflow YAML. |
+| `allowed_bots` | No | `cursor[bot],unified-ci-app[bot],dependabot[bot]` | Comma-separated bot actor logins allowed to trigger analysis. Dependabot-triggered runs require `ANTHROPIC_API_KEY` as a Dependabot secret (Actions secrets are not exposed to Dependabot runs; otherwise analysis skips with unavailable status). |
 
 ## Secrets
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `GH_TOKEN` | Yes | Credential for `gh`/GitHub API against `target_repo`. Use **`${{ github.token }}`** when the caller passes `target_repo: ${{ github.repository }}` (same repo as the workflow). Use a **PAT** in **`secrets.GH_TOKEN`** only when `target_repo` is a *different* repository—the default `GITHUB_TOKEN` is limited to the caller repo and cannot act on another repo's PRs, statuses, or labels. |
-| `ANTHROPIC_API_KEY` | Yes | Anthropic API key for Claude analysis. Must be provided by the caller. |
+| `GH_TOKEN` | No | Optional credential for `gh`/GitHub API against `target_repo`; falls back to `${{ github.token }}` when omitted (sufficient when `target_repo` is `${{ github.repository }}`). Use a **PAT** in **`secrets.GH_TOKEN`** only when `target_repo` is a *different* repository—the default `GITHUB_TOKEN` is limited to the caller repo and cannot act on another repo's PRs, statuses, or labels. |
+| `ANTHROPIC_API_KEY` | No | Optional Anthropic API key for Claude analysis. Dependabot-triggered runs require `ANTHROPIC_API_KEY` as a **Dependabot secret** because Actions secrets are not exposed to Dependabot runs. When `ANTHROPIC_API_KEY` is missing, analysis is skipped and the workflow posts a **`success`** status with an unavailable description (`Analysis unavailable — manual review required`), which can pass a required check without running AI analysis. |
 | `WEBHOOK_URL` | No | Optional Mattermost webhook URL for notifications. If omitted, no webhook notification is sent. |
 
 ## Repository Environment Variables
@@ -102,7 +103,7 @@ These are configured via **Settings > Environments** or **Settings > Secrets and
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PR_TEST_ANALYSIS_DRY_RUN` | `false` | When `true`: runs the AI analysis but always posts a success status, does not comment on PRs, and writes results to the Job Summary only. When `false` or not set: enforces analysis — a failure verdict marks the CI check as failed and posts a PR comment. |
-| `CLAUDE_MODEL` | `claude-sonnet-4-6` | Used in the Usage `with.claude_model` expression when `workflow_dispatch` does not supply `claude_model` (e.g. on `pull_request` runs). |
+| `CLAUDE_MODEL` | `claude-sonnet-5-5` | Used in the Usage `with.claude_model` expression when `workflow_dispatch` does not supply `claude_model` (e.g. on `pull_request` runs). |
 
 ### Configuring Environment Variables
 
@@ -182,5 +183,5 @@ Available hashtags for filtering:
 - `#pass-test-analysis` — passing results
 - `#fail-test-analysis` — failing results
 - `#override-test-analysis` — manual overrides
-- `#unavailable-test-analysis` — analysis unavailable (AI error/timeout)
+- `#unavailable-test-analysis` — analysis unavailable (AI error, timeout, or missing `ANTHROPIC_API_KEY`; never posted for external/forked PRs without secrets)
 - `#<repo>-pr-<number>` — specific PR (e.g., `#mattermost-pr-1234`)

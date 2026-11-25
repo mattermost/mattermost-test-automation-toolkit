@@ -27,7 +27,8 @@ export const isReportsIncomplete = (text: string): boolean => text.startsWith(RE
 
 // GitHub commit statuses have no compare-and-swap API. Every caller MUST hold
 // the same non-cancelling, SHA-scoped job concurrency lock across these reads
-// and writes, including triage and the cross-lane summary. See the action README.
+// and writes, including the cross-lane summary. The only exception is per-lane
+// triage with its aggregate off; the e2e-test-status README states its race window.
 
 /** The run and attempt that own a lane's status. Strings: they are compared as big integers. */
 export interface Owner {
@@ -46,12 +47,20 @@ export interface StatusRow {
 /** Summarizes the latest status of each lane into the aggregate's state and description. */
 export type LaneSummarizer = (lanes: LaneStatus[], untriaged?: LaneStatus[], release?: boolean, pr?: boolean) => LaneSummary;
 
+/** Options controlling aggregate status publication in `summarize`. */
+export interface SummarizeOptions {
+  /** Only update an existing aggregate owned by the same run (avoids creating phantom checks on clean re-runs). */
+  onlyIfExists?: boolean;
+  /** Receives the computed summary state and description when checked. */
+  onSummary?: (summary: LaneSummary) => void;
+}
+
 export interface StatusPublisher {
   allowed(operation: string): Promise<boolean>;
-  summarize(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean): Promise<void>;
+  summarize(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean, options?: SummarizeOptions): Promise<boolean>;
   write(row: StatusRow, operation?: string): Promise<boolean>;
   info(row: StatusRow): Promise<boolean>;
-  refresh(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean): Promise<void>;
+  refresh(lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release?: boolean): Promise<boolean>;
 }
 
 const positive = (v: unknown): boolean => /^[1-9]\d*$/.test(String(v ?? ""));
@@ -147,6 +156,9 @@ export function inferRelease(id: CompositeIdentity, env: Env = {}, rows: CommitS
   return undefined;
 }
 
+const statusKey = (r: Pick<CommitStatus, "state" | "description" | "target_url">): string =>
+  JSON.stringify([r.state, r.description ?? "", r.target_url ?? ""]);
+
 /** Builds the status publisher for one lane and its cross-lane aggregate. */
 export function statusPublisher({ api, id, context, env = {}, log = console.error, release: defaultRelease }: {
   api: GhApi;
@@ -158,6 +170,9 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
 }): StatusPublisher {
   // Validated when a lane is written, not when the publisher is built: a verification run only summarizes.
   let validated: Owner | undefined;
+  let lastWritten: CommitStatus | null = null;
+  const staleKeys = new Set<string>();
+  let sawMissingPreWrite = false;
   const owner = (): Owner => (validated ??= publishingOwner(id, env));
   // The aggregate is a projection of the lanes, owned by whichever run refreshed it.
   const snapshotOwner = (): Owner => {
@@ -165,21 +180,47 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     if (!positive(snapshot.run) || !positive(snapshot.attempt)) throw new Error("Invalid status publishing run/attempt");
     return snapshot;
   };
-  const allowed = async (operation: string): Promise<boolean> => {
-    const rows = await readStatuses(api, id);
-    const ok = mayPublish(rows, id, context, owner(), operation);
-    if (!ok) log(`Status ${context} belongs to another run/attempt or has no known owner; publication skipped`);
-    return ok;
+  const overlayStale = (fetched: CommitStatus[]): CommitStatus[] => {
+    if (!lastWritten) return fetched;
+    const currentInRead = fetched.find((r) => r.context === context);
+    const currentOwner = currentInRead ? statusOwner(currentInRead.target_url, id.repository) : null;
+    const newerOrUnknownOwner = Boolean(currentInRead && (!currentOwner || compareOwners(currentOwner, owner()) > 0));
+    const matchesPreWrite = currentInRead ? staleKeys.has(statusKey(currentInRead)) : sawMissingPreWrite;
+    const staleSelfRead = !newerOrUnknownOwner && matchesPreWrite && (!currentInRead || statusKey(currentInRead) !== statusKey(lastWritten));
+    return staleSelfRead ? [lastWritten, ...fetched] : fetched;
   };
+  const checkAllowed = async (operation: string): Promise<CommitStatus[] | null> => {
+    const rows = overlayStale(await readStatuses(api, id));
+    const ok = mayPublish(rows, id, context, owner(), operation);
+    if (!ok) {
+      log(`Status ${context} belongs to another run/attempt or has no known owner; publication skipped`);
+      return null;
+    }
+    return rows;
+  };
+  const allowed = async (operation: string): Promise<boolean> => (await checkAllowed(operation)) !== null;
   const post = (row: StatusRow, by: Owner = owner()): Promise<unknown> => api("POST", `/repos/${id.repository}/statuses/${id.commit_sha}`, {
     ...row, description: row.description.slice(0, 140), target_url: ownedURL(row.target_url, by, id.repository),
   });
-  const summarize = async (lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release = defaultRelease): Promise<void> => {
-    if (!summaryContext || !lanes.length) return;
+  const summarize = async (lanes: string[], summaryContext: string | undefined, summarizeLanes: LaneSummarizer, release = defaultRelease, options: SummarizeOptions = {}): Promise<boolean> => {
+    if (!summaryContext || !lanes.length) return false;
     if (lanes.includes(summaryContext)) throw new Error("The aggregate must not be a required lane");
-    const rows = await readStatuses(api, id);
+    // GitHub's /statuses endpoint is eventually consistent right after a POST: overlay this publisher's own write only
+    // when the self-read still shows the exact pre-write row (or missing row) owned by no newer/unknown writer.
+    const rows = overlayStale(await readStatuses(api, id));
+    const currentAgg = rows.find((r) => r.context === summaryContext) ?? null;
+    const by = snapshotOwner();
+    const currentOwner = currentAgg ? statusOwner(currentAgg.target_url, id.repository) : null;
+    // Never let an older run's late consolidate step overwrite a newer run's aggregate status.
+    if (currentOwner && compareOwners(currentOwner, by) > 0) {
+      log(`Aggregate ${summaryContext} belongs to a newer run (${currentOwner.run}#${currentOwner.attempt}); publication skipped`);
+      return false;
+    }
+    if (options.onlyIfExists && (!currentAgg || !currentOwner || currentOwner.run !== by.run)) {
+      return false;
+    }
     const latest = lanes.map((lane) => ({ context: lane, status: rows.find((r) => r.context === lane) ?? null }));
-    if (!latest.some((lane) => lane.status)) return;
+    if (!latest.some((lane) => lane.status)) return false;
     // The other E2E checks under the aggregate's prefix (an upgrade lane, a policy lane): named when red.
     const prefix = summaryContext.slice(0, summaryContext.lastIndexOf("/") + 1);
     const others = prefix ? [...new Set(rows.map((r) => r.context))].filter((c) => c.startsWith(prefix) && c !== summaryContext && !lanes.includes(c)) : [];
@@ -187,7 +228,10 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     const resolvedRelease = release ?? inferRelease(id, env, rows, summaryContext);
     // A run with no PR (main, a release branch) names its failures against the commit, not a PR.
     const pr = Number(id.gh_pr_number || 0) > 0;
-    await post({ ...summarizeLanes(latest, untriaged, resolvedRelease, pr), context: summaryContext }, snapshotOwner());
+    const summary = summarizeLanes(latest, untriaged, resolvedRelease, pr);
+    options.onSummary?.(summary);
+    await post({ ...summary, context: summaryContext }, by);
+    return true;
   };
   return {
     allowed,
@@ -196,8 +240,20 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
     // statuses without claiming a lane or pretending to be its test run.
     summarize,
     async write(row, operation = "finish") {
-      if (!await allowed(operation)) return false;
+      const preRows = await checkAllowed(operation);
+      if (!preRows) return false;
+      const prior = preRows.find((r) => r.context === context) ?? null;
+      const payload: CommitStatus = {
+        context,
+        state: row.state,
+        description: row.description.slice(0, 140),
+        target_url: ownedURL(row.target_url, owner(), id.repository),
+      };
       await post({ ...row, context });
+      if (prior && statusKey(prior) !== statusKey(payload)) staleKeys.add(statusKey(prior));
+      else if (!prior) sawMissingPreWrite = true;
+      if (lastWritten && statusKey(lastWritten) !== statusKey(payload)) staleKeys.add(statusKey(lastWritten));
+      lastWritten = payload;
       return true;
     },
     async info(row) {
@@ -206,8 +262,8 @@ export function statusPublisher({ api, id, context, env = {}, log = console.erro
       return true;
     },
     async refresh(lanes, summaryContext, summarizeLanes, release = defaultRelease) {
-      if (!summaryContext || !lanes.includes(context) || !await allowed("finish")) return;
-      await summarize(lanes, summaryContext, summarizeLanes, release);
+      if (!summaryContext || !lanes.includes(context) || !await allowed("finish")) return false;
+      return summarize(lanes, summaryContext, summarizeLanes, release);
     },
   };
 }

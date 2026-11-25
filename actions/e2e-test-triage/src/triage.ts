@@ -9,14 +9,17 @@ import { FAILED_TESTS, isReportsIncomplete, isUpstreamFailed, readStatuses, stat
 import { compositeIdentityFrom, fetchRun, missingArrived, NoResultsError, SupersededRunError, tsioBase } from "../../shared/src/tsio.ts";
 import type { CompositeIdentity, RunResult, Wait } from "../../shared/src/tsio.ts";
 import { isShardPlaceholder, isSpecNotRun, isSpecStopped } from "./classify.ts";
+import { skimRunArtifacts } from "./artifacts.ts";
+import { skimCiLogsForFindings } from "./ci-logs.ts";
 import { configFrom, DEFAULTS, historyLane, PR_SPEND_KEY } from "./config.ts";
-import { loadEvidence } from "./evidence.ts";
+import { evidenceFor, loadEvidence, mergeEvidence } from "./evidence.ts";
 import { dropStormRuns, fetchChangedFiles, fetchHistory, fetchSpecRuns, markBrokeBy, markFixedOnTrunk, markOutOfDate, trunkRunsOn } from "./history.ts";
 import { enrichFindings, siblingPlatforms } from "./enrich.ts";
 import { askModelBatch } from "./judge.ts";
 import { evaluateRun } from "./evaluate.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
 import { findingLogLine, redact, secretsOf, writeFindings } from "./findings.ts";
+import type { LaneDiagnosisSummary, RerunSummary } from "./findings.ts";
 import { askCauseWith, decideRerun, readDeadJobs } from "./rerun-check.ts";
 import { laneDescription } from "./lane-diagnosis.ts";
 import { laneTurnsGreen } from "./lane-diagnosis.ts";
@@ -25,7 +28,7 @@ import type { JudgedLane } from "./lane-verdict.ts";
 import type { RerunDecision } from "./rerun-check.ts";
 import { ledgerTotals } from "./pricing.ts";
 import { activeFlag, noResultsText, otherRunText, passLine, renderLane, renderNotTriaged, renderSummary, renderUnfinished, RERUN, RERUNNING, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
-import type { AskFn, Config, Diff, HistoryLike, Observation, SpecHistory } from "./types.ts";
+import type { AskFn, Config, Diff, Finding, HistoryLike, Observation, SpecHistory } from "./types.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
 export interface TriageIdentity extends CompositeIdentity {
@@ -66,6 +69,10 @@ interface Seen {
   run: RunResult | null;
   result: EvaluatedRun | null;
   enforce: boolean | null;
+  basis: "tests" | "orchestration" | "lane" | null;
+  description: string | null;
+  laneDiagnosis: LaneDiagnosisSummary | null;
+  rerun: RerunSummary | null;
 }
 
 /** The composite identity, or null when it cannot be read: the findings file then names what it can. */
@@ -100,8 +107,8 @@ async function unreadHistory(read: Promise<HistoryLike>, log: (message: string) 
  * ends (FINDINGS_FILE): judged, superseded, with no results, or broken off.
  */
 export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
-  const written = { summary: false };
-  const seen: Seen = { run: null, result: null, enforce: null };
+  const written = { summary: false, aggregateOutput: false };
+  const seen: Seen = { run: null, result: null, enforce: null, basis: null, description: null, laneDiagnosis: null, rerun: null };
   const { env } = options;
   const log = options.log ?? console.error;
   const requested: "enforce" | "report-only" = String(env.MODE ?? "").trim() === "enforce" ? "enforce" : "report-only";
@@ -109,7 +116,7 @@ export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
   const effective = (): "enforce" | "report-only" => (seen.enforce === null ? requested : seen.enforce ? "enforce" : "report-only");
   try {
     const result = await decideRun(options, written, seen);
-    writeFindings({ env, id: identityOrNull(env), mode: effective(), run: seen.run, result, notTriaged: null }, log);
+    writeFindings({ env, id: identityOrNull(env), mode: effective(), run: seen.run, result, notTriaged: null, basis: seen.basis, description: seen.description, laneDiagnosis: seen.laneDiagnosis, rerun: seen.rerun }, log);
     return result;
   } catch (e) {
     const id = identityOrNull(env);
@@ -140,7 +147,14 @@ export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
         log(`triage's summary not written: ${String(writeError).slice(0, 160)}`);
       }
     }
-    writeFindings({ env, id, mode: effective(), run: seen.run, result: seen.result, notTriaged }, log);
+    if (!written.aggregateOutput && env.GITHUB_OUTPUT) {
+      try {
+        appendFileSync(env.GITHUB_OUTPUT, "aggregate-published=false\n");
+      } catch (writeError) {
+        log(`triage's output not written: ${String(writeError).slice(0, 160)}`);
+      }
+    }
+    writeFindings({ env, id, mode: effective(), run: seen.run, result: seen.result, notTriaged, basis: seen.basis, description: seen.description, laneDiagnosis: seen.laneDiagnosis, rerun: seen.rerun }, log);
     if (e instanceof SupersededRunError) throw new NotTriagedError(notTriaged);
     throw e;
   }
@@ -213,7 +227,7 @@ async function defaultBranchOf(api: GhApi, repository: string, log: (message: st
 }
 
 /** Fetches the run, its history and diff, evaluates the findings, and writes the summary and commit statuses. */
-async function decideRun({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait, retryWait }: TriageOptions, written: { summary: boolean }, seen: Seen): Promise<EvaluatedRun> {
+async function decideRun({ env, fetchImpl = fetch, log = console.error, now = new Date(), wait, retryWait }: TriageOptions, written: { summary: boolean; aggregateOutput: boolean }, seen: Seen): Promise<EvaluatedRun> {
   const cfg: Config = configFrom(env, log);
   const id = compositeIdentityFrom<TriageIdentity>(env.COMPOSITE_IDENTITY);
   const prNumber = Number(id.gh_pr_number || 0) || null;
@@ -227,10 +241,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   const historyReport = cfg.historyReport || reportName;
   // No results to judge test by test (no TSIO group, or a group with no test cases: every worker died before it
   // reported): the lane is judged from its orchestration and its jobs alone (see judgeLane).
+  const sameRun = !env.GITHUB_RUN_ID || String(env.GITHUB_RUN_ID) === String(id.gh_run_id);
   let laneOnly: string | null = null;
   let run: RunResult;
   try {
-    run = await fetchRun(fetchImpl, base, id, reportName, wait);
+    run = await fetchRun(fetchImpl, base, id, reportName, wait, sameRun ? env.GITHUB_RUN_ATTEMPT : null);
   } catch (e) {
     if (!(e instanceof NoResultsError) && !/reported no test cases/.test(String(e))) throw e;
     laneOnly = String(e instanceof Error ? e.message : e).slice(0, 200);
@@ -300,14 +315,16 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
   // the repository's default branch. Until GitHub names that branch (the lookup failed, or never ran because nothing
   // failed) it stays undefined, and the publisher infers it from the tested identity and the statuses.
   let releaseRun: boolean | undefined = isTrunkRun ? undefined : false;
-  const settleLaneSummary = async (): Promise<void> => {
+  const settleLaneSummary = async (): Promise<boolean> => {
     try {
-      await publisher.refresh(lanes, triageContext ?? undefined, laneSummary, releaseRun);
+      return await publisher.refresh(lanes, triageContext ?? undefined, laneSummary, releaseRun);
     } catch (e) {
       log(`triage check ${triageContext} not summarised: ${String(e).slice(0, 200)}`);
+      return false;
     }
   };
-  if (announce) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : flakyOnly ? `${run.counts.flaky} flaky · triage is checking them` : `${run.counts.failed} failed · triage is checking them`);
+  const announceTriagePending = announce && (!lanes.length || lanes.includes(String(context)));
+  if (announceTriagePending) await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : flakyOnly ? `${run.counts.flaky} flaky · triage is checking them` : `${run.counts.failed} failed · triage is checking them`);
   try {
     let history: HistoryLike = new Map();
     let diff: Diff = { files: [], ok: false };
@@ -340,12 +357,17 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         }
       }
       const baseRuns = prBase ? trunkRunsOn(history, prBase) : 0;
+      const isReleasePrBase = Boolean(prBase && /^(?:build-)?release[-/]/i.test(prBase));
       if (prBase && baseRuns < cfg.minTrunkRuns) {
-        const fallback = await defaultBranchOf(api, id.repository, log);
-        if (fallback && fallback !== prBase) {
-          trunkBranch = fallback;
-          notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
-          history = await unreadHistory(fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log);
+        if (isReleasePrBase) {
+          notes.push(`Trunk history stays on ${prBase} (${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}); default branch history is not substituted for a release branch.`);
+        } else {
+          const fallback = await defaultBranchOf(api, id.repository, log);
+          if (fallback && fallback !== prBase) {
+            trunkBranch = fallback;
+            notes.push(`Trunk history is read from ${fallback}, the default branch: ${prBase} has ${baseRuns} earlier runs of these tests, fewer than ${cfg.minTrunkRuns}.`);
+            history = await unreadHistory(fetchHistory(fetchImpl, base, id.repository, run.failing, now.toISOString(), cfg, trunkBranch, historyReport, log, historyLane(id, cfg)), log);
+          }
         }
       }
       await dropStormRuns({ history, fetchImpl, base, minFailures: cfg.infraMinFailures, trunkBranch, own: run.group_id, pr: prNumber, log });
@@ -403,14 +425,67 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     }
     const apiKey = env.ANTHROPIC_API_KEY;
     const ask: AskFn | null = apiKey && !prSpendUnknown ? (packs, model) => askModelBatch(fetchImpl, apiKey, model, packs) : null;
+    const secrets = secretsOf(env);
+    const attemptStr = String(run.attempt ?? (sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : id.gh_run_attempt || 1));
+    const runIdStr = String(id.gh_run_id || env.GITHUB_RUN_ID || "");
+    const artifactEvidenceEnabled = String(env.ARTIFACT_EVIDENCE ?? "").trim().toLowerCase() !== "false";
+    const artifactPatterns = String(env.ARTIFACT_PATTERNS ?? "").split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+    const skimRuntimeEvidence = ask && env.GITHUB_TOKEN
+      ? async (targets: Finding[]): Promise<void> => {
+          if (!targets.length) return;
+          const [ciLogs, skimmedArtifacts] = await Promise.all([
+            skimCiLogsForFindings({
+              fetchImpl,
+              token: String(env.GITHUB_TOKEN),
+              repository: id.repository,
+              runId: runIdStr,
+              attempt: attemptStr,
+              findings: targets,
+              prefix: env.LANE_JOB_PREFIX || null,
+              filter: env.LANE_JOB_FILTER || null,
+              reportName,
+              lane: env.LANE || id.name,
+              secrets,
+              log,
+            }),
+            artifactEvidenceEnabled
+              ? skimRunArtifacts({
+                  fetchImpl,
+                  token: String(env.GITHUB_TOKEN),
+                  repository: id.repository,
+                  runId: runIdStr,
+                  findings: targets,
+                  reportName,
+                  lane: env.LANE || id.name,
+                  patterns: artifactPatterns,
+                  secrets,
+                  log,
+                })
+              : Promise.resolve({ evidence: [], serviceLogs: "", artifactsScanned: [] }),
+          ]);
+          for (const [idx, f] of targets.entries()) {
+            const ci = ciLogs.byFinding.get(idx) || ciLogs.runExcerpt;
+            if (ci) f.ci_logs = ci;
+            if (skimmedArtifacts.serviceLogs) f.service_logs = skimmedArtifacts.serviceLogs;
+            const matched = skimmedArtifacts.evidence.filter((e) => evidenceFor(f, [e]) != null);
+            if (matched.length) {
+              const base = f.producer ?? matched[0];
+              const normalized = matched.map((m) => ({ ...m, file: base.file, title: base.title, full_title: base.full_title }));
+              const merged = mergeEvidence(f.producer ? [f.producer] : [], normalized);
+              if (merged[0]) f.producer = merged[0];
+            }
+          }
+        }
+      : null;
     const result = await evaluateRun({
       run, id, prNumber, history, diff, trunkBranch, branchBase, branchName: branchBase ? id.branch ?? null : null, testRoot, cfg,
       prTitle: pull.title ?? "", lane: env.LANE || id.name, log,
       ask,
       evidence: env.EVIDENCE_DIR ? loadEvidence(env.EVIDENCE_DIR, log) : [],
       enrich: (findings) => enrichFindings({ findings, api, id, testRoot, prFiles: diff.ok ? diff.files : null, baseBranch: prBase, log }),
+      skimRuntimeEvidence,
       // A release run's matrix (OS x server version) is wider than a PR's platforms.
-      otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, log, limit: branchBase ? 20 : 5 }),
+      otherPlatforms: (findings) => siblingPlatforms({ findings, fetchImpl, base, id, runAttempt: run.attempt, log, limit: branchBase ? 20 : 5 }),
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths, fetchFileDiffs: Boolean(branchBase) }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
@@ -428,7 +503,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       const judged = await judgeLane({
         env, fetchImpl, api, tsio: base, id, context, base: laneBase, trunkRun: isTrunkRun,
         prFiles: diff.ok ? diff.files.map((f) => f.filename) : null, lanePaths: lanePathsOf(testRoot, cfg.supportPaths),
-        judgedSpecs: run.failing.map((t) => t.file), noResults: Boolean(laneOnly), log,
+        judgedSpecs: run.failing.map((t) => t.file), noResults: Boolean(laneOnly), reportAttempt: run.attempt ?? null, log,
       });
       const mass = ["broken on main", "fixed on main", "caused by PR"].includes(judged.verdict.label);
       const testsBlock = result.findings.some((f) => f.blocking);
@@ -440,7 +515,9 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         decides = true;
         if (enforce && !announce) {
           announce = true;
-          await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : "Triage is checking this lane");
+          if (!lanes.length || lanes.includes(String(context))) {
+            await postTriageCheck("pending", lanes.length ? `Triage is checking ${laneName(String(context))}` : "Triage is checking this lane");
+          }
         }
       }
       log(`e2e-test-triage: lane ${lane ? "verdict" : "read (tests decide)"}: ${judged.verdict.label} (${judged.verdict.fault}): ${judged.verdict.what}`);
@@ -451,7 +528,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // read: one the change broke (build, test server) holds the re-run (see decideRerun).
     // The later of the run's own attempt and the identity's: a re-run of failed jobs keeps the first attempt's TSIO
     // identity (gh_run_attempt 1), so the identity alone would promise a re-run the listener will not make.
-    const attempt = Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1);
+    const attempt = sameRun ? Math.max(Number(id.gh_run_attempt) || 1, Number(env.GITHUB_RUN_ATTEMPT) || 1) : Number(id.gh_run_attempt) || 1;
     // A spec that never ran (NOT_RUN) is no test's result either: re-running its shard is how it runs.
     const onlyNoResults = (result.unnamed || result.missing || result.findings.some((f) => f.class === "NOT_RUN")) && !result.findings.some((f) => f.blocking && f.class !== "NOT_RUN");
     // Every report arrived and no test failed, but a job outside the tests died (a worker whose specs the others ran):
@@ -488,7 +565,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       notes.push(`No test failed: the ${run.counts.flaky === 1 ? "1 test that failed a try" : `${run.counts.flaky} tests that failed a try`} passed on a retry. The lane counted ${run.counts.flaky === 1 ? "it" : "them"} as failed.`);
     // The lane's own re-run: only for a machine failure, and only within the repo's allowance. A lane whose orchestration
     // began is re-run whole, from its first job: re-running its failed jobs alone finds that run closed.
-    const laneRerun = lane && lane.verdict.rerun !== "none" && attempt <= cfg.rerunAttempts && Number(env.GITHUB_RUN_ATTEMPT || attempt) <= cfg.rerunAttempts ? lane.verdict.rerun : null;
+    const laneRerun = lane && lane.verdict.rerun !== "none" && attempt <= cfg.rerunAttempts ? lane.verdict.rerun : null;
     const rerun = (lane ? laneRerun : rerunCheck?.rerun) ? { attempt: attempt + 1, of: cfg.rerunAttempts + 1 } : null;
     const held = lane ? null : rerunCheck?.held ?? null;
     // A bulk failure the base branch explains (the lane fails the same way there) is not the PR's: its tests are cleared
@@ -515,11 +592,16 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       : onlyDeadJobs
       ? `(${held ? `not re-run: ${held}` : `machine failure, ${rerun ? RERUNNING : RERUN}`}) ${passLine(run.counts)}`
       : statusDescription(result.verdict, result.findings, result.infra, run.counts, result.missing, result.unnamed ?? 0, result.notRun ?? 0, rerun, held);
+    const basis: "tests" | "orchestration" | "lane" = lane ? (lane.verdict.label === "all specs ran" ? "orchestration" : "lane") : "tests";
+    seen.basis = basis;
+    seen.description = description;
+    seen.laneDiagnosis = lane ? { label: lane.verdict.label, fault: lane.verdict.fault, what: lane.verdict.what, action: lane.verdict.action } : null;
+    seen.rerun = { requested: Boolean(rerun), of: rerun?.of ?? null, held };
     // The run flag only while it keeps the run red (see activeFlag): a flagged run whose failures were all cleared has none.
     const flag = activeFlag(result.infra, result.findings);
     if (env.GITHUB_OUTPUT)
       appendFileSync(env.GITHUB_OUTPUT, `effective_mode=${enforce ? "enforce" : "report-only"}\nverdict=${result.verdict}\nblocking=${flag ? run.counts.failed : result.findings.filter((f) => f.blocking).length + (result.unnamed ?? 0)}\nexonerated=${result.findings.filter((f) => !f.blocking).length}\ndescription=${description}\nrerun=${Boolean(rerun)}\nrerun_of=${rerun?.of ?? ""}\nrerun_held=${held ?? ""}\n` +
-        `rerun_job=${rerun && laneRerun === "lane" ? String(lane?.startJobId ?? 0) : ""}\nlane_label=${lane?.verdict.label ?? ""}\nlane_fault=${lane?.verdict.fault ?? ""}\nbasis=${lane ? (lane.verdict.label === "all specs ran" ? "orchestration" : "lane") : "tests"}\n` +
+        `rerun_job=${rerun && laneRerun === "lane" ? String(lane?.startJobId ?? 0) : ""}\nlane_label=${lane?.verdict.label ?? ""}\nlane_fault=${lane?.verdict.fault ?? ""}\nbasis=${basis}\n` +
         `ai_calls=${spend.calls}\nai_cost_usd=${spend.cost_usd == null ? "unknown" : spend.cost_usd.toFixed(6)}\nai_input_tokens=${spend.input_tokens}\nai_output_tokens=${spend.output_tokens}\n`);
     // A lane with nothing failed or missing has nothing to report, so it writes no job
     // summary: the run page then shows only the lanes someone needs to read.
@@ -556,7 +638,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         log(`triage's line not written on ${context}: ${String(e).slice(0, 200)}`);
       }
     }
-    if (announce && lanes.length) await settleLaneSummary();
+    let aggregatePublished = false;
+    if (announce && lanes.length) aggregatePublished = await settleLaneSummary();
     else if (announce) {
       // The same labels as the E2E check's text (see statusDescription), and its re-run wording.
       const again = held ? `not re-run: ${held}` : rerun ? RERUNNING : RERUN;
@@ -564,7 +647,10 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
         ? `${run.counts.failed} failed · not triaged, ${runFlag(flag)}`
         : `${run.counts.failed} failed → ${statusLabels(result.findings, run.counts.failed).map((l) => (l === RERUN ? again : l)).join(", ") || "none cleared"}${flag ? ` · ${runFlag(flag)}` : ""}${result.unnamed && result.findings.length ? ` · ${again}` : ""}`) + (result.missing ? ` · ${result.missing.short}` : ""));
     }
-    if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `published=${published}\n`);
+    if (env.GITHUB_OUTPUT) {
+      appendFileSync(env.GITHUB_OUTPUT, `published=${published}\naggregate-published=${aggregatePublished}\n`);
+      written.aggregateOutput = true;
+    }
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));
     log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;
@@ -576,7 +662,11 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       } catch {
         // The lane's own failure is what the PR shows; a write that fails here changes nothing.
       }
-      await settleLaneSummary();
+      const aggregatePublished = await settleLaneSummary();
+      if (env.GITHUB_OUTPUT) {
+        appendFileSync(env.GITHUB_OUTPUT, `aggregate-published=${aggregatePublished}\n`);
+        written.aggregateOutput = true;
+      }
     } else if (announce) await postTriageCheck("error", "Triage could not finish; the E2E result stands");
     throw e;
   }

@@ -1,0 +1,89 @@
+---
+name: E2E test triage consolidate
+description: >
+  Consolidate per-lane triage findings after parallel triage completes: settle the
+  PR-wide aggregate commit status under the caller's SHA lock and emit a unified
+  Human Markdown summary and Agent JSON / Fix Brief.
+author: Mattermost
+inputs:
+  composite-identity:
+    description: TSIO identity JSON (required only when settling triage-status-context)
+    required: false
+    default: ""
+  github-token:
+    description: GitHub token with statuses:write (required only when settling triage-status-context)
+    required: false
+    default: ""
+  triage-status-context:
+    description: Shared PR-wide aggregate check to update (e.g. e2e-test/triage or e2e/triage); empty skips GitHub status writes
+    required: false
+    default: ""
+  triage-lanes:
+    description: Comma-separated required lane status contexts included in the aggregate check
+    required: false
+    default: ""
+  only-if-exists:
+    description: '"true" updates triage-status-context only if already posted by this workflow run (for Attempt-2 all-pass cleanup)'
+    required: false
+    default: "false"
+  release:
+    description: '"true" or "false" to force release wording; empty infers automatically'
+    required: false
+    default: ""
+  findings-dir:
+    description: Directory containing per-lane findings JSON files downloaded from parallel triage jobs
+    required: false
+    default: ""
+  summary-file:
+    description: Optional output path for machine-readable Agent triage-summary.json
+    required: false
+    default: ""
+  write-summary:
+    description: '"true" appends Human Summary and Agent Fix Brief to GITHUB_STEP_SUMMARY'
+    required: false
+    default: "true"
+  cancelled:
+    description: '"true" skips publication when the workflow was cancelled'
+    required: false
+    default: "false"
+outputs:
+  state:
+    description: Overall consolidated state (success, failure, pending, error)
+    value: ${{ steps.consolidate.outputs.state }}
+  description:
+    description: Overall status description
+    value: ${{ steps.consolidate.outputs.description }}
+  published:
+    description: Whether triage-status-context was written
+    value: ${{ steps.consolidate.outputs.published }}
+  blocking:
+    description: Total blocking items across triaged lanes
+    value: ${{ steps.consolidate.outputs.blocking }}
+  exonerated:
+    description: Total exonerated items across triaged lanes
+    value: ${{ steps.consolidate.outputs.exonerated }}
+  ai-calls:
+    description: Total AI calls across triaged lanes
+    value: ${{ steps.consolidate.outputs.ai_calls }}
+  ai-cost-usd:
+    description: Total AI cost in USD across triaged lanes
+    value: ${{ steps.consolidate.outputs.ai_cost_usd }}
+runs:
+  using: composite
+  steps:
+    - id: consolidate
+      if: ${{ !cancelled() && inputs.cancelled != 'true' }}
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        COMPOSITE_IDENTITY: ${{ inputs.composite-identity }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        TRIAGE_CONTEXT: ${{ inputs.triage-status-context }}
+        TRIAGE_LANES: ${{ inputs.triage-lanes }}
+        ONLY_IF_EXISTS: ${{ inputs.only-if-exists }}
+        RELEASE: ${{ inputs.release }}
+        FINDINGS_DIR: ${{ inputs.findings-dir }}
+        SUMMARY_FILE: ${{ inputs.summary-file }}
+        WRITE_SUMMARY: ${{ inputs.write-summary }}
+        CANCELLED: ${{ inputs.cancelled }}
+      run: node "$ACTION_PATH/../dist/index.js" consolidate

@@ -234,3 +234,13 @@ test("the model is asked with the re-run prompt, its cost is counted, and an ans
   assert.equal(ledger.calls.length, 1);
   assert.ok((ledger.calls[0].cost_usd ?? 0) > 0);
 });
+
+test("classifyDeadJob holds build failures present in errors when trailing warnings or cache misses appear", () => {
+  const call = classifyDeadJob(job({
+    step: "Build iOS Simulator",
+    tail: "Cache not found for input keys: pods-ios-123\nwarning: Run script build phase will be run during every build",
+    errors: ["clang++: error: linker command failed with exit code 1", "** BUILD FAILED **"],
+  }));
+  assert.deepEqual([call.verdict, call.short], ["hold", "the build failed"]);
+  assert.match(call.reason, /linker command failed/);
+});

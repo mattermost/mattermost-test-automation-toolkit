@@ -35,11 +35,18 @@ Rules:
   since, together with a diff that does not touch that area. Producer evidence can support these, never clear alone.
 - producer_evidence (id producer), when present, is what the test run itself recorded at the failure: screenshots of the
   screen at that moment (attached as images), the step the test stopped at, and log lines such as the requests the app
-  was still waiting on or the errors the app logged. A wait on the test server that never returned, or a server request
+  was still waiting on or the errors the app logged. Inspect attached screenshots closely for error banners, blank/crashed
+  screens, spinners, or unexpected UI text. A wait on the test server that never returned, or a server request
   that failed or was rejected (an error dialog on screen, an app error naming the call), in an area the diff does not
   touch, supports flaky_environment; a stuck or failing request, screen or flow that the diff changes supports
   caused_by_pr. The PR's own CI wrote this evidence, so it never clears a failure on its own: a clear must also cite
   cross_pr or this_pr_history (or, for flaky_environment, an error that is clearly infrastructural).
+- ci_logs (id ci_logs), when present, is the failing CI job's stripped step output around this spec/test or run errors.
+  Use it to spot runner/OIDC/network/external-service failures vs. build/app/test regressions caused by the diff.
+- service_logs (id service_logs), when present, contains high-signal error lines from server/service/app artifacts
+  (mattermost.log, nginx.log, postgres.log, calls/rtcd, electron/detox/maestro logs, Playwright error-context.md). Use
+  it to distinguish server 5xx/panic/infra failures from PR-introduced API/UI breaks. Neither ci_logs nor service_logs
+  clears a non-infra failure on its own without cross_pr, this_pr_history, or a clearly infrastructural root cause.
 - this_pr_history (id this_pr) is this test on earlier commits of the same PR, and the files that changed between its
   last pass and now. If it passed with the same PR changes in place and nothing in changed_since_last_pass could
   affect the test (read the changes when they are given: app code the test exercises counts even if the error doesn't
@@ -126,6 +133,10 @@ Evidence:
   line of code than this build.
 - cross_pr_failures_14d (id cross_pr): other pull requests where this test failed the same way.
 - test_code_near_failure: the test's code around the failing line.
+- producer_evidence (id producer), ci_logs (id ci_logs), and service_logs (id service_logs), when present: attached
+  failure screenshots, CI step log excerpts, and server/app error logs (mattermost.log, nginx.log, electron/detox/maestro
+  logs, error-context.md). Inspect them to pinpoint whether the app panicked/errored, a service was unreachable, or the
+  test assertion broke.
 
 Rules:
 - Cite only evidence items by their id from the pack. Never invent commits, versions, files or errors.
@@ -380,6 +391,6 @@ export function parseAnswer(text: string, causes: readonly Cause[] = CAUSES): Om
 // v4: the pack gained pr.change_summary and this_pr_history.latest, and this_pr is citable only after a latest pass.
 // v6: the pack no longer carries the rules' class and reason, so the model reads the evidence unanchored. Every v5
 // answer is a miss.
-// v7: answers carry a fix, and a PR streak's pack its pr_streak and product hunks. Every v6 answer is a miss.
+// v8: packs carry ci_logs and service_logs and prompts instruct models on logs + screenshots. Every v7 answer is a miss.
 // A release pack is keyed with its own question, so a PR answer is never reused for it.
-export const answerKey = (model: string, pack: Pack): string => `v7:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + systemFor(pack), pack)}`;
+export const answerKey = (model: string, pack: Pack): string => `v8:${packKey(model + "\n" + JSON.stringify(samplingFor(model)) + "\n" + systemFor(pack), pack)}`;

@@ -165,9 +165,10 @@ names the PR by the same bar as any other failure.
 errors, or 30 or more failed) is triaged test by test, and the model is asked. A
 PR that breaks server startup fails every test on its environment, so on a
 flagged run an environment error is held even with `infra-clears: true`: it stays
-blocking until the model clears it, which it does only by citing the same failure
-on another PR or a pass on an earlier commit of this PR, never on the error text
-alone. Without the model (no key, over budget, an error) it stays blocking and the
+blocking until the model clears it, which it does by citing the same failure
+on another PR or a pass on an earlier commit of this PR (or, with `infra-clears: true`
+and no cited diff hunk, `ci_logs`, `service_logs`, or an infrastructural `error`).
+Without the model (no key, over budget, an error) it stays blocking and the
 run stays red as `ACTION_REQUIRED`. Once every failure is cleared the run is
 `SUCCESS`; missing reports still keep it red.
 
@@ -249,10 +250,14 @@ in the diff could, below 0.6 when the evidence is not enough. It clears a failur
 only at `min-confidence` (0.85) or more **and** with a citation a reviewer can
 open: other PRs failing the same way, or an earlier pass on this PR with nothing
 related the PR changed since (for an environment cause, also an error that is
-clearly infrastructural). What the test run recorded (`evidence-dir`) supports a
-clear but never makes one alone, since the PR's own CI wrote it. The question
-carries the facts, not the rules' call: the model is not told the class or reason
-triage gave the failure, so its answer is its own read of the evidence.
+clearly infrastructural). What the test run recorded (`evidence-dir`) and runtime
+logs (`ci_logs` from failed CI jobs and `service_logs` from skimmed artifacts,
+summarized under **Runtime logs inspected** in the job summary) support a clear
+but never make one alone on a normal run, since the PR's own CI wrote them (on a
+held `INFRA_ERROR` with `infra-clears: true` and no cited diff hunk, `ci_logs`,
+`service_logs`, or an infrastructural `error` can also support `flaky_environment`).
+The question carries the facts, not the rules' call: the model is not told the
+class or reason triage gave the failure, so its answer is its own read of the evidence.
 
 **The first failure in a chain:** a later test in a spec often fails only because
 an earlier one's setup failed. Each question carries the earliest test of the
@@ -423,9 +428,10 @@ as before. All inputs are
 described in [`action.yml`](action.yml). Gate jobs on the `verdict` output, not
 on summary text.
 
-Permissions: `contents: read`, `pull-requests: read`, and `statuses: write` for
-enforce. The token is used only with GitHub. Only the exact mode `enforce`
-writes statuses; anything else is report-only.
+Permissions: `contents: read`, `pull-requests: read`, `actions: read` (for CI log
+and artifact skimming and automatic re-runs), and `statuses: write` for enforce.
+The token is used only with GitHub. Only the exact mode `enforce` writes statuses;
+anything else is report-only.
 
 ## Evidence from the test run
 
@@ -449,6 +455,14 @@ pass on this PR, or an infrastructure error for an environment cause). Only
 PNG/JPEG files inside the directory are read, at most two per test and 3.5 MB
 each. A link in the directory that dangles, or that points outside it, is skipped
 with a warning, and the rest of the evidence still loads.
+
+When the model is enabled and the token has `actions: read`, triage also skims
+the run's CI job logs and GitHub Actions artifacts (`artifact-evidence`, default
+`"true"`; set `"false"` to disable artifact downloads, and `artifact-patterns` for
+comma- or newline-separated substrings prioritizing additional artifact names).
+It merges `evidence*.json` manifests and failure screenshots with `evidence-dir`,
+and extracts `mattermost.log`, service logs, and Playwright `error-context.md`
+excerpts into `service_logs` (with job logs in `ci_logs`).
 
 ## Automatic re-runs
 
@@ -527,16 +541,20 @@ the reason.
 every run: judged, superseded, with no results, or broken off. It is for measuring
 how often triage's answers are right, so a consumer can join it to the verdicts
 later. Nothing in it is a secret, and each error is only its first line (200
-characters at most). Fields, in `schema` 2:
+characters at most). Fields, in `schema` 3:
 
 ```json
 {
-  "schema": 2,
+  "schema": 3,
   "repository": "mattermost/mattermost", "commit_sha": "<sha>", "pr": 5,
   "lane": "playwright-full-enterprise", "status_context": "<context>",
   "run_id": "39637355358", "run_attempt": "1",
   "mode": "enforce | report-only",
   "verdict": "SUCCESS | FAILURE | ACTION_REQUIRED | null",
+  "basis": "tests | orchestration | lane | null",
+  "description": "commit-status summary line | null",
+  "lane_diagnosis": { "label": "caused by PR", "fault": "PR", "what": "", "action": "" },
+  "rerun": { "requested": false, "of": null, "held": null },
   "counts": { "total": 0, "passed": 0, "failed": 0, "flaky": 0, "skipped": 0 },
   "ai": { "calls": 0, "cost_usd": 0, "model": "claude-sonnet-5-5 | null" },
   "triaged": true,
@@ -565,6 +583,7 @@ characters at most). Fields, in `schema` 2:
   main, test bug, server compat, caused by PR, app bug, broken on branch, or machine
   failure. Files written before held "out of date" and "needs investigation" too.
 - Schema 2 added `label` and `ai.explanation`.
+- Schema 3 added `basis`, `description`, `lane_diagnosis`, and `rerun`. Consumers on schema 2 skip schema 3 records until they upgrade.
 
 Consumers check `schema` first. A future change to the shape bumps it.
 
@@ -617,7 +636,16 @@ Enforcing triage now requires a recognized raw lane status owned by the same
 run, and cannot clear a pending raw status. It shares the guard with
 [`e2e-test-status`](../e2e-test-status/README.md). All producers of a given SHA's statuses
 must hold the publication-job lock documented there, including this action and
-its cross-lane summary. Ownership checks alone cannot prevent a check/write
+its cross-lane summary. The one exception, parallel per-lane triage with
+`triage-status-context: "off"` plus the consolidate sub-action, and its race
+window are documented there. Ownership checks alone cannot prevent a check/write
 race. Stale runs still produce diagnostic summaries but cannot update statuses.
 The fixed Mattermost caller refreshes the factual lane summary even when AI
-triage is report-only; the AI action still writes no statuses in that mode.
+triage is report-only; the AI action still writes no statuses in that mode. The
+`aggregate-published` output is `"true"` only when triage wrote the PR-wide
+aggregate check in that run, and `"false"` otherwise (including on early exits
+or non-announcing errors).
+
+### Consolidate sub-action (`actions/e2e-test-triage/consolidate`)
+
+For parallel per-lane callers running with `triage-status-context: "off"`, run `actions/e2e-test-triage/consolidate` once at the end under the SHA status lock to settle `triage-status-context` (supporting `only-if-exists: "true"` for Attempt-2 all-pass cleanup) and emit a unified Human Markdown table (`GITHUB_STEP_SUMMARY`) plus Agent JSON (`summary-file`) and Fix Brief from downloaded `findings-dir` artifacts. Inputs: `composite-identity`, `github-token`, `triage-status-context`, `triage-lanes`, `only-if-exists`, `release`, `findings-dir`, `summary-file`, `write-summary`, `cancelled`. Outputs: `state`, `description`, `published`, `blocking`, `exonerated`, `ai-calls`, `ai-cost-usd`.

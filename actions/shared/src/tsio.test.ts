@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { FetchImpl } from "./github.ts";
-import { DEFAULT_TSIO_BASE_URL, NoResultsError, STAGING_TSIO_BASE_URL, SupersededRunError, compositeIdentityFrom, fetchRun, missingReports, missingArrived, outcomeWithDuplicates, tsioBase } from "./tsio.ts";
+import { DEFAULT_TSIO_BASE_URL, NoResultsError, STAGING_TSIO_BASE_URL, SupersededRunError, compositeIdentityFrom, effectiveAttemptOf, fetchRun, listReportGroups, missingReports, missingArrived, outcomeWithDuplicates, tsioBase } from "./tsio.ts";
 
 test("use-staging unset, false or empty keeps the shared instance or the given base URL", () => {
   assert.equal(tsioBase({}), DEFAULT_TSIO_BASE_URL);
@@ -161,4 +161,92 @@ test("the run reader counts a test that failed and then passed later in its own 
   const run = await fetchRun(fetchImpl, "http://tsio", ours, null, { attempts: 1, ms: 0 });
   assert.deepEqual(run.failing, []);
   assert.deepEqual(run.counts, { total: 1, passed: 1, failed: 0, flaky: 1, skipped: 0 });
+});
+
+test("fetchRun honors GITHUB_RUN_ATTEMPT when a re-run keeps attempt 1 in COMPOSITE_IDENTITY", async () => {
+  const fetchImpl = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/suites")) return Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] });
+    if (u.includes("/cases")) return Response.json([{ suite_id: "s1", title: "t1", status: "passed", retry_count: 0, ordinal: 0 }]);
+    return Response.json({ reports: [group(ours.gh_run_id, "2")] });
+  }) as FetchImpl;
+  const run = await fetchRun(fetchImpl, "http://tsio", ours, null, { attempts: 1, ms: 0 }, "2");
+  assert.equal(run.counts.passed, 1);
+});
+
+test("listReportGroups paginates past 100 groups using offset", async () => {
+  const urls: string[] = [];
+  const fetchImpl = (async (url: string) => {
+    urls.push(String(url));
+    const offset = Number(new URL(String(url)).searchParams.get("offset") ?? "0");
+    if (offset === 0) return Response.json({ reports: Array.from({ length: 100 }, (_, i) => group(String(i))) });
+    return Response.json({ reports: [group("101")] });
+  }) as FetchImpl;
+  const rows = await listReportGroups(fetchImpl, "http://tsio", { repository: "o/r", commit: commit });
+  assert.equal(rows.length, 101);
+  assert.deepEqual(urls.map((u) => new URL(u).searchParams.get("offset") ?? "0"), ["0", "100"]);
+  assert.ok(urls.every((u) => new URL(u).searchParams.get("limit") === "100"));
+});
+
+test("fetchRun stops paging once page 1 has exact effectiveAttempt, but reads page 2 when only older fallback is on page 1", async () => {
+  const pageCallsA: string[] = [];
+  const fetchA = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/reports?")) {
+      pageCallsA.push(u);
+      const offset = Number(new URL(u).searchParams.get("offset") ?? "0");
+      if (offset === 0) {
+        return Response.json({
+          reports: [group(ours.gh_run_id, "1"), ...Array.from({ length: 99 }, (_, i) => group(String(1000 + i)))],
+        });
+      }
+      return new Response("boom", { status: 500 });
+    }
+    if (u.endsWith("/suites")) return Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] });
+    if (u.includes("/cases")) return Response.json([{ suite_id: "s1", title: "t1", status: "passed", retry_count: 0, ordinal: 0 }]);
+    throw new Error(`unexpected ${u}`);
+  }) as FetchImpl;
+  const runA = await fetchRun(fetchA, "http://tsio", ours, null, { attempts: 1, ms: 0 });
+  assert.equal(pageCallsA.length, 1);
+  assert.equal(runA.attempt, "1");
+  assert.equal(runA.counts.passed, 1);
+
+  const pageCallsB: string[] = [];
+  const fetchB = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/reports?")) {
+      pageCallsB.push(u);
+      const offset = Number(new URL(u).searchParams.get("offset") ?? "0");
+      if (offset === 0) {
+        return Response.json({
+          reports: [group(ours.gh_run_id, "1"), ...Array.from({ length: 99 }, (_, i) => group(String(2000 + i)))],
+        });
+      }
+      return Response.json({ reports: [group(ours.gh_run_id, "2")] });
+    }
+    if (u.endsWith("/suites")) return Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] });
+    if (u.includes("/cases")) return Response.json([{ suite_id: "s1", title: "t1", status: "passed", retry_count: 0, ordinal: 0 }]);
+    throw new Error(`unexpected ${u}`);
+  }) as FetchImpl;
+  const runB = await fetchRun(fetchB, "http://tsio", ours, null, { attempts: 1, ms: 0 }, "2");
+  assert.equal(pageCallsB.length, 2);
+  assert.equal(runB.attempt, "2");
+  assert.equal(runB.counts.passed, 1);
+});
+
+test("effectiveAttemptOf normalizes leading zeros and TSIO list/suites null fields do not throw TypeError", async () => {
+  assert.equal(effectiveAttemptOf("1", "02"), "2");
+  assert.equal(effectiveAttemptOf("2", "01"), "2");
+
+  const empty = await listReportGroups((async () => Response.json({ reports: null })) as FetchImpl, "http://tsio", { repository: "o/r" });
+  assert.deepEqual(empty, []);
+
+  const nullSuitesFetch = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/reports?")) return Response.json({ reports: [group(ours.gh_run_id, "2")] });
+    if (u.endsWith("/suites")) return Response.json({ suites: null });
+    if (u.includes("/cases")) return Response.json([]);
+    throw new Error(`unexpected ${u}`);
+  }) as FetchImpl;
+  await assert.rejects(() => fetchRun(nullSuitesFetch, "http://tsio", ours, null, { attempts: 1, ms: 0 }, "02"), /reported no test cases/);
 });

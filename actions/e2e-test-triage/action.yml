@@ -123,7 +123,7 @@ inputs:
     required: false
     default: ""
   findings-file:
-    description: Optional path of a JSON file triage writes after every run, judged or not, for measuring its accuracy (schema 1, see the README). Holds no secret and only the first line of each error. Empty turns it off
+    description: Optional path of a JSON file triage writes after every run, judged or not, for measuring its accuracy (schema 3, see the README). Holds no secret and only the first line of each error. Empty turns it off
     required: false
     default: ""
   rerun-attempts:
@@ -153,10 +153,21 @@ inputs:
       this job, with every job after it, so it starts a new TSIO run (see e2e-test-rerun)
     required: false
     default: prepare-run
+  artifact-evidence:
+    description: '"true" (default) skims failing run debug/evidence/failure artifacts for screenshots and server/app error logs (needs actions: read on github-token); "false" disables artifact downloads'
+    required: false
+    default: "true"
+  artifact-patterns:
+    description: Optional comma- or newline-separated substrings prioritizing additional GitHub Actions artifact names to skim
+    required: false
+    default: ""
 outputs:
   published:
     description: Whether triage wrote its verdict to the required status
     value: ${{ steps.triage.outputs.published }}
+  aggregate-published:
+    description: Whether triage wrote the PR-wide aggregate check in this run
+    value: ${{ steps.triage.outputs.aggregate-published }}
   effective-mode:
     description: enforce or report-only, after applying the PR's report-only label
     value: ${{ steps.triage.outputs.effective_mode }}
@@ -227,6 +238,8 @@ runs:
         LANE_JOB_PREFIX: ${{ inputs.lane-job-prefix }}
         LANE_JOB_FILTER: ${{ inputs.lane-job-filter }}
         LANE_START_JOB: ${{ inputs.lane-start-job }}
+        ARTIFACT_EVIDENCE: ${{ inputs.artifact-evidence }}
+        ARTIFACT_PATTERNS: ${{ inputs.artifact-patterns }}
       run: node "${{ github.action_path }}/dist/index.js"
     # The request for a re-run, for e2e-test-rerun: one marker per lane and attempt, named with the attempt and the
     # attempts the lane allows in all, so the listener acts on this attempt's requests within the lane's limit.

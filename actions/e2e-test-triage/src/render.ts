@@ -266,6 +266,8 @@ function factsTable(f: Finding, branch: string, pr: boolean, branchRun: string |
   if (f.other_lanes?.length) rows.push(["Same test, same run, other platforms", f.other_lanes.map((o) => `${o.platform}: ${o.result}`).join(", ")]);
   if (f.tries?.ran) rows.push(["Tries in this run", f.tries.ran === 1 ? "Failed its only try" : f.tries.failed === f.tries.ran ? `Failed all ${f.tries.ran}` : `Failed ${f.tries.failed} of ${f.tries.ran}`]);
   if (f.producer) rows.push(["Recorded by the run", [f.producer.images.length && count(f.producer.images.length, "screenshot"), f.producer.notes && `notes: ${f.producer.notes.slice(0, 200)}`].filter(Boolean).join("; ")]);
+  const runtimeSources = [f.ci_logs && "CI logs", f.service_logs && "service logs"].filter(Boolean);
+  if (runtimeSources.length) rows.push(["Runtime logs inspected", runtimeSources.join(", ")]);
   if (f.same_as) rows.push(["Same failure as", f.same_as]);
   if (f.out_of_date) {
     const c = f.out_of_date.commit;

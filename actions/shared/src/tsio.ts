@@ -194,6 +194,7 @@ export interface FailingTest {
 
 export interface RunResult {
   group_id: TsioId;
+  attempt?: string;
   failing: FailingTest[];
   missing: Missing | null;
   outcomes: Map<string, string>;
@@ -248,36 +249,94 @@ export function missingArrived(missing: Missing | null): string | null {
   return `${received ?? "?"} reports arrived (the expected count is unknown)`;
 }
 
+/** Picks `runAttempt` when it is a valid numeric attempt newer than `idAttempt`, else `idAttempt`. */
+export function effectiveAttemptOf(idAttempt: string | number | null | undefined, runAttempt?: string | number | null): string {
+  const base = String(idAttempt ?? "");
+  return runAttempt != null && /^\d+$/.test(String(runAttempt)) && /^\d+$/.test(base) && Number(runAttempt) > Number(base)
+    ? String(Number(runAttempt))
+    : base;
+}
+
+function groupMatches(g: TsioGroup, id: CompositeIdentity, runId: string, attempt: string): boolean {
+  return (
+    g.repository === id.repository &&
+    g.commit === id.commit_sha &&
+    g.name === id.name &&
+    String(g.gh_run_id) === runId &&
+    String(g.gh_run_attempt) === attempt
+  );
+}
+
+/** Lists TSIO report groups with offset pagination so multi-group commits are never truncated at 20 rows. */
+export async function listReportGroups(
+  fetchImpl: FetchImpl,
+  base: string,
+  params: Record<string, string>,
+  maxPages = 2,
+  pageSize = 100,
+  stopWhen?: (all: TsioGroup[]) => boolean,
+): Promise<TsioGroup[]> {
+  const all: TsioGroup[] = [];
+  for (let page = 0; page < maxPages; page++) {
+    const q = new URLSearchParams({ ...params, limit: String(pageSize), ...(page > 0 ? { offset: String(page * pageSize) } : {}) });
+    const data = await tsioJson<{ reports?: TsioGroup[] | null }>(fetchImpl, base, `/reports?${q}`);
+    const reports = data.reports ?? [];
+    all.push(...reports);
+    if (reports.length < pageSize || stopWhen?.(all)) break;
+  }
+  return all;
+}
+
 /**
  * The run's results, optionally narrowed to one report in the group (desktop
  * uploads one per OS). `reportName` is a prefix: names end in a release version.
  */
-export async function fetchRun(fetchImpl: FetchImpl, base: string, id: CompositeIdentity, reportName: string | null = null, wait: Wait = { attempts: 6, ms: 20000 }): Promise<RunResult> {
-  const q = new URLSearchParams({ repository: id.repository, commit: id.commit_sha, name: String(id.name), limit: "20" });
-  const { reports: groups = [] } = await tsioJson<{ reports?: TsioGroup[] }>(fetchImpl, base, `/reports?${q}`);
-  return runFromGroups(fetchImpl, base, id, groups, reportName, wait);
+export async function fetchRun(
+  fetchImpl: FetchImpl,
+  base: string,
+  id: CompositeIdentity,
+  reportName: string | null = null,
+  wait: Wait = { attempts: 6, ms: 20000 },
+  runAttempt?: string | number | null,
+): Promise<RunResult> {
+  const runId = String(id.gh_run_id ?? "");
+  const idAttempt = String(id.gh_run_attempt ?? "");
+  const effectiveAttempt = effectiveAttemptOf(idAttempt, runAttempt);
+  const groups = await listReportGroups(
+    fetchImpl,
+    base,
+    { repository: id.repository, commit: id.commit_sha, name: String(id.name) },
+    2,
+    100,
+    runId && idAttempt ? (all) => all.some((g) => groupMatches(g, id, runId, effectiveAttempt)) : undefined,
+  );
+  return runFromGroups(fetchImpl, base, id, groups, reportName, wait, runAttempt);
 }
 
 /**
  * The run's results from a group list already read. fetchRun is this after its one list call; a caller that reads
  * several runs from one list (the sibling groups of a run) calls it directly, so the list is read once.
  */
-export async function runFromGroups(fetchImpl: FetchImpl, base: string, id: CompositeIdentity, groups: TsioGroup[], reportName: string | null = null, wait: Wait = { attempts: 6, ms: 20000 }): Promise<RunResult> {
+export async function runFromGroups(
+  fetchImpl: FetchImpl,
+  base: string,
+  id: CompositeIdentity,
+  groups: TsioGroup[],
+  reportName: string | null = null,
+  wait: Wait = { attempts: 6, ms: 20000 },
+  runAttempt?: string | number | null,
+): Promise<RunResult> {
   const get = <T>(path: string): Promise<T> => tsioJson<T>(fetchImpl, base, path);
   // Match the full identity ourselves: never trust the server's filtering, and
   // run id + attempt are what tell two runs of one suite on one commit apart.
   const runId = String(id.gh_run_id ?? "");
-  const attempt = String(id.gh_run_attempt ?? "");
-  if (!runId || !attempt)
-    throw new Error(`composite identity is missing gh_run_id or gh_run_attempt; refusing to guess which run to read (run_id=${runId || "-"} attempt=${attempt || "-"})`);
-  const group = groups.find(
-    (g) =>
-      g.repository === id.repository &&
-      g.commit === id.commit_sha &&
-      g.name === id.name &&
-      String(g.gh_run_id) === runId &&
-      String(g.gh_run_attempt) === attempt,
-  );
+  const idAttempt = String(id.gh_run_attempt ?? "");
+  if (!runId || !idAttempt)
+    throw new Error(`composite identity is missing gh_run_id or gh_run_attempt; refusing to guess which run to read (run_id=${runId || "-"} attempt=${idAttempt || "-"})`);
+  const effectiveAttempt = effectiveAttemptOf(idAttempt, runAttempt);
+  const matchAttempt = (att: string): TsioGroup | undefined => groups.find((g) => groupMatches(g, id, runId, att));
+  const group = (effectiveAttempt !== idAttempt ? matchAttempt(effectiveAttempt) : undefined) ?? matchAttempt(idAttempt);
+  const attempt = effectiveAttempt;
   if (!group) {
     const noGroup = `TSIO returned no group for ${id.repository} ${id.commit_sha.slice(0, 7)} ${id.name} run ${runId} attempt ${attempt} (of ${groups.length} row(s) returned)`;
     // A newer run or attempt of this commit and suite took the group: this run is superseded, and the newest replacement is named.
@@ -314,10 +373,11 @@ export async function runFromGroups(fetchImpl: FetchImpl, base: string, id: Comp
       missing = { expected, received, status: detail.status };
     }
   }
-  const [{ suites: uploaded = [] }, allCases] = await Promise.all([
-    get<{ suites?: TsioSuite[] }>(`/reports/${group.id}/suites`),
+  const [suitesRes, allCases] = await Promise.all([
+    get<{ suites?: TsioSuite[] | null }>(`/reports/${group.id}/suites`),
     get<TsioCase[]>(`/reports/${group.id}/cases`),
   ]);
+  const uploaded = suitesRes.suites ?? [];
   // A re-run uploads its jobs' reports again under the same names: the newest report of a name replaces the earlier
   // attempt's (report ids are UUIDv7, so they sort by upload time). No run uploads two reports of one name otherwise.
   const newest = new Map<string, string>();
@@ -415,7 +475,7 @@ export async function runFromGroups(fetchImpl: FetchImpl, base: string, id: Comp
     else if (status === "flaky") flaky++;
   }
   // Passed includes retry-recovered tests, as the E2E statuses count them.
-  return { group_id: group.id, failing, missing, outcomes, elsewhere, counts:{ total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
+  return { group_id: group.id, attempt: String(group.gh_run_attempt), failing, missing, outcomes, elsewhere, counts:{ total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
 }
 
 /** What a run is missing when some reports never arrived, long and short; null if complete. */

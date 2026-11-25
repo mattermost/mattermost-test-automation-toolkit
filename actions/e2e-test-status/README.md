@@ -14,9 +14,36 @@ are left alone. API errors or truncated history fail closed.
 
 ## Required caller serialization
 
-GitHub statuses have no atomic compare-and-swap. **The guard alone is not a
-lock.** All prepare/claim, skip, report/triage, and aggregate-publication jobs
-for the tested commit must use this same repository-wide mutex:
+GitHub statuses have no atomic compare-and-swap, so the ownership guard alone
+is not a lock. All producers of a given SHA's statuses must hold this same
+repository-wide mutex across reads and writes.
+
+The one exception is parallel per-lane triage. An `e2e-test-triage` step may
+write its own lane's required status without the SHA mutex only when it runs
+with `triage-status-context: "off"` (keep `triage-lanes` set so per-PR budget
+splitting still applies) and a single downstream consolidation job
+(`actions/e2e-test-triage/consolidate`) holds the SHA mutex to project the
+aggregate check and summaries. No other writer may skip the mutex.
+
+That lock-free write cannot detect a claim that lands after its read. Triage
+reads the lane, checks ownership, and then posts. If another run that tests the
+same commit claims the lane `pending` inside that window, the older triage
+verdict and target URL replace the newer claim. The newer run's later finish
+and triage writes then fail the same-run ownership check and are skipped, so
+the required lane status keeps the older run's verdict until a later run or
+attempt claims that lane again. Consolidation does not repair this: it rewrites
+only the aggregate check, never a lane context. The exception therefore also
+requires that no other run can claim that lane between triage's read and its
+post. Run each triage step inside its whole-lane concurrency group (below) so a
+newer run of the same lane cannot claim before triage finishes. That group does
+not cover a run outside it, such as a second PR whose head is the same commit
+or a manual dispatch of that commit. A caller that can start such an
+overlapping run must keep triage under the SHA mutex.
+
+Unlocked per-lane triage can also overwrite a manual `E2E/Override` status on
+the same lane (manual overrides keep the owning run's `target_url`, so
+`mayPublish` does not block a later triage write); serialize manual overrides
+with triage if that race matters.
 
 ```yaml
 concurrency:

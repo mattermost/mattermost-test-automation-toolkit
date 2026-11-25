@@ -55,6 +55,7 @@ export interface EvaluateParams {
   log?: (message: string) => void;
   evidence?: Evidence[];
   enrich?: ((findings: Finding[]) => Promise<void>) | null;
+  skimRuntimeEvidence?: ((findings: Finding[]) => Promise<void>) | null;
   /** The same test on the run's sibling groups (see siblingPlatforms). Asked of every failing run, model or not. */
   otherPlatforms?: ((findings: Finding[]) => Promise<void>) | null;
   outOfDate?: ((findings: Finding[]) => Promise<OutOfDateResult>) | null;
@@ -89,6 +90,7 @@ export async function evaluateRun({
   log = () => {},
   evidence = [],
   enrich = null,
+  skimRuntimeEvidence = null,
   otherPlatforms = null,
   outOfDate = null,
   fixedOnTrunk = null,
@@ -176,6 +178,16 @@ export async function evaluateRun({
       result.ownershipUnknown = !diff.ok;
       for (const f of result.findings)
         if (f.class !== "OWNED_BY_PR") Object.assign(f, { blocking: true, decision: "evidence_incomplete", reason: `${f.reason} ${blind}, so this could not be confirmed.` });
+    } else if (history.reportUnknownFor?.size) {
+      for (const f of result.findings) {
+        if (f.class !== "OWNED_BY_PR" && history.reportUnknownFor.has(identityKey(f))) {
+          Object.assign(f, {
+            blocking: true,
+            decision: "evidence_incomplete",
+            reason: `${f.reason} History does not identify which report a past run came from, so another platform's history cannot be ruled out, so this could not be confirmed.`,
+          });
+        }
+      }
     }
     // The same test on the run's other platforms: this run's own reports (no call), then its sibling groups. The summary
     // and the pack read it, and a failure that failed every try here and on another platform is held.
@@ -241,13 +253,19 @@ export async function evaluateRun({
     }
     if (!blind && prNumber) {
       // More facts for the failures the rules couldn't settle; a lookup that fails only leaves a fact out.
-      if (enrich) {
-        try {
-          await enrich(result.findings.filter((f) => JUDGED.has(f.class) && f.blocking && !f.identity_unresolved && !f.out_of_date));
-        } catch (e) {
-          log(`extra evidence unavailable: ${String(e).slice(0, 200)}`);
-        }
-      }
+      const eligible = result.findings.filter((f) => JUDGED.has(f.class) && f.blocking && !f.identity_unresolved && !f.out_of_date && f.decision !== "evidence_incomplete");
+      await Promise.all([
+        enrich
+          ? enrich(eligible).catch((e: unknown) => {
+              log(`extra evidence unavailable: ${String(e).slice(0, 200)}`);
+            })
+          : Promise.resolve(),
+        skimRuntimeEvidence
+          ? skimRuntimeEvidence(eligible).catch((e: unknown) => {
+              log(`runtime evidence unavailable: ${String(e).slice(0, 200)}`);
+            })
+          : Promise.resolve(),
+      ]);
       markEarlierFailures(result.findings);
       const others: OtherFailure[] = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const pr: PrRef = { number: prNumber, repository: id.repository, title: prTitle, lane };
@@ -263,13 +281,18 @@ export async function evaluateRun({
       // A release branch's run: what kind of failure each held one is (see SYSTEM_RELEASE and decideRelease).
       for (const f of result.findings) f.release = true;
       const held = result.findings.filter((f) => f.blocking && f.class !== "OWNED_BY_PR" && !f.identity_unresolved && f.decision !== "evidence_incomplete");
-      if (enrich) {
-        try {
-          await enrich(held);
-        } catch (e) {
-          log(`extra evidence unavailable: ${String(e).slice(0, 200)}`);
-        }
-      }
+      await Promise.all([
+        enrich
+          ? enrich(held).catch((e: unknown) => {
+              log(`extra evidence unavailable: ${String(e).slice(0, 200)}`);
+            })
+          : Promise.resolve(),
+        skimRuntimeEvidence
+          ? skimRuntimeEvidence(held).catch((e: unknown) => {
+              log(`runtime evidence unavailable: ${String(e).slice(0, 200)}`);
+            })
+          : Promise.resolve(),
+      ]);
       markEarlierFailures(result.findings);
       const others: OtherFailure[] = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const release: ReleaseRef = { repository: id.repository, name: id.name ?? "", branch: branchName || "this branch", base: branchBase, historyBranch: trunkBranch || branchBase, lane };
