@@ -16,7 +16,7 @@ export type RecommendedAction = "merge_base" | "fix_pr" | "fix_test" | "rerun" |
 
 export interface ConsolidatedLane {
   lane: string;
-  status_context: string | null;
+  status_context: string |Partial<FindingsRecord> | null;
   verdict: string | null;
   basis: string | null;
   description: string | null;
@@ -173,8 +173,18 @@ export function buildTriageSummary(records: FindingsRecord[], aggregate: LaneSum
     }
   }
 
-  const derivedState = failingLanes > 0 || blockingTotal > 0 ? "failure" : "success";
-  const derivedDesc = failingLanes > 0 ? `${failingLanes} lane(s) blocking (${blockingTotal} issue(s))` : records.length ? `All ${records.length} triaged lane(s) cleared (${exoneratedTotal} cleared)` : "All lanes green";
+  const derivedState =
+    records.length === 0
+      ? "error"
+      : failingLanes > 0 || blockingTotal > 0
+        ? "failure"
+        : "success";
+  const derivedDesc =
+    records.length === 0
+      ? "No triage findings available"
+      : failingLanes > 0
+        ? `${failingLanes} lane(s) blocking (${blockingTotal} issue(s))`
+        : `All ${records.length} triaged lane(s) cleared (${exoneratedTotal} cleared)`;
 
   return {
     schema: 1,
@@ -245,7 +255,7 @@ export async function consolidate({ env, fetchImpl = fetch, log = console.error,
     mkdirSync(dirname(env.SUMMARY_FILE), { recursive: true });
     writeFileSync(env.SUMMARY_FILE, `${JSON.stringify(summary, null, 2)}\n`);
   }
-  if (env.GITHUB_STEP_SUMMARY && String(env.WRITE_SUMMARY ?? "true").trim().toLowerCase() !== "false" && (records.length > 0 || published)) {
+  if (env.GITHUB_STEP_SUMMARY && String(env.WRITE_SUMMARY ?? "true").trim().toLowerCase() !== "false" && (records.length > 0 || published || Boolean(!triageContext && env.FINDINGS_DIR))) {
     appendFileSync(env.GITHUB_STEP_SUMMARY, `${renderTriageSummaryMarkdown(summary)}\n`);
   }
   if (env.GITHUB_OUTPUT) {

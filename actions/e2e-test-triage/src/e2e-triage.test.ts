@@ -23,7 +23,7 @@ import type { SummaryInput } from "./render.ts";
 import { evaluateRun, settlePR, verdictOf } from "./evaluate.ts";
 import type { EvaluatedRun, EvaluateParams } from "./evaluate.ts";
 import { NotTriagedError, triage } from "./triage.ts";
-import { FINDINGS_SCHEMA, checkFindingsShape, findingLogLine, redact } from "./findings.ts";
+import { FINDINGS_SCHEMA, checkFindingsShape, findingLogLine, findingsRecord, redact } from "./findings.ts";
 import type { CommitStatus, Env, FetchImpl, GhApi } from "../../shared/src/github.ts";
 import { RETRY_DELAYS_MS } from "../../shared/src/github.ts";
 import { laneSummary, redReason } from "../../shared/src/lane.ts";
@@ -3455,6 +3455,21 @@ test("the findings file has one shape, and the shape check names what drifts fro
   assert.ok(checkFindingsShape({ ...good, triaged: true, not_triaged_reason: null }).length > 0, "a triaged run has its verdict");
   assert.ok(checkFindingsShape({ ...good, extra: 1 }).length > 0, "no field outside the schema");
   assert.ok(checkFindingsShape({ ...good, findings: [{ title: "t", error_first_line: "a\nb" }] }).length > 0, "one line of error, never a stack");
+});
+
+test("findingsRecord prefers the selected TSIO report attempt over id.gh_run_attempt", () => {
+  const id = { repository: "o/r", commit_sha: "abc", branch: "b", name: "n", run_group: "g", gh_run_id: "12", gh_run_attempt: "1", gh_pr_number: 5 };
+  const selected = findingsRecord({
+    env,
+    id,
+    mode: "enforce",
+    run: { group_id: "g1", attempt: "2", failing: [], missing: null, outcomes: new Map(), elsewhere: new Map(), counts: { total: 1, passed: 1, failed: 0, flaky: 0, skipped: 0 } },
+    result: null,
+    notTriaged: null,
+  });
+  assert.equal(selected.run_attempt, "2");
+  const fallback = findingsRecord({ env, id, mode: "enforce", run: null, result: null, notTriaged: "no_results: missing" });
+  assert.equal(fallback.run_attempt, "1");
 });
 
 test("tokens are redacted from the findings file: GitHub and Anthropic tokens, and the action's own secrets", () => {

@@ -204,5 +204,20 @@ test("consolidate settles aggregate status, respects only-if-exists, and writes 
     assert.equal(posted.length, 1);
     assert.deepEqual([posted[0].context, posted[0].state, posted[0].description], ["e2e-test/triage", "success", "All lanes green"]);
     assert.match(readFileSync(out2, "utf8"), /published=true/);
+
+    // 3. Missing findings in summary-only mode resolves to error and writes step summary.
+    const emptySummary = buildTriageSummary([], null);
+    assert.equal(emptySummary.overall_state, "error");
+    assert.equal(emptySummary.overall_description, "No triage findings available");
+    const step3 = join(dir, "step3.md");
+    const out3 = join(dir, "gh-output-3.txt");
+    await consolidate({
+      env: { FINDINGS_DIR: emptyDir, SUMMARY_FILE: summaryFile, GITHUB_STEP_SUMMARY: step3, GITHUB_OUTPUT: out3 },
+      fetchImpl: () => { throw new Error("should not call GitHub when TRIAGE_CONTEXT is empty"); },
+      log: () => {},
+    });
+    assert.equal(JSON.parse(readFileSync(summaryFile, "utf8")).overall_state, "error");
+    assert.match(readFileSync(step3, "utf8"), /No triage findings available/);
+    assert.match(readFileSync(out3, "utf8"), /state=error/);
   });
 });

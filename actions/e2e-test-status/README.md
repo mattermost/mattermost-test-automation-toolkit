@@ -14,7 +14,7 @@ are left alone. API errors or truncated history fail closed.
 
 ## Required caller serialization
 
-All producers of a given SHA's statuses must hold this same repository-wide mutex across reads and writes. The one exception is parallel per-lane triage running with `triage-status-context: "off"` (while keeping `triage-lanes` set so per-PR budget splitting still applies), followed by a single downstream consolidation job (`actions/e2e-test-triage/consolidate`) holding the SHA lock to project the aggregate check and summaries. Note that unlocked per-lane triage leaves a narrow simultaneous-write window against manual `E2E/Override` updates to the same lane; `mayPublish` still prevents overwriting any already-completed manual override.
+All producers of a given SHA's statuses must hold this same repository-wide mutex across reads and writes. The one exception is parallel per-lane triage running with `triage-status-context: "off"` (while keeping `triage-lanes` set so per-PR budget splitting still applies), followed by a single downstream consolidation job (`actions/e2e-test-triage/consolidate`) holding the SHA lock to project the aggregate check and summaries. Note that unlocked per-lane triage can overwrite a manual `E2E/Override` status on the same lane (manual overrides keep the owning run's `target_url`, so `mayPublish` does not block a later triage write); serialize manual overrides with triage if that race matters.
 
 ```yaml
 concurrency:

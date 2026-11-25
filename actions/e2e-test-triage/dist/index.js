@@ -1686,7 +1686,7 @@ function findingsRecord({ env, id, mode, run: run2, result, notTriaged, basis = 
     lane: text(env.LANE) ?? text(id?.name),
     status_context: text(env.STATUS_CONTEXT),
     run_id: text(id?.gh_run_id),
-    run_attempt: text(id?.gh_run_attempt),
+    run_attempt: text(run2?.attempt) ?? text(id?.gh_run_attempt),
     mode,
     verdict: result?.verdict ?? null,
     basis: basis ?? null,
@@ -1815,8 +1815,8 @@ function buildTriageSummary(records, aggregate, secrets = []) {
       });
     }
   }
-  const derivedState = failingLanes > 0 || blockingTotal > 0 ? "failure" : "success";
-  const derivedDesc = failingLanes > 0 ? `${failingLanes} lane(s) blocking (${blockingTotal} issue(s))` : records.length ? `All ${records.length} triaged lane(s) cleared (${exoneratedTotal} cleared)` : "All lanes green";
+  const derivedState = records.length === 0 ? "error" : failingLanes > 0 || blockingTotal > 0 ? "failure" : "success";
+  const derivedDesc = records.length === 0 ? "No triage findings available" : failingLanes > 0 ? `${failingLanes} lane(s) blocking (${blockingTotal} issue(s))` : `All ${records.length} triaged lane(s) cleared (${exoneratedTotal} cleared)`;
   return {
     schema: 1,
     overall_state: aggregate?.state ?? derivedState,
@@ -1883,7 +1883,7 @@ async function consolidate({ env, fetchImpl = fetch, log = console.error, retryW
     (0, import_node_fs2.writeFileSync)(env.SUMMARY_FILE, `${JSON.stringify(summary, null, 2)}
 `);
   }
-  if (env.GITHUB_STEP_SUMMARY && String(env.WRITE_SUMMARY ?? "true").trim().toLowerCase() !== "false" && (records.length > 0 || published)) {
+  if (env.GITHUB_STEP_SUMMARY && String(env.WRITE_SUMMARY ?? "true").trim().toLowerCase() !== "false" && (records.length > 0 || published || Boolean(!triageContext && env.FINDINGS_DIR))) {
     (0, import_node_fs2.appendFileSync)(env.GITHUB_STEP_SUMMARY, `${renderTriageSummaryMarkdown(summary)}
 `);
   }

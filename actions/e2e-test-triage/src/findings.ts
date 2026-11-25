@@ -167,7 +167,7 @@ export function findingsRecord({ env, id, mode, run, result, notTriaged, basis =
     lane: text(env.LANE) ?? text(id?.name),
     status_context: text(env.STATUS_CONTEXT),
     run_id: text(id?.gh_run_id),
-    run_attempt: text(id?.gh_run_attempt),
+    run_attempt: text(run?.attempt) ?? text(id?.gh_run_attempt),
     mode,
     verdict: result?.verdict ?? null,
     basis: basis ?? null,
