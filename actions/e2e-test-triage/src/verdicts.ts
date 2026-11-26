@@ -90,6 +90,34 @@ export function makeVerdictLookup({
 }
 
 /**
+ * Gates which findings are persisted as TSIO verdicts.
+ * Unresolved/unconfirmed outcomes (e.g. judge outage, incomplete evidence, first-failure clears, or unconfirmed trunk
+ * regressions/insufficient-data findings) are omitted so they cannot poison or shadow signature verdict reuse.
+ */
+export function shouldSubmitFindingVerdict(f: Finding): boolean {
+  if (f.decision === "unavailable" || f.decision === "evidence_incomplete" || f.decision === "first_failure") return false;
+  if (
+    f.class === "INSUFFICIENT_DATA" &&
+    f.decision !== "adjudicator_unblock" &&
+    f.decision !== "adjudicator_blame" &&
+    f.decision !== "base_broken" &&
+    !f.reused_from_id
+  ) {
+    return false;
+  }
+  if (statusLabelOf(f) === "broken on main") {
+    return (
+      f.class === "BROKEN_ON_TRUNK" ||
+      f.same_as_class === "BROKEN_ON_TRUNK" ||
+      f.decision === "base_broken" ||
+      (f.decision === "adjudicator_unblock" && f.judge?.cause === "bug_on_master") ||
+      Boolean(f.reused_from_id)
+    );
+  }
+  return true;
+}
+
+/**
  * Submits settled triage verdicts to TSIO POST /api/v1/verdicts.
  * Always fails open: missing auth, network errors, timeouts, or 4xx/5xx log a redacted warning and return [].
  */
@@ -114,7 +142,8 @@ export async function submitTriageVerdicts({
   runURL: string;
   log: (message: string) => void;
 }): Promise<CreatedVerdictItem[]> {
-  const hasFindings = findings.length > 0;
+  const submittable = findings.filter(shouldSubmitFindingVerdict);
+  const hasFindings = submittable.length > 0;
   const hasFailingLane = Boolean(lane && lane.verdict.state !== "success");
   if (!hasFindings && !hasFailingLane) return [];
 
@@ -147,10 +176,11 @@ export async function submitTriageVerdicts({
       });
     }
     if (hasFindings) {
-      for (const f of [...findings].sort((a, b) => Number(b.blocking) - Number(a.blocking))) {
+      for (const f of [...submittable].sort((a, b) => Number(b.blocking) - Number(a.blocking))) {
         items.push(findingToVerdictItem(f, runURL, secrets));
       }
     }
+    if (!items.length) return [];
 
     const gid = reportGroupId != null && isUuid(String(reportGroupId)) ? String(reportGroupId) : null;
     return await submitVerdicts(fetchImpl, base, auth.headers, {

@@ -160,6 +160,35 @@ function reusableOutcomeFor(
   if (prior.summary != null && typeof prior.summary !== "string") return null;
   if (prior.model != null && typeof prior.model !== "string") return null;
   if (prior.confidence != null && (typeof prior.confidence !== "number" || !Number.isFinite(prior.confidence) || prior.confidence < minConfidence)) return null;
+  const validConfidence = typeof prior.confidence === "number" && Number.isFinite(prior.confidence) && prior.confidence >= minConfidence;
+  if (prior.decided_by === "ai") {
+    if (!validConfidence || prior.rule !== "adjudicator_unblock") return null;
+  } else if (prior.decided_by === "reused") {
+    if (prior.confidence != null && !validConfidence) return null;
+    const validReusedRule =
+      prior.rule === "adjudicator_unblock" ||
+      (prior.label === "broken on main" && (prior.rule === "base_broken" || prior.rule === "engine" || prior.rule === "BROKEN_ON_TRUNK"));
+    if (!validReusedRule) return null;
+  } else if (prior.decided_by === "rules") {
+    if (prior.label === "broken on main") {
+      if (prior.rule !== "BROKEN_ON_TRUNK" && prior.rule !== "base_broken" && prior.rule !== "same_failure") return null;
+    } else if (prior.label === "flaky") {
+      if (
+        prior.rule !== "FLAKY_ON_TRUNK" &&
+        prior.rule !== "FLAKY_CROSS_PR" &&
+        prior.rule !== "FLAKY_NOT_RUN" &&
+        prior.rule !== "INFRA_ERROR" &&
+        prior.rule !== "rules_unblock" &&
+        prior.rule !== "same_failure"
+      ) {
+        return null;
+      }
+    } else {
+      return null;
+    }
+  } else {
+    return null;
+  }
   if (pack.release) {
     if (prior.label === "flaky") {
       const lanes = pack.same_test_other_platforms_this_run?.results ?? [];

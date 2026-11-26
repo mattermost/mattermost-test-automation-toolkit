@@ -2494,7 +2494,22 @@ function findingLogLine(f, n, of, secrets) {
   const line = `e2e-test-triage: finding ${n}/${of} ${row.blocking ? "blocking" : "cleared"} ${row.class} decision=${row.decision ?? "-"} ai=${ai} cited=${cited} "${clip(row.title, 120)}" \xB7 ${clip(row.file, 100)}: ${row.reason}`;
   return clip(line.replace(/\s+/g, " "), 500);
 }
-var secretsOf = (env, extra = []) => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY, env.TSIO_API_KEY, env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, ...extra].filter((s) => Boolean(s));
+var secretsOf = (env, extra = []) => {
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const raw of [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY, env.TSIO_API_KEY, env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, ...extra]) {
+    if (!raw) continue;
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    for (const candidate of trimmed !== raw ? [raw, trimmed] : [raw]) {
+      if (!seen.has(candidate)) {
+        seen.add(candidate);
+        out.push(candidate);
+      }
+    }
+  }
+  return out;
+};
 function findingsRecord({ env, id, mode, run, result, notTriaged, basis = null, description = null, laneDiagnosis = null, rerun = null }) {
   const secrets = secretsOf(env);
   const ai = result?.ai ?? newLedger();
@@ -4163,6 +4178,26 @@ function reusableOutcomeFor(prior, pack, f, isTrunk, minConfidence) {
   if (prior.summary != null && typeof prior.summary !== "string") return null;
   if (prior.model != null && typeof prior.model !== "string") return null;
   if (prior.confidence != null && (typeof prior.confidence !== "number" || !Number.isFinite(prior.confidence) || prior.confidence < minConfidence)) return null;
+  const validConfidence = typeof prior.confidence === "number" && Number.isFinite(prior.confidence) && prior.confidence >= minConfidence;
+  if (prior.decided_by === "ai") {
+    if (!validConfidence || prior.rule !== "adjudicator_unblock") return null;
+  } else if (prior.decided_by === "reused") {
+    if (prior.confidence != null && !validConfidence) return null;
+    const validReusedRule = prior.rule === "adjudicator_unblock" || prior.label === "broken on main" && (prior.rule === "base_broken" || prior.rule === "engine" || prior.rule === "BROKEN_ON_TRUNK");
+    if (!validReusedRule) return null;
+  } else if (prior.decided_by === "rules") {
+    if (prior.label === "broken on main") {
+      if (prior.rule !== "BROKEN_ON_TRUNK" && prior.rule !== "base_broken" && prior.rule !== "same_failure") return null;
+    } else if (prior.label === "flaky") {
+      if (prior.rule !== "FLAKY_ON_TRUNK" && prior.rule !== "FLAKY_CROSS_PR" && prior.rule !== "FLAKY_NOT_RUN" && prior.rule !== "INFRA_ERROR" && prior.rule !== "rules_unblock" && prior.rule !== "same_failure") {
+        return null;
+      }
+    } else {
+      return null;
+    }
+  } else {
+    return null;
+  }
   if (pack.release) {
     if (prior.label === "flaky") {
       const lanes = pack.same_test_other_platforms_this_run?.results ?? [];
@@ -5217,6 +5252,16 @@ function makeVerdictLookup({
     }
   };
 }
+function shouldSubmitFindingVerdict(f) {
+  if (f.decision === "unavailable" || f.decision === "evidence_incomplete" || f.decision === "first_failure") return false;
+  if (f.class === "INSUFFICIENT_DATA" && f.decision !== "adjudicator_unblock" && f.decision !== "adjudicator_blame" && f.decision !== "base_broken" && !f.reused_from_id) {
+    return false;
+  }
+  if (statusLabelOf(f) === "broken on main") {
+    return f.class === "BROKEN_ON_TRUNK" || f.same_as_class === "BROKEN_ON_TRUNK" || f.decision === "base_broken" || f.decision === "adjudicator_unblock" && f.judge?.cause === "bug_on_master" || Boolean(f.reused_from_id);
+  }
+  return true;
+}
 async function submitTriageVerdicts({
   env,
   fetchImpl,
@@ -5228,7 +5273,8 @@ async function submitTriageVerdicts({
   runURL,
   log
 }) {
-  const hasFindings = findings.length > 0;
+  const submittable = findings.filter(shouldSubmitFindingVerdict);
+  const hasFindings = submittable.length > 0;
   const hasFailingLane = Boolean(lane && lane.verdict.state !== "success");
   if (!hasFindings && !hasFailingLane) return [];
   let secrets = secretsOf(env);
@@ -5259,10 +5305,11 @@ async function submitTriageVerdicts({
       });
     }
     if (hasFindings) {
-      for (const f of [...findings].sort((a, b) => Number(b.blocking) - Number(a.blocking))) {
+      for (const f of [...submittable].sort((a, b) => Number(b.blocking) - Number(a.blocking))) {
         items.push(findingToVerdictItem(f, runURL, secrets));
       }
     }
+    if (!items.length) return [];
     const gid = reportGroupId != null && isUuid(String(reportGroupId)) ? String(reportGroupId) : null;
     return await submitVerdicts(fetchImpl, base, auth.headers, {
       repository,

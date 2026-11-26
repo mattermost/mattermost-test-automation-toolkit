@@ -16,7 +16,7 @@ import { newLedger } from "./pricing.ts";
 import { decidedBy, statusLabelOf } from "./render.ts";
 import { triage } from "./triage.ts";
 import type { Answer, Finding, Observation, Pack, PrRef } from "./types.ts";
-import { buildErrorContext, findingToVerdictItem, makeVerdictLookup, submitTriageVerdicts } from "./verdicts.ts";
+import { buildErrorContext, findingToVerdictItem, makeVerdictLookup, shouldSubmitFindingVerdict, submitTriageVerdicts } from "./verdicts.ts";
 import type { JudgedLane } from "./lane-verdict.ts";
 
 const GROUP_UUID = "01960000-0000-7000-8000-000000000001";
@@ -418,12 +418,19 @@ test("fail-open: TSIO lookup 500 or timeout falls back cleanly to LLM", async ()
 
 test("POST /api/v1/verdicts supports OIDC auth, skips when unauthenticated, deduplicates targets, redacts secrets, and fails open on 500", async () => {
   // 1. OIDC Bearer auth + secret redaction + deduplication
+  const oidcErr = "Error with https://example.com/cb?token=ghp_secretToken1234567890123456 and oidc-jwt-secret-value-999999\n" + "a".repeat(80_000);
   const hOidc = makeHarness({
     envOver: {
       ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc.example/token?sig=abc",
       ACTIONS_ID_TOKEN_REQUEST_TOKEN: "oidc-req-secret-token",
       TSIO_OIDC_AUDIENCE: "mattermost-test-system-io",
     },
+    history: [
+      ...Array.from({ length: 6 }, (_, i) => obs({ title: "t1", commit_sha: `c${i}` })),
+      obs({ title: "t1", gh_pr_number: 99, status: "failed", commit_sha: "otherpr", error_excerpt: oidcErr }),
+      ...Array.from({ length: 6 }, (_, i) => obs({ title: "t2", commit_sha: `c${i}` })),
+      obs({ title: "t2", gh_pr_number: 99, status: "failed", commit_sha: "otherpr" }),
+    ],
     cases: [
       {
         suite_id: "s1",
@@ -431,7 +438,7 @@ test("POST /api/v1/verdicts supports OIDC auth, skips when unauthenticated, dedu
         status: "failed",
         retry_count: 0,
         ordinal: 0,
-        error_message: "Error with https://example.com/cb?token=ghp_secretToken1234567890123456 and oidc-jwt-secret-value-999999\n" + "a".repeat(80_000),
+        error_message: oidcErr,
         test_id: TEST_UUID_1,
         signature_id: SIG_UUID_1,
         signature_fingerprint: "fp-dup",
@@ -564,6 +571,10 @@ test("HIGH-2: ACTIONS_ID_TOKEN_REQUEST_TOKEN and OIDC JWTs are redacted from log
         GITHUB_STEP_SUMMARY: summaryPath,
       },
       onOidc: async () => Response.json({ value: jwt }),
+      history: [
+        ...Array.from({ length: 6 }, (_, i) => obs({ title: `test with ${reqSecret} and ${jwt}`, commit_sha: `c${i}` })),
+        obs({ title: `test with ${reqSecret} and ${jwt}`, gh_pr_number: 99, status: "failed", commit_sha: "otherpr", error_excerpt: `Error carrying ${reqSecret} and ${jwt}` }),
+      ],
       cases: [
         {
           suite_id: "s1",
@@ -585,6 +596,8 @@ test("HIGH-2: ACTIONS_ID_TOKEN_REQUEST_TOKEN and OIDC JWTs are redacted from log
       },
     });
     await triage({ env: h.env, fetchImpl: h.fetchImpl, log: (m) => h.logs.push(m), now: new Date("2026-11-26T12:00:00Z"), retryWait: noopWait });
+
+    assert.equal(h.postedVerdicts.length, 1);
 
     const logText = h.logs.join("\n");
     const findingsText = readFileSync(findingsPath, "utf8");
@@ -976,4 +989,260 @@ test("findingsRecord and findingLogLine redact secrets before clipping without u
   }
   assert.ok(rec.findings[0].error_first_line.includes("[redacted]"));
   assert.ok(rec.findings[0].reason.includes("[redacted]"));
+});
+
+test("secretsOf includes trimmed TSIO_API_KEY and ACTIONS_ID_TOKEN_REQUEST_TOKEN, excludes whitespace-only, and redacts trimmed credentials", async () => {
+  const trimmedApiKey = "zxcvbnmasdfghjkl";
+  const paddedApiKey = `  ${trimmedApiKey}\n`;
+  const trimmedReqToken = "oidc-req-padded-12345";
+  const paddedReqToken = `\t ${trimmedReqToken}  `;
+
+  const s = secretsOf(
+    {
+      GITHUB_TOKEN: "   ",
+      ANTHROPIC_API_KEY: "\n\t",
+      TSIO_API_KEY: paddedApiKey,
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: paddedReqToken,
+    },
+    ["  ", paddedApiKey, " extra-secret "],
+  );
+  assert.deepEqual(s, [paddedApiKey, trimmedApiKey, paddedReqToken, trimmedReqToken, " extra-secret ", "extra-secret"]);
+
+  const f: Finding = {
+    file: "specs/a.spec.ts",
+    title: "t1",
+    error: `Connection rejected ${trimmedApiKey} and ${trimmedReqToken}`,
+    class: "REGRESSION",
+    reason: `Auth failed for ${trimmedApiKey}`,
+    blocking: true,
+    trunk: { runs: 0, passes: 0, fails: 0, flaky: 0, latest: "" },
+    cross_pr: { prs: [], examples: [], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
+    judge: { cause: "flaky_environment", confidence: 0.9, cited_evidence: [], explanation: `Used ${trimmedReqToken}` },
+  };
+  const env: Env = { TSIO_API_KEY: paddedApiKey, ACTIONS_ID_TOKEN_REQUEST_TOKEN: paddedReqToken, MODE: "enforce" };
+  const rec = findingsRecord({
+    env,
+    id: null,
+    mode: "enforce",
+    run: null,
+    result: { verdict: "FAILURE", findings: [f], infra: null, counts: { total: 1, passed: 0, failed: 1, flaky: 0, skipped: 0 }, missing: null, ai: newLedger() },
+    notTriaged: null,
+  });
+  const logLine = findingLogLine(f, 1, 1, s);
+
+  const logs: string[] = [];
+  const lookup = makeVerdictLookup({
+    fetchImpl: async () => {
+      throw new Error(`Connection rejected ${trimmedApiKey} and ${trimmedReqToken}`);
+    },
+    base: "http://tsio",
+    repository: "o/r",
+    log: (m) => logs.push(m),
+    secrets: s,
+  });
+  await lookup("fp-1");
+  await submitTriageVerdicts({
+    env,
+    fetchImpl: async () => {
+      throw new Error(`POST rejected ${trimmedApiKey} and ${trimmedReqToken}`);
+    },
+    base: "http://tsio",
+    repository: "o/r",
+    reportGroupId: GROUP_UUID,
+    findings: [f],
+    lane: null,
+    runURL: "https://github.com/o/r/actions/runs/1",
+    log: (m) => logs.push(m),
+  });
+
+  const texts = [
+    rec.findings[0].error_first_line,
+    rec.findings[0].reason,
+    rec.findings[0].ai.explanation ?? "",
+    logLine,
+    ...logs,
+  ];
+  assert.equal(logs.length, 2);
+  for (const text of texts) {
+    assert.ok(!text.includes(trimmedApiKey), `must redact trimmed TSIO_API_KEY: ${text}`);
+    assert.ok(!text.includes(trimmedReqToken), `must redact trimmed ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${text}`);
+    assert.ok(text.includes("[redacted]"), `must contain [redacted]: ${text}`);
+  }
+});
+
+test("submitTriageVerdicts filters unresolved/unconfirmed verdicts while preserving confirmed base-branch verdicts", async () => {
+  const baseFinding = (over: Partial<Finding>): Finding => ({
+    file: "specs/a.spec.ts",
+    title: "t1",
+    error: "Error: boom",
+    class: "REGRESSION",
+    reason: "Reason",
+    blocking: true,
+    test_id: TEST_UUID_1,
+    signature_id: SIG_UUID_1,
+    signature_fingerprint: "fp-1",
+    trunk: { runs: 6, passes: 5, fails: 1, flaky: 0, latest: "failed" },
+    cross_pr: { prs: [], examples: [], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
+    ...over,
+  });
+
+  const rejected: Finding[] = [
+    baseFinding({ trunk_run: true, decision: "unavailable" }),
+    baseFinding({ trunk_run: true, decision: undefined }),
+    baseFinding({ trunk_run: true, class: "INSUFFICIENT_DATA", decision: undefined }),
+    baseFinding({ decision: "evidence_incomplete" }),
+    baseFinding({ blocking: false, decision: "first_failure" }),
+  ];
+  for (const f of rejected) {
+    assert.equal(shouldSubmitFindingVerdict(f), false, `must reject ${f.class}/${f.decision}/trunk=${Boolean(f.trunk_run)}`);
+  }
+
+  let fetchCalls = 0;
+  const skipped = await submitTriageVerdicts({
+    env: { TSIO_API_KEY: "tsio-secret-key-123" },
+    fetchImpl: async () => {
+      fetchCalls++;
+      return Response.json({ verdicts: [] });
+    },
+    base: "http://tsio",
+    repository: "o/r",
+    reportGroupId: GROUP_UUID,
+    findings: rejected,
+    lane: null,
+    runURL: "https://github.com/o/r/actions/runs/1",
+    log: () => {},
+  });
+  assert.deepEqual(skipped, []);
+  assert.equal(fetchCalls, 0, "must not call POST /verdicts when all findings are filtered out");
+
+  const confirmed: Finding[] = [
+    baseFinding({ class: "BROKEN_ON_TRUNK", trunk_run: true, test_id: TEST_UUID_1 }),
+    baseFinding({ class: "SAME_FAILURE_AS_CLEARED", same_as_class: "BROKEN_ON_TRUNK", blocking: false, decision: "same_failure", test_id: TEST_UUID_2 }),
+    baseFinding({ blocking: false, decision: "base_broken", test_id: "55555555-5555-4555-8555-555555555555" }),
+    baseFinding({
+      blocking: false,
+      decision: "adjudicator_unblock",
+      judge: { cause: "bug_on_master", confidence: 0.91, cited_evidence: ["cross_pr"], explanation: "Broken on master" },
+      test_id: "66666666-6666-4666-8666-666666666666",
+    }),
+  ];
+  for (const f of confirmed) {
+    assert.equal(statusLabelOf(f), "broken on main");
+    assert.equal(shouldSubmitFindingVerdict(f), true, `must keep confirmed broken on main (${f.class}/${f.decision})`);
+  }
+
+  const posted: { verdicts: Record<string, unknown>[] }[] = [];
+  await submitTriageVerdicts({
+    env: { TSIO_API_KEY: "tsio-secret-key-123" },
+    fetchImpl: async (_url, init) => {
+      posted.push(JSON.parse(String(init?.body)) as { verdicts: Record<string, unknown>[] });
+      return Response.json({ verdicts: [] });
+    },
+    base: "http://tsio",
+    repository: "o/r",
+    reportGroupId: GROUP_UUID,
+    findings: [...rejected, ...confirmed],
+    lane: null,
+    runURL: "https://github.com/o/r/actions/runs/1",
+    log: () => {},
+  });
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].verdicts.length, confirmed.length);
+  for (const v of posted[0].verdicts) assert.equal(v.label, "broken on main");
+});
+
+test("reusableOutcomeFor rejects unconfirmed stored verdicts and allows verified rules, ai, and reused verdicts", async () => {
+  const pr: PrRef = { number: 5, repository: "o/r", title: "Fix", lane: "playwright-full" };
+  const mkFinding = (over: Partial<Finding> = {}): Finding => ({
+    file: "specs/a.spec.ts",
+    title: "t1",
+    error: "Error: boom",
+    class: "REGRESSION",
+    reason: "Cross-PR",
+    blocking: true,
+    trunk: { runs: 6, fails: 0, flaky: 0, passes: 6, latest: "passed" },
+    cross_pr: { prs: [99], examples: ["PR #99: Error: boom"], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
+    signature_fingerprint: "fp-reuse-gate",
+    ...over,
+  });
+
+  const runJudge = async (prior: TsioVerdict, opts: { release?: boolean; isTrunk?: boolean } = {}) => {
+    const f = mkFinding(opts.release ? { release: true } : {});
+    const pack = opts.release
+      ? releasePack(f, { repository: "o/r", name: "e2e-Server_11.11.0", branch: "release-11.11", base: "master", historyBranch: "master" }, [])
+      : buildPack(f, [], pr, []);
+    let asked = 0;
+    await judge(
+      [f],
+      [pack],
+      async () => {
+        asked++;
+        return {
+          answers: [{ cause: "flaky_environment", confidence: 0.9, cited_evidence: ["cross_pr"], explanation: "LLM fallback" }],
+          usage: null,
+          served_model: "claude-sonnet-5-5",
+        };
+      },
+      undefined,
+      () => {},
+      Boolean(opts.isTrunk),
+      undefined,
+      async () => prior,
+    );
+    return { f, asked };
+  };
+
+  const rejectedPriors: { prior: TsioVerdict; release?: boolean }[] = [
+    { prior: priorVerdict({ label: "broken on main", decided_by: "rules", rule: "unavailable", confidence: null }) },
+    { prior: priorVerdict({ label: "broken on main", decided_by: "rules", rule: "REGRESSION", confidence: null }) },
+    { prior: priorVerdict({ label: "broken on main", decided_by: "rules", rule: "INSUFFICIENT_DATA", confidence: null }) },
+    { prior: priorVerdict({ label: "flaky", decided_by: "rules", rule: "first_failure", confidence: null }) },
+    { prior: priorVerdict({ label: "flaky", decided_by: "rules", rule: "unavailable", confidence: null }) },
+    { prior: priorVerdict({ label: "test bug", decided_by: "rules", rule: "test_bug", confidence: null }), release: true },
+    { prior: priorVerdict({ label: "server compat", decided_by: "rules", rule: "server_compat", confidence: null }), release: true },
+    { prior: priorVerdict({ label: "broken on main", decided_by: "ai", rule: "adjudicator_unblock", confidence: null }) },
+    { prior: priorVerdict({ label: "flaky", decided_by: "ai", rule: "engine", confidence: 0.95 }) },
+    { prior: priorVerdict({ label: "broken on main", decided_by: "ai", rule: "adjudicator_blame", confidence: 0.95 }) },
+    { prior: priorVerdict({ label: "flaky", decided_by: "reused", rule: "first_failure", confidence: null }) },
+    { prior: priorVerdict({ label: "broken on main", decided_by: null, rule: "BROKEN_ON_TRUNK", confidence: null }) },
+  ];
+
+  for (const { prior, release } of rejectedPriors) {
+    const { f, asked } = await runJudge(prior, { release });
+    assert.equal(asked, 1, `must reject prior decided_by=${prior.decided_by} rule=${prior.rule} label=${prior.label} conf=${prior.confidence}`);
+    assert.equal(f.reused_from_id, undefined);
+  }
+
+  const allowedPriors: { prior: TsioVerdict; release?: boolean; isTrunk?: boolean }[] = [
+    { prior: priorVerdict({ label: "broken on main", decided_by: "rules", rule: "BROKEN_ON_TRUNK", confidence: null }) },
+    { prior: priorVerdict({ label: "broken on main", decided_by: "rules", rule: "base_broken", confidence: null }) },
+    { prior: priorVerdict({ label: "broken on main", decided_by: "rules", rule: "same_failure", confidence: null }) },
+    { prior: priorVerdict({ label: "flaky", decided_by: "rules", rule: "FLAKY_ON_TRUNK", confidence: null }) },
+    { prior: priorVerdict({ label: "flaky", decided_by: "rules", rule: "FLAKY_CROSS_PR", confidence: null }) },
+    { prior: priorVerdict({ label: "flaky", decided_by: "rules", rule: "FLAKY_NOT_RUN", confidence: null }) },
+    { prior: priorVerdict({ label: "flaky", decided_by: "rules", rule: "INFRA_ERROR", confidence: null }) },
+    { prior: priorVerdict({ label: "flaky", decided_by: "rules", rule: "rules_unblock", confidence: null }) },
+    { prior: priorVerdict({ label: "flaky", decided_by: "rules", rule: "same_failure", confidence: null }) },
+    { prior: priorVerdict({ label: "broken on main", decided_by: "ai", rule: "adjudicator_unblock", confidence: 0.9 }) },
+    { prior: priorVerdict({ label: "flaky", decided_by: "reused", rule: "adjudicator_unblock", confidence: null }) },
+    { prior: priorVerdict({ label: "broken on main", decided_by: "reused", rule: "engine", confidence: null }), isTrunk: true },
+    { prior: priorVerdict({ label: "broken on main", decided_by: "reused", rule: "base_broken", confidence: null }) },
+    { prior: priorVerdict({ label: "broken on main", decided_by: "reused", rule: "BROKEN_ON_TRUNK", confidence: null }) },
+    { prior: priorVerdict({ label: "test bug", decided_by: "ai", rule: "adjudicator_unblock", confidence: 0.92 }), release: true },
+  ];
+
+  for (const { prior, release, isTrunk } of allowedPriors) {
+    const { f, asked } = await runJudge(prior, { release, isTrunk });
+    assert.equal(asked, 0, `must reuse valid prior decided_by=${prior.decided_by} rule=${prior.rule} label=${prior.label}`);
+    assert.equal(f.reused_from_id, PRIOR_VERDICT_UUID);
+  }
 });
