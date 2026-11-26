@@ -399,6 +399,15 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
       const { suite_id: suiteId, title } = lastAttempt;
       const file = fileOf2.get(suiteId) ?? "";
       const first = attempts.find((a) => a.suite_id === suiteId);
+      const pickCaseMeta = (k) => {
+        if (lastAttempt[k] != null) return lastAttempt[k];
+        const fromAny = attempts.find((a) => a[k] != null)?.[k];
+        if (fromAny != null) return fromAny;
+        return lastAttempt[k];
+      };
+      const testId = pickCaseMeta("test_id");
+      const signatureId = pickCaseMeta("signature_id");
+      const signatureFingerprint = pickCaseMeta("signature_fingerprint");
       failing.push({
         file,
         title,
@@ -410,7 +419,10 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
         identity_unresolved: testsPerIdentity.get(identityKey({ file, title, full_title: lastAttempt.full_title, report_scope: reportName })).size > 1,
         error: [lastAttempt.error_message, lastAttempt.error_stack].filter(Boolean).join("\n"),
         tries: { ran: attempts.filter((a) => a.status !== "skipped").length, failed: attempts.filter((a) => FAILED_STATUSES.has(a.status)).length },
-        ...typeof first?.ordinal === "number" ? { ordinal: first.ordinal } : {}
+        ...typeof first?.ordinal === "number" ? { ordinal: first.ordinal } : {},
+        ...testId !== void 0 ? { test_id: testId } : {},
+        ...signatureId !== void 0 ? { signature_id: signatureId } : {},
+        ...signatureFingerprint !== void 0 ? { signature_fingerprint: signatureFingerprint } : {}
       });
     } else if (status === "skipped") skipped++;
     else if (status === "flaky") flaky++;
@@ -425,6 +437,163 @@ function missingReports(missing) {
   const state = missing.status ?? "not completed";
   if (expected == null) return { text: `the run's results are incomplete (${received ?? "?"} reports arrived; the expected count is unknown; TSIO group ${state})`, short: "results incomplete" };
   return { text: `the run's results are incomplete (${received ?? "?"} of ${expected} reports arrived; TSIO group ${state})`, short: `results incomplete: ${received ?? "?"} of ${expected} reports` };
+}
+var DEFAULT_TSIO_OIDC_AUDIENCE = "mattermost-test-system-io";
+var MAX_VERDICT_BATCH = 500;
+var MAX_ERROR_CONTEXT_BYTES = 64 * 1024;
+var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var isUuid = (v) => typeof v === "string" && UUID_RE.test(v);
+async function resolveTsioAuthHeaders(env, fetchImpl = fetch, log = () => {
+}) {
+  const apiKey = (env.TSIO_API_KEY ?? "").trim();
+  if (apiKey) return { headers: { "X-API-Key": apiKey }, secret: apiKey };
+  const reqUrl = (env.ACTIONS_ID_TOKEN_REQUEST_URL ?? "").trim();
+  const reqToken = (env.ACTIONS_ID_TOKEN_REQUEST_TOKEN ?? "").trim();
+  if (!reqUrl || !reqToken) return null;
+  const audience = (env.TSIO_OIDC_AUDIENCE ?? "").trim() || DEFAULT_TSIO_OIDC_AUDIENCE;
+  const sep2 = reqUrl.includes("?") ? "&" : "?";
+  const url = `${reqUrl}${sep2}audience=${encodeURIComponent(audience)}`;
+  try {
+    const res = await fetchImpl(url, {
+      headers: { authorization: `Bearer ${reqToken}`, accept: "application/json" },
+      signal: AbortSignal.timeout(1e4)
+    });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {
+      });
+      log(`TSIO OIDC token request failed: HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    const token = typeof data?.value === "string" ? data.value.trim() : "";
+    if (!token) {
+      log("TSIO OIDC token response held no token");
+      return null;
+    }
+    return { headers: { Authorization: `Bearer ${token}` }, secret: token };
+  } catch (e) {
+    const name = e instanceof Error ? e.name : "Error";
+    log(`TSIO OIDC token request unavailable (${name})`);
+    return null;
+  }
+}
+async function lookupVerdictBySignature(fetchImpl, base, fingerprint, opts) {
+  const fp = fingerprint.trim();
+  if (!fp) return null;
+  const q = new URLSearchParams();
+  if (opts?.repository) q.set("repository", opts.repository);
+  q.set("window_days", String(opts?.windowDays ?? 90));
+  const qs = q.toString();
+  const url = `${withoutTrailingSlash(base)}/api/v1/verdicts/by-signature/${encodeURIComponent(fp)}${qs ? `?${qs}` : ""}`;
+  const res = await fetchImpl(url, { signal: AbortSignal.timeout(opts?.timeoutMs ?? 1e4) });
+  if (res.status === 404) {
+    await res.body?.cancel().catch(() => {
+    });
+    return null;
+  }
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {
+    });
+    throw new Error(`TSIO GET /verdicts/by-signature: ${res.status}`);
+  }
+  const data = await res.json();
+  if (!data || typeof data !== "object" || Array.isArray(data) || typeof data.id !== "string" || !data.id || typeof data.label !== "string" || !data.label) {
+    throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+  }
+  return data;
+}
+var utf8Bytes = (s) => new TextEncoder().encode(s).byteLength;
+function normalizeErrorContext(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out = { ...raw };
+  if (utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES) return out;
+  for (let guard = 0; guard < 64 && utf8Bytes(JSON.stringify(out)) > MAX_ERROR_CONTEXT_BYTES; guard++) {
+    let longestStrKey = null;
+    let longestStrLen = 0;
+    for (const [k, v] of Object.entries(out)) {
+      if (typeof v === "string" && v.length > longestStrLen) {
+        longestStrKey = k;
+        longestStrLen = v.length;
+      }
+    }
+    if (longestStrKey && longestStrLen > 64) {
+      out[longestStrKey] = out[longestStrKey].slice(0, Math.floor(longestStrLen / 2));
+      continue;
+    }
+    let largestKey = null;
+    let largestBytes = -1;
+    for (const [k, v] of Object.entries(out)) {
+      const b = utf8Bytes(JSON.stringify(v ?? null));
+      if (b > largestBytes) {
+        largestBytes = b;
+        largestKey = k;
+      }
+    }
+    if (!largestKey) break;
+    delete out[largestKey];
+  }
+  return utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES ? out : {};
+}
+function sanitizeVerdictItem(item) {
+  const testId = isUuid(item.test_id) ? item.test_id : null;
+  const sigId = isUuid(item.signature_id) ? item.signature_id : null;
+  const fp = typeof item.fingerprint === "string" && item.fingerprint.trim() ? item.fingerprint.trim() : null;
+  const conf = typeof item.confidence === "number" && Number.isFinite(item.confidence) ? Math.min(1, Math.max(0, item.confidence)) : null;
+  const reusedFromId = isUuid(item.reused_from_id) ? item.reused_from_id : null;
+  return {
+    test_id: testId,
+    signature_id: sigId,
+    fingerprint: fp,
+    label: item.label,
+    decided_by: item.decided_by ?? null,
+    rule: item.rule ?? null,
+    confidence: conf,
+    summary: item.summary ?? null,
+    model: item.model ?? null,
+    triage_url: item.triage_url ?? null,
+    error_context: normalizeErrorContext(item.error_context),
+    reused_from_id: reusedFromId
+  };
+}
+async function submitVerdicts(fetchImpl, base, authHeaders, request, opts) {
+  if (!request.verdicts.length) return [];
+  const reportGroupId = isUuid(request.report_group_id) ? request.report_group_id : null;
+  const sanitized = request.verdicts.map(sanitizeVerdictItem).filter((v) => v.label.trim().length > 0);
+  if (!sanitized.length) return [];
+  let items = sanitized;
+  if (reportGroupId) {
+    const seen = /* @__PURE__ */ new Set();
+    items = [];
+    for (const item of sanitized) {
+      const key = `${item.test_id ?? ""}\0${item.signature_id ?? ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(item);
+    }
+  }
+  const endpoint = `${withoutTrailingSlash(base)}/api/v1/verdicts`;
+  const created = [];
+  for (let i = 0; i < items.length; i += MAX_VERDICT_BATCH) {
+    const chunk = items.slice(i, i + MAX_VERDICT_BATCH);
+    const res = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        repository: request.repository,
+        report_group_id: reportGroupId,
+        verdicts: chunk
+      }),
+      signal: AbortSignal.timeout(opts?.timeoutMs ?? 15e3)
+    });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {
+      });
+      throw new Error(`TSIO POST /verdicts: ${res.status}`);
+    }
+    const data = await res.json();
+    if (Array.isArray(data?.verdicts)) created.push(...data.verdicts);
+  }
+  return created;
 }
 
 // ../e2e-test-triage/src/classify.ts
@@ -1478,6 +1647,10 @@ function whyNext(f, branch, pr, branchRun = null) {
   }
 }
 function decidedBy(f) {
+  if (f.reused_from_id) {
+    const model2 = shortModel(f.reused_verdict?.model ?? f.judge?.provenance?.served_model ?? f.ai?.model);
+    return model2 ? `Reused (${model2})` : "Reused (TSIO)";
+  }
   const model = shortModel(f.judge?.provenance?.served_model ?? f.ai?.model);
   if (f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame") return `AI (${model})${f.escalated ? ", second opinion" : ""}`;
   if (f.judge || f.ai?.model) return `Rules; AI asked${f.escalated ? ", second opinion" : ""}`;
@@ -2224,7 +2397,7 @@ function findingLogLine(f, n, of, secrets) {
   const line = `e2e-test-triage: finding ${n}/${of} ${row.blocking ? "blocking" : "cleared"} ${row.class} decision=${row.decision ?? "-"} ai=${ai} cited=${cited} "${clip(row.title, 120)}" \xB7 ${clip(row.file, 100)}: ${row.reason}`;
   return clip(line.replace(/\s+/g, " "), 500);
 }
-var secretsOf = (env) => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY].filter((s) => Boolean(s));
+var secretsOf = (env, extra = []) => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY, env.TSIO_API_KEY, ...extra].filter((s) => Boolean(s));
 function findingsRecord({ env, id, mode, run, result, notTriaged, basis = null, description = null, laneDiagnosis = null, rerun = null }) {
   const secrets = secretsOf(env);
   const ai = result?.ai ?? newLedger();
@@ -3881,8 +4054,35 @@ function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
   return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && unblocks(answer.cause, cited, pack, cls, cfg.infraClears);
 }
 var JUDGED_PER_CALL = 8;
+function canReuseFinding(f, pack, isTrunk) {
+  if (!f.signature_fingerprint || !f.blocking) return false;
+  if (f.class === "OWNED_BY_PR" || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete") return false;
+  if (exoneratedSet(isTrunk).has(f.class)) return false;
+  if (f.failed_everywhere?.length || f.pr_streak || f.changed_by_pr || f.untouched === false) return false;
+  if (pack.pr?.spec_file_changed_by_pr || pack.diff_hunks_of_files_named_in_error.some((h) => h.related)) return false;
+  return true;
+}
+function reusableOutcomeFor(prior, pack, f, isTrunk, minConfidence) {
+  if (prior.confidence != null && (!Number.isFinite(prior.confidence) || prior.confidence < minConfidence)) return null;
+  if (pack.release) {
+    if (prior.label === "flaky") {
+      const lanes = pack.same_test_other_platforms_this_run?.results ?? [];
+      const everywhere = Boolean(f.tries && f.tries.ran >= 1 && f.tries.failed === f.tries.ran && lanes.length && lanes.every((l) => FAILED_STATUSES.has(l.result)));
+      if (everywhere) return null;
+      return { cause: "flaky_environment", blocking: false, decision: "adjudicator_unblock" };
+    }
+    if (prior.label === "test bug") return { cause: "test_bug", blocking: false, decision: "adjudicator_unblock" };
+    if (prior.label === "server compat") return { cause: "server_compat", blocking: false, decision: "adjudicator_unblock" };
+    return null;
+  }
+  if (prior.label === "flaky") return { cause: "flaky_environment", blocking: false, decision: "adjudicator_unblock" };
+  if (prior.label === "broken on main") {
+    return isTrunk ? { cause: "bug_on_master", blocking: true, decision: "engine" } : { cause: "bug_on_master", blocking: false, decision: "adjudicator_unblock" };
+  }
+  return null;
+}
 async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
-}, isTrunkRun = false, ledger = newLedger()) {
+}, isTrunkRun = false, ledger = newLedger(), lookupVerdict = null) {
   const groups = /* @__PURE__ */ new Map();
   const sortKey = (f) => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title, f.error ?? ""];
   const compareKeys = (a, b) => {
@@ -3993,9 +4193,54 @@ async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
       await ask(model, missed, false);
     }
   };
-  await ask(cfg.model, pending);
-  for (const g of pending) settle(g, g.answer, g.answer ? null : g.error ?? null);
-  const escalate = cfg.escalationModel && cfg.escalationModel !== cfg.model ? pending.filter((g) => !g.advisory && g.answer && nearMiss(g.lead.f.class, g.answer, g.lead.pack, cfg, isTrunkRun)) : [];
+  const reused = /* @__PURE__ */ new Set();
+  if (lookupVerdict && pending.length) {
+    const lookupCache = /* @__PURE__ */ new Map();
+    const lookupCached = (fp) => {
+      let p = lookupCache.get(fp);
+      if (!p) {
+        p = Promise.resolve().then(() => lookupVerdict(fp)).catch((e) => {
+          warn(`TSIO verdict lookup failed: ${String(e).slice(0, 200)}`);
+          return null;
+        });
+        lookupCache.set(fp, p);
+      }
+      return p;
+    };
+    const candidates = pending.filter(
+      (g) => !cachedAnswer(cfg.answers?.[answerKey(cfg.model, g.lead.pack)], g.lead.pack) && g.members.every((m) => canReuseFinding(m.f, m.pack, isTrunkRun) && m.f.signature_fingerprint === g.lead.f.signature_fingerprint)
+    );
+    await Promise.all([...new Set(candidates.map((g) => g.lead.f.signature_fingerprint))].map((fp) => lookupCached(fp)));
+    for (const g of candidates) {
+      const prior = await lookupCached(g.lead.f.signature_fingerprint);
+      if (!prior) continue;
+      const resolved = g.members.map((m) => reusableOutcomeFor(prior, m.pack, m.f, isTrunkRun, cfg.minConfidence));
+      if (resolved.some((r) => r === null)) continue;
+      reused.add(g);
+      const explanation = prior.summary?.trim() || `Reused prior TSIO verdict (${prior.label})`;
+      for (const [idx, m] of g.members.entries()) {
+        const res = resolved[idx];
+        Object.assign(m.f, {
+          blocking: res.blocking,
+          decision: res.decision,
+          ...isTrunkRun && !m.pack.release ? { trunk_run: true } : {},
+          reused_from_id: prior.id,
+          reused_verdict: prior,
+          judge: {
+            cause: res.cause,
+            confidence: prior.confidence ?? cfg.minConfidence,
+            cited_evidence: [],
+            explanation,
+            provenance: { served_model: prior.model ?? "reused" }
+          }
+        });
+      }
+    }
+  }
+  const toAsk = reused.size ? pending.filter((g) => !reused.has(g)) : pending;
+  await ask(cfg.model, toAsk);
+  for (const g of toAsk) settle(g, g.answer, g.answer ? null : g.error ?? null);
+  const escalate = cfg.escalationModel && cfg.escalationModel !== cfg.model ? toAsk.filter((g) => !g.advisory && g.answer && nearMiss(g.lead.f.class, g.answer, g.lead.pack, cfg, isTrunkRun)) : [];
   if (escalate.length) {
     for (const g of escalate) delete g.answer;
     await ask(cfg.escalationModel, escalate);
@@ -4037,7 +4282,8 @@ async function evaluateRun({
   outOfDate = null,
   fixedOnTrunk = null,
   brokeBy = null,
-  specHistory = null
+  specHistory = null,
+  lookupVerdict = null
 }) {
   const isTrunkRun = prNumber == null;
   const tests = run.failing.filter((t) => !isShardPlaceholder(t));
@@ -4174,7 +4420,7 @@ async function evaluateRun({
         const why = commonSenseClear(f, packs[i]);
         if (why) Object.assign(f, { blocking: false, decision: "rules_unblock", reason: why });
       }
-      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
+      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai, lookupVerdict);
     }
     if (!blind && !prNumber && branchBase) {
       for (const f of result.findings) f.release = true;
@@ -4191,7 +4437,7 @@ async function evaluateRun({
       const others = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const release = { repository: id.repository, name: id.name ?? "", branch: branchName || "this branch", base: branchBase, historyBranch: trunkBranch || branchBase, lane };
       const packs = result.findings.map((f) => held.includes(f) ? releasePack(f, release, others, changeContext) : null);
-      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
+      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai, lookupVerdict);
     }
     if (!blind && prNumber) sameFailure(result.findings);
     if (prNumber && !branchBase) settlePR(result.findings, changed, diff.ok && testRoot != null, Boolean(result.infra), files, cfg.minTrunkRuns);
@@ -4809,6 +5055,115 @@ async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRu
   return { verdict, orchestration, jobs, baseline, startJobId };
 }
 
+// ../e2e-test-triage/src/verdicts.ts
+var ANSI2 = /\x1b\[[0-9;]*m/g;
+function firstErrorLine(error) {
+  const line = String(error ?? "").replace(ANSI2, "").split(/\r?\n/).find((l) => l.trim()) ?? "";
+  return line.trim().slice(0, 200);
+}
+function buildErrorContext(f, secrets) {
+  const first = firstErrorLine(f.error);
+  return {
+    file: redact(f.repo_path ?? f.file, secrets),
+    title: redact(f.title, secrets),
+    ...f.full_title ? { full_title: redact(f.full_title, secrets) } : {},
+    class: f.class,
+    error_first_line: redact(first, secrets),
+    ...f.error ? { error: redact(f.error.slice(0, 4e3), secrets) } : {},
+    ...f.reason ? { reason: redact(f.reason.slice(0, 1e3), secrets) } : {},
+    ...f.tries ? { tries: { ran: f.tries.ran, failed: f.tries.failed } } : {}
+  };
+}
+function findingToVerdictItem(f, runURL, secrets) {
+  const rawConf = f.reused_from_id ? f.reused_verdict?.confidence ?? f.judge?.confidence ?? null : f.judge?.confidence ?? null;
+  const confidence = typeof rawConf === "number" && Number.isFinite(rawConf) ? Math.min(1, Math.max(0, rawConf)) : null;
+  const rawSummary = f.reused_from_id ? f.reused_verdict?.summary ?? f.judge?.explanation ?? f.reason ?? "" : f.judge?.explanation ?? f.reason ?? "";
+  const cleanSummary = redact(rawSummary, secrets).trim();
+  const model = f.reused_from_id ? f.reused_verdict?.model ?? f.judge?.provenance?.served_model ?? null : f.judge?.provenance?.served_model ?? f.ai?.model ?? null;
+  return {
+    test_id: isUuid(f.test_id) ? f.test_id : null,
+    signature_id: isUuid(f.signature_id) ? f.signature_id : null,
+    fingerprint: typeof f.signature_fingerprint === "string" && f.signature_fingerprint.trim() ? f.signature_fingerprint.trim() : null,
+    label: statusLabelOf(f),
+    decided_by: f.reused_from_id ? "reused" : f.judge ? "ai" : "rules",
+    rule: f.decision ?? f.class ?? null,
+    confidence,
+    summary: cleanSummary ? cleanSummary.slice(0, 1e3) : null,
+    model,
+    triage_url: runURL,
+    error_context: buildErrorContext(f, secrets),
+    reused_from_id: isUuid(f.reused_from_id) ? f.reused_from_id : null
+  };
+}
+function makeVerdictLookup({
+  fetchImpl,
+  base,
+  repository,
+  log,
+  secrets,
+  windowDays = 90
+}) {
+  return async (fingerprint) => {
+    try {
+      return await lookupVerdictBySignature(fetchImpl, base, fingerprint, { repository, windowDays });
+    } catch (e) {
+      log(`e2e-test-triage: TSIO verdict lookup failed (failing open): ${redact(String(e).slice(0, 200), secrets)}`);
+      return null;
+    }
+  };
+}
+async function submitTriageVerdicts({
+  env,
+  fetchImpl,
+  base,
+  repository,
+  reportGroupId,
+  findings,
+  lane,
+  runURL,
+  log
+}) {
+  const hasFindings = findings.length > 0;
+  const hasFailingLane = Boolean(lane && lane.verdict.state !== "success");
+  if (!hasFindings && !hasFailingLane) return [];
+  let secrets = secretsOf(env);
+  try {
+    const auth = await resolveTsioAuthHeaders(env, fetchImpl, (msg) => log(redact(msg, secrets)));
+    if (!auth) return [];
+    secrets = secretsOf(env, [auth.secret]);
+    const items = hasFindings ? [...findings].sort((a, b) => Number(b.blocking) - Number(a.blocking)).map((f) => findingToVerdictItem(f, runURL, secrets)) : [
+      {
+        test_id: null,
+        signature_id: null,
+        fingerprint: null,
+        label: lane.verdict.label,
+        decided_by: "rules",
+        rule: lane.verdict.fault,
+        confidence: null,
+        summary: redact(lane.verdict.what, secrets).trim().slice(0, 1e3) || null,
+        model: null,
+        triage_url: runURL,
+        error_context: {
+          lane_label: redact(lane.verdict.label, secrets),
+          fault: redact(lane.verdict.fault, secrets),
+          what: redact(lane.verdict.what, secrets).slice(0, 1e3),
+          action: redact(lane.verdict.action, secrets).slice(0, 1e3)
+        },
+        reused_from_id: null
+      }
+    ];
+    const gid = reportGroupId != null && isUuid(String(reportGroupId)) ? String(reportGroupId) : null;
+    return await submitVerdicts(fetchImpl, base, auth.headers, {
+      repository,
+      report_group_id: gid,
+      verdicts: items
+    });
+  } catch (e) {
+    log(`e2e-test-triage: TSIO verdict submission skipped (failing open): ${redact(String(e).slice(0, 200), secrets)}`);
+    return [];
+  }
+}
+
 // ../e2e-test-triage/src/triage.ts
 var isPlainObject2 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var isPrSpend = (v) => isPlainObject2(v) && typeof v.pr === "number" && typeof v.usd === "number" && Number.isFinite(v.usd) && v.usd >= 0;
@@ -5152,7 +5507,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths, fetchFileDiffs: Boolean(branchBase) }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
-      specHistory
+      specHistory,
+      lookupVerdict: ask ? makeVerdictLookup({ fetchImpl, base, repository: id.repository, log, secrets }) : null
     });
     seen.result = result;
     const flagged = activeFlag(result.infra, result.findings);
@@ -5295,6 +5651,17 @@ aggregate-published=${aggregatePublished}
 `);
       written.aggregateOutput = true;
     }
+    await submitTriageVerdicts({
+      env,
+      fetchImpl,
+      base,
+      repository: id.repository,
+      reportGroupId: run.group_id,
+      findings: result.findings,
+      lane,
+      runURL,
+      log
+    });
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));
     log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;

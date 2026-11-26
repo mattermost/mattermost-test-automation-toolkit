@@ -223,7 +223,11 @@ function whyNext(f: Finding, branch: string, pr: boolean, branchRun: string | nu
   }
 }
 
-function decidedBy(f: Finding): string {
+export function decidedBy(f: Finding): string {
+  if (f.reused_from_id) {
+    const model = shortModel(f.reused_verdict?.model ?? f.judge?.provenance?.served_model ?? f.ai?.model);
+    return model ? `Reused (${model})` : "Reused (TSIO)";
+  }
   const model = shortModel(f.judge?.provenance?.served_model ?? f.ai?.model);
   if (f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame") return `AI (${model})${f.escalated ? ", second opinion" : ""}`;
   if (f.judge || f.ai?.model) return `Rules; AI asked${f.escalated ? ", second opinion" : ""}`;

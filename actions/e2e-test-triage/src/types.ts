@@ -4,6 +4,8 @@
 // Shapes the triage modules share. Each field mirrors what the old engine reads or writes: optional and
 // nullable fields are the ones it checks with ?. or ??.
 
+import type { TsioVerdict } from "../../shared/src/tsio.ts";
+
 export type TsioId = string | number;
 
 /** One TSIO history row: a past execution of a test. */
@@ -40,6 +42,9 @@ export interface TestRef {
   tries?: { ran: number; failed: number };
   /** Where the test ran in its report (TSIO's case ordinal), when the run says. */
   ordinal?: number | null;
+  test_id?: string | null;
+  signature_id?: string | null;
+  signature_fingerprint?: string | null;
 }
 
 /** A commit a TSIO-side or GitHub-side lookup named: its sha, and the PR merged in it when the message says so. */
@@ -153,6 +158,8 @@ export interface Finding extends TestRef {
   escalated?: boolean;
   same_as?: string;
   same_as_class?: string;
+  reused_from_id?: string | null;
+  reused_verdict?: TsioVerdict | null;
 }
 
 /** An earlier failure in the same spec and run: its title, the first line of its error, and its class. */

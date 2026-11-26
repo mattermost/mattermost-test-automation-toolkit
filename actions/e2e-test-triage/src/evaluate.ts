@@ -11,6 +11,7 @@ import { evidenceFor } from "./evidence.ts";
 import { buildPack, changeCategory, namesChangedFile, releasePack } from "./pack.ts";
 import type { OtherFailure, ReleaseRef } from "./pack.ts";
 import { judge } from "./decision.ts";
+import type { LookupVerdictFn } from "./decision.ts";
 import type { OutOfDateResult } from "./history.ts";
 import { newLedger } from "./pricing.ts";
 import type { AskFn, ChangedFile, Config, Diff, Evidence, Finding, HistoryLike, Ledger, PrRef, SpecHistory } from "./types.ts";
@@ -63,6 +64,8 @@ export interface EvaluateParams {
   brokeBy?: ((findings: Finding[]) => Promise<void>) | null;
   /** Past runs of the specs a stopped Jest process skipped (see classifyNotRun); null when they could not be read. */
   specHistory?: SpecHistory | null;
+  /** Optional pre-LLM TSIO verdict lookup by signature fingerprint. */
+  lookupVerdict?: LookupVerdictFn | null;
 }
 
 /** A run flagged as a whole (see infraVerdict) is red for it while any failure still blocks, or when none is named. */
@@ -96,6 +99,7 @@ export async function evaluateRun({
   fixedOnTrunk = null,
   brokeBy = null,
   specHistory = null,
+  lookupVerdict = null,
 }: EvaluateParams): Promise<EvaluatedRun> {
   const isTrunkRun = prNumber == null;
   // A shard placeholder (no test name, a desktop shard stub, a mobile spec that did not run) has no history to read and
@@ -275,7 +279,7 @@ export async function evaluateRun({
         const why = commonSenseClear(f, packs[i]);
         if (why) Object.assign(f, { blocking: false, decision: "rules_unblock", reason: why });
       }
-      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
+      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai, lookupVerdict);
     }
     if (!blind && !prNumber && branchBase) {
       // A release branch's run: what kind of failure each held one is (see SYSTEM_RELEASE and decideRelease).
@@ -297,7 +301,7 @@ export async function evaluateRun({
       const others: OtherFailure[] = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const release: ReleaseRef = { repository: id.repository, name: id.name ?? "", branch: branchName || "this branch", base: branchBase, historyBranch: trunkBranch || branchBase, lane };
       const packs = result.findings.map((f) => (held.includes(f) ? releasePack(f, release, others, changeContext) : null));
-      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
+      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai, lookupVerdict);
     }
     if (!blind && prNumber) sameFailure(result.findings);
     // Whether the PR touches a test is known only from a complete change list and a test root to place the spec in it.

@@ -3,7 +3,25 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { FetchImpl } from "./github.ts";
-import { DEFAULT_TSIO_BASE_URL, NoResultsError, STAGING_TSIO_BASE_URL, SupersededRunError, compositeIdentityFrom, effectiveAttemptOf, fetchRun, listReportGroups, missingReports, missingArrived, outcomeWithDuplicates, tsioBase } from "./tsio.ts";
+import {
+  DEFAULT_TSIO_BASE_URL,
+  MAX_ERROR_CONTEXT_BYTES,
+  NoResultsError,
+  STAGING_TSIO_BASE_URL,
+  SupersededRunError,
+  compositeIdentityFrom,
+  effectiveAttemptOf,
+  fetchRun,
+  isUuid,
+  listReportGroups,
+  lookupVerdictBySignature,
+  missingArrived,
+  missingReports,
+  outcomeWithDuplicates,
+  resolveTsioAuthHeaders,
+  submitVerdicts,
+  tsioBase,
+} from "./tsio.ts";
 
 test("use-staging unset, false or empty keeps the shared instance or the given base URL", () => {
   assert.equal(tsioBase({}), DEFAULT_TSIO_BASE_URL);
@@ -249,4 +267,170 @@ test("effectiveAttemptOf normalizes leading zeros and TSIO list/suites null fiel
     throw new Error(`unexpected ${u}`);
   }) as FetchImpl;
   await assert.rejects(() => fetchRun(nullSuitesFetch, "http://tsio", ours, null, { attempts: 1, ms: 0 }, "02"), /reported no test cases/);
+});
+
+test("fetchRun propagates test_id, signature_id, and signature_fingerprint with attempt fallback when present", async () => {
+  const tid1 = "11111111-1111-4111-8111-111111111111";
+  const sid1 = "22222222-2222-4222-8222-222222222222";
+  const fetchImpl = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/suites")) return Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] });
+    if (u.includes("/cases")) {
+      return Response.json([
+        { suite_id: "s1", title: "t1", status: "failed", retry_count: 0, ordinal: 0, error_message: "boom", test_id: tid1, signature_id: sid1, signature_fingerprint: "fp-1" },
+        { suite_id: "s1", title: "t1", status: "failed", retry_count: 1, ordinal: 1, error_message: "boom" },
+        { suite_id: "s1", title: "t2", status: "failed", retry_count: 0, ordinal: 2, error_message: "plain" },
+      ]);
+    }
+    return Response.json({ reports: [group(ours.gh_run_id)] });
+  }) as FetchImpl;
+  const run = await fetchRun(fetchImpl, "http://tsio", ours, null, { attempts: 1, ms: 0 });
+  assert.equal(run.failing.length, 2);
+  assert.equal(run.failing[0].test_id, tid1);
+  assert.equal(run.failing[0].signature_id, sid1);
+  assert.equal(run.failing[0].signature_fingerprint, "fp-1");
+  assert.equal("test_id" in run.failing[1], false);
+  assert.equal("signature_id" in run.failing[1], false);
+  assert.equal("signature_fingerprint" in run.failing[1], false);
+});
+
+test("isUuid distinguishes RFC 4122 / UUIDv7 strings from non-UUIDs", () => {
+  assert.equal(isUuid("01960000-0000-7000-8000-000000000001"), true);
+  assert.equal(isUuid(""), false);
+  assert.equal(isUuid("g1"), false);
+  assert.equal(isUuid(null), false);
+});
+
+test("resolveTsioAuthHeaders prefers X-API-Key, falls back to GitHub OIDC, and fails open without logging secrets", async () => {
+  const logs: string[] = [];
+  const apiKeyAuth = await resolveTsioAuthHeaders(
+    { TSIO_API_KEY: "secret-tsio-key", ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc.example/tok?sig=1", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "req-secret" },
+    (async () => {
+      throw new Error("should not call OIDC when TSIO_API_KEY is set");
+    }) as FetchImpl,
+    (m) => logs.push(m),
+  );
+  assert.deepEqual(apiKeyAuth, { headers: { "X-API-Key": "secret-tsio-key" }, secret: "secret-tsio-key" });
+
+  let requestedUrl = "";
+  let authHeader = "";
+  const oidcAuth = await resolveTsioAuthHeaders(
+    { ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc.example/tok?sig=1", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "req-secret", TSIO_OIDC_AUDIENCE: "custom-aud" },
+    (async (url: string, init?: RequestInit) => {
+      requestedUrl = url;
+      authHeader = (init?.headers as Record<string, string>)?.authorization ?? "";
+      return Response.json({ value: "jwt-token-xyz" });
+    }) as FetchImpl,
+    (m) => logs.push(m),
+  );
+  assert.equal(requestedUrl, "https://oidc.example/tok?sig=1&audience=custom-aud");
+  assert.equal(authHeader, "Bearer req-secret");
+  assert.deepEqual(oidcAuth, { headers: { Authorization: "Bearer jwt-token-xyz" }, secret: "jwt-token-xyz" });
+
+  const failedOidc = await resolveTsioAuthHeaders(
+    { ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc.example/tok", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "super-secret-req-token" },
+    (async () => new Response("denied", { status: 403 })) as FetchImpl,
+    (m) => logs.push(m),
+  );
+  assert.equal(failedOidc, null);
+  assert.ok(logs.some((l) => l.includes("HTTP 403")));
+  assert.ok(logs.every((l) => !l.includes("super-secret-req-token")));
+
+  assert.equal(await resolveTsioAuthHeaders({}), null);
+});
+
+test("lookupVerdictBySignature returns null on 404, parses 200 OK, and throws on error status", async () => {
+  const fp = "sha256:abc/123";
+  let seenUrl = "";
+  const hit = await lookupVerdictBySignature(
+    (async (url: string) => {
+      seenUrl = url;
+      return Response.json({
+        id: "33333333-3333-4333-8333-333333333333",
+        report_group_id: null,
+        repository: "mattermost/mattermost",
+        test_id: null,
+        signature_id: "44444444-4444-4444-8444-444444444444",
+        fingerprint: fp,
+        label: "flaky",
+        decided_by: "ai",
+        rule: "adjudicator_unblock",
+        confidence: 0.92,
+        summary: "Known timeout flake",
+        model: "claude-sonnet-5-5",
+        triage_url: null,
+        reused_from_id: null,
+        created_at: "2026-11-26T00:00:00Z",
+      });
+    }) as FetchImpl,
+    "http://tsio/",
+    fp,
+    { repository: "mattermost/mattermost", windowDays: 90 },
+  );
+  assert.equal(seenUrl, "http://tsio/api/v1/verdicts/by-signature/sha256%3Aabc%2F123?repository=mattermost%2Fmattermost&window_days=90");
+  assert.equal(hit?.label, "flaky");
+
+  const miss = await lookupVerdictBySignature((async () => new Response(null, { status: 404 })) as FetchImpl, "http://tsio", fp);
+  assert.equal(miss, null);
+
+  await assert.rejects(
+    () => lookupVerdictBySignature((async () => new Response("err", { status: 500 })) as FetchImpl, "http://tsio", fp),
+    /500/,
+  );
+});
+
+test("submitVerdicts deduplicates on (test_id, signature_id), chunks at 500, and caps error_context at 64 KiB", async () => {
+  const tid = "11111111-1111-4111-8111-111111111111";
+  const sid = "22222222-2222-4222-8222-222222222222";
+  const gid = "33333333-3333-4333-8333-333333333333";
+
+  const sentBatches: { report_group_id: string | null; verdicts: { error_context: Record<string, unknown> | null; test_id: string | null }[] }[] = [];
+  const bigErr = "x".repeat(90_000);
+  const items = [
+    { test_id: tid, signature_id: sid, label: "caused by PR", error_context: { error: bigErr, file: "a.spec.ts" } },
+    { test_id: tid, signature_id: sid, label: "flaky", error_context: { file: "dup" } },
+    ...Array.from({ length: 501 }, (_, i) => ({
+      test_id: `00000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`,
+      signature_id: null,
+      label: "flaky",
+    })),
+  ];
+
+  const created = await submitVerdicts(
+    (async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as (typeof sentBatches)[number];
+      sentBatches.push(body);
+      return Response.json({
+        verdicts: body.verdicts.map((v, i) => ({
+          id: `99999999-9999-4999-8999-${String(i + 1).padStart(12, "0")}`,
+          report_group_id: body.report_group_id,
+          repository: "o/r",
+          test_id: v.test_id,
+          signature_id: null,
+          label: "flaky",
+          decided_by: "ai",
+          rule: null,
+          confidence: null,
+          summary: null,
+          model: null,
+          triage_url: null,
+          reused_from_id: null,
+          created_at: "2026-11-26T00:00:00Z",
+          created: true,
+          superseded_id: null,
+        })),
+      });
+    }) as FetchImpl,
+    "http://tsio",
+    { "X-API-Key": "k" },
+    { repository: "o/r", report_group_id: gid, verdicts: items },
+  );
+
+  assert.equal(sentBatches.length, 2, "502 unique items split into 500 + 2");
+  assert.equal(sentBatches[0].verdicts.length, 500);
+  assert.equal(sentBatches[1].verdicts.length, 2);
+  assert.equal(created.length, 502);
+  const firstCtx = sentBatches[0].verdicts[0].error_context!;
+  assert.ok(Buffer.byteLength(JSON.stringify(firstCtx), "utf8") <= MAX_ERROR_CONTEXT_BYTES);
+  assert.equal(firstCtx.file, "a.spec.ts");
 });

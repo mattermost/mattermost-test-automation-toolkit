@@ -29,6 +29,7 @@ import type { RerunDecision } from "./rerun-check.ts";
 import { ledgerTotals } from "./pricing.ts";
 import { activeFlag, noResultsText, otherRunText, passLine, renderLane, renderNotTriaged, renderSummary, renderUnfinished, RERUN, RERUNNING, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
 import type { AskFn, Config, Diff, Finding, HistoryLike, Observation, SpecHistory } from "./types.ts";
+import { makeVerdictLookup, submitTriageVerdicts } from "./verdicts.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
 export interface TriageIdentity extends CompositeIdentity {
@@ -490,6 +491,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory,
+      lookupVerdict: ask ? makeVerdictLookup({ fetchImpl, base, repository: id.repository, log, secrets }) : null,
     });
     seen.result = result;
     // A lane red outside its tests, or one with so many failures that triage flagged the run instead of judging them:
@@ -651,6 +653,17 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       appendFileSync(env.GITHUB_OUTPUT, `published=${published}\naggregate-published=${aggregatePublished}\n`);
       written.aggregateOutput = true;
     }
+    await submitTriageVerdicts({
+      env,
+      fetchImpl,
+      base,
+      repository: id.repository,
+      reportGroupId: run.group_id,
+      findings: result.findings,
+      lane,
+      runURL,
+      log,
+    });
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));
     log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;

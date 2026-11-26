@@ -151,7 +151,8 @@ export function findingLogLine(f: Finding, n: number, of: number, secrets: strin
 }
 
 /** The action's own secrets, as set in the environment: what the summary and the findings file must never print. */
-export const secretsOf = (env: Env): string[] => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY].filter((s): s is string => Boolean(s));
+export const secretsOf = (env: Env, extra: (string | null | undefined)[] = []): string[] =>
+  [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY, env.TSIO_API_KEY, ...extra].filter((s): s is string => Boolean(s));
 
 /** The findings file's contents for one run. */
 export function findingsRecord({ env, id, mode, run, result, notTriaged, basis = null, description = null, laneDiagnosis = null, rerun = null }: FindingsFacts): FindingsRecord {
