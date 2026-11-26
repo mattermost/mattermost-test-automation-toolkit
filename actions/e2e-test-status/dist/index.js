@@ -578,6 +578,19 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
       const { suite_id: suiteId, title } = lastAttempt;
       const file = fileOf.get(suiteId) ?? "";
       const first = attempts.find((a) => a.suite_id === suiteId);
+      const pickCaseMeta = (k) => {
+        if (lastAttempt[k] != null) return lastAttempt[k];
+        const fromAny = attempts.find((a) => a[k] != null)?.[k];
+        return fromAny != null ? fromAny : lastAttempt[k];
+      };
+      const testId = pickCaseMeta("test_id");
+      const errorText = (a) => [a.error_message, a.error_stack].filter(Boolean).join("\n");
+      const lastError = errorText(lastAttempt);
+      const sigAttempt = lastAttempt.signature_fingerprint != null || lastAttempt.signature_id != null ? lastAttempt : (lastError !== "" ? attempts.find(
+        (a) => FAILED_STATUSES.has(a.status) && (a.signature_fingerprint != null || a.signature_id != null) && errorText(a) === lastError
+      ) : void 0) ?? lastAttempt;
+      const signatureId = sigAttempt.signature_id;
+      const signatureFingerprint = sigAttempt.signature_fingerprint;
       failing.push({
         file,
         title,
@@ -587,15 +600,19 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
         report_scope: reportName,
         identity_ambiguous: testsPerLeaf.get(JSON.stringify([file, title])).size > 1,
         identity_unresolved: testsPerIdentity.get(identityKey({ file, title, full_title: lastAttempt.full_title, report_scope: reportName })).size > 1,
-        error: [lastAttempt.error_message, lastAttempt.error_stack].filter(Boolean).join("\n"),
+        error: lastError,
         tries: { ran: attempts.filter((a) => a.status !== "skipped").length, failed: attempts.filter((a) => FAILED_STATUSES.has(a.status)).length },
-        ...typeof first?.ordinal === "number" ? { ordinal: first.ordinal } : {}
+        ...typeof first?.ordinal === "number" ? { ordinal: first.ordinal } : {},
+        ...testId !== void 0 ? { test_id: testId } : {},
+        ...signatureId !== void 0 ? { signature_id: signatureId } : {},
+        ...signatureFingerprint !== void 0 ? { signature_fingerprint: signatureFingerprint } : {}
       });
     } else if (status === "skipped") skipped++;
     else if (status === "flaky") flaky++;
   }
   return { group_id: group.id, attempt: String(group.gh_run_attempt), failing, missing, outcomes, elsewhere, counts: { total: byTest.size, passed: byTest.size - failed - skipped, failed, flaky, skipped } };
 }
+var MAX_ERROR_CONTEXT_BYTES = 64 * 1024;
 
 // src/publish.ts
 function reportWait(env) {

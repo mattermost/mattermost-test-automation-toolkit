@@ -29,6 +29,7 @@ import type { RerunDecision } from "./rerun-check.ts";
 import { ledgerTotals } from "./pricing.ts";
 import { activeFlag, noResultsText, otherRunText, passLine, renderLane, renderNotTriaged, renderSummary, renderUnfinished, RERUN, RERUNNING, runFlag, statusDescription, statusLabels, supersededText } from "./render.ts";
 import type { AskFn, Config, Diff, Finding, HistoryLike, Observation, SpecHistory } from "./types.ts";
+import { makeVerdictLookup, submitTriageVerdicts } from "./verdicts.ts";
 
 /** The composite identity as the triage action reads it from COMPOSITE_IDENTITY, including the PR and branch fields. */
 export interface TriageIdentity extends CompositeIdentity {
@@ -142,7 +143,7 @@ export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
     if (!written.summary && summaryPath) {
       try {
         const text = body ? renderNotTriaged({ text: body, lane: env.LANE || id?.name || null }) : renderUnfinished({ reason, lane: env.LANE || null });
-        appendFileSync(summaryPath, text + "\n");
+        appendFileSync(summaryPath, redact(text, secrets) + "\n");
       } catch (writeError) {
         log(`triage's summary not written: ${String(writeError).slice(0, 160)}`);
       }
@@ -490,6 +491,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
       specHistory,
+      lookupVerdict: ask ? makeVerdictLookup({ fetchImpl, base, repository: id.repository, log, secrets }) : null,
     });
     seen.result = result;
     // A lane red outside its tests, or one with so many failures that triage flagged the run instead of judging them:
@@ -606,7 +608,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // A lane with nothing failed or missing has nothing to report, so it writes no job
     // summary: the run page then shows only the lanes someone needs to read.
     if (env.GITHUB_STEP_SUMMARY && (decides || laneRed || lane)) {
-      appendFileSync(env.GITHUB_STEP_SUMMARY, summary + "\n");
+      appendFileSync(env.GITHUB_STEP_SUMMARY, redact(summary, secrets) + "\n");
       written.summary = true;
     }
     // Only the exact value "enforce" writes the required status; anything else is report-only.
@@ -651,6 +653,17 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
       appendFileSync(env.GITHUB_OUTPUT, `published=${published}\naggregate-published=${aggregatePublished}\n`);
       written.aggregateOutput = true;
     }
+    await submitTriageVerdicts({
+      env,
+      fetchImpl,
+      base,
+      repository: id.repository,
+      reportGroupId: run.group_id,
+      findings: result.findings,
+      lane,
+      runURL,
+      log,
+    });
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));
     log(`e2e-test-triage: ${result.verdict} (${run.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;

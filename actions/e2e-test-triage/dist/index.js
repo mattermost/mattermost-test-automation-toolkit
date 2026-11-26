@@ -590,6 +590,19 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
       const { suite_id: suiteId, title } = lastAttempt;
       const file = fileOf2.get(suiteId) ?? "";
       const first = attempts.find((a) => a.suite_id === suiteId);
+      const pickCaseMeta = (k) => {
+        if (lastAttempt[k] != null) return lastAttempt[k];
+        const fromAny = attempts.find((a) => a[k] != null)?.[k];
+        return fromAny != null ? fromAny : lastAttempt[k];
+      };
+      const testId = pickCaseMeta("test_id");
+      const errorText = (a) => [a.error_message, a.error_stack].filter(Boolean).join("\n");
+      const lastError = errorText(lastAttempt);
+      const sigAttempt = lastAttempt.signature_fingerprint != null || lastAttempt.signature_id != null ? lastAttempt : (lastError !== "" ? attempts.find(
+        (a) => FAILED_STATUSES.has(a.status) && (a.signature_fingerprint != null || a.signature_id != null) && errorText(a) === lastError
+      ) : void 0) ?? lastAttempt;
+      const signatureId = sigAttempt.signature_id;
+      const signatureFingerprint = sigAttempt.signature_fingerprint;
       failing.push({
         file,
         title,
@@ -599,9 +612,12 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
         report_scope: reportName,
         identity_ambiguous: testsPerLeaf.get(JSON.stringify([file, title])).size > 1,
         identity_unresolved: testsPerIdentity.get(identityKey({ file, title, full_title: lastAttempt.full_title, report_scope: reportName })).size > 1,
-        error: [lastAttempt.error_message, lastAttempt.error_stack].filter(Boolean).join("\n"),
+        error: lastError,
         tries: { ran: attempts.filter((a) => a.status !== "skipped").length, failed: attempts.filter((a) => FAILED_STATUSES.has(a.status)).length },
-        ...typeof first?.ordinal === "number" ? { ordinal: first.ordinal } : {}
+        ...typeof first?.ordinal === "number" ? { ordinal: first.ordinal } : {},
+        ...testId !== void 0 ? { test_id: testId } : {},
+        ...signatureId !== void 0 ? { signature_id: signatureId } : {},
+        ...signatureFingerprint !== void 0 ? { signature_fingerprint: signatureFingerprint } : {}
       });
     } else if (status === "skipped") skipped++;
     else if (status === "flaky") flaky++;
@@ -616,6 +632,250 @@ function missingReports(missing) {
   const state = missing.status ?? "not completed";
   if (expected == null) return { text: `the run's results are incomplete (${received ?? "?"} reports arrived; the expected count is unknown; TSIO group ${state})`, short: "results incomplete" };
   return { text: `the run's results are incomplete (${received ?? "?"} of ${expected} reports arrived; TSIO group ${state})`, short: `results incomplete: ${received ?? "?"} of ${expected} reports` };
+}
+var DEFAULT_TSIO_OIDC_AUDIENCE = "mattermost-test-system-io";
+var MAX_VERDICT_BATCH = 500;
+var MAX_ERROR_CONTEXT_BYTES = 64 * 1024;
+var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var isUuid = (v) => typeof v === "string" && UUID_RE.test(v);
+async function resolveTsioAuthHeaders(env, fetchImpl = fetch, log = () => {
+}) {
+  const apiKey = (env.TSIO_API_KEY ?? "").trim();
+  if (apiKey) return { headers: { "X-API-Key": apiKey }, secret: apiKey };
+  const reqUrl = (env.ACTIONS_ID_TOKEN_REQUEST_URL ?? "").trim();
+  const reqToken = (env.ACTIONS_ID_TOKEN_REQUEST_TOKEN ?? "").trim();
+  if (!reqUrl || !reqToken) return null;
+  const audience = (env.TSIO_OIDC_AUDIENCE ?? "").trim() || DEFAULT_TSIO_OIDC_AUDIENCE;
+  const sep2 = reqUrl.includes("?") ? "&" : "?";
+  const url = `${reqUrl}${sep2}audience=${encodeURIComponent(audience)}`;
+  try {
+    const res = await fetchImpl(url, {
+      headers: { authorization: `Bearer ${reqToken}`, accept: "application/json" },
+      signal: AbortSignal.timeout(1e4)
+    });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {
+      });
+      log(`TSIO OIDC token request failed: HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    const token = typeof data?.value === "string" ? data.value.trim() : "";
+    if (!token) {
+      log("TSIO OIDC token response held no token");
+      return null;
+    }
+    return { headers: { Authorization: `Bearer ${token}` }, secret: token };
+  } catch (e) {
+    const name = e instanceof Error ? e.name : "Error";
+    log(`TSIO OIDC token request unavailable (${name})`);
+    return null;
+  }
+}
+async function lookupVerdictBySignature(fetchImpl, base, fingerprint, opts) {
+  const fp = fingerprint.trim();
+  if (!fp) return null;
+  const q = new URLSearchParams();
+  if (opts?.repository) q.set("repository", opts.repository);
+  q.set("window_days", String(opts?.windowDays ?? 90));
+  const qs = q.toString();
+  const url = `${withoutTrailingSlash(base)}/api/v1/verdicts/by-signature/${encodeURIComponent(fp)}${qs ? `?${qs}` : ""}`;
+  const res = await fetchImpl(url, { signal: AbortSignal.timeout(opts?.timeoutMs ?? 1e4) });
+  if (res.status === 404) {
+    await res.body?.cancel().catch(() => {
+    });
+    return null;
+  }
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {
+    });
+    throw new Error(`TSIO GET /verdicts/by-signature: ${res.status}`);
+  }
+  const data = await res.json();
+  if (!data || typeof data !== "object" || Array.isArray(data) || typeof data.id !== "string" || !data.id || typeof data.label !== "string" || !data.label) {
+    throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+  }
+  const optStr = (v) => {
+    if (v == null) return null;
+    if (typeof v !== "string") throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+    return v;
+  };
+  const reqStr = (v) => {
+    if (v == null) return "";
+    if (typeof v !== "string") throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+    return v;
+  };
+  let confidence = null;
+  if (data.confidence != null) {
+    if (typeof data.confidence !== "number" || !Number.isFinite(data.confidence)) {
+      throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+    }
+    confidence = data.confidence;
+  }
+  return {
+    id: data.id,
+    report_group_id: optStr(data.report_group_id),
+    repository: reqStr(data.repository),
+    test_id: optStr(data.test_id),
+    signature_id: reqStr(data.signature_id),
+    fingerprint: reqStr(data.fingerprint),
+    label: data.label,
+    decided_by: optStr(data.decided_by),
+    rule: optStr(data.rule),
+    confidence,
+    summary: optStr(data.summary),
+    model: optStr(data.model),
+    triage_url: optStr(data.triage_url),
+    reused_from_id: optStr(data.reused_from_id),
+    created_at: reqStr(data.created_at)
+  };
+}
+function sliceUtf16Safe(s, maxUnits) {
+  if (maxUnits <= 0) return "";
+  if (s.length <= maxUnits) return s;
+  let end = maxUnits;
+  const code = s.charCodeAt(end - 1);
+  if (code >= 55296 && code <= 56319) end--;
+  return s.slice(0, end);
+}
+var utf8Bytes = (s) => new TextEncoder().encode(s).byteLength;
+function toJsonSafe(v, ancestors) {
+  if (typeof v === "bigint") return String(v);
+  if (v === null || typeof v !== "object") {
+    return typeof v === "function" || typeof v === "symbol" || v === void 0 ? void 0 : v;
+  }
+  if (ancestors.has(v)) return void 0;
+  ancestors.add(v);
+  try {
+    const toJson = v.toJSON;
+    if (typeof toJson === "function") {
+      try {
+        return toJsonSafe(toJson.call(v), ancestors);
+      } catch {
+        return void 0;
+      }
+    }
+    if (Array.isArray(v)) return v.map((el) => toJsonSafe(el, ancestors) ?? null);
+    const copy = {};
+    for (const [k, val] of Object.entries(v)) {
+      const safeVal = toJsonSafe(val, ancestors);
+      if (safeVal !== void 0) copy[k] = safeVal;
+    }
+    return copy;
+  } finally {
+    ancestors.delete(v);
+  }
+}
+function normalizeErrorContext(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  try {
+    const safe = toJsonSafe(raw, /* @__PURE__ */ new WeakSet());
+    if (!safe || typeof safe !== "object" || Array.isArray(safe)) return {};
+    const out = safe;
+    if (utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES) return out;
+    for (let guard = 0; guard < 64 && utf8Bytes(JSON.stringify(out)) > MAX_ERROR_CONTEXT_BYTES; guard++) {
+      let longestStrKey = null;
+      let longestStrLen = 0;
+      for (const [k, v] of Object.entries(out)) {
+        if (typeof v === "string" && v.length > longestStrLen) {
+          longestStrKey = k;
+          longestStrLen = v.length;
+        }
+      }
+      if (longestStrKey && longestStrLen > 64) {
+        const next = sliceUtf16Safe(out[longestStrKey], Math.floor(longestStrLen / 2));
+        if (next.length < longestStrLen) {
+          out[longestStrKey] = next;
+          continue;
+        }
+      }
+      let largestKey = null;
+      let largestBytes = -1;
+      for (const [k, v] of Object.entries(out)) {
+        const b = utf8Bytes(JSON.stringify(v ?? null));
+        if (b > largestBytes) {
+          largestBytes = b;
+          largestKey = k;
+        }
+      }
+      if (!largestKey) break;
+      delete out[largestKey];
+    }
+    return utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES ? out : {};
+  } catch {
+    return {};
+  }
+}
+function sanitizeVerdictItem(item) {
+  const testId = isUuid(item.test_id) ? item.test_id : null;
+  const sigId = isUuid(item.signature_id) ? item.signature_id : null;
+  const fp = typeof item.fingerprint === "string" && item.fingerprint.trim() ? item.fingerprint.trim() : null;
+  const conf = typeof item.confidence === "number" && Number.isFinite(item.confidence) ? Math.min(1, Math.max(0, item.confidence)) : null;
+  const reusedFromId = isUuid(item.reused_from_id) ? item.reused_from_id : null;
+  return {
+    test_id: testId,
+    signature_id: sigId,
+    fingerprint: fp,
+    label: item.label,
+    decided_by: item.decided_by ?? null,
+    rule: item.rule ?? null,
+    confidence: conf,
+    summary: item.summary ?? null,
+    model: item.model ?? null,
+    triage_url: item.triage_url ?? null,
+    error_context: normalizeErrorContext(item.error_context),
+    reused_from_id: reusedFromId
+  };
+}
+async function submitVerdicts(fetchImpl, base, authHeaders, request, opts) {
+  if (!request.verdicts.length) return [];
+  const reportGroupId = isUuid(request.report_group_id) ? request.report_group_id : null;
+  const sanitized = request.verdicts.map(sanitizeVerdictItem).filter((v) => v.label.trim().length > 0);
+  if (!sanitized.length) return [];
+  const fpToSigId = /* @__PURE__ */ new Map();
+  for (const item of sanitized) {
+    if (item.fingerprint && item.signature_id && !fpToSigId.has(item.fingerprint)) {
+      fpToSigId.set(item.fingerprint, item.signature_id);
+    }
+  }
+  const normalized = sanitized.map(
+    (item) => !item.signature_id && item.fingerprint && fpToSigId.has(item.fingerprint) ? { ...item, signature_id: fpToSigId.get(item.fingerprint) } : item
+  );
+  let items = normalized;
+  if (reportGroupId) {
+    const seen = /* @__PURE__ */ new Set();
+    items = [];
+    for (const item of normalized) {
+      const sigKey = item.signature_id ? `s:${item.signature_id}` : item.fingerprint ? `f:${item.fingerprint}` : "";
+      const key = `${item.test_id ?? ""}\0${sigKey}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(item);
+    }
+  }
+  const endpoint = `${withoutTrailingSlash(base)}/api/v1/verdicts`;
+  const created = [];
+  for (let i = 0; i < items.length; i += MAX_VERDICT_BATCH) {
+    const chunk = items.slice(i, i + MAX_VERDICT_BATCH);
+    const res = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        repository: request.repository,
+        report_group_id: reportGroupId,
+        verdicts: chunk
+      }),
+      signal: AbortSignal.timeout(opts?.timeoutMs ?? 15e3)
+    });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {
+      });
+      throw new Error(`TSIO POST /verdicts: ${res.status}`);
+    }
+    const data = await res.json();
+    if (Array.isArray(data?.verdicts)) created.push(...data.verdicts);
+  }
+  return created;
 }
 
 // src/findings.ts
@@ -1381,6 +1641,10 @@ function whyNext(f, branch, pr, branchRun = null) {
   }
 }
 function decidedBy(f) {
+  if (f.reused_from_id) {
+    const model2 = shortModel(f.reused_verdict?.model ?? f.judge?.provenance?.served_model ?? f.ai?.model);
+    return model2 ? `Reused (${model2})` : "Reused (TSIO)";
+  }
   const model = shortModel(f.judge?.provenance?.served_model ?? f.ai?.model);
   if (f.decision === "adjudicator_unblock" || f.decision === "adjudicator_veto" || f.decision === "adjudicator_blame") return `AI (${model})${f.escalated ? ", second opinion" : ""}`;
   if (f.judge || f.ai?.model) return `Rules; AI asked${f.escalated ? ", second opinion" : ""}`;
@@ -1627,7 +1891,13 @@ function statusDescription(verdict, findings, runInfra, counts, missing = null, 
 
 // src/findings.ts
 var FINDINGS_SCHEMA = 3;
-var SECRET_PATTERNS = [/gh[pousr]_[A-Za-z0-9]{20,}/g, /github_pat_[A-Za-z0-9_]{20,}/g, /sk-ant-[A-Za-z0-9_-]{8,}/g, /\bBearer\s+[^\s"']+/gi];
+var SECRET_PATTERNS = [
+  /gh[pousr]_[A-Za-z0-9]{20,}/g,
+  /github_pat_[A-Za-z0-9_]{20,}/g,
+  /sk-ant-[A-Za-z0-9_-]{8,}/g,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+  /\bBearer\s+[^\s"']+/gi
+];
 var ANSI = /\x1b\[[0-9;]*m/g;
 var CREDENTIAL_KV = /([A-Za-z0-9_.-]*(?:token|password|secret|passwd|api[_-]?key|apikey|license|authorization)[A-Za-z0-9_.-]*)(\s*[=:]\s*)((?:Bearer\s+)?[^\s"',;&]+)/gi;
 function redact(text, secrets) {
@@ -1641,10 +1911,10 @@ function redact(text, secrets) {
   for (const p of SECRET_PATTERNS) out = out.replace(p, "[redacted]");
   return out;
 }
-var clip = (s, max) => s.length > max ? s.slice(0, max) : s;
-var firstLine = (error) => {
+var clip = (s, max) => sliceUtf16Safe(s, max);
+var firstLine = (error, secrets) => {
   const line = String(error ?? "").replace(ANSI, "").split(/\r?\n/).find((l) => l.trim()) ?? "";
-  return clip(line.trim(), 200);
+  return clip(redact(line.trim(), secrets), 200);
 };
 function rowOf(f, secrets) {
   const judge2 = f.judge ?? null;
@@ -1657,7 +1927,7 @@ function rowOf(f, secrets) {
     blocking: f.blocking,
     decision: f.decision ?? null,
     reason: clip(redact(f.reason ?? "", secrets), 300),
-    error_first_line: redact(firstLine(f.error), secrets),
+    error_first_line: firstLine(f.error, secrets),
     out_of_date: Boolean(f.out_of_date),
     tries: f.tries ? { ran: f.tries.ran, failed: f.tries.failed } : null,
     other_lanes_failed: (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform),
@@ -1671,7 +1941,22 @@ function findingLogLine(f, n, of, secrets) {
   const line = `e2e-test-triage: finding ${n}/${of} ${row.blocking ? "blocking" : "cleared"} ${row.class} decision=${row.decision ?? "-"} ai=${ai} cited=${cited} "${clip(row.title, 120)}" \xB7 ${clip(row.file, 100)}: ${row.reason}`;
   return clip(line.replace(/\s+/g, " "), 500);
 }
-var secretsOf = (env) => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY].filter((s) => Boolean(s));
+var secretsOf = (env, extra = []) => {
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const raw of [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY, env.TSIO_API_KEY, env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, ...extra]) {
+    if (!raw) continue;
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    for (const candidate of trimmed !== raw ? [raw, trimmed] : [raw]) {
+      if (!seen.has(candidate)) {
+        seen.add(candidate);
+        out.push(candidate);
+      }
+    }
+  }
+  return out;
+};
 function findingsRecord({ env, id, mode, run: run2, result, notTriaged, basis = null, description = null, laneDiagnosis = null, rerun = null }) {
   const secrets = secretsOf(env);
   const ai = result?.ai ?? newLedger();
@@ -4072,8 +4357,58 @@ function nearMiss(cls, answer, pack, cfg, isTrunkRun) {
   return JUDGED.has(cls) && answer.cause !== "caused_by_pr" && answer.confidence < cfg.minConfidence && unblocks(answer.cause, cited, pack, cls, cfg.infraClears);
 }
 var JUDGED_PER_CALL = 8;
+function canReuseFinding(f, pack, isTrunk) {
+  if (!f.signature_fingerprint || !f.blocking) return false;
+  if (f.class === "OWNED_BY_PR" || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete") return false;
+  if (exoneratedSet(isTrunk).has(f.class)) return false;
+  if (f.failed_everywhere?.length || f.pr_streak || f.changed_by_pr || f.untouched === false) return false;
+  if (pack.pr?.spec_file_changed_by_pr || pack.diff_hunks_of_files_named_in_error.some((h) => h.related)) return false;
+  return true;
+}
+function reusableOutcomeFor(prior, pack, f, isTrunk, minConfidence) {
+  if (prior.summary != null && typeof prior.summary !== "string") return null;
+  if (prior.model != null && typeof prior.model !== "string") return null;
+  if (prior.confidence != null && (typeof prior.confidence !== "number" || !Number.isFinite(prior.confidence) || prior.confidence < minConfidence)) return null;
+  const validConfidence = typeof prior.confidence === "number" && Number.isFinite(prior.confidence) && prior.confidence >= minConfidence;
+  if (prior.decided_by === "ai") {
+    if (!validConfidence || prior.rule !== "adjudicator_unblock") return null;
+  } else if (prior.decided_by === "reused") {
+    if (prior.confidence != null && !validConfidence) return null;
+    const validReusedRule = prior.rule === "adjudicator_unblock" || prior.label === "broken on main" && (prior.rule === "base_broken" || prior.rule === "engine" || prior.rule === "BROKEN_ON_TRUNK");
+    if (!validReusedRule) return null;
+  } else if (prior.decided_by === "rules") {
+    if (prior.label === "broken on main") {
+      if (prior.rule !== "BROKEN_ON_TRUNK" && prior.rule !== "base_broken" && prior.rule !== "same_failure") return null;
+    } else if (prior.label === "flaky") {
+      if (prior.rule !== "FLAKY_ON_TRUNK" && prior.rule !== "FLAKY_CROSS_PR" && prior.rule !== "FLAKY_NOT_RUN" && prior.rule !== "INFRA_ERROR" && prior.rule !== "rules_unblock" && prior.rule !== "same_failure") {
+        return null;
+      }
+    } else {
+      return null;
+    }
+  } else {
+    return null;
+  }
+  if (pack.release) {
+    if (prior.label === "flaky") {
+      const lanes = pack.same_test_other_platforms_this_run?.results ?? [];
+      const everywhere = Boolean(f.tries && f.tries.ran >= 1 && f.tries.failed === f.tries.ran && lanes.length && lanes.every((l) => FAILED_STATUSES.has(l.result)));
+      if (everywhere) return null;
+      return { cause: "flaky_environment", blocking: false, decision: "adjudicator_unblock" };
+    }
+    if (prior.label === "test bug") return { cause: "test_bug", blocking: false, decision: "adjudicator_unblock" };
+    if (prior.label === "server compat") return { cause: "server_compat", blocking: false, decision: "adjudicator_unblock" };
+    return null;
+  }
+  if (prior.label === "flaky") return { cause: "flaky_environment", blocking: false, decision: "adjudicator_unblock" };
+  if (prior.label === "broken on main") {
+    if (isTrunk && f.class === "INFRA_ERROR") return null;
+    return isTrunk ? { cause: "bug_on_master", blocking: true, decision: "engine" } : { cause: "bug_on_master", blocking: false, decision: "adjudicator_unblock" };
+  }
+  return null;
+}
 async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
-}, isTrunkRun = false, ledger = newLedger()) {
+}, isTrunkRun = false, ledger = newLedger(), lookupVerdict = null) {
   const groups = /* @__PURE__ */ new Map();
   const sortKey = (f) => [f.file, f.full_title ?? f.title, f.report_name ?? "", f.title, f.error ?? ""];
   const compareKeys = (a, b) => {
@@ -4184,9 +4519,57 @@ async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
       await ask(model, missed, false);
     }
   };
-  await ask(cfg.model, pending);
-  for (const g of pending) settle(g, g.answer, g.answer ? null : g.error ?? null);
-  const escalate = cfg.escalationModel && cfg.escalationModel !== cfg.model ? pending.filter((g) => !g.advisory && g.answer && nearMiss(g.lead.f.class, g.answer, g.lead.pack, cfg, isTrunkRun)) : [];
+  const reused = /* @__PURE__ */ new Set();
+  if (lookupVerdict && pending.length) {
+    const lookupCache = /* @__PURE__ */ new Map();
+    const lookupCached = (fp) => {
+      let p = lookupCache.get(fp);
+      if (!p) {
+        p = Promise.resolve().then(() => lookupVerdict(fp)).catch((e) => {
+          warn(`TSIO verdict lookup failed: ${String(e).slice(0, 200)}`);
+          return null;
+        });
+        lookupCache.set(fp, p);
+      }
+      return p;
+    };
+    const candidates = pending.filter(
+      (g) => !g.advisory && !cachedAnswer(cfg.answers?.[answerKey(cfg.model, g.lead.pack)], g.lead.pack) && g.members.every((m) => canReuseFinding(m.f, m.pack, isTrunkRun) && m.f.signature_fingerprint === g.lead.f.signature_fingerprint)
+    );
+    await Promise.all([...new Set(candidates.map((g) => g.lead.f.signature_fingerprint))].map((fp) => lookupCached(fp)));
+    for (const g of candidates) {
+      const prior = await lookupCached(g.lead.f.signature_fingerprint);
+      if (!prior || typeof prior !== "object" || typeof prior.id !== "string" || !prior.id || typeof prior.label !== "string" || !prior.label) continue;
+      const resolved = g.members.map((m) => reusableOutcomeFor(prior, m.pack, m.f, isTrunkRun, cfg.minConfidence));
+      if (resolved.some((r) => r === null)) continue;
+      reused.add(g);
+      const summary = typeof prior.summary === "string" ? prior.summary.trim() : "";
+      const explanation = summary || `Reused prior TSIO verdict (${prior.label})`;
+      const confidence = typeof prior.confidence === "number" && Number.isFinite(prior.confidence) ? prior.confidence : cfg.minConfidence;
+      const servedModel = typeof prior.model === "string" && prior.model ? prior.model : "reused";
+      for (const [idx, m] of g.members.entries()) {
+        const res = resolved[idx];
+        Object.assign(m.f, {
+          blocking: res.blocking,
+          decision: res.decision,
+          ...isTrunkRun && !m.pack.release ? { trunk_run: true } : {},
+          reused_from_id: prior.id,
+          reused_verdict: prior,
+          judge: {
+            cause: res.cause,
+            confidence,
+            cited_evidence: [],
+            explanation,
+            provenance: { served_model: servedModel }
+          }
+        });
+      }
+    }
+  }
+  const toAsk = reused.size ? pending.filter((g) => !reused.has(g)) : pending;
+  await ask(cfg.model, toAsk);
+  for (const g of toAsk) settle(g, g.answer, g.answer ? null : g.error ?? null);
+  const escalate = cfg.escalationModel && cfg.escalationModel !== cfg.model ? toAsk.filter((g) => !g.advisory && g.answer && nearMiss(g.lead.f.class, g.answer, g.lead.pack, cfg, isTrunkRun)) : [];
   if (escalate.length) {
     for (const g of escalate) delete g.answer;
     await ask(cfg.escalationModel, escalate);
@@ -4228,7 +4611,8 @@ async function evaluateRun({
   outOfDate = null,
   fixedOnTrunk = null,
   brokeBy = null,
-  specHistory = null
+  specHistory = null,
+  lookupVerdict = null
 }) {
   const isTrunkRun = prNumber == null;
   const tests = run2.failing.filter((t) => !isShardPlaceholder(t));
@@ -4365,7 +4749,7 @@ async function evaluateRun({
         const why = commonSenseClear(f, packs[i]);
         if (why) Object.assign(f, { blocking: false, decision: "rules_unblock", reason: why });
       }
-      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
+      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai, lookupVerdict);
     }
     if (!blind && !prNumber && branchBase) {
       for (const f of result.findings) f.release = true;
@@ -4382,7 +4766,7 @@ async function evaluateRun({
       const others = result.findings.map((f) => ({ class: f.class, title: (f.full_title || f.title).slice(0, 200), file: f.file, signature: errorSignature(f.error) }));
       const release = { repository: id.repository, name: id.name ?? "", branch: branchName || "this branch", base: branchBase, historyBranch: trunkBranch || branchBase, lane };
       const packs = result.findings.map((f) => held.includes(f) ? releasePack(f, release, others, changeContext) : null);
-      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai);
+      if (ask) await judge(result.findings, packs, ask, cfg, log, isTrunkRun, result.ai, lookupVerdict);
     }
     if (!blind && prNumber) sameFailure(result.findings);
     if (prNumber && !branchBase) settlePR(result.findings, changed, diff.ok && testRoot != null, Boolean(result.infra), files, cfg.minTrunkRuns);
@@ -5000,6 +5384,135 @@ async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRu
   return { verdict, orchestration, jobs, baseline, startJobId };
 }
 
+// src/verdicts.ts
+var ANSI2 = /\x1b\[[0-9;]*m/g;
+function firstErrorLine(error, secrets) {
+  const line = String(error ?? "").replace(ANSI2, "").split(/\r?\n/).find((l) => l.trim()) ?? "";
+  return sliceUtf16Safe(redact(line.trim(), secrets), 200);
+}
+function buildErrorContext(f, secrets) {
+  const first = firstErrorLine(f.error, secrets);
+  return {
+    file: redact(f.repo_path ?? f.file, secrets),
+    title: redact(f.title, secrets),
+    ...f.full_title ? { full_title: redact(f.full_title, secrets) } : {},
+    class: f.class,
+    error_first_line: first,
+    ...f.error ? { error: sliceUtf16Safe(redact(f.error, secrets), 4e3) } : {},
+    ...f.reason ? { reason: sliceUtf16Safe(redact(f.reason, secrets), 1e3) } : {},
+    ...f.tries ? { tries: { ran: f.tries.ran, failed: f.tries.failed } } : {}
+  };
+}
+function findingToVerdictItem(f, runURL, secrets) {
+  const rawConf = f.reused_from_id ? f.reused_verdict?.confidence ?? f.judge?.confidence ?? null : f.judge?.confidence ?? null;
+  const confidence = typeof rawConf === "number" && Number.isFinite(rawConf) ? Math.min(1, Math.max(0, rawConf)) : null;
+  const reusedSummary = typeof f.reused_verdict?.summary === "string" ? f.reused_verdict.summary : null;
+  const rawSummary = f.reused_from_id ? reusedSummary ?? f.judge?.explanation ?? f.reason ?? "" : f.judge?.explanation ?? f.reason ?? "";
+  const cleanSummary = redact(rawSummary, secrets).trim();
+  const reusedModel = typeof f.reused_verdict?.model === "string" ? f.reused_verdict.model : null;
+  const model = f.reused_from_id ? reusedModel ?? f.judge?.provenance?.served_model ?? null : f.judge?.provenance?.served_model ?? f.ai?.model ?? null;
+  return {
+    test_id: isUuid(f.test_id) ? f.test_id : null,
+    signature_id: isUuid(f.signature_id) ? f.signature_id : null,
+    fingerprint: typeof f.signature_fingerprint === "string" && f.signature_fingerprint.trim() ? f.signature_fingerprint.trim() : null,
+    label: statusLabelOf(f),
+    decided_by: f.reused_from_id ? "reused" : f.judge ? "ai" : "rules",
+    rule: f.decision ?? f.class ?? null,
+    confidence,
+    summary: cleanSummary ? sliceUtf16Safe(cleanSummary, 1e3) : null,
+    model,
+    triage_url: runURL,
+    error_context: buildErrorContext(f, secrets),
+    reused_from_id: isUuid(f.reused_from_id) ? f.reused_from_id : null
+  };
+}
+function makeVerdictLookup({
+  fetchImpl,
+  base,
+  repository,
+  log,
+  secrets,
+  windowDays = 90
+}) {
+  return async (fingerprint) => {
+    try {
+      return await lookupVerdictBySignature(fetchImpl, base, fingerprint, { repository, windowDays });
+    } catch (e) {
+      log(`e2e-test-triage: TSIO verdict lookup failed (failing open): ${sliceUtf16Safe(redact(String(e), secrets), 200)}`);
+      return null;
+    }
+  };
+}
+function shouldSubmitFindingVerdict(f) {
+  if (f.decision === "unavailable" || f.decision === "evidence_incomplete" || f.decision === "first_failure") return false;
+  if (f.class === "INSUFFICIENT_DATA" && f.decision !== "adjudicator_unblock" && f.decision !== "adjudicator_blame" && f.decision !== "base_broken" && !f.reused_from_id) {
+    return false;
+  }
+  if (statusLabelOf(f) === "broken on main") {
+    return f.class === "BROKEN_ON_TRUNK" || f.same_as_class === "BROKEN_ON_TRUNK" || f.decision === "base_broken" || f.decision === "adjudicator_unblock" && f.judge?.cause === "bug_on_master" || Boolean(f.reused_from_id);
+  }
+  return true;
+}
+async function submitTriageVerdicts({
+  env,
+  fetchImpl,
+  base,
+  repository,
+  reportGroupId,
+  findings,
+  lane,
+  runURL,
+  log
+}) {
+  const submittable = findings.filter(shouldSubmitFindingVerdict);
+  const hasFindings = submittable.length > 0;
+  const hasFailingLane = Boolean(lane && lane.verdict.state !== "success");
+  if (!hasFindings && !hasFailingLane) return [];
+  let secrets = secretsOf(env);
+  try {
+    const auth = await resolveTsioAuthHeaders(env, fetchImpl, (msg) => log(redact(msg, secrets)));
+    if (!auth) return [];
+    secrets = secretsOf(env, [auth.secret]);
+    const items = [];
+    if (hasFailingLane) {
+      items.push({
+        test_id: null,
+        signature_id: null,
+        fingerprint: null,
+        label: lane.verdict.label,
+        decided_by: "rules",
+        rule: lane.verdict.fault,
+        confidence: null,
+        summary: sliceUtf16Safe(redact(lane.verdict.what, secrets).trim(), 1e3) || null,
+        model: null,
+        triage_url: runURL,
+        error_context: {
+          lane_label: redact(lane.verdict.label, secrets),
+          fault: redact(lane.verdict.fault, secrets),
+          what: sliceUtf16Safe(redact(lane.verdict.what, secrets), 1e3),
+          action: sliceUtf16Safe(redact(lane.verdict.action, secrets), 1e3)
+        },
+        reused_from_id: null
+      });
+    }
+    if (hasFindings) {
+      for (const f of [...submittable].sort((a, b) => Number(b.blocking) - Number(a.blocking))) {
+        items.push(findingToVerdictItem(f, runURL, secrets));
+      }
+    }
+    if (!items.length) return [];
+    const gid = reportGroupId != null && isUuid(String(reportGroupId)) ? String(reportGroupId) : null;
+    return await submitVerdicts(fetchImpl, base, auth.headers, {
+      repository,
+      report_group_id: gid,
+      verdicts: items
+    });
+  } catch (e) {
+    log(`e2e-test-triage: TSIO verdict submission skipped (failing open): ${sliceUtf16Safe(redact(String(e), secrets), 200)}`);
+    return [];
+  }
+}
+
 // src/triage.ts
 var isPlainObject2 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var isPrSpend = (v) => isPlainObject2(v) && typeof v.pr === "number" && typeof v.usd === "number" && Number.isFinite(v.usd) && v.usd >= 0;
@@ -5053,7 +5566,7 @@ async function triage(options) {
     if (!written.summary && summaryPath) {
       try {
         const text = body ? renderNotTriaged({ text: body, lane: env.LANE || id?.name || null }) : renderUnfinished({ reason, lane: env.LANE || null });
-        (0, import_node_fs4.appendFileSync)(summaryPath, text + "\n");
+        (0, import_node_fs4.appendFileSync)(summaryPath, redact(text, secrets) + "\n");
       } catch (writeError) {
         log(`triage's summary not written: ${String(writeError).slice(0, 160)}`);
       }
@@ -5343,7 +5856,8 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = /*
       outOfDate: (findings) => markOutOfDate({ findings, api, id, baseBranch: branchBase ?? trunkBranch, until: now.toISOString(), log, supportPaths: cfg.supportPaths, fetchFileDiffs: Boolean(branchBase) }),
       fixedOnTrunk: (findings) => markFixedOnTrunk({ findings, api, id, baseBranch: trunkBranch, log }),
       brokeBy: (findings) => markBrokeBy({ findings, api, id, log }),
-      specHistory
+      specHistory,
+      lookupVerdict: ask ? makeVerdictLookup({ fetchImpl, base, repository: id.repository, log, secrets }) : null
     });
     seen.result = result;
     const flagged = activeFlag(result.infra, result.findings);
@@ -5450,7 +5964,7 @@ ai_input_tokens=${spend.input_tokens}
 ai_output_tokens=${spend.output_tokens}
 `);
     if (env.GITHUB_STEP_SUMMARY && (decides || laneRed || lane)) {
-      (0, import_node_fs4.appendFileSync)(env.GITHUB_STEP_SUMMARY, summary + "\n");
+      (0, import_node_fs4.appendFileSync)(env.GITHUB_STEP_SUMMARY, redact(summary, secrets) + "\n");
       written.summary = true;
     }
     const mode = String(env.MODE ?? "").trim();
@@ -5486,6 +6000,17 @@ aggregate-published=${aggregatePublished}
 `);
       written.aggregateOutput = true;
     }
+    await submitTriageVerdicts({
+      env,
+      fetchImpl,
+      base,
+      repository: id.repository,
+      reportGroupId: run2.group_id,
+      findings: result.findings,
+      lane,
+      runURL,
+      log
+    });
     result.findings.forEach((f, i) => log(findingLogLine(f, i + 1, result.findings.length, secretsOf(env))));
     log(`e2e-test-triage: ${result.verdict} (${run2.counts.failed} failed, ${result.findings.filter((f) => f.blocking).length} blocking)${enforce ? "" : " [report-only]"}`);
     return result;

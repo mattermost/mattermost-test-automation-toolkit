@@ -2,12 +2,15 @@
 // See LICENSE.txt for license information.
 
 import { FAILED_STATUSES } from "../../shared/src/tsio.ts";
+import type { TsioVerdict } from "../../shared/src/tsio.ts";
 import { errorSignature, exoneratedSet, isInfraError, JUDGED } from "./classify.ts";
 import { DEFAULTS } from "./config.ts";
 import { chainClears, CLEARING, evidenceIds, PACK_IMAGES, serverOf } from "./pack.ts";
 import { answerKey, cachedAnswer, expectedOutput, maxTokensFor, systemFor } from "./judge.ts";
 import { costOf, ledgerTotals, newLedger } from "./pricing.ts";
-import type { Answer, BatchResult, Config, Finding, Ledger, Pack } from "./types.ts";
+import type { Answer, BatchResult, Cause, Config, Finding, Ledger, Pack } from "./types.ts";
+
+export type LookupVerdictFn = (fingerprint: string) => Promise<TsioVerdict | null>;
 
 const trunkSameFailure = (trunk?: Partial<Pack["trunk_history_14d"]>): boolean =>
   Boolean(trunk?.same_error) && ((trunk?.fails ?? 0) > 0 || (trunk?.flaky ?? 0) > 0 || trunk?.latest === "failed");
@@ -138,6 +141,75 @@ interface Group {
 /** The most questions one model call carries; a bigger run is asked in several calls. */
 export const JUDGED_PER_CALL = 8;
 
+function canReuseFinding(f: Finding, pack: Pack, isTrunk: boolean): boolean {
+  if (!f.signature_fingerprint || !f.blocking) return false;
+  if (f.class === "OWNED_BY_PR" || f.identity_unresolved || f.out_of_date || f.decision === "evidence_incomplete") return false;
+  if (exoneratedSet(isTrunk).has(f.class)) return false;
+  if (f.failed_everywhere?.length || f.pr_streak || f.changed_by_pr || f.untouched === false) return false;
+  if (pack.pr?.spec_file_changed_by_pr || pack.diff_hunks_of_files_named_in_error.some((h) => h.related)) return false;
+  return true;
+}
+
+function reusableOutcomeFor(
+  prior: TsioVerdict,
+  pack: Pack,
+  f: Finding,
+  isTrunk: boolean,
+  minConfidence: number,
+): { cause: Cause; blocking: boolean; decision: string } | null {
+  if (prior.summary != null && typeof prior.summary !== "string") return null;
+  if (prior.model != null && typeof prior.model !== "string") return null;
+  if (prior.confidence != null && (typeof prior.confidence !== "number" || !Number.isFinite(prior.confidence) || prior.confidence < minConfidence)) return null;
+  const validConfidence = typeof prior.confidence === "number" && Number.isFinite(prior.confidence) && prior.confidence >= minConfidence;
+  if (prior.decided_by === "ai") {
+    if (!validConfidence || prior.rule !== "adjudicator_unblock") return null;
+  } else if (prior.decided_by === "reused") {
+    if (prior.confidence != null && !validConfidence) return null;
+    const validReusedRule =
+      prior.rule === "adjudicator_unblock" ||
+      (prior.label === "broken on main" && (prior.rule === "base_broken" || prior.rule === "engine" || prior.rule === "BROKEN_ON_TRUNK"));
+    if (!validReusedRule) return null;
+  } else if (prior.decided_by === "rules") {
+    if (prior.label === "broken on main") {
+      if (prior.rule !== "BROKEN_ON_TRUNK" && prior.rule !== "base_broken" && prior.rule !== "same_failure") return null;
+    } else if (prior.label === "flaky") {
+      if (
+        prior.rule !== "FLAKY_ON_TRUNK" &&
+        prior.rule !== "FLAKY_CROSS_PR" &&
+        prior.rule !== "FLAKY_NOT_RUN" &&
+        prior.rule !== "INFRA_ERROR" &&
+        prior.rule !== "rules_unblock" &&
+        prior.rule !== "same_failure"
+      ) {
+        return null;
+      }
+    } else {
+      return null;
+    }
+  } else {
+    return null;
+  }
+  if (pack.release) {
+    if (prior.label === "flaky") {
+      const lanes = pack.same_test_other_platforms_this_run?.results ?? [];
+      const everywhere = Boolean(f.tries && f.tries.ran >= 1 && f.tries.failed === f.tries.ran && lanes.length && lanes.every((l) => FAILED_STATUSES.has(l.result)));
+      if (everywhere) return null;
+      return { cause: "flaky_environment", blocking: false, decision: "adjudicator_unblock" };
+    }
+    if (prior.label === "test bug") return { cause: "test_bug", blocking: false, decision: "adjudicator_unblock" };
+    if (prior.label === "server compat") return { cause: "server_compat", blocking: false, decision: "adjudicator_unblock" };
+    return null;
+  }
+  if (prior.label === "flaky") return { cause: "flaky_environment", blocking: false, decision: "adjudicator_unblock" };
+  if (prior.label === "broken on main") {
+    if (isTrunk && f.class === "INFRA_ERROR") return null;
+    return isTrunk
+      ? { cause: "bug_on_master", blocking: true, decision: "engine" }
+      : { cause: "bug_on_master", blocking: false, decision: "adjudicator_unblock" };
+  }
+  return null;
+}
+
 /**
  * Ask the model about findings an answer could change, up to cfg.maxJudged questions, at most
  * JUDGED_PER_CALL per call. Same spec and error share a question; questions that could change the
@@ -154,6 +226,7 @@ export async function judge(
   warn: (message: string) => void = () => {},
   isTrunkRun = false,
   ledger: Ledger = newLedger(),
+  lookupVerdict: LookupVerdictFn | null = null,
 ): Promise<Finding[]> {
   const groups = new Map<string, Group>();
   // TSIO lists a run's failures in no fixed order. Visiting them in one makes the same run pick the same
@@ -285,10 +358,63 @@ export async function judge(
       await ask(model, missed, false);
     }
   };
-  await ask(cfg.model, pending);
-  for (const g of pending) settle(g, g.answer, g.answer ? null : g.error ?? null);
+  const reused = new Set<Group>();
+  if (lookupVerdict && pending.length) {
+    const lookupCache = new Map<string, Promise<TsioVerdict | null>>();
+    const lookupCached = (fp: string): Promise<TsioVerdict | null> => {
+      let p = lookupCache.get(fp);
+      if (!p) {
+        p = Promise.resolve()
+          .then(() => lookupVerdict(fp))
+          .catch((e) => {
+            warn(`TSIO verdict lookup failed: ${String(e).slice(0, 200)}`);
+            return null;
+          });
+        lookupCache.set(fp, p);
+      }
+      return p;
+    };
+    const candidates = pending.filter(
+      (g) =>
+        !g.advisory &&
+        !cachedAnswer(cfg.answers?.[answerKey(cfg.model, g.lead.pack)], g.lead.pack) &&
+        g.members.every((m) => canReuseFinding(m.f, m.pack, isTrunkRun) && m.f.signature_fingerprint === g.lead.f.signature_fingerprint),
+    );
+    await Promise.all([...new Set(candidates.map((g) => g.lead.f.signature_fingerprint!))].map((fp) => lookupCached(fp)));
+    for (const g of candidates) {
+      const prior = await lookupCached(g.lead.f.signature_fingerprint!);
+      if (!prior || typeof prior !== "object" || typeof prior.id !== "string" || !prior.id || typeof prior.label !== "string" || !prior.label) continue;
+      const resolved = g.members.map((m) => reusableOutcomeFor(prior, m.pack, m.f, isTrunkRun, cfg.minConfidence));
+      if (resolved.some((r) => r === null)) continue;
+      reused.add(g);
+      const summary = typeof prior.summary === "string" ? prior.summary.trim() : "";
+      const explanation = summary || `Reused prior TSIO verdict (${prior.label})`;
+      const confidence = typeof prior.confidence === "number" && Number.isFinite(prior.confidence) ? prior.confidence : cfg.minConfidence;
+      const servedModel = typeof prior.model === "string" && prior.model ? prior.model : "reused";
+      for (const [idx, m] of g.members.entries()) {
+        const res = resolved[idx]!;
+        Object.assign(m.f, {
+          blocking: res.blocking,
+          decision: res.decision,
+          ...(isTrunkRun && !m.pack.release ? { trunk_run: true } : {}),
+          reused_from_id: prior.id,
+          reused_verdict: prior,
+          judge: {
+            cause: res.cause,
+            confidence,
+            cited_evidence: [],
+            explanation,
+            provenance: { served_model: servedModel },
+          },
+        });
+      }
+    }
+  }
+  const toAsk = reused.size ? pending.filter((g) => !reused.has(g)) : pending;
+  await ask(cfg.model, toAsk);
+  for (const g of toAsk) settle(g, g.answer, g.answer ? null : g.error ?? null);
   const escalate = cfg.escalationModel && cfg.escalationModel !== cfg.model
-    ? pending.filter((g) => !g.advisory && g.answer && nearMiss(g.lead.f.class, g.answer, g.lead.pack, cfg, isTrunkRun))
+    ? toAsk.filter((g) => !g.advisory && g.answer && nearMiss(g.lead.f.class, g.answer, g.lead.pack, cfg, isTrunkRun))
     : [];
   if (escalate.length) {
     for (const g of escalate) delete g.answer;

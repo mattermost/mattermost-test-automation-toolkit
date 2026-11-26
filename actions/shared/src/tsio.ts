@@ -175,6 +175,9 @@ export interface TsioCase {
   ordinal: number;
   error_message?: string | null;
   error_stack?: string | null;
+  test_id?: string | null;
+  signature_id?: string | null;
+  signature_fingerprint?: string | null;
 }
 
 export interface FailingTest {
@@ -190,6 +193,9 @@ export interface FailingTest {
   tries: { ran: number; failed: number };
   /** Its first try's case ordinal in the report it is named by: where it ran there. Absent when TSIO sent none. */
   ordinal?: number;
+  test_id?: string | null;
+  signature_id?: string | null;
+  signature_fingerprint?: string | null;
 }
 
 export interface RunResult {
@@ -458,6 +464,27 @@ export async function runFromGroups(
       const file = fileOf.get(suiteId) ?? "";
       // The first try in the report it is named by: ordinals are only comparable within one report.
       const first = attempts.find((a) => a.suite_id === suiteId);
+      const pickCaseMeta = (k: "test_id"): string | null | undefined => {
+        if (lastAttempt[k] != null) return lastAttempt[k];
+        const fromAny = attempts.find((a) => a[k] != null)?.[k];
+        return fromAny != null ? fromAny : lastAttempt[k];
+      };
+      const testId = pickCaseMeta("test_id");
+      const errorText = (a: TsioCase): string => [a.error_message, a.error_stack].filter(Boolean).join("\n");
+      const lastError = errorText(lastAttempt);
+      const sigAttempt =
+        lastAttempt.signature_fingerprint != null || lastAttempt.signature_id != null
+          ? lastAttempt
+          : (lastError !== ""
+              ? attempts.find(
+                  (a) =>
+                    FAILED_STATUSES.has(a.status) &&
+                    (a.signature_fingerprint != null || a.signature_id != null) &&
+                    errorText(a) === lastError,
+                )
+              : undefined) ?? lastAttempt;
+      const signatureId = sigAttempt.signature_id;
+      const signatureFingerprint = sigAttempt.signature_fingerprint;
       failing.push({
         file,
         title,
@@ -467,9 +494,12 @@ export async function runFromGroups(
         report_scope: reportName,
         identity_ambiguous: testsPerLeaf.get(JSON.stringify([file, title]))!.size > 1,
         identity_unresolved: testsPerIdentity.get(identityKey({ file, title, full_title: lastAttempt.full_title, report_scope: reportName }))!.size > 1,
-        error: [lastAttempt.error_message, lastAttempt.error_stack].filter(Boolean).join("\n"),
+        error: lastError,
         tries: { ran: attempts.filter((a) => a.status !== "skipped").length, failed: attempts.filter((a) => FAILED_STATUSES.has(a.status)).length },
         ...(typeof first?.ordinal === "number" ? { ordinal: first.ordinal } : {}),
+        ...(testId !== undefined ? { test_id: testId } : {}),
+        ...(signatureId !== undefined ? { signature_id: signatureId } : {}),
+        ...(signatureFingerprint !== undefined ? { signature_fingerprint: signatureFingerprint } : {}),
       });
     } else if (status === "skipped") skipped++;
     else if (status === "flaky") flaky++;
@@ -488,4 +518,360 @@ export function missingReports(missing: Missing | null): { text: string; short: 
   // The count is named where TSIO gave one; "?" marks what it did not.
   if (expected == null) return { text: `the run's results are incomplete (${received ?? "?"} reports arrived; the expected count is unknown; TSIO group ${state})`, short: "results incomplete" };
   return { text: `the run's results are incomplete (${received ?? "?"} of ${expected} reports arrived; TSIO group ${state})`, short: `results incomplete: ${received ?? "?"} of ${expected} reports` };
+}
+
+export const DEFAULT_TSIO_OIDC_AUDIENCE = "mattermost-test-system-io";
+export const MAX_VERDICT_BATCH = 500;
+export const MAX_ERROR_CONTEXT_BYTES = 64 * 1024;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const isUuid = (v: unknown): v is string => typeof v === "string" && UUID_RE.test(v);
+
+export interface TsioVerdict {
+  id: string;
+  report_group_id: string | null;
+  repository: string;
+  test_id: string | null;
+  signature_id: string;
+  fingerprint: string;
+  label: string;
+  decided_by: string | null;
+  rule: string | null;
+  confidence: number | null;
+  summary: string | null;
+  model: string | null;
+  triage_url: string | null;
+  reused_from_id: string | null;
+  created_at: string;
+}
+
+export interface CreateVerdictItem {
+  test_id?: string | null;
+  signature_id?: string | null;
+  fingerprint?: string | null;
+  label: string;
+  decided_by?: string | null;
+  rule?: string | null;
+  confidence?: number | null;
+  summary?: string | null;
+  model?: string | null;
+  triage_url?: string | null;
+  error_context?: Record<string, unknown> | null;
+  reused_from_id?: string | null;
+}
+
+export interface CreateVerdictsBatchRequest {
+  repository: string;
+  report_group_id?: string | null;
+  verdicts: CreateVerdictItem[];
+}
+
+export interface CreatedVerdictItem {
+  id: string;
+  report_group_id: string | null;
+  repository: string;
+  test_id: string | null;
+  signature_id: string | null;
+  label: string;
+  decided_by: string | null;
+  rule: string | null;
+  confidence: number | null;
+  summary: string | null;
+  model: string | null;
+  triage_url: string | null;
+  reused_from_id: string | null;
+  created_at: string;
+  created: boolean;
+  superseded_id: string | null;
+}
+
+export interface CreateVerdictsBatchResponse {
+  verdicts: CreatedVerdictItem[];
+}
+
+export interface TsioAuth {
+  headers: Record<string, string>;
+  secret: string;
+}
+
+/**
+ * Resolves optional TSIO write auth headers: X-API-Key (TSIO_API_KEY) first,
+ * then GitHub OIDC (ACTIONS_ID_TOKEN_REQUEST_URL + ACTIONS_ID_TOKEN_REQUEST_TOKEN).
+ * Returns null if neither is configured or OIDC minting fails (fail-open). Never logs tokens.
+ */
+export async function resolveTsioAuthHeaders(
+  env: Env,
+  fetchImpl: FetchImpl = fetch,
+  log: (message: string) => void = () => {},
+): Promise<TsioAuth | null> {
+  const apiKey = (env.TSIO_API_KEY ?? "").trim();
+  if (apiKey) return { headers: { "X-API-Key": apiKey }, secret: apiKey };
+
+  const reqUrl = (env.ACTIONS_ID_TOKEN_REQUEST_URL ?? "").trim();
+  const reqToken = (env.ACTIONS_ID_TOKEN_REQUEST_TOKEN ?? "").trim();
+  if (!reqUrl || !reqToken) return null;
+
+  const audience = (env.TSIO_OIDC_AUDIENCE ?? "").trim() || DEFAULT_TSIO_OIDC_AUDIENCE;
+  const sep = reqUrl.includes("?") ? "&" : "?";
+  const url = `${reqUrl}${sep}audience=${encodeURIComponent(audience)}`;
+  try {
+    const res = await fetchImpl(url, {
+      headers: { authorization: `Bearer ${reqToken}`, accept: "application/json" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      log(`TSIO OIDC token request failed: HTTP ${res.status}`);
+      return null;
+    }
+    const data = (await res.json()) as { value?: unknown } | null;
+    const token = typeof data?.value === "string" ? data.value.trim() : "";
+    if (!token) {
+      log("TSIO OIDC token response held no token");
+      return null;
+    }
+    return { headers: { Authorization: `Bearer ${token}` }, secret: token };
+  } catch (e) {
+    const name = e instanceof Error ? e.name : "Error";
+    log(`TSIO OIDC token request unavailable (${name})`);
+    return null;
+  }
+}
+
+/**
+ * Queries GET /api/v1/verdicts/by-signature/{fingerprint}.
+ * Returns null on 404; throws a concise status/shape error on unexpected failures so callers fail open.
+ */
+export async function lookupVerdictBySignature(
+  fetchImpl: FetchImpl,
+  base: string,
+  fingerprint: string,
+  opts?: { repository?: string; windowDays?: number; timeoutMs?: number },
+): Promise<TsioVerdict | null> {
+  const fp = fingerprint.trim();
+  if (!fp) return null;
+  const q = new URLSearchParams();
+  if (opts?.repository) q.set("repository", opts.repository);
+  q.set("window_days", String(opts?.windowDays ?? 90));
+  const qs = q.toString();
+  const url = `${withoutTrailingSlash(base)}/api/v1/verdicts/by-signature/${encodeURIComponent(fp)}${qs ? `?${qs}` : ""}`;
+  const res = await fetchImpl(url, { signal: AbortSignal.timeout(opts?.timeoutMs ?? 10_000) });
+  if (res.status === 404) {
+    await res.body?.cancel().catch(() => {});
+    return null;
+  }
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`TSIO GET /verdicts/by-signature: ${res.status}`);
+  }
+  const data = (await res.json()) as Record<string, unknown> | null;
+  if (!data || typeof data !== "object" || Array.isArray(data) || typeof data.id !== "string" || !data.id || typeof data.label !== "string" || !data.label) {
+    throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+  }
+  const optStr = (v: unknown): string | null => {
+    if (v == null) return null;
+    if (typeof v !== "string") throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+    return v;
+  };
+  const reqStr = (v: unknown): string => {
+    if (v == null) return "";
+    if (typeof v !== "string") throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+    return v;
+  };
+  let confidence: number | null = null;
+  if (data.confidence != null) {
+    if (typeof data.confidence !== "number" || !Number.isFinite(data.confidence)) {
+      throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+    }
+    confidence = data.confidence;
+  }
+  return {
+    id: data.id,
+    report_group_id: optStr(data.report_group_id),
+    repository: reqStr(data.repository),
+    test_id: optStr(data.test_id),
+    signature_id: reqStr(data.signature_id),
+    fingerprint: reqStr(data.fingerprint),
+    label: data.label,
+    decided_by: optStr(data.decided_by),
+    rule: optStr(data.rule),
+    confidence,
+    summary: optStr(data.summary),
+    model: optStr(data.model),
+    triage_url: optStr(data.triage_url),
+    reused_from_id: optStr(data.reused_from_id),
+    created_at: reqStr(data.created_at),
+  };
+}
+
+/** Slices at most maxUnits UTF-16 code units without splitting a surrogate pair. */
+export function sliceUtf16Safe(s: string, maxUnits: number): string {
+  if (maxUnits <= 0) return "";
+  if (s.length <= maxUnits) return s;
+  let end = maxUnits;
+  const code = s.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) end--;
+  return s.slice(0, end);
+}
+
+const utf8Bytes = (s: string): number => new TextEncoder().encode(s).byteLength;
+
+function toJsonSafe(v: unknown, ancestors: WeakSet<object>): unknown {
+  if (typeof v === "bigint") return String(v);
+  if (v === null || typeof v !== "object") {
+    return typeof v === "function" || typeof v === "symbol" || v === undefined ? undefined : v;
+  }
+  if (ancestors.has(v)) return undefined;
+  ancestors.add(v);
+  try {
+    const toJson = (v as { toJSON?: unknown }).toJSON;
+    if (typeof toJson === "function") {
+      try {
+        return toJsonSafe((toJson as () => unknown).call(v), ancestors);
+      } catch {
+        return undefined;
+      }
+    }
+    if (Array.isArray(v)) return v.map((el) => toJsonSafe(el, ancestors) ?? null);
+    const copy: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v)) {
+      const safeVal = toJsonSafe(val, ancestors);
+      if (safeVal !== undefined) copy[k] = safeVal;
+    }
+    return copy;
+  } finally {
+    ancestors.delete(v);
+  }
+}
+
+function normalizeErrorContext(raw: unknown): Record<string, unknown> | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  try {
+    const safe = toJsonSafe(raw, new WeakSet());
+    if (!safe || typeof safe !== "object" || Array.isArray(safe)) return {};
+    const out = safe as Record<string, unknown>;
+    if (utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES) return out;
+
+    for (let guard = 0; guard < 64 && utf8Bytes(JSON.stringify(out)) > MAX_ERROR_CONTEXT_BYTES; guard++) {
+      let longestStrKey: string | null = null;
+      let longestStrLen = 0;
+      for (const [k, v] of Object.entries(out)) {
+        if (typeof v === "string" && v.length > longestStrLen) {
+          longestStrKey = k;
+          longestStrLen = v.length;
+        }
+      }
+      if (longestStrKey && longestStrLen > 64) {
+        const next = sliceUtf16Safe(out[longestStrKey] as string, Math.floor(longestStrLen / 2));
+        if (next.length < longestStrLen) {
+          out[longestStrKey] = next;
+          continue;
+        }
+      }
+      let largestKey: string | null = null;
+      let largestBytes = -1;
+      for (const [k, v] of Object.entries(out)) {
+        const b = utf8Bytes(JSON.stringify(v ?? null));
+        if (b > largestBytes) {
+          largestBytes = b;
+          largestKey = k;
+        }
+      }
+      if (!largestKey) break;
+      delete out[largestKey];
+    }
+    return utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES ? out : {};
+  } catch {
+    return {};
+  }
+}
+
+function sanitizeVerdictItem(item: CreateVerdictItem): CreateVerdictItem {
+  const testId = isUuid(item.test_id) ? item.test_id : null;
+  const sigId = isUuid(item.signature_id) ? item.signature_id : null;
+  const fp = typeof item.fingerprint === "string" && item.fingerprint.trim() ? item.fingerprint.trim() : null;
+  const conf = typeof item.confidence === "number" && Number.isFinite(item.confidence)
+    ? Math.min(1, Math.max(0, item.confidence))
+    : null;
+  const reusedFromId = isUuid(item.reused_from_id) ? item.reused_from_id : null;
+  return {
+    test_id: testId,
+    signature_id: sigId,
+    fingerprint: fp,
+    label: item.label,
+    decided_by: item.decided_by ?? null,
+    rule: item.rule ?? null,
+    confidence: conf,
+    summary: item.summary ?? null,
+    model: item.model ?? null,
+    triage_url: item.triage_url ?? null,
+    error_context: normalizeErrorContext(item.error_context),
+    reused_from_id: reusedFromId,
+  };
+}
+
+/**
+ * Submits AI triage verdicts to POST /api/v1/verdicts in chunks of <= 500.
+ * Deduplicates items on (test_id, signature_id) when report_group_id is a valid UUID,
+ * enforces UUID/null normalization and <= 64 KiB JSON object error_context.
+ */
+export async function submitVerdicts(
+  fetchImpl: FetchImpl,
+  base: string,
+  authHeaders: Record<string, string>,
+  request: CreateVerdictsBatchRequest,
+  opts?: { timeoutMs?: number },
+): Promise<CreatedVerdictItem[]> {
+  if (!request.verdicts.length) return [];
+  const reportGroupId = isUuid(request.report_group_id) ? request.report_group_id : null;
+  const sanitized = request.verdicts.map(sanitizeVerdictItem).filter((v) => v.label.trim().length > 0);
+  if (!sanitized.length) return [];
+
+  const fpToSigId = new Map<string, string>();
+  for (const item of sanitized) {
+    if (item.fingerprint && item.signature_id && !fpToSigId.has(item.fingerprint)) {
+      fpToSigId.set(item.fingerprint, item.signature_id);
+    }
+  }
+  const normalized = sanitized.map((item) =>
+    !item.signature_id && item.fingerprint && fpToSigId.has(item.fingerprint)
+      ? { ...item, signature_id: fpToSigId.get(item.fingerprint)! }
+      : item,
+  );
+
+  let items = normalized;
+  if (reportGroupId) {
+    const seen = new Set<string>();
+    items = [];
+    for (const item of normalized) {
+      const sigKey = item.signature_id ? `s:${item.signature_id}` : item.fingerprint ? `f:${item.fingerprint}` : "";
+      const key = `${item.test_id ?? ""}\0${sigKey}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(item);
+    }
+  }
+
+  const endpoint = `${withoutTrailingSlash(base)}/api/v1/verdicts`;
+  const created: CreatedVerdictItem[] = [];
+  for (let i = 0; i < items.length; i += MAX_VERDICT_BATCH) {
+    const chunk = items.slice(i, i + MAX_VERDICT_BATCH);
+    const res = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        repository: request.repository,
+        report_group_id: reportGroupId,
+        verdicts: chunk,
+      }),
+      signal: AbortSignal.timeout(opts?.timeoutMs ?? 15_000),
+    });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      throw new Error(`TSIO POST /verdicts: ${res.status}`);
+    }
+    const data = (await res.json()) as CreateVerdictsBatchResponse | null;
+    if (Array.isArray(data?.verdicts)) created.push(...data.verdicts);
+  }
+  return created;
 }

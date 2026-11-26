@@ -6,7 +6,7 @@
 
 import { writeFileSync } from "node:fs";
 import type { Env } from "../../shared/src/github.ts";
-import { isFailedTry } from "../../shared/src/tsio.ts";
+import { isFailedTry, sliceUtf16Safe } from "../../shared/src/tsio.ts";
 import type { RunResult } from "../../shared/src/tsio.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
 import { statusLabelOf } from "./render.ts";
@@ -89,7 +89,13 @@ export interface FindingsFacts {
   rerun?: RerunSummary | null;
 }
 
-const SECRET_PATTERNS = [/gh[pousr]_[A-Za-z0-9]{20,}/g, /github_pat_[A-Za-z0-9_]{20,}/g, /sk-ant-[A-Za-z0-9_-]{8,}/g, /\bBearer\s+[^\s"']+/gi];
+const SECRET_PATTERNS = [
+  /gh[pousr]_[A-Za-z0-9]{20,}/g,
+  /github_pat_[A-Za-z0-9_]{20,}/g,
+  /sk-ant-[A-Za-z0-9_-]{8,}/g,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+  /\bBearer\s+[^\s"']+/gi,
+];
 const ANSI = /\x1b\[[0-9;]*m/g;
 
 // A credential-named key and its value: "token=…", "password: …", "Authorization: Bearer …", in any case. The key may carry a
@@ -112,11 +118,11 @@ export function redact(text: string, secrets: string[]): string {
   return out;
 }
 
-const clip = (s: string, max: number): string => (s.length > max ? s.slice(0, max) : s);
+const clip = (s: string, max: number): string => sliceUtf16Safe(s, max);
 /** The first line of an error, without colour codes, at most 200 characters. Never the stack. */
-const firstLine = (error: string | null | undefined): string => {
+const firstLine = (error: string | null | undefined, secrets: string[]): string => {
   const line = String(error ?? "").replace(ANSI, "").split(/\r?\n/).find((l) => l.trim()) ?? "";
-  return clip(line.trim(), 200);
+  return clip(redact(line.trim(), secrets), 200);
 };
 
 function rowOf(f: Finding, secrets: string[]): FindingRow {
@@ -130,7 +136,7 @@ function rowOf(f: Finding, secrets: string[]): FindingRow {
     blocking: f.blocking,
     decision: f.decision ?? null,
     reason: clip(redact(f.reason ?? "", secrets), 300),
-    error_first_line: redact(firstLine(f.error), secrets),
+    error_first_line: firstLine(f.error, secrets),
     out_of_date: Boolean(f.out_of_date),
     tries: f.tries ? { ran: f.tries.ran, failed: f.tries.failed } : null,
     other_lanes_failed: (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform),
@@ -151,7 +157,22 @@ export function findingLogLine(f: Finding, n: number, of: number, secrets: strin
 }
 
 /** The action's own secrets, as set in the environment: what the summary and the findings file must never print. */
-export const secretsOf = (env: Env): string[] => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY].filter((s): s is string => Boolean(s));
+export const secretsOf = (env: Env, extra: (string | null | undefined)[] = []): string[] => {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY, env.TSIO_API_KEY, env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, ...extra]) {
+    if (!raw) continue;
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    for (const candidate of trimmed !== raw ? [raw, trimmed] : [raw]) {
+      if (!seen.has(candidate)) {
+        seen.add(candidate);
+        out.push(candidate);
+      }
+    }
+  }
+  return out;
+};
 
 /** The findings file's contents for one run. */
 export function findingsRecord({ env, id, mode, run, result, notTriaged, basis = null, description = null, laneDiagnosis = null, rerun = null }: FindingsFacts): FindingsRecord {

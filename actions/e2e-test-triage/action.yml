@@ -161,6 +161,14 @@ inputs:
     description: Optional comma- or newline-separated substrings prioritizing additional GitHub Actions artifact names to skim
     required: false
     default: ""
+  tsio-api-key:
+    description: "Optional TSIO API key for submitting AI triage verdicts (X-API-Key). Without it, GitHub OIDC (id-token: write) is tried; without either, verdict submission is skipped"
+    required: false
+    default: ""
+  tsio-oidc-audience:
+    description: Optional OIDC audience claim requested when authenticating to TSIO with a GitHub Actions ID token
+    required: false
+    default: mattermost-test-system-io
 outputs:
   published:
     description: Whether triage wrote its verdict to the required status
@@ -240,6 +248,8 @@ runs:
         LANE_START_JOB: ${{ inputs.lane-start-job }}
         ARTIFACT_EVIDENCE: ${{ inputs.artifact-evidence }}
         ARTIFACT_PATTERNS: ${{ inputs.artifact-patterns }}
+        TSIO_API_KEY: ${{ inputs.tsio-api-key }}
+        TSIO_OIDC_AUDIENCE: ${{ inputs.tsio-oidc-audience }}
       run: node "${{ github.action_path }}/dist/index.js"
     # The request for a re-run, for e2e-test-rerun: one marker per lane and attempt, named with the attempt and the
     # attempts the lane allows in all, so the listener acts on this attempt's requests within the lane's limit.
