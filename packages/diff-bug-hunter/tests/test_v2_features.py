@@ -1209,3 +1209,22 @@ def test_sibling_tests_fair_directory_budget_prevents_go_starving_jest_and_works
         "webapp/channels/src/components/panel.test.tsx",
     } <= r_files
     assert sum(len(s["source"].splitlines()) for s in user["sibling_tests_and_helpers"]) <= ctx.MAX_SIBLING_LINES
+
+
+def test_sibling_tests_fall_back_to_setup_helpers_when_no_sibling_relates(tmp_path):
+    # PR 39657: invitation.go has no invitation_test.go and no sibling mentions AcceptInvitation; the package's
+    # mocks_test.go (newMockServer) is what a hunter needs to build the Service. Before: [] and every hunter was EMPTY.
+    wt = tmp_path / "wt"
+    rc = wt / "server/platform/services/remotecluster"
+    rc.mkdir(parents=True)
+    (rc / "invitation.go").write_text("package remotecluster\n\nfunc (rcs *Service) AcceptInvitation() {}\n")
+    (rc / "mocks_test.go").write_text("package remotecluster\n\ntype mockServer struct{}\n\n"
+                                      "func newMockServer(t *testing.T) *mockServer { return &mockServer{} }\n")
+    (rc / "ping_test.go").write_text("package remotecluster\n\nfunc TestPing(t *testing.T) {}\n")
+    res = ctx.sibling_tests(wt, ["server/platform/services/remotecluster/invitation.go"], {"AcceptInvitation"})
+    assert [r["file"] for r in res] == ["server/platform/services/remotecluster/mocks_test.go"]
+    assert "func newMockServer" in res[0]["source"]
+    # a related sibling present: no fallback, unrelated helper files stay out
+    (rc / "invitation_test.go").write_text("package remotecluster\n\nfunc TestAccept(t *testing.T) {}\n")
+    res = ctx.sibling_tests(wt, ["server/platform/services/remotecluster/invitation.go"], {"AcceptInvitation"})
+    assert [r["file"] for r in res] == ["server/platform/services/remotecluster/invitation_test.go"]

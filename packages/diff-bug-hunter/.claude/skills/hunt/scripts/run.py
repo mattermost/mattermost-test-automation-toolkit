@@ -3,11 +3,11 @@
 # See LICENSE.txt for license information.
 """Steps 4-5: run hunter tests, vet on the merge-base, score mutants. Go and Jest adapters.
 
-usage: run.py run <pr> <A|B|A2|R>      3 runs on unmodified PR head (Go with -race); writes run_<tag>.json
-       run.py base <pr> <A|B|A2|R>     the same tests once on the merge-base worktree; writes base_<tag>.json
+usage: run.py run <pr> <A|B|A2|R|V>    1 run on unmodified PR head, failures rerun up to 3 in all (Go with -race); writes run_<tag>.json
+       run.py base <pr> <A|B|A2|R|V>   the same tests once on the merge-base worktree; writes base_<tag>.json
        run.py diff <pr> D              differential recorders (build_requests.py <pr> diff): run on the PR head twice (records
-                                       that differ = NONDETERMINISTIC, dropped) and once on the merge-base, then diff the
-                                       records per (test, input). SAME | DIFF | NONDETERMINISTIC | BASE_UNCOMPILABLE |
+                                       that differ are dropped; too few stable = NONDETERMINISTIC) and on the merge-base (a
+                                       second time only for a DIFF), then diff the stable records per (test, input). SAME | DIFF | NONDETERMINISTIC | BASE_UNCOMPILABLE |
                                        BASE_FAILED | RECORDER_FAILED | NO_RECORDS; writes diff_D.json, diff_D.examples.json
        run.py cover <pr> <A|A2>        each test alone with coverage (no -race); writes run_<tag>.coverage.json: which
                                        changed lines it reaches, VACUOUS if none (then it kills no mutant)
@@ -47,11 +47,13 @@ from ctx import changed_lines, top_blocks
 from hunt_common import (
     InfraError,
     git,
+    git_cmd,
     hunt_dir,
     hunt_lock,
     load_json,
     node_env,
     read_state,
+    read_text_lossy,
     require_disk,
     scratch,
     sh,
@@ -59,6 +61,7 @@ from hunt_common import (
     under,
     write_json,
 )
+from verdicts import Verdict
 
 HUNT_FILE = re.compile(r"^(hunt_hunt[a-z0-9]+_test\.go|hunt_[a-z0-9]+\.test\.tsx?)$")
 RESULT_GO = re.compile(r"^\s*--- (PASS|FAIL|SKIP): (\S+)", re.M)
@@ -282,19 +285,19 @@ def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome,
             if p.returncode != 0 and "=== RUN" in out:
                 # A test started and the binary died before any result line (panic in a goroutine, timeout):
                 # that is a test failure, not an environment problem.
-                got = {f"{d}::{PACKAGE_FAILED}": "FAIL"}
+                got = {f"{d}::{PACKAGE_FAILED}": Verdict.FAIL}
             else:
                 raise InfraError(f"0 tests executed in {pkg} (exit {p.returncode}):\n{out[-2500:]}")
-        elif p.returncode != 0 and "FAIL" not in got.values():
+        elif p.returncode != 0 and Verdict.FAIL not in got.values():
             # e.g. TestMain teardown, a race report or a panic after the last test: the package failed even though no
             # test line says so. Record it instead of reporting PASS.
-            got[f"{d}::{PACKAGE_FAILED}"] = "FAIL"
+            got[f"{d}::{PACKAGE_FAILED}"] = Verdict.FAIL
         into.results.update(got)
-        into.packages[d] = "PASS" if p.returncode == 0 else "FAIL"
+        into.packages[d] = Verdict.PASS if p.returncode == 0 else Verdict.FAIL
         for name, block in go_test_output(out).items():
-            if got.get(f"{d}::{name}") == "FAIL":
+            if got.get(f"{d}::{name}") == Verdict.FAIL:
                 into.messages[f"{d}::{name}"] = normalize_failure(block, wt)
-        if got.get(f"{d}::{PACKAGE_FAILED}") == "FAIL":
+        if got.get(f"{d}::{PACKAGE_FAILED}") == Verdict.FAIL:
             into.messages[f"{d}::{PACKAGE_FAILED}"] = normalize_failure(out[-4000:], wt)
         into.log += out
 
@@ -308,13 +311,39 @@ def go_compiles(wt: Path, file: str) -> str | None:
 
 # ---------------------------------------------------------------- Jest
 
+JEST_CONFIGS = ("jest.config.js", "jest.config.ts", "jest.config.cjs", "jest.config.mjs")
+# Mattermost's webapp/platform/* packages (types, client, components) have no jest config of their own; the channels
+# config maps @mattermost/<pkg> to webapp/platform/<pkg>/src, so a test there runs under it.
+JEST_FALLBACK_ROOT = "webapp/channels"
+
+
 def jest_root(wt: Path, rel: str) -> Path:
     p = (wt / rel).resolve().parent
     while p != wt.resolve().parent:
-        if any((p / n).exists() for n in ("jest.config.js", "jest.config.ts", "jest.config.cjs", "jest.config.mjs")):
+        if any((p / n).exists() for n in JEST_CONFIGS):
             return p
         p = p.parent
+    fallback = wt / JEST_FALLBACK_ROOT
+    if Path(rel).parts[:1] == ("webapp",) and any((fallback / n).exists() for n in JEST_CONFIGS):
+        return fallback.resolve()
     raise InfraError(f"no jest.config above {rel}")
+
+
+def jest_pkg_dir(wt: Path, rel: str, root: Path) -> Path | None:
+    """For a test outside its config's rootDir (the fallback): the nearest package.json dir above it, else its dir."""
+    f = (wt / rel).resolve()
+    if f.is_relative_to(root.resolve()):
+        return None
+    p = f.parent
+    while p != wt.resolve() and not (p / "package.json").exists():
+        p = p.parent
+    return p if p != wt.resolve() else f.parent
+
+
+def jest_roots_args(wt: Path, rel: str, root: Path) -> list[str]:
+    """Jest only finds test files under `roots` (default: rootDir), so a fallback-run test adds its package dir."""
+    pkg = jest_pkg_dir(wt, rel, root)
+    return [] if pkg is None else ["--roots", str(root.resolve()), "--roots", str(pkg)]
 
 
 def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
@@ -326,12 +355,12 @@ def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
             # --runTestsByPath: a bare path is a regex and would also run e.g. src/packages/.../actions/hunt_a.test.tsx
             # --ci=false: Jest turns --ci on by itself when CI is set, and then a test whose snapshot is missing fails
             # instead of writing one (removed after the run). Verdicts must not depend on where the hunt runs.
-            p = sh(["npx", "jest", "--runTestsByPath", _rel(wt, rel, root), "--watchAll=false", "--ci=false",
-                    "--json", f"--outputFile={out}"],
+            p = sh(["npx", "jest", *jest_roots_args(wt, rel, root), "--runTestsByPath", _rel(wt, rel, root),
+                    "--watchAll=false", "--ci=false", "--json", f"--outputFile={out}"],
                    root, check=False, timeout=1200, env=node_env())
             if not out.exists():
                 raise InfraError(f"jest wrote no results for {rel}:\n{(p.stdout + p.stderr)[-2500:]}")
-            data = json.loads(out.read_text())
+            data = json.loads(read_text_lossy(out))
         for f in data.get("testResults", []):
             if not f.get("assertionResults"):
                 if f.get("message"):
@@ -344,19 +373,19 @@ def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
                 found += 1
                 # file + full name: equal titles in two describe blocks or files never overwrite each other
                 key = f"{rel}::{a.get('fullName') or a['title']}"
-                status = {"passed": "PASS", "failed": "FAIL"}.get(a["status"], "SKIP")
-                if status == "FAIL":
+                status = {"passed": Verdict.PASS, "failed": Verdict.FAIL}.get(a["status"], Verdict.SKIP)
+                if status == Verdict.FAIL:
                     file_failed = True
                 into.results[key] = status
                 failures = a.get("failureMessages") or []
                 if failures:
                     into.messages[key] = normalize_failure("\n".join(failures), wt)
                     into.log += "\n".join(failures) + "\n"
-            into.packages[rel] = "FAIL" if f.get("status") == "failed" else "PASS"
+            into.packages[rel] = Verdict.FAIL if f.get("status") == "failed" else Verdict.PASS
             if f.get("status") == "failed" and not file_failed and found:
                 # e.g. afterAll threw or an unhandled error hit after passing assertions
                 pkey = f"{rel}::{PACKAGE_FAILED}"
-                into.results[pkey] = "FAIL"
+                into.results[pkey] = Verdict.FAIL
                 msg = f.get("message") or f"{rel}: Jest suite failed after assertions passed"
                 into.messages[pkey] = normalize_failure(msg, wt)
                 into.log += msg + "\n"
@@ -389,14 +418,14 @@ def compiles(wt: Path, file: str) -> str | None:
     return go_compiles(wt, file) if file.endswith(".go") else jest_compiles(wt, file)
 
 
-def classify(statuses: list[str]) -> str:
-    if all(x == "PASS" for x in statuses):
-        return "PASS"
-    if all(x == "FAIL" for x in statuses):
-        return "FAIL_3_OF_3"
-    if all(x == "SKIP" for x in statuses):
-        return "SKIP"
-    return "FLAKY"
+def classify(statuses: list[str]) -> Verdict:
+    if all(x == Verdict.PASS for x in statuses):
+        return Verdict.PASS
+    if all(x == Verdict.FAIL for x in statuses):
+        return Verdict.FAIL_3_OF_3
+    if all(x == Verdict.SKIP for x in statuses):
+        return Verdict.SKIP
+    return Verdict.FLAKY
 
 
 def fingerprint(files: list[dict[str, str]]) -> str:
@@ -419,7 +448,7 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
     # Keep compile_<tag>.log as the audit record of any prior repair round (compute_verdicts checks run_R freshness).
     for stale in (f"run_{tag}.json", f"run_{tag}.messages.json", f"run_{tag}.runtimes.json",
                   f"run_{tag}.coverage.json", f"run_{tag}.response.sha256",
-                  f"base_{tag}.json", f"base_{tag}.response.sha256"):
+                  f"base_{tag}.json", f"base_{tag}.errors.json", f"base_{tag}.response.sha256"):
         (hdir / stale).unlink(missing_ok=True)
     if not files:  # e.g. a Mode B hunter for a PR whose description promises nothing testable
         write_json(hdir / f"run_{tag}.json", {})
@@ -432,15 +461,30 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
         cmd_fuzz(hdir, state, tag)
         files = load_json(hdir / tag / "response.json")["files"]
     placed: list[Path] = []
-    outcomes = []
+    outcomes: list[Outcome] = []
+    statuses: dict[str, list[str]] = {}  # identity -> one status per run that executed it
     try:
         placed = place(wt, files, target_dirs_for(hdir, state, tag))
-        for _ in range(runs):
-            outcomes.append(run_suite(wt, suite_for(tag, state, placed, wt), race=True))
+        full = suite_for(tag, state, placed, wt)
+        first = run_suite(wt, full, race=True)
+        outcomes.append(first)
+        for n, st in first.results.items():
+            statuses[n] = [st]
+        # Lazy confirmation (C2): a test that did not fail on the first run is not run again. Only the failures are
+        # rerun, up to `runs` runs in all; a rerun that passes ends that test's reruns (it is FLAKY).
+        failing = {n for n, st in first.results.items() if st == Verdict.FAIL}
+        for _ in range(runs - 1):
+            suite = _filter_base_suite(full, failing, {}) if failing else Suite()
+            if suite.empty():
+                break
+            o = run_suite(wt, suite, race=True)
+            outcomes.append(o)
+            for n in failing:
+                statuses[n].append(o.results.get(n, Verdict.MISSING))
+            failing = {n for n in failing if o.results.get(n) == Verdict.FAIL}
     finally:
         unplace(placed)
-    names = sorted(set().union(*(o.results for o in outcomes)))
-    table = {n: classify([o.results.get(n, "MISSING") for o in outcomes]) for n in names}
+    table = {n: classify(statuses[n]) for n in sorted(statuses)}
     write_json(hdir / f"run_{tag}.json", table)
     write_json(hdir / f"run_{tag}.messages.json", outcomes[0].messages)
     runtimes = {d: max(o.runtimes[d] for o in outcomes if d in o.runtimes)
@@ -583,35 +627,59 @@ def jest_missing(msg: str) -> list[str]:
 
 def base_verdict(name: str, base_status: str, head: dict[str, str], head_msgs: dict[str, str], base_msg: str) -> str:
     """Only a test that failed 3/3 on head gets a bug verdict; anything else is labelled as not a failure."""
-    if head.get(name) != "FAIL_3_OF_3":
-        return "NOT_A_HEAD_FAILURE"
-    if base_status == "PASS":
-        return "NEW_PR_BUG"
-    if base_status != "FAIL":
+    if head.get(name) != Verdict.FAIL_3_OF_3:
+        return Verdict.NOT_A_HEAD_FAILURE
+    if base_status == Verdict.PASS:
+        return Verdict.NEW_PR_BUG
+    if base_status != Verdict.FAIL:
         return base_status
     if name in head_msgs and head_msgs[name] == base_msg:
-        return "PRE_EXISTING"
+        return Verdict.PRE_EXISTING
     if MISSING_ON_BASE.search(base_msg):
         # Jest (Babel, no type check) loads a test of a function the PR adds; on base it fails as "not a function".
-        return "NEW_API"
-    return "BASE_FAILS_DIFFERENTLY"  # decide from the diff, as for BASE_UNCOMPILABLE
+        return Verdict.NEW_API
+    return Verdict.BASE_FAILS_DIFFERENTLY  # decide from the diff, as for BASE_UNCOMPILABLE
 
 
 def base_table(head: dict[str, str], head_msgs: dict[str, str], o: Outcome) -> dict[str, str]:
     """One verdict per test the base run reported, plus one for every head failure it did not report."""
     out = {n: base_verdict(n, s, head, head_msgs, o.messages.get(n, "")) for n, s in o.results.items()}
     for n, status in head.items():
-        if status == "FAIL_3_OF_3" and n not in o.results:
+        if status == Verdict.FAIL_3_OF_3 and n not in o.results:
             # No result line for it on base. A package-level failure (teardown, a late race or panic) on head is new
             # if the same package exited cleanly on base; otherwise the package died on base or the test is absent.
             pkg = o.packages.get(n.split("::", 1)[0])
-            if n.endswith(f"::{PACKAGE_FAILED}") and pkg == "PASS":
-                out[n] = "NEW_PR_BUG"
-            elif pkg == "FAIL" or o.results.get(n.split("::", 1)[0] + f"::{PACKAGE_FAILED}") == "FAIL":
-                out[n] = "BASE_FAILS_DIFFERENTLY"
+            if n.endswith(f"::{PACKAGE_FAILED}") and pkg == Verdict.PASS:
+                out[n] = Verdict.NEW_PR_BUG
+            elif pkg == Verdict.FAIL or o.results.get(n.split("::", 1)[0] + f"::{PACKAGE_FAILED}") == Verdict.FAIL:
+                out[n] = Verdict.BASE_FAILS_DIFFERENTLY
             else:
-                out[n] = "NOT_RUN_ON_BASE"
+                out[n] = Verdict.NOT_RUN_ON_BASE
     return out
+
+
+def _on_head(wt_head: Path, name: str) -> bool:
+    """True when `name` appears in a tracked file of the (clean) PR-head worktree. A name the base compiler calls
+    undefined and the head tree mentions is a symbol the PR adds."""
+    p = sh(git_cmd("grep", "-q", "-w", "-F", "-e", name), wt_head, check=False)
+    return p.returncode == 0
+
+
+def go_pr_added_names(wt_head: Path, errors: str) -> list[str] | None:
+    """A8: the identifiers a Go build failure on the merge-base leaves undefined, when EVERY error is an undefined
+    name (an import left unused does not count) and every such name exists on the PR head. None otherwise: another
+    kind of error, or a name the PR did not add, means the failure is not explained by a new API."""
+    msgs = [m.group(3).strip() for m in GO_ERROR.finditer(errors)]
+    msgs = [m for m in msgs if not GO_UNUSED_IMPORT.match(m)]
+    if not msgs:
+        return None
+    names: set[str] = set()
+    for m in msgs:
+        found = undefined_names(m)
+        if not found:
+            return None
+        names |= {x.split(".")[-1] for x in found}
+    return sorted(names) if all(_on_head(wt_head, n) for n in names) else None
 
 
 def _unit_key(rel: str) -> str:
@@ -636,9 +704,11 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     rejects is cut from the placed copy and the rest is vetted; a Jest test that fails as "not a function"); the
     undefined names are in the "new_api" key. It is not a bug by itself: root-cause it. BASE_UNCOMPILABLE ("*": nothing
     could be salvaged) / BASE_FAILS_DIFFERENTLY / NOT_RUN_ON_BASE: decide from the diff. NOT_A_HEAD_FAILURE: nothing
-    to vet."""
+    to vet. A build failure whose every error names only symbols the PR adds is NEW_API too (A8); any other build failure
+    is BASE_UNCOMPILABLE per test, with every error kept in base_<tag>.errors.json ({unit: error text})."""
     wt = Path(state["wt_base"])
     ensure_clean(wt)
+    (hdir / f"base_{tag}.errors.json").unlink(missing_ok=True)
     files = load_json(hdir / tag / "response.json")["files"]
     if not (hdir / f"run_{tag}.json").exists():
         raise InfraError(f"run_{tag}.json missing: run `run.py run <pr> {tag}` before `base`")
@@ -652,11 +722,11 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
                  if (hdir / f"run_{tag}.messages.json").exists() else {})
     runtimes_path = hdir / f"run_{tag}.runtimes.json"
     go_timeouts = timeout_caps(load_json(runtimes_path)) if runtimes_path.exists() else None
-    failing = {n for n, v in head.items() if v == "FAIL_3_OF_3"}
-    out: dict[str, Any] = {n: "NOT_A_HEAD_FAILURE" for n in head if n not in failing}
+    failing = {n for n, v in head.items() if v == Verdict.FAIL_3_OF_3}
+    out: dict[str, Any] = {n: Verdict.NOT_A_HEAD_FAILURE for n in head if n not in failing}
     approved_dirs = target_dirs_for(hdir, state, tag)
     new_api: dict[str, list[str]] = {}
-    uncompilable: list[tuple[str, set[str], str]] = []
+    uncompilable: list[tuple[str, set[str], str, list[str] | None]] = []  # unit, failing tests, error, PR-added names
     any_ran = False
     units = _failing_base_units(files, failing) if files and failing else []
     for unit_key, unit_files, unit_failing in units:
@@ -667,32 +737,42 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
             out.update(base_table({n: head[n] for n in unit_failing}, head_msgs, o))
             for n, idents in gone.items():  # removed from the base copies: vetted by what head said about them
                 if n in unit_failing:
-                    out[n] = "NEW_API"
+                    out[n] = Verdict.NEW_API
                     new_api[n] = idents
             for n in unit_failing:
-                if out.get(n) == "NEW_API" and n not in new_api:  # Jest: the failure text names what is missing
+                if out.get(n) == Verdict.NEW_API and n not in new_api:  # Jest: the failure text names what is missing
                     new_api[n] = jest_missing(o.messages.get(n, ""))
             any_ran = True
         except CompileError as e:
-            uncompilable.append((unit_key, unit_failing, str(e)))
+            err, added = str(e), None
+            if isinstance(e, GoBuildError):  # the full error list: the message keeps only the tail of a long one
+                err_full = go_build_errors(wt, e.pkg_dir)
+                added = go_pr_added_names(Path(state["wt"]), err_full)
+                err = f"{err[:200]}\n...\n{err_full}" if err_full.strip() else err
+            uncompilable.append((unit_key, unit_failing, err, added))
         finally:
             unplace(placed)
     if uncompilable:
-        if not any_ran:
-            out = {"*": "BASE_UNCOMPILABLE", "detail": uncompilable[-1][2][-800:]}
-        else:
-            details: list[str] = []
-            for unit_key, unit_failing, err in uncompilable:
-                is_missing = bool(MISSING_ON_BASE.search(err))
-                for n in sorted(unit_failing):
-                    out[n] = "NEW_API" if is_missing else "BASE_UNCOMPILABLE"
-                    if is_missing:
-                        new_api[n] = jest_missing(err)
-                if not is_missing:
-                    details.append(f"{unit_key}: {err[-300:]}")
-            if details:
-                out["detail"] = "\n".join(details)[-800:]
-    if new_api and "*" not in out:
+        details: list[str] = []
+        evidence: dict[str, str] = {}
+        for unit_key, unit_failing, err, added in uncompilable:
+            is_missing = bool(MISSING_ON_BASE.search(err))
+            evidence[unit_key] = err[-6000:]
+            for n in sorted(unit_failing):
+                if added or is_missing:
+                    out[n] = Verdict.NEW_API
+                    new_api[n] = added or jest_missing(err)
+                else:
+                    out[n] = Verdict.BASE_UNCOMPILABLE
+            if not (added or is_missing):
+                details.append(f"{unit_key}: {err[-300:]}")
+        if details:
+            out["detail"] = "\n".join(details)[-800:]
+        if not any_ran and failing and all(out.get(n) == Verdict.BASE_UNCOMPILABLE for n in failing):
+            out["*"] = Verdict.BASE_UNCOMPILABLE  # nothing could be salvaged: the file-wide verdict
+            out["detail"] = uncompilable[-1][2][-800:]
+        write_json(hdir / f"base_{tag}.errors.json", evidence)
+    if new_api:
         out["new_api"] = new_api
     write_json(hdir / f"base_{tag}.json", out)
     (hdir / f"base_{tag}.response.sha256").write_text(digest)
@@ -702,6 +782,9 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
 # ---------------------------------------------------------------- differential recorders (Mode D)
 
 DIFF_EXAMPLES = 5
+# A recorder whose two head runs agree on fewer records than this (or on fewer than all of them, when it wrote fewer)
+# is NONDETERMINISTIC: too little stable evidence to compare. Records that differ between the runs are dropped.
+MIN_STABLE_RECORDS = 3
 NO_RECORD = "<no record>"
 TARGET_MISSING = re.compile(r"target missing", re.I)
 
@@ -726,7 +809,7 @@ def read_records(path: Path) -> dict[str, dict[int, dict[str, Any]]]:
     out: dict[str, dict[int, dict[str, Any]]] = {}
     if not path.exists():
         return out
-    for line in path.read_text().splitlines():
+    for line in read_text_lossy(path).splitlines():
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
@@ -752,6 +835,11 @@ def record_name(identity: str) -> str:
 def _json_eq(a: Any, b: Any) -> bool:
     """Compare decoded JSON values strictly by JSON type/structure (unlike Python's == where True == 1)."""
     return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
+def stable_indices(x: dict[int, dict[str, Any]], y: dict[int, dict[str, Any]]) -> set[int]:
+    """The record indices two runs of one recorder agree on (written by both, equal)."""
+    return {i for i in set(x) | set(y) if _json_eq(x.get(i), y.get(i))}
 
 
 def diff_records(head: dict[int, dict[str, Any]], base: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -815,11 +903,58 @@ def _diff_unit_pass(
     return merged, recs, errors, gone, raw_lines
 
 
+def _confirm_diff_on_base(
+    wt_base: Path, state: dict[str, Any], tag: str, by_unit: dict[str, list[dict[str, str]]], targets: set[str],
+    pending: list[tuple[str, str, tuple[str, str], dict[int, dict[str, Any]], set[int],
+                        dict[int, dict[str, Any]], set[int]]],
+    verdicts: dict[str, str], detail: dict[str, Any],
+) -> None:
+    """R5: rerun the merge-base once, only for the units that hold a DIFF recorder, and keep the DIFF only on records
+    the two base runs agree on. A DIFF whose every differing record is unstable on base becomes NONDETERMINISTIC; a
+    unit that cannot be rerun keeps its first-run verdict."""
+    units = sorted({u for _, u, *_ in pending})
+    placed_all: list[Path] = []
+    unit_paths: list[tuple[str, list[Path]]] = []
+    try:
+        for u in units:
+            up = place(wt_base, by_unit[u], targets)
+            placed_all.extend(up)
+            unit_paths.append((u, up))
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                _, recs2, errors2, _, _ = _diff_unit_pass(wt_base, state, tag, unit_paths, Path(td), "base2",
+                                                          base=True)
+            except InfraError:  # the rerun could not run: every pending DIFF keeps its first-run verdict
+                recs2, errors2 = {}, dict.fromkeys(units, "base rerun failed")
+    finally:
+        unplace(placed_all)
+    for ident, u_key, rkey, a, stable, base1, cmp_idx in pending:
+        if u_key in errors2 or rkey not in recs2:
+            detail[ident]["base_rerun"] = "not available; DIFF from one base run"
+            continue
+        base2 = recs2[rkey]
+        base_ok = stable_indices(base1, base2)
+        keep = {i for i in cmp_idx if i in base_ok or (i not in base1 and i not in base2)}
+        unstable = len(cmp_idx - keep)
+        diffs = diff_records({i: a[i] for i in stable if i in keep}, {i: r for i, r in base1.items() if i in keep})
+        if diffs:
+            detail[ident].update({"differing": len(diffs), "compared": len(keep), "examples": diffs[:DIFF_EXAMPLES]})
+        else:  # every differing record changed between the two base runs: no stable evidence
+            verdicts[ident] = Verdict.NONDETERMINISTIC
+            detail[ident] = {"detail": f"the {detail[ident]['differing']} differing record(s) are not stable between two "
+                                       "runs on the merge-base; dropped", "dropped": unstable}
+            continue
+        if unstable:
+            detail[ident]["dropped"] = detail[ident].get("dropped", 0) + unstable
+
+
 def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str]:
     """Run the Mode D recorders on the PR head (twice) and on the merge-base (once), then compare their records.
     The model wrote the inputs and the recorder; code decides: SAME (all records equal), DIFF (some differ: up to
-    DIFF_EXAMPLES smallest examples per test in diff_D.examples.json), NONDETERMINISTIC (the two head runs disagree: the
-    test's records are dropped), BASE_UNCOMPILABLE (that test cannot build or load on the merge-base because it uses
+    DIFF_EXAMPLES smallest examples per test in diff_D.examples.json), NONDETERMINISTIC (fewer than MIN_STABLE_RECORDS
+    records agree between the two head runs, or a DIFF whose records are all unstable between two base runs). Records
+    that differ between the two head runs are dropped from the comparison and counted in "dropped"; a DIFF is rerun
+    once on the merge-base, for its units only, and kept on the records both base runs agree on, BASE_UNCOMPILABLE (that test cannot build or load on the merge-base because it uses
     something the PR adds), BASE_FAILED, RECORDER_FAILED (failed on head), NO_RECORDS (passed but wrote nothing)."""
     if tag != "D":
         raise InfraError(f"diff is for the Mode D tag (D), not {tag}")
@@ -883,44 +1018,57 @@ def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str
 
         (hdir / f"diff_{tag}.head.jsonl").write_text("".join(head_raw))
         (hdir / f"diff_{tag}.base.jsonl").write_text("".join(base_raw))
+    pending_diff: list[tuple[str, str, tuple[str, str], dict[int, dict[str, Any]], set[int],
+                             dict[int, dict[str, Any]], set[int]]] = []
     for ident in sorted(set(runs[0].results) | set(runs[1].results)):
         u_key = ident.split("::", 1)[0]
         rkey = (u_key, record_name(ident))
-        statuses = [r.results.get(ident, "MISSING") for r in runs]
+        statuses = [r.results.get(ident, Verdict.MISSING) for r in runs]
         a, b = head_recs[0].get(rkey, {}), head_recs[1].get(rkey, {})
-        if any(s != "PASS" for s in statuses):
-            verdicts[ident] = "RECORDER_FAILED"
+        stable = stable_indices(a, b)
+        if any(s != Verdict.PASS for s in statuses):
+            verdicts[ident] = Verdict.RECORDER_FAILED
             msg = runs[0].messages.get(ident) or runs[1].messages.get(ident, "")
             detail[ident] = {"detail": f"head runs: {statuses}; {normalize_failure(msg, wt)[-600:]}"}
         elif not a and not b:
-            verdicts[ident] = "NO_RECORDS"
-        elif not _json_eq(a, b):
-            verdicts[ident] = "NONDETERMINISTIC"
+            verdicts[ident] = Verdict.NO_RECORDS
+        elif len(stable) < min(MIN_STABLE_RECORDS, len(set(a) | set(b))) or not stable:
+            verdicts[ident] = Verdict.NONDETERMINISTIC
             keys = set(a) | set(b)
-            detail[ident] = {"detail": f"{len([i for i in keys if not _json_eq(a.get(i), b.get(i))])} of {len(keys)} records differ "
-                                       "between two runs on the PR head; dropped"}
+            detail[ident] = {"detail": f"{len(keys) - len(stable)} of {len(keys)} records differ between two runs on the "
+                                       f"PR head; only {len(stable)} stable (need {MIN_STABLE_RECORDS}); dropped",
+                             "dropped": len(keys) - len(stable)}
         elif u_key in base_errors:
-            verdicts[ident] = "BASE_UNCOMPILABLE"
+            verdicts[ident] = Verdict.BASE_UNCOMPILABLE
             detail[ident] = {"detail": base_errors[u_key]}
         elif ident in gone:
-            verdicts[ident] = "BASE_UNCOMPILABLE"
+            verdicts[ident] = Verdict.BASE_UNCOMPILABLE
             detail[ident] = {"detail": "undefined on the merge-base: " + ", ".join(gone[ident])}
         else:
-            status = base.results.get(ident, "MISSING")
+            status = base.results.get(ident, Verdict.MISSING)
             msg = base.messages.get(ident, "")
-            if status != "PASS":
+            if status != Verdict.PASS:
                 missing = MISSING_ON_BASE.search(msg) or TARGET_MISSING.search(msg)
-                verdicts[ident] = "BASE_UNCOMPILABLE" if missing else "BASE_FAILED"
+                verdicts[ident] = Verdict.BASE_UNCOMPILABLE if missing else Verdict.BASE_FAILED
                 detail[ident] = {"detail": f"base run: {status}; {normalize_failure(msg, wt_base)[-600:]}"}
             elif not base_recs.get(rkey):
-                verdicts[ident] = "BASE_FAILED"
+                verdicts[ident] = Verdict.BASE_FAILED
                 detail[ident] = {"detail": "the recorder passed on the merge-base but wrote no records"}
             else:
-                diffs = diff_records(a, base_recs[rkey])
-                verdicts[ident] = "DIFF" if diffs else "SAME"
+                # Compare only what is stable on head, plus indices only the base wrote (the head never did).
+                head_keys = set(a) | set(b)
+                cmp_idx = stable | (set(base_recs[rkey]) - head_keys)
+                dropped = len(head_keys) - len(stable)
+                diffs = diff_records({i: a[i] for i in stable}, {i: r for i, r in base_recs[rkey].items() if i in cmp_idx})
+                verdicts[ident] = Verdict.DIFF if diffs else Verdict.SAME
                 if diffs:
-                    detail[ident] = {"differing": len(diffs), "compared": len(set(a) | set(base_recs[rkey])),
+                    detail[ident] = {"differing": len(diffs), "compared": len(cmp_idx),
                                      "examples": diffs[:DIFF_EXAMPLES]}
+                    pending_diff.append((ident, u_key, rkey, a, stable, base_recs[rkey], cmp_idx))
+                if dropped:
+                    detail.setdefault(ident, {})["dropped"] = dropped
+    if pending_diff:
+        _confirm_diff_on_base(wt_base, state, tag, by_unit, targets, pending_diff, verdicts, detail)
     write_json(hdir / f"diff_{tag}.json", verdicts)
     write_json(hdir / f"diff_{tag}.examples.json", detail)
     return verdicts
@@ -938,12 +1086,12 @@ def all_mutants(hdir: Path) -> list[dict[str, Any]]:
 
 
 def is_kill(name: str, status: str, base: Outcome) -> bool:
-    if status != "FAIL":
+    if status != Verdict.FAIL:
         return False
     if name.endswith(f"::{PACKAGE_FAILED}"):
         # A package-level failure kills only if the baseline run of that package was observed to exit cleanly.
-        return base.packages.get(name.split("::", 1)[0]) == "PASS"
-    return base.results.get(name) == "PASS"
+        return base.packages.get(name.split("::", 1)[0]) == Verdict.PASS
+    return base.results.get(name) == Verdict.PASS
 
 
 def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: Outcome,
@@ -952,25 +1100,25 @@ def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: Outcome,
                          "what_breaks": m["what_breaks"], "killers": [], "mutant": m}
     # A mutant that cannot be applied as written goes back to a planter (regen), like one that does not compile.
     if m["file"] not in state["changed"]:
-        return {**v, "verdict": "NEEDS_REGENERATION", "detail": f"{m['file']} is not one of the hunted files {state['changed']}"}
+        return {**v, "verdict": Verdict.NEEDS_REGENERATION, "detail": f"{m['file']} is not one of the hunted files {state['changed']}"}
     path = under(wt, m["file"])
     orig = path.read_text()
     if orig.count(m["old"]) != 1:
-        return {**v, "verdict": "NEEDS_REGENERATION",
+        return {**v, "verdict": Verdict.NEEDS_REGENERATION,
                 "detail": f"`old` occurs {orig.count(m['old'])} times in {m['file']}; it must occur exactly once"}
     try:
         path.write_text(orig.replace(m["old"], m["new"], 1))
         try:
             err = compiles(wt, m["file"])
             if err:
-                return {**v, "verdict": "NEEDS_REGENERATION", "detail": err}
+                return {**v, "verdict": Verdict.NEEDS_REGENERATION, "detail": err}
             r = run_suite(wt, suite, race=False, go_timeouts=mutant_timeouts(base)).results
         except CompileError as e:
-            return {**v, "verdict": "NEEDS_REGENERATION", "detail": str(e)[-1500:]}
+            return {**v, "verdict": Verdict.NEEDS_REGENERATION, "detail": str(e)[-1500:]}
         except InfraError as e:  # one mutant's environment failure (a compile-check timeout too) loses no other verdict
-            return {**v, "verdict": "ERROR", "detail": str(e)[-1500:]}
+            return {**v, "verdict": Verdict.ERROR, "detail": str(e)[-1500:]}
         killers = sorted(n for n, s in r.items() if is_kill(n, s, base) and n not in vacuous)
-        return {**v, "verdict": "KILLED" if killers else "SURVIVED", "killers": killers}
+        return {**v, "verdict": Verdict.KILLED if killers else Verdict.SURVIVED, "killers": killers}
     finally:
         path.write_text(orig)
 
@@ -989,7 +1137,7 @@ def cmd_mutants(hdir: Path, state: dict[str, Any], tag: str) -> list[dict[str, A
         suite = suite_for(tag, state, placed, wt)
         if suite.empty():  # the PR (or the hunter) has no tests in the hunted packages: nothing can kill a mutant
             verdicts = [{"id": m["id"], "held_back": m["held_back"], "file": m["file"], "what_breaks": m["what_breaks"],
-                         "killers": [], "mutant": m, "verdict": "SURVIVED", "detail": "no tests to score"}
+                         "killers": [], "mutant": m, "verdict": Verdict.SURVIVED, "detail": "no tests to score"}
                         for m in all_mutants(hdir)]
         else:
             base = run_suite(wt, suite, race=False)
@@ -1099,11 +1247,14 @@ def go_test_coverage(wt: Path, d: str, name: str, changed: dict[str, set[int]],
 def jest_test_coverage(wt: Path, rel: str, full_name: str,
                        changed: dict[str, set[int]]) -> dict[str, tuple[set[int], set[int]]] | None:
     root = jest_root(wt, rel)
-    js_files = [f for f in changed if re.search(r"\.[jt]sx?$", f) and (wt / f).resolve().is_relative_to(root.resolve())]
+    pkg = jest_pkg_dir(wt, rel, root)
+    js_files = [f for f in changed if re.search(r"\.[jt]sx?$", f)
+                and any((wt / f).resolve().is_relative_to(d.resolve()) for d in (root, pkg) if d is not None)]
     if not js_files:
         return {}
     with tempfile.TemporaryDirectory() as td:
-        args = ["npx", "jest", "--runTestsByPath", _rel(wt, rel, root), "--watchAll=false", "--ci=false",
+        args = ["npx", "jest", *jest_roots_args(wt, rel, root), "--runTestsByPath", _rel(wt, rel, root),
+                "--watchAll=false", "--ci=false",
                 "-t", f"^{js_regex_escape(full_name)}$", "--coverage", "--coverageReporters=json",
                 f"--coverageDirectory={td}"]
         for f in js_files:
@@ -1128,12 +1279,12 @@ def cover_table(changed: dict[str, set[int]],
     reached: dict[str, set[int]] = {f: set() for f in changed}
     for name, cov in per_test.items():
         if cov is None:
-            tests[name] = {"verdict": "UNKNOWN", "hit": {}}  # no profile (a crash): never dropped on missing data
+            tests[name] = {"verdict": Verdict.UNKNOWN, "hit": {}}  # no profile (a crash): never dropped on missing data
             continue
         hit = {f: sorted(h & executable[f]) for f, (_, h) in cov.items() if h & executable[f]}
         for f, lines in hit.items():
             reached[f] |= set(lines)
-        tests[name] = {"verdict": "REACHES" if hit else "VACUOUS", "hit": hit}
+        tests[name] = {"verdict": Verdict.REACHES if hit else Verdict.VACUOUS, "hit": hit}
     total = sum(len(v) for v in executable.values())
     return {"tests": tests, "reached": sum(len(v) for v in reached.values()), "executable": total,
             "unreached": {f: sorted(executable[f] - reached[f]) for f in changed if executable[f] - reached[f]}}
@@ -1184,7 +1335,7 @@ def vacuous_tests(hdir: Path, tag: str) -> set[str]:
     p = hdir / f"run_{tag}.coverage.json"
     if not p.exists():
         return set()
-    return {n for n, t in load_json(p)["tests"].items() if t["verdict"] == "VACUOUS" and t.get("head") != "FAIL_3_OF_3"}
+    return {n for n, t in load_json(p)["tests"].items() if t["verdict"] == Verdict.VACUOUS and t.get("head") != Verdict.FAIL_3_OF_3}
 
 
 # ---------------------------------------------------------------- Go fuzzing (discovery only; HUNT_FUZZ=0 turns it off)
@@ -1279,7 +1430,7 @@ def cmd_fuzz(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
                         "./" + _rel(wt, d, root)], root, check=False, timeout=1800)
                 entries = sorted(corpus.glob("*")) if corpus.is_dir() else []
                 if p.returncode == 0:
-                    report["targets"][name] = "PASS"
+                    report["targets"][name] = Verdict.PASS
                 elif not entries:
                     out = p.stdout + p.stderr
                     if "[build failed]" in out or "[setup failed]" in out:
@@ -1345,7 +1496,8 @@ def main(argv: list[str]) -> int:
                 info = load_json(hdir / f"diff_{tag}.examples.json")
                 for n, verdict in verdicts.items():
                     d = info.get(n, {})
-                    count = f" ({d['differing']} of {d['compared']} inputs differ)" if verdict == "DIFF" else ""
+                    count = f" ({d['differing']} of {d['compared']} inputs differ)" if verdict == Verdict.DIFF else ""
+                    count += f" [{d['dropped']} unstable record(s) dropped]" if d.get("dropped") else ""
                     print(f"[{tag} diff] {n}: {verdict}{count}" + (f" {d['detail'][:300]}" if "detail" in d else ""))
                     for ex in d.get("examples", []):
                         print(f"    input: {json.dumps(ex['input'], sort_keys=True)[:300]}")

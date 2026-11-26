@@ -54,7 +54,7 @@ def test_a_helper_the_base_rejects_takes_its_callers_with_it(tmp_path):
     _clean(state)
 
 
-def test_nothing_salvageable_keeps_the_file_wide_verdict(tmp_path):
+def test_unsalvageable_file_whose_errors_name_only_pr_added_symbols_is_new_api(tmp_path):
     hdir, state = make_hunt(tmp_path, "go_newapi")
     src = json.loads((hdir / "A" / "response.json").read_text())
     # an error outside any func (a package-level var using the new API) cannot be cut out of one test
@@ -62,7 +62,9 @@ def test_nothing_salvageable_keeps_the_file_wide_verdict(tmp_path):
     (hdir / "A" / "response.json").write_text(json.dumps(src))
     run.cmd_run(hdir, state, "A")
     out = run.cmd_base(hdir, state, "A")
-    assert out["*"] == "BASE_UNCOMPILABLE" and "ClampAll" in out["detail"] and "new_api" not in out
+    # A8: every error names ClampAll, which the PR adds, so each failing test is NEW_API instead of file-wide uncompilable
+    assert "*" not in out and out["calc::TestHuntA_ClampAllClamps"] == "NEW_API"
+    assert out["new_api"]["calc::TestHuntA_ClampAllClamps"] == ["ClampAll"]
     _clean(state)
 
 
@@ -70,7 +72,7 @@ def test_salvage_stops_after_three_rounds_of_removals(tmp_path, monkeypatch):
     hdir, state = make_hunt(tmp_path, "go_newapi")
     run.cmd_run(hdir, state, "A")
     monkeypatch.setattr(run, "MAX_SALVAGE_ROUNDS", 0)
-    assert run.cmd_base(hdir, state, "A")["*"] == "BASE_UNCOMPILABLE"
+    assert run.cmd_base(hdir, state, "A")["calc::TestHuntA_ClampAllClamps"] == "NEW_API"  # A8: not a file-wide verdict
     _clean(state)
 
 

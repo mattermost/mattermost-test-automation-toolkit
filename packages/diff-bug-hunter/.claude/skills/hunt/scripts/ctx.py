@@ -3,7 +3,7 @@
 # See LICENSE.txt for license information.
 """Step 2: mechanical blind context for one batch of a PR.
 
-usage: ctx.py <pr> [--batch N]
+usage: ctx.py <pr> [--batch N | --all-batches | --first-batch]
 Reads prepare.json, fetches PR title/body over the GitHub REST API, runs the large-diff prefilter, and writes
 ctx.json (what hunters see), state.json (what the runner needs) and skipped.log (every file not hunted, with reason).
 Nothing here is summarised or chosen by a model.
@@ -25,13 +25,20 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import prefilter
-from hunt_common import REPO, InfraError, git, git_cmd, hunt_dir, hunt_lock, sh, write_json
+import reliability
+from hunt_common import REPO, InfraError, git, git_cmd, hunt_dir, hunt_lock, read_text_lossy, sh, write_json
 
 MAX_SOURCE_LINES = 1500     # bigger changed files are shown as windows around the hunks
 MAX_SIBLING_LINES = 3000    # total sibling test lines per batch
-MAX_CALLERS = 40
+MAX_CALLERS = 40            # total caller excerpts, shared fairly between changed symbols
+MAX_HOPS = 3                # caller walk: direct caller plus up to two more hops toward an entry point
+MAX_HOP_GREPS = 24          # repo greps spent on hops 2-3 per batch
+MAX_CHAINS_PER_SYMBOL = 2   # direct callers whose chain is walked, per symbol
+MAX_COUNT_FILES = 25        # files whose caller count feeds the batch ordering
+MAX_COUNT_SYMBOLS = 8
 CALLER_PAD = 6
 MAX_BLOCK_LINES = 90        # one neighbour or merge-base function, clipped
+MAX_PATCH_LINES = 4000      # one file's patch in a hunter request; longer (generated) patches are cut there only
 MAX_LINE_CHARS = 300        # longer lines (generated literals) are cut, so one file cannot flood the context
 MAX_NEIGHBOURS = 2          # unchanged functions shown per changed file
 MAX_NEIGHBOUR_LINES = 1000  # neighbour lines per batch, shared evenly between its files
@@ -55,6 +62,15 @@ def source_view(wt: Path, path: str, patch: str) -> str:
         a, b = max(1, start - 40), min(len(lines), start + n + 40)
         parts.append(numbered(lines, a, b))
     return "\n   ...\n".join(parts)
+
+
+def request_patch(patch: str) -> str:
+    """One file's patch as a hunter sees it: whole up to MAX_PATCH_LINES, then cut with a note. A generated file of
+    tens of thousands of lines would otherwise fill the model's context on its own."""
+    lines = patch.splitlines()
+    if len(lines) <= MAX_PATCH_LINES:
+        return patch
+    return "\n".join(lines[:MAX_PATCH_LINES]) + f"\n[patch cut: {len(lines) - MAX_PATCH_LINES} more lines not shown]"
 
 
 def changed_symbols(patch: str, lang: str) -> set[str]:
@@ -244,9 +260,59 @@ def _emit_sibling_group(
     return used_total
 
 
+GO_SETUP_DECL = re.compile(r"^(?:func (?!(?:Test|Benchmark|Fuzz|Example)[A-Z_(])(?:\([^)]*\) )?\w+\(|type \w+ )", re.M)
+
+
+HELPER_SRC_NAME = re.compile(r"testlib|test_?helpers?|test_?utils?|testutil", re.I)
+MAX_JEST_FALLBACK = 2
+
+
+def setup_fallback(cands: list[Path], helpers: list[Path] | None = None) -> list[tuple[int, Path, list[str]]]:
+    """No sibling ranks 0-2 (no same-name test, none mentions a changed symbol): give the hunter the Go files that
+    declare the package's setup helpers / mock types (e.g. remotecluster's mocks_test.go newMockServer), smallest first,
+    so it can build the service under test. Without them hunters return no tests at all (PR 39657). `helpers` are
+    non-test sources of the same directory (api4/apitestlib.go): prefilter keeps them out of the hunt, but they are
+    where a package's Setup(t) lives, so they count here too."""
+    found: list[tuple[int, Path, list[str]]] = []
+    for p in [*cands, *(helpers or [])]:
+        if not (p.name.endswith("_test.go") or (p.name.endswith(".go") and HELPER_SRC_NAME.search(p.name))):
+            continue
+        body = p.read_text(errors="replace")
+        if GO_SETUP_DECL.search(body):
+            found.append((3, p, body.split("\n")))
+    found.sort(key=lambda item: len(item[2]))
+    return found[:MAX_SECONDARY_SIBLINGS]
+
+
+def helper_sources(d: Path, exclude: set[str], wt: Path) -> list[Path]:
+    """Non-test Go helper sources of a directory (apitestlib.go, testlib.go, test_helper.go), never a changed file."""
+    return sorted(p for p in d.iterdir()
+                  if not p.is_symlink() and p.is_file() and p.name.endswith(".go") and not p.name.endswith("_test.go")
+                  and HELPER_SRC_NAME.search(p.name) and str(p.relative_to(wt)) not in exclude)
+
+
+def jest_fallback(d: Path, exclude: set[str], wt: Path) -> list[tuple[int, Path, list[str]]]:
+    """A jest directory with no same-name or symbol-mentioning test: show its smallest sibling tests (same directory,
+    else its __tests__ or the parent's __tests__) so the hunter sees how this code base mounts and mocks components."""
+    for where in (d, d / "__tests__", d.parent / "__tests__"):
+        if not where.is_dir():
+            continue
+        found = []
+        for p in sorted(where.iterdir()):
+            if (p.is_symlink() or not p.is_file() or not p.name.endswith(SIBLING_TEST_SUFFIXES[1:])
+                    or p.name.startswith("hunt_") or str(p.relative_to(wt)) in exclude):
+                continue
+            found.append((3, p, p.read_text(errors="replace").split("\n")))
+        if found:
+            found.sort(key=lambda item: len(item[2]))
+            return found[:MAX_JEST_FALLBACK]
+    return []
+
+
 def sibling_tests(wt: Path, files: list[str], symbols: set[str]) -> list[dict[str, str]]:
     """Sibling tests in rank order, fairly budgeted across unique target directories; oversized rank 0/1/2 files
-    are emitted as compact windowed excerpts instead of being dropped, and unrelated tests are never included."""
+    are emitted as compact windowed excerpts instead of being dropped, and unrelated tests are never included, except
+    the setup-helper fallback for a directory that has nothing else (setup_fallback)."""
     file_set = {str(Path(f)) for f in files}
     dir_stems: dict[Path, list[str]] = {}
     for f in files:
@@ -278,6 +344,10 @@ def sibling_tests(wt: Path, files: list[str], symbols: set[str]) -> list[dict[st
             else:
                 continue
             ranked.append((rank, p, lines))
+        if not ranked:
+            ranked = setup_fallback(cands, helper_sources(d, file_set, wt))
+        if not ranked and any(lang_of(f) == "jest" and not f.endswith(".sql") and (wt / f).parent == d for f in files):
+            ranked = jest_fallback(d, file_set, wt)
         ranked.sort(key=lambda item: (item[0], item[1].name))
         if ranked:
             dir_cands[d] = ranked
@@ -287,7 +357,7 @@ def sibling_tests(wt: Path, files: list[str], symbols: set[str]) -> list[dict[st
     dir_budgets = _allocate_budgets(dir_needs, MAX_SIBLING_LINES)
     for d, ranked in dir_cands.items():
         budget = dir_budgets[d]
-        primary = [item for item in ranked if item[0] <= 1]
+        primary = [item for item in ranked if item[0] != 2]  # ranks 0-1, or the rank-3 setup fallback alone
         secondary = [item for item in ranked if item[0] == 2]
         used_total = _emit_sibling_group(wt, primary, budget, symbols, out)
         rem = budget - used_total
@@ -297,43 +367,177 @@ def sibling_tests(wt: Path, files: list[str], symbols: set[str]) -> list[dict[st
     return out
 
 
-def callers(wt: Path, files: list[str], symbols: set[str]) -> list[dict[str, str]]:
-    out: list[dict[str, str]] = []
-    seen: set[tuple[str, int]] = set()
+ENTRY_POINT = re.compile(r"/(?:api4|wsapi|plugin|web)/|/plugin_api[^/]*\.go$")
+GO_FUNC_DECL = re.compile(r"^func (?:\([^)]*\)\s*)?([A-Za-z_]\w*)")
+TS_FUNC_DECL = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s+([A-Za-z_]\w*)|const\s+([A-Za-z_]\w*)\s*[=:])")
+PERMISSION_CALL = re.compile(r"SessionHasPermissionTo\w*\(|\bHasPermissionTo\w*\(")
+MAX_ENCLOSING_LINES = 400
+CALLER_INCLUDES = ("--include=*.go", "--include=*.ts", "--include=*.tsx", "--include=*.js")
+CALLER_EXCLUDE_DIRS = ("--exclude-dir=node_modules", "--exclude-dir=vendor")
+
+
+def is_entry_point(path: str) -> bool:
+    return bool(ENTRY_POINT.search("/" + path))
+
+
+def _is_test_path(f: str) -> bool:
+    return f.endswith(("_test.go", ".test.ts", ".test.tsx", ".test.js", ".test.jsx")) or "/mocks/" in f
+
+
+def grep_word(wt: Path, word: str, roots: list[str]) -> list[tuple[str, int]]:
+    """(file, line) of every whole-word hit of `word` in non-test source under `roots`, in grep order."""
+    hits: list[tuple[str, int]] = []
+    for root in roots:
+        p = sh(["grep", "-rnwIH", *CALLER_INCLUDES, *CALLER_EXCLUDE_DIRS, "-e", word, root], wt, check=False)
+        for hit in p.stdout.splitlines():
+            if hit.count(":") < 2:
+                continue
+            f, n_s, _ = hit.split(":", 2)
+            if n_s.isdigit() and not _is_test_path(f):
+                hits.append((f, int(n_s)))
+    return hits
+
+
+def enclosing_function(lines: list[str], n: int, lang: str) -> tuple[str, int, int] | None:
+    """(name, first line, last line), 1-based, of the top-level function around line n, or None."""
+    rx = GO_FUNC_DECL if lang == "go" else TS_FUNC_DECL
+    for i in range(min(n, len(lines)) - 1, max(-1, n - 1 - MAX_ENCLOSING_LINES), -1):
+        m = rx.match(lines[i])
+        if not m:
+            continue
+        name = next(g for g in m.groups() if g)
+        end = i + 1
+        for j in range(i + 1, min(len(lines), i + MAX_ENCLOSING_LINES)):
+            end = j + 1
+            if lines[j].startswith("}"):
+                break
+        return name, i + 1, end
+    return None
+
+
+def permission_lines(f: str, lines: list[str], a: int, b: int) -> list[str]:
+    return [f"{f}:{i}: {lines[i - 1].strip()[:MAX_LINE_CHARS]}" for i in range(a, min(b, len(lines)) + 1)
+            if PERMISSION_CALL.search(lines[i - 1])]
+
+
+def caller_rank(hit: tuple[str, int]) -> tuple[int, int, str, int]:
+    """Entry points (api4, wsapi, plugin, web) first, then the shallowest paths: never alphabetical across the repo."""
+    f, n = hit
+    return (0 if is_entry_point(f) else 1, f.count("/"), f, n)
+
+
+def callers(wt: Path, files: list[str], symbols: set[str]) -> list[dict[str, Any]]:
+    """Caller excerpts per changed symbol, round-robin so one popular symbol cannot use the whole MAX_CALLERS cap.
+    Each symbol's list is its direct callers ranked entry points first; the top MAX_CHAINS_PER_SYMBOL callers are
+    walked up to MAX_HOPS hops toward an api4/wsapi/plugin/web entry point (the enclosing function of each hit is
+    searched in turn). Every excerpt carries the SessionHasPermissionTo* lines of its enclosing function, the
+    authorisation on the path to the change."""
     roots = sorted({f.split("/")[0] for f in files})
+    file_set = set(files)
+    cache: dict[str, list[str]] = {}
+    grep_budget = [MAX_HOP_GREPS]
+
+    def source(f: str) -> list[str]:
+        if f not in cache:
+            cache[f] = (wt / f).read_text(errors="replace").split("\n")
+        return cache[f]
+
+    def excerpt(f: str, n: int, sym: str, root_sym: str, hop: int) -> dict[str, Any]:
+        lines = source(f)
+        a, b = max(1, n - CALLER_PAD), min(len(lines), n + CALLER_PAD)
+        enc = enclosing_function(lines, n, lang_of(f))
+        e: dict[str, Any] = {"file": f, "symbol": sym, "lines": f"{a}-{b}", "source": numbered(lines, a, b),
+                             "hop": hop, "entry_point": is_entry_point(f),
+                             "permission_checks": permission_lines(f, lines, enc[1], enc[2]) if enc else []}
+        if enc:
+            e["enclosing"] = enc[0]
+        if root_sym != sym:
+            e["chain_for"] = root_sym
+        return e
+
+    per_symbol: list[list[dict[str, Any]]] = []
     for sym in sorted(symbols):
-        for root in roots:
-            p = sh(["grep", "-rnwIH", "--include=*.go", "--include=*.ts", "--include=*.tsx", "--include=*.js",
-                    "--exclude-dir=node_modules", "--exclude-dir=vendor", sym, root], wt, check=False)
-            for hit in p.stdout.splitlines():
-                if hit.count(":") < 2:
-                    continue
-                f, n_s, _ = hit.split(":", 2)
-                if (f in files or f.endswith(("_test.go", ".test.ts", ".test.tsx", ".test.js"))
-                        or "/mocks/" in f or not n_s.isdigit()):
-                    continue
-                n = int(n_s)
-                if (f, n // 10) in seen:
-                    continue
-                seen.add((f, n // 10))
-                lines = (wt / f).read_text(errors="replace").split("\n")
-                a, b = max(1, n - CALLER_PAD), min(len(lines), n + CALLER_PAD)
-                out.append({"file": f, "symbol": sym, "lines": f"{a}-{b}", "source": numbered(lines, a, b)})
-                if len(out) >= MAX_CALLERS:
-                    return out
+        direct: list[tuple[str, int]] = []
+        seen: set[tuple[str, int]] = set()
+        for f, n in sorted(grep_word(wt, sym, roots), key=caller_rank):
+            if f in file_set or (f, n // 10) in seen:
+                continue
+            seen.add((f, n // 10))
+            direct.append((f, n))
+        items: list[dict[str, Any]] = []
+        used: set[tuple[str, int]] = set()
+        for k, (f, n) in enumerate(direct):
+            if (f, n // 10) not in used:
+                items.append(excerpt(f, n, sym, sym, 1))
+            if k >= MAX_CHAINS_PER_SYMBOL:
+                continue
+            cur_f, cur_n = f, n
+            for hop in range(2, MAX_HOPS + 1):
+                if is_entry_point(cur_f) or grep_budget[0] <= 0:
+                    break
+                enc = enclosing_function(source(cur_f), cur_n, lang_of(cur_f))
+                if enc is None or len(enc[0]) <= 3 or enc[0].startswith("Test") or enc[0] == sym:
+                    break
+                grep_budget[0] -= 1
+                ups = [h for h in sorted(grep_word(wt, enc[0], roots), key=caller_rank)
+                       if h[0] not in file_set and h != (cur_f, cur_n)]
+                if not ups:
+                    break
+                cur_f, cur_n = ups[0]
+                used.add((cur_f, cur_n // 10))
+                items.append(excerpt(cur_f, cur_n, enc[0], sym, hop))
+        per_symbol.append(items)
+
+    out: list[dict[str, Any]] = []
+    seen_out: set[tuple[str, str]] = set()
+    for group in itertools.zip_longest(*per_symbol):
+        for item in group:
+            if item is None or (item["file"], item["lines"]) in seen_out:
+                continue
+            seen_out.add((item["file"], item["lines"]))
+            out.append(item)
+            if len(out) >= MAX_CALLERS:
+                return out
     return out
 
 
+def caller_counts(wt: Path, chosen: list[prefilter.FileDiff]) -> dict[str, int]:
+    """How many places call each file's changed symbols (whole-word hits outside the file and tests), for the batch
+    order. Only the riskiest MAX_COUNT_FILES files are measured; the rest count as 0."""
+    out: dict[str, int] = {}
+    ranked = sorted((f for f in chosen if not prefilter.excluded(f.path)), key=lambda f: (-prefilter.risk(f), f.path))
+    for f in ranked[:MAX_COUNT_FILES]:
+        syms = sorted(changed_symbols(f.patch, lang_of(f.path)))[:MAX_COUNT_SYMBOLS]
+        if not syms or f.path.endswith(".sql"):
+            continue
+        pattern = "|".join(re.escape(s) for s in syms)
+        p = sh(["grep", "-rnwIHE", *CALLER_INCLUDES, *CALLER_EXCLUDE_DIRS, "-e", pattern, f.path.split("/")[0]],
+               wt, check=False)
+        out[f.path] = sum(1 for line in p.stdout.splitlines()
+                          if not line.startswith(f.path + ":") and not _is_test_path(line.split(":", 1)[0]))
+    return out
+
+
+SQL_TEST_DIR = "server/channels/store/sqlstore"  # Go store tests exercise the migrations
+
+
 def test_targets(wt: Path, files: list[str]) -> list[dict[str, str]]:
-    """Where hunters must write their tests: one file per Go package dir / webapp component dir."""
+    """Where hunters must write their tests: one file per Go package dir / webapp component dir. A .sql migration has
+    no test directory of its own: its tests go to the sqlstore package, when this checkout has one."""
     out, seen = [], set()
     for f in files:
         d = str(Path(f).parent)
+        if f.endswith(".sql"):
+            gofiles = sorted((wt / SQL_TEST_DIR).glob("*.go")) if (wt / SQL_TEST_DIR).is_dir() else []
+            gofiles = [p for p in gofiles if not p.name.endswith("_test.go")]
+            if not gofiles:
+                continue
+            d, f = SQL_TEST_DIR, str(gofiles[0].relative_to(wt))
         if d in seen:
             continue
         seen.add(d)
         if f.endswith(".go"):
-            m = re.search(r"^package (\w+)", (wt / f).read_text(), re.M)
+            m = re.search(r"^package (\w+)", read_text_lossy(wt / f), re.M)
             out.append({"lang": "go", "dir": d, "path": f"{d}/hunt_hunt<mode>_test.go", "package": m.group(1) if m else "?"})
         else:
             out.append({"lang": "jest", "dir": d, "path": f"{d}/hunt_<mode>.test.tsx"})
@@ -805,15 +1009,33 @@ def neighbours_and_base(wt: Path, wt_base: Path, files: list[str], patches: dict
     return neigh, base
 
 
-def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any], *, all_batches: bool = False) -> dict[str, Any]:
+FORCE_ALL_RULES = ("R01", "R02")  # reliability invariants (guest isolation, team/channel boundaries): never hunt a subset
+
+
+def forced_all_batches(diffs: list[prefilter.FileDiff], deleted: list[str]) -> list[str]:
+    """Ids of the RELIABILITY rules in FORCE_ALL_RULES that the whole PR triggers. Rules unreadable from the trusted
+    ref count as no hit here: run.py/build_requests.py read the same file and fail closed on their own."""
+    try:
+        rules = reliability.load()
+    except InfraError:
+        return []
+    mctx = {"all_changed_files": [f.path for f in diffs] + deleted,
+            "diff_production_code": "\n".join(f.patch for f in diffs if f.patch),
+            "changed_files_head_source": []}
+    return [r.id for r in reliability.match(mctx, rules) if r.id in FORCE_ALL_RULES]
+
+
+def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any], *, all_batches: bool = False,
+          first_batch: bool = False) -> dict[str, Any]:
     repo, wt, mb, head = Path(prep["repo"]), Path(prep["wt"]), prep["merge_base"], prep["head"]
     diffs = file_diffs(repo, mb, head)
     for f in diffs:
         if not prefilter.excluded(f.path):
             f.patch = git(repo, "diff", mb, head, "--", f.path)
-    plan = prefilter.plan(diffs)
+    plan = prefilter.plan(diffs, callers=caller_counts(wt, diffs))
     deleted = git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=D", mb, head).splitlines()
     plan.skipped += [(path, "deleted") for path in deleted]
+    forced = forced_all_batches(diffs, deleted) if first_batch and len(plan.batches) > 1 else []
     hdir = Path(prep.get("hunt_dir") or hunt_dir(pr))
     hdir.mkdir(parents=True, exist_ok=True)
     if not plan.batches:
@@ -834,14 +1056,15 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any], *, al
         if prev_head and prev_head != head:
             head_changed = True
         elif prev_head == head:
-            all_batches = all_batches or bool(prev.get("all_batches"))
+            all_batches = all_batches or (bool(prev.get("all_batches")) and not first_batch)
             if isinstance(prev_batch, int) and prev_batch != batch:
                 archive_batch(hdir, prev_batch)
+    all_batches = all_batches or bool(forced)
     reset_hunt_dir(hdir, include_whole_pr=head_changed)
     (hdir / "skipped.log").write_text("\n".join(prefilter.describe(plan, batch)) + "\n")
     chosen = plan.batches[batch - 1]
     files = [f.path for f in chosen]
-    patches = {f.path: "\n".join(f.patch.splitlines()[:prefilter.MAX_LINES + 20]) for f in chosen}
+    patches = {f.path: f.patch for f in chosen}  # whole patch: a long diff is a batch of its own, never cut
     syms: set[str] = set()
     for f in chosen:
         syms |= changed_symbols(f.patch, lang_of(f.path))
@@ -853,7 +1076,7 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any], *, al
         pr_info["range"] = f"{prep['range'][0]}...{prep['range'][1]}"
     ctx: dict[str, Any] = {
         "pr": pr_info,
-        "diff_production_code": "\n".join(patches[f] for f in files),
+        "diff_production_code": "\n".join(request_patch(patches[f]) for f in files),
         "changed_files_head_source": [{"file": f, "source": source_view(wt, f, patches[f])} for f in files],
         "sibling_tests_and_helpers": sibling_tests(wt, files, syms),
         "callers": callers(wt, files, syms),
@@ -865,6 +1088,7 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any], *, al
     ctx["neighbors_same_file"], ctx["changed_functions_base_source"] = neighbours_and_base(
         wt, Path(prep["wt_base"]), files, {f.path: f.patch for f in chosen}, set(all_changed))
     state = {"pr": pr, "batch": batch, "batches": len(plan.batches), "all_batches": all_batches,
+             "forced_all_batches": forced,
              "batch_plan": [[f.path for f in b] for b in plan.batches],
              "repo": str(repo), "wt": str(wt), "wt_base": prep["wt_base"], "merge_base": mb, "head": head,
              "changed": files, "targets": targets, "own_tests": own_tests(repo, mb, head, {t["dir"] for t in targets})}
@@ -887,7 +1111,11 @@ def main() -> None:
     grp = ap.add_mutually_exclusive_group()
     grp.add_argument("--batch", type=int, default=None)
     grp.add_argument("--all-batches", action="store_true",
-                     help="build batch 1 and print all batches (subsequent --batch N calls archive prior batches)")
+                     help="hunt every batch, riskiest first (the default; kept for old callers): build batch 1 and "
+                          "print all batches (subsequent --batch N calls archive prior batches)")
+    grp.add_argument("--first-batch", action="store_true",
+                     help="hunt only the riskiest batch, as before the all-batches default; a PR that triggers R01/R02 "
+                          "still hunts every batch")
     a = ap.parse_args()
     batch = 1 if a.batch is None else a.batch
     with hunt_lock(hunt_dir(a.pr), a.pr):  # never rewrite state.json under a running run.py, nor read a half-made prep
@@ -901,12 +1129,14 @@ def main() -> None:
             meta = json.loads(sh(["gh", "api", f"repos/{REPO}/pulls/{a.pr}"], Path(".")).stdout)
             if meta.get("draft"):
                 print(f"note: PR #{a.pr} is a draft")
-        st = build(a.pr, batch, prep, meta, all_batches=a.all_batches)
+        st = build(a.pr, batch, prep, meta, all_batches=not a.first_batch, first_batch=a.first_batch)
     ctx = json.loads((hunt_dir(a.pr) / "ctx.json").read_text())
     print(f"batch {st['batch']}/{st['batches']}: {len(st['changed'])} files, {len(ctx['callers'])} caller excerpts, "
           f"{len(ctx['sibling_tests_and_helpers'])} sibling test files, {len(ctx['neighbors_same_file'])} neighbour and "
           f"{len(ctx['changed_functions_base_source'])} merge-base functions; skipped.log has the rest")
-    if a.all_batches and st["batches"] > 1:
+    if st["forced_all_batches"]:
+        print(f"all batches forced by reliability rule(s) {', '.join(st['forced_all_batches'])}")
+    if st["all_batches"] and st["batches"] > 1:
         print(f"all-batches plan ({st['batches']} batches; run --batch 2..{st['batches']} after batch 1):")
         for idx, bfiles in enumerate(st["batch_plan"], 1):
             print(f"  batch {idx}: {', '.join(bfiles)}")

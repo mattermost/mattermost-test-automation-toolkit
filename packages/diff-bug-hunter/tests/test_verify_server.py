@@ -266,6 +266,7 @@ def test_seed_raises_infra_error_on_team_lookup_failure():
 
 def test_images_pull_failure_raises_infra_error(monkeypatch):
     monkeypatch.setattr(pr_server, "pr_images", lambda _pr: {"head": "r:aaa", "base": "r:bbb"})
+    monkeypatch.setattr(pr_server, "published", lambda img: True)  # base is published: no ancestor walk
     monkeypatch.setattr(pr_server, "pull", lambda img: "manifest unknown" if img == "r:aaa" else None)
     with pytest.raises(pr_server.InfraError, match="image pull failed"):
         pr_server.main(["images", "40100", "--pull"])

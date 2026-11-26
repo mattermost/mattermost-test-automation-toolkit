@@ -34,6 +34,7 @@ from typing import Any
 from ctx import changed_go_tests
 from hunt_common import InfraError, clean_untracked, git, hunt_dir, hunt_lock, read_state, terminate_handler, write_json
 from run import PACKAGE_FAILED, CompileError, Outcome, classify, ensure_clean, go_run
+from verdicts import Verdict
 
 FLAG = "ENABLE_FULLY_PARALLEL_TESTS"
 PARALLEL_ENV = "HUNT_GO_PARALLEL"
@@ -124,22 +125,24 @@ def _run_unit(wt: Path, unit: dict[str, Any]) -> tuple[dict[str, str], dict[str,
     try:
         heads = [_run(wt, unit, unit["tests"], True) for _ in range(RUNS)]
         names = sorted(set().union(*(h.results for h in heads)))
-        seen = {n: classify([h.results.get(n, "MISSING") for h in heads]) for n in names}
-        failing = [n for n in names if seen[n] == "FAIL_3_OF_3"]
+        seen = {n: classify([h.results.get(n, Verdict.MISSING) for h in heads]) for n in names}
+        failing = [n for n in names if seen[n] == Verdict.FAIL_3_OF_3]
         pkg_failed = any(n.endswith(f"::{PACKAGE_FAILED}") for n in failing)
         retest = list(unit["tests"]) if pkg_failed else [n.split("::", 1)[1] for n in failing]
         plain = _run(wt, unit, retest, False) if retest else Outcome()
     except CompileError as e:  # not a finding: generated code or build tags may be missing in this worktree
-        return {f"{key}::*": "NOT_RUN"}, {f"{key}::*": str(e)[-1500:]}
-    table, msgs = {}, {}
+        return {f"{key}::*": Verdict.NOT_RUN}, {f"{key}::*": str(e)[-1500:]}
+    table: dict[str, str] = {}
+    msgs: dict[str, str] = {}
     for n in names:
         v = seen[n]
-        if v == "FAIL_3_OF_3":
+        if v == Verdict.FAIL_3_OF_3:
             without = plain.packages.get(unit["dir"]) if n.endswith(f"::{PACKAGE_FAILED}") else plain.results.get(n)
-            v = {"PASS": "PR_TEST_FAILS_UNDER_CI", "FAIL": "PR_TEST_FAILS"}.get(without or "", "FLAKY")
+            ci_map: dict[str, Verdict] = {Verdict.PASS: Verdict.PR_TEST_FAILS_UNDER_CI, Verdict.FAIL: Verdict.PR_TEST_FAILS}
+            v = ci_map.get(without or "", Verdict.FLAKY)
         table[n] = v
         failure = next((h.messages[n] for h in heads if n in h.messages), None)
-        if v != "PASS" and failure is not None:
+        if v != Verdict.PASS and failure is not None:
             msgs[n] = failure
     return table, msgs
 
@@ -157,7 +160,7 @@ def cmd_pr(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
             try:
                 t, m = _run_unit(wt, unit)
             except InfraError as e:  # e.g. a test behind a build tag ran 0 tests: lose this unit, keep the others
-                t, m = {f"{unit['key']}::*": "NOT_RUN"}, {f"{unit['key']}::*": str(e)[-800:]}
+                t, m = {f"{unit['key']}::*": Verdict.NOT_RUN}, {f"{unit['key']}::*": str(e)[-800:]}
             table.update(t)
             msgs.update(m)
     finally:

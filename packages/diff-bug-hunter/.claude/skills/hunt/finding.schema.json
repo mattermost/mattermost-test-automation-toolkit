@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hunt/finding.schema.json",
+  "title": "Author-facing finding",
+  "description": "The only shape a finding takes when it reaches the PR author. Built from a vetted.json row that verdict.py admissibility() keeps. Enum values are the tokens in scripts/verdicts.py.",
+  "type": "object",
+  "required": [
+    "impact",
+    "severity",
+    "actor_roles",
+    "entry_point",
+    "repro_cmd",
+    "base_result",
+    "head_result",
+    "contradicts",
+    "file_line",
+    "checked",
+    "not_checked",
+    "root_cause"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "impact": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What goes wrong for a user or caller, in one or two sentences."
+    },
+    "severity": {
+      "enum": [
+        "critical",
+        "major",
+        "minor"
+      ]
+    },
+    "actor_roles": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "system_admin",
+          "team_admin",
+          "channel_admin",
+          "member",
+          "guest"
+        ]
+      },
+      "description": "Roles that trigger the failure, from a role-matrix run. Empty means the role matrix did not run; the finding then says so in not_checked."
+    },
+    "entry_point": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Entry point the reproduction goes through, e.g. \"api4 DELETE /api/v4/x\"."
+    },
+    "repro_cmd": {
+      "type": "string",
+      "minLength": 1,
+      "description": "One command that reproduces the failure on head and passes on base."
+    },
+    "base_result": {
+      "enum": [
+        "NEW_PR_BUG",
+        "DIFF"
+      ],
+      "description": "Mechanical verdict on the merge-base: NEW_PR_BUG for a test, DIFF for a Mode D input."
+    },
+    "head_result": {
+      "enum": [
+        "FAIL_3_OF_3",
+        "DIFF"
+      ],
+      "description": "Mechanical verdict on head."
+    },
+    "contradicts": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The PR text line (description or commit message) the behaviour contradicts, or null when the bug is not against a stated claim."
+    },
+    "file_line": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Root-cause location, path:line."
+    },
+    "checked": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "What was verified (for example: fix-commit check passed, caller reached)."
+    },
+    "not_checked": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "What was not verified and why. Shown to the author next to the finding."
+    },
+    "root_cause": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Group key: the root-cause file_line. Kept tests that name the exact same file_line are one root cause; findings.json carries one item per group."
+    },
+    "related": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "file_line",
+          "repro_cmd",
+          "impact"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "file_line": {
+            "type": "string"
+          },
+          "repro_cmd": {
+            "type": "string"
+          },
+          "impact": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Other kept tests with the same root cause. Each is a separate reproduction of the same bug."
+    }
+  }
+}

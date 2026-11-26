@@ -65,6 +65,11 @@ def test_ledger_records_telemetry_and_exports_only_mode_r_escapes(tmp_path):
         },
     }))
     out_ledger = tmp_path / "telemetry" / "hunt_ledger.jsonl"
+    (hdir / "vetted.json").write_text(json.dumps({"rows": [{
+        "id": "CR1", "source": "R", "decision": "KEEP", "reason": "real", "file_line": "websocket_actions.ts:1599",
+        "caller": "websocket handler", "entry_point": "websocket refetch", "repro_cmd": "npx jest hunt_r.test.tsx",
+        "evidence_path": "review_verdicts.json", "severity": "minor", "fix_check": None,
+    }]}))
     row = ledger.record("40299", hdir=hdir, out_path=out_ledger)
     assert row["confidence_tier"] == "Bug Proven"
     assert row["modes"]["mode_a_empty"] == 1
@@ -211,7 +216,7 @@ def test_eval_bugs_kinds_skip_missing_locks_and_diff_gate(tmp_path, capsys):
         "rows": [{"kind": "case", "id": "hotfix-1", "lock": True, "vetted": True, "hunters_new_api": False}],
     }))
     cand_card.write_text(json.dumps({
-        "metrics": {"vetted_recall": 0.5, "fp_rate": 0.04},
+        "metrics": {"vetted_recall": 0.5, "fp_rate": 0.0},
         "rows": [{"kind": "case", "id": "hotfix-1", "lock": True, "vetted": True, "hunters_new_api": False}],
     }))
     assert eval_bugs.main(["eval_bugs.py", "diff", str(base_card), str(cand_card)]) == 0

@@ -354,6 +354,49 @@ def test_babel_compile_check(tmp_path):
     assert run.jest_compiles(wt, "web/src/counter.tsx")
 
 
+def _platform_tree(wt: Path) -> None:
+    """webapp/channels has the jest config; webapp/platform/types (a package with no config) does not."""
+    web = FIX / "react_bug" / "base" / "web"
+    ch = wt / "webapp" / "channels"
+    ch.mkdir(parents=True)
+    for n in ("jest.config.js", "babel.config.js", "package.json"):
+        shutil.copy(web / n, ch / n)
+    pkg = wt / "webapp" / "platform" / "types"
+    (pkg / "src").mkdir(parents=True)
+    (pkg / "package.json").write_text('{"name": "@mattermost/types"}\n')
+
+
+def test_jest_root_falls_back_to_channels_for_platform_packages(tmp_path):
+    _platform_tree(tmp_path)
+    rel = "webapp/platform/types/src/hunt_a.test.ts"
+    root = run.jest_root(tmp_path, rel)
+    assert root == (tmp_path / "webapp/channels").resolve()
+    pkg = (tmp_path / "webapp/platform/types").resolve()
+    assert run.jest_roots_args(tmp_path, rel, root) == ["--roots", str(root), "--roots", str(pkg)]
+    # a test under the config's own rootDir keeps the default roots
+    assert run.jest_roots_args(tmp_path, "webapp/channels/src/x.test.ts", root) == []
+    # outside webapp/ there is no fallback
+    (tmp_path / "other").mkdir()
+    with pytest.raises(run.InfraError, match="no jest.config above other/x.test.ts"):
+        run.jest_root(tmp_path, "other/x.test.ts")
+
+
+@pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(), reason="run `make jest-deps` first")
+def test_jest_runs_a_platform_package_test_under_the_channels_config(tmp_path):
+    _platform_tree(tmp_path)
+    (tmp_path / "webapp/channels/node_modules").symlink_to(JESTDEPS)
+    src = tmp_path / "webapp/platform/types/src"
+    (src / "policy.ts").write_text("export const isEmpty = (rules: string[]) => rules.length === 0;\n")
+    (src / "hunt_a.test.ts").write_text(
+        "import {isEmpty} from './policy';\n"
+        "test('HuntA_empty', () => { expect(isEmpty([])).toBe(true); });\n"
+        "test('HuntA_wrong', () => { expect(isEmpty(['a'])).toBe(true); });\n")
+    o = run.Outcome()
+    run.jest_run(tmp_path, ["webapp/platform/types/src/hunt_a.test.ts"], "HuntA_", o)
+    key = "webapp/platform/types/src/hunt_a.test.ts::"
+    assert o.results == {key + "HuntA_empty": "PASS", key + "HuntA_wrong": "FAIL"}
+
+
 # ------------------------------------------------------------------ fixture 3: clean control + mutation gate
 
 def test_clean_control_has_no_findings_and_mutants_are_scored(tmp_path):
@@ -641,7 +684,7 @@ def test_lessons_append_only_and_matching(tmp_path):
         lessons.add({**base, "pattern": "p1"}, path)
     with pytest.raises(ValueError):
         lessons.add({"pattern": "p3"}, path)
-    assert path.read_text() == before and first["id"] == "L001"
+    assert path.read_text() == before and first["id"].startswith("L-")  # uuid ids
     c = {"changed_files_head_source": [{"file": "server/channels/app/platform/config.go"}], "diff_production_code": "ClientConfig"}
     assert [m["pattern"] for m in lessons.match(c, lessons.load(path))] == ["p1"]
 
@@ -2226,7 +2269,7 @@ def test_lessons_prune_is_deterministic_and_append_only(tmp_path):
     f.write_text("".join(json.dumps(x) + "\n" for x in lessons_) + json.dumps(out[0]) + "\n")
     assert [x["id"] for x in lessons.load(f)] == ["L001", "L003"]
     added = lessons.add({**lesson("x", ["server/y/*"]), "pattern": "new"}, f)
-    assert added["id"] == "L004"
+    assert added["id"].startswith("L-") and added["id"] not in {"L001", "L002", "L003"}
 
 
 def test_hunters_log_which_lessons_they_were_shown(tmp_path, monkeypatch):
@@ -2338,7 +2381,11 @@ def test_eval_bugs_scores_a_real_bug_and_a_clean_control(tmp_path, monkeypatch, 
                                "old_recall": 0.0, "old_fp_rate": 0.0, "combined_recall": 1.0, "combined_fp_rate": 0.0,
                                "new_api_recall": 0.0, "new_api_fp_rate": 0.0, "old_sometimes_recall": 0.0,
                                "old_sometimes_fp_rate": 0.0, "pr_ci_recall": 0.0, "pr_ci_fp_rate": 0.0,
-                               "pr_fails_recall": 0.0, "pr_fails_fp_rate": 0.0}
+                               "pr_fails_recall": 0.0, "pr_fails_fp_rate": 0.0,
+                               # the fix commit is the revert: the vetted clamp test passes there (STRONG)
+                               "strong_recall": 1.0, "strong_recall_fix_forward": 0.0, "strictly_weak_ratio_A": 0.0,
+                               # no vetted.json in this fixture: nothing admitted, so both admissibility rates are 0
+                               "admissibility_recall": 0.0, "admissibility_fp_rate": 0.0}
     # the same responses always give the same scorecard
     assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out2")]) == 0
     assert json.loads((tmp_path / "out2" / "scorecard.json").read_text()) == card
@@ -3098,3 +3145,9 @@ def test_mine_rules_ignores_sql_comment_headers_inside_hunk(tmp_path, capsys):
     assert mine_rules.main(["mine_rules.py", str(repo), "-n", "10", "--min", "2"]) == 0
     out = capsys.readouterr().out
     assert "buggyQueryGuard" in out and "sqlstore/*" in out
+
+
+def test_sh_survives_non_utf8_test_output(tmp_path):
+    # PR 39657: a Go recorder printed generated ids containing b"\xff\xfe"; the strict decode crashed `run.py diff`.
+    p = hunt_common.sh([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'id=\\xff\\xfe ok')"], tmp_path)
+    assert p.returncode == 0 and p.stdout == "id=�� ok"

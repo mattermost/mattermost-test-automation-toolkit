@@ -17,7 +17,11 @@ single `failure.png` only if the run FAILs. Hand its path to the user and never 
      own e2e stack on that image at `http://localhost:8065`, **replaces** a server running another build (`make stop-server`
      drops its volumes: ask before running it over a stack the user is using), and seeds both the
      `VERIFY_USER` system admin and a non-admin `verify_member` (same `VERIFY_PASSWORD`, joined to team `verify`,
-     onboarding overlay off for both). Pass `VERIFY_USER=verify_member` to test non-admin / RBAC behavior. One stack at a time: run the plan on head, then `up` the base
+     onboarding overlay off for both). A license is uploaded when `MM_LICENSE_FILE` (path) or `MM_LICENSE` is set (never print it;
+     `--require-license` makes a missing one `INFRA_ERROR`). `up --flags FeatureA,FeatureB` and/or `--flags-from-diff <base>..<head>`
+     (every `FeatureFlags.<Name>` on an added diff line) set `MM_FEATUREFLAGS_<NAME>=true` on the server; the printed `PROFILE flags=... license=...`
+     line goes into the report. A range `base..head` uses `base` itself as the base image; if a base image is not published `images` prints
+     `BASE_SUBSTITUTION` (nearest published first-parent ancestor, max 20 back): state it in the report. Pass `VERIFY_USER=verify_member` to test non-admin / RBAC behavior. One stack at a time: run the plan on head, then `up` the base
      image and run it again, and compare the two verdicts (`--compare` needs both up at once; two standalone `PASS` verdicts only show assertions held on each build, not whether captured values changed). An image swap takes
      ~100 s, the plan seconds. A missing image = CI has not built that commit yet: say so, do not build it.
    - Logged-in pages: the runner authenticates through the API before the first step, so no step goes to the login

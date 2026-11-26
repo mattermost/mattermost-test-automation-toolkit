@@ -31,23 +31,41 @@ EXCLUDE: list[tuple[str, str]] = [
     ("*.md", "docs"), ("*.svg", "asset"), ("*.png", "asset"), ("*.scss", "style"), ("*.css", "style"),
     ("*.yml", "config"), ("*.yaml", "config"),
 ]
-SOURCE_EXT = (".go", ".ts", ".tsx", ".js", ".jsx")
+SOURCE_EXT = (".go", ".ts", ".tsx", ".js", ".jsx", ".sql")  # .sql: migrations are hunted for reviewed schema bugs
 
 # (regex, weight). Searched in the path and in the file's added/removed lines.
 # Aligned with Mattermost's internal PR risk rubric (0-10 scale; starting points to calibrate against revert history).
 # Tier 1 Critical (8-10), Tier 2 High (5-7), Tier 3 Moderate (3-4). Non-source CI/Docker files stay excluded above
 # because /hunt generates Go/Jest unit tests.
+def _w(*stems: str, closed: tuple[str, ...] = ()) -> str:
+    """Word-start regex: `stems` may continue (auth -> authz), `closed` words may not (role, not controller).
+    The text is camelCase-split and lower-cased first (see _risk_text), so checkAuth reads as check_auth and a match
+    never starts inside a word ('ctx.' is not 'tx.', 'concert' is not 'cert', 'block(' is not 'lock(')."""
+    parts = [re.escape(s) for s in stems] + [re.escape(c) + r"(?![a-z0-9])" for c in closed]
+    return r"(?<![a-z0-9])(?:" + "|".join(parts) + ")"
+
+
 RISK: list[tuple[str, int]] = [
-    (r"auth|permission|session|token|password|mfa|saml|ldap|oauth|guest|role|secret|crypt|tls|cert", 10),
-    (r"/store/|sqlstore|transaction|tx\.|commit|rollback|migration|backfill|kvstore|upgrade", 9),
-    (r"sanitiz|escape|parse|unmarshal|decode|regexp|validate|isvalid|upload|ssrf|markdown|html|signature|hmac", 9),
-    (r"/api4/|/wsapi/|websocket|/plugin/|/web/|webhook|handler|router|http\.", 8),
-    (r"sync\.|go func|atomic\.|mutex|lock\(|chan |select \{|cache|cluster|job|queue", 7),
+    (_w("auth", "permission", "session", "token", "password", "mfa", "saml", "ldap", "oauth", "guest", "secret", "crypt",
+        closed=("role", "roles", "tls", "cert", "certs", "certificate", "certificates")), 10),
+    (r"/store/|" + _w("sqlstore", "transaction", "commit", "rollback", "migration", "backfill", "kvstore", "upgrade")
+     + r"|" + _w("tx") + r"\.|\.sql(?![a-z0-9])", 9),
+    (_w("sanitiz", "escape", "parse", "unmarshal", "decode", "regexp", "validate", "isvalid", "upload", "ssrf",
+        "markdown", "signature", "hmac", closed=("html",)), 9),
+    (r"/api4/|/wsapi/|/plugin/|/web/|" + _w("websocket", "webhook", "handler", "router") + r"|" + _w("http") + r"\.", 8),
+    (_w("sync") + r"\.|" + _w("go") + r" func|" + _w("atomic") + r"\.|" + _w("mutex", "cache", "cluster", "queue")
+     + r"|" + _w("lock") + r"\(|" + _w("chan") + r" |" + _w("select") + r" \{|" + _w("job", "jobs"), 7),
     (r"/public/model/", 6),
-    (r"config|featureflag|audit|license", 5),
-    (r"reducer|actions?/|selectors?/|dispatch\(", 4),
+    (_w("config", "featureflag", "audit", "license"), 5),
+    (_w("reducer", "selector", "dispatch") + r"|" + _w("action", "actions") + r"/", 4),
     (r"/app/|/platform/|/cmd/mmctl/|/src/components/|/src/utils/", 3),
 ]
+_CAMEL = re.compile(r"([a-z0-9])([A-Z])")
+
+
+def _risk_text(path: str, patch: str) -> str:
+    changed = "\n".join(line for line in patch.splitlines() if line[:1] in "+-" and line[:3] not in ("+++", "---"))
+    return _CAMEL.sub(r"\1_\2", f"{path}\n{changed}").lower()
 
 
 @dataclass
@@ -80,8 +98,7 @@ def excluded(path: str) -> str | None:
 def risk(f: FileDiff) -> float:
     """Max-based score plus breadth bonus (+0.5 per extra Tier 1/2 category, cap +2.0), matching Mattermost's PR risk
     rubric so a Tier 1 auth, persistence or input-handling file always outranks a multi-keyword Tier 2/3 file."""
-    changed = "\n".join(line for line in f.patch.splitlines() if line[:1] in "+-" and line[:3] not in ("+++", "---"))
-    text = f"{f.path}\n{changed}".lower()
+    text = _risk_text(f.path, f.patch)
     hits = [w for rx, w in RISK if re.search(rx, text)]
     if not hits:
         return 0.0
@@ -89,8 +106,20 @@ def risk(f: FileDiff) -> float:
     return max(hits) + min(2.0, 0.5 * extra_high)
 
 
-def plan(files: list[FileDiff], max_files: int = MAX_FILES, max_lines: int = MAX_LINES) -> Plan:
-    """Exclude, rank by (risk desc, size desc, path), then pack greedily: a batch holds at most max_files files and
+MAX_CALLER_BONUS = 1.0
+CALLER_BONUS_AT = 20  # callers at which the bonus saturates
+
+
+def rank_score(f: FileDiff, callers: dict[str, int] | None = None) -> float:
+    """risk x callers: the risk score plus up to +1.0 for how many places call the file's changed symbols. The bonus
+    is below the 2-point gap between tiers' base weights, so a Tier 1 file still outranks a busier Tier 3 one."""
+    n = (callers or {}).get(f.path, 0)
+    return risk(f) + MAX_CALLER_BONUS * min(n, CALLER_BONUS_AT) / CALLER_BONUS_AT
+
+
+def plan(files: list[FileDiff], max_files: int = MAX_FILES, max_lines: int = MAX_LINES,
+         callers: dict[str, int] | None = None) -> Plan:
+    """Exclude, rank by (risk x callers desc, size desc, path), then pack greedily: a batch holds at most max_files files and
     max_lines changed lines. A single file larger than max_lines gets a batch of its own and is marked oversize."""
     out = Plan()
     keep = []
@@ -100,7 +129,7 @@ def plan(files: list[FileDiff], max_files: int = MAX_FILES, max_lines: int = MAX
             out.skipped.append((f.path, reason))
         else:
             keep.append(f)
-    keep.sort(key=lambda f: (-risk(f), -f.lines, f.path))
+    keep.sort(key=lambda f: (-rank_score(f, callers), -f.lines, f.path))
     cur: list[FileDiff] = []
     cur_lines = 0
     for f in keep:
@@ -126,7 +155,7 @@ def describe(p: Plan, batch: int) -> list[str]:
     for i, b in enumerate(p.batches, 1):
         for f in b:
             tag = "HUNT" if i == batch else f"DEFERRED to batch {i}"
-            over = " (oversize: diff truncated)" if f.lines > MAX_LINES else ""
+            over = " (oversize: batch of its own)" if f.lines > MAX_LINES else ""
             lines.append(f"{tag}\t{f.path}\trisk={risk(f):g} lines={f.lines}{over}")
     lines += [f"EXCLUDED\t{path}\t{reason}" for path, reason in p.skipped]
     return lines

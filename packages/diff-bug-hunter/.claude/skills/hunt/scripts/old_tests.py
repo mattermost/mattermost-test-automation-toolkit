@@ -64,6 +64,7 @@ from hunt_common import (
     write_json,
 )
 from run import PACKAGE_FAILED, CompileError, Outcome, classify, ensure_clean, go_root, go_run, jest_run
+from verdicts import Verdict
 
 GO_TEST = re.compile(r"^func (Test(?:[A-Z_0-9]\w*)?)\((?:\w+ )?\*(?:\w+\.)?T\)")
 JEST_TEST = re.compile(r"\.test\.[jt]sx?$")
@@ -223,15 +224,15 @@ class Swap:
 
 def verdict(head: list[str], base: str | None, pkg_base: str | None, name: str) -> str:
     cls = classify(head)
-    if cls != "FAIL_3_OF_3":
+    if cls != Verdict.FAIL_3_OF_3:
         return cls
-    if base == "PASS":
-        return "OLD_TEST_BREAKS"
-    if base == "FAIL":
-        return "PRE_EXISTING"
-    if name.endswith(f"::{PACKAGE_FAILED}") and pkg_base == "PASS":
-        return "OLD_TEST_BREAKS"
-    return "NOT_RUN_ON_BASE"
+    if base == Verdict.PASS:
+        return Verdict.OLD_TEST_BREAKS
+    if base == Verdict.FAIL:
+        return Verdict.PRE_EXISTING
+    if name.endswith(f"::{PACKAGE_FAILED}") and pkg_base == Verdict.PASS:
+        return Verdict.OLD_TEST_BREAKS
+    return Verdict.NOT_RUN_ON_BASE
 
 
 def _compile_errors(wt: Path, unit: dict[str, Any]) -> str:
@@ -332,37 +333,38 @@ def _run_unit(wt: Path, wt_base: Path, unit: dict[str, Any], swap: Swap,
                     raise CompileError(first_error) from e
     except CompileError as e:
         names = unit["tests"] if go else [unit["file"]]
-        return ({f"{key}::{n}": "OLD_TEST_UNCOMPILABLE" for n in names}, {f"{key}::*": str(e)[-1500:]})
+        return ({f"{key}::{n}": Verdict.OLD_TEST_UNCOMPILABLE for n in names}, {f"{key}::*": str(e)[-1500:]})
     finally:
         swap.restore()
     names = sorted(set().union(*(h.results for h in heads)))
-    seen = {n: [h.results.get(n, "MISSING") for h in heads] for n in names}
+    seen = {n: [h.results.get(n, Verdict.MISSING) for h in heads] for n in names}
     # Failed on head in some runs only: a probabilistic break looks like this, so give base the same number of runs.
-    some = [n for n in names if classify(seen[n]) == "FLAKY" and "FAIL" in seen[n]
+    some = [n for n in names if classify(seen[n]) == Verdict.FLAKY and Verdict.FAIL in seen[n]
             and not n.endswith(f"::{PACKAGE_FAILED}")]
     try:
         base = run_once(wt_base, tests)
         more = [run_once(wt_base, [n.split("::", 1)[1] for n in some] if go else tests) for _ in range(RUNS - 1)] if some else []
     except CompileError as e:
-        out = {f"{key}::{n}": "NOT_RUN" for n in (tests if go else [unit["file"]])}
+        out: dict[str, str] = {f"{key}::{n}": Verdict.NOT_RUN for n in (tests if go else [unit["file"]])}
         out_msgs = {f"{key}::*": f"base uncompilable: {str(e)[-1500:]}"}
         for t, why in removed.items():
-            out[f"{key}::{t}"] = "OLD_TEST_UNCOMPILABLE"
+            out[f"{key}::{t}"] = Verdict.OLD_TEST_UNCOMPILABLE
             out_msgs[f"{key}::{t}"] = why[-1500:]
         return out, out_msgs
     finally:
         base_swap.restore()  # nothing is swapped on base; this only removes files the run left behind
-    table, msgs = {}, {}
+    table: dict[str, str] = {}
+    msgs: dict[str, str] = {}
     for n in names:
         v = verdict(seen[n], base.results.get(n), base.packages.get(n.split("::", 1)[0]), n)
-        if n in some and v == "FLAKY" and all(o.results.get(n) == "PASS" for o in [base, *more]):
-            v = "OLD_TEST_SOMETIMES_BREAKS"
+        if n in some and v == Verdict.FLAKY and all(o.results.get(n) == Verdict.PASS for o in [base, *more]):
+            v = Verdict.OLD_TEST_SOMETIMES_BREAKS
         table[n] = v
         failure = next((h.messages[n] for h in heads if n in h.messages), None)
-        if v != "PASS" and failure is not None:
+        if v != Verdict.PASS and failure is not None:
             msgs[n] = failure
     for t, why in removed.items():
-        table[f"{key}::{t}"] = "OLD_TEST_UNCOMPILABLE"
+        table[f"{key}::{t}"] = Verdict.OLD_TEST_UNCOMPILABLE
         msgs[f"{key}::{t}"] = why[-1500:]
     return table, msgs
 
@@ -468,7 +470,7 @@ def cmd_old(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
         try:
             t, m = _run_unit(wt, wt_base, unit, swap, base_swap)
         except InfraError as e:  # e.g. a test behind a build tag ran 0 tests: lose this unit, keep the others
-            t, m = {f"{unit['key']}::*": "NOT_RUN"}, {f"{unit['key']}::*": str(e)[-800:]}
+            t, m = {f"{unit['key']}::*": Verdict.NOT_RUN}, {f"{unit['key']}::*": str(e)[-800:]}
         table.update(t)
         msgs.update(m)
     ensure_clean(wt)

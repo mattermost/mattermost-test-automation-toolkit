@@ -85,7 +85,8 @@
 // "capture" calls an /api/v4/ endpoint (same checks as api.path, same credentials, auto X-CSRF-Token on writes) and
 // records the JSON body without asserting; optional "save" extracts scalar fields into $var for later paths/bodies.
 // Plans with only "capture" steps and "expect.api" checks skip Chromium and run directly via Playwright APIRequestContext.
-// "goto" and "api.path" are checked after URL resolution: they must stay on the server, and api.path under /api/v4/.
+// "goto" and "api.path" are checked after URL resolution: they must stay on the server, and api.path (and capture) under
+// /api/v4/, /oauth/ or /plugins/<id>/.
 
 import {createRequire} from 'node:module';
 import {readFileSync, realpathSync, writeFileSync} from 'node:fs';
@@ -175,12 +176,14 @@ function staysOn(p, origin) {
 
 // Checked after URL resolution too: "/api/v4/../../x" or a stray tab must not reach a non-API handler.
 // When `allowVars` is true (plan validation), `$var` placeholders are treated as safe path tokens and re-checked at runtime.
+// Same-origin server paths a capture or api expect may call: the API, OAuth endpoints and a plugin's own routes.
+const SERVER_PATH_RE = /^\/(?:api\/v4\/|oauth\/|plugins\/[A-Za-z0-9][A-Za-z0-9._-]*\/)/;
 function isApiPath(p, origin, allowVars = false) {
     if (!nonEmpty(p)) {
         return false;
     }
     const probe = allowVars ? p.replace(VAR_REF_RE, 'x') : p;
-    return probe.startsWith('/api/v4/') && staysOn(probe, origin) && new URL(probe, origin).pathname.startsWith('/api/v4/');
+    return SERVER_PATH_RE.test(probe) && staysOn(probe, origin) && SERVER_PATH_RE.test(new URL(probe, origin).pathname);
 }
 
 function checkApiSpec(spec, origin, where, allowExpectKeys = false) {
@@ -189,7 +192,7 @@ function checkApiSpec(spec, origin, where, allowExpectKeys = false) {
         throw new PlanError(`${where}: api takes only ${allowedKeys.join(', ')}`);
     }
     if (!isApiPath(spec.path, origin, true)) {
-        throw new PlanError(`${where}: api.path must be a path under /api/v4/ (got ${JSON.stringify(spec.path)})`);
+        throw new PlanError(`${where}: api.path must be a path under /api/v4/, /oauth/ or /plugins/<id>/ (got ${JSON.stringify(spec.path)})`);
     }
     if ('method' in spec && !(typeof spec.method === 'string' && API_METHODS.includes(spec.method.toUpperCase()))) {
         throw new PlanError(`${where}: api.method must be one of ${API_METHODS.join(', ')}`);
@@ -370,7 +373,7 @@ export function validatePlan(plan, env = process.env) {
             }
             if (typeof s.capture.api === 'string') {
                 if (!isApiPath(s.capture.api, origin, true)) {
-                    throw new PlanError(`${where}: capture.api must be a path under /api/v4/ (got ${JSON.stringify(s.capture.api)})`);
+                    throw new PlanError(`${where}: capture.api must be a path under /api/v4/, /oauth/ or /plugins/<id>/ (got ${JSON.stringify(s.capture.api)})`);
                 }
             } else {
                 checkApiSpec(s.capture.api, origin, `${where} capture`);
@@ -737,7 +740,7 @@ function expandPath(raw, origin, vars, mustBeApi) {
         return val;
     });
     if (mustBeApi ? !isApiPath(out, origin) : (!out.startsWith('/') || out.startsWith('//') || out.includes('\\') || !staysOn(out, origin))) {
-        throw new Error(`resolved path ${JSON.stringify(out)} left ${mustBeApi ? '/api/v4/' : origin}`);
+        throw new Error(`resolved path ${JSON.stringify(out)} left ${mustBeApi ? '/api/v4/, /oauth/ or /plugins/<id>/' : origin}`);
     }
     return out;
 }
@@ -1754,7 +1757,7 @@ test(${q(plan.name ?? 'frozen /verify plan')}, async () => {
     const u = new URL(out, BASE);
     expect(u.origin, \`path \${out} left \${BASE}\`).toBe(new URL(BASE).origin);
     if (mustBeApi) {
-      expect(u.pathname.startsWith('/api/v4/'), \`path \${out} left /api/v4/\`).toBe(true);
+      expect(/^\\/(?:api\\/v4\\/|oauth\\/|plugins\\/[A-Za-z0-9][A-Za-z0-9._-]*\\/)/.test(u.pathname), \`path \${out} left /api/v4/, /oauth/ or /plugins/<id>/\`).toBe(true);
     }
     return out;
   };

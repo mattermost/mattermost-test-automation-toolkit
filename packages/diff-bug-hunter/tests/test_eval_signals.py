@@ -468,3 +468,79 @@ def test_mine_controls_finds_in_window_commit_under_out_of_order_child_date(tmp_
     manifest = {"cases": [{"id": "c1", "bug_sha": bug, "fix_sha": fix, "area": "a"}], "controls": []}
     picked, _ = mine_controls.mine(repo, manifest, 5)
     assert any(c["sha"] == target for c in picked)
+
+
+# ------------------------------------------------------------------ fix-commit oracle: is a vetted test the right test?
+CLAMP_FIXED = (FIX / "go_bug" / "base" / "calc" / "calc.go").read_text()
+CLAMP_BUGGY = (FIX / "go_bug" / "head" / "calc" / "calc.go").read_text()
+
+
+def _with_fix(path: Path, repo: Path, calc_go: str) -> None:
+    """Make the case's fix a fix-forward commit on top of the bug (not the revert) that leaves calc.go as calc_go."""
+    m = json.loads(path.read_text())
+    case = m["cases"][0]
+    _git(repo, "checkout", "-q", "-b", "fix", case["bug_sha"])
+    (repo / "calc" / "calc.go").write_text(calc_go)
+    _git(repo, "commit", "-qam", "Fix forward")
+    case.update(kind="rc_hotfix", fix_sha=_git(repo, "rev-parse", "HEAD"))
+    path.write_text(json.dumps(m))
+
+
+def _fix_card(tmp: Path, monkeypatch, capsys, calc_go: str | None) -> tuple[dict[str, Any], str]:
+    path, repo = _fixture_manifest(tmp)
+    if calc_go is not None:
+        _with_fix(path, repo, calc_go)
+    _stub_signals(monkeypatch, {}, {})
+    eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp / "out"), "--signals", "hunters"])
+    return _card(tmp), capsys.readouterr().out
+
+
+def test_fix_oracle_a_vetted_test_that_passes_on_the_revert_is_strong(tmp_path, monkeypatch, capsys):
+    card, out = _fix_card(tmp_path, monkeypatch, capsys, None)  # the fixture's fix is `git revert` of the bug
+    rows = {r["id"]: r for r in card["rows"]}
+    assert rows["clamp"]["vetted"] and rows["clamp"]["strong"] and rows["clamp"]["fix_oracle"] == "revert"
+    assert rows["clamp"]["fix_verdicts"] == {"A": {"STRONG": 1}} and rows["clamp"]["strictly_weak"] == []
+    assert not rows["percent"]["has_fix"] and rows["percent"]["fix_verdicts"] == {}  # controls have no fix commit
+    m = card["metrics"]
+    assert (m["strong_recall"], m["strong_recall_fix_forward"], m["strictly_weak_ratio_A"]) == (1.0, 0.0, 0.0)
+    assert "strong recall      1.00 (1 cases with a fix commit; fix-forward only: 0.00 of 0)" in out
+
+
+def test_fix_oracle_a_vetted_test_that_still_fails_on_the_fix_is_strictly_weak(tmp_path, monkeypatch, capsys):
+    # The "fix" changes something else and keeps the off-by-one: the hunter test asserts what the fix did not remove.
+    card, out = _fix_card(tmp_path, monkeypatch, capsys, CLAMP_BUGGY.replace("limits v", "limits the value v"))
+    row = next(r for r in card["rows"] if r["id"] == "clamp")
+    assert row["vetted"] and not row["strong"] and row["fix_oracle"] == "fix_forward"
+    assert row["strictly_weak"] == ["A:calc::TestHuntA_ClampRangeAndIdentity"]
+    assert (card["metrics"]["strong_recall_fix_forward"], card["metrics"]["strictly_weak_ratio_A"]) == (0.0, 1.0)
+    assert "read clamp: A:calc::TestHuntA_ClampRangeAndIdentity" in out
+
+
+def test_fix_oracle_a_test_of_an_api_the_fix_renamed_is_fix_incompatible(tmp_path, monkeypatch, capsys):
+    card, _ = _fix_card(tmp_path, monkeypatch, capsys, CLAMP_FIXED.replace("func Clamp(", "func ClampInt("))
+    row = next(r for r in card["rows"] if r["id"] == "clamp")
+    assert row["vetted"] and not row["strong"] and row["fix_verdicts"] == {"A": {"FIX_INCOMPATIBLE": 1}}
+    assert card["metrics"]["strictly_weak_ratio_A"] == 0.0  # unknown is neither strong nor strictly weak
+
+
+def test_fix_verdict_needs_every_run_to_agree():
+    assert eval_bugs.fix_verdict(["PASS"] * 3, False, "") == "STRONG"
+    assert eval_bugs.fix_verdict(["FAIL"] * 3, False, "got 7, want 5") == "STRICTLY_WEAK"
+    assert eval_bugs.fix_verdict(["PASS", "FAIL", "PASS"], False, "") == "FIX_FLAKY"
+    assert eval_bugs.fix_verdict(["PASS"] * 3, True, "") == "FIX_INCOMPATIBLE"
+    assert eval_bugs.fix_verdict(["FAIL"] * 3, False, "TypeError: clamp is not a function") == "FIX_INCOMPATIBLE"
+    assert eval_bugs.fix_verdict(["MISSING", "PASS", "PASS"], False, "") == "FIX_NOT_RUN"
+
+
+def test_diff_gate_fails_when_strong_recall_drops_and_skips_it_for_old_scorecards():
+    def card(vetted: float, strong: float | None) -> dict[str, Any]:
+        metrics: dict[str, Any] = {"vetted_recall": vetted, "fp_rate": 0.0}
+        if strong is not None:
+            metrics["strong_recall"] = strong
+        return {"metrics": metrics, "rows": [{"kind": "case", "id": "c1"}], "errors": [], "verdict": "PASS"}
+
+    dropped = eval_bugs.diff_scorecards(card(0.5, 0.5), card(0.5, 0.25))
+    assert dropped["verdict"] == "FAIL" and not dropped["strong_ok"]
+    assert eval_bugs.diff_scorecards(card(0.5, 0.25), card(0.5, 0.5))["verdict"] == "PASS"
+    old = eval_bugs.diff_scorecards(card(0.5, None), card(0.5, 0.0))  # a baseline from before the fix oracle
+    assert old["verdict"] == "PASS" and old["base_strong_recall"] is None

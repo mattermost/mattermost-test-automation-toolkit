@@ -21,9 +21,7 @@ from pathlib import Path
 from typing import Any
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
-PROMPTS_DIR = SKILL_DIR / "prompts"
 LESSONS_FILE = SKILL_DIR / "lessons.jsonl"
-DISPATCH_TEMPLATE = SKILL_DIR / "dispatch.md"
 
 REPO = os.environ.get("HUNT_REPO", "mattermost/mattermost")
 
@@ -127,7 +125,10 @@ def sh(args: list[str], cwd: Path, *, check: bool = True, timeout: int = 1800,
     if args[:1] == ["git"]:
         env = git_env(env)
     try:
-        p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env, check=False)
+        # errors="replace": a test may print arbitrary bytes (a recorder's generated id "\xff\xfe", PR 39657); a
+        # strict decode would crash the whole run instead of yielding a result.
+        p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout, env=env,
+                           check=False)
     except FileNotFoundError as e:
         raise InfraError(f"command not found: {args[0]}") from e
     except subprocess.TimeoutExpired as e:
@@ -163,15 +164,32 @@ def clean_untracked(wt: Path) -> None:
             under(wt, rel).unlink(missing_ok=True)
 
 
+def read_text_lossy(path: Path) -> str:
+    """Read UTF-8 text, replacing undecodable bytes instead of raising UnicodeDecodeError."""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
 def load_json(path: Path) -> Any:
     """Load JSON written by a model. Repairs only invalid backslash escapes, the one defect seen in practice."""
-    raw = path.read_text()
+    return loads_lossy(read_text_lossy(path))
+
+
+def loads_lossy(raw: str) -> Any:
+    """json.loads with the same backslash repair as load_json, for model text that is not on disk."""
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         # Keep valid escapes (including an escaped backslash) and double every other lone backslash.
         return json.loads(re.sub(r'\\(["\\/bfnrt]|u[0-9a-fA-F]{4})|\\',
                                  lambda m: m.group(0) if m.group(1) else "\\\\", raw))
+
+
+def read_dict(path: Path) -> dict[str, Any]:
+    """A JSON object file, or {} when it is missing or holds something else."""
+    if not path.exists():
+        return {}
+    data = load_json(path)
+    return data if isinstance(data, dict) else {}
 
 
 def write_json(path: Path, data: Any) -> None:

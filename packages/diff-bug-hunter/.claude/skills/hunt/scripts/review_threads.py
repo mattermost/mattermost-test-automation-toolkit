@@ -35,6 +35,7 @@ from hunt_common import (
     write_json,
 )
 from run import PACKAGE_FAILED, fingerprint
+from verdicts import Verdict
 
 CODERABBIT_LOGINS = frozenset({"coderabbitai", "coderabbitai[bot]"})
 HIGH_SEVERITIES = frozenset({"critical", "major"})
@@ -93,8 +94,8 @@ _BADGE_LINE = re.compile(
     re.I,
 )
 _BASE_VERDICT_PRIORITY = (
-    "NEW_PR_BUG", "NEW_API", "BASE_FAILS_DIFFERENTLY", "BASE_UNCOMPILABLE",
-    "NOT_RUN_ON_BASE", "SKIP", "UNVETTED", "PRE_EXISTING",
+    Verdict.NEW_PR_BUG, Verdict.NEW_API, Verdict.BASE_FAILS_DIFFERENTLY, Verdict.BASE_UNCOMPILABLE,
+    Verdict.NOT_RUN_ON_BASE, Verdict.SKIP, Verdict.UNVETTED, Verdict.PRE_EXISTING,
 )
 
 
@@ -503,7 +504,7 @@ def compute_verdicts(hdir: Path) -> dict[str, Any]:
         declared = [str(x) for x in claim.get("tests", [])] if isinstance(claim.get("tests"), list) else []
         matched = _match_tests(cid, declared, run_res)
         statuses = {m: run_res[m] for m in matched}
-        failing = [m for m, s in statuses.items() if s == "FAIL_3_OF_3"]
+        failing = [m for m, s in statuses.items() if s == Verdict.FAIL_3_OF_3]
         pkg_fail_key = f"{Path(t['path']).parent}::{PACKAGE_FAILED}"
         entry: dict[str, Any] = {
             "id": cid,
@@ -519,42 +520,42 @@ def compute_verdicts(hdir: Path) -> dict[str, Any]:
         }
         if failing:
             if not base_res:
-                bv = "UNVETTED"
-            elif base_res.get("*") == "BASE_UNCOMPILABLE":
-                bv = "BASE_UNCOMPILABLE"
+                bv: str = Verdict.UNVETTED
+            elif base_res.get("*") == Verdict.BASE_UNCOMPILABLE:
+                bv = Verdict.BASE_UNCOMPILABLE
             else:
                 bvs = [
-                    "UNVETTED" if str(base_res.get(m, "")) in ("", "NOT_A_HEAD_FAILURE") else str(base_res[m])
+                    Verdict.UNVETTED if str(base_res.get(m, "")) in ("", Verdict.NOT_A_HEAD_FAILURE) else str(base_res[m])
                     for m in failing
                 ]
                 bv = next((p for p in _BASE_VERDICT_PRIORITY if p in bvs), bvs[0])
-            if bv == "UNVETTED":
+            if bv == Verdict.UNVETTED:
                 pr_ref = str(meta.get("pr") or "<pr>")
-                entry["verdict"] = "UNPROVABLE_DYNAMICALLY"
-                entry["base_verdict"] = "UNVETTED"
+                entry["verdict"] = Verdict.UNPROVABLE_DYNAMICALLY
+                entry["base_verdict"] = Verdict.UNVETTED
                 entry["reason"] = (
                     f"failing 3/3 on head ({', '.join(failing)}), but merge-base vetting is missing or stale; "
                     f"run `run.py base {pr_ref} R` then rerun `review_threads.py verdicts {pr_ref}`"
                 )
             else:
-                entry["verdict"] = "PROVEN"
+                entry["verdict"] = Verdict.PROVEN
                 entry["base_verdict"] = bv
                 entry["reason"] = f"failing 3/3 on head ({', '.join(failing)}); merge-base={bv}"
         elif claim.get("testable") is False:
-            entry["verdict"] = "UNPROVABLE_DYNAMICALLY"
+            entry["verdict"] = Verdict.UNPROVABLE_DYNAMICALLY
             entry["base_verdict"] = ""
             entry["reason"] = str(claim.get("reason") or "marked untestable dynamically by Mode R")
-        elif matched and all(s == "PASS" for s in statuses.values()):
-            entry["verdict"] = "DISPROVEN"
+        elif matched and all(s == Verdict.PASS for s in statuses.values()):
+            entry["verdict"] = Verdict.DISPROVEN
             entry["base_verdict"] = ""
             entry["reason"] = f"all linked tests passed 3/3 on head ({', '.join(matched)})"
-        elif any(s in ("FLAKY", "SKIP") for s in statuses.values()):
-            bad = [f"{m}={s}" for m, s in statuses.items() if s in ("FLAKY", "SKIP")]
-            entry["verdict"] = "UNPROVABLE_DYNAMICALLY"
+        elif any(s in (Verdict.FLAKY, Verdict.SKIP) for s in statuses.values()):
+            bad = [f"{m}={s}" for m, s in statuses.items() if s in (Verdict.FLAKY, Verdict.SKIP)]
+            entry["verdict"] = Verdict.UNPROVABLE_DYNAMICALLY
             entry["base_verdict"] = ""
             entry["reason"] = f"inconclusive test execution ({', '.join(bad)})"
         else:
-            entry["verdict"] = "UNPROVABLE_DYNAMICALLY"
+            entry["verdict"] = Verdict.UNPROVABLE_DYNAMICALLY
             entry["base_verdict"] = ""
             if compile_failed:
                 entry["reason"] = "Mode R tests failed to compile (see compile_R.log)"

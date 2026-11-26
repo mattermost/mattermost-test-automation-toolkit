@@ -1,0 +1,369 @@
+{
+ "pr": 40336,
+ "repo": "mattermost/mattermost",
+ "note": "Pre-fix head 7572ae1. All 7 rows are real: 3 root causes. The major (untouched stored value flagged on blur) was fixed by the author; the URL client/server mismatch and the 64-byte truncation were reproduced by hand and are still present on 213daa6.",
+ "labels": {
+  "webapp/channels/src/components/post_attributes/hunt_a.test.tsx::HuntA HuntA_legacy_stored_value_left_unchanged_is_not_flagged_or_trapped": "KEEP",
+  "webapp/channels/src/components/post_attributes/hunt_b.test.tsx::HuntB HuntB_insert_at_limit_does_not_drop_existing_tail": "KEEP",
+  "webapp/channels/src/components/post_attributes/hunt_b.test.tsx::HuntB HuntB_refused_url_value_is_never_committed_on_blur": "KEEP",
+  "webapp/channels/src/components/post_attributes/hunt_b.test.tsx::HuntB HuntB_url_refuses_backslash_in_authority": "KEEP",
+  "webapp/channels/src/components/post_attributes/hunt_b.test.tsx::HuntB HuntB_url_refuses_control_characters_go_refuses": "KEEP",
+  "webapp/channels/src/components/post_attributes/hunt_b.test.tsx::HuntB HuntB_url_refuses_percent_escaped_ascii_in_host": "KEEP",
+  "webapp/channels/src/components/post_attributes/hunt_d.test.tsx::HuntD HuntD_PostAttributeValueControl_text": "KEEP"
+ },
+ "user": {
+  "pr": {
+   "title": "99674fc1770389c7cc007e6d4ce4f0f147bd57c4...7572ae16be4937ba5300cfcbb4411289ff70974f",
+   "description": "Range 99674fc1770389c7cc007e6d4ce4f0f147bd57c4...7572ae16be4937ba5300cfcbb4411289ff70974f (4 non-merge commit(s)):\n7572ae16be [MM-72226] Refuse malformed percent escapes in post attribute URL values\nece776bca7 [MM-72226] Accept bracketed IPv4 email domains and scoped IPv6 URLs in post attribute text validation\n1b0b7e3408 [MM-72226] Test post attribute text limits and value type validation\n76824d8467 [MM-72226] Limit and validate post attribute text values before sending"
+  },
+  "diff_production_code": "diff --git a/webapp/channels/src/components/post_attributes/post_attribute_value_control.tsx b/webapp/channels/src/components/post_attributes/post_attribute_value_control.tsx\nindex 41e76b7298..81b443aab6 100644\n--- a/webapp/channels/src/components/post_attributes/post_attribute_value_control.tsx\n+++ b/webapp/channels/src/components/post_attributes/post_attribute_value_control.tsx\n@@ -15,6 +15,7 @@ import * as Menu from 'components/menu';\n import {resolveOption} from 'utils/property_options';\n \n import PostAttributeText from './post_attribute_text';\n+import {limitTextValue, validateTextValue} from './text_value';\n import {hasValueControl, storedEntries} from './utils';\n \n /*\n@@ -284,6 +285,10 @@ function OptionMenu({field, value, disabled, onChange, ariaLabel, renderValue, a\n  * Enter blurs rather than writing directly, so blur stays the single commit path\n  * and Enter cannot fire a second PATCH on the way out.\n  *\n+ * Input stops at the server's length limit, and a value the field's\n+ * `value_type` refuses is never committed: it stays in the input with an\n+ * inline error, rather than failing the send or the PATCH.\n+ *\n  * A bare `<input>` rather than the `Input` widget: that widget draws a bordered\n  * fieldset, which would make one row of the modal a form control while every\n  * other row is a line of text. The styling matches the option menu's trigger, so\n@@ -291,11 +296,20 @@ function OptionMenu({field, value, disabled, onChange, ariaLabel, renderValue, a\n  * under the pointer.\n  */\n function TextInput({field, value, disabled, onChange, autoOpen}: Props) {\n+    const {formatMessage} = useIntl();\n     const instanceId = useId();\n     const stored = storedText(value);\n     const [draft, setDraft] = useState(stored);\n     const inputRef = useRef<HTMLInputElement>(null);\n \n+    // Shown from the first attempt to commit rather than on the first\n+    // keystroke, so a half-typed address isn't flagged; it then follows the\n+    // draft and goes away once the draft is fixed.\n+    const [showError, setShowError] = useState(false);\n+    const error = showError ? validateTextValue(field, draft) : undefined;\n+    const inputId = `postAttributeValueInput-${field.id}-${instanceId}`;\n+    const errorId = `${inputId}-error`;\n+\n     // Focused from an effect rather than through `autoFocus`, which also\n     // steals focus on any page load that happens to mount the input; this\n     // only fires for the field the composer's picker just added.\n@@ -305,34 +319,63 @@ function TextInput({field, value, disabled, onChange, autoOpen}: Props) {\n         }\n     }, [autoOpen]);\n \n-    const handleBlur = useCallback(() => {\n+    const handleBlur = useCallback((event: React.FocusEvent<HTMLInputElement>) => {\n+        if (validateTextValue(field, draft)) {\n+            setShowError(true);\n+\n+            // Keeps the composer's chip from returning to rest, which would\n+            // drop the draft along with its error.\n+            event.stopPropagation();\n+            return;\n+        }\n+\n         if (draft !== stored) {\n             onChange(field.id, draft);\n         }\n-    }, [draft, stored, field.id, onChange]);\n+    }, [draft, stored, field, onChange]);\n \n     const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLInputElement>) => {\n-        if (event.key === 'Enter') {\n-            event.preventDefault();\n-            event.currentTarget.blur();\n+        if (event.key !== 'Enter') {\n+            return;\n         }\n-    }, []);\n+\n+        event.preventDefault();\n+        if (validateTextValue(field, draft)) {\n+            setShowError(true);\n+            return;\n+        }\n+        event.currentTarget.blur();\n+    }, [field, draft]);\n \n     return (\n-        <input\n-            id={`postAttributeValueInput-${field.id}-${instanceId}`}\n-            name={`postAttributeValueInput-${field.name}`}\n-            data-testid={`post-attribute-input-${field.name}`}\n-            type='text'\n-            className='PostAttributesModalRow__input'\n-            value={draft}\n-            disabled={disabled}\n-            aria-label={getPropertyFieldLabel(field)}\n-            ref={inputRef}\n-            onChange={(event) => setDraft(event.target.value)}\n-            onBlur={handleBlur}\n-            onKeyDown={handleKeyDown}\n-        />\n+        <span className='PostAttributesModalRow__textField'>\n+            <input\n+                id={inputId}\n+                name={`postAttributeValueInput-${field.name}`}\n+                data-testid={`post-attribute-input-${field.name}`}\n+                type='text'\n+                className='PostAttributesModalRow__input'\n+                value={draft}\n+                disabled={disabled}\n+                aria-label={getPropertyFieldLabel(field)}\n+                aria-invalid={error ? true : undefined}\n+                aria-describedby={error ? errorId : undefined}\n+                ref={inputRef}\n+                onChange={(event) => setDraft(limitTextValue(event.target.value))}\n+                onBlur={handleBlur}\n+                onKeyDown={handleKeyDown}\n+            />\n+            {error && (\n+                <span\n+                    id={errorId}\n+                    className='PostAttributesModalRow__inputError'\n+                    data-testid={`post-attribute-input-error-${field.name}`}\n+                    role='alert'\n+                >\n+                    {formatMessage(error)}\n+                </span>\n+            )}\n+        </span>\n     );\n }\ndiff --git a/webapp/channels/src/components/post_attributes/text_value.ts b/webapp/channels/src/components/post_attributes/text_value.ts\nnew file mode 100644\nindex 0000000000..1bad76a4a9\n--- /dev/null\n+++ b/webapp/channels/src/components/post_attributes/text_value.ts\n@@ -0,0 +1,130 @@\n+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.\n+// See LICENSE.txt for license information.\n+\n+import {defineMessages} from 'react-intl';\n+import type {MessageDescriptor} from 'react-intl';\n+\n+import type {PropertyField} from '@mattermost/types/properties';\n+\n+// The server's `PropertyFieldValueTypeTextMaxLength`, which counts UTF-8 bytes\n+// of the trimmed value. An input's `maxLength` counts UTF-16 code units, so it\n+// lets through multibyte text the server refuses.\n+export const TEXT_VALUE_MAX_BYTES = 64;\n+\n+const messages = defineMessages({\n+    invalidEmail: {\n+        id: 'post_attributes.text_value.invalid_email',\n+        defaultMessage: 'Enter a valid email address',\n+        description: 'Inline error under a post attribute text input whose attribute holds an email address, shown when the value typed is not one.',\n+    },\n+    uppercaseEmail: {\n+        id: 'post_attributes.text_value.uppercase_email',\n+        defaultMessage: 'Use lowercase letters only',\n+        description: 'Inline error under a post attribute text input whose attribute holds an email address, shown when the value typed contains uppercase letters, which are not accepted.',\n+    },\n+    invalidUrl: {\n+        id: 'post_attributes.text_value.invalid_url',\n+        defaultMessage: 'Enter a valid URL, such as https://example.com',\n+        description: 'Inline error under a post attribute text input whose attribute holds a URL, shown when the value typed is not a full URL.',\n+    },\n+});\n+\n+function utf8ByteLength(text: string): number {\n+    let bytes = 0;\n+    for (const char of text) {\n+        const codePoint = char.codePointAt(0)!;\n+        if (codePoint < 0x80) {\n+            bytes += 1;\n+        } else if (codePoint < 0x800) {\n+            bytes += 2;\n+        } else if (codePoint < 0x10000) {\n+            bytes += 3;\n+        } else {\n+            bytes += 4;\n+        }\n+    }\n+    return bytes;\n+}\n+\n+/**\n+ * Cuts typed or pasted text down to what the server accepts, whole characters\n+ * at a time so a multibyte character is never split.\n+ */\n+export function limitTextValue(text: string): string {\n+    if (utf8ByteLength(text.trim()) <= TEXT_VALUE_MAX_BYTES) {\n+        return text;\n+    }\n+\n+    let kept = '';\n+    for (const char of text) {\n+        if (utf8ByteLength((kept + char).trim()) > TEXT_VALUE_MAX_BYTES) {\n+            break;\n+        }\n+        kept += char;\n+    }\n+    return kept;\n+}\n+\n+// `model.IsValidEmail` takes only a bare `local@domain` that Go's `net/mail`\n+// parses back unchanged: both halves dot-atoms, so no spaces, specials, or\n+// empty or doubled dots. The domain may also be a bracketed IPv4 address.\n+const ATOM = '[^\\\\x00-\\\\x20\\\\x7f()<>\\\\[\\\\]:;@\\\\\\\\,\".]+';\n+const DOT_ATOM = `${ATOM}(?:\\\\.${ATOM})*`;\n+const IPV4_OCTET = '(?:25[0-5]|2[0-4]\\\\d|1\\\\d\\\\d|[1-9]?\\\\d)';\n+const IPV4_LITERAL = `\\\\[(?:${IPV4_OCTET}\\\\.){3}${IPV4_OCTET}\\\\]`;\n+const EMAIL_PATTERN = new RegExp(`^${DOT_ATOM}@(?:${DOT_ATOM}|${IPV4_LITERAL})$`);\n+\n+// `new URL` repairs `https:example.com` into a URL with a host, which Go's\n+// `url.ParseRequestURI` does not, so the `//` is required up front.\n+const URL_PREFIX_PATTERN = /^[a-z][a-z\\d+.-]*:\\/\\//i;\n+\n+// Go accepts an IPv6 zone in the host (`[fe80::1%25eth0]`), which `new URL`\n+// refuses, so the zone is dropped before the check.\n+const IPV6_ZONE_PATTERN = /^([a-z][a-z\\d+.-]*:\\/\\/[^/?#]*\\[[\\da-f:.]+)%25[\\w.~-]+\\]/i;\n+\n+// Go refuses a `%` that does not start a two-digit escape anywhere before the\n+// query, which `new URL` tolerates.\n+const MALFORMED_ESCAPE_PATTERN = /%(?![\\da-f]{2})/i;\n+\n+function isValidUrl(text: string): boolean {\n+    if (!URL_PREFIX_PATTERN.test(text)) {\n+        return false;\n+    }\n+\n+    const withoutZone = text.replace(IPV6_ZONE_PATTERN, '$1]');\n+    if (MALFORMED_ESCAPE_PATTERN.test(withoutZone.split('?')[0])) {\n+        return false;\n+    }\n+\n+    try {\n+        return new URL(withoutZone).host !== '';\n+    } catch {\n+        return false;\n+    }\n+}\n+\n+/**\n+ * Why the server would refuse this text for the field's `value_type`, or\n+ * undefined when it would accept it. An empty value is always accepted.\n+ */\n+export function validateTextValue(field: PropertyField, text: string): MessageDescriptor | undefined {\n+    const trimmed = text.trim();\n+    if (!trimmed) {\n+        return undefined;\n+    }\n+\n+    switch (field.attrs?.value_type) {\n+    case 'email':\n+        if (!EMAIL_PATTERN.test(trimmed)) {\n+            return messages.invalidEmail;\n+        }\n+        if (trimmed !== trimmed.toLowerCase()) {\n+            return messages.uppercaseEmail;\n+        }\n+        return undefined;\n+    case 'url':\n+        return isValidUrl(trimmed) ? undefined : messages.invalidUrl;\n+    default:\n+        return undefined;\n+    }\n+}",
+  "callers": [
+   {
+    "file": "webapp/channels/src/components/user_settings/plugin/plugin_setting.tsx",
+    "symbol": "error",
+    "lines": "59-71",
+    "hop": 1,
+    "entry_point": true,
+    "enclosing": "PluginSetting",
+    "source": "   59                  name: key,\n   60                  value: toUpdate.current[key],\n   61              });\n   62          }\n   63  \n   64          if (preferences.length) {\n   65              // Save preferences does not offer any await strategy or error handling\n   66              // so I am leaving this as is for now. We probably should update save\n   67              // preferences and handle any kind of error or network delay here.\n   68              dispatch(savePreferences(userId, preferences));\n   69              section.onSubmit?.(toUpdate.current);\n   70          }\n   71  "
+   },
+   {
+    "file": "webapp/channels/scripts/formatter.js",
+    "symbol": "char",
+    "lines": "74-86",
+    "hop": 1,
+    "entry_point": false,
+    "enclosing": "readCatalog",
+    "source": "   74  /**\n   75   * Custom comparator for case-insensitive alphabetical sorting\n   76   * with underscore before dot (to match existing en.json ordering)\n   77   */\n   78  module.exports.compareMessages = (el1, el2) => {\n   79      // Normalize keys: replace _ with a character that sorts before .\n   80      // Use \\x00 (null char) which sorts before all printable characters\n   81      const key1 = el1.key.toLowerCase().replace(/_/g, '\\x00');\n   82      const key2 = el2.key.toLowerCase().replace(/_/g, '\\x00');\n   83  \n   84      if (key1 < key2) {\n   85          return -1;\n   86      }"
+   },
+   {
+    "file": "webapp/channels/src/utils/text_formatting.tsx",
+    "symbol": "codePoint",
+    "lines": "1083-1095",
+    "hop": 1,
+    "entry_point": false,
+    "enclosing": "handleUnicodeEmoji",
+    "source": " 1083      output = output.replace(searchPattern, (emojiMatch) => {\n 1084          // convert unicode character to hex string\n 1085          const codePoints = [fixedCharCodeAt(emojiMatch, 0)];\n 1086  \n 1087          if (emojiMatch.length > 1) {\n 1088              for (let i = 1; i < emojiMatch.length; i++) {\n 1089                  const codePoint = fixedCharCodeAt(emojiMatch, i);\n 1090                  if (codePoint === -1) {\n 1091                      // Not a complete character\n 1092                      continue;\n 1093                  }\n 1094  \n 1095                  codePoints.push(codePoint);"
+   },
+   {
+    "file": "webapp/channels/src/utils/password.tsx",
+    "symbol": "errorId",
+    "lines": "7-19",
+    "hop": 1,
+    "entry_point": false,
+    "enclosing": "isValidPassword",
+    "source": "    7  \n    8  import type {PasswordConfig} from 'mattermost-redux/selectors/entities/general';\n    9  \n   10  import Constants from 'utils/constants';\n   11  \n   12  export function isValidPassword(password: string, passwordConfig: PasswordConfig, intl?: IntlShape) {\n   13      let errorId: keyof typeof passwordErrors = 'passwordError';\n   14      let valid = true;\n   15      const minimumLength = passwordConfig.minimumLength || Constants.MIN_PASSWORD_LENGTH;\n   16  \n   17      if (password.length < minimumLength || password.length > Constants.MAX_PASSWORD_LENGTH) {\n   18          valid = false;\n   19      }"
+   },
+   {
+    "file": "webapp/channels/src/components/advanced_text_editor/advanced_text_editor.tsx",
+    "symbol": "handleBlur",
+    "lines": "639-651",
+    "hop": 1,
+    "entry_point": false,
+    "source": "  639      }, []);\n  640  \n  641      const handleHeightChange = useCallback((height: number, maxHeight: number) => {\n  642          setRenderScrollbar(height > maxHeight);\n  643      }, []);\n  644  \n  645      const handleBlur = useCallback(() => {\n  646          lastBlurAt.current = Date.now();\n  647          setKeepEditorInFocus(false);\n  648      }, []);\n  649  \n  650      const handleFocus = useCallback(() => {\n  651          setKeepEditorInFocus(true);"
+   },
+   {
+    "file": "webapp/channels/src/components/admin_console/boolean_setting.tsx",
+    "symbol": "inputId",
+    "lines": "80-92",
+    "hop": 1,
+    "entry_point": false,
+    "enclosing": "BooleanSetting",
+    "source": "   80  \n   81      const isDisabled = disabled || setByEnv;\n   82  \n   83      return (\n   84          <SettingSet\n   85              helpText={helptext}\n   86              inputId={id}\n   87              label={label}\n   88              setByEnv={setByEnv}\n   89          >\n   90              <BooleanRadioGroup>\n   91                  <Radio\n   92                      data-testid={id + 'true'}"
+   },
+   {
+    "file": "webapp/channels/src/utils/url.tsx",
+    "symbol": "isValidUrl",
+    "lines": "279-291",
+    "hop": 1,
+    "entry_point": false,
+    "enclosing": "isValidUrl",
+    "source": "  279  \n  280      const regexp = new RegExp(`^(${siteURL})?/[a-z0-9]+([a-z\\\\-0-9]+|(__)?)[a-z0-9]+/pl/\\\\w+`, 'gu');\n  281  \n  282      return isInternalURL(url, siteURL) && (regexp.test(url));\n  283  }\n  284  \n  285  export function isValidUrl(url = '') {\n  286      const regex = /^https?:\\/\\//i;\n  287      return regex.test(url);\n  288  }\n  289  \n  290  export function isStringContainingUrl(text: string): boolean {\n  291      const regex = new RegExp('(https?://|www.)');"
+   },
+   {
+    "file": "webapp/channels/src/actions/global_actions.tsx",
+    "symbol": "messages",
+    "lines": "127-139",
+    "hop": 1,
+    "entry_point": false,
+    "enclosing": "setLastUnreadChannel",
+    "source": "  127      if (member && messageCount) {\n  128          const crtEnabled = isCollapsedThreadsEnabled(state);\n  129  \n  130          const unreadCount = calculateUnreadCount(messageCount, member, crtEnabled);\n  131  \n  132          hadMentions = unreadCount.mentions > 0;\n  133          hadUnreads = unreadCount.showUnread && unreadCount.messages > 0;\n  134      }\n  135  \n  136      return {\n  137          type: ActionTypes.SET_LAST_UNREAD_CHANNEL,\n  138          channelId: channel.id,\n  139          hadMentions,"
+   }
+  ],
+  "candidates": [
+   {
+    "id": "webapp/channels/src/components/post_attributes/hunt_a.test.tsx::HuntA HuntA_legacy_stored_value_left_unchanged_is_not_flagged_or_trapped",
+    "source": "A",
+    "mechanical_verdict": "NEW_API",
+    "repro_cmd": "cd webapp/channels && npx jest src/components/post_attributes/hunt_a.test.tsx -t \"HuntA HuntA_legacy_stored_value_left_unchanged_is_not_flagged_or_trapped\"",
+    "head_failure": "Error: expect(received).toEqual(expected) // deep equality\n\n- Expected - 2\n+ Received + 2\n\n Object {\n- \"alert\": false,\n+ \"alert\": true,\n \"calls\": 0,\n- \"parentBlur\": 1,\n+ \"parentBlur\": 0,\n \"stored\": \"not a url\",\n \"value\": \"not a url\",\n \"valueType\": \"url\",\n }",
+    "diagnostic_v_results": {
+     "run_V": {},
+     "base_V": {}
+    },
+    "test_source": "\n                throw new Error(`seed=${seed} iteration=${i} input=${JSON.stringify(text)} observed=${JSON.stringify(observed)} expected=${JSON.stringify({shown: expected, calls: expectedCalls})}`);\n            }\n        }\n    });\n\n    test('HuntA_legacy_stored_value_left_unchanged_is_not_flagged_or_trapped', () => {\n        // Values stored before the field had a value_type (or before it was\n        // changed), which the user only tabs through without editing.\n        const cases: Array<[string, string]> = [\n            ['url', 'not a url'],\n            ['url', 'example.com'],\n            ['email', 'Foo@Bar.com'],\n            ['email', 'someone at example dot com'],\n        ];\n\n        for (const [valueType, stored] of cases) {\n            const onChange = jest.fn();\n            const parentBlur = jest.fn();\n            const {unmount} = renderWithContext(\n                <div onBlur={parentBlur}>\n                    <PostAttributeValueControl\n                        field={huntField(valueType)}\n                        value={huntValue(stored)}\n                        disabled={false}\n                        onChange={onChange}\n                    />\n                </div>,\n            );\n\n            const input = screen.getByTestId('post-attribute-input-note') as HTMLInputElement;\n            act(() => {\n                input.focus();\n            });\n            fireEvent.blur(input);\n\n            const observed = {\n                calls: onChange.mock.calls.length,\n                alert: Boolean(screen.queryByRole('alert')),\n                parentBlur: parentBlur.mock.calls.length,\n                value: input.value,\n            };\n            unmount();\n\n            expect({valueType, stored, ...observed}).toEqual({valueType, stored, calls: 0, alert: false, parentBlur: 1, value: stored});\n        }\n    });\n\n    test('HuntA_email_sequence_commits_only_accepted_drafts', () => {\n        const seed = 0x5eed07;\n        const rng = mulberry32(seed);\n\n        for (let run = 0; run < 25; run++) {\n            const onChange = jest.fn();\n            const {unmount} = renderWithContext(\n                <PostAttributeValueControl\n                    field={huntField('email')}\n                    value={undefined}\n                    disabled={false}\n                    onChange={onChange}\n                />,\n            );\n            const input = screen.getByTestId('post-attribute-input-note') as HTMLInputElement;\n\n            let draft = '';\n            const expectedCalls: string[][] = [];\n            const log: string[] = [];\n            const opCount = intBetween(rng, 3, 8);\n\n            for (let step = 0; step < opCount; step++) {\n                const kind = pick(rng, ['set', 'set', 'blur', 'enter']);\n                let failedCommit = false;\n\n                if (kind === 'set') {\n                    const text = pick(rng, [...VALID_EMAILS, ...INVALID_EMAILS, '']);\n                    log.push(`set(${JSON.stringify(text)})`);\n                 \n[truncated]"
+   },
+   {
+    "id": "webapp/channels/src/components/post_attributes/hunt_b.test.tsx::HuntB HuntB_insert_at_limit_does_not_drop_existing_tail",
+    "source": "B",
+    "mechanical_verdict": "NEW_API",
+    "repro_cmd": "cd webapp/channels && npx jest src/components/post_attributes/hunt_b.test.tsx -t \"HuntB HuntB_insert_at_limit_does_not_drop_existing_tail\"",
+    "head_failure": "Error: stored \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaZ\", typed X at start -> input became \"Xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+    "diagnostic_v_results": {
+     "run_V": {},
+     "base_V": {}
+    },
+    "test_source": "\n            throw new Error(`input ${JSON.stringify(typed)} was committed: ${JSON.stringify(onChange.mock.calls)}`);\n        }\n    });\n\n    // \"Input stops at the server's length limit\": a keystroke inserted at the\n    // start of a value already at the limit must not silently drop the tail.\n    test('HuntB_insert_at_limit_does_not_drop_existing_tail', () => {\n        const stored = 'a'.repeat(63) + 'Z';\n        renderControl(huntField(), huntValue(stored));\n        const input = screen.getByTestId('post-attribute-input-contact') as HTMLInputElement;\n        expect(input.value).toBe(stored);\n\n        const attempted = 'X' + stored;\n        fireEvent.change(input, {target: {value: attempted}});\n\n        if (!input.value.endsWith('Z') || input.value.length > 64) {\n            throw new Error(`stored ${JSON.stringify(stored)}, typed X at start -> input became ${JSON.stringify(input.value)}`);\n        }\n    });\n});\n"
+   },
+   {
+    "id": "webapp/channels/src/components/post_attributes/hunt_b.test.tsx::HuntB HuntB_refused_url_value_is_never_committed_on_blur",
+    "source": "B",
+    "mechanical_verdict": "NEW_API",
+    "repro_cmd": "cd webapp/channels && npx jest src/components/post_attributes/hunt_b.test.tsx -t \"HuntB HuntB_refused_url_value_is_never_committed_on_blur\"",
+    "head_failure": "Error: input \"http://example.com/a\\tb\" was committed: [[\"field_text\",\"http://example.com/a\\tb\"]]",
+    "diagnostic_v_results": {
+     "run_V": {},
+     "base_V": {}
+    },
+    "test_source": "\n        if (result?.id !== 'post_attributes.text_value.invalid_url') {\n            throw new Error(`input ${JSON.stringify(input)}: expected invalid_url, got ${JSON.stringify(result)}`);\n        }\n    });\n\n    test('HuntB_refused_url_value_is_never_committed_on_blur', () => {\n        const onChange = renderControl(huntField('url'));\n        const input = screen.getByTestId('post-attribute-input-contact');\n        const typed = 'http://example.com/a' + String.fromCharCode(9) + 'b';\n\n        fireEvent.change(input, {target: {value: typed}});\n        fireEvent.blur(input);\n\n        if (onChange.mock.calls.length) {\n            throw new Error(`input ${JSON.stringify(typed)} was committed: ${JSON.stringify(onChange.mock.calls)}`);\n        }\n    });\n\n    // \"Input stops at the server's length limit\": a keystroke inserted at the\n    // start of a value already at the limit must not silently drop the tail.\n    test('HuntB_insert_at_limit_does_not_drop_existing_tail', () => {\n        const stored = 'a'.repeat(63) + 'Z';\n        renderControl(huntField(), huntValue(stored));\n        const input = screen.getByTestId('post-attribute-input-contact') as HTMLInputElement;\n        expect(input.value).toBe(stored);\n\n        const attempted = 'X' + stored;\n        fireEvent.change(input, {target: {value: attempted}});\n\n        if (!input.value.endsWith('Z') || input.value.length > 64) {\n            throw new Error(`stored ${JSON.stringify(stored)}, typed X at start -> input became ${JSON.stringify(input.value)}`);\n        }\n    });\n});\n"
+   },
+   {
+    "id": "webapp/channels/src/components/post_attributes/hunt_b.test.tsx::HuntB HuntB_url_refuses_backslash_in_authority",
+    "source": "B",
+    "mechanical_verdict": "NEW_API",
+    "repro_cmd": "cd webapp/channels && npx jest src/components/post_attributes/hunt_b.test.tsx -t \"HuntB HuntB_url_refuses_backslash_in_authority\"",
+    "head_failure": "Error: input \"http://example.com\\\\path\": expected invalid_url, got undefined",
+    "diagnostic_v_results": {
+     "run_V": {},
+     "base_V": {}
+    },
+    "test_source": "\n            throw new Error(`validateTextValue(url) accepted hosts Go refuses: ${JSON.stringify(accepted)}`);\n        }\n    });\n\n    // Go reads everything up to the first '/' as the authority, and a backslash\n    // is an invalid host character there; `new URL` treats it as a path slash.\n    test('HuntB_url_refuses_backslash_in_authority', () => {\n        const input = 'http://example.com' + BACKSLASH + 'path';\n        const result = validateTextValue(huntField('url'), input);\n        if (result?.id !== 'post_attributes.text_value.invalid_url') {\n            throw new Error(`input ${JSON.stringify(input)}: expected invalid_url, got ${JSON.stringify(result)}`);\n        }\n    });\n\n    test('HuntB_refused_url_value_is_never_committed_on_blur', () => {\n        const onChange = renderControl(huntField('url'));\n        const input = screen.getByTestId('post-attribute-input-contact');\n        const typed = 'http://example.com/a' + String.fromCharCode(9) + 'b';\n\n        fireEvent.change(input, {target: {value: typed}});\n        fireEvent.blur(input);\n\n        if (onChange.mock.calls.length) {\n            throw new Error(`input ${JSON.stringify(typed)} was committed: ${JSON.stringify(onChange.mock.calls)}`);\n        }\n    });\n\n    // \"Input stops at the server's length limit\": a keystroke inserted at the\n    // start of a value already at the limit must not silently drop the tail.\n    test('HuntB_insert_at_limit_does_not_drop_existing_tail', () => {\n        const stored = 'a'.repeat(63) + 'Z';\n        renderControl(huntField(), huntValue(stored));\n        const input = screen.getByTestId('post-attribute-input-contact') as HTMLInputElement;\n        expect(input.value).toBe(stored);\n\n        const attempted = 'X' + stored;\n        fireEvent.change(input, {target: {value: attempted}});\n\n        if (!input.value.endsWith('Z') || input.value.length > 64) {\n            throw new Error(`stored ${JSON.stringify(stored)}, typed X at start -> input became ${JSON.stringify(input.value)}`);\n        }\n    });\n});\n"
+   },
+   {
+    "id": "webapp/channels/src/components/post_attributes/hunt_b.test.tsx::HuntB HuntB_url_refuses_control_characters_go_refuses",
+    "source": "B",
+    "mechanical_verdict": "NEW_API",
+    "repro_cmd": "cd webapp/channels && npx jest src/components/post_attributes/hunt_b.test.tsx -t \"HuntB HuntB_url_refuses_control_characters_go_refuses\"",
+    "head_failure": "Error: validateTextValue(url) accepted values Go's URL parser refuses: [\"http://example.com/a\\tb\",\"http://example.com/a\\nb\",\"http://example.com/a\\u0001b\",\"http://example.com/a\u007fb\"]",
+    "diagnostic_v_results": {
+     "run_V": {},
+     "base_V": {}
+    },
+    "test_source": "\n    return inputs.filter((input) => validateTextValue(huntField(valueType), input) === undefined);\n}\n\ndescribe('HuntB', () => {\n    // Go's url.Parse/ParseRequestURI refuse any byte < 0x20 or 0x7f anywhere in\n    // the URL; `new URL` strips tabs/newlines and percent-encodes the rest.\n    test('HuntB_url_refuses_control_characters_go_refuses', () => {\n        const inputs = [\n            'http://example.com/a' + String.fromCharCode(9) + 'b',\n            'http://example.com/a' + String.fromCharCode(10) + 'b',\n            'http://example.com/a' + String.fromCharCode(1) + 'b',\n            'http://example.com/a' + String.fromCharCode(0x7f) + 'b',\n        ];\n        const accepted = acceptedOf('url', inputs);\n        if (accepted.length) {\n            throw new Error(`validateTextValue(url) accepted values Go's URL parser refuses: ${JSON.stringify(accepted)}`);\n        }\n    });\n\n    // Go's unescape in host mode refuses %XX escapes of ASCII bytes other than %25;\n    // `new URL` decodes them into the host and accepts.\n    test('HuntB_url_refuses_percent_escaped_ascii_in_host', () => {\n        const inputs = [\n            'http://exa%41mple.com/',\n            'http://%6c%6fcalhost/',\n        ];\n        const accepted = acceptedOf('url', inputs);\n        if (accepted.length) {\n            throw new Error(`validateTextValue(url) accepted hosts Go refuses: ${JSON.stringify(accepted)}`);\n        }\n    });\n\n    // Go reads everything up to the first '/' as the authority, and a backslash\n    // is an invalid host character there; `new URL` treats it as a path slash.\n    test('HuntB_url_refuses_backslash_in_authority', () => {\n        const input = 'http://example.com' + BACKSLASH + 'path';\n        const result = validateTextValue(huntField('url'), input);\n        if (result?.id !== 'post_attributes.text_value.invalid_url') {\n            throw new Error(`input ${JSON.stringify(input)}: expected invalid_url, got ${JSON.stringify(result)}`);\n        }\n    });\n\n    test('HuntB_refused_url_value_is_never_committed_on_blur', () => {\n        const onChange = renderControl(huntField('url'));\n        const input = screen.getByTestId('post-attribute-input-contact');\n        const typed = 'http://example.com/a' + String.fromCharCode(9) + 'b';\n\n        fireEvent.change(input, {target: {value: typed}});\n        fireEvent.blur(input);\n\n        if (onChange.mock.calls.length) {\n            throw new Error(`input ${JSON.stringify(typed)} was committed: ${JSON.stringify(onChange.mock.calls)}`);\n        }\n    });\n\n    // \"Input stops at the server's length limit\": a keystroke inserted at the\n    // start of a value already at the limit must not silently drop the tail.\n    test('HuntB_insert_at_limit_does_not_drop_existing_tail', () => {\n        const stored = 'a'.repeat(63) + 'Z';\n        renderControl(huntField(), huntValue(stored));\n        const input = screen.getByTestId('post-attribute-input-contact') as HTMLInputElement;\n        expect(input.value).toBe(stored);\n\n    \n[truncated]"
+   },
+   {
+    "id": "webapp/channels/src/components/post_attributes/hunt_b.test.tsx::HuntB HuntB_url_refuses_percent_escaped_ascii_in_host",
+    "source": "B",
+    "mechanical_verdict": "NEW_API",
+    "repro_cmd": "cd webapp/channels && npx jest src/components/post_attributes/hunt_b.test.tsx -t \"HuntB HuntB_url_refuses_percent_escaped_ascii_in_host\"",
+    "head_failure": "Error: validateTextValue(url) accepted hosts Go refuses: [\"http://exa%41mple.com/\",\"http://%6c%6fcalhost/\"]",
+    "diagnostic_v_results": {
+     "run_V": {},
+     "base_V": {}
+    },
+    "test_source": "\n            throw new Error(`validateTextValue(url) accepted values Go's URL parser refuses: ${JSON.stringify(accepted)}`);\n        }\n    });\n\n    // Go's unescape in host mode refuses %XX escapes of ASCII bytes other than %25;\n    // `new URL` decodes them into the host and accepts.\n    test('HuntB_url_refuses_percent_escaped_ascii_in_host', () => {\n        const inputs = [\n            'http://exa%41mple.com/',\n            'http://%6c%6fcalhost/',\n        ];\n        const accepted = acceptedOf('url', inputs);\n        if (accepted.length) {\n            throw new Error(`validateTextValue(url) accepted hosts Go refuses: ${JSON.stringify(accepted)}`);\n        }\n    });\n\n    // Go reads everything up to the first '/' as the authority, and a backslash\n    // is an invalid host character there; `new URL` treats it as a path slash.\n    test('HuntB_url_refuses_backslash_in_authority', () => {\n        const input = 'http://example.com' + BACKSLASH + 'path';\n        const result = validateTextValue(huntField('url'), input);\n        if (result?.id !== 'post_attributes.text_value.invalid_url') {\n            throw new Error(`input ${JSON.stringify(input)}: expected invalid_url, got ${JSON.stringify(result)}`);\n        }\n    });\n\n    test('HuntB_refused_url_value_is_never_committed_on_blur', () => {\n        const onChange = renderControl(huntField('url'));\n        const input = screen.getByTestId('post-attribute-input-contact');\n        const typed = 'http://example.com/a' + String.fromCharCode(9) + 'b';\n\n        fireEvent.change(input, {target: {value: typed}});\n        fireEvent.blur(input);\n\n        if (onChange.mock.calls.length) {\n            throw new Error(`input ${JSON.stringify(typed)} was committed: ${JSON.stringify(onChange.mock.calls)}`);\n        }\n    });\n\n    // \"Input stops at the server's length limit\": a keystroke inserted at the\n    // start of a value already at the limit must not silently drop the tail.\n    test('HuntB_insert_at_limit_does_not_drop_existing_tail', () => {\n        const stored = 'a'.repeat(63) + 'Z';\n        renderControl(huntField(), huntValue(stored));\n        const input = screen.getByTestId('post-attribute-input-contact') as HTMLInputElement;\n        expect(input.value).toBe(stored);\n\n        const attempted = 'X' + stored;\n        fireEvent.change(input, {target: {value: attempted}});\n\n        if (!input.value.endsWith('Z') || input.value.length > 64) {\n            throw new Error(`stored ${JSON.stringify(stored)}, typed X at start -> input became ${JSON.stringify(input.value)}`);\n        }\n    });\n});\n"
+   },
+   {
+    "id": "webapp/channels/src/components/post_attributes/hunt_d.test.tsx::HuntD HuntD_PostAttributeValueControl_text",
+    "source": "D",
+    "mechanical_verdict": "DIFF",
+    "repro_cmd": "cd webapp/channels && npx jest src/components/post_attributes/hunt_d.test.tsx -t \"HuntD HuntD_PostAttributeValueControl_text\"",
+    "examples": [
+     {
+      "i": 36,
+      "input": {
+       "disabled": false,
+       "hasStored": true,
+       "ops": [
+        {
+         "kind": "enter"
+        }
+       ],
+       "stored": "Bad Email",
+       "valueType": "url"
+      },
+      "base": {
+       "final": {
+        "ariaInvalid": null,
+        "calls": [],
+        "focused": false,
+        "present": true,
+        "value": "Bad Email"
+       },
+       "steps": [
+        {
+         "ariaInvalid": null,
+         "calls": [],
+         "focused": false,
+         "present": true,
+         "value": "Bad Email"
+        },
+        {
+         "ariaInvalid": null,
+         "calls": [],
+         "focused": false,
+         "present": true,
+         "value": "Bad Email"
+        }
+       ]
+      },
+      "head": {
+       "final": {
+        "ariaInvalid": "true",
+        "calls": [],
+        "focused": true,
+        "present": true,
+        "value": "Bad Email"
+       },
+       "steps": [
+        {
+         "ariaInvalid": null,
+         "calls": [],
+         "focused": false,
+         "present": true,
+         "value": "Bad Email"
+        },
+        {
+         "ariaInvalid": "true",
+         "calls": [],
+         "focused": true,
+         "present": true,
+         "value": "Bad Email"
+        }
+       ]
+      }
+     },
+     {
+      "i": 208,
+      "input": {
+       "disabled": false,
+       "hasStored": true,
+       "ops": [
+        {
+         "kind": "blur"
+        }
+       ],
+       "stored": "Bad Email",
+       "valueType": "email"
+      },
+      "base": {
+       "final": {
+        "ariaInvalid": null,
+        "calls": [],
+        "focused": false,
+        "present": true,
+        "value": "Bad Email"
+       },
+       "steps": [
+        {
+         "ariaInvalid": null,
+         "calls": [],
+         "focused": false,
+         "present": true,
+         "value": "Bad Email"
+        },
+        {
+         "ariaInvalid": null,
+         "calls": [],
+         "focused": false,
+         "present": true,
+         "value": "Bad Email"
+        }
+       ]
+      },
+      "head": {
+       "final": {
+        "ariaInvalid": "true",
+        "calls": [],
+        "focused": false,
+        "present": true,
+        "value": "Bad Email"
+       },
+       "steps": [
+        {
+         "ariaInvalid": null,
+         "calls": [],
+         "focused": false,
+         "present": true,
+         "value": "Bad Email"
+        },
+        {
+         "ariaInvalid": "true",
+         "calls": [],
+         "focused": false,
+         "present": true,
+         "value": "Bad Email"
+        }
+       ]
+      }
+     },
+     {
+      "i": 246,
+      "input": {
+       "disabled": false,
+       "hasStored": true,
+       "ops": [
+        {
+         "kind": "blur"
+        }
+       ],
+       "stored": "foo@bar.com",
+       "valueType": "url"
+      },
+      "base": {
+       "final": {
+        "ariaInvalid": null,
+        "calls": [],
+        "focused": false,
+        "present": true,
+        "value": "foo@bar.com"
+       },
+       "steps": [
+        {
+         "ariaInvalid": null,
+         "calls": [],
+         "focused": false,
+         "present": true,
+         "value": "foo@bar.com"
+        },
+        {
+         "ariaInvalid": null,
+         "calls": [],
+         "focused": false,
+         "present": true,
+         "value": "foo@bar.com"
+        }
+       ]
+      },
+      "head": {
+       "final": {
+        "ariaInvalid": "true",
+        "calls": [],
+        "focused": false,
+        "present": true,
+        "value": "foo@bar.com"
+       },
+       "steps": [
+        {
+         "ariaInvalid": null,
+         "calls": [],
+         "focused": false,
+         "present": true,
+         "value": "foo@bar.com"
+        },
+        {
+         "ariaInvalid": "true",
+         "calls": [],
+         "focused": false,
+         "present": true,
+         "value": "foo@bar.com"
+        }
+       ]
+      }
+     }
+    ],
+    "test_source": "\n        cases.push({hasStored: true, stored: 'hello', disabled: true, valueType: vt, ops: [{kind: 'type', text: 'bye'}, {kind: 'blur'}]});\n    }\n    return cases;\n}\n\ndescribe('HuntD', () => {\n    test('HuntD_PostAttributeValueControl_text', () => {\n        if (typeof PostAttributeValueControl !== 'function') {\n            throw new Error('target missing: PostAttributeValueControl');\n        }\n        const rand = mulberry32(0x5eed1234);\n        const cases: Case[] = edgeCases();\n        for (let k = 0; k < 200; k++) {\n            const changed = k % 2 === 0;\n            const valueType = changed ? pick(rand, ['email', 'url', null, 'email', 'url']) : pick(rand, VALUE_TYPES);\n            const s = pick(rand, STORED);\n            cases.push({\n                valueType,\n                hasStored: s.hasStored,\n                stored: s.stored,\n                disabled: rand() < 0.05,\n                ops: genOps(rand, valueType, changed),\n            });\n        }\n        cases.forEach((c, i) => {\n            huntDRecord('HuntD_PostAttributeValueControl_text', i, c, () => runCase(c));\n        });\n    });\n});\n"
+   }
+  ]
+ }
+}

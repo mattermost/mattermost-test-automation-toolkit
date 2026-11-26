@@ -101,7 +101,11 @@ def hunter_system(mode: str, state: dict[str, Any], ctx: dict[str, Any], strateg
     """System prompt for a hunter. `strategies` adds prompts/strategy_x.md: only first-pass hunters get it, so
     strengthen and repair rounds stay focused on their one job."""
     lang_rules = "".join(prompt(f"lang_{lang}") for lang in langs(state))
-    lesson_text = "" if mode.startswith("D") else lessons.render(lessons.match(ctx))
+    lesson_text = ""
+    if not mode.startswith("D"):
+        known = lessons.load()
+        lesson_text = lessons.render(lessons.match(ctx, known))
+        lesson_text += lessons.render_probes(lessons.probes_for(ctx.get("diff_production_code", ""), known))
     common = prompt("common").replace("{lang_rules}", lang_rules).replace("{lessons}", lesson_text)
     rules = reliability.render(reliability.match(ctx)) if mode.startswith("A") else ""
     extra = prompt("strategy_x") if strategies else ""

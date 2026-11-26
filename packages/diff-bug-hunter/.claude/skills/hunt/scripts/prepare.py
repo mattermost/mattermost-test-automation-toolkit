@@ -4,12 +4,18 @@
 """Step 1: worktrees + infrastructure gate.
 
 usage: prepare.py <pr | base..head | base...head> [--fresh]
-Creates <scratch>/wt<key> at the PR head (or range head) and <scratch>/wt<key>.base at the merge-base, sets up
+Creates <scratch>/wt<key> at the PR head (or range head) and <scratch>/wt<key>.base at the base, sets up
 go.work and webapp node_modules, and checks Postgres + Redis when the diff touches stateful server code. Prints
 INFRA_ERROR and exits 2 on any environment failure.
+Range base: `base..head` (two dots) takes the base ref itself as the base worktree; `base...head` (three dots) takes
+merge-base(base, head), as a PR does.
+prepare.json carries schema_version (SCHEMA_VERSION). A hunt dir prepared by another schema prints SCHEMA_MISMATCH and
+exits 5 instead of resuming, unless --fresh is given.
 Preparing again wipes hunt<key>/. When it already holds hunter responses or verdicts for the current head, that would
 throw away paid-for work (a restarted session does exactly this), so it prints ALREADY_HUNTED and exits 4 instead.
 --fresh starts over anyway; a PR or branch whose head moved starts over without it.
+Postgres and Redis: with a usable docker, containers `hunt-pg` (127.0.0.1:5432) and `hunt-redis` (127.0.0.1:6379) are
+started; without docker, or when their ports are taken, the host's Postgres and Redis are used.
 """
 from __future__ import annotations
 
@@ -45,6 +51,38 @@ from hunt_common import (
     write_json,
 )
 
+SCHEMA_VERSION = 1  # bump when the hunt dir layout or prepare.json changes meaning: resuming an older one is refused
+PG_MAX_CONNECTIONS = 400  # 4 parallel hunts x parallel Go test packages, each with its own pool
+PG_CONTAINER, PG_IMAGE = "hunt-pg", "postgres:18.3"  # the pinned Postgres (CLAUDE.md); mmuser/mostest as start_pg.sh
+REDIS_CONTAINER, REDIS_IMAGE = "hunt-redis", "redis:7"
+
+
+class SchemaMismatch(RuntimeError):
+    """hunt<key>/ was prepared by another schema_version: resuming it could mix layouts. Printed as SCHEMA_MISMATCH."""
+
+
+def check_schema(hdir: Path, head: str, fresh: bool) -> None:
+    """Refuse to resume a preparation of this same head made by another schema. A moved head starts over anyway."""
+    if fresh or not (hdir / "prepare.json").exists():
+        return
+    try:
+        prev = json.loads((hdir / "prepare.json").read_text())
+    except ValueError as e:
+        raise SchemaMismatch(f"{hdir.name}/prepare.json is not JSON; pass --fresh to start over") from e
+    if not isinstance(prev, dict) or prev.get("head") != head:
+        return
+    found = prev.get("schema_version")
+    if found != SCHEMA_VERSION:
+        raise SchemaMismatch(f"{hdir.name}/ was prepared by schema_version {found!r}, this is {SCHEMA_VERSION}: "
+                             "old hunt results are not resumed. Pass --fresh to start over.")
+
+
+def is_two_dot(target: str) -> bool:
+    """`base..head` (two dots, base taken as is) rather than `base...head` (merge-base) or a PR number."""
+    s = str(target).strip()
+    return ".." in s and "..." not in s
+
+
 STATEFUL = ("server/channels/api4/", "server/channels/app/", "server/channels/store/", "server/channels/web/",
             "server/channels/wsapi/")
 
@@ -60,23 +98,28 @@ def _registered_worktrees(repo: Path) -> set[Path]:
     return {Path(line[9:]).resolve() for line in out.splitlines() if line.startswith("worktree ")}
 
 
-def worktrees(repo: Path, head_ref: str, base_ref: str, wt: Path, wt_base: Path) -> str:
-    """Head worktree at head_ref, base worktree at merge-base(head_ref, base_ref). Returns the merge-base sha.
+def worktrees(repo: Path, head_ref: str, base_ref: str, wt: Path, wt_base: Path, *, two_dot: bool = False) -> str:
+    """Head worktree at head_ref, base worktree at merge-base(head_ref, base_ref), or at base_ref itself when
+    two_dot (base_ref is then a commit sha). Returns the base commit sha.
     Re-running resets both to the same commits (no stale hunt files survive)."""
-    mb = git(repo, "merge-base", head_ref, base_ref)
-    git(repo, "worktree", "prune")
-    registered = _registered_worktrees(repo)
+    mb = base_ref if two_dot else git(repo, "merge-base", head_ref, base_ref)
     for path, ref in ((wt, head_ref), (wt_base, mb)):
-        if path.exists():
-            if not (path / ".git").is_file() or path.resolve() not in registered:
-                raise InfraError(f"{path} exists but is not a git worktree of {repo}")
-            # Discard leftovers (an interrupted mutant, hunt files) before switching, or checkout refuses.
-            git(path, "reset", "-q", "--hard")
-            git(path, "clean", "-qfd", "-e", "node_modules", "-e", "go.work*")
-            git(path, "checkout", "-q", "-f", "--detach", ref)
-        else:
-            git(repo, "worktree", "add", "-q", "--detach", str(path), ref)
+        worktree(repo, path, ref)
     return mb
+
+
+def worktree(repo: Path, path: Path, ref: str) -> None:
+    """One detached worktree at ref, created or reset (no stale hunt files survive)."""
+    git(repo, "worktree", "prune")
+    if path.exists():
+        if not (path / ".git").is_file() or path.resolve() not in _registered_worktrees(repo):
+            raise InfraError(f"{path} exists but is not a git worktree of {repo}")
+        # Discard leftovers (an interrupted mutant, hunt files) before switching, or checkout refuses.
+        git(path, "reset", "-q", "--hard")
+        git(path, "clean", "-qfd", "-e", "node_modules", "-e", "go.work*")
+        git(path, "checkout", "-q", "-f", "--detach", ref)
+    else:
+        git(repo, "worktree", "add", "-q", "--detach", str(path), ref)
 
 
 def go_work(wt: Path) -> None:
@@ -87,7 +130,59 @@ def go_work(wt: Path) -> None:
             sh(["go", "work", "init", *mods], wt)
 
 
+def docker_usable() -> bool:
+    if not shutil.which("docker"):
+        return False
+    return sh(["docker", "info", "--format", "{{.ServerVersion}}"], Path("."), check=False).returncode == 0
+
+
+def _container_running(name: str) -> bool | None:
+    """True/False for an existing container's state, None when it does not exist."""
+    p = sh(["docker", "inspect", "-f", "{{.State.Running}}", name], Path("."), check=False)
+    return None if p.returncode != 0 else p.stdout.strip() == "true"
+
+
+def _ensure_container(name: str, run_args: list[str]) -> None:
+    state = _container_running(name)
+    if state is None:
+        sh(["docker", "run", "-d", "--name", name, *run_args], Path("."))
+    elif not state:
+        sh(["docker", "start", name], Path("."))
+
+
+def _docker_services() -> None:
+    """Postgres and Redis in containers on fixed loopback ports, with the role and database the Mattermost tests use.
+
+    Parallel hunts share this server but not test data: each Mattermost test package creates its own randomly named
+    database (server/channels/store/storetest/settings.go, `"db" + model.NewId()`). What they do share is the
+    connection limit, so the container raises max_connections from Postgres's default of 100 to PG_MAX_CONNECTIONS.
+    The setting applies when the container is created; remove an older hunt-pg container to pick it up."""
+    _ensure_container(PG_CONTAINER, ["-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-p", "127.0.0.1:5432:5432", PG_IMAGE,
+                                     "-c", f"max_connections={PG_MAX_CONNECTIONS}"])
+    # One bounded readiness poll (60 s) inside the container's shell: a wait for startup, not a retry of a test.
+    poll = ("i=0; until pg_isready -h localhost -U postgres -q; do i=$((i+1)); "
+            "[ $i -ge 60 ] && exit 1; done; exit 0")
+    if sh(["docker", "exec", PG_CONTAINER, "sh", "-c", poll], Path("."), check=False).returncode != 0:
+        raise InfraError(f"Postgres container {PG_CONTAINER} not ready after 60s")
+    psql = ["docker", "exec", PG_CONTAINER, "psql", "-h", "localhost", "-U", "postgres"]
+    if sh([*psql, "-tAc", "SELECT 1 FROM pg_roles WHERE rolname='mmuser'"], Path("."), check=False).stdout.strip() != "1":
+        sh([*psql, "-qc", "CREATE ROLE mmuser LOGIN SUPERUSER PASSWORD 'mostest'"], Path("."))
+    if sh([*psql, "-tAc", "SELECT 1 FROM pg_database WHERE datname='mattermost_test'"], Path("."),
+          check=False).stdout.strip() != "1":
+        sh([*psql, "-qc", "CREATE DATABASE mattermost_test OWNER mmuser"], Path("."))
+    _ensure_container(REDIS_CONTAINER, ["-p", "127.0.0.1:6379:6379", REDIS_IMAGE])
+    poll = "i=0; until [ \"$(redis-cli ping)\" = PONG ]; do i=$((i+1)); [ $i -ge 30 ] && exit 1; done; exit 0"
+    if sh(["docker", "exec", REDIS_CONTAINER, "sh", "-c", poll], Path("."), check=False).returncode != 0:
+        raise InfraError(f"Redis container {REDIS_CONTAINER} did not answer PING")
+
+
 def services_up() -> None:
+    if docker_usable():
+        try:
+            _docker_services()
+            return
+        except InfraError as e:  # e.g. the fixed port is held by a host Postgres: the host tools below serve instead
+            print(f"note: docker services unavailable ({str(e).splitlines()[0][:200]}); using host Postgres and Redis")
     if sh(["pg_isready", "-h", "localhost"], Path("."), check=False).returncode != 0:
         sh(["bash", str(SKILL_DIR / "scripts" / "start_pg.sh")], SKILL_DIR, timeout=300)
     if sh(["pg_isready", "-h", "localhost"], Path("."), check=False).returncode != 0:
@@ -184,10 +279,19 @@ def main(pr: str, fresh: bool = False) -> None:
 
 
 def resolve_ref(mm: Path, ref: str) -> str:
-    """Resolve a branch, tag, or commit sha in `mm`, fetching it from origin when available."""
-    p = sh(git_cmd("fetch", "-q", "origin", ref), mm, check=False)
+    """Resolve a branch, tag, or commit sha in `mm`, fetching it from origin when available.
+
+    A commit sha already in the clone is used as is. Anything else is fetched into its own ref
+    (refs/hunt-fetch/<hash of ref>) and read back from there, never from FETCH_HEAD: fetching an object the clone
+    already has can leave FETCH_HEAD without it, and hunts running in parallel share the clone's FETCH_HEAD."""
+    if all(c in "0123456789abcdef" for c in ref.lower()) and len(ref) >= 7:
+        q = sh(git_cmd("rev-parse", "-q", "--verify", f"{ref}^{{commit}}"), mm, check=False)
+        if q.returncode == 0:
+            return q.stdout.strip()
+    local = f"refs/hunt-fetch/{hashlib.sha256(ref.encode()).hexdigest()[:16]}"
+    p = sh(git_cmd("fetch", "-q", "origin", f"+{ref}:{local}"), mm, check=False)
     if p.returncode == 0:
-        return git(mm, "rev-parse", "FETCH_HEAD^{commit}")
+        return git(mm, "rev-parse", f"{local}^{{commit}}")
     for cand in (ref, f"origin/{ref}", f"refs/tags/{ref}", f"refs/remotes/origin/{ref}"):
         q = sh(git_cmd("rev-parse", "-q", "--verify", f"{cand}^{{commit}}"), mm, check=False)
         if q.returncode == 0:
@@ -202,6 +306,7 @@ def prepare(pr: str, fresh: bool = False) -> None:
     wt, wt_base = worktree_paths(pr)
     if rng is not None:
         base_spec, head_spec = rng
+        two_dot = is_two_dot(pr)
         mm = mm_clone()
         ensure_clone(mm)
         base_sha = resolve_ref(mm, base_spec)
@@ -211,15 +316,17 @@ def prepare(pr: str, fresh: bool = False) -> None:
             raise AlreadyHunted(f"{hdir.name}/ already has results for head {head_sha[:10]}: {', '.join(done)}. "
                                 "Do not start over: continue from the first step whose output is missing, or report. "
                                 "Pass --fresh only if the user asked for a new hunt.")
+        check_schema(hdir, head_sha, fresh)
         reset_hunt_dir(hdir, include_whole_pr=True)
         (hdir / "prepare.json").unlink(missing_ok=True)
-        mb = worktrees(mm, head_sha, base_sha, wt, wt_base)
+        mb = worktrees(mm, head_sha, base_sha, wt, wt_base, two_dot=two_dot)
         go_changed, web_changed = deps(mm, wt, wt_base, mb, head_sha)
-        write_json(hdir / "prepare.json", {"pr": pr, "range": [base_spec, head_spec], "repo": str(mm),
+        write_json(hdir / "prepare.json", {"schema_version": SCHEMA_VERSION, "pr": pr, "range": [base_spec, head_spec],
+                                           "base_mode": "two-dot" if two_dot else "merge-base", "repo": str(mm),
                                            "wt": str(wt), "wt_base": str(wt_base), "head": head_sha,
                                            "merge_base": mb, "base_ref": base_spec})
-        print(f"ready: head {wt} ({head_spec} @ {head_sha[:10]})  base {wt_base} ({base_spec} @ {mb[:10]})  "
-              f"go={go_changed} webapp={web_changed}")
+        print(f"ready: head {wt} ({head_spec} @ {head_sha[:10]})  base {wt_base} ({base_spec} @ {mb[:10]}, "
+              f"{'two-dot' if two_dot else 'merge-base'})  go={go_changed} webapp={web_changed}")
         return
     meta = pr_meta(pr)
     done = [] if fresh else existing_results(hdir, meta["head"]["sha"])
@@ -227,6 +334,7 @@ def prepare(pr: str, fresh: bool = False) -> None:
         raise AlreadyHunted(f"hunt{pr}/ already has results for head {meta['head']['sha'][:10]}: {', '.join(done)}. "
                             "Do not start over: continue from the first step whose output is missing, or report. "
                             "Pass --fresh only if the user asked for a new hunt.")
+    check_schema(hdir, meta["head"]["sha"], fresh)
     # The worktrees are about to move: context, responses and verdicts from the previous preparation no longer apply.
     reset_hunt_dir(hdir, include_whole_pr=True)
     (hdir / "prepare.json").unlink(missing_ok=True)
@@ -237,9 +345,9 @@ def prepare(pr: str, fresh: bool = False) -> None:
     git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", f"+{base}:refs/remotes/origin/{base}")
     mb = worktrees(mm, f"pr-{pr}", f"origin/{base}", wt, wt_base)
     go_changed, web_changed = deps(mm, wt, wt_base, mb, f"pr-{pr}")
-    write_json(hdir / "prepare.json", {"pr": pr, "repo": str(mm), "wt": str(wt), "wt_base": str(wt_base),
-                                       "head": git(mm, "rev-parse", f"pr-{pr}"), "merge_base": mb,
-                                       "base_ref": base})
+    write_json(hdir / "prepare.json", {"schema_version": SCHEMA_VERSION, "pr": pr, "repo": str(mm), "wt": str(wt),
+                                       "wt_base": str(wt_base), "head": git(mm, "rev-parse", f"pr-{pr}"),
+                                       "merge_base": mb, "base_ref": base})
     print(f"ready: head {wt}  base {wt_base} ({base} @ {mb[:10]})  go={go_changed} webapp={web_changed}")
 
 
@@ -251,6 +359,9 @@ if __name__ == "__main__":
     except AlreadyHunted as e:
         print(f"ALREADY_HUNTED {e}")
         sys.exit(4)
+    except SchemaMismatch as e:
+        print(f"SCHEMA_MISMATCH {e}")
+        sys.exit(5)
     except InfraError as e:
         print(f"INFRA_ERROR {e}")
         sys.exit(2)

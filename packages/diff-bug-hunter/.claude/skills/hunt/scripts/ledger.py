@@ -23,10 +23,12 @@ from pathlib import Path
 from typing import Any
 
 from hunt_common import InfraError, hunt_dir, load_json, read_state, scratch, target_key, under, write_json
+from verdict import admissibility
+from verdicts import Verdict
 
-_BAD_RUN = frozenset({"FLAKY", "SKIP", "(package failed)"})
-_BAD_BASE = frozenset({"NEW_API", "BASE_UNCOMPILABLE", "BASE_FAILS_DIFFERENTLY", "NOT_RUN_ON_BASE", "UNVETTED"})
-_BAD_DIFF = frozenset({"RECORDER_FAILED", "BASE_FAILED", "BASE_UNCOMPILABLE", "NO_RECORDS", "NONDETERMINISTIC"})
+_BAD_RUN = frozenset({Verdict.FLAKY, Verdict.SKIP, "(package failed)"})
+_BAD_BASE = frozenset({Verdict.NEW_API, Verdict.BASE_UNCOMPILABLE, Verdict.BASE_FAILS_DIFFERENTLY, Verdict.NOT_RUN_ON_BASE, Verdict.UNVETTED})
+_BAD_DIFF = frozenset({Verdict.RECORDER_FAILED, Verdict.BASE_FAILED, Verdict.BASE_UNCOMPILABLE, Verdict.NO_RECORDS, Verdict.NONDETERMINISTIC})
 
 
 def ledger_path(override: Path | None = None) -> Path:
@@ -82,9 +84,9 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
             head_fails: set[str] = set()
             if isinstance(run_data, dict):
                 for k, v in run_data.items():
-                    if v == "PASS":
+                    if v == Verdict.PASS:
                         counts["pass"] += 1
-                    elif v == "FAIL_3_OF_3":
+                    elif v == Verdict.FAIL_3_OF_3:
                         counts["fail_3_of_3"] += 1
                         head_fails.add(str(k))
                     if v in _BAD_RUN or "::(package failed)" in str(k):
@@ -94,21 +96,21 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
 
             base_data = _read_optional_json(bdir / f"base_{tag}.json")
             if isinstance(base_data, dict):
-                if head_fails and any(str(base_data.get(t, "")) not in ("NEW_PR_BUG", "PRE_EXISTING") for t in head_fails):
+                if head_fails and any(str(base_data.get(t, "")) not in (Verdict.NEW_PR_BUG, Verdict.PRE_EXISTING) for t in head_fails):
                     mode_gaps = True
                 for tname, v in base_data.items():
                     if tname in ("*", "detail", "new_api"):
                         if tname == "*" and v in _BAD_BASE:
                             mode_gaps = True
                         continue
-                    if v == "NEW_PR_BUG":
+                    if v == Verdict.NEW_PR_BUG:
                         counts["new_pr_bug"] += 1
                         caught_by_tag[tag].add(tname)
-                    elif v == "NEW_API":
+                    elif v == Verdict.NEW_API:
                         counts["new_api"] += 1
                         caught_by_tag[tag].add(tname)
                         mode_gaps = True
-                    elif v == "PRE_EXISTING":
+                    elif v == Verdict.PRE_EXISTING:
                         counts["pre_existing"] += 1
                     elif v in _BAD_BASE:
                         mode_gaps = True
@@ -116,9 +118,14 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
             elif head_fails:
                 mode_gaps = True
 
+        d_resp = _read_optional_dict(bdir / "D" / "response.json")
+        if (bdir / "D" / "response.json").exists() and not d_resp.get("files"):
+            mode_gaps = True
         diff_data = _read_optional_json(bdir / "diff_D.json")
         if isinstance(diff_data, dict):
-            counts["diff"] += sum(1 for v in diff_data.values() if v == "DIFF")
+            if not diff_data:
+                mode_gaps = True
+            counts["diff"] += sum(1 for v in diff_data.values() if v == Verdict.DIFF)
             if any(v in _BAD_DIFF for v in diff_data.values()):
                 mode_gaps = True
         else:
@@ -149,10 +156,10 @@ def _skipped_info(hdir: Path) -> tuple[int, dict[str, str]]:
     return deferred, reasons
 
 
-def _confidence_tier(hdir: Path, counts: dict[str, int],
-                     reached: int, executable: int, deferred_count: int,
-                     batches_hunted: int, batches_total: int,
-                     mode_gaps: bool, verdicts: dict[str, Any]) -> str:
+def _tier_and_gaps(hdir: Path, counts: dict[str, int],
+                   reached: int, executable: int, deferred_count: int,
+                   batches_hunted: int, batches_total: int,
+                   mode_gaps: bool, verdicts: dict[str, Any]) -> tuple[str, list[str]]:
     pr_tests_data = _read_optional_dict(hdir / "pr_tests.json")
     old_tests_data = _read_optional_dict(hdir / "old_tests.json")
     pr_tests_map = pr_tests_data.get("tests")
@@ -161,40 +168,46 @@ def _confidence_tier(hdir: Path, counts: dict[str, int],
     old_vals = set(old_tests_map.values()) if isinstance(old_tests_map, dict) else set()
 
     has_r_bug = any(
-        isinstance(e, dict) and e.get("verdict") == "PROVEN" and e.get("base_verdict") == "NEW_PR_BUG"
+        isinstance(e, dict) and e.get("verdict") == Verdict.PROVEN and e.get("base_verdict") == Verdict.NEW_PR_BUG
         for e in verdicts.values()
     )
-    if (
+    raw_bug = (
         counts["new_pr_bug"] > 0
         or has_r_bug
-        or "PR_TEST_FAILS_UNDER_CI" in pr_vals
-        or bool(old_vals & {"OLD_TEST_BREAKS", "OLD_TEST_SOMETIMES_BREAKS"})
-    ):
-        return "Bug Proven"
+        or Verdict.PR_TEST_FAILS_UNDER_CI in pr_vals
+        or bool(old_vals & {Verdict.OLD_TEST_BREAKS, Verdict.OLD_TEST_SOMETIMES_BREAKS})
+    )
+    # A1: only a vetted row that passes verdict.admissibility reaches the author.
+    if admissibility(hdir)["keep"]:
+        return "Bug Proven", []
+    unvetted = raw_bug and not (hdir / "vetted.json").exists()
 
     threads_doc = _read_optional_dict(hdir / "R" / "threads.json")
     has_pending_r = bool(threads_doc.get("included")) and not verdicts
     r_compile_gap = (hdir / "compile_R.log").exists() and not (hdir / "run_R.json").exists()
     r_gaps = any(
         isinstance(e, dict) and (
-            e.get("verdict") == "UNPROVABLE_DYNAMICALLY"
-            or (e.get("verdict") == "PROVEN" and e.get("base_verdict") in _BAD_BASE)
+            e.get("verdict") == Verdict.UNPROVABLE_DYNAMICALLY
+            or (e.get("verdict") == Verdict.PROVEN and e.get("base_verdict") in _BAD_BASE)
         )
         for e in verdicts.values()
     )
 
     gaps = (
-        mode_gaps
+        unvetted
+        or mode_gaps
         or has_pending_r
         or r_compile_gap
         or r_gaps
         or (deferred_count > 0 and batches_hunted < batches_total)
         or counts["mode_a_empty"] > 0
-        or bool(pr_vals & {"NOT_RUN", "FLAKY", "PR_TEST_FAILS"})
-        or bool(old_vals & {"NOT_RUN", "NOT_RUN_ON_BASE", "FLAKY"})
+        or bool(pr_vals & {Verdict.NOT_RUN, Verdict.FLAKY, Verdict.PR_TEST_FAILS})
+        or bool(old_vals & {Verdict.NOT_RUN, Verdict.NOT_RUN_ON_BASE, Verdict.FLAKY})
         or (executable > 0 and reached == 0)
     )
-    return "Partial or Unverified Coverage" if gaps else "High-Confidence Clean"
+    if not gaps:
+        return "High-Confidence Clean", []
+    return "Partial or Unverified Coverage", (["unvetted findings"] if unvetted else [])
 
 
 def _export_escapes(hdir: Path, state: dict[str, Any], pr_key: str,
@@ -215,9 +228,9 @@ def _export_escapes(hdir: Path, state: dict[str, Any], pr_key: str,
     exported: list[str] = []
     safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(pr_key)).strip(".") or "target"
     for cid, entry in sorted(verdicts.items()):
-        if not isinstance(entry, dict) or entry.get("verdict") != "PROVEN":
+        if not isinstance(entry, dict) or entry.get("verdict") != Verdict.PROVEN:
             continue
-        if entry.get("base_verdict") not in ("NEW_PR_BUG", "NEW_API"):
+        if entry.get("base_verdict") not in (Verdict.NEW_PR_BUG, Verdict.NEW_API):
             continue
         tests = entry.get("tests")
         tests_dict = tests if isinstance(tests, dict) else {}
@@ -267,11 +280,11 @@ def record(pr: str, hdir: Path | None = None, out_path: Path | None = None) -> d
         if not isinstance(item, dict):
             continue
         v = item.get("verdict")
-        if v == "PROVEN":
+        if v == Verdict.PROVEN:
             r_summary["proven"] += 1
-        elif v == "DISPROVEN":
+        elif v == Verdict.DISPROVEN:
             r_summary["disproven"] += 1
-        elif v == "UNPROVABLE_DYNAMICALLY":
+        elif v == Verdict.UNPROVABLE_DYNAMICALLY:
             r_summary["unprovable"] += 1
             if item.get("severity") in ("critical", "major"):
                 r_summary["unprovable_high_severity"] += 1
@@ -285,6 +298,9 @@ def record(pr: str, hdir: Path | None = None, out_path: Path | None = None) -> d
 
     batches_hunted = len(_batch_dirs(hdir))
     batches_total = int(state.get("batches") or 1)
+    tier, tier_gaps = _tier_and_gaps(
+        hdir, counts, reached, executable, deferred_count, batches_hunted, batches_total, mode_gaps, verdicts,
+    )
     entry: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "target": str(state.get("pr", pr)),
@@ -295,9 +311,8 @@ def record(pr: str, hdir: Path | None = None, out_path: Path | None = None) -> d
         "batches_total": batches_total,
         "all_batches": bool(state.get("all_batches")),
         "deferred_count": deferred_count,
-        "confidence_tier": _confidence_tier(
-            hdir, counts, reached, executable, deferred_count, batches_hunted, batches_total, mode_gaps, verdicts,
-        ),
+        "confidence_tier": tier,
+        "gaps": tier_gaps,
         "modes": counts,
         "mode_a_reached": reached,
         "mode_a_executable": executable,
