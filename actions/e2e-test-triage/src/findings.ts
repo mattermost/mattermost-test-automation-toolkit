@@ -6,7 +6,7 @@
 
 import { writeFileSync } from "node:fs";
 import type { Env } from "../../shared/src/github.ts";
-import { isFailedTry } from "../../shared/src/tsio.ts";
+import { isFailedTry, sliceUtf16Safe } from "../../shared/src/tsio.ts";
 import type { RunResult } from "../../shared/src/tsio.ts";
 import type { EvaluatedRun } from "./evaluate.ts";
 import { statusLabelOf } from "./render.ts";
@@ -118,11 +118,11 @@ export function redact(text: string, secrets: string[]): string {
   return out;
 }
 
-const clip = (s: string, max: number): string => (s.length > max ? s.slice(0, max) : s);
+const clip = (s: string, max: number): string => sliceUtf16Safe(s, max);
 /** The first line of an error, without colour codes, at most 200 characters. Never the stack. */
-const firstLine = (error: string | null | undefined): string => {
+const firstLine = (error: string | null | undefined, secrets: string[]): string => {
   const line = String(error ?? "").replace(ANSI, "").split(/\r?\n/).find((l) => l.trim()) ?? "";
-  return clip(line.trim(), 200);
+  return clip(redact(line.trim(), secrets), 200);
 };
 
 function rowOf(f: Finding, secrets: string[]): FindingRow {
@@ -136,7 +136,7 @@ function rowOf(f: Finding, secrets: string[]): FindingRow {
     blocking: f.blocking,
     decision: f.decision ?? null,
     reason: clip(redact(f.reason ?? "", secrets), 300),
-    error_first_line: redact(firstLine(f.error), secrets),
+    error_first_line: firstLine(f.error, secrets),
     out_of_date: Boolean(f.out_of_date),
     tries: f.tries ? { ran: f.tries.ran, failed: f.tries.failed } : null,
     other_lanes_failed: (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform),

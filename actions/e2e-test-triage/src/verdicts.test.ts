@@ -10,12 +10,14 @@ import type { Env, FetchImpl } from "../../shared/src/github.ts";
 import { MAX_ERROR_CONTEXT_BYTES } from "../../shared/src/tsio.ts";
 import type { TsioVerdict } from "../../shared/src/tsio.ts";
 import { judge } from "./decision.ts";
-import { checkFindingsShape, findingsRecord, secretsOf } from "./findings.ts";
+import { checkFindingsShape, findingLogLine, findingsRecord, secretsOf } from "./findings.ts";
 import { buildPack, releasePack } from "./pack.ts";
+import { newLedger } from "./pricing.ts";
 import { decidedBy, statusLabelOf } from "./render.ts";
 import { triage } from "./triage.ts";
 import type { Answer, Finding, Observation, Pack, PrRef } from "./types.ts";
-import { buildErrorContext, findingToVerdictItem } from "./verdicts.ts";
+import { buildErrorContext, findingToVerdictItem, makeVerdictLookup, submitTriageVerdicts } from "./verdicts.ts";
+import type { JudgedLane } from "./lane-verdict.ts";
 
 const GROUP_UUID = "01960000-0000-7000-8000-000000000001";
 const TEST_UUID_1 = "11111111-1111-4111-8111-111111111111";
@@ -717,4 +719,261 @@ test("MEDIUM-2: buildErrorContext and findingToVerdictItem truncate 4-byte emoji
   assert.ok(!loneRe.test(String(ctx.error ?? "")));
   assert.ok(!loneRe.test(String(ctx.reason ?? "")));
   assert.ok(!loneRe.test(String(item.summary ?? "")));
+});
+
+test("secret redaction runs before truncation across 200, 1000, and 4000 char boundaries", async () => {
+  const opaque = "OPAQUE_SECRET_BOUNDARY_VALUE_9876543210";
+  const prefix = "OPAQUE_SECRET_";
+  const firstLineBoundaryErr = "x".repeat(185) + opaque + " tail";
+  const bodyBoundaryErr = "line1\n" + "e".repeat(3979) + opaque + " tail";
+  const reasonBoundary = "r".repeat(985) + opaque + " tail";
+
+  const mkFinding = (error: string): Finding => ({
+    file: "specs/a.spec.ts",
+    title: "t1",
+    error,
+    class: "REGRESSION",
+    reason: reasonBoundary,
+    blocking: true,
+    trunk: { runs: 0, passes: 0, fails: 0, flaky: 0, latest: "" },
+    cross_pr: { prs: [], examples: [], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
+  });
+
+  const ctxFirst = buildErrorContext(mkFinding(firstLineBoundaryErr), [opaque]);
+  assert.ok(!String(ctxFirst.error_first_line).includes(prefix), "error_first_line must not leak partial secret");
+  assert.ok(String(ctxFirst.error_first_line).includes("[redacted]"));
+  assert.ok(!String(ctxFirst.reason).includes(prefix), "reason must not leak partial secret across 1000-char boundary");
+  assert.ok(String(ctxFirst.reason).includes("[redacted]"));
+
+  const ctxBody = buildErrorContext(mkFinding(bodyBoundaryErr), [opaque]);
+  assert.ok(!String(ctxBody.error).includes(prefix), "error must not leak partial secret across 4000-char boundary");
+  assert.ok(String(ctxBody.error).includes("[redacted]"));
+
+  const rec = findingsRecord({
+    env: { TSIO_API_KEY: opaque, MODE: "enforce" },
+    id: null,
+    mode: "enforce",
+    run: null,
+    result: { verdict: "FAILURE", findings: [mkFinding(firstLineBoundaryErr)], infra: null, counts: { total: 1, passed: 0, failed: 1, flaky: 0, skipped: 0 }, missing: null, ai: newLedger() },
+    notTriaged: null,
+  });
+  assert.ok(!rec.findings[0].error_first_line.includes(prefix), "findingsRecord error_first_line must not leak partial secret");
+  assert.ok(rec.findings[0].error_first_line.includes("[redacted]"));
+
+  const logs: string[] = [];
+  const lookup = makeVerdictLookup({
+    fetchImpl: async () => {
+      throw new Error("x".repeat(180) + opaque + " tail");
+    },
+    base: "http://tsio",
+    repository: "o/r",
+    log: (m) => logs.push(m),
+    secrets: [opaque],
+  });
+  await lookup("fp-1");
+  await submitTriageVerdicts({
+    env: { TSIO_API_KEY: opaque },
+    fetchImpl: async () => {
+      throw new Error("y".repeat(180) + opaque + " tail");
+    },
+    base: "http://tsio",
+    repository: "o/r",
+    reportGroupId: GROUP_UUID,
+    findings: [mkFinding("err")],
+    lane: null,
+    runURL: "https://github.com/o/r/actions/runs/1",
+    log: (m) => logs.push(m),
+  });
+  assert.equal(logs.length, 2);
+  for (const l of logs) {
+    assert.ok(!l.includes(prefix), `warning log must not leak partial secret: ${l}`);
+    assert.ok(l.includes("[redacted]"), `warning log must redact secret: ${l}`);
+  }
+});
+
+test("submitTriageVerdicts submits failing lane verdict alongside non-empty findings", async () => {
+  const posted: { verdicts: Record<string, unknown>[] }[] = [];
+  const finding: Finding = {
+    file: "specs/a.spec.ts",
+    title: "t1",
+    error: "Error: flake",
+    class: "REGRESSION",
+    reason: "Cleared by adjudicator",
+    blocking: false,
+    decision: "adjudicator_unblock",
+    test_id: TEST_UUID_1,
+    signature_id: SIG_UUID_1,
+    signature_fingerprint: "fp-1",
+    trunk: { runs: 6, passes: 6, fails: 0, flaky: 0, latest: "passed" },
+    cross_pr: { prs: [99], examples: ["PR #99: Error: flake"], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
+  };
+  const lane: JudgedLane = {
+    verdict: {
+      state: "failure",
+      label: "machine failure",
+      fault: "infrastructure",
+      what: "Worker shard timed out before uploading results",
+      action: "Re-run lane",
+      rerun: "lane",
+      evidence: [],
+    },
+    orchestration: null,
+    jobs: null,
+    baseline: null,
+    startJobId: 101,
+  };
+
+  await submitTriageVerdicts({
+    env: { TSIO_API_KEY: "tsio-secret-key-123" },
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as { verdicts: Record<string, unknown>[] };
+      posted.push(body);
+      return Response.json({ verdicts: [] });
+    },
+    base: "http://tsio",
+    repository: "o/r",
+    reportGroupId: GROUP_UUID,
+    findings: [finding],
+    lane,
+    runURL: "https://github.com/o/r/actions/runs/1",
+    log: () => {},
+  });
+
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].verdicts.length, 2, "must submit both failing lane verdict and test finding verdict");
+  assert.equal(posted[0].verdicts[0].test_id, null);
+  assert.equal(posted[0].verdicts[0].signature_id, null);
+  assert.equal(posted[0].verdicts[0].fingerprint, null);
+  assert.equal(posted[0].verdicts[0].label, "machine failure");
+  assert.equal(posted[0].verdicts[0].rule, "infrastructure");
+  assert.equal(posted[0].verdicts[1].test_id, TEST_UUID_1);
+  assert.equal(posted[0].verdicts[1].signature_id, SIG_UUID_1);
+});
+
+test("submitTriageVerdicts retains failing lane verdict when findings contain an all-null item", async () => {
+  const posted: { verdicts: Record<string, unknown>[] }[] = [];
+  const allNullFinding: Finding = {
+    file: "specs/unindexed.spec.ts",
+    title: "unindexed test",
+    error: "Error: timed out",
+    class: "FLAKY_NOT_RUN",
+    reason: "Cleared by rule",
+    blocking: true,
+    decision: "block",
+    test_id: null,
+    signature_id: null,
+    signature_fingerprint: null,
+    trunk: { runs: 0, passes: 0, fails: 0, flaky: 0, latest: "" },
+    cross_pr: { prs: [], examples: [], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
+  };
+  const identifiedFinding: Finding = {
+    ...allNullFinding,
+    file: "specs/identified.spec.ts",
+    title: "identified test",
+    blocking: false,
+    decision: "adjudicator_unblock",
+    test_id: TEST_UUID_1,
+    signature_id: SIG_UUID_1,
+    signature_fingerprint: "fp-1",
+  };
+  const lane: JudgedLane = {
+    verdict: {
+      state: "failure",
+      label: "machine failure",
+      fault: "infrastructure",
+      what: "Missing shard report",
+      action: "Re-run lane",
+      rerun: "lane",
+      evidence: [],
+    },
+    orchestration: null,
+    jobs: null,
+    baseline: null,
+    startJobId: 101,
+  };
+
+  await submitTriageVerdicts({
+    env: { TSIO_API_KEY: "tsio-secret-key-123" },
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as { verdicts: Record<string, unknown>[] };
+      posted.push(body);
+      return Response.json({ verdicts: [] });
+    },
+    base: "http://tsio",
+    repository: "o/r",
+    reportGroupId: GROUP_UUID,
+    findings: [allNullFinding, identifiedFinding],
+    lane,
+    runURL: "https://github.com/o/r/actions/runs/1",
+    log: () => {},
+  });
+
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].verdicts.length, 2, "must retain failing lane verdict in the single (null, null) slot plus identified finding");
+  assert.equal(posted[0].verdicts[0].test_id, null);
+  assert.equal(posted[0].verdicts[0].signature_id, null);
+  assert.equal(posted[0].verdicts[0].fingerprint, null);
+  assert.equal(posted[0].verdicts[0].label, "machine failure");
+  assert.equal(posted[0].verdicts[0].rule, "infrastructure");
+  assert.equal(posted[0].verdicts[1].test_id, TEST_UUID_1);
+  assert.equal(posted[0].verdicts[1].signature_id, SIG_UUID_1);
+});
+
+test("findingsRecord and findingLogLine redact secrets before clipping without unpaired UTF-16 surrogates", () => {
+  const loneRe = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  const opaque = "opaque_secret_val_998877665544332211";
+  const prefix = "opaque_secret_";
+  // After replacing 36-char `opaque` with 10-char `[redacted]` (-26), "🚀" (2 UTF-16 code units) straddles index 200 (199..200) and 300 (299..300).
+  const makeAtBoundary = (limit: number): string => `${opaque}${"a".repeat(limit - 11)}🚀tail`;
+  const f: Finding = {
+    file: "specs/a.spec.ts",
+    title: makeAtBoundary(120),
+    error: makeAtBoundary(200),
+    class: "REGRESSION",
+    reason: makeAtBoundary(300),
+    blocking: true,
+    trunk: { runs: 0, passes: 0, fails: 0, flaky: 0, latest: "" },
+    cross_pr: { prs: [], examples: [], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
+    judge: { cause: "flaky_environment", confidence: 0.9, cited_evidence: [], explanation: makeAtBoundary(200) },
+  };
+
+  const rec = findingsRecord({
+    env: { TSIO_API_KEY: opaque, MODE: "enforce" },
+    id: null,
+    mode: "enforce",
+    run: null,
+    result: { verdict: "FAILURE", findings: [f], infra: null, counts: { total: 1, passed: 0, failed: 1, flaky: 0, skipped: 0 }, missing: null, ai: newLedger() },
+    notTriaged: null,
+    description: makeAtBoundary(200),
+    laneDiagnosis: { label: "infra", fault: "missing_reports", what: makeAtBoundary(300), action: makeAtBoundary(200) },
+  });
+
+  const logLine = findingLogLine(f, 1, 1, [opaque]);
+  const strings = [
+    rec.description ?? "",
+    rec.lane_diagnosis?.what ?? "",
+    rec.lane_diagnosis?.action ?? "",
+    rec.findings[0].error_first_line,
+    rec.findings[0].reason,
+    rec.findings[0].ai.explanation ?? "",
+    logLine,
+  ];
+  for (const text of strings) {
+    assert.ok(!text.includes(prefix), `must not leak secret fragment: ${text}`);
+    assert.ok(!loneRe.test(text), `must not leave unpaired UTF-16 surrogate: ${text}`);
+  }
+  assert.ok(rec.findings[0].error_first_line.includes("[redacted]"));
+  assert.ok(rec.findings[0].reason.includes("[redacted]"));
 });

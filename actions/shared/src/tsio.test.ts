@@ -526,3 +526,30 @@ test("submitVerdicts backfills signature_id by fingerprint, keeps distinct null-
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(truncatedErr), "must not contain lone UTF-16 surrogates");
   assert.ok(Buffer.byteLength(JSON.stringify(sent[0].verdicts[1].error_context), "utf8") <= MAX_ERROR_CONTEXT_BYTES);
 });
+
+test("fetchRun does not inherit signature metadata from an earlier attempt with a different or empty error", async () => {
+  const tid1 = "11111111-1111-4111-8111-111111111111";
+  const sid1 = "22222222-2222-4222-8222-222222222222";
+  const fetchImpl = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/suites")) return Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] });
+    if (u.includes("/cases")) {
+      return Response.json([
+        { suite_id: "s1", title: "t1", status: "failed", retry_count: 0, ordinal: 0, error_message: "Error A", test_id: tid1, signature_id: sid1, signature_fingerprint: "fp-A" },
+        { suite_id: "s1", title: "t1", status: "failed", retry_count: 1, ordinal: 1, error_message: "Error B", test_id: tid1, signature_id: null, signature_fingerprint: null },
+        { suite_id: "s1", title: "t2", status: "failed", retry_count: 0, ordinal: 2, error_message: "", test_id: tid1, signature_id: sid1, signature_fingerprint: "fp-empty" },
+        { suite_id: "s1", title: "t2", status: "failed", retry_count: 1, ordinal: 3, error_message: "", test_id: tid1, signature_id: null, signature_fingerprint: null },
+      ]);
+    }
+    return Response.json({ reports: [group(ours.gh_run_id)] });
+  }) as FetchImpl;
+
+  const run = await fetchRun(fetchImpl, "http://tsio", ours, null, { attempts: 1, ms: 0 });
+  assert.equal(run.failing.length, 2);
+  assert.equal(run.failing[0].error, "Error B");
+  assert.equal(run.failing[0].signature_id, null, "must not inherit Error A's signature_id");
+  assert.equal(run.failing[0].signature_fingerprint, null, "must not inherit Error A's signature_fingerprint");
+  assert.equal(run.failing[1].error, "");
+  assert.equal(run.failing[1].signature_id, null, "must not fall back when lastAttempt error is empty");
+  assert.equal(run.failing[1].signature_fingerprint, null, "must not fall back when lastAttempt error is empty");
+});

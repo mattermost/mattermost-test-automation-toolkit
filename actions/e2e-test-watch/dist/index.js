@@ -405,7 +405,11 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
         return fromAny != null ? fromAny : lastAttempt[k];
       };
       const testId = pickCaseMeta("test_id");
-      const sigAttempt = lastAttempt.signature_fingerprint != null || lastAttempt.signature_id != null ? lastAttempt : attempts.find((a) => a.signature_fingerprint != null || a.signature_id != null) ?? lastAttempt;
+      const errorText = (a) => [a.error_message, a.error_stack].filter(Boolean).join("\n");
+      const lastError = errorText(lastAttempt);
+      const sigAttempt = lastAttempt.signature_fingerprint != null || lastAttempt.signature_id != null ? lastAttempt : (lastError !== "" ? attempts.find(
+        (a) => FAILED_STATUSES.has(a.status) && (a.signature_fingerprint != null || a.signature_id != null) && errorText(a) === lastError
+      ) : void 0) ?? lastAttempt;
       const signatureId = sigAttempt.signature_id;
       const signatureFingerprint = sigAttempt.signature_fingerprint;
       failing.push({
@@ -417,7 +421,7 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
         report_scope: reportName,
         identity_ambiguous: testsPerLeaf.get(JSON.stringify([file, title])).size > 1,
         identity_unresolved: testsPerIdentity.get(identityKey({ file, title, full_title: lastAttempt.full_title, report_scope: reportName })).size > 1,
-        error: [lastAttempt.error_message, lastAttempt.error_stack].filter(Boolean).join("\n"),
+        error: lastError,
         tries: { ran: attempts.filter((a) => a.status !== "skipped").length, failed: attempts.filter((a) => FAILED_STATUSES.has(a.status)).length },
         ...typeof first?.ordinal === "number" ? { ordinal: first.ordinal } : {},
         ...testId !== void 0 ? { test_id: testId } : {},
@@ -2460,10 +2464,10 @@ function redact(text, secrets) {
   for (const p of SECRET_PATTERNS) out = out.replace(p, "[redacted]");
   return out;
 }
-var clip = (s, max) => s.length > max ? s.slice(0, max) : s;
-var firstLine = (error) => {
+var clip = (s, max) => sliceUtf16Safe(s, max);
+var firstLine = (error, secrets) => {
   const line = String(error ?? "").replace(ANSI, "").split(/\r?\n/).find((l) => l.trim()) ?? "";
-  return clip(line.trim(), 200);
+  return clip(redact(line.trim(), secrets), 200);
 };
 function rowOf(f, secrets) {
   const judge2 = f.judge ?? null;
@@ -2476,7 +2480,7 @@ function rowOf(f, secrets) {
     blocking: f.blocking,
     decision: f.decision ?? null,
     reason: clip(redact(f.reason ?? "", secrets), 300),
-    error_first_line: redact(firstLine(f.error), secrets),
+    error_first_line: firstLine(f.error, secrets),
     out_of_date: Boolean(f.out_of_date),
     tries: f.tries ? { ran: f.tries.ran, failed: f.tries.failed } : null,
     other_lanes_failed: (f.other_lanes ?? []).filter((o) => isFailedTry(o.result)).map((o) => o.platform),
@@ -5156,20 +5160,20 @@ async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRu
 
 // ../e2e-test-triage/src/verdicts.ts
 var ANSI2 = /\x1b\[[0-9;]*m/g;
-function firstErrorLine(error) {
+function firstErrorLine(error, secrets) {
   const line = String(error ?? "").replace(ANSI2, "").split(/\r?\n/).find((l) => l.trim()) ?? "";
-  return sliceUtf16Safe(line.trim(), 200);
+  return sliceUtf16Safe(redact(line.trim(), secrets), 200);
 }
 function buildErrorContext(f, secrets) {
-  const first = firstErrorLine(f.error);
+  const first = firstErrorLine(f.error, secrets);
   return {
     file: redact(f.repo_path ?? f.file, secrets),
     title: redact(f.title, secrets),
     ...f.full_title ? { full_title: redact(f.full_title, secrets) } : {},
     class: f.class,
-    error_first_line: redact(first, secrets),
-    ...f.error ? { error: redact(sliceUtf16Safe(f.error, 4e3), secrets) } : {},
-    ...f.reason ? { reason: redact(sliceUtf16Safe(f.reason, 1e3), secrets) } : {},
+    error_first_line: first,
+    ...f.error ? { error: sliceUtf16Safe(redact(f.error, secrets), 4e3) } : {},
+    ...f.reason ? { reason: sliceUtf16Safe(redact(f.reason, secrets), 1e3) } : {},
     ...f.tries ? { tries: { ran: f.tries.ran, failed: f.tries.failed } } : {}
   };
 }
@@ -5208,7 +5212,7 @@ function makeVerdictLookup({
     try {
       return await lookupVerdictBySignature(fetchImpl, base, fingerprint, { repository, windowDays });
     } catch (e) {
-      log(`e2e-test-triage: TSIO verdict lookup failed (failing open): ${redact(String(e).slice(0, 200), secrets)}`);
+      log(`e2e-test-triage: TSIO verdict lookup failed (failing open): ${sliceUtf16Safe(redact(String(e), secrets), 200)}`);
       return null;
     }
   };
@@ -5232,8 +5236,9 @@ async function submitTriageVerdicts({
     const auth = await resolveTsioAuthHeaders(env, fetchImpl, (msg) => log(redact(msg, secrets)));
     if (!auth) return [];
     secrets = secretsOf(env, [auth.secret]);
-    const items = hasFindings ? [...findings].sort((a, b) => Number(b.blocking) - Number(a.blocking)).map((f) => findingToVerdictItem(f, runURL, secrets)) : [
-      {
+    const items = [];
+    if (hasFailingLane) {
+      items.push({
         test_id: null,
         signature_id: null,
         fingerprint: null,
@@ -5251,8 +5256,13 @@ async function submitTriageVerdicts({
           action: sliceUtf16Safe(redact(lane.verdict.action, secrets), 1e3)
         },
         reused_from_id: null
+      });
+    }
+    if (hasFindings) {
+      for (const f of [...findings].sort((a, b) => Number(b.blocking) - Number(a.blocking))) {
+        items.push(findingToVerdictItem(f, runURL, secrets));
       }
-    ];
+    }
     const gid = reportGroupId != null && isUuid(String(reportGroupId)) ? String(reportGroupId) : null;
     return await submitVerdicts(fetchImpl, base, auth.headers, {
       repository,
@@ -5260,7 +5270,7 @@ async function submitTriageVerdicts({
       verdicts: items
     });
   } catch (e) {
-    log(`e2e-test-triage: TSIO verdict submission skipped (failing open): ${redact(String(e).slice(0, 200), secrets)}`);
+    log(`e2e-test-triage: TSIO verdict submission skipped (failing open): ${sliceUtf16Safe(redact(String(e), secrets), 200)}`);
     return [];
   }
 }

@@ -12,21 +12,21 @@ import type { Finding, TsioId } from "./types.ts";
 
 const ANSI = /\x1b\[[0-9;]*m/g;
 
-function firstErrorLine(error: string | null | undefined): string {
+function firstErrorLine(error: string | null | undefined, secrets: string[]): string {
   const line = String(error ?? "").replace(ANSI, "").split(/\r?\n/).find((l) => l.trim()) ?? "";
-  return sliceUtf16Safe(line.trim(), 200);
+  return sliceUtf16Safe(redact(line.trim(), secrets), 200);
 }
 
 export function buildErrorContext(f: Finding, secrets: string[]): Record<string, unknown> {
-  const first = firstErrorLine(f.error);
+  const first = firstErrorLine(f.error, secrets);
   return {
     file: redact(f.repo_path ?? f.file, secrets),
     title: redact(f.title, secrets),
     ...(f.full_title ? { full_title: redact(f.full_title, secrets) } : {}),
     class: f.class,
-    error_first_line: redact(first, secrets),
-    ...(f.error ? { error: redact(sliceUtf16Safe(f.error, 4000), secrets) } : {}),
-    ...(f.reason ? { reason: redact(sliceUtf16Safe(f.reason, 1000), secrets) } : {}),
+    error_first_line: first,
+    ...(f.error ? { error: sliceUtf16Safe(redact(f.error, secrets), 4000) } : {}),
+    ...(f.reason ? { reason: sliceUtf16Safe(redact(f.reason, secrets), 1000) } : {}),
     ...(f.tries ? { tries: { ran: f.tries.ran, failed: f.tries.failed } } : {}),
   };
 }
@@ -83,7 +83,7 @@ export function makeVerdictLookup({
     try {
       return await lookupVerdictBySignature(fetchImpl, base, fingerprint, { repository, windowDays });
     } catch (e) {
-      log(`e2e-test-triage: TSIO verdict lookup failed (failing open): ${redact(String(e).slice(0, 200), secrets)}`);
+      log(`e2e-test-triage: TSIO verdict lookup failed (failing open): ${sliceUtf16Safe(redact(String(e), secrets), 200)}`);
       return null;
     }
   };
@@ -124,29 +124,33 @@ export async function submitTriageVerdicts({
     if (!auth) return [];
     secrets = secretsOf(env, [auth.secret]);
 
-    const items: CreateVerdictItem[] = hasFindings
-      ? [...findings].sort((a, b) => Number(b.blocking) - Number(a.blocking)).map((f) => findingToVerdictItem(f, runURL, secrets))
-      : [
-          {
-            test_id: null,
-            signature_id: null,
-            fingerprint: null,
-            label: lane!.verdict.label,
-            decided_by: "rules",
-            rule: lane!.verdict.fault,
-            confidence: null,
-            summary: sliceUtf16Safe(redact(lane!.verdict.what, secrets).trim(), 1000) || null,
-            model: null,
-            triage_url: runURL,
-            error_context: {
-              lane_label: redact(lane!.verdict.label, secrets),
-              fault: redact(lane!.verdict.fault, secrets),
-              what: sliceUtf16Safe(redact(lane!.verdict.what, secrets), 1000),
-              action: sliceUtf16Safe(redact(lane!.verdict.action, secrets), 1000),
-            },
-            reused_from_id: null,
-          },
-        ];
+    const items: CreateVerdictItem[] = [];
+    if (hasFailingLane) {
+      items.push({
+        test_id: null,
+        signature_id: null,
+        fingerprint: null,
+        label: lane!.verdict.label,
+        decided_by: "rules",
+        rule: lane!.verdict.fault,
+        confidence: null,
+        summary: sliceUtf16Safe(redact(lane!.verdict.what, secrets).trim(), 1000) || null,
+        model: null,
+        triage_url: runURL,
+        error_context: {
+          lane_label: redact(lane!.verdict.label, secrets),
+          fault: redact(lane!.verdict.fault, secrets),
+          what: sliceUtf16Safe(redact(lane!.verdict.what, secrets), 1000),
+          action: sliceUtf16Safe(redact(lane!.verdict.action, secrets), 1000),
+        },
+        reused_from_id: null,
+      });
+    }
+    if (hasFindings) {
+      for (const f of [...findings].sort((a, b) => Number(b.blocking) - Number(a.blocking))) {
+        items.push(findingToVerdictItem(f, runURL, secrets));
+      }
+    }
 
     const gid = reportGroupId != null && isUuid(String(reportGroupId)) ? String(reportGroupId) : null;
     return await submitVerdicts(fetchImpl, base, auth.headers, {
@@ -155,7 +159,7 @@ export async function submitTriageVerdicts({
       verdicts: items,
     });
   } catch (e) {
-    log(`e2e-test-triage: TSIO verdict submission skipped (failing open): ${redact(String(e).slice(0, 200), secrets)}`);
+    log(`e2e-test-triage: TSIO verdict submission skipped (failing open): ${sliceUtf16Safe(redact(String(e), secrets), 200)}`);
     return [];
   }
 }

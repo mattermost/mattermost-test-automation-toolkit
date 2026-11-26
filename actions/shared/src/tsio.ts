@@ -470,10 +470,19 @@ export async function runFromGroups(
         return fromAny != null ? fromAny : lastAttempt[k];
       };
       const testId = pickCaseMeta("test_id");
+      const errorText = (a: TsioCase): string => [a.error_message, a.error_stack].filter(Boolean).join("\n");
+      const lastError = errorText(lastAttempt);
       const sigAttempt =
         lastAttempt.signature_fingerprint != null || lastAttempt.signature_id != null
           ? lastAttempt
-          : attempts.find((a) => a.signature_fingerprint != null || a.signature_id != null) ?? lastAttempt;
+          : (lastError !== ""
+              ? attempts.find(
+                  (a) =>
+                    FAILED_STATUSES.has(a.status) &&
+                    (a.signature_fingerprint != null || a.signature_id != null) &&
+                    errorText(a) === lastError,
+                )
+              : undefined) ?? lastAttempt;
       const signatureId = sigAttempt.signature_id;
       const signatureFingerprint = sigAttempt.signature_fingerprint;
       failing.push({
@@ -485,7 +494,7 @@ export async function runFromGroups(
         report_scope: reportName,
         identity_ambiguous: testsPerLeaf.get(JSON.stringify([file, title]))!.size > 1,
         identity_unresolved: testsPerIdentity.get(identityKey({ file, title, full_title: lastAttempt.full_title, report_scope: reportName }))!.size > 1,
-        error: [lastAttempt.error_message, lastAttempt.error_stack].filter(Boolean).join("\n"),
+        error: lastError,
         tries: { ran: attempts.filter((a) => a.status !== "skipped").length, failed: attempts.filter((a) => FAILED_STATUSES.has(a.status)).length },
         ...(typeof first?.ordinal === "number" ? { ordinal: first.ordinal } : {}),
         ...(testId !== undefined ? { test_id: testId } : {}),
