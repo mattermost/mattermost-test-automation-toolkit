@@ -434,3 +434,95 @@ test("submitVerdicts deduplicates on (test_id, signature_id), chunks at 500, and
   assert.ok(Buffer.byteLength(JSON.stringify(firstCtx), "utf8") <= MAX_ERROR_CONTEXT_BYTES);
   assert.equal(firstCtx.file, "a.spec.ts");
 });
+
+test("fetchRun resolves signature_id and signature_fingerprint coherently from the same attempt row", async () => {
+  const tid1 = "11111111-1111-4111-8111-111111111111";
+  const sid1 = "22222222-2222-4222-8222-222222222222";
+  const sid2 = "33333333-3333-4333-8333-333333333333";
+  const fetchImpl = (async (url: string) => {
+    const u = String(url);
+    if (u.includes("/suites")) return Response.json({ suites: [{ id: "s1", file_path: "specs/a.spec.ts" }] });
+    if (u.includes("/cases")) {
+      return Response.json([
+        { suite_id: "s1", title: "t1", status: "failed", retry_count: 0, ordinal: 0, error_message: "e0", test_id: tid1, signature_id: sid1, signature_fingerprint: "fp-attempt-0" },
+        { suite_id: "s1", title: "t1", status: "failed", retry_count: 1, ordinal: 1, error_message: "e1", test_id: tid1, signature_id: sid2, signature_fingerprint: null },
+        { suite_id: "s1", title: "t2", status: "failed", retry_count: 0, ordinal: 2, error_message: "e2", test_id: tid1, signature_id: sid1, signature_fingerprint: "fp-0" },
+        { suite_id: "s1", title: "t2", status: "failed", retry_count: 1, ordinal: 3, error_message: "e3", test_id: tid1, signature_id: null, signature_fingerprint: "fp-1" },
+      ]);
+    }
+    return Response.json({ reports: [group(ours.gh_run_id)] });
+  }) as FetchImpl;
+  const run = await fetchRun(fetchImpl, "http://tsio", ours, null, { attempts: 1, ms: 0 });
+  assert.equal(run.failing.length, 2);
+  assert.equal(run.failing[0].signature_id, sid2);
+  assert.equal(run.failing[0].signature_fingerprint, null, "must not pair attempt 1 signature_id with attempt 0 fingerprint");
+  assert.equal(run.failing[1].signature_id, null, "must not pair attempt 0 signature_id with attempt 1 fingerprint");
+  assert.equal(run.failing[1].signature_fingerprint, "fp-1");
+});
+
+test("lookupVerdictBySignature validates optional field types and normalizes omitted fields", async () => {
+  const minimal = await lookupVerdictBySignature(
+    (async () => Response.json({ id: "33333333-3333-4333-8333-333333333333", label: "flaky" })) as FetchImpl,
+    "http://tsio",
+    "fp-min",
+  );
+  assert.equal(minimal?.summary, null);
+  assert.equal(minimal?.confidence, null);
+  assert.equal(minimal?.model, null);
+
+  for (const bad of [
+    { id: "v1", label: "flaky", summary: 12345 },
+    { id: "v1", label: "flaky", confidence: "0.95" },
+    { id: "v1", label: "flaky", model: { name: "x" } },
+  ]) {
+    await assert.rejects(
+      () => lookupVerdictBySignature((async () => Response.json(bad)) as FetchImpl, "http://tsio", "fp-bad"),
+      /invalid response shape/,
+    );
+  }
+});
+
+test("submitVerdicts backfills signature_id by fingerprint, keeps distinct null-sig fingerprints, and handles non-serializable or emoji error_context safely", async () => {
+  const tid = "11111111-1111-4111-8111-111111111111";
+  const sid1 = "22222222-2222-4222-8222-222222222222";
+  const gid = "33333333-3333-4333-8333-333333333333";
+  const circular: Record<string, unknown> = { a: "ok", n: 42n };
+  circular.self = circular;
+  circular.bad = {
+    toJSON() {
+      throw new Error("toJSON boom");
+    },
+  };
+  const emojiOver = "😀".repeat(33_000);
+
+  const sent: { verdicts: { test_id: string | null; signature_id: string | null; fingerprint: string | null; error_context: Record<string, unknown> | null }[] }[] = [];
+  await submitVerdicts(
+    (async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as (typeof sent)[number];
+      sent.push(body);
+      return Response.json({ verdicts: [] });
+    }) as FetchImpl,
+    "http://tsio",
+    { "X-API-Key": "k" },
+    {
+      repository: "o/r",
+      report_group_id: gid,
+      verdicts: [
+        { test_id: tid, signature_id: null, fingerprint: "fp-same", label: "flaky", error_context: circular },
+        { test_id: tid, signature_id: sid1, fingerprint: "fp-same", label: "caused by PR" },
+        { test_id: tid, signature_id: null, fingerprint: "fp-two", label: "flaky", error_context: { error: emojiOver } },
+      ],
+    },
+  );
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].verdicts.length, 2, "fp-same collapses to 1 item while distinct fp-two is retained");
+  assert.equal(sent[0].verdicts[0].signature_id, sid1, "signature_id backfilled from matching fingerprint item in batch");
+  assert.equal(sent[0].verdicts[0].error_context?.a, "ok");
+  assert.equal(sent[0].verdicts[0].error_context?.n, "42");
+  assert.equal(sent[0].verdicts[1].fingerprint, "fp-two");
+
+  const truncatedErr = String(sent[0].verdicts[1].error_context?.error ?? "");
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(truncatedErr), "must not contain lone UTF-16 surrogates");
+  assert.ok(Buffer.byteLength(JSON.stringify(sent[0].verdicts[1].error_context), "utf8") <= MAX_ERROR_CONTEXT_BYTES);
+});

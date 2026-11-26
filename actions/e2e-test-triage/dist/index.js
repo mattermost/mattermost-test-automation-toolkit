@@ -593,12 +593,12 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
       const pickCaseMeta = (k) => {
         if (lastAttempt[k] != null) return lastAttempt[k];
         const fromAny = attempts.find((a) => a[k] != null)?.[k];
-        if (fromAny != null) return fromAny;
-        return lastAttempt[k];
+        return fromAny != null ? fromAny : lastAttempt[k];
       };
       const testId = pickCaseMeta("test_id");
-      const signatureId = pickCaseMeta("signature_id");
-      const signatureFingerprint = pickCaseMeta("signature_fingerprint");
+      const sigAttempt = lastAttempt.signature_fingerprint != null || lastAttempt.signature_id != null ? lastAttempt : attempts.find((a) => a.signature_fingerprint != null || a.signature_id != null) ?? lastAttempt;
+      const signatureId = sigAttempt.signature_id;
+      const signatureFingerprint = sigAttempt.signature_fingerprint;
       failing.push({
         file,
         title,
@@ -691,39 +691,116 @@ async function lookupVerdictBySignature(fetchImpl, base, fingerprint, opts) {
   if (!data || typeof data !== "object" || Array.isArray(data) || typeof data.id !== "string" || !data.id || typeof data.label !== "string" || !data.label) {
     throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
   }
-  return data;
+  const optStr = (v) => {
+    if (v == null) return null;
+    if (typeof v !== "string") throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+    return v;
+  };
+  const reqStr = (v) => {
+    if (v == null) return "";
+    if (typeof v !== "string") throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+    return v;
+  };
+  let confidence = null;
+  if (data.confidence != null) {
+    if (typeof data.confidence !== "number" || !Number.isFinite(data.confidence)) {
+      throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+    }
+    confidence = data.confidence;
+  }
+  return {
+    id: data.id,
+    report_group_id: optStr(data.report_group_id),
+    repository: reqStr(data.repository),
+    test_id: optStr(data.test_id),
+    signature_id: reqStr(data.signature_id),
+    fingerprint: reqStr(data.fingerprint),
+    label: data.label,
+    decided_by: optStr(data.decided_by),
+    rule: optStr(data.rule),
+    confidence,
+    summary: optStr(data.summary),
+    model: optStr(data.model),
+    triage_url: optStr(data.triage_url),
+    reused_from_id: optStr(data.reused_from_id),
+    created_at: reqStr(data.created_at)
+  };
+}
+function sliceUtf16Safe(s, maxUnits) {
+  if (maxUnits <= 0) return "";
+  if (s.length <= maxUnits) return s;
+  let end = maxUnits;
+  const code = s.charCodeAt(end - 1);
+  if (code >= 55296 && code <= 56319) end--;
+  return s.slice(0, end);
 }
 var utf8Bytes = (s) => new TextEncoder().encode(s).byteLength;
+function toJsonSafe(v, ancestors) {
+  if (typeof v === "bigint") return String(v);
+  if (v === null || typeof v !== "object") {
+    return typeof v === "function" || typeof v === "symbol" || v === void 0 ? void 0 : v;
+  }
+  if (ancestors.has(v)) return void 0;
+  ancestors.add(v);
+  try {
+    const toJson = v.toJSON;
+    if (typeof toJson === "function") {
+      try {
+        return toJsonSafe(toJson.call(v), ancestors);
+      } catch {
+        return void 0;
+      }
+    }
+    if (Array.isArray(v)) return v.map((el) => toJsonSafe(el, ancestors) ?? null);
+    const copy = {};
+    for (const [k, val] of Object.entries(v)) {
+      const safeVal = toJsonSafe(val, ancestors);
+      if (safeVal !== void 0) copy[k] = safeVal;
+    }
+    return copy;
+  } finally {
+    ancestors.delete(v);
+  }
+}
 function normalizeErrorContext(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const out = { ...raw };
-  if (utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES) return out;
-  for (let guard = 0; guard < 64 && utf8Bytes(JSON.stringify(out)) > MAX_ERROR_CONTEXT_BYTES; guard++) {
-    let longestStrKey = null;
-    let longestStrLen = 0;
-    for (const [k, v] of Object.entries(out)) {
-      if (typeof v === "string" && v.length > longestStrLen) {
-        longestStrKey = k;
-        longestStrLen = v.length;
+  try {
+    const safe = toJsonSafe(raw, /* @__PURE__ */ new WeakSet());
+    if (!safe || typeof safe !== "object" || Array.isArray(safe)) return {};
+    const out = safe;
+    if (utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES) return out;
+    for (let guard = 0; guard < 64 && utf8Bytes(JSON.stringify(out)) > MAX_ERROR_CONTEXT_BYTES; guard++) {
+      let longestStrKey = null;
+      let longestStrLen = 0;
+      for (const [k, v] of Object.entries(out)) {
+        if (typeof v === "string" && v.length > longestStrLen) {
+          longestStrKey = k;
+          longestStrLen = v.length;
+        }
       }
-    }
-    if (longestStrKey && longestStrLen > 64) {
-      out[longestStrKey] = out[longestStrKey].slice(0, Math.floor(longestStrLen / 2));
-      continue;
-    }
-    let largestKey = null;
-    let largestBytes = -1;
-    for (const [k, v] of Object.entries(out)) {
-      const b = utf8Bytes(JSON.stringify(v ?? null));
-      if (b > largestBytes) {
-        largestBytes = b;
-        largestKey = k;
+      if (longestStrKey && longestStrLen > 64) {
+        const next = sliceUtf16Safe(out[longestStrKey], Math.floor(longestStrLen / 2));
+        if (next.length < longestStrLen) {
+          out[longestStrKey] = next;
+          continue;
+        }
       }
+      let largestKey = null;
+      let largestBytes = -1;
+      for (const [k, v] of Object.entries(out)) {
+        const b = utf8Bytes(JSON.stringify(v ?? null));
+        if (b > largestBytes) {
+          largestBytes = b;
+          largestKey = k;
+        }
+      }
+      if (!largestKey) break;
+      delete out[largestKey];
     }
-    if (!largestKey) break;
-    delete out[largestKey];
+    return utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES ? out : {};
+  } catch {
+    return {};
   }
-  return utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES ? out : {};
 }
 function sanitizeVerdictItem(item) {
   const testId = isUuid(item.test_id) ? item.test_id : null;
@@ -751,12 +828,22 @@ async function submitVerdicts(fetchImpl, base, authHeaders, request, opts) {
   const reportGroupId = isUuid(request.report_group_id) ? request.report_group_id : null;
   const sanitized = request.verdicts.map(sanitizeVerdictItem).filter((v) => v.label.trim().length > 0);
   if (!sanitized.length) return [];
-  let items = sanitized;
+  const fpToSigId = /* @__PURE__ */ new Map();
+  for (const item of sanitized) {
+    if (item.fingerprint && item.signature_id && !fpToSigId.has(item.fingerprint)) {
+      fpToSigId.set(item.fingerprint, item.signature_id);
+    }
+  }
+  const normalized = sanitized.map(
+    (item) => !item.signature_id && item.fingerprint && fpToSigId.has(item.fingerprint) ? { ...item, signature_id: fpToSigId.get(item.fingerprint) } : item
+  );
+  let items = normalized;
   if (reportGroupId) {
     const seen = /* @__PURE__ */ new Set();
     items = [];
-    for (const item of sanitized) {
-      const key = `${item.test_id ?? ""}\0${item.signature_id ?? ""}`;
+    for (const item of normalized) {
+      const sigKey = item.signature_id ? `s:${item.signature_id}` : item.fingerprint ? `f:${item.fingerprint}` : "";
+      const key = `${item.test_id ?? ""}\0${sigKey}`;
       if (seen.has(key)) continue;
       seen.add(key);
       items.push(item);
@@ -1800,7 +1887,13 @@ function statusDescription(verdict, findings, runInfra, counts, missing = null, 
 
 // src/findings.ts
 var FINDINGS_SCHEMA = 3;
-var SECRET_PATTERNS = [/gh[pousr]_[A-Za-z0-9]{20,}/g, /github_pat_[A-Za-z0-9_]{20,}/g, /sk-ant-[A-Za-z0-9_-]{8,}/g, /\bBearer\s+[^\s"']+/gi];
+var SECRET_PATTERNS = [
+  /gh[pousr]_[A-Za-z0-9]{20,}/g,
+  /github_pat_[A-Za-z0-9_]{20,}/g,
+  /sk-ant-[A-Za-z0-9_-]{8,}/g,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+  /\bBearer\s+[^\s"']+/gi
+];
 var ANSI = /\x1b\[[0-9;]*m/g;
 var CREDENTIAL_KV = /([A-Za-z0-9_.-]*(?:token|password|secret|passwd|api[_-]?key|apikey|license|authorization)[A-Za-z0-9_.-]*)(\s*[=:]\s*)((?:Bearer\s+)?[^\s"',;&]+)/gi;
 function redact(text, secrets) {
@@ -1844,7 +1937,7 @@ function findingLogLine(f, n, of, secrets) {
   const line = `e2e-test-triage: finding ${n}/${of} ${row.blocking ? "blocking" : "cleared"} ${row.class} decision=${row.decision ?? "-"} ai=${ai} cited=${cited} "${clip(row.title, 120)}" \xB7 ${clip(row.file, 100)}: ${row.reason}`;
   return clip(line.replace(/\s+/g, " "), 500);
 }
-var secretsOf = (env, extra = []) => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY, env.TSIO_API_KEY, ...extra].filter((s) => Boolean(s));
+var secretsOf = (env, extra = []) => [env.GITHUB_TOKEN, env.ANTHROPIC_API_KEY, env.TSIO_API_KEY, env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, ...extra].filter((s) => Boolean(s));
 function findingsRecord({ env, id, mode, run: run2, result, notTriaged, basis = null, description = null, laneDiagnosis = null, rerun = null }) {
   const secrets = secretsOf(env);
   const ai = result?.ai ?? newLedger();
@@ -4254,7 +4347,9 @@ function canReuseFinding(f, pack, isTrunk) {
   return true;
 }
 function reusableOutcomeFor(prior, pack, f, isTrunk, minConfidence) {
-  if (prior.confidence != null && (!Number.isFinite(prior.confidence) || prior.confidence < minConfidence)) return null;
+  if (prior.summary != null && typeof prior.summary !== "string") return null;
+  if (prior.model != null && typeof prior.model !== "string") return null;
+  if (prior.confidence != null && (typeof prior.confidence !== "number" || !Number.isFinite(prior.confidence) || prior.confidence < minConfidence)) return null;
   if (pack.release) {
     if (prior.label === "flaky") {
       const lanes = pack.same_test_other_platforms_this_run?.results ?? [];
@@ -4268,6 +4363,7 @@ function reusableOutcomeFor(prior, pack, f, isTrunk, minConfidence) {
   }
   if (prior.label === "flaky") return { cause: "flaky_environment", blocking: false, decision: "adjudicator_unblock" };
   if (prior.label === "broken on main") {
+    if (isTrunk && f.class === "INFRA_ERROR") return null;
     return isTrunk ? { cause: "bug_on_master", blocking: true, decision: "engine" } : { cause: "bug_on_master", blocking: false, decision: "adjudicator_unblock" };
   }
   return null;
@@ -4399,16 +4495,19 @@ async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
       return p;
     };
     const candidates = pending.filter(
-      (g) => !cachedAnswer(cfg.answers?.[answerKey(cfg.model, g.lead.pack)], g.lead.pack) && g.members.every((m) => canReuseFinding(m.f, m.pack, isTrunkRun) && m.f.signature_fingerprint === g.lead.f.signature_fingerprint)
+      (g) => !g.advisory && !cachedAnswer(cfg.answers?.[answerKey(cfg.model, g.lead.pack)], g.lead.pack) && g.members.every((m) => canReuseFinding(m.f, m.pack, isTrunkRun) && m.f.signature_fingerprint === g.lead.f.signature_fingerprint)
     );
     await Promise.all([...new Set(candidates.map((g) => g.lead.f.signature_fingerprint))].map((fp) => lookupCached(fp)));
     for (const g of candidates) {
       const prior = await lookupCached(g.lead.f.signature_fingerprint);
-      if (!prior) continue;
+      if (!prior || typeof prior !== "object" || typeof prior.id !== "string" || !prior.id || typeof prior.label !== "string" || !prior.label) continue;
       const resolved = g.members.map((m) => reusableOutcomeFor(prior, m.pack, m.f, isTrunkRun, cfg.minConfidence));
       if (resolved.some((r) => r === null)) continue;
       reused.add(g);
-      const explanation = prior.summary?.trim() || `Reused prior TSIO verdict (${prior.label})`;
+      const summary = typeof prior.summary === "string" ? prior.summary.trim() : "";
+      const explanation = summary || `Reused prior TSIO verdict (${prior.label})`;
+      const confidence = typeof prior.confidence === "number" && Number.isFinite(prior.confidence) ? prior.confidence : cfg.minConfidence;
+      const servedModel = typeof prior.model === "string" && prior.model ? prior.model : "reused";
       for (const [idx, m] of g.members.entries()) {
         const res = resolved[idx];
         Object.assign(m.f, {
@@ -4419,10 +4518,10 @@ async function judge(findings, packs, askMany, cfg = DEFAULTS, warn = () => {
           reused_verdict: prior,
           judge: {
             cause: res.cause,
-            confidence: prior.confidence ?? cfg.minConfidence,
+            confidence,
             cited_evidence: [],
             explanation,
-            provenance: { served_model: prior.model ?? "reused" }
+            provenance: { served_model: servedModel }
           }
         });
       }
@@ -5250,7 +5349,7 @@ async function judgeLane({ env, fetchImpl, api, tsio, id, context, base, trunkRu
 var ANSI2 = /\x1b\[[0-9;]*m/g;
 function firstErrorLine(error) {
   const line = String(error ?? "").replace(ANSI2, "").split(/\r?\n/).find((l) => l.trim()) ?? "";
-  return line.trim().slice(0, 200);
+  return sliceUtf16Safe(line.trim(), 200);
 }
 function buildErrorContext(f, secrets) {
   const first = firstErrorLine(f.error);
@@ -5260,17 +5359,19 @@ function buildErrorContext(f, secrets) {
     ...f.full_title ? { full_title: redact(f.full_title, secrets) } : {},
     class: f.class,
     error_first_line: redact(first, secrets),
-    ...f.error ? { error: redact(f.error.slice(0, 4e3), secrets) } : {},
-    ...f.reason ? { reason: redact(f.reason.slice(0, 1e3), secrets) } : {},
+    ...f.error ? { error: redact(sliceUtf16Safe(f.error, 4e3), secrets) } : {},
+    ...f.reason ? { reason: redact(sliceUtf16Safe(f.reason, 1e3), secrets) } : {},
     ...f.tries ? { tries: { ran: f.tries.ran, failed: f.tries.failed } } : {}
   };
 }
 function findingToVerdictItem(f, runURL, secrets) {
   const rawConf = f.reused_from_id ? f.reused_verdict?.confidence ?? f.judge?.confidence ?? null : f.judge?.confidence ?? null;
   const confidence = typeof rawConf === "number" && Number.isFinite(rawConf) ? Math.min(1, Math.max(0, rawConf)) : null;
-  const rawSummary = f.reused_from_id ? f.reused_verdict?.summary ?? f.judge?.explanation ?? f.reason ?? "" : f.judge?.explanation ?? f.reason ?? "";
+  const reusedSummary = typeof f.reused_verdict?.summary === "string" ? f.reused_verdict.summary : null;
+  const rawSummary = f.reused_from_id ? reusedSummary ?? f.judge?.explanation ?? f.reason ?? "" : f.judge?.explanation ?? f.reason ?? "";
   const cleanSummary = redact(rawSummary, secrets).trim();
-  const model = f.reused_from_id ? f.reused_verdict?.model ?? f.judge?.provenance?.served_model ?? null : f.judge?.provenance?.served_model ?? f.ai?.model ?? null;
+  const reusedModel = typeof f.reused_verdict?.model === "string" ? f.reused_verdict.model : null;
+  const model = f.reused_from_id ? reusedModel ?? f.judge?.provenance?.served_model ?? null : f.judge?.provenance?.served_model ?? f.ai?.model ?? null;
   return {
     test_id: isUuid(f.test_id) ? f.test_id : null,
     signature_id: isUuid(f.signature_id) ? f.signature_id : null,
@@ -5279,7 +5380,7 @@ function findingToVerdictItem(f, runURL, secrets) {
     decided_by: f.reused_from_id ? "reused" : f.judge ? "ai" : "rules",
     rule: f.decision ?? f.class ?? null,
     confidence,
-    summary: cleanSummary ? cleanSummary.slice(0, 1e3) : null,
+    summary: cleanSummary ? sliceUtf16Safe(cleanSummary, 1e3) : null,
     model,
     triage_url: runURL,
     error_context: buildErrorContext(f, secrets),
@@ -5331,14 +5432,14 @@ async function submitTriageVerdicts({
         decided_by: "rules",
         rule: lane.verdict.fault,
         confidence: null,
-        summary: redact(lane.verdict.what, secrets).trim().slice(0, 1e3) || null,
+        summary: sliceUtf16Safe(redact(lane.verdict.what, secrets).trim(), 1e3) || null,
         model: null,
         triage_url: runURL,
         error_context: {
           lane_label: redact(lane.verdict.label, secrets),
           fault: redact(lane.verdict.fault, secrets),
-          what: redact(lane.verdict.what, secrets).slice(0, 1e3),
-          action: redact(lane.verdict.action, secrets).slice(0, 1e3)
+          what: sliceUtf16Safe(redact(lane.verdict.what, secrets), 1e3),
+          action: sliceUtf16Safe(redact(lane.verdict.action, secrets), 1e3)
         },
         reused_from_id: null
       }
@@ -5408,7 +5509,7 @@ async function triage(options) {
     if (!written.summary && summaryPath) {
       try {
         const text = body ? renderNotTriaged({ text: body, lane: env.LANE || id?.name || null }) : renderUnfinished({ reason, lane: env.LANE || null });
-        (0, import_node_fs4.appendFileSync)(summaryPath, text + "\n");
+        (0, import_node_fs4.appendFileSync)(summaryPath, redact(text, secrets) + "\n");
       } catch (writeError) {
         log(`triage's summary not written: ${String(writeError).slice(0, 160)}`);
       }
@@ -5806,7 +5907,7 @@ ai_input_tokens=${spend.input_tokens}
 ai_output_tokens=${spend.output_tokens}
 `);
     if (env.GITHUB_STEP_SUMMARY && (decides || laneRed || lane)) {
-      (0, import_node_fs4.appendFileSync)(env.GITHUB_STEP_SUMMARY, summary + "\n");
+      (0, import_node_fs4.appendFileSync)(env.GITHUB_STEP_SUMMARY, redact(summary, secrets) + "\n");
       written.summary = true;
     }
     const mode = String(env.MODE ?? "").trim();

@@ -581,12 +581,12 @@ async function runFromGroups(fetchImpl, base, id, groups, reportName = null, wai
       const pickCaseMeta = (k) => {
         if (lastAttempt[k] != null) return lastAttempt[k];
         const fromAny = attempts.find((a) => a[k] != null)?.[k];
-        if (fromAny != null) return fromAny;
-        return lastAttempt[k];
+        return fromAny != null ? fromAny : lastAttempt[k];
       };
       const testId = pickCaseMeta("test_id");
-      const signatureId = pickCaseMeta("signature_id");
-      const signatureFingerprint = pickCaseMeta("signature_fingerprint");
+      const sigAttempt = lastAttempt.signature_fingerprint != null || lastAttempt.signature_id != null ? lastAttempt : attempts.find((a) => a.signature_fingerprint != null || a.signature_id != null) ?? lastAttempt;
+      const signatureId = sigAttempt.signature_id;
+      const signatureFingerprint = sigAttempt.signature_fingerprint;
       failing.push({
         file,
         title,

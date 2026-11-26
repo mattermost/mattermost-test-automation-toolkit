@@ -2,7 +2,7 @@
 // See LICENSE.txt for license information.
 
 import type { Env, FetchImpl } from "../../shared/src/github.ts";
-import { isUuid, lookupVerdictBySignature, resolveTsioAuthHeaders, submitVerdicts } from "../../shared/src/tsio.ts";
+import { isUuid, lookupVerdictBySignature, resolveTsioAuthHeaders, sliceUtf16Safe, submitVerdicts } from "../../shared/src/tsio.ts";
 import type { CreateVerdictItem, CreatedVerdictItem, TsioVerdict } from "../../shared/src/tsio.ts";
 import type { LookupVerdictFn } from "./decision.ts";
 import { redact, secretsOf } from "./findings.ts";
@@ -14,7 +14,7 @@ const ANSI = /\x1b\[[0-9;]*m/g;
 
 function firstErrorLine(error: string | null | undefined): string {
   const line = String(error ?? "").replace(ANSI, "").split(/\r?\n/).find((l) => l.trim()) ?? "";
-  return line.trim().slice(0, 200);
+  return sliceUtf16Safe(line.trim(), 200);
 }
 
 export function buildErrorContext(f: Finding, secrets: string[]): Record<string, unknown> {
@@ -25,8 +25,8 @@ export function buildErrorContext(f: Finding, secrets: string[]): Record<string,
     ...(f.full_title ? { full_title: redact(f.full_title, secrets) } : {}),
     class: f.class,
     error_first_line: redact(first, secrets),
-    ...(f.error ? { error: redact(f.error.slice(0, 4000), secrets) } : {}),
-    ...(f.reason ? { reason: redact(f.reason.slice(0, 1000), secrets) } : {}),
+    ...(f.error ? { error: redact(sliceUtf16Safe(f.error, 4000), secrets) } : {}),
+    ...(f.reason ? { reason: redact(sliceUtf16Safe(f.reason, 1000), secrets) } : {}),
     ...(f.tries ? { tries: { ran: f.tries.ran, failed: f.tries.failed } } : {}),
   };
 }
@@ -34,12 +34,14 @@ export function buildErrorContext(f: Finding, secrets: string[]): Record<string,
 export function findingToVerdictItem(f: Finding, runURL: string, secrets: string[]): CreateVerdictItem {
   const rawConf = f.reused_from_id ? (f.reused_verdict?.confidence ?? f.judge?.confidence ?? null) : (f.judge?.confidence ?? null);
   const confidence = typeof rawConf === "number" && Number.isFinite(rawConf) ? Math.min(1, Math.max(0, rawConf)) : null;
+  const reusedSummary = typeof f.reused_verdict?.summary === "string" ? f.reused_verdict.summary : null;
   const rawSummary = f.reused_from_id
-    ? (f.reused_verdict?.summary ?? f.judge?.explanation ?? f.reason ?? "")
+    ? (reusedSummary ?? f.judge?.explanation ?? f.reason ?? "")
     : (f.judge?.explanation ?? f.reason ?? "");
   const cleanSummary = redact(rawSummary, secrets).trim();
+  const reusedModel = typeof f.reused_verdict?.model === "string" ? f.reused_verdict.model : null;
   const model = f.reused_from_id
-    ? (f.reused_verdict?.model ?? f.judge?.provenance?.served_model ?? null)
+    ? (reusedModel ?? f.judge?.provenance?.served_model ?? null)
     : (f.judge?.provenance?.served_model ?? f.ai?.model ?? null);
 
   return {
@@ -50,7 +52,7 @@ export function findingToVerdictItem(f: Finding, runURL: string, secrets: string
     decided_by: f.reused_from_id ? "reused" : f.judge ? "ai" : "rules",
     rule: f.decision ?? f.class ?? null,
     confidence,
-    summary: cleanSummary ? cleanSummary.slice(0, 1000) : null,
+    summary: cleanSummary ? sliceUtf16Safe(cleanSummary, 1000) : null,
     model,
     triage_url: runURL,
     error_context: buildErrorContext(f, secrets),
@@ -133,14 +135,14 @@ export async function submitTriageVerdicts({
             decided_by: "rules",
             rule: lane!.verdict.fault,
             confidence: null,
-            summary: redact(lane!.verdict.what, secrets).trim().slice(0, 1000) || null,
+            summary: sliceUtf16Safe(redact(lane!.verdict.what, secrets).trim(), 1000) || null,
             model: null,
             triage_url: runURL,
             error_context: {
               lane_label: redact(lane!.verdict.label, secrets),
               fault: redact(lane!.verdict.fault, secrets),
-              what: redact(lane!.verdict.what, secrets).slice(0, 1000),
-              action: redact(lane!.verdict.action, secrets).slice(0, 1000),
+              what: sliceUtf16Safe(redact(lane!.verdict.what, secrets), 1000),
+              action: sliceUtf16Safe(redact(lane!.verdict.action, secrets), 1000),
             },
             reused_from_id: null,
           },

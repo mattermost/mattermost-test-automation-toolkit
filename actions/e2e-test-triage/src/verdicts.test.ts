@@ -2,6 +2,9 @@
 // See LICENSE.txt for license information.
 
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import type { Env, FetchImpl } from "../../shared/src/github.ts";
 import { MAX_ERROR_CONTEXT_BYTES } from "../../shared/src/tsio.ts";
@@ -12,6 +15,7 @@ import { buildPack, releasePack } from "./pack.ts";
 import { decidedBy, statusLabelOf } from "./render.ts";
 import { triage } from "./triage.ts";
 import type { Answer, Finding, Observation, Pack, PrRef } from "./types.ts";
+import { buildErrorContext, findingToVerdictItem } from "./verdicts.ts";
 
 const GROUP_UUID = "01960000-0000-7000-8000-000000000001";
 const TEST_UUID_1 = "11111111-1111-4111-8111-111111111111";
@@ -274,10 +278,10 @@ test("pre-LLM broken-on-main hit skips LLM on PR (unblocking) and preserves bloc
     title: "t1",
     error: "Error: boom",
     class: "REGRESSION",
-    reason: "First failure on trunk",
+    reason: "Failed on trunk",
     blocking: true,
-    trunk: { runs: 6, fails: 0, flaky: 0, passes: 6, latest: "passed" },
-    cross_pr: { prs: [], examples: [], passes: 0 },
+    trunk: { runs: 6, fails: 1, flaky: 0, passes: 5, latest: "failed", same_error: true },
+    cross_pr: { prs: [99], examples: ["PR #99: Error: boom"], passes: 0 },
     failure_signatures: [],
     trunk_break: null,
     this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
@@ -478,7 +482,239 @@ test("POST /api/v1/verdicts supports OIDC auth, skips when unauthenticated, dedu
   }
 });
 
-test("secretsOf includes TSIO_API_KEY alongside GitHub and Anthropic secrets", () => {
-  const s = secretsOf({ GITHUB_TOKEN: "gh-secret", ANTHROPIC_API_KEY: "ant-secret", TSIO_API_KEY: "tsio-secret" }, ["oidc-secret"]);
-  assert.deepEqual(s, ["gh-secret", "ant-secret", "tsio-secret", "oidc-secret"]);
+test("secretsOf includes TSIO_API_KEY and ACTIONS_ID_TOKEN_REQUEST_TOKEN alongside GitHub and Anthropic secrets", () => {
+  const s = secretsOf(
+    { GITHUB_TOKEN: "gh-secret", ANTHROPIC_API_KEY: "ant-secret", TSIO_API_KEY: "tsio-secret", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "req-secret" },
+    ["oidc-secret"],
+  );
+  assert.deepEqual(s, ["gh-secret", "ant-secret", "tsio-secret", "req-secret", "oidc-secret"]);
+});
+
+test("HIGH-1: malformed TSIO prior fields fail open to LLM without throwing in judge() or triage()", async () => {
+  const pr: PrRef = { number: 5, repository: "o/r", title: "Fix", lane: "playwright-full" };
+  const mkFinding = (): Finding => ({
+    file: "specs/a.spec.ts",
+    title: "t1",
+    error: "Error: boom",
+    class: "REGRESSION",
+    reason: "Cross-PR",
+    blocking: true,
+    trunk: { runs: 6, fails: 0, flaky: 0, passes: 6, latest: "passed" },
+    cross_pr: { prs: [99], examples: ["PR #99: Error: boom"], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
+    signature_fingerprint: "fp-malformed",
+  });
+
+  for (const badPrior of [
+    priorVerdict({ summary: 12345 as unknown as string }),
+    priorVerdict({ summary: {} as unknown as string }),
+    priorVerdict({ confidence: "0.95" as unknown as number }),
+    priorVerdict({ model: 42 as unknown as string }),
+    {} as unknown as TsioVerdict,
+  ]) {
+    const f = mkFinding();
+    const pack = buildPack(f, [], pr, []);
+    let asked = 0;
+    await judge(
+      [f],
+      [pack],
+      async () => {
+        asked++;
+        return {
+          answers: [{ cause: "flaky_environment", confidence: 0.9, cited_evidence: ["cross_pr"], explanation: "LLM fallback" }],
+          usage: null,
+          served_model: "claude-sonnet-5-5",
+        };
+      },
+      undefined,
+      () => {},
+      false,
+      undefined,
+      async () => badPrior,
+    );
+    assert.equal(asked, 1, "malformed prior must fall back to LLM without throwing");
+    assert.equal(f.blocking, false);
+    assert.equal(f.reused_from_id, undefined);
+  }
+
+  const hBadHttp = makeHarness({
+    onLookup: async () => Response.json({ id: PRIOR_VERDICT_UUID, label: "flaky", confidence: 0.95, summary: 12345 }),
+  });
+  const res = await triage({ env: hBadHttp.env, fetchImpl: hBadHttp.fetchImpl, log: (m) => hBadHttp.logs.push(m), now: new Date("2026-11-26T12:00:00Z"), retryWait: noopWait });
+  assert.equal(hBadHttp.anthropicCalls, 1);
+  assert.equal(res.verdict, "SUCCESS");
+});
+
+test("HIGH-2: ACTIONS_ID_TOKEN_REQUEST_TOKEN and OIDC JWTs are redacted from logs, FINDINGS_FILE, GITHUB_STEP_SUMMARY, and posted verdicts", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "triage-redact-"));
+  const findingsPath = join(dir, "findings.json");
+  const summaryPath = join(dir, "summary.md");
+  const reqSecret = "actions-id-req-secret-99999";
+  const jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig_part_abc12345";
+  try {
+    const h = makeHarness({
+      envOver: {
+        ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc.example/token",
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: reqSecret,
+        FINDINGS_FILE: findingsPath,
+        GITHUB_STEP_SUMMARY: summaryPath,
+      },
+      onOidc: async () => Response.json({ value: jwt }),
+      cases: [
+        {
+          suite_id: "s1",
+          title: `test with ${reqSecret} and ${jwt}`,
+          status: "failed",
+          retry_count: 0,
+          ordinal: 0,
+          error_message: `Error carrying ${reqSecret} and ${jwt}`,
+          test_id: TEST_UUID_1,
+          signature_id: SIG_UUID_1,
+          signature_fingerprint: "fp-sec",
+        },
+      ],
+      llmAnswer: {
+        cause: "flaky_environment",
+        confidence: 0.92,
+        cited_evidence: ["cross_pr"],
+        explanation: `Saw ${reqSecret} and ${jwt} in output`,
+      },
+    });
+    await triage({ env: h.env, fetchImpl: h.fetchImpl, log: (m) => h.logs.push(m), now: new Date("2026-11-26T12:00:00Z"), retryWait: noopWait });
+
+    const logText = h.logs.join("\n");
+    const findingsText = readFileSync(findingsPath, "utf8");
+    const summaryText = readFileSync(summaryPath, "utf8");
+    const postedText = JSON.stringify(h.postedVerdicts[0]?.body ?? {});
+
+    for (const [where, text] of [
+      ["logs", logText],
+      ["FINDINGS_FILE", findingsText],
+      ["GITHUB_STEP_SUMMARY", summaryText],
+      ["POST /verdicts", postedText],
+    ] as const) {
+      assert.ok(!text.includes(reqSecret), `${where} must not leak ACTIONS_ID_TOKEN_REQUEST_TOKEN`);
+      assert.ok(!text.includes(jwt), `${where} must not leak OIDC JWT`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("HIGH-4: advisory groups (advise=true, canChange=false) are NOT unblocked by TSIO verdict reuse", async () => {
+  const pr: PrRef = { number: 5, repository: "o/r", title: "Fix", lane: "playwright-full" };
+  const f: Finding = {
+    file: "specs/a.spec.ts",
+    title: "t1",
+    error: "Error: expected visible",
+    class: "REGRESSION",
+    reason: "Failed without clearing evidence",
+    blocking: true,
+    trunk: { runs: 6, fails: 0, flaky: 0, passes: 6, latest: "passed" },
+    cross_pr: { prs: [], examples: [], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
+    signature_fingerprint: "fp-advisory",
+  };
+  const pack = buildPack(f, [], pr, []);
+  let asked = 0;
+  let lookups = 0;
+  await judge(
+    [f],
+    [pack],
+    async () => {
+      asked++;
+      return {
+        answers: [{ cause: "caused_by_pr", confidence: 0.7, cited_evidence: [], explanation: "Unsure" }],
+        usage: null,
+        served_model: "claude-sonnet-5-5",
+      };
+    },
+    undefined,
+    () => {},
+    false,
+    undefined,
+    async () => {
+      lookups++;
+      return priorVerdict({ label: "flaky", confidence: 0.99 });
+    },
+  );
+  assert.equal(lookups, 0, "advisory group must not query TSIO for unblock reuse");
+  assert.equal(asked, 1, "advisory group must proceed to LLM advice path");
+  assert.equal(f.blocking, true, "advisory finding must remain blocking");
+  assert.equal(f.decision, "advice");
+  assert.equal(f.reused_from_id, undefined);
+});
+
+test("LOW-1: trunk INFRA_ERROR does not reuse broken-on-main verdict", async () => {
+  const pr: PrRef = { number: null, repository: "o/r", title: "", lane: "master" };
+  const f: Finding = {
+    file: "specs/a.spec.ts",
+    title: "t1",
+    error: "Error: ECONNREFUSED 127.0.0.1:8065",
+    class: "INFRA_ERROR",
+    reason: "Service unreachable",
+    blocking: true,
+    trunk: { runs: 6, fails: 0, flaky: 0, passes: 6, latest: "passed" },
+    cross_pr: { prs: [99], examples: ["PR #99: Error: ECONNREFUSED 127.0.0.1:8065"], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
+    signature_fingerprint: "fp-infra-trunk",
+  };
+  const pack = buildPack(f, [], pr, []);
+  let asked = 0;
+  let lookups = 0;
+  await judge(
+    [f],
+    [pack],
+    async () => {
+      asked++;
+      return {
+        answers: [{ cause: "flaky_environment", confidence: 0.9, cited_evidence: ["cross_pr"], explanation: "Infra blip" }],
+        usage: null,
+        served_model: "claude-sonnet-5-5",
+      };
+    },
+    undefined,
+    () => {},
+    true,
+    undefined,
+    async () => {
+      lookups++;
+      return priorVerdict({ label: "broken on main", confidence: 0.95 });
+    },
+  );
+  assert.equal(lookups, 1, "non-advisory trunk INFRA_ERROR must consult lookup");
+  assert.equal(asked, 1, "trunk INFRA_ERROR must not reuse 'broken on main'");
+  assert.equal(f.reused_from_id, undefined);
+});
+
+test("MEDIUM-2: buildErrorContext and findingToVerdictItem truncate 4-byte emojis without lone UTF-16 surrogates", () => {
+  const loneRe = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  const err = "x".repeat(3999) + "😀" + "tail";
+  const reason = "r".repeat(999) + "😀" + "tail";
+  const summary = "s".repeat(999) + "😀" + "tail";
+  const f: Finding = {
+    file: "specs/a.spec.ts",
+    title: "t1",
+    error: err,
+    class: "REGRESSION",
+    reason,
+    blocking: true,
+    trunk: { runs: 0, passes: 0, fails: 0, flaky: 0, latest: "" },
+    cross_pr: { prs: [], examples: [], passes: 0 },
+    failure_signatures: [],
+    trunk_break: null,
+    this_pr: { runs: 0, passes: 0, fails: 0, last_pass: null, latest: "" },
+    judge: { cause: "flaky_environment", confidence: 0.9, cited_evidence: [], explanation: summary },
+  };
+  const ctx = buildErrorContext(f, []);
+  const item = findingToVerdictItem(f, "https://github.com/o/r/actions/runs/1", []);
+  assert.ok(!loneRe.test(String(ctx.error ?? "")));
+  assert.ok(!loneRe.test(String(ctx.reason ?? "")));
+  assert.ok(!loneRe.test(String(item.summary ?? "")));
 });

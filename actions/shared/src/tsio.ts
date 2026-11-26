@@ -464,15 +464,18 @@ export async function runFromGroups(
       const file = fileOf.get(suiteId) ?? "";
       // The first try in the report it is named by: ordinals are only comparable within one report.
       const first = attempts.find((a) => a.suite_id === suiteId);
-      const pickCaseMeta = (k: "test_id" | "signature_id" | "signature_fingerprint"): string | null | undefined => {
+      const pickCaseMeta = (k: "test_id"): string | null | undefined => {
         if (lastAttempt[k] != null) return lastAttempt[k];
         const fromAny = attempts.find((a) => a[k] != null)?.[k];
-        if (fromAny != null) return fromAny;
-        return lastAttempt[k];
+        return fromAny != null ? fromAny : lastAttempt[k];
       };
       const testId = pickCaseMeta("test_id");
-      const signatureId = pickCaseMeta("signature_id");
-      const signatureFingerprint = pickCaseMeta("signature_fingerprint");
+      const sigAttempt =
+        lastAttempt.signature_fingerprint != null || lastAttempt.signature_id != null
+          ? lastAttempt
+          : attempts.find((a) => a.signature_fingerprint != null || a.signature_id != null) ?? lastAttempt;
+      const signatureId = sigAttempt.signature_id;
+      const signatureFingerprint = sigAttempt.signature_fingerprint;
       failing.push({
         file,
         title,
@@ -656,42 +659,122 @@ export async function lookupVerdictBySignature(
   if (!data || typeof data !== "object" || Array.isArray(data) || typeof data.id !== "string" || !data.id || typeof data.label !== "string" || !data.label) {
     throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
   }
-  return data as unknown as TsioVerdict;
+  const optStr = (v: unknown): string | null => {
+    if (v == null) return null;
+    if (typeof v !== "string") throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+    return v;
+  };
+  const reqStr = (v: unknown): string => {
+    if (v == null) return "";
+    if (typeof v !== "string") throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+    return v;
+  };
+  let confidence: number | null = null;
+  if (data.confidence != null) {
+    if (typeof data.confidence !== "number" || !Number.isFinite(data.confidence)) {
+      throw new Error("TSIO GET /verdicts/by-signature: invalid response shape");
+    }
+    confidence = data.confidence;
+  }
+  return {
+    id: data.id,
+    report_group_id: optStr(data.report_group_id),
+    repository: reqStr(data.repository),
+    test_id: optStr(data.test_id),
+    signature_id: reqStr(data.signature_id),
+    fingerprint: reqStr(data.fingerprint),
+    label: data.label,
+    decided_by: optStr(data.decided_by),
+    rule: optStr(data.rule),
+    confidence,
+    summary: optStr(data.summary),
+    model: optStr(data.model),
+    triage_url: optStr(data.triage_url),
+    reused_from_id: optStr(data.reused_from_id),
+    created_at: reqStr(data.created_at),
+  };
+}
+
+/** Slices at most maxUnits UTF-16 code units without splitting a surrogate pair. */
+export function sliceUtf16Safe(s: string, maxUnits: number): string {
+  if (maxUnits <= 0) return "";
+  if (s.length <= maxUnits) return s;
+  let end = maxUnits;
+  const code = s.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) end--;
+  return s.slice(0, end);
 }
 
 const utf8Bytes = (s: string): number => new TextEncoder().encode(s).byteLength;
 
+function toJsonSafe(v: unknown, ancestors: WeakSet<object>): unknown {
+  if (typeof v === "bigint") return String(v);
+  if (v === null || typeof v !== "object") {
+    return typeof v === "function" || typeof v === "symbol" || v === undefined ? undefined : v;
+  }
+  if (ancestors.has(v)) return undefined;
+  ancestors.add(v);
+  try {
+    const toJson = (v as { toJSON?: unknown }).toJSON;
+    if (typeof toJson === "function") {
+      try {
+        return toJsonSafe((toJson as () => unknown).call(v), ancestors);
+      } catch {
+        return undefined;
+      }
+    }
+    if (Array.isArray(v)) return v.map((el) => toJsonSafe(el, ancestors) ?? null);
+    const copy: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v)) {
+      const safeVal = toJsonSafe(val, ancestors);
+      if (safeVal !== undefined) copy[k] = safeVal;
+    }
+    return copy;
+  } finally {
+    ancestors.delete(v);
+  }
+}
+
 function normalizeErrorContext(raw: unknown): Record<string, unknown> | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const out: Record<string, unknown> = { ...(raw as Record<string, unknown>) };
-  if (utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES) return out;
+  try {
+    const safe = toJsonSafe(raw, new WeakSet());
+    if (!safe || typeof safe !== "object" || Array.isArray(safe)) return {};
+    const out = safe as Record<string, unknown>;
+    if (utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES) return out;
 
-  for (let guard = 0; guard < 64 && utf8Bytes(JSON.stringify(out)) > MAX_ERROR_CONTEXT_BYTES; guard++) {
-    let longestStrKey: string | null = null;
-    let longestStrLen = 0;
-    for (const [k, v] of Object.entries(out)) {
-      if (typeof v === "string" && v.length > longestStrLen) {
-        longestStrKey = k;
-        longestStrLen = v.length;
+    for (let guard = 0; guard < 64 && utf8Bytes(JSON.stringify(out)) > MAX_ERROR_CONTEXT_BYTES; guard++) {
+      let longestStrKey: string | null = null;
+      let longestStrLen = 0;
+      for (const [k, v] of Object.entries(out)) {
+        if (typeof v === "string" && v.length > longestStrLen) {
+          longestStrKey = k;
+          longestStrLen = v.length;
+        }
       }
-    }
-    if (longestStrKey && longestStrLen > 64) {
-      out[longestStrKey] = (out[longestStrKey] as string).slice(0, Math.floor(longestStrLen / 2));
-      continue;
-    }
-    let largestKey: string | null = null;
-    let largestBytes = -1;
-    for (const [k, v] of Object.entries(out)) {
-      const b = utf8Bytes(JSON.stringify(v ?? null));
-      if (b > largestBytes) {
-        largestBytes = b;
-        largestKey = k;
+      if (longestStrKey && longestStrLen > 64) {
+        const next = sliceUtf16Safe(out[longestStrKey] as string, Math.floor(longestStrLen / 2));
+        if (next.length < longestStrLen) {
+          out[longestStrKey] = next;
+          continue;
+        }
       }
+      let largestKey: string | null = null;
+      let largestBytes = -1;
+      for (const [k, v] of Object.entries(out)) {
+        const b = utf8Bytes(JSON.stringify(v ?? null));
+        if (b > largestBytes) {
+          largestBytes = b;
+          largestKey = k;
+        }
+      }
+      if (!largestKey) break;
+      delete out[largestKey];
     }
-    if (!largestKey) break;
-    delete out[largestKey];
+    return utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES ? out : {};
+  } catch {
+    return {};
   }
-  return utf8Bytes(JSON.stringify(out)) <= MAX_ERROR_CONTEXT_BYTES ? out : {};
 }
 
 function sanitizeVerdictItem(item: CreateVerdictItem): CreateVerdictItem {
@@ -735,12 +818,25 @@ export async function submitVerdicts(
   const sanitized = request.verdicts.map(sanitizeVerdictItem).filter((v) => v.label.trim().length > 0);
   if (!sanitized.length) return [];
 
-  let items = sanitized;
+  const fpToSigId = new Map<string, string>();
+  for (const item of sanitized) {
+    if (item.fingerprint && item.signature_id && !fpToSigId.has(item.fingerprint)) {
+      fpToSigId.set(item.fingerprint, item.signature_id);
+    }
+  }
+  const normalized = sanitized.map((item) =>
+    !item.signature_id && item.fingerprint && fpToSigId.has(item.fingerprint)
+      ? { ...item, signature_id: fpToSigId.get(item.fingerprint)! }
+      : item,
+  );
+
+  let items = normalized;
   if (reportGroupId) {
     const seen = new Set<string>();
     items = [];
-    for (const item of sanitized) {
-      const key = `${item.test_id ?? ""}\0${item.signature_id ?? ""}`;
+    for (const item of normalized) {
+      const sigKey = item.signature_id ? `s:${item.signature_id}` : item.fingerprint ? `f:${item.fingerprint}` : "";
+      const key = `${item.test_id ?? ""}\0${sigKey}`;
       if (seen.has(key)) continue;
       seen.add(key);
       items.push(item);

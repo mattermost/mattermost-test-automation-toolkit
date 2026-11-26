@@ -157,7 +157,9 @@ function reusableOutcomeFor(
   isTrunk: boolean,
   minConfidence: number,
 ): { cause: Cause; blocking: boolean; decision: string } | null {
-  if (prior.confidence != null && (!Number.isFinite(prior.confidence) || prior.confidence < minConfidence)) return null;
+  if (prior.summary != null && typeof prior.summary !== "string") return null;
+  if (prior.model != null && typeof prior.model !== "string") return null;
+  if (prior.confidence != null && (typeof prior.confidence !== "number" || !Number.isFinite(prior.confidence) || prior.confidence < minConfidence)) return null;
   if (pack.release) {
     if (prior.label === "flaky") {
       const lanes = pack.same_test_other_platforms_this_run?.results ?? [];
@@ -171,6 +173,7 @@ function reusableOutcomeFor(
   }
   if (prior.label === "flaky") return { cause: "flaky_environment", blocking: false, decision: "adjudicator_unblock" };
   if (prior.label === "broken on main") {
+    if (isTrunk && f.class === "INFRA_ERROR") return null;
     return isTrunk
       ? { cause: "bug_on_master", blocking: true, decision: "engine" }
       : { cause: "bug_on_master", blocking: false, decision: "adjudicator_unblock" };
@@ -344,17 +347,21 @@ export async function judge(
     };
     const candidates = pending.filter(
       (g) =>
+        !g.advisory &&
         !cachedAnswer(cfg.answers?.[answerKey(cfg.model, g.lead.pack)], g.lead.pack) &&
         g.members.every((m) => canReuseFinding(m.f, m.pack, isTrunkRun) && m.f.signature_fingerprint === g.lead.f.signature_fingerprint),
     );
     await Promise.all([...new Set(candidates.map((g) => g.lead.f.signature_fingerprint!))].map((fp) => lookupCached(fp)));
     for (const g of candidates) {
       const prior = await lookupCached(g.lead.f.signature_fingerprint!);
-      if (!prior) continue;
+      if (!prior || typeof prior !== "object" || typeof prior.id !== "string" || !prior.id || typeof prior.label !== "string" || !prior.label) continue;
       const resolved = g.members.map((m) => reusableOutcomeFor(prior, m.pack, m.f, isTrunkRun, cfg.minConfidence));
       if (resolved.some((r) => r === null)) continue;
       reused.add(g);
-      const explanation = prior.summary?.trim() || `Reused prior TSIO verdict (${prior.label})`;
+      const summary = typeof prior.summary === "string" ? prior.summary.trim() : "";
+      const explanation = summary || `Reused prior TSIO verdict (${prior.label})`;
+      const confidence = typeof prior.confidence === "number" && Number.isFinite(prior.confidence) ? prior.confidence : cfg.minConfidence;
+      const servedModel = typeof prior.model === "string" && prior.model ? prior.model : "reused";
       for (const [idx, m] of g.members.entries()) {
         const res = resolved[idx]!;
         Object.assign(m.f, {
@@ -365,10 +372,10 @@ export async function judge(
           reused_verdict: prior,
           judge: {
             cause: res.cause,
-            confidence: prior.confidence ?? cfg.minConfidence,
+            confidence,
             cited_evidence: [],
             explanation,
-            provenance: { served_model: prior.model ?? "reused" },
+            provenance: { served_model: servedModel },
           },
         });
       }

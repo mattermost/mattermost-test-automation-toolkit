@@ -143,7 +143,7 @@ export async function triage(options: TriageOptions): Promise<EvaluatedRun> {
     if (!written.summary && summaryPath) {
       try {
         const text = body ? renderNotTriaged({ text: body, lane: env.LANE || id?.name || null }) : renderUnfinished({ reason, lane: env.LANE || null });
-        appendFileSync(summaryPath, text + "\n");
+        appendFileSync(summaryPath, redact(text, secrets) + "\n");
       } catch (writeError) {
         log(`triage's summary not written: ${String(writeError).slice(0, 160)}`);
       }
@@ -608,7 +608,7 @@ async function decideRun({ env, fetchImpl = fetch, log = console.error, now = ne
     // A lane with nothing failed or missing has nothing to report, so it writes no job
     // summary: the run page then shows only the lanes someone needs to read.
     if (env.GITHUB_STEP_SUMMARY && (decides || laneRed || lane)) {
-      appendFileSync(env.GITHUB_STEP_SUMMARY, summary + "\n");
+      appendFileSync(env.GITHUB_STEP_SUMMARY, redact(summary, secrets) + "\n");
       written.summary = true;
     }
     // Only the exact value "enforce" writes the required status; anything else is report-only.
