@@ -1,7 +1,7 @@
 """Per-stage telemetry ledger: one JSON line per stage in <hdir>/telemetry.jsonl.
 
 Line: {stage, start, end, secs, exit ("ok" | exception class name), ...fields}
-Fields are free-form (model, tokens_in, tokens_out, cost_usd, retries, image_pull_s,
+Fields are free-form (model, tokens_in, cache_write, cache_read, tokens_out, cost_usd, retries, image_pull_s,
 effort_tier, schema_version). Each line is appended with a single write.
 """
 from __future__ import annotations
@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 LEDGER = "telemetry.jsonl"
+TOKEN_KEYS = ("tokens_in", "cache_write", "cache_read", "tokens_out")  # tokens_in includes both cache parts
 
 
 def _append(hdir: str | Path, row: dict[str, Any]) -> None:
@@ -60,7 +61,7 @@ def _num(v: Any) -> float:
 
 def summarize(hdir: str | Path) -> dict[str, Any]:
     """Totals plus per-stage totals. Missing ledger gives zeros; malformed lines are skipped."""
-    out: dict[str, Any] = {"total_secs": 0.0, "total_cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "by_stage": {}}
+    out: dict[str, Any] = {"total_secs": 0.0, "total_cost_usd": 0.0, **dict.fromkeys(TOKEN_KEYS, 0), "by_stage": {}}
     path = Path(hdir) / LEDGER
     if not path.exists():
         return out
@@ -72,17 +73,16 @@ def summarize(hdir: str | Path) -> dict[str, Any]:
         if not isinstance(row, dict) or "stage" not in row:
             continue
         secs, cost = _num(row.get("secs")), _num(row.get("cost_usd"))
-        tin, tout = int(_num(row.get("tokens_in"))), int(_num(row.get("tokens_out")))
         b = out["by_stage"].setdefault(
-            str(row["stage"]), {"count": 0, "secs": 0.0, "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "failures": 0})
+            str(row["stage"]), {"count": 0, "secs": 0.0, "cost_usd": 0.0, **dict.fromkeys(TOKEN_KEYS, 0), "failures": 0})
         b["count"] += 1
         b["secs"] += secs
         b["cost_usd"] += cost
-        b["tokens_in"] += tin
-        b["tokens_out"] += tout
+        for k in TOKEN_KEYS:
+            n = int(_num(row.get(k)))
+            b[k] += n
+            out[k] += n
         b["failures"] += row.get("exit", "ok") != "ok"
         out["total_secs"] += secs
         out["total_cost_usd"] += cost
-        out["tokens_in"] += tin
-        out["tokens_out"] += tout
     return out

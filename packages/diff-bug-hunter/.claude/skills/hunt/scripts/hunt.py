@@ -191,7 +191,8 @@ def dispatch_one(hdir: Path, tag: str, request: Path) -> bool:
         print(f"[dispatch {tag}] FAILED {str(e)[:300]}")
         set_gap(hdir, f"dispatch:{tag}", str(e)[:500])
         return False
-    print(f"[dispatch {tag}] {res.status} retries={res.retries} tokens_in={res.tokens_in} tokens_out={res.tokens_out}")
+    print(f"[dispatch {tag}] {res.status} retries={res.retries} tokens_in={res.tokens_in} "
+          f"cache_write={res.cache_write} cache_read={res.cache_read} tokens_out={res.tokens_out}")
     set_gap(hdir, f"dispatch:{tag}", None)
     return True
 

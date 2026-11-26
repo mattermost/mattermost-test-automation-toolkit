@@ -651,7 +651,9 @@ def file_diffs(repo: Path, mb: str, head: str) -> list[prefilter.FileDiff]:
 # Outputs of an earlier hunt or batch. Left in place they would be reused (an old regenerated mutant, an old compile
 # log, old verdicts), so a new context removes them; prepare.json and whole-PR artifacts stay across batch switches.
 STALE = ("A", "B", "D", "A2", "M", "M2", "R_*", "run_A*", "run_B*", "run_D*", "base_A*", "base_B*", "base_D*",
-         "mutants_*", "compile_A*", "compile_B*", "compile_D*", "fuzz_*", "diff_*", "ctx.json", "state.json", "skipped.log")
+         "mutants_*", "compile_A*", "compile_B*", "compile_D*", "fuzz_*", "diff_*", "ctx.json", "state.json", "skipped.log",
+         # driver outputs: a new batch or head must be vetted again, never reuse the last run's decisions
+         "V", "run_V*", "base_V*", "vet", "vetted.json", "verdict.json", "findings.json", "audit.md")
 WHOLE_PR_STALE = ("old_tests.json", "old_tests.messages.json", "pr_tests.json", "pr_tests.messages.json",
                   "R", "run_R*", "base_R*", "compile_R*", "review_verdicts.json", "batches")
 

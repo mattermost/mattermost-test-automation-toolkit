@@ -27,9 +27,12 @@ sys.dont_write_bytecode = True
 if not sys.pycache_prefix:
     sys.pycache_prefix = "/dev/null/hunt-pyc"
 
+import fcntl
 import hashlib
 import json
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from ctx import reset_hunt_dir
@@ -59,6 +62,20 @@ REDIS_CONTAINER, REDIS_IMAGE = "hunt-redis", "redis:7"
 
 class SchemaMismatch(RuntimeError):
     """hunt<key>/ was prepared by another schema_version: resuming it could mix layouts. Printed as SCHEMA_MISMATCH."""
+
+
+@contextmanager
+def clone_fetch_lock(mm: Path) -> Iterator[None]:
+    """Serialize fetches into the shared clone (blocking: a wait, not a retry)."""
+    with (mm.parent / f".{mm.name}.fetch.lock").open("w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+RUN_STALE = ("telemetry.jsonl", "driver.json")  # one run's cost and gaps; a new hunt starts from zero
 
 
 def check_schema(hdir: Path, head: str, fresh: bool) -> None:
@@ -289,7 +306,8 @@ def resolve_ref(mm: Path, ref: str) -> str:
         if q.returncode == 0:
             return q.stdout.strip()
     local = f"refs/hunt-fetch/{hashlib.sha256(ref.encode()).hexdigest()[:16]}"
-    p = sh(git_cmd("fetch", "-q", "origin", f"+{ref}:{local}"), mm, check=False)
+    with clone_fetch_lock(mm):
+        p = sh(git_cmd("fetch", "-q", "origin", f"+{ref}:{local}"), mm, check=False)
     if p.returncode == 0:
         return git(mm, "rev-parse", f"{local}^{{commit}}")
     for cand in (ref, f"origin/{ref}", f"refs/tags/{ref}", f"refs/remotes/origin/{ref}"):
@@ -319,6 +337,8 @@ def prepare(pr: str, fresh: bool = False) -> None:
         check_schema(hdir, head_sha, fresh)
         reset_hunt_dir(hdir, include_whole_pr=True)
         (hdir / "prepare.json").unlink(missing_ok=True)
+        for name in RUN_STALE:
+            (hdir / name).unlink(missing_ok=True)
         mb = worktrees(mm, head_sha, base_sha, wt, wt_base, two_dot=two_dot)
         go_changed, web_changed = deps(mm, wt, wt_base, mb, head_sha)
         write_json(hdir / "prepare.json", {"schema_version": SCHEMA_VERSION, "pr": pr, "range": [base_spec, head_spec],
@@ -338,11 +358,14 @@ def prepare(pr: str, fresh: bool = False) -> None:
     # The worktrees are about to move: context, responses and verdicts from the previous preparation no longer apply.
     reset_hunt_dir(hdir, include_whole_pr=True)
     (hdir / "prepare.json").unlink(missing_ok=True)
+    for name in RUN_STALE:
+        (hdir / name).unlink(missing_ok=True)
     mm = mm_clone()
     ensure_clone(mm)
     # The PR's own base branch (release-* cherry-picks are common), not always master.
     base = meta["base"]["ref"]
-    git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", f"+{base}:refs/remotes/origin/{base}")
+    with clone_fetch_lock(mm):  # parallel hunts share the clone; two fetches of one ref fail with "cannot lock ref"
+        git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", f"+{base}:refs/remotes/origin/{base}")
     mb = worktrees(mm, f"pr-{pr}", f"origin/{base}", wt, wt_base)
     go_changed, web_changed = deps(mm, wt, wt_base, mb, f"pr-{pr}")
     write_json(hdir / "prepare.json", {"schema_version": SCHEMA_VERSION, "pr": pr, "repo": str(mm), "wt": str(wt),

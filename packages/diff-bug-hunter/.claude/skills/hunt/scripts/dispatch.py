@@ -25,8 +25,10 @@ Behaviour:
 - On success the response is re-read (lossy JSON repair, see hunt_common.load_json), then written atomically
   (temp file + os.replace).
 - Token counts and cost come from the CLI's JSON when present: tokens_in is usage.input_tokens plus the cache-creation
-  and cache-read input tokens (all of them are billed input), tokens_out is usage.output_tokens, cost is
-  total_cost_usd. They go to telemetry.jsonl as one `dispatch` row per call.
+  and cache-read input tokens (all of them are billed input), cache_write and cache_read are those two parts on their
+  own (they are priced differently), tokens_out is usage.output_tokens, cost is total_cost_usd. They go to
+  telemetry.jsonl as one `dispatch` row per call.
+- A failed call's error starts with the CLI's `result` text (for example a usage-limit message), then the output tail.
 """
 from __future__ import annotations
 
@@ -73,10 +75,17 @@ class DispatchError(RuntimeError):
 class DispatchResult:
     status: str  # "ok" or "skipped" (already answered for this request)
     retries: int = 0
-    tokens_in: int = 0
+    tokens_in: int = 0  # every billed input token: uncached + cache_write + cache_read
+    cache_write: int = 0
+    cache_read: int = 0
     tokens_out: int = 0
     cost_usd: float = 0.0
     secs: float = 0.0
+
+    def add(self, usage: dict[str, int], cost: float) -> None:
+        for k, v in usage.items():
+            setattr(self, k, getattr(self, k) + v)
+        self.cost_usd += cost
 
 
 def request_sha(path: Path) -> str:
@@ -103,20 +112,25 @@ def is_answered(request: Path) -> bool:
         return False
 
 
-def _usage(stdout: str) -> tuple[dict[str, Any] | None, int, int, float]:
-    """The CLI's JSON object (None when stdout is not JSON), with token counts and cost (zero when absent)."""
+def _usage(stdout: str) -> tuple[dict[str, Any] | None, dict[str, int], float]:
+    """The CLI's JSON object (None when stdout is not JSON), its token counts as DispatchResult fields, and its cost.
+    Absent counts and cost are zero."""
     try:
         data = json.loads(stdout)
     except ValueError:
-        return None, 0, 0, 0.0
+        return None, {}, 0.0
     if not isinstance(data, dict):
-        return None, 0, 0, 0.0
+        return None, {}, 0.0
     usage: dict[str, Any] = data["usage"] if isinstance(data.get("usage"), dict) else {}
-    tin = sum(v for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
-              if isinstance(v := usage.get(k), int))
-    tout = usage.get("output_tokens")
+
+    def count(key: str) -> int:
+        v = usage.get(key)
+        return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+    uncached, write, read = count("input_tokens"), count("cache_creation_input_tokens"), count("cache_read_input_tokens")
     cost = data.get("total_cost_usd")
-    return (data, tin, int(tout) if isinstance(tout, int) else 0,
+    return (data, {"tokens_in": uncached + write + read, "cache_write": write, "cache_read": read,
+                   "tokens_out": count("output_tokens")},
             float(cost) if isinstance(cost, (int, float)) else 0.0)
 
 
@@ -221,10 +235,8 @@ def dispatch(request: Path, *, cmd: str | None = None, hdir: Path | None = None,
                 raise InfraError(f"dispatch command not found: {argv[0]}") from e
             except subprocess.TimeoutExpired as e:
                 raise DispatchError(f"dispatch timed out after {TIMEOUT_S}s for {request}") from e
-            data, tin, tout, cost = _usage(p.stdout)
-            result.tokens_in += tin
-            result.tokens_out += tout
-            result.cost_usd += cost
+            data, usage, cost = _usage(p.stdout)
+            result.add(usage, cost)
             failed = p.returncode != 0 or bool(data and data.get("is_error"))
             text = p.stdout + p.stderr
             if failed:
@@ -233,8 +245,10 @@ def dispatch(request: Path, *, cmd: str | None = None, hdir: Path | None = None,
                     sleep(delay)
                     delay = min(delay * 2, MAX_DELAY_S)
                     continue
+                said = data.get("result") if data else None
+                said = f"{said[:300]} | " if isinstance(said, str) and said else ""
                 raise DispatchError(f"dispatch failed for {request} (exit {p.returncode}, attempt {attempt}): "
-                                    f"{text[-800:]}")
+                                    f"{said}{text[-800:]}")
             if inline:
                 try:
                     answer = parse_answer(data)
@@ -258,7 +272,8 @@ def dispatch(request: Path, *, cmd: str | None = None, hdir: Path | None = None,
     finally:
         if result.status != "skipped":
             telemetry.record(hdir, "dispatch", tag=tag, exit=result.status, retries=result.retries,
-                             tokens_in=result.tokens_in, tokens_out=result.tokens_out, cost_usd=result.cost_usd,
+                             tokens_in=result.tokens_in, cache_write=result.cache_write,
+                             cache_read=result.cache_read, tokens_out=result.tokens_out, cost_usd=result.cost_usd,
                              secs=round(time.monotonic() - t0, 6))
 
 
@@ -274,7 +289,8 @@ def main(argv: list[str]) -> int:
     except InfraError as e:
         print(f"INFRA_ERROR {e}")
         return 2
-    print(f"{res.status}: retries={res.retries} tokens_in={res.tokens_in} tokens_out={res.tokens_out} "
+    print(f"{res.status}: retries={res.retries} tokens_in={res.tokens_in} cache_write={res.cache_write} "
+          f"cache_read={res.cache_read} tokens_out={res.tokens_out} "
           f"cost_usd={res.cost_usd:.6f}")
     return 0
 

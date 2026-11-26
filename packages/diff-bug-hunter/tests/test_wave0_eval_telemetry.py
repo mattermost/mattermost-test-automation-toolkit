@@ -49,13 +49,14 @@ def test_stage_records_exception_class_and_reraises(tmp_path):
 
 def test_record_and_summarize(tmp_path):
     assert telemetry.summarize(tmp_path)["total_secs"] == 0.0
-    telemetry.record(tmp_path, "a", secs=2.0, cost_usd=1.0, tokens_in=100, tokens_out=10)
+    telemetry.record(tmp_path, "a", secs=2.0, cost_usd=1.0, tokens_in=100, cache_write=70, cache_read=20, tokens_out=10)
     telemetry.record(tmp_path, "a", secs=1.0, cost_usd=0.5, tokens_in=50, tokens_out=5, exit="TimeoutError")
     telemetry.record(tmp_path, "b", secs=4.0)
     with (tmp_path / "telemetry.jsonl").open("a") as fh:
         fh.write("not json\n")
     s = telemetry.summarize(tmp_path)
     assert s["total_secs"] == 7.0 and s["total_cost_usd"] == 1.5
-    assert (s["tokens_in"], s["tokens_out"]) == (150, 15)
+    assert (s["tokens_in"], s["cache_write"], s["cache_read"], s["tokens_out"]) == (150, 70, 20, 15)
+    assert (s["by_stage"]["a"]["cache_write"], s["by_stage"]["a"]["cache_read"]) == (70, 20)
     assert s["by_stage"]["a"]["count"] == 2 and s["by_stage"]["a"]["failures"] == 1
     assert s["by_stage"]["b"]["secs"] == 4.0

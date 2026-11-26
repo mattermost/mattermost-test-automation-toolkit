@@ -104,25 +104,25 @@ def _tier(hdir: Path, state: dict[str, Any], keep: list[dict[str, Any]], driver_
     return tier, list(gaps) + driver_gaps, reached, executable
 
 
-def _telemetry_table(hdir: Path) -> tuple[list[str], float, int, int, float]:
+def _telemetry_table(hdir: Path) -> tuple[list[str], float, str, float]:
     summary = telemetry.summarize(hdir)
     rows = [
-        "| stage | runs | secs | tokens in | tokens out | cost USD | failures |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| stage | runs | secs | tokens in | cache write | cache read | tokens out | cost USD | failures |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for name, b in sorted(summary["by_stage"].items()):
-        rows.append(f"| {name} | {b['count']} | {b['secs']:.1f} | {b['tokens_in']} | {b['tokens_out']} | "
-                    f"{b['cost_usd']:.4f} | {b['failures']} |")
+        rows.append(f"| {name} | {b['count']} | {b['secs']:.1f} | {b['tokens_in']} | {b['cache_write']} | "
+                    f"{b['cache_read']} | {b['tokens_out']} | {b['cost_usd']:.4f} | {b['failures']} |")
     wall = sum(b["secs"] for name, b in summary["by_stage"].items() if name.startswith("step:"))
-    return rows, wall, summary["tokens_in"], summary["tokens_out"], summary["total_cost_usd"]
+    s = summary
+    tokens = f"{s['tokens_in']} ({s['cache_write']} / {s['cache_read']}) / {s['tokens_out']}"
+    return rows, wall, tokens, s["total_cost_usd"]
 
 
 def write(hdir: Path, target: str) -> dict[str, Any]:
     state = read_state(hdir)
     prep = read_dict(hdir / "prepare.json")
-    adm = read_dict(hdir / "verdict.json")
-    keep = [r for r in adm.get("keep", []) if isinstance(r, dict)]
-    not_kept = [h for h in adm.get("held", []) if isinstance(h, dict)]
+    keep, not_kept = ledger.resolved_verdicts(hdir, require_verdict_json=True)
     # The skeptic's DROP is a decision (the evidence shows no bug); only the rest are unresolved.
     dropped: list[dict[str, Any]] = []
     held: list[dict[str, Any]] = []
@@ -136,7 +136,7 @@ def write(hdir: Path, target: str) -> dict[str, Any]:
             raise ValueError("finding is missing keys")
     write_json(hdir / "findings.json", findings)
     tier, gaps, reached, executable = _tier(hdir, state, keep, driver_gaps, held=len(held))
-    rows, wall, tin, tout, cost = _telemetry_table(hdir)
+    rows, wall, tokens, cost = _telemetry_table(hdir)
     lines = [
         f"# Hunt audit: {target}", "",
         f"- Head: `{prep.get('head', state.get('head', ''))}`",
@@ -158,7 +158,7 @@ def write(hdir: Path, target: str) -> dict[str, Any]:
               for h in dropped] or ["- none"]
     lines += ["", "## Coverage", f"- changed lines reached: {reached}/{executable} (Mode A)",
               "- Mutation gate: not run (the driver does not run --mutants)", "",
-              "## Telemetry", f"- Wall seconds (steps): {wall:.1f}", f"- Tokens in/out: {tin} / {tout}",
+              "## Telemetry", f"- Wall seconds (steps): {wall:.1f}", f"- Tokens in (cache write / cache read) / out: {tokens}",
               f"- Cost USD: {cost:.4f}", "", *rows, ""]
     (hdir / "audit.md").write_text("\n".join(lines) + "\n")
     print(f"[report] {len(findings)} finding(s) ({len(keep)} kept tests), {len(held)} held, {len(dropped)} dropped, "

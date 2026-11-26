@@ -163,9 +163,26 @@ def test_default_command_is_one_inline_turn_with_no_tools(tmp_path, monkeypatch)
     assert str(seen["system"]).startswith("s\n\n") and "no tools" in str(seen["system"])
     assert "# Schema" in str(seen["input"]) and str(req) not in str(seen["input"])
     assert json.loads((hdir / "A" / "response.json").read_text()) == {"files": [], "tests": ["t"]}
-    assert (res.tokens_in, res.tokens_out, res.cost_usd) == (10, 4, 0.5)
+    assert (res.tokens_in, res.cache_write, res.cache_read, res.tokens_out, res.cost_usd) == (10, 5, 1, 4, 0.5)
     row = [json.loads(x) for x in (hdir / "telemetry.jsonl").read_text().splitlines()][-1]
-    assert (row["tokens_in"], row["tokens_out"], row["cost_usd"]) == (10, 4, 0.5)
+    assert (row["tokens_in"], row["cache_write"], row["cache_read"], row["tokens_out"], row["cost_usd"]) == (
+        10, 5, 1, 4, 0.5)
+
+
+def test_failed_call_reports_the_cli_result_text(tmp_path, monkeypatch):
+    """The CLI prints a long JSON object on failure. The error must carry its `result` text, not only the tail."""
+    def fake_run(argv, **kw):
+        out = json.dumps({"is_error": True, "subtype": "success", "result": "Claude usage limit reached",
+                          "padding": "x" * 2000})
+        return subprocess.CompletedProcess(argv, 1, stdout=out, stderr="")
+
+    monkeypatch.delenv("HUNT_DISPATCH_CMD", raising=False)
+    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
+    monkeypatch.setattr(dispatch.subprocess, "run", fake_run)
+    hdir = tmp_path / "hunt"
+    with pytest.raises(dispatch.DispatchError) as e:
+        dispatch.dispatch(_request(hdir, "A"), hdir=hdir, tag="A", sleep=lambda _s: None)
+    assert "Claude usage limit reached" in str(e.value)
 
 
 def test_inline_answer_without_json_fails_and_writes_nothing(tmp_path, monkeypatch):
@@ -309,7 +326,8 @@ def test_report_writes_only_kept_findings_in_the_schema_shape_and_gaps_in_the_au
                                        "held": [{"row": {"id": "t2", "source": "B"}, "reasons": ["repro_cmd missing"]}]})
     write_json(hdir / "driver.json", {"gaps": {"dispatch:B": "B failed"}})
     telemetry.record(hdir, "step:prepare", secs=1.5, cost_usd=0.0)
-    telemetry.record(hdir, "dispatch", tag="A", secs=2.0, tokens_in=100, tokens_out=20, cost_usd=0.25)
+    telemetry.record(hdir, "dispatch", tag="A", secs=2.0, tokens_in=100, cache_write=60, cache_read=30,
+                     tokens_out=20, cost_usd=0.25)
     out = report.write(hdir, "x")
     findings = json.loads((hdir / "findings.json").read_text())
     assert out == {"tier": "Bug Proven", "findings": 1, "kept_tests": 1, "held": 1, "dropped": 0}
@@ -318,7 +336,8 @@ def test_report_writes_only_kept_findings_in_the_schema_shape_and_gaps_in_the_au
     assert findings[0]["contradicts"] is None and findings[0]["actor_roles"] == []
     audit = (hdir / "audit.md").read_text()
     assert "Bug Proven" in audit and "dispatch:B: B failed" in audit and "repro_cmd missing" in audit
-    assert "| dispatch | 1 | 2.0 | 100 | 20 | 0.2500 | 0 |" in audit
+    assert "| dispatch | 1 | 2.0 | 100 | 60 | 30 | 20 | 0.2500 | 0 |" in audit
+    assert "- Tokens in (cache write / cache read) / out: 100 (60 / 30) / 20" in audit
 
 
 def test_report_without_keeps_is_partial_when_a_driver_gap_exists(tmp_path):
@@ -888,3 +907,192 @@ def test_a_jest_repro_title_is_shell_quoted(tmp_path):
     hdir = _skeptic_hunt(tmp_path)
     cmd = hunt.repro_cmd(hdir, "webapp/channels/src/c/hunt_b.test.tsx::HuntB $(touch pwned)")
     assert cmd.endswith("-t 'HuntB $(touch pwned)'")
+
+
+# ------------------------------------------------------------------ v3 rerun defects (2026-11-26)
+
+def test_a_fresh_hunt_never_reuses_the_last_runs_vetting_or_cost(tmp_path):
+    """v3 reruns kept vetted.json and telemetry.jsonl: the skeptic stage was skipped and cost added up across runs."""
+    import ctx
+    hdir = tmp_path / "hunt"
+    for name in ("vetted.json", "verdict.json", "findings.json", "audit.md", "run_V.json", "base_V.json"):
+        write_json(hdir / name, {})
+    (hdir / "V").mkdir()
+    (hdir / "vet").mkdir()
+    ctx.reset_hunt_dir(hdir)
+    assert sorted(p.name for p in hdir.iterdir()) == []
+    assert set(prepare.RUN_STALE) == {"telemetry.jsonl", "driver.json"}
+
+
+def test_parallel_fetches_into_the_shared_clone_are_serialized(tmp_path):
+    """Two hunts fetching master at once failed with "cannot lock ref 'refs/remotes/origin/master'"."""
+    import concurrent.futures
+    import time
+    mm = tmp_path / "mmfull"
+    mm.mkdir()
+    inside = []
+
+    def hold(i):
+        with prepare.clone_fetch_lock(mm):
+            inside.append(i)
+            assert len(inside) == 1
+            time.sleep(0.05)
+            inside.remove(i)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(hold, range(6)))
+
+
+def test_report_keeps_archived_batch_findings_after_batch_switch(tmp_path):
+    """Archiving batch 1 moves verdict.json/findings.json out of root; report.write must keep prior batch findings."""
+    import ctx
+    import ledger
+
+    hdir = _skeptic_hunt(tmp_path)
+    tid = "pkg::TestBug1"
+    kept_a = {
+        "id": tid, "source": "A", "decision": "KEEP", "reason": "null deref",
+        "file_line": "a.go:10", "caller": "Handle", "entry_point": "POST /x",
+        "repro_cmd": "go test ./pkg -run '^TestBug1$' -count=1",
+        "evidence_path": "base_A.json", "severity": "major", "fix_check": None,
+        "mechanical_verdict": "NEW_PR_BUG",
+    }
+    kept_r = {
+        "id": "claim_1", "source": "R", "decision": "KEEP", "reason": "stale thread",
+        "file_line": "r.go:5", "caller": "Check", "entry_point": "POST /r",
+        "repro_cmd": "go test ./r -run '^TestR$' -count=1",
+        "evidence_path": "review_verdicts.json", "severity": "minor", "fix_check": None,
+        "mechanical_verdict": "NEW_PR_BUG",
+    }
+    held_b = {"row": {"id": "pkg::TestHeld1", "source": "B", "decision": "HELD"}, "reasons": ["needs check"]}
+
+    write_json(hdir / "A" / "response.json", {"files": [{"path": "pkg/a_test.go", "content": "func TestBug1() {}"}]})
+    write_json(hdir / "run_A.json", {tid: "FAIL_3_OF_3"})
+    write_json(hdir / "base_A.json", {tid: "NEW_PR_BUG"})
+    write_json(hdir / "vetted.json", {"rows": [kept_a]})
+    write_json(hdir / "verdict.json", {"vetted_present": True, "keep": [kept_a, kept_r], "held": [held_b]})
+    write_json(hdir / "findings.json", [{"root_cause": "a.go:10"}])
+
+    archived = ctx.archive_batch(hdir, 1)
+    assert (archived / "verdict.json").exists()
+    assert not (hdir / "verdict.json").exists()
+
+    write_json(hdir / "prepare.json", {"schema_version": 1, "head": "abc", "merge_base": "def"})
+    write_json(hdir / "state.json", {"pr": "1", "wt": str(tmp_path / "wt"), "batch": 2, "batches": 2})
+    write_json(hdir / "vetted.json", {"rows": []})
+    drop_r = {"row": {"id": "claim_1", "source": "R", "decision": "DROP", "reason": "superseded"},
+              "reasons": ["decision is DROP"]}
+    write_json(hdir / "verdict.json", {"vetted_present": True, "keep": [], "held": [drop_r]})
+
+    res = report.write(hdir, "1")
+    assert res == {"tier": "Bug Proven", "findings": 1, "kept_tests": 1, "held": 1, "dropped": 1}
+    findings = json.loads((hdir / "findings.json").read_text())
+    assert len(findings) == 1 and findings[0]["root_cause"] == "a.go:10"
+
+    counts, _c, reached, executable, mode_gaps = ledger._aggregate_modes(hdir)
+    tier, _gaps = ledger._tier_and_gaps(hdir, counts, reached, executable, 0, 2, 2, mode_gaps, {})
+    assert tier == "Bug Proven"
+
+
+def test_ledger_resolves_numeric_batches_supersedes_lesson_holds_and_archived_r(tmp_path):
+    """Numeric batch_N sort, later DROP/HELD superseding, lesson-filtered holds, and root review_verdicts.json."""
+    import ledger
+
+    kept_r = {
+        "id": "claim_1", "source": "R", "decision": "KEEP", "reason": "stale thread",
+        "file_line": "r.go:5", "caller": "Check", "entry_point": "POST /r",
+        "repro_cmd": "go test ./r -run '^TestR$' -count=1",
+        "evidence_path": "review_verdicts.json", "severity": "minor", "fix_check": None,
+        "mechanical_verdict": "NEW_PR_BUG",
+    }
+    drop_r = {"row": {"id": "claim_1", "source": "R", "decision": "DROP", "reason": "superseded"},
+              "reasons": ["decision=DROP"]}
+
+    # 1. Numeric sorting: batch_10 must come after batch_9 (not between batch_1 and batch_2)
+    h1 = tmp_path / "h_num"
+    for b in ("batch_2", "batch_9", "batch_10"):
+        (h1 / "batches" / b).mkdir(parents=True)
+    write_json(h1 / "batches" / "batch_9" / "verdict.json", {"vetted_present": True, "keep": [kept_r], "held": []})
+    write_json(h1 / "batches" / "batch_10" / "verdict.json", {"vetted_present": True, "keep": [], "held": [drop_r]})
+    assert [p.name for p in ledger._batch_dirs(h1)] == ["batch_2", "batch_9", "batch_10", "h_num"]
+    assert ledger.resolved_verdicts(h1)[0] == []
+
+    # 2. Active batch DROP supersedes archived batch KEEP in _tier_and_gaps
+    h2 = tmp_path / "h_super"
+    write_json(h2 / "batches" / "batch_1" / "verdict.json", {"vetted_present": True, "keep": [kept_r], "held": []})
+    write_json(h2 / "verdict.json", {"vetted_present": True, "keep": [], "held": [drop_r]})
+    base_counts = {"mode_a_empty": 0, "new_pr_bug": 0}
+    tier2, _ = ledger._tier_and_gaps(h2, base_counts, 1, 1, 0, 2, 2, False, {})
+    assert tier2 == "High-Confidence Clean"
+
+    # 3. Lesson-filtered verdict.json hold overrides archived vetted.json KEEP
+    h3 = tmp_path / "h_lesson"
+    tid = "pkg::TestA"
+    kept_a = {**kept_r, "id": tid, "source": "A", "evidence_path": "base_A.json"}
+    write_json(h3 / "batches" / "batch_1" / "run_A.json", {tid: "FAIL_3_OF_3"})
+    write_json(h3 / "batches" / "batch_1" / "base_A.json", {tid: "NEW_PR_BUG"})
+    write_json(h3 / "batches" / "batch_1" / "vetted.json", {"rows": [kept_a]})
+    write_json(h3 / "batches" / "batch_1" / "verdict.json", {
+        "vetted_present": True, "keep": [],
+        "held": [{"row": kept_a, "reasons": ["failure text matches false-positive lesson L1"]}],
+    })
+    tier3, _ = ledger._tier_and_gaps(h3, {**base_counts, "new_pr_bug": 1}, 1, 1, 0, 1, 1, False, {})
+    assert tier3 == "Partial or Unverified Coverage"
+
+    # 4. Unfinished archived batch (vetted.json without verdict.json) never promotes kept rows and flags unvetted
+    h4 = tmp_path / "h_unfinished"
+    write_json(h4 / "batches" / "batch_1" / "run_A.json", {tid: "FAIL_3_OF_3"})
+    write_json(h4 / "batches" / "batch_1" / "base_A.json", {tid: "NEW_PR_BUG"})
+    write_json(h4 / "batches" / "batch_1" / "vetted.json", {"rows": [kept_a]})
+    assert ledger.resolved_verdicts(h4)[0] == []
+    assert ledger._tier_and_gaps(
+        h4, {**base_counts, "new_pr_bug": 1}, 1, 1, 0, 1, 1, False, {}
+    ) == ("Partial or Unverified Coverage", ["unvetted findings"])
+
+    # 5. Empty archived vetted.json must not hide an unvetted NEW_PR_BUG in the active batch
+    h5 = tmp_path / "h_active_unvetted"
+    write_json(h5 / "batches" / "batch_1" / "vetted.json", {"rows": []})
+    write_json(h5 / "batches" / "batch_1" / "verdict.json", {"vetted_present": True, "keep": [], "held": []})
+    write_json(h5 / "base_A.json", {tid: "NEW_PR_BUG"})
+    assert ledger._tier_and_gaps(
+        h5, {**base_counts, "new_pr_bug": 1}, 1, 1, 0, 2, 2, False, {}
+    ) == ("Partial or Unverified Coverage", ["unvetted findings"])
+
+    # 6. report.write must not emit findings.json from unfiltered vetted.json when verdict.json is absent
+    h6 = tmp_path / "h_no_verdict"
+    write_json(h6 / "prepare.json", {"schema_version": 1, "head": "abc", "merge_base": "def"})
+    write_json(h6 / "state.json", {"pr": "1", "wt": str(tmp_path / "wt"), "batch": 1, "batches": 1})
+    write_json(h6 / "run_A.json", {tid: "FAIL_3_OF_3"})
+    write_json(h6 / "base_A.json", {tid: "NEW_PR_BUG"})
+    write_json(h6 / "vetted.json", {"rows": [kept_a]})
+    report.write(h6, "1")
+    assert json.loads((h6 / "findings.json").read_text()) == []
+
+    # 7. Malformed or empty verdict.json ({}) must not mark an archive as vetted
+    h7 = tmp_path / "h_bad_verdict"
+    write_json(h7 / "batches" / "batch_1" / "base_A.json", {tid: "NEW_PR_BUG"})
+    write_json(h7 / "batches" / "batch_1" / "verdict.json", {})
+    assert ledger._tier_and_gaps(
+        h7, {**base_counts, "new_pr_bug": 1}, 1, 1, 0, 1, 1, False, {}
+    ) == ("Partial or Unverified Coverage", ["unvetted findings"])
+
+    # 8. {"keep": None, "held": []} normalizes cleanly without TypeError
+    h8 = tmp_path / "h_null_keep"
+    write_json(h8 / "verdict.json", {"keep": None, "held": []})
+    assert ledger.resolved_verdicts(h8) == ([], [])
+
+    # 9. Unvetted Mode D DIFF in an archive without vetted.json/verdict.json flags unvetted
+    h9 = tmp_path / "h_diff_unvetted"
+    write_json(h9 / "batches" / "batch_1" / "diff_D.json", {"pkg::Diff": "DIFF"})
+    assert ledger._tier_and_gaps(
+        h9, base_counts, 1, 1, 0, 1, 1, False, {}
+    ) == ("Partial or Unverified Coverage", ["unvetted findings"])
+
+    # 10. Held entries with non-dict row (e.g. {"row": None}) reject the verdict.json payload
+    h10 = tmp_path / "h_bad_held_row"
+    write_json(h10 / "batches" / "batch_1" / "base_A.json", {tid: "NEW_PR_BUG"})
+    write_json(h10 / "batches" / "batch_1" / "verdict.json", {"keep": [], "held": [{"row": None}]})
+    assert ledger.resolved_verdicts(h10) == ([], [])
+    assert ledger._tier_and_gaps(
+        h10, {**base_counts, "new_pr_bug": 1}, 1, 1, 0, 1, 1, False, {}
+    ) == ("Partial or Unverified Coverage", ["unvetted findings"])
