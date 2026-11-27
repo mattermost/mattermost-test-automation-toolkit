@@ -439,15 +439,32 @@ def is_entry_point(path: str) -> bool:
 
 
 def _is_test_path(f: str) -> bool:
-    return f.endswith(("_test.go", ".test.ts", ".test.tsx", ".test.js", ".test.jsx")) or "/mocks/" in f
+    return (
+        f.endswith(("_test.go", ".test.ts", ".test.tsx", ".test.js", ".test.jsx"))
+        or "/mocks/" in f
+        or "/node_modules/" in f
+        or "/vendor/" in f
+        or f.startswith(("node_modules/", "vendor/"))
+    )
+
+
+def _grep_callers(wt: Path, word: str, root: str) -> list[str]:
+    if (wt / ".git").exists() and root:
+        specs = [root] if (wt / root).is_file() else [f"{root}/*.{ext}" for ext in ("go", "ts", "tsx", "js", "jsx")]
+        excludes = [":(exclude)*/node_modules/*", ":(exclude)node_modules/*", ":(exclude)*/vendor/*", ":(exclude)vendor/*"]
+        p = sh(git_cmd("grep", "--no-color", "-nwIF", "--untracked", "--no-exclude-standard", "-e", word,
+                       "--", *specs, *excludes), wt, check=False)
+        if p.returncode in (0, 1):
+            return p.stdout.splitlines()
+    p = sh(["grep", "-rnwIH", *CALLER_INCLUDES, *CALLER_EXCLUDE_DIRS, "-e", word, root], wt, check=False)
+    return p.stdout.splitlines()
 
 
 def grep_word(wt: Path, word: str, roots: list[str]) -> list[tuple[str, int]]:
     """(file, line) of every whole-word hit of `word` in non-test source under `roots`, in grep order."""
     hits: list[tuple[str, int]] = []
     for root in roots:
-        p = sh(["grep", "-rnwIH", *CALLER_INCLUDES, *CALLER_EXCLUDE_DIRS, "-e", word, root], wt, check=False)
-        for hit in p.stdout.splitlines():
+        for hit in _grep_callers(wt, word, root):
             if hit.count(":") < 2:
                 continue
             f, n_s, _ = hit.split(":", 2)

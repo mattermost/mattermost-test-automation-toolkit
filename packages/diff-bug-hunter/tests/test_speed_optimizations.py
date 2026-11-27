@@ -10,8 +10,10 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+import ctx
 import hunt_common
 import pr_tests
+import prepare
 import pytest
 import run
 
@@ -391,3 +393,208 @@ def test_persisted_frozen_fuzz_runs_isolated_on_rerun_and_mutant_compiles_all_pa
     monkeypatch.setattr(run, "go_compile_binary", fake_compile)
     monkeypatch.setattr(run, "run_suite", lambda *a, **k: pytest.fail("should fail compile before running tests"))
     assert run.score_mutant(wt, {"changed": ["pkg1/a.go"]}, suite, base, m)["verdict"] == "NEEDS_REGENERATION"
+
+
+def test_npm_ci_uses_prefer_offline(tmp_path, monkeypatch):
+    webapp = tmp_path / "webapp"
+    webapp.mkdir()
+    (webapp / "package-lock.json").write_text("{}")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(prepare, "sh", lambda args, *a, **k: calls.append(args))
+    prepare.npm_ci_for_lock(webapp)
+    assert calls and "--prefer-offline" in calls[0]
+
+
+def test_callers_git_grep_and_non_git_fallback(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "pkg" / "mocks").mkdir(parents=True)
+    (repo / "pkg" / "a.go").write_text("package pkg\nfunc Target() {}\n")
+    (repo / "pkg" / "b.go").write_text("package pkg\nfunc Use1() { Target() }\n")
+    (repo / "pkg" / "b_test.go").write_text("package pkg\nfunc TestUse() { Target() }\n")
+    (repo / "pkg" / "mocks" / "m.go").write_text("package mocks\nfunc MockUse() { Target() }\n")
+    (repo / ".gitignore").write_text("zz_*.go\nnode_modules/\n")
+    (repo / "pkg" / "node_modules").mkdir(parents=True)
+    (repo / "pkg" / "node_modules" / "skip.go").write_text("package pkg\nfunc IgnoredNM() { Target() }\n")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "add", ".gitignore", "pkg/a.go", "pkg/b.go", "pkg/b_test.go", "pkg/mocks/m.go")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init")
+    (repo / "pkg" / "c.go").write_text("package pkg\nfunc Use2() { Target() }\n")
+    (repo / "pkg" / "zz_gen.go").write_text("package pkg\nfunc Gen() { Target() }\n")
+
+    assert ctx.grep_word(repo, "Target", ["pkg"]) == [
+        ("pkg/a.go", 2), ("pkg/b.go", 2), ("pkg/c.go", 2), ("pkg/zz_gen.go", 2),
+    ]
+
+    nongit = tmp_path / "nongit"
+    (nongit / "pkg").mkdir(parents=True)
+    (nongit / "pkg" / "a.go").write_text("package pkg\nfunc Target() {}\n")
+    (nongit / "pkg" / "b.go").write_text("package pkg\nfunc Use1() { Target() }\n")
+    assert ctx.grep_word(nongit, "Target", ["pkg"]) == [("pkg/a.go", 2), ("pkg/b.go", 2)]
+
+
+def test_jest_bin_batched_jest_run_and_v8_cover_fallback(tmp_path, monkeypatch):
+    root = tmp_path / "webapp"
+    (root / "src").mkdir(parents=True)
+    (root / "jest.config.js").write_text("module.exports = {};\n")
+    assert run._jest_bin(root) == ["npx", "jest"]
+    (root / "node_modules" / ".bin").mkdir(parents=True)
+    local_jest = root / "node_modules" / ".bin" / "jest"
+    local_jest.write_text("#!/bin/sh\n")
+    assert run._jest_bin(root) == [str(local_jest)]
+
+    seen_args: list[list[str]] = []
+
+    def fake_sh(args, cwd, **k):
+        seen_args.append(args)
+        out_arg = next(a for a in args if a.startswith("--outputFile="))
+        Path(out_arg.split("=", 1)[1]).write_text(json.dumps({
+            "testResults": [
+                {"name": str((root / "src" / "a.test.tsx").resolve()), "status": "passed",
+                 "assertionResults": [{"title": "HuntA_1", "fullName": "HuntA_1", "status": "passed"}]},
+                {"name": str((root / "src" / "b.test.tsx").resolve()), "status": "passed",
+                 "assertionResults": [{"title": "HuntA_2", "fullName": "HuntA_2", "status": "passed"}]},
+            ]
+        }))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(run, "sh", fake_sh)
+    into = run.Outcome()
+    run.jest_run(root, ["src/a.test.tsx", "src/b.test.tsx"], "HuntA_", into)
+    assert len(seen_args) == 1
+    assert "--bail=1" not in seen_args[0] and "--bail=false" in seen_args[0]
+    assert "src/a.test.tsx" in seen_args[0] and "src/b.test.tsx" in seen_args[0]
+
+    # Grouped Jest run missing one file retries that file individually instead of raising CompileError
+    retry_calls: list[list[str]] = []
+
+    def fake_retry_sh(args, cwd, **k):
+        retry_calls.append(args)
+        out_arg = next(a for a in args if a.startswith("--outputFile="))
+        only_b = len([a for a in args if a.endswith(".test.tsx")]) == 1 and "src/b.test.tsx" in args
+        results = [
+            {"name": str((root / ("src/b.test.tsx" if only_b else "src/a.test.tsx")).resolve()), "status": "passed",
+             "assertionResults": [{"title": "HuntA_2" if only_b else "HuntA_1", "fullName": "HuntA_2" if only_b else "HuntA_1", "status": "passed"}]},
+        ]
+        Path(out_arg.split("=", 1)[1]).write_text(json.dumps({"testResults": results}))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(run, "sh", fake_retry_sh)
+    retry_into = run.Outcome()
+    run.jest_run(root, ["src/a.test.tsx", "src/b.test.tsx"], "HuntA_", retry_into)
+    assert len(retry_calls) == 2 and retry_into.results == {
+        "src/a.test.tsx::HuntA_1": "PASS",
+        "src/b.test.tsx::HuntA_2": "PASS",
+    }
+
+    (root / "src" / "prod.ts").write_text("export const x = 1;\n")
+
+    def fake_cov_sh(args, cwd, **k):
+        if "--showConfig" in args:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"configs": [{"setupFilesAfterEnv": []}]}), "")
+        cov_dir = Path(next(a for a in args if a.startswith("--coverageDirectory=")).split("=", 1)[1])
+        (cov_dir / "coverage-final.json").write_text(json.dumps({
+            str((root / "src" / "prod.ts").resolve()): {
+                "statementMap": {"0": {"start": {"line": 1}, "end": {"line": 1}}},
+                "s": {"0": 0},
+            }
+        }))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(run, "sh", fake_cov_sh)
+    monkeypatch.setattr(run, "jest_test_coverage", lambda *a, **k: pytest.fail("should not fall back to per-test"))
+    cov = run._jest_file_coverage(root, "src/a.test.tsx", [("src/a.test.tsx::HuntA_1", "HuntA_1"),
+                                                          ("src/a.test.tsx::HuntA_2", "HuntA_2")],
+                                  {"src/prod.ts": {1}})
+    assert cov["src/a.test.tsx::HuntA_1"]["src/prod.ts"] == ({1}, set())
+    assert cov["src/a.test.tsx::HuntA_2"]["src/prod.ts"] == ({1}, set())
+
+
+def test_jest_file_coverage_preserves_setup_files_and_partial_events(tmp_path, monkeypatch):
+    root = tmp_path / "webapp"
+    (root / "src").mkdir(parents=True)
+    (root / "jest.config.js").write_text("module.exports = {};\n")
+    (root / "src" / "prod.ts").write_text("export const x = 1;\n")
+    abs_prod = str((root / "src" / "prod.ts").resolve())
+    seen_args: list[list[str]] = []
+
+    def fake_sh(args, cwd, **k):
+        seen_args.append(args)
+        if "--showConfig" in args:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"configs": [{"setupFilesAfterEnv": ["setupTests.js"]}]}), "")
+        out = Path(k.get("env", {}).get("HUNT_COVER_OUT", ""))
+        out.write_text(json.dumps({"test": "HuntA_1", "hits": {abs_prod: {"inst": [1], "hit": [1]}}}) + "\n")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(run, "sh", fake_sh)
+    called_fallback: list[str] = []
+    monkeypatch.setattr(run, "jest_test_coverage", lambda wt, rel, name, changed: called_fallback.append(name) or {"src/prod.ts": ({1}, {1})})
+
+    tests = [("src/a.test.tsx::HuntA_1", "HuntA_1"), ("src/a.test.tsx::HuntA_2", "HuntA_2")]
+    res = run._jest_file_coverage(root, "src/a.test.tsx", tests, {"src/prod.ts": {1}})
+    test_run_args = [a for a in seen_args if "--runTestsByPath" in a][0]
+    setups = [a.split("=", 1)[1] for a in test_run_args if a.startswith("--setupFilesAfterEnv=")]
+    assert setups[0] == "setupTests.js" and setups[1].endswith("hook.cjs")
+    assert res["src/a.test.tsx::HuntA_1"]["src/prod.ts"] == ({1}, {1})
+    assert called_fallback == ["HuntA_2"]
+
+
+def test_jest_cov_hook_isolates_lazy_hits_across_tests(tmp_path):
+    hook = tmp_path / "hook.cjs"
+    hook.write_text(run._JEST_COV_HOOK)
+    out = tmp_path / "events.jsonl"
+    driver = tmp_path / "driver.cjs"
+    driver.write_text(f"""
+const be = [], ae = [];
+global.beforeEach = f => be.push(f);
+global.afterEach = f => ae.push(f);
+let name = '';
+global.expect = {{getState: () => ({{currentTestName: name}})}};
+require({json.dumps(str(hook))});
+const run = (n, body) => {{ name = n; be.forEach(f => f()); body(); ae.forEach(f => f()); }};
+run('t1', () => {{
+  global.__coverage__ = {{'/src/a.ts': {{s: {{'0': 1}}, statementMap: {{'0': {{start: {{line: 1}}, end: {{line: 1}}}}}}}}}};
+}});
+run('t2', () => {{}});
+""")
+    env = {**hunt_common.node_env(), "HUNT_COVER_OUT": str(out), "HUNT_COVER_FILES": json.dumps(["/src/a.ts"])}
+    subprocess.run(["node", str(driver)], check=True, env=env)
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert rows[0]["hits"]["/src/a.ts"]["hit"] == [1]
+    assert rows[1]["hits"]["/src/a.ts"]["hit"] == []
+
+
+def test_jest_file_coverage_falls_back_when_afterall_hits_unattributed_changed_line(tmp_path, monkeypatch):
+    root = tmp_path / "webapp"
+    (root / "src").mkdir(parents=True)
+    (root / "jest.config.js").write_text("module.exports = {};\n")
+    (root / "src" / "prod.ts").write_text("export const a = 1;\nexport const b = 2;\n")
+    abs_prod = str((root / "src" / "prod.ts").resolve())
+
+    def fake_sh(args, cwd, **k):
+        if "--showConfig" in args:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"configs": [{"setupFilesAfterEnv": []}]}), "")
+        out = Path(k.get("env", {}).get("HUNT_COVER_OUT", ""))
+        out.write_text(
+            json.dumps({"test": "HuntA_1", "hits": {abs_prod: {"inst": [1, 2], "hit": [1]}}}) + "\n"
+            + json.dumps({"test": "HuntA_2", "hits": {abs_prod: {"inst": [1, 2], "hit": [1]}}}) + "\n"
+        )
+        cov_dir = Path(next(a for a in args if a.startswith("--coverageDirectory=")).split("=", 1)[1])
+        (cov_dir / "coverage-final.json").write_text(json.dumps({
+            abs_prod: {
+                "statementMap": {"0": {"start": {"line": 1}, "end": {"line": 1}},
+                                 "1": {"start": {"line": 2}, "end": {"line": 2}}},
+                "s": {"0": 1, "1": 1},
+            }
+        }))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(run, "sh", fake_sh)
+    fallback_names: list[str] = []
+    monkeypatch.setattr(run, "jest_test_coverage", lambda wt, rel, name, ch: fallback_names.append(name) or {"src/prod.ts": ({1, 2}, {1, 2})})
+    cov = run._jest_file_coverage(
+        root, "src/a.test.tsx",
+        [("src/a.test.tsx::HuntA_1", "HuntA_1"), ("src/a.test.tsx::HuntA_2", "HuntA_2")],
+        {"src/prod.ts": {1, 2}},
+    )
+    assert fallback_names == ["HuntA_1", "HuntA_2"]
+    assert cov["src/a.test.tsx::HuntA_2"]["src/prod.ts"] == ({1, 2}, {1, 2})

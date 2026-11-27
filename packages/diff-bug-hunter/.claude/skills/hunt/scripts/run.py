@@ -484,33 +484,54 @@ def jest_roots_args(wt: Path, rel: str, root: Path) -> list[str]:
     return [] if pkg is None else ["--roots", str(root.resolve()), "--roots", str(pkg)]
 
 
+def _jest_bin(root: Path) -> list[str]:
+    local = root / "node_modules" / ".bin" / "jest"
+    return [str(local)] if local.exists() else ["npx", "jest"]
+
+
 def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
+    by_group: dict[tuple[Path, tuple[str, ...]], list[str]] = {}
     for rel in files:
-        found = 0
         root = jest_root(wt, rel)
+        rargs = tuple(jest_roots_args(wt, rel, root))
+        by_group.setdefault((root, rargs), []).append(rel)
+    for (root, rargs), raw_rels in by_group.items():
+        rels = list(dict.fromkeys(raw_rels))
+        abs_to_rel = {(wt / rel).resolve(): rel for rel in rels}
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "out.json"
             # --runTestsByPath: a bare path is a regex and would also run e.g. src/packages/.../actions/hunt_a.test.tsx
             # --ci=false: Jest turns --ci on by itself when CI is set, and then a test whose snapshot is missing fails
             # instead of writing one (removed after the run). Verdicts must not depend on where the hunt runs.
-            p = sh(["npx", "jest", *jest_roots_args(wt, rel, root), "--runTestsByPath", _rel(wt, rel, root),
-                    "--watchAll=false", "--ci=false", "--json", f"--outputFile={out}"],
-                   root, check=False, timeout=1200, env=node_env())
+            args = [*_jest_bin(root), *rargs, *(["--bail=false"] if len(rels) > 1 else []),
+                    "--runTestsByPath", *[_rel(wt, rel, root) for rel in rels],
+                    "--watchAll=false", "--ci=false", "--json", f"--outputFile={out}"]
+            p = sh(args, root, check=False, timeout=min(3600, 1200 * len(rels)), env=node_env())
             if not out.exists():
-                raise InfraError(f"jest wrote no results for {rel}:\n{(p.stdout + p.stderr)[-2500:]}")
-            data = json.loads(read_text_lossy(out))
+                raise InfraError(f"jest wrote no results for {', '.join(rels)}:\n{(p.stdout + p.stderr)[-2500:]}")
+            try:
+                data = json.loads(read_text_lossy(out))
+            except json.JSONDecodeError as e:
+                raise InfraError(f"jest wrote invalid JSON for {', '.join(rels)}: {e}") from e
+        seen_rels: set[str] = set()
         for f in data.get("testResults", []):
+            fname = f.get("name", "")
+            f_rel: str | None = abs_to_rel.get(Path(fname).resolve()) if fname else (rels[0] if len(rels) == 1 else None)
+            if f_rel is None:
+                continue
+            seen_rels.add(f_rel)
             if not f.get("assertionResults"):
                 if f.get("message"):
-                    raise CompileError(f"{rel}:\n{f['message'][-2500:]}")
-                raise InfraError(f"0 tests executed in {rel}")
+                    raise CompileError(f"{f_rel}:\n{f['message'][-2500:]}")
+                raise InfraError(f"0 tests executed in {f_rel}")
+            found = 0
             file_failed = False
             for a in f["assertionResults"]:
                 if prefix and not a["title"].startswith(prefix):
                     continue
                 found += 1
                 # file + full name: equal titles in two describe blocks or files never overwrite each other
-                key = f"{rel}::{a.get('fullName') or a['title']}"
+                key = f"{f_rel}::{a.get('fullName') or a['title']}"
                 status = {"passed": Verdict.PASS, "failed": Verdict.FAIL}.get(a["status"], Verdict.SKIP)
                 if status == Verdict.FAIL:
                     file_failed = True
@@ -519,17 +540,24 @@ def jest_run(wt: Path, files: list[str], prefix: str, into: Outcome) -> None:
                 if failures:
                     into.messages[key] = normalize_failure("\n".join(failures), wt)
                     into.log += "\n".join(failures) + "\n"
-            into.packages[rel] = Verdict.FAIL if f.get("status") == "failed" else Verdict.PASS
+            into.packages[f_rel] = Verdict.FAIL if f.get("status") == "failed" else Verdict.PASS
             if f.get("status") == "failed" and not file_failed and found:
                 # e.g. afterAll threw or an unhandled error hit after passing assertions
-                pkey = f"{rel}::{PACKAGE_FAILED}"
+                pkey = f"{f_rel}::{PACKAGE_FAILED}"
                 into.results[pkey] = Verdict.FAIL
-                msg = f.get("message") or f"{rel}: Jest suite failed after assertions passed"
+                msg = f.get("message") or f"{f_rel}: Jest suite failed after assertions passed"
                 into.messages[pkey] = normalize_failure(msg, wt)
                 into.log += msg + "\n"
-        if not found:
-            # Checked per file: a passing file must not hide one whose tests were all filtered out.
-            raise CompileError(f"{rel}: no test title starts with {prefix!r}; rename the tests")
+            if not found:
+                # Checked per file: a passing file must not hide one whose tests were all filtered out.
+                raise CompileError(f"{f_rel}: no test title starts with {prefix!r}; rename the tests")
+        missing = [rel for rel in rels if rel not in seen_rels]
+        if missing:
+            if len(rels) > 1:
+                for rel in missing:
+                    jest_run(wt, [rel], prefix, into)
+            else:
+                raise CompileError(f"{missing[0]}: jest reported no results")
 
 
 def jest_compiles(wt: Path, file: str) -> str | None:
@@ -1908,7 +1936,7 @@ def jest_test_coverage(wt: Path, rel: str, full_name: str,
     if not js_files:
         return {}
     with tempfile.TemporaryDirectory() as td:
-        args = ["npx", "jest", *jest_roots_args(wt, rel, root), "--runTestsByPath", _rel(wt, rel, root),
+        args = [*_jest_bin(root), *jest_roots_args(wt, rel, root), "--runTestsByPath", _rel(wt, rel, root),
                 "--watchAll=false", "--ci=false",
                 "-t", f"^{js_regex_escape(full_name)}$", "--coverage", "--coverageReporters=json",
                 f"--coverageDirectory={td}"]
@@ -1920,6 +1948,162 @@ def jest_test_coverage(wt: Path, rel: str, full_name: str,
             return None
         cov = json.loads(final.read_text())
     return {f: jest_profile_lines(cov, str(wt / f)) for f in js_files}
+
+
+_JEST_COV_HOOK = """\
+const fs = require('fs');
+const path = require('path');
+let firstTest = true;
+const initHits = new Map();
+beforeEach(() => {
+  const isFirst = firstTest;
+  firstTest = false;
+  const cov = global.__coverage__;
+  if (!cov || typeof cov !== 'object') return;
+  for (const [f, fc] of Object.entries(cov)) {
+    if (!fc || !fc.s) continue;
+    if (isFirst) {
+      const s = new Set();
+      for (const [k, v] of Object.entries(fc.s)) {
+        if (v > 0) s.add(k);
+      }
+      initHits.set(f, s);
+    }
+    const base = initHits.get(f) || new Set();
+    for (const k of Object.keys(fc.s)) {
+      fc.s[k] = base.has(k) ? 1 : 0;
+    }
+  }
+});
+afterEach(() => {
+  const cov = global.__coverage__;
+  const out = process.env.HUNT_COVER_OUT;
+  const name = typeof expect !== 'undefined' && expect.getState ? expect.getState().currentTestName : '';
+  if (!cov || typeof cov !== 'object' || !out || !name) return;
+  const targets = JSON.parse(process.env.HUNT_COVER_FILES || '[]');
+  const hits = {};
+  for (const absPath of targets) {
+    const entry = cov[absPath] || (Object.entries(cov).find(([k]) => path.resolve(k) === absPath) || [])[1];
+    if (!entry || !entry.s || !entry.statementMap) continue;
+    const inst = new Set();
+    const hit = new Set();
+    for (const [sid, loc] of Object.entries(entry.statementMap)) {
+      for (let ln = loc.start.line; ln <= loc.end.line; ln++) {
+        inst.add(ln);
+        if ((entry.s[sid] || 0) > 0) hit.add(ln);
+      }
+    }
+    hits[absPath] = {inst: [...inst], hit: [...hit]};
+  }
+  fs.appendFileSync(out, JSON.stringify({test: name, hits}) + '\\n');
+});
+"""
+
+
+def _jest_setup_files(root: Path) -> list[str] | None:
+    """The single project's setupFilesAfterEnv, or None when Jest's config cannot be read reliably (the CLI flag would
+    then replace the repo's own setup files, so the caller falls back to per-test coverage)."""
+    try:
+        p = sh([*_jest_bin(root), "--showConfig"], root, check=False, timeout=60, env=node_env())
+        if p.returncode != 0:
+            return None
+        configs = json.loads(p.stdout)["configs"]
+        if not isinstance(configs, list) or len(configs) != 1:
+            return None
+        setup = configs[0].get("setupFilesAfterEnv") or []
+    except (InfraError, OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError):
+        return None
+    if not isinstance(setup, list) or not all(isinstance(x, str) for x in setup):
+        return None
+    return list(dict.fromkeys(setup))
+
+
+def _jest_per_test_coverage(wt: Path, rel: str, tests: list[tuple[str, str]],
+                            changed: dict[str, set[int]]) -> dict[str, dict[str, tuple[set[int], set[int]]] | None]:
+    with ThreadPoolExecutor(max_workers=min(4, len(tests))) as pool:
+        futs = {ident: pool.submit(jest_test_coverage, wt, rel, name, changed) for ident, name in tests}
+        return {ident: fut.result() for ident, fut in futs.items()}
+
+
+def _jest_file_coverage(wt: Path, rel: str, tests: list[tuple[str, str]],
+                        changed: dict[str, set[int]]) -> dict[str, dict[str, tuple[set[int], set[int]]] | None]:
+    if not tests:
+        return {}
+    if len(tests) <= 1:
+        return {tests[0][0]: jest_test_coverage(wt, rel, tests[0][1], changed)}
+    root = jest_root(wt, rel)
+    pkg = jest_pkg_dir(wt, rel, root)
+    js_files = [f for f in changed if re.search(r"\.[jt]sx?$", f)
+                and any((wt / f).resolve().is_relative_to(d.resolve()) for d in (root, pkg) if d is not None)]
+    if not js_files:
+        return {ident: {} for ident, _ in tests}
+    abs_by_file = {f: str((wt / f).resolve()) for f in js_files}
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        hook = td_p / "hook.cjs"
+        hook.write_text(_JEST_COV_HOOK)
+        events = td_p / "events.jsonl"
+        env = {**node_env(), "HUNT_COVER_OUT": str(events),
+               "HUNT_COVER_FILES": json.dumps([abs_by_file[f] for f in js_files])}
+        extra_setup = _jest_setup_files(root)
+        if extra_setup is None:
+            return _jest_per_test_coverage(wt, rel, tests, changed)
+        args = [*_jest_bin(root), *jest_roots_args(wt, rel, root), "--runTestsByPath", _rel(wt, rel, root),
+                "--runInBand", "--watchAll=false", "--ci=false", "--coverage", "--coverageReporters=json",
+                f"--coverageDirectory={td_p}"]
+        for s in extra_setup:
+            args.append(f"--setupFilesAfterEnv={s}")
+        args.append(f"--setupFilesAfterEnv={hook}")
+        for f in js_files:
+            args.append(f"--collectCoverageFrom={_rel(wt, f, root)}")
+        proc = sh(args, root, check=False, timeout=1200, env=env)
+        by_name: dict[str, dict[str, tuple[set[int], set[int]]]] = {}
+        if events.exists():
+            for line in events.read_text(errors="replace").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # blank or truncated last line (jest killed mid-append)
+                if not isinstance(row, dict) or not isinstance(row.get("test"), str):
+                    continue
+                hits = row.get("hits") or {}
+                if hits:
+                    by_name[row["test"]] = {
+                        f: (set(hits[abs_p]["inst"]), set(hits[abs_p]["hit"]))
+                        for f, abs_p in abs_by_file.items() if abs_p in hits
+                    }
+        final = td_p / "coverage-final.json"
+        if by_name:
+            if final.exists():
+                try:
+                    cov = json.loads(final.read_text())
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    return _jest_per_test_coverage(wt, rel, tests, changed)
+                whole = {f: jest_profile_lines(cov, str(wt / f)) for f in js_files}
+                event_hits: dict[str, set[int]] = {f: set() for f in js_files}
+                for t_cov in by_name.values():
+                    for f, (_, h) in t_cov.items():
+                        event_hits[f] |= h
+                if any((whole[f][1] & changed[f]) - event_hits[f] for f in js_files):
+                    return _jest_per_test_coverage(wt, rel, tests, changed)
+            res: dict[str, dict[str, tuple[set[int], set[int]]] | None] = {}
+            missing = []
+            for ident, name in tests:
+                if name in by_name:
+                    res[ident] = by_name[name]
+                else:
+                    missing.append((ident, name))
+            res.update(_jest_per_test_coverage(wt, rel, missing, changed) if missing else {})
+            return res
+        if proc.returncode == 0 and final.exists():
+            try:
+                cov = json.loads(final.read_text())
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return _jest_per_test_coverage(wt, rel, tests, changed)
+            whole = {f: jest_profile_lines(cov, str(wt / f)) for f in js_files}
+            if not any(h & changed[f] for f, (_, h) in whole.items()):
+                return {ident: whole for ident, _ in tests}
+    return _jest_per_test_coverage(wt, rel, tests, changed)
 
 
 def cover_table(changed: dict[str, set[int]],
@@ -1963,6 +2147,7 @@ def cmd_cover(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     placed: list[Path] = []
     try:
         placed = place(wt, files, {t["dir"] for t in state["targets"]})
+        jest_by_file: dict[str, list[tuple[str, str]]] = {}
         with tempfile.TemporaryDirectory() as bin_td:
             go_bins: dict[str, tuple[Path | None, list[str]]] = {}
             for ident in sorted(table):
@@ -1970,11 +2155,13 @@ def cmd_cover(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
                 if name == PACKAGE_FAILED:
                     continue
                 if loc.endswith((".ts", ".tsx", ".js", ".jsx")):
-                    per_test[ident] = jest_test_coverage(wt, loc, name, changed)
+                    jest_by_file.setdefault(loc, []).append((ident, name))
                 else:
                     if loc not in go_bins:
                         go_bins[loc] = go_cover_binary(wt, loc, changed, Path(bin_td))
                     per_test[ident] = go_test_coverage(wt, loc, name, changed, prebuilt=go_bins[loc])
+        for loc, tests in jest_by_file.items():
+            per_test.update(_jest_file_coverage(wt, loc, tests, changed))
     finally:
         unplace(placed)
     out = cover_table(changed, per_test)

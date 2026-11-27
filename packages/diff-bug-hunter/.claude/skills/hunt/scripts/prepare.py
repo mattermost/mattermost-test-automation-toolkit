@@ -249,7 +249,7 @@ def npm_ci_for_lock(webapp: Path) -> None:
     stamp = webapp / "node_modules" / ".hunt-lock-sha256"
     if stamp.exists() and stamp.read_text().strip() == digest:
         return
-    sh(["npm", "ci", "--no-audit", "--no-fund"], webapp, timeout=3600, env=node_env())
+    sh(["npm", "ci", "--prefer-offline", "--no-audit", "--no-fund"], webapp, timeout=3600, env=node_env())
     stamp.parent.mkdir(exist_ok=True)
     stamp.write_text(digest)
 
