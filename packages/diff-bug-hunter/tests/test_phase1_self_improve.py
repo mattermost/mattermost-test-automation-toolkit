@@ -21,7 +21,7 @@ import prefilter
 import pytest
 import review_threads
 import trusted
-from test_hunt_engine import _git
+from conftest import _git, make_repo
 
 
 @pytest.fixture(autouse=True)
@@ -135,36 +135,20 @@ def test_prefilter_calibrates_2026_hotfix_hotspots():
 # ------------------------------------------------------------------ 1D. old_tests.py quotas
 
 def test_old_tests_balances_go_and_jest_units_and_ranks_by_risk(tmp_path):
-    repo = tmp_path / "rel"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    # Create 15 Go packages and 15 Jest component test files; one high-risk Go pkg (auth) and one high-risk Jest dir.
+    base, head_files = {}, {}
     for i in range(15):
-        gdir = repo / f"server/channels/pkg{i:02d}"
-        gdir.mkdir(parents=True)
-        (gdir / "svc.go").write_text("package pkg\nfunc F() int { return 1 }\n")
-        (gdir / "svc_test.go").write_text('package pkg\nimport "testing"\nfunc TestF(t *testing.T) {}\n')
-        wdir = repo / f"webapp/channels/src/components/c{i:02d}"
-        wdir.mkdir(parents=True)
-        (wdir / "c.tsx").write_text("export const C = 1;\n")
-        (wdir / "c.test.tsx").write_text("it('ok', () => {});\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    mb = _git(repo, "rev-parse", "HEAD")
-
-    _git(repo, "checkout", "-qb", "rel")
-    for i in range(15):
-        gdir = repo / f"server/channels/pkg{i:02d}"
+        base[f"server/channels/pkg{i:02d}/svc.go"] = "package pkg\nfunc F() int { return 1 }\n"
+        base[f"server/channels/pkg{i:02d}/svc_test.go"] = 'package pkg\nimport "testing"\nfunc TestF(t *testing.T) {}\n'
+        base[f"webapp/channels/src/components/c{i:02d}/c.tsx"] = "export const C = 1;\n"
+        base[f"webapp/channels/src/components/c{i:02d}/c.test.tsx"] = "it('ok', () => {});\n"
         line = "// checkAuth(session, token)" if i == 14 else "// tweak"
-        (gdir / "svc.go").write_text(f"package pkg\n{line}\nfunc F() int {{ return 2 }}\n")
-        (gdir / "svc_test.go").write_text('package pkg\nimport "testing"\nfunc TestF(t *testing.T) { _ = 2 }\n')
-        wdir = repo / f"webapp/channels/src/components/c{i:02d}"
         wline = "// permission check" if i == 13 else "// ui"
-        (wdir / "c.tsx").write_text(f"export const C = 2; {wline}\n")
-        (wdir / "c.test.tsx").write_text("it('ok', () => { expect(2).toBe(2); });\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "head")
-    head = _git(repo, "rev-parse", "HEAD")
+        head_files[f"server/channels/pkg{i:02d}/svc.go"] = f"package pkg\n{line}\nfunc F() int {{ return 2 }}\n"
+        head_files[f"server/channels/pkg{i:02d}/svc_test.go"] = 'package pkg\nimport "testing"\nfunc TestF(t *testing.T) { _ = 2 }\n'
+        head_files[f"webapp/channels/src/components/c{i:02d}/c.tsx"] = f"export const C = 2; {wline}\n"
+        head_files[f"webapp/channels/src/components/c{i:02d}/c.test.tsx"] = "it('ok', () => { expect(2).toBe(2); });\n"
+    repo = make_repo(tmp_path, base, head_files, dirname="rel", feature_branch="rel")
+    mb, head = _git(repo, "rev-parse", "master"), _git(repo, "rev-parse", "HEAD")
 
     units, skipped = old_tests.plan(repo, mb, head)
     go_u = [u for u in units if u["lang"] == "go"]
@@ -381,13 +365,7 @@ def test_coderabbit_review_fixes_flags_scorecards_lessons_ledger_and_review_fres
     (h_rt / "run_R.json").write_text('{"pkg::HuntR_CR1": "PASS"}')
     assert review_threads.compute_verdicts(h_rt)["verdicts"]["CR1"]["verdict"] == "UNPROVABLE_DYNAMICALLY"
     (h_rt / "R" / "response.json").write_text('{"files": []}')
-    repo = tmp_path / "repo_rt"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    (repo / "pkg").mkdir()
-    (repo / "pkg" / "a.go").write_text("package pkg\nfunc F() {}\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "init")
+    repo = make_repo(tmp_path, {"pkg/a.go": "package pkg\nfunc F() {}\n"}, base_msg="init", dirname="repo_rt")
     mb = _git(repo, "rev-parse", "HEAD")
     review_threads.build_review_context(
         "77", h_rt, {"repo": str(repo), "wt": str(repo), "wt_base": str(repo), "merge_base": mb, "head": mb}, {},

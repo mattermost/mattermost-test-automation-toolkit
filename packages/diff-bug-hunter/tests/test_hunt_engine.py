@@ -7,14 +7,12 @@ base-branch rules and RELIABILITY.md triggers. Fixtures are tiny git repos built
 /verify: verify_ui.mjs against a local fixture server (pass, pageerror, HTTP 500, step cap, no screenshots)."""
 from __future__ import annotations
 
-import http.server
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 import build_requests
@@ -28,56 +26,34 @@ import pytest
 import reliability
 import run
 import trusted
-
-ROOT = Path(__file__).resolve().parent.parent
-SKILL = ROOT / ".claude" / "skills" / "hunt"
-SCRIPTS = SKILL / "scripts"
-VERIFY_UI = ROOT / ".claude" / "skills" / "verify" / "scripts" / "verify_ui.mjs"
-VERIFY_DEPS = Path(__file__).resolve().parent / "verify_fixtures" / "node_modules"
-FIX = Path(__file__).resolve().parent / "hunt_fixtures"
-JESTDEPS = FIX / "jestdeps" / "node_modules"
-
-# Fixture repos ignore the developer's git config (signing, hooks, templates) and inherited repository locations.
-GIT_ENV = {**hunt_common.git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
-           "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
-
-
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True, env=GIT_ENV).stdout.strip()
-
-
-def _overlay(src: Path, dst: Path) -> None:
-    for p in src.rglob("*"):
-        if p.is_file():
-            out = dst / p.relative_to(src)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(p, out)
-
-
-def make_hunt(tmp: Path, name: str) -> tuple[Path, dict]:
-    """Repo with master=base and feature=base+head, worktrees via prepare.worktrees, context via ctx.build."""
-    repo = tmp / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    _overlay(FIX / name / "base", repo)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    _git(repo, "checkout", "-qb", "feature")
-    _overlay(FIX / name / "head", repo)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "head")
-    wt, wt_base = tmp / "wt", tmp / "wt.base"
-    mb = prepare.worktrees(repo, "feature", "master", wt, wt_base)
-    for w in (wt, wt_base):
-        if (w / "web").is_dir():
-            (w / "web" / "node_modules").symlink_to(JESTDEPS)
-    hdir = tmp / "hunt"
-    prep = {"repo": str(repo), "wt": str(wt), "wt_base": str(wt_base), "merge_base": mb,
-            "head": _git(repo, "rev-parse", "feature"), "hunt_dir": str(hdir)}
-    state = ctx.build("1", 1, prep, {"title": f"fixture {name}", "body": "Clamp keeps values in range."})
-    shutil.copytree(FIX / name / "responses", hdir, dirs_exist_ok=True)  # after ctx.build, which clears old outputs
-    return hdir, state
-
+from conftest import (
+    FIX,
+    GIT_ENV,
+    JESTDEPS,
+    ROOT,
+    SCRIPTS,
+    SKILL,
+    TOKEN,
+    VERIFY_DEPS,
+    VERIFY_UI,
+    JsonHandler,
+    _git,
+    _module,
+    _node_env,
+    http_server,
+    make_hunt,
+    make_repo,
+    needs_jest,
+    needs_node,
+    needs_playwright,
+    run_frozen_spec,
+)
+from conftest import (
+    overlay as _overlay,
+)
+from conftest import (
+    wts_clean as _clean,
+)
 
 # ------------------------------------------------------------------ worktrees + context
 
@@ -124,17 +100,7 @@ def test_pr_tests_diff_is_capped_and_skips_other_dirs(tmp_path, monkeypatch):
 def _ctx_from(tmp: Path, base: dict[str, str], head: dict[str, str], untracked: dict[str, str] | None = None) -> dict:
     """ctx.json for a two-commit repo (`base` files, then `head` edits); `untracked` files are dropped into the head
     worktree before the context is built."""
-    repo = tmp / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    for files, msg in ((base, "base"), (head, "head")):
-        if msg == "head":
-            _git(repo, "checkout", "-qb", "feature")
-        for rel, body in files.items():
-            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
-            (repo / rel).write_text(body)
-        _git(repo, "add", "-A")
-        _git(repo, "commit", "-qm", msg)
+    repo = make_repo(tmp, base, head)
     wt, wt_base = tmp / "wt", tmp / "wt.base"
     mb = prepare.worktrees(repo, "feature", "master", wt, wt_base)
     for rel, body in (untracked or {}).items():
@@ -337,7 +303,7 @@ def test_go_bug_fails_3_of_3_and_is_new_in_pr(tmp_path):
 
 # ------------------------------------------------------------------ fixture 2: known React bug
 
-@pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(), reason="run `make jest-deps` first")
+@needs_jest
 def test_react_bug_fails_3_of_3_and_is_new_in_pr(tmp_path):
     hdir, state = make_hunt(tmp_path, "react_bug")
     assert state["targets"] == [{"lang": "jest", "dir": "web/src", "path": "web/src/hunt_<mode>.test.tsx"}]
@@ -345,7 +311,7 @@ def test_react_bug_fails_3_of_3_and_is_new_in_pr(tmp_path):
     assert run.cmd_base(hdir, state, "A") == {"web/src/hunt_a.test.tsx::HuntA HuntA_neverExceedsMax": "NEW_PR_BUG"}
 
 
-@pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(), reason="run `make jest-deps` first")
+@needs_jest
 def test_babel_compile_check(tmp_path):
     _, state = make_hunt(tmp_path, "react_bug")
     wt = Path(state["wt"])
@@ -381,7 +347,7 @@ def test_jest_root_falls_back_to_channels_for_platform_packages(tmp_path):
         run.jest_root(tmp_path, "other/x.test.ts")
 
 
-@pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(), reason="run `make jest-deps` first")
+@needs_jest
 def test_jest_runs_a_platform_package_test_under_the_channels_config(tmp_path):
     _platform_tree(tmp_path)
     (tmp_path / "webapp/channels/node_modules").symlink_to(JESTDEPS)
@@ -626,7 +592,7 @@ def test_go_profile_lines_match_by_path_below_the_module_root():
     assert run.go_profile_lines(prof, "calc/percent.go") == ({7, 8, 11}, {7, 8})
 
 
-@pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(), reason="run `make jest-deps` first")
+@needs_jest
 def test_cover_measures_a_jest_test(tmp_path):
     hdir, state = make_hunt(tmp_path, "react_bug")
     run.cmd_run(hdir, state, "A", runs=1)
@@ -856,22 +822,11 @@ fetch('/api/v4/missing404');
 </script></body></html>""",
 }
 
-TOKEN, USER_ID = "tok-123", "uid1"
+USER_ID = "uid1"
 SEEN: list[tuple[str, str, str | None]] = []  # (Host, path, Authorization) of every request the fixture server saw
 
 
-class _Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *args):  # keep test output clean
-        pass
-
-    def _send(self, code: int, body: str, ctype: str = "application/json", headers: dict | None = None):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        for k, v in (headers or {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(body.encode())
-
+class _Handler(JsonHandler):
     def _auth(self) -> str | None:
         """Mattermost's order: the MMAUTHTOKEN cookie wins over the Authorization header. Cookie sessions need a
         matching X-CSRF-Token on writes ("Appears to be a CSRF attempt")."""
@@ -977,49 +932,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 @pytest.fixture
 def ui_server():
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
-        yield f"http://127.0.0.1:{srv.server_address[1]}"
-    finally:
-        srv.shutdown()
-        srv.server_close()
-
-
-def _node_env(auth: str = "password") -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("VERIFY_")}
-    if auth == "password":
-        env.update(VERIFY_USER="tester", VERIFY_PASSWORD="pw")
-    elif auth == "token":
-        env["VERIFY_TOKEN"] = TOKEN
-    paths = [str(VERIFY_DEPS)] + [p for p in env.get("NODE_PATH", "").split(os.pathsep) if p]
-    env["NODE_PATH"] = os.pathsep.join(paths)
-    if os.environ.get("HUNT_NODE_BIN"):
-        env["PATH"] = f"{os.environ['HUNT_NODE_BIN']}{os.pathsep}{env['PATH']}"
-    return env
-
-
-def _playwright_available() -> bool:
-    try:
-        # the library and a browser build that matches it (make verify-deps installs only the library)
-        check = "const fs = require('fs'); process.exit(fs.existsSync(require('playwright').chromium.executablePath()) ? 0 : 1)"
-        p = subprocess.run(["node", "-e", check], env=_node_env(), capture_output=True, check=False)
-    except FileNotFoundError:  # no node at all: optional /verify tests skip (HUNT_REQUIRE_DEPS makes them fail)
-        return False
-    return p.returncode == 0
-
-
-def _node_available() -> bool:
-    try:
-        return subprocess.run(["node", "-v"], env=_node_env("none"), capture_output=True, check=False).returncode == 0
-    except FileNotFoundError:
-        return False
-
-
-# CI sets HUNT_REQUIRE_DEPS=1 so missing dependencies fail loudly instead of skipping.
-REQUIRE_DEPS = bool(os.environ.get("HUNT_REQUIRE_DEPS"))
-needs_node = pytest.mark.skipif(not REQUIRE_DEPS and not _node_available(), reason="node not on PATH")
-needs_playwright = pytest.mark.skipif(not REQUIRE_DEPS and not _playwright_available(), reason="run `make verify-deps` first")
+    with http_server(_Handler) as (_, url):
+        yield url
 
 
 def verify(tmp: Path, plan: dict, *extra: str, auth: str = "password", env: dict | None = None) -> tuple[int, str]:
@@ -1099,17 +1013,12 @@ def test_verify_freezes_a_passing_plan_into_a_model_free_playwright_test(tmp_pat
     assert code == 0 and "frozen to frozen.spec.ts" in out, out
     spec = (tmp_path / "frozen.spec.ts").read_text()
     assert "Copyright (c) 2015-present Mattermost" in spec and "ariaSnapshot" not in spec and "screenshot" not in spec
-    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
-    cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
-    env = {**_node_env(), "MM_URL": ui_server}
-    run_spec = lambda: subprocess.run(["node", str(cli), "test", "frozen.spec.ts", "--reporter=line"],  # noqa: E731
-                                      cwd=tmp_path, env=env, capture_output=True, text=True, timeout=180, check=False)
-    p = run_spec()
-    assert p.returncode == 0 and "1 passed" in p.stdout, p.stdout + p.stderr
+    p = run_frozen_spec(tmp_path, "frozen.spec.ts", env={"MM_URL": ui_server})
+    assert p is not None and p.returncode == 0 and "1 passed" in p.stdout, p.stdout + p.stderr
     # the frozen test keeps the oracle: the same flow against a broken page fails without any model involved
     (tmp_path / "frozen.spec.ts").write_text(spec.replace('"/ok"', '"/boom"').replace('"Save"', '"Boom"'))
-    p = run_spec()
-    assert p.returncode != 0 and "kaboom" in p.stdout + p.stderr, p.stdout + p.stderr
+    p = run_frozen_spec(tmp_path, "frozen.spec.ts", env={"MM_URL": ui_server})
+    assert p is not None and p.returncode != 0 and "kaboom" in p.stdout + p.stderr, p.stdout + p.stderr
 
 
 # ------------------------------------------------------------------ installer
@@ -1179,14 +1088,10 @@ def test_frozen_spec_reuses_the_api_login_with_only_a_token(tmp_path, ui_server)
     spec = (tmp_path / "frozen.spec.ts").read_text()
     assert "async function apiLogin(context, base, env)" in spec and "await apiLogin(context, BASE, process.env)" in spec
     assert "getByLabel(" not in spec and ".fill(" not in spec  # no login form steps
-    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
-    cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
     for auth, ok in (("token", True), ("none", False)):
-        env = {**_node_env(auth), "VERIFY_BASE_URL": ui_server}
-        p = subprocess.run(["node", str(cli), "test", "frozen.spec.ts", "--reporter=line"], cwd=tmp_path, env=env,
-                           capture_output=True, text=True, timeout=180, check=False)
-        assert (p.returncode == 0) == ok, (auth, p.stdout + p.stderr)
-    assert "set VERIFY_TOKEN or VERIFY_USER + VERIFY_PASSWORD" in p.stdout + p.stderr
+        p = run_frozen_spec(tmp_path, "frozen.spec.ts", auth=auth, env={"VERIFY_BASE_URL": ui_server})
+        assert p is not None and (p.returncode == 0) == ok, (auth, p.stdout + p.stderr)
+    assert p is not None and "set VERIFY_TOKEN or VERIFY_USER + VERIFY_PASSWORD" in p.stdout + p.stderr
 
 
 @needs_playwright
@@ -1515,13 +1420,6 @@ def test_text_rendering_keeps_every_value_and_fences_code_safely():
 
 # ------------------------------------------------------------------ /verify hardening (self-review)
 
-def _module(expr: str) -> str:
-    """Evaluate an expression against verify_ui.mjs's exports in a fresh node (no browser)."""
-    code = f"import(process.env.VERIFY_UI_MODULE).then((m) => console.log(JSON.stringify({expr})))"
-    p = subprocess.run(["node", "-e", code], env={**_node_env("none"), "VERIFY_UI_MODULE": str(VERIFY_UI)},
-                       capture_output=True, text=True, check=True)
-    return p.stdout.strip()
-
 
 @needs_playwright
 def test_verify_strict_plan_validation_exits_2(tmp_path, ui_server):
@@ -1600,12 +1498,8 @@ def test_frozen_spec_keeps_errors_free_of_the_token(tmp_path, ui_server):
             "expect": [{"api": {"path": "/api/v4/users/me", "json_has": {"username": "tester"}}}]}
     code, out = verify(tmp_path, plan, "--freeze", "frozen.spec.ts", auth="token")
     assert code == 0, out
-    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
-    cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
-    env = {**_node_env("token"), "VERIFY_REPLAY_BASE_URL": "http://127.0.0.1:9"}  # nothing listens there
-    p = subprocess.run(["node", str(cli), "test", "frozen.spec.ts", "--reporter=line"], cwd=tmp_path, env=env,
-                       capture_output=True, text=True, timeout=180, check=False)
-    assert p.returncode != 0 and "ECONNREFUSED" in p.stdout + p.stderr and TOKEN not in p.stdout + p.stderr
+    p = run_frozen_spec(tmp_path, "frozen.spec.ts", auth="token", env={"VERIFY_REPLAY_BASE_URL": "http://127.0.0.1:9"})
+    assert p is not None and p.returncode != 0 and "ECONNREFUSED" in p.stdout + p.stderr and TOKEN not in p.stdout + p.stderr
 
 
 @needs_playwright
@@ -1619,13 +1513,7 @@ def test_frozen_spec_type_checks_strictly(tmp_path, ui_server):
     assert code == 0, out
     # the test timeout covers the plan at its limits: 2 steps and 4 expectations
     assert "test.setTimeout(60000 + 2 * (TIMEOUT + SETTLE_MS) + 4 * TIMEOUT + SETTLE_MS);" in (tmp_path / "typed.spec.ts").read_text()
-    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
-    (tmp_path / "tsconfig.json").write_text(json.dumps({"compilerOptions": {
-        "strict": True, "noEmit": True, "target": "es2022", "module": "esnext", "moduleResolution": "bundler",
-        "types": ["node"], "skipLibCheck": True}, "files": ["typed.spec.ts"]}))
-    p = subprocess.run(["node", str(VERIFY_DEPS / "typescript" / "bin" / "tsc"), "-p", "."], cwd=tmp_path,
-                       env=_node_env("none"), capture_output=True, text=True, timeout=180, check=False)
-    assert p.returncode == 0, p.stdout + p.stderr
+    run_frozen_spec(tmp_path, "typed.spec.ts", check_tsc=True, run_test=False)
 
 
 @needs_node
@@ -1799,14 +1687,8 @@ def test_verify_login_never_replays_the_password_through_a_redirect(tmp_path):
             captured.append(body)
             self._send(200, "{}")
 
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirecting)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
-        base = f"http://127.0.0.1:{srv.server_address[1]}"
+    with http_server(Redirecting) as (_, base):
         code, out = verify(tmp_path, {"base_url": base, "steps": [], "expect": [{"visible": {"role": "main"}}]})
-    finally:
-        srv.shutdown()
-        srv.server_close()
     assert captured == [] and code == 2 and "login as tester failed: HTTP 307" in out, (captured, out)
 
 
@@ -2121,7 +2003,7 @@ def test_regen_reads_only_the_requested_score(tmp_path, monkeypatch):
     assert "PR-attempt" in user and "PR error" in user and "A-attempt" not in user
 
 
-@pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(), reason="run `make jest-deps` first")
+@needs_jest
 def test_each_jest_hunter_file_needs_its_own_matching_test(tmp_path):
     hdir, state = make_hunt(tmp_path, "react_bug")
     resp = json.loads((hdir / "A" / "response.json").read_text())
@@ -2326,30 +2208,16 @@ def test_mine_rules_proposes_parseable_candidates_and_writes_nothing(tmp_path, c
 
 def _bug_fix_history(tmp: Path) -> tuple[Path, str, str]:
     """base -> bug (the go_bug fixture's head) -> fix (git revert of the bug)."""
-    repo = tmp / "bugrepo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    _overlay(FIX / "go_bug" / "base", repo)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    _overlay(FIX / "go_bug" / "head", repo)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "Make Clamp faster\n\nAvoid a comparison in the hot path.")
+    repo = make_repo(tmp, "go_bug", "go_bug", head_msg="Make Clamp faster\n\nAvoid a comparison in the hot path.",
+                     dirname="bugrepo", feature_branch=None)
     bug = _git(repo, "rev-parse", "HEAD")
     _git(repo, "revert", "--no-edit", "HEAD")
     return repo, bug, _git(repo, "rev-parse", "HEAD")
 
 
 def _control_history(tmp: Path) -> tuple[Path, str]:
-    repo = tmp / "cleanrepo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    _overlay(FIX / "clean" / "base", repo)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    _overlay(FIX / "clean" / "head", repo)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "Handle a zero total in Percent")
+    repo = make_repo(tmp, "clean", "clean", head_msg="Handle a zero total in Percent",
+                     dirname="cleanrepo", feature_branch=None)
     return repo, _git(repo, "rev-parse", "HEAD")
 
 
@@ -2564,17 +2432,11 @@ def test_frozen_replay_rechecks_the_cookie_rule_for_its_new_target(tmp_path, ui_
             "steps": [{"goto": "/whoami"}], "expect": [{"text": {"css": "#who"}, "contains": "signed in as tester"}]}
     code, out = verify(tmp_path, plan, "--freeze", "frozen.spec.ts", auth="password")
     assert code == 0, out  # 127.0.0.1 and localhost are different hosts for cookies
-    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
-    cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
     retarget = ui_server.replace("127.0.0.1", "localhost")  # now BASE shares its host with http://localhost:1
-    p = subprocess.run(["node", str(cli), "test", "frozen.spec.ts", "--reporter=line"], cwd=tmp_path,
-                       env={**_node_env("password"), "VERIFY_REPLAY_BASE_URL": retarget},
-                       capture_output=True, text=True, timeout=180, check=False)
-    assert p.returncode != 0 and "share the host of" in p.stdout + p.stderr, p.stdout + p.stderr
-    p = subprocess.run(["node", str(cli), "test", "frozen.spec.ts", "--reporter=line"], cwd=tmp_path,
-                       env={**_node_env("token"), "VERIFY_REPLAY_BASE_URL": retarget},
-                       capture_output=True, text=True, timeout=180, check=False)
-    assert p.returncode == 0, p.stdout + p.stderr  # token mode sets no session cookie
+    p = run_frozen_spec(tmp_path, "frozen.spec.ts", auth="password", env={"VERIFY_REPLAY_BASE_URL": retarget})
+    assert p is not None and p.returncode != 0 and "share the host of" in p.stdout + p.stderr, p.stdout + p.stderr
+    p = run_frozen_spec(tmp_path, "frozen.spec.ts", auth="token", env={"VERIFY_REPLAY_BASE_URL": retarget})
+    assert p is not None and p.returncode == 0, p.stdout + p.stderr  # token mode sets no session cookie
 
 
 def test_shipped_revert_manifest_is_well_formed():
@@ -2653,13 +2515,6 @@ def test_mutant_scoring_stops_on_low_disk_before_placing_anything(tmp_path, monk
 
 # ------------------------------------------------------------------ old tests on new code (no model)
 
-def _clean(wt: Path) -> bool:
-    try:
-        run.ensure_clean(wt)  # the same rule run.py applies: node_modules and go.work do not count
-    except run.InfraError:
-        return False
-    return True
-
 
 def test_old_test_the_pr_had_to_edit_breaks_on_head_and_passes_on_base(tmp_path):
     hdir, state = make_hunt(tmp_path, "old_test_break")
@@ -2703,7 +2558,7 @@ def test_old_tests_restore_head_files_even_when_a_run_is_interrupted(tmp_path, m
     assert _clean(Path(state["wt"]))
 
 
-@pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(), reason="run `make jest-deps` first")
+@needs_jest
 def test_old_jest_file_the_pr_edited_breaks_on_head_and_leaves_no_snapshot(tmp_path):
     hdir, state = make_hunt(tmp_path, "old_test_jest")
     out = old_tests.cmd_old(hdir, state)
@@ -2802,7 +2657,6 @@ def test_prepare_and_ctx_work_on_release_tag_ranges(tmp_path, monkeypatch):
     _git(repo, "commit", "-qm", "Clamp upper bound change for rc3")
     _git(repo, "tag", "release-12.1.0-rc3")
 
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
     monkeypatch.setenv("HUNT_MM", str(repo))
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
     monkeypatch.setattr(prepare, "pr_meta", lambda pr: pytest.fail("gh api must not be called for a range"))
@@ -2841,17 +2695,8 @@ def test_verify_api_write_methods_csrf_save_and_browserless_fast_path(tmp_path, 
     code, out = verify(tmp_path, plan, "--freeze", "api.spec.ts", auth="password")
     assert code == 0 and "API-only, no browser" in out, out
     # Frozen spec must pass tsc --strict AND replay cleanly with password+CSRF auth
-    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
-    (tmp_path / "tsconfig.json").write_text(json.dumps({"compilerOptions": {
-        "strict": True, "noEmit": True, "target": "es2022", "module": "esnext", "moduleResolution": "bundler",
-        "types": ["node"], "skipLibCheck": True}, "files": ["api.spec.ts"]}))
-    tc = subprocess.run(["node", str(VERIFY_DEPS / "typescript" / "bin" / "tsc"), "-p", "."], cwd=tmp_path,
-                        env=_node_env("none"), capture_output=True, text=True, timeout=180, check=False)
-    assert tc.returncode == 0, tc.stdout + tc.stderr
-    cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
-    p = subprocess.run(["node", str(cli), "test", "api.spec.ts", "--reporter=line"], cwd=tmp_path,
-                       env=_node_env("password"), capture_output=True, text=True, timeout=180, check=False)
-    assert p.returncode == 0 and "1 passed" in p.stdout, p.stdout + p.stderr
+    p = run_frozen_spec(tmp_path, "api.spec.ts", auth="password", check_tsc=True)
+    assert p is not None and p.returncode == 0 and "1 passed" in p.stdout, p.stdout + p.stderr
     # Unsafe $var tokens cannot traverse outside /api/v4/
     unsafe_plan = {"base_url": ui_server, "steps": [{"capture": {"api": {"method": "POST", "path": "/api/v4/unsafe"}, "save": {"bad": "id"}}}],
                    "expect": [{"api": {"path": "/api/v4/things/$bad"}}]}
@@ -2880,17 +2725,8 @@ def test_verify_drag_release_false_mouse_up_and_freeze(tmp_path, ui_server):
     }
     code, out = verify(tmp_path, plan, "--freeze", "drag.spec.ts", auth="none")
     assert code == 0 and "- paragraph: down,dragged\n" in out, out
-    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
-    (tmp_path / "tsconfig.json").write_text(json.dumps({"compilerOptions": {
-        "strict": True, "noEmit": True, "target": "es2022", "module": "esnext", "moduleResolution": "bundler",
-        "types": ["node"], "skipLibCheck": True}, "files": ["drag.spec.ts"]}))
-    tc = subprocess.run(["node", str(VERIFY_DEPS / "typescript" / "bin" / "tsc"), "-p", "."], cwd=tmp_path,
-                        env=_node_env("none"), capture_output=True, text=True, timeout=180, check=False)
-    assert tc.returncode == 0, tc.stdout + tc.stderr
-    cli = VERIFY_DEPS / "@playwright" / "test" / "cli.js"
-    p = subprocess.run(["node", str(cli), "test", "drag.spec.ts", "--reporter=line"], cwd=tmp_path,
-                       env=_node_env("none"), capture_output=True, text=True, timeout=180, check=False)
-    assert p.returncode == 0 and "1 passed" in p.stdout, p.stdout + p.stderr
+    p = run_frozen_spec(tmp_path, "drag.spec.ts", auth="none", check_tsc=True)
+    assert p is not None and p.returncode == 0 and "1 passed" in p.stdout, p.stdout + p.stderr
     # Out-of-bounds drag offset is INVALID_PLAN
     code, out = verify(tmp_path, {"base_url": ui_server, "steps": [{"drag": {"from": {"css": "#handle"}, "dx": 5000}}],
                                   "expect": [{"visible": {"role": "main"}}]}, auth="none")
@@ -2968,13 +2804,7 @@ def test_verify_freeze_emits_covers_and_verified_at_and_rejects_multiline(tmp_pa
     spec = (tmp_path / "meta.spec.ts").read_text()
     assert "// covers: server/channels/api4/config.go, webapp/channels/src/foo.tsx\n" in spec
     assert "// verified-at: 5e62cb1\n" in spec
-    (tmp_path / "node_modules").symlink_to(VERIFY_DEPS)
-    (tmp_path / "tsconfig.json").write_text(json.dumps({"compilerOptions": {
-        "strict": True, "noEmit": True, "target": "es2022", "module": "esnext", "moduleResolution": "bundler",
-        "types": ["node"], "skipLibCheck": True}, "files": ["meta.spec.ts"]}))
-    tc = subprocess.run(["node", str(VERIFY_DEPS / "typescript" / "bin" / "tsc"), "-p", "."], cwd=tmp_path,
-                        env=_node_env("none"), capture_output=True, text=True, timeout=180, check=False)
-    assert tc.returncode == 0, tc.stdout + tc.stderr
+    run_frozen_spec(tmp_path, "meta.spec.ts", check_tsc=True, run_test=False)
     for bad in ({"verified_at": "abc\nevil()"}, {"covers": ["ok\nbad"]}, {"covers": []}):
         bad_plan = {"base_url": ui_server, "steps": [], "expect": [{"api": {"path": "/api/v4/users/me", "status": 401}}], **bad}
         bcode, bout = verify(tmp_path, bad_plan, auth="none")
@@ -2982,16 +2812,8 @@ def test_verify_freeze_emits_covers_and_verified_at_and_rejects_multiline(tmp_pa
 
 
 def test_prepare_worktrees_refuses_non_worktree_dir(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    _overlay(FIX / "go_bug" / "base", repo)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    mb = _git(repo, "rev-parse", "HEAD")
-    _overlay(FIX / "go_bug" / "head", repo)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "head")
+    repo = make_repo(tmp_path, "go_bug", "go_bug", feature_branch=None)
+    mb = _git(repo, "rev-parse", "HEAD~1")
     head = _git(repo, "rev-parse", "HEAD")
     wt, wt_base = tmp_path / "wt", tmp_path / "wt_base"
     wt.mkdir()
@@ -3051,43 +2873,23 @@ def test_run_clears_stale_coverage_and_records_jest_package_failed(tmp_path, mon
 
 @needs_node
 def test_verify_ui_rejects_unicode_separators_long_expanded_body_and_503_capture(tmp_path):
-    import http.server
-    import threading
-
     seen = []
 
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
+    class Handler(JsonHandler):
         def do_GET(self):
             if self.path == "/api/v4/big":
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"big": "x" * 70000}).encode())
+                self._send(200, {"big": "x" * 70000})
             elif self.path == "/api/v4/fail503":
-                self.send_response(503)
-                self.end_headers()
-                self.wfile.write(b"{}")
+                self._send(503, "{}")
             else:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b"{}")
+                self._send(200, "{}")
 
         def do_POST(self):
             raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             seen.append((self.path, self.headers.get("Content-Type", ""), raw))
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"ok": true}')
+            self._send(200, '{"ok": true}')
 
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    url = f"http://127.0.0.1:{srv.server_address[1]}"
-    try:
+    with http_server(Handler) as (_, url):
         for bad in ({"verified_at": "a\u2028b"}, {"verified_at": "a\u2029b"}, {"covers": ["ok\u2028bad"]}):
             bplan = {"base_url": url, "steps": [], "expect": [{"api": {"path": "/api/v4/ok", "status": 200}}], **bad}
             bcode, bout = verify(tmp_path, bplan, auth="none")
@@ -3122,19 +2924,13 @@ def test_verify_ui_rejects_unicode_separators_long_expanded_body_and_503_capture
         }
         scode, sout = verify(tmp_path, s503_plan, auth="none")
         assert scode == 1 and "503" in sout, (scode, sout)
-    finally:
-        srv.shutdown()
 
 
 def test_mine_rules_ignores_sql_comment_headers_inside_hunk(tmp_path, capsys):
     import mine_rules
-    repo = tmp_path / "sqlrepo"
-    sql = repo / "server" / "channels" / "store" / "sqlstore" / "q.sql"
-    sql.parent.mkdir(parents=True)
-    _git(repo, "init", "-q", "-b", "master")
-    sql.write_text("-- base\nSELECT safeFunc();\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "init")
+    rel_sql = "server/channels/store/sqlstore/q.sql"
+    repo = make_repo(tmp_path, {rel_sql: "-- base\nSELECT safeFunc();\n"}, base_msg="init", dirname="sqlrepo")
+    sql = repo / rel_sql
     for idx in range(2):
         # Reverting removes "-- comment" (producing "--- comment" inside the hunk) and adds buggyQueryGuard().
         sql.write_text(f"-- base\nSELECT buggyQueryGuard({idx});\n")

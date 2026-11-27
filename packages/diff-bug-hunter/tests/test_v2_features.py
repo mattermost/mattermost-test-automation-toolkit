@@ -31,13 +31,7 @@ import reliability
 import review_threads
 import run
 import trusted
-from test_hunt_engine import JESTDEPS, _git, make_hunt
-
-ROOT = Path(__file__).resolve().parent.parent
-SKILL = ROOT / ".claude" / "skills" / "hunt"
-
-needs_jest = pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(),
-                                reason="run `make jest-deps` first")
+from conftest import JESTDEPS, SKILL, _git, make_hunt, make_repo, needs_jest
 
 
 @pytest.fixture(autouse=True)
@@ -89,31 +83,13 @@ def _cr_node(
 
 def _two_batch_repo(tmp: Path) -> tuple[Path, dict[str, Any]]:
     """Git repo with 6 changed Go files across pkg1 (5 files -> batch 1) and pkg2 (1 buggy file -> batch 2)."""
-    repo = tmp / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    (repo / "go.mod").write_text("module example.com/v2fx\n\ngo 1.22\n")
-    (repo / "pkg1").mkdir()
-    (repo / "pkg2").mkdir()
-    for i in range(1, 6):
-        (repo / "pkg1" / f"f{i}.go").write_text(f"package pkg1\n\nfunc F{i}(x int) int {{ return x + {i} }}\n")
-    (repo / "pkg2" / "extra.go").write_text("package pkg2\n\nfunc Extra(x int) int { return x * 2 }\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    _git(repo, "checkout", "-qb", "feature")
-    # Introduce a bug in pkg1/f1.go (high-risk keyword "auth" so pkg1 stays batch 1) and in pkg2/extra.go (batch 2).
-    (repo / "pkg1" / "f1.go").write_text(
-        "package pkg1\n\n// auth helper\nfunc F1(x int) int {\n\tif x == 0 {\n\t\treturn 999 // bug\n\t}\n\treturn x + 1\n}\n"
-    )
-    for i in range(2, 6):
-        (repo / "pkg1" / f"f{i}.go").write_text(
-            f"package pkg1\n\n// auth helper {i}\nfunc F{i}(x int) int {{ return x + {i} }}\n"
-        )
-    (repo / "pkg2" / "extra.go").write_text(
-        "package pkg2\n\nfunc Extra(x int) int {\n\tif x < 0 {\n\t\treturn 0 // bug: negative input zeroed\n\t}\n\treturn x * 2\n}\n"
-    )
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "head")
+    base = {"go.mod": "module example.com/v2fx\n\ngo 1.22\n",
+            "pkg2/extra.go": "package pkg2\n\nfunc Extra(x int) int { return x * 2 }\n",
+            **{f"pkg1/f{i}.go": f"package pkg1\n\nfunc F{i}(x int) int {{ return x + {i} }}\n" for i in range(1, 6)}}
+    head = {"pkg1/f1.go": "package pkg1\n\n// auth helper\nfunc F1(x int) int {\n\tif x == 0 {\n\t\treturn 999 // bug\n\t}\n\treturn x + 1\n}\n",
+            "pkg2/extra.go": "package pkg2\n\nfunc Extra(x int) int {\n\tif x < 0 {\n\t\treturn 0 // bug: negative input zeroed\n\t}\n\treturn x * 2\n}\n",
+            **{f"pkg1/f{i}.go": f"package pkg1\n\n// auth helper {i}\nfunc F{i}(x int) int {{ return x + {i} }}\n" for i in range(2, 6)}}
+    repo = make_repo(tmp, base, head)
     wt, wt_base = tmp / "wt", tmp / "wt.base"
     mb = prepare.worktrees(repo, "feature", "master", wt, wt_base)
     hdir = tmp / "hunt42"
@@ -373,16 +349,7 @@ def test_all_batches_prints_plan_archives_prior_batches_and_preserves_whole_pr_o
 
 def test_pr_tests_caps_go_test_parallel_flag_and_clamps_minimum(tmp_path, monkeypatch):
     # Real Go test asserting that TestMain observes -test.parallel == 2 (not NCPUs) under ENABLE_FULLY_PARALLEL_TESTS.
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    (repo / "go.mod").write_text("module example.com/par\n\ngo 1.22\n")
-    (repo / "par").mkdir()
-    (repo / "par" / "par.go").write_text("package par\n\nfunc Ok() bool { return true }\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    _git(repo, "checkout", "-qb", "feature")
-    (repo / "par" / "par_test.go").write_text(
+    par_test = (
         'package par\n\nimport (\n\t"flag"\n\t"os"\n\t"strconv"\n\t"testing"\n)\n\n'
         'var seenParallel int\n\n'
         'func TestMain(m *testing.M) {\n'
@@ -401,8 +368,11 @@ def test_pr_tests_caps_go_test_parallel_flag_and_clamps_minimum(tmp_path, monkey
         '\t}\n'
         '}\n'
     )
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "head")
+    repo = make_repo(
+        tmp_path,
+        {"go.mod": "module example.com/par\n\ngo 1.22\n", "par/par.go": "package par\n\nfunc Ok() bool { return true }\n"},
+        {"par/par_test.go": par_test},
+    )
     wt, wt_base = tmp_path / "wt", tmp_path / "wt.base"
     mb = prepare.worktrees(repo, "feature", "master", wt, wt_base)
     hdir = tmp_path / "hunt"
@@ -773,15 +743,12 @@ def test_review_threads_nested_details_late_replies_basename_focus_and_deleted_f
         review_threads.fetch_graphql("not-a-pr")
 
     # Deleted-at-head file & same-file basename:line reference (like #40294 property_field.go:79).
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    (repo / "go.mod").write_text("module example.com/del\n\ngo 1.22\n")
-    (repo / "pkg").mkdir()
-    (repo / "pkg" / "keep.go").write_text("package pkg\n" + "".join(f"// line {i}\n" for i in range(2, 1600)))
-    (repo / "pkg" / "old.go").write_text("package pkg\n\nfunc Legacy() int { return 1 }\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
+    repo = make_repo(
+        tmp_path,
+        {"go.mod": "module example.com/del\n\ngo 1.22\n",
+         "pkg/keep.go": "package pkg\n" + "".join(f"// line {i}\n" for i in range(2, 1600)),
+         "pkg/old.go": "package pkg\n\nfunc Legacy() int { return 1 }\n"},
+    )
     _git(repo, "checkout", "-qb", "feature")
     (repo / "pkg" / "old.go").unlink()
     _git(repo, "add", "-A")

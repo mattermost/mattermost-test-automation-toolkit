@@ -13,16 +13,8 @@ import build_requests
 import pytest
 import run
 import trusted
-from test_hunt_engine import JESTDEPS, make_hunt
-
-needs_jest = pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(),
-                                reason="run `make jest-deps` first")
-
-
-def _clean(state: dict) -> None:
-    for wt in (state["wt"], state["wt_base"]):
-        run.ensure_clean(Path(wt))
-        assert not list(Path(wt).rglob("hunt_*"))
+from conftest import _git, make_hunt, needs_jest
+from conftest import assert_clean_wts as _clean
 
 
 def _examples(hdir: Path) -> dict:
@@ -257,7 +249,6 @@ def test_diff_records_distinguishes_bool_and_int():
 
 
 def test_cmd_diff_isolates_same_named_recorders_across_packages(tmp_path):
-    from test_hunt_engine import _git
     hdir, state = make_hunt(tmp_path, "diff_go")
     wt, wt_base = Path(state["wt"]), Path(state["wt_base"])
     for root, expr in ((wt_base, "return x"), (wt, "return x + 1")):

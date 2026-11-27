@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,28 +17,26 @@ import prepare
 import pytest
 import report
 import telemetry
-import trusted
 import verdict
+from conftest import (
+    FAKE_DISPATCH,
+    JESTDEPS,
+    _git,
+    cli_json,
+    make_repo,
+    needs_jest,
+    vetted_row,
+)
+from conftest import (
+    canned_responses as _canned,
+)
+from conftest import (
+    e2e_repo as _e2e_repo,
+)
+from conftest import (
+    fake_script as _fake,
+)
 from hunt_common import hunt_dir, worktree_paths, write_json
-from test_hunt_engine import FIX, JESTDEPS, _git
-
-FAKE_DISPATCH = '''
-import json, os, sys
-from pathlib import Path
-req = Path(sys.argv[-1])
-data = json.loads(req.read_text())
-tag = req.parent.name
-with Path(os.environ["FAKE_LOG"]).open("a") as fh:
-    fh.write(tag + "\\n")
-src = Path(os.environ["FAKE_RESPONSES"]) / tag / "response.json"
-if src.exists():
-    text = src.read_text()
-elif tag == "vet":
-    text = json.dumps({"rows": []})
-else:
-    text = json.dumps({"files": [], "tests": []})
-Path(data["response_path"]).write_text(text)
-'''
 
 FLAKY_THEN_OK = '''
 import json, os, sys
@@ -54,12 +50,6 @@ if n == 0:
     sys.exit(1)
 Path(json.loads(req.read_text())["response_path"]).write_text(json.dumps({"files": [], "tests": []}))
 '''
-
-
-def _fake(tmp: Path, name: str, body: str) -> str:
-    path = tmp / name
-    path.write_text(body)
-    return f"{shlex.quote(sys.executable)} {shlex.quote(str(path))}"
 
 
 def _request(hdir: Path, tag: str) -> Path:
@@ -133,12 +123,6 @@ def test_dispatch_is_idempotent_per_request_sha(tmp_path):
     assert json.loads((hdir / "D" / "response.json").read_text()) == {"files": [{"path": "x"}], "tests": []}
 
 
-def _cli_answer(answer: object, **usage: int) -> str:
-    return json.dumps({"result": f"Here it is:\n```json\n{json.dumps(answer)}\n```", "total_cost_usd": 0.5,
-                       "usage": usage or {"input_tokens": 4, "cache_creation_input_tokens": 5,
-                                          "cache_read_input_tokens": 1, "output_tokens": 4}})
-
-
 def test_default_command_is_one_inline_turn_with_no_tools(tmp_path, monkeypatch):
     """The model gets the request as its system prompt and stdin and no tools: text in a diff cannot make it read
     or write a file. The script, not the model, writes response.json."""
@@ -147,10 +131,9 @@ def test_default_command_is_one_inline_turn_with_no_tools(tmp_path, monkeypatch)
     def fake_run(argv, **kw):
         seen["argv"], seen["input"] = argv, kw["input"]
         seen["system"] = Path(argv[argv.index("--system-prompt-file") + 1]).read_text()
-        return subprocess.CompletedProcess(argv, 0, stdout=_cli_answer({"files": [], "tests": ["t"]}), stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=cli_json({"files": [], "tests": ["t"]}, markdown=True), stderr="")
 
     monkeypatch.delenv("HUNT_DISPATCH_CMD", raising=False)
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
     monkeypatch.setattr(dispatch.subprocess, "run", fake_run)
     hdir = tmp_path / "hunt"
     req = _request(hdir, "A")
@@ -177,7 +160,6 @@ def test_failed_call_reports_the_cli_result_text(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(argv, 1, stdout=out, stderr="")
 
     monkeypatch.delenv("HUNT_DISPATCH_CMD", raising=False)
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
     monkeypatch.setattr(dispatch.subprocess, "run", fake_run)
     hdir = tmp_path / "hunt"
     with pytest.raises(dispatch.DispatchError) as e:
@@ -190,7 +172,6 @@ def test_inline_answer_without_json_fails_and_writes_nothing(tmp_path, monkeypat
         return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"result": "I cannot help."}), stderr="")
 
     monkeypatch.delenv("HUNT_DISPATCH_CMD", raising=False)
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
     monkeypatch.setattr(dispatch.subprocess, "run", fake_run)
     hdir = tmp_path / "hunt"
     req = _request(hdir, "A")
@@ -210,7 +191,6 @@ def test_inline_input_sends_the_md_user_and_schema_sections(tmp_path):
 
 
 def test_dispatch_slots_cap_concurrent_calls_and_wait_with_jitter(tmp_path, monkeypatch):
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
     monkeypatch.setenv("HUNT_MAX_DISPATCH", "1")
     monkeypatch.setattr(dispatch, "TIMEOUT_S", 2)
     naps: list[float] = []
@@ -224,17 +204,11 @@ def test_dispatch_slots_cap_concurrent_calls_and_wait_with_jitter(tmp_path, monk
 # ------------------------------------------------------------------ prepare.py
 
 def _two_commit_repo(tmp: Path, master_advances: bool) -> Path:
-    repo = tmp / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    (repo / "calc").mkdir()
-    (repo / "calc" / "calc.go").write_text("package calc\n\nfunc F() int { return 1 }\n")
-    (repo / "go.mod").write_text("module x\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    _git(repo, "checkout", "-qb", "feature")
-    (repo / "calc" / "calc.go").write_text("package calc\n\nfunc F() int { return 2 }\n")
-    _git(repo, "commit", "-qam", "head")
+    repo = make_repo(
+        tmp,
+        {"calc/calc.go": "package calc\n\nfunc F() int { return 1 }\n", "go.mod": "module x\n"},
+        {"calc/calc.go": "package calc\n\nfunc F() int { return 2 }\n"},
+    )
     if master_advances:
         _git(repo, "checkout", "-q", "master")
         (repo / "other.txt").write_text("later\n")
@@ -312,10 +286,11 @@ def test_without_docker_services_use_the_host_tools(monkeypatch):
 # ------------------------------------------------------------------ report.py
 
 def _keep_row() -> dict:
-    return {"id": "calc::TestHuntA_Clamp", "source": "A", "decision": "KEEP", "reason": "Clamp returns hi+1 for hi.",
-            "file_line": "calc/calc.go:9", "caller": "api4 PUT /x", "entry_point": "api4 PUT /x",
-            "repro_cmd": "go test ./calc -run TestHuntA_Clamp", "evidence_path": "run_A.json", "severity": "major",
-            "fix_check": None, "mechanical_verdict": "NEW_PR_BUG"}
+    return vetted_row(
+        id="calc::TestHuntA_Clamp", reason="Clamp returns hi+1 for hi.", file_line="calc/calc.go:9",
+        caller="api4 PUT /x", entry_point="api4 PUT /x", repro_cmd="go test ./calc -run TestHuntA_Clamp",
+        mechanical_verdict="NEW_PR_BUG",
+    )
 
 
 def test_report_writes_only_kept_findings_in_the_schema_shape_and_gaps_in_the_audit(tmp_path):
@@ -379,37 +354,6 @@ def test_only_dropped_candidates_leave_the_tier_clean(tmp_path):
 
 # ------------------------------------------------------------------ hunt.py end to end
 
-def _e2e_repo(tmp: Path, name: str, monkeypatch) -> Path:
-    """Fixture repo: master = fixture base, feature = base + head. HUNT_MM points at it (no origin, local refs)."""
-    repo = tmp / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    shutil.copytree(FIX / name / "base", repo, dirs_exist_ok=True)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    _git(repo, "checkout", "-qb", "feature")
-    shutil.copytree(FIX / name / "head", repo, dirs_exist_ok=True)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "head")
-    monkeypatch.setenv("HUNT_MM", str(repo))
-    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
-    return repo
-
-
-def _canned(tmp: Path, name: str, row_id: str, source: str) -> tuple[Path, Path]:
-    responses = tmp / "responses"
-    shutil.copytree(FIX / name / "responses" / "A", responses / "A")
-    (responses / "vet").mkdir(parents=True)
-    row = {"id": row_id, "source": source, "decision": "KEEP",
-           "reason": "The hunted input returns a value outside the documented range.",
-           "file_line": "calc/calc.go:1", "caller": "calc.Clamp is the exported API the PR changes",
-           "entry_point": "calc.Clamp (library API)", "repro_cmd": f"go test ./calc -run {row_id.split('::')[1]}",
-           "evidence_path": "run_A.json", "severity": "major", "fix_check": None}
-    (responses / "vet" / "response.json").write_text(json.dumps({"rows": [row]}))
-    log = tmp / "dispatch.log"
-    return responses, log
-
-
 def _run_driver(monkeypatch, tmp: Path, target: str, responses: Path, log: Path, cmd: str) -> int:
     monkeypatch.setenv("HUNT_DISPATCH_CMD", cmd)
     monkeypatch.setenv("FAKE_RESPONSES", str(responses))
@@ -459,9 +403,8 @@ def test_end_to_end_go_bug_driver_runs_mode_d_when_opted_in(tmp_path, monkeypatc
     assert json.loads((hdir / "state.json").read_text())["modes"] == ["A", "B", "D"]
 
 
+@needs_jest
 def test_end_to_end_react_bug_driver_finds_the_react_regression(tmp_path, monkeypatch):
-    if not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir():
-        pytest.skip("run `make jest-deps` first")
     _e2e_repo(tmp_path, "react_bug", monkeypatch)
     target = "master..feature"
     prepare.main(target)  # prepare first, then link the jest deps into the worktrees the driver will use

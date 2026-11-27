@@ -173,17 +173,14 @@ def gh_json(path: str) -> Any:
 def pr_shas(target: str) -> dict[str, str]:
     """Head and base commit shas for a PR number or a git range. `base..head` uses base itself; `base...head` and a PR
     use the merge-base."""
-    three = "..." in target
     for sep in ("...", ".."):
         if sep in target:
             base_ref, head_ref = (s.strip() for s in target.split(sep, 1))
             if not base_ref or not head_ref:
                 raise InfraError(f"invalid range {target!r}: expected <base>..<head> or <base>...<head>")
             head = gh_json(f"repos/{REPO}/commits/{head_ref}")["sha"]
-            if three:
-                base = gh_json(f"repos/{REPO}/compare/{base_ref}...{head_ref}")["merge_base_commit"]["sha"]
-            else:
-                base = gh_json(f"repos/{REPO}/commits/{base_ref}")["sha"]
+            base = (gh_json(f"repos/{REPO}/compare/{base_ref}...{head_ref}")["merge_base_commit"]["sha"]
+                    if sep == "..." else gh_json(f"repos/{REPO}/commits/{base_ref}")["sha"])
             return {"head": head, "base": base}
     meta = gh_json(f"repos/{REPO}/pulls/{target}")
     head = meta["head"]["sha"]
@@ -272,15 +269,33 @@ def _error_id(e: urllib.error.HTTPError) -> str:
         return ""
 
 
-def seed(url: str, user: str, password: str, license_text: str | None = None) -> None:
-    """Admin `user` (the first account on a fresh server is system admin), non-admin `verify_member`, team `verify`,
-    and onboarding off for both. `license_text` is uploaded as the server license once the admin is logged in."""
+def _create_user(url: str, username: str, password: str, token: str | None = None) -> str:
     try:
-        request("POST", f"{url}/api/v4/users", {"username": user, "email": f"{user}@example.com", "password": password})
+        _, user = request("POST", f"{url}/api/v4/users",
+                          {"username": username, "email": f"{username}@example.com", "password": password})
+        return str((user or {}).get("id") or "")
     except urllib.error.HTTPError as e:
         reason = _error_id(e)
         if reason != "app.user.save.username_exists.app_error":  # an existing user is fine (a reused server)
-            raise InfraError(f"creating {user}: HTTP {e.code} {reason}") from e
+            raise InfraError(f"creating {username}: HTTP {e.code} {reason}") from e
+    if token:
+        try:
+            _, user = request("GET", f"{url}/api/v4/users/username/{username}", token=token)
+            return str((user or {}).get("id") or "")
+        except urllib.error.HTTPError:
+            return ""
+    return ""
+
+
+def _disable_onboarding(url: str, uid: str, token: str) -> None:
+    prefs = [{"user_id": uid, "category": c, "name": n, "value": v} for c, n, v in ONBOARDING_OFF]
+    request("PUT", f"{url}/api/v4/users/{uid}/preferences", prefs, token)
+
+
+def seed(url: str, user: str, password: str, license_text: str | None = None) -> None:
+    """Admin `user` (the first account on a fresh server is system admin), non-admin `verify_member`, team `verify`,
+    and onboarding off for both. `license_text` is uploaded as the server license once the admin is logged in."""
+    _create_user(url, user, password)
     try:
         hdr, me = request("POST", f"{url}/api/v4/users/login", {"login_id": user, "password": password})
     except urllib.error.HTTPError as e:
@@ -304,23 +319,9 @@ def seed(url: str, user: str, password: str, license_text: str | None = None) ->
             team_id = (team or {}).get("id") or ""
         except urllib.error.HTTPError as lookup_err:
             raise InfraError(f"looking up team verify: HTTP {lookup_err.code}") from lookup_err
-    prefs = [{"user_id": me["id"], "category": c, "name": n, "value": v} for c, n, v in ONBOARDING_OFF]
-    request("PUT", f"{url}/api/v4/users/{me['id']}/preferences", prefs, token)
+    _disable_onboarding(url, me["id"], token)
     if user != MEMBER_USER:
-        member_id = ""
-        try:
-            _, member = request("POST", f"{url}/api/v4/users",
-                                {"username": MEMBER_USER, "email": f"{MEMBER_USER}@example.com", "password": password})
-            member_id = (member or {}).get("id") or ""
-        except urllib.error.HTTPError as e:
-            reason = _error_id(e)
-            if reason != "app.user.save.username_exists.app_error":
-                raise InfraError(f"creating {MEMBER_USER}: HTTP {e.code} {reason}") from e
-            try:
-                _, member = request("GET", f"{url}/api/v4/users/username/{MEMBER_USER}", token=token)
-                member_id = (member or {}).get("id") or ""
-            except urllib.error.HTTPError:
-                member_id = ""
+        member_id = _create_user(url, MEMBER_USER, password, token=token)
         if member_id:
             if team_id:
                 try:
@@ -329,8 +330,7 @@ def seed(url: str, user: str, password: str, license_text: str | None = None) ->
                 except urllib.error.HTTPError as e:
                     if e.code not in (400, 404):
                         raise InfraError(f"adding {MEMBER_USER} to team verify: HTTP {e.code}") from e
-            mprefs = [{"user_id": member_id, "category": c, "name": n, "value": v} for c, n, v in ONBOARDING_OFF]
-            request("PUT", f"{url}/api/v4/users/{member_id}/preferences", mprefs, token)
+            _disable_onboarding(url, member_id, token)
 
 
 def make(e2e: Path, target: str, image: str, mm_env: str = "") -> None:
@@ -401,25 +401,18 @@ def down(e2e: Path) -> None:
 
 def main(argv: list[str]) -> None:
     argv = list(argv)
-    e2e_dir = None
-    if "--e2e" in argv:
-        i = argv.index("--e2e")
-        if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
-            sys.exit(__doc__)
-        e2e_dir = argv[i + 1]
-        del argv[i:i + 2]
-    e2e = Path(e2e_dir) if e2e_dir else default_e2e()
     opts: dict[str, str] = {}
-    for name in ("--flags", "--flags-from-diff"):
+    for name in ("--e2e", "--flags", "--flags-from-diff"):
         if name in argv:
             i = argv.index(name)
             if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
                 sys.exit(__doc__)
             opts[name] = argv[i + 1]
             del argv[i:i + 2]
+    e2e = Path(opts["--e2e"]) if "--e2e" in opts else default_e2e()
     require_license = "--require-license" in argv
     argv = [a for a in argv if a != "--require-license"]
-    if (opts or require_license) and argv[:1] != ["up"]:
+    if (("--flags" in opts or "--flags-from-diff" in opts) or require_license) and argv[:1] != ["up"]:
         sys.exit(__doc__)
     pull_too = "--pull" in argv
     args = [a for a in argv if a != "--pull"]

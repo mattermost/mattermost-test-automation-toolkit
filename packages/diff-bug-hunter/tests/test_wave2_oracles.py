@@ -7,14 +7,9 @@ import json
 from pathlib import Path
 
 import pytest
-from test_hunt_engine import make_hunt, run  # imports the scripts
-
-
-def _clean(state: dict) -> None:
-    for key in ("wt", "wt_base"):
-        assert not list(Path(state[key]).rglob("hunt_*"))
-        run.ensure_clean(Path(state[key]))
-
+from conftest import assert_clean_wts as _clean
+from conftest import make_hunt
+from test_hunt_engine import run  # imports the scripts
 
 # ------------------------------------------------------------------ C2: lazy confirmation
 

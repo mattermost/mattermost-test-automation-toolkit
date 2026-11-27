@@ -26,7 +26,6 @@ Stdlib only, like the rest of the skill.
 """
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -35,6 +34,7 @@ sys.dont_write_bytecode = True
 if not sys.pycache_prefix:
     sys.pycache_prefix = "/dev/null/hunt-pyc"
 
+from hunt_common import read_optional_json
 from verdicts import Verdict
 
 SOURCES = frozenset({"A", "B", "D", "R", "V", "old", "verify"})
@@ -48,21 +48,12 @@ ROW_KEYS = ("id", "source", "decision", "reason", "file_line", "caller", "entry_
 _BASE_TAGS = {"A": ("A", "A2"), "B": ("B",)}
 
 
-def _read_json(path: Path) -> Any:
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
-
-
 def load_vetted(hdir: Path) -> list[dict[str, Any]] | None:
     """Rows from hdir/vetted.json, or None when the file is missing or unreadable (the caller reports Partial).
 
     Accepts {"rows": [...]} (the schema form), a bare list, or the legacy {"findings": [...]} key.
     """
-    data = _read_json(hdir / "vetted.json")
+    data = read_optional_json(hdir / "vetted.json")
     if data is None:
         return None
     if isinstance(data, dict):
@@ -102,7 +93,7 @@ def row_errors(row: dict[str, Any]) -> list[str]:
 
 
 def _lookup(path: Path, key: str) -> Any:
-    data = _read_json(path)
+    data = read_optional_json(path)
     return data.get(key) if isinstance(data, dict) else None
 
 

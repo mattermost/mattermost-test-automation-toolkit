@@ -69,6 +69,7 @@ from hunt_common import (
     scratch,
     target_key,
     terminate_handler,
+    write_atomic,
     write_json,
 )
 
@@ -120,9 +121,7 @@ def _update_driver(hdir: Path, fn: Callable[[dict[str, Any]], None]) -> dict[str
         path = hdir / "driver.json"
         doc = read_dict(path)
         fn(doc)
-        tmp = path.with_name(path.name + ".tmp")
-        write_json(tmp, doc)
-        os.replace(tmp, path)
+        write_atomic(path, doc)
         return doc
 
 
@@ -275,19 +274,19 @@ def _add_numbered_lines(path: str, text: str, valid: dict[str, set[int]]) -> Non
             nums.add(int(m.group(1)))
 
 
-def _extract_valid_lines(req_path: Path) -> dict[str, set[int]]:
-    req = read_dict(req_path)
+def _parse_user(req: dict[str, Any]) -> dict[str, Any]:
     raw_user = req.get("user")
     if isinstance(raw_user, str):
         try:
-            user = json.loads(raw_user)
+            raw_user = json.loads(raw_user)
         except ValueError:
-            user = {}
-    elif isinstance(raw_user, dict):
-        user = raw_user
-    else:
-        user = {}
-    if not isinstance(user, dict):
+            return {}
+    return raw_user if isinstance(raw_user, dict) else {}
+
+
+def _extract_valid_lines(req_path: Path) -> dict[str, set[int]]:
+    user = _parse_user(read_dict(req_path))
+    if not user:
         return {}
     valid: dict[str, set[int]] = {}
     _add_diff_hunk_lines(str(user.get("diff_production_code") or ""), valid)
@@ -387,7 +386,7 @@ def _batch_has_risky_file(hdir: Path) -> bool:
 
 def escalate_tag(hdir: Path, tag: str, reason: str, *, no_prompt_cache: bool | None = None) -> tuple[
         bool, dispatch.DispatchResult | None, dispatch.DispatchError | None]:
-    if not can_escalate(hdir):
+    if not can_escalate(hdir) or over_budget(hdir):
         return False, None, None
     orig = hdir / tag / "request.json"
     opus_req = hdir / tag / "request.opus.json"
@@ -397,8 +396,7 @@ def escalate_tag(hdir: Path, tag: str, reason: str, *, no_prompt_cache: bool | N
     from_tier = str(req_data.get("tier") or "sonnet").lower()
     if from_tier != "sonnet":
         return False, None, None
-    raw_user = req_data.get("user")
-    user_obj = json.loads(raw_user) if isinstance(raw_user, str) else (raw_user if isinstance(raw_user, dict) else {})
+    user_obj = _parse_user(req_data)
     resp_path = Path(str(req_data.get("response_path") or (hdir / tag / "response.json")))
     raw_schema = req_data.get("schema")
     schema: dict[str, Any] = raw_schema if isinstance(raw_schema, dict) else build_requests.HUNTER_SCHEMA
@@ -504,6 +502,18 @@ def repair_round(target: str, hdir: Path, tag: str, *, no_prompt_cache: bool | N
     return ok
 
 
+def _run_with_repair(target: str, hdir: Path, tag: str, subcmd: str, label: str, *,
+                     no_prompt_cache: bool | None = None) -> subprocess.CompletedProcess[str] | None:
+    p = script("run.py", subcmd, target, tag)
+    if p.returncode == 3 and repair_round(target, hdir, tag, no_prompt_cache=no_prompt_cache):
+        p = script("run.py", subcmd, target, tag)
+    if p.returncode == 3:
+        set_gap(hdir, f"run:{tag}", f"{tag} COMPILE_ERROR after one repair round")
+        return None
+    expect_ok(p, label)
+    return p
+
+
 def run_tag(target: str, hdir: Path, tag: str, *, retry_empty: bool = False,
             no_prompt_cache: bool | None = None) -> None:
     if (hdir / f"run_{tag}.json").exists():
@@ -511,13 +521,9 @@ def run_tag(target: str, hdir: Path, tag: str, *, retry_empty: bool = False,
     if not (hdir / tag / "response.json").exists():
         set_gap(hdir, f"run:{tag}", f"hunter {tag} wrote no response")
         return
-    p = script("run.py", "run", target, tag)
-    if p.returncode == 3 and repair_round(target, hdir, tag, no_prompt_cache=no_prompt_cache):
-        p = script("run.py", "run", target, tag)
-    if p.returncode == 3:
-        set_gap(hdir, f"run:{tag}", f"{tag} COMPILE_ERROR after one repair round")
+    p = _run_with_repair(target, hdir, tag, "run", f"run.py run {tag}", no_prompt_cache=no_prompt_cache)
+    if p is None:
         return
-    expect_ok(p, f"run.py run {tag}")
     if retry_empty and "EMPTY_RESPONSE" in p.stdout and not (hdir / tag / "request.retry.json").exists():
         expect_ok(script("build_requests.py", target, "retry", tag), f"build_requests retry {tag}")
         ok, _, _ = _call_dispatch(hdir, f"{tag}:retry", hdir / tag / "request.retry.json",
@@ -530,13 +536,11 @@ def run_tag(target: str, hdir: Path, tag: str, *, retry_empty: bool = False,
         if req_tier == "sonnet" and not (hdir / tag / "request.opus.json").exists():
             ok, _, _ = escalate_tag(hdir, tag, "empty_after_retry", no_prompt_cache=no_prompt_cache)
             if ok:
-                p = script("run.py", "run", target, tag)
-                if p.returncode == 3 and repair_round(target, hdir, tag, no_prompt_cache=no_prompt_cache):
-                    p = script("run.py", "run", target, tag)
-                if p.returncode == 3:
-                    set_gap(hdir, f"run:{tag}", f"{tag} COMPILE_ERROR after one repair round")
+                p2 = _run_with_repair(target, hdir, tag, "run", f"run.py run {tag} after opus escalation",
+                                      no_prompt_cache=no_prompt_cache)
+                if p2 is None:
                     return
-                expect_ok(p, f"run.py run {tag} after opus escalation")
+                p = p2
     set_gap(hdir, f"empty:{tag}", "Mode A emitted no tests after one retry" if "EMPTY_RESPONSE" in p.stdout else None)
     set_gap(hdir, f"run:{tag}", None)
 
@@ -547,14 +551,8 @@ def run_diff(target: str, hdir: Path, *, no_prompt_cache: bool | None = None) ->
     if not (hdir / "D" / "response.json").exists():
         set_gap(hdir, "run:D", "hunter D wrote no response")
         return
-    p = script("run.py", "diff", target, "D")
-    if p.returncode == 3 and repair_round(target, hdir, "D", no_prompt_cache=no_prompt_cache):
-        p = script("run.py", "diff", target, "D")
-    if p.returncode == 3:
-        set_gap(hdir, "run:D", "D COMPILE_ERROR after one repair round")
-        return
-    expect_ok(p, "run.py diff D")
-    set_gap(hdir, "run:D", None)
+    if _run_with_repair(target, hdir, "D", "diff", "run.py diff D", no_prompt_cache=no_prompt_cache) is not None:
+        set_gap(hdir, "run:D", None)
 
 
 def stage_run(target: str, hdir: Path, modes: tuple[str, ...] = DEFAULT_MODES, *,
@@ -639,8 +637,9 @@ def stage_v(target: str, hdir: Path, *, no_prompt_cache: bool | None = None) -> 
         messages.update(read_dict(hdir / f"run_{tag}.messages.json"))
     user = {"candidates": [{"id": c["id"], "tag": c["source"], "head_failure": str(messages.get(c["id"], ""))[:1500],
                             "test_source": files_by_tag[c["source"]]} for c in cands]}
-    req = build_requests.write_request(hdir / "V" / "request.json", V_SYSTEM, user, build_requests.HUNTER_SCHEMA,
-                                       hdir / "V" / "response.json")
+    opus_req = hdir / "V" / "request.opus.json"
+    req = opus_req if opus_req.exists() else build_requests.write_request(
+        hdir / "V" / "request.json", V_SYSTEM, user, build_requests.HUNTER_SCHEMA, hdir / "V" / "response.json")
     ok, res, err = _call_dispatch(hdir, "V", req, strict_schema=True, no_prompt_cache=no_prompt_cache)
     reason: str | None = None
     if err is not None and err.schema_errors:
@@ -867,9 +866,7 @@ def _record_hunt_done(hdir: Path, target: str, pv: str, modes: tuple[str, ...]) 
         "modes": list(modes),
         "completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    tmp = hdir / "hunt_done.json.tmp"
-    write_json(tmp, doc)
-    os.replace(tmp, hdir / "hunt_done.json")
+    write_atomic(hdir / "hunt_done.json", doc)
     idx = scratch() / "hunted_index.jsonl"
     idx.parent.mkdir(parents=True, exist_ok=True)
     with idx.open("a") as fh:
@@ -880,7 +877,7 @@ def _requests_done(hdir: Path, modes: tuple[str, ...]) -> bool:
     for t in ("A", "B", "D"):
         if t in modes and not (hdir / t / "request.json").exists():
             return False
-    if modes == ("R",):
+    if "R" in modes:
         return (hdir / "R" / "threads.json").exists() or (hdir / "R" / "request.json").exists()
     return True
 
@@ -902,9 +899,7 @@ def _sync_modes_in_state(hdir: Path, modes: tuple[str, ...]) -> None:
     state = read_dict(state_path)
     if state and state.get("modes") != list(modes):
         state["modes"] = list(modes)
-        tmp = state_path.with_name(state_path.name + ".tmp")
-        write_json(tmp, state)
-        os.replace(tmp, state_path)
+        write_atomic(state_path, state)
 
 
 def drive(target: str, fresh: bool = False, *, force: bool = False, modes: tuple[str, ...] = DEFAULT_MODES,
@@ -924,7 +919,7 @@ def drive(target: str, fresh: bool = False, *, force: bool = False, modes: tuple
                 for stale in ("vetted.json", "verdict.json", "findings.json", "audit.md", "hunt_done.json"):
                     (hdir / stale).unlink(missing_ok=True)
         if read_dict(hdir / "prepare.json").get("huntable_files") == 0:
-            print("[hunt] skip: no huntable source files (docs-only/test-only diff; see skipped.log)")
+            print("[hunt] skip: no huntable source files (docs-only/test-only diff)")
             return 0
         _update_driver(hdir, lambda doc: doc.__setitem__("modes", list(modes)))
         step(hdir, "ctx", lambda: (hdir / "ctx.json").exists() or read_dict(hdir / "state.json").get("batches") == 0,

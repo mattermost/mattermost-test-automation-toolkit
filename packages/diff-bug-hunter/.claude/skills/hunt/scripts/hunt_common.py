@@ -13,9 +13,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -193,9 +194,40 @@ def read_dict(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def read_optional_json(path: Path) -> Any:
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def read_optional_dict(path: Path) -> dict[str, Any]:
+    data = read_optional_json(path)
+    return data if isinstance(data, dict) else {}
+
+
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=1))
+
+
+def write_atomic(path: Path, data: Any) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    write_json(tmp, data)
+    os.replace(tmp, path)
+
+
+def run_locked_cli(pr: str, hdir: Path, fn: Callable[[], int]) -> int:
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, terminate_handler)
+    try:
+        with hunt_lock(hdir, pr):
+            return fn()
+    except InfraError as e:
+        print(f"INFRA_ERROR {e}")
+        return 2
 
 
 def read_state(hdir: Path) -> dict[str, Any]:

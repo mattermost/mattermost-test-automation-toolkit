@@ -4,16 +4,11 @@
 that /verify can log in as without the onboarding overlay. The server is a small in-process fake of the four
 Mattermost API calls seeding makes."""
 
-import http.server
 import json
-import sys
-import threading
-from pathlib import Path
 
-import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".claude" / "skills" / "verify" / "scripts"))
 import pr_server
+import pytest
+from conftest import JsonHandler, http_server
 
 
 def test_a_commit_maps_to_its_published_enterprise_image():
@@ -31,18 +26,7 @@ def test_a_running_build_matches_only_its_own_image():
     assert not pr_server.build_matches("5e62cb15e5", "mattermostdevelopment/mattermost-enterprise-edition:master")
 
 
-class _Fake(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        pass
-
-    def _send(self, code, body=None, headers=None):
-        self.send_response(code)
-        for k, v in (headers or {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        if body is not None:
-            self.wfile.write(json.dumps(body).encode())
-
+class _Fake(JsonHandler):
     def do_POST(self):
         st, body = self.server.state, json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if self.path == "/api/v4/users":
@@ -57,7 +41,8 @@ class _Fake(http.server.BaseHTTPRequestHandler):
             u = st["users"].get(body["login_id"])
             if not u or u["password"] != body["password"]:
                 return self._send(401, {})
-            return self._send(200, {"id": u["id"], "roles": u["roles"]}, {} if st.get("no_token") else {"Token": "tok"})
+            return self._send(200, {"id": u["id"], "roles": u["roles"]},
+                              headers={} if st.get("no_token") else {"Token": "tok"})
         if self.path == "/api/v4/teams":
             if body["name"] in st["teams"]:
                 return self._send(400, {})
@@ -87,11 +72,8 @@ class _Fake(http.server.BaseHTTPRequestHandler):
 
 @pytest.fixture
 def fake():
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Fake)
-    srv.state = {"users": {}, "teams": set(), "members": set(), "prefs": [], "build": "5e62cb15e5"}
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    yield srv, f"http://127.0.0.1:{srv.server_address[1]}"
-    srv.shutdown()
+    with http_server(_Fake, state={"users": {}, "teams": set(), "members": set(), "prefs": [], "build": "5e62cb15e5"}) as res:
+        yield res
 
 
 def test_seeding_makes_the_first_user_an_admin_and_turns_the_onboarding_overlay_off(fake):
@@ -230,38 +212,21 @@ def test_pr_images_supports_release_ranges(monkeypatch):
 
 
 def test_seed_raises_infra_error_on_team_lookup_failure():
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
+    class Handler(JsonHandler):
         def do_POST(self):
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
             if self.path == "/api/v4/users":
-                self.send_response(201)
-                self.end_headers()
-                self.wfile.write(json.dumps({"id": "u1"}).encode())
+                self._send(201, {"id": "u1"})
             elif self.path == "/api/v4/users/login":
-                self.send_response(200)
-                self.send_header("Token", "tok")
-                self.end_headers()
-                self.wfile.write(json.dumps({"id": "u1", "roles": "system_admin"}).encode())
+                self._send(200, {"id": "u1", "roles": "system_admin"}, headers={"Token": "tok"})
             elif self.path == "/api/v4/teams":
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b"{}")
+                self._send(400, "{}")
 
         def do_GET(self):
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(b"{}")
+            self._send(500, "{}")
 
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
-        with pytest.raises(pr_server.InfraError, match="looking up team verify: HTTP 500"):
-            pr_server.seed(f"http://127.0.0.1:{srv.server_address[1]}", "poster", "pw")
-    finally:
-        srv.shutdown()
+    with http_server(Handler) as (_, url), pytest.raises(pr_server.InfraError, match="looking up team verify: HTTP 500"):
+        pr_server.seed(url, "poster", "pw")
 
 
 def test_images_pull_failure_raises_infra_error(monkeypatch):

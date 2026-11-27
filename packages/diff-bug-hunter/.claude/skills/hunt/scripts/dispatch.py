@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Any
 
 import telemetry
-from hunt_common import InfraError, load_json, loads_lossy, scratch, write_json
+from hunt_common import InfraError, load_json, loads_lossy, scratch, write_atomic
 
 DEFAULT_CMD = "claude -p --output-format json --tools '' --strict-mcp-config --disable-slash-commands --setting-sources ''"
 OUTPUT_RULE = ("Answer with exactly one JSON object that matches the JSON schema in the Schema section. No prose, no "
@@ -121,22 +121,17 @@ def _stop_reason(data: dict[str, Any] | None) -> str:
     return ""
 
 
+_TYPE_MAP = {"object": dict, "array": list, "string": str, "boolean": bool}
+
+
 def _matches_type(value: Any, kind: Any) -> bool:
-    if kind == "object":
-        return isinstance(value, dict)
-    if kind == "array":
-        return isinstance(value, list)
-    if kind == "string":
-        return isinstance(value, str)
-    if kind == "boolean":
-        return isinstance(value, bool)
+    if kind in _TYPE_MAP:
+        return isinstance(value, _TYPE_MAP[kind])
     if kind == "integer":
         return isinstance(value, int) and not isinstance(value, bool)
     if kind == "number":
         return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if kind == "null":
-        return value is None
-    return True
+    return value is None if kind == "null" else True
 
 
 def validate_schema(data: Any, schema: Any, path: str = "$") -> list[str]:
@@ -300,12 +295,6 @@ def slot(sleep: Callable[[float], None] = time.sleep) -> Iterator[None]:
         waited += pause
 
 
-def _write_atomic(path: Path, data: Any) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    write_json(tmp, data)
-    os.replace(tmp, path)
-
-
 def dispatch(request: Path, *, cmd: str | None = None, hdir: Path | None = None, tag: str | None = None,
              sleep: Callable[[float], None] = time.sleep, strict_schema: bool = False,
              no_prompt_cache: bool | None = None) -> DispatchResult:
@@ -371,7 +360,7 @@ def dispatch(request: Path, *, cmd: str | None = None, hdir: Path | None = None,
                 except (TypeError, ValueError) as e:
                     raise DispatchError(f"inline answer for {request} is not JSON: {e}: {p.stdout[-400:]}",
                                         stop_reason=result.stop_reason) from e
-                _write_atomic(resp, answer)
+                write_atomic(resp, answer)
             if not resp.exists():
                 raise DispatchError(f"dispatch exited 0 but wrote no response for {request}",
                                     stop_reason=result.stop_reason)
@@ -390,7 +379,7 @@ def dispatch(request: Path, *, cmd: str | None = None, hdir: Path | None = None,
                 stop_reason=result.stop_reason,
                 schema_errors=schema_errors,
             )
-        _write_atomic(resp, parsed)  # re-written atomically: a reader never sees a half-written response
+        write_atomic(resp, parsed)  # re-written atomically: a reader never sees a half-written response
         sidecar(request).write_text(request_sha(request))
         result.secs = round(time.monotonic() - t0, 6)
         return result

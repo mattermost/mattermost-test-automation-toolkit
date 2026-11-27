@@ -181,7 +181,15 @@ def load_manifest(path: Path, repo_override: Path | None,
             raise ManifestError(f"{e.get('id')}: no repo (set manifest repo or --repo)")
         return r if r.is_absolute() else (path.parent / r).resolve()
 
-    cases, ctrls, skipped_missing = [], [], []
+    def resolve(repo: Path, rev: str, eid: Any) -> str | None:
+        sha = _resolve_commit(repo, rev, skip_missing)
+        if sha is None:
+            skipped_missing.append(str(eid))
+        return sha
+
+    cases: list[dict[str, Any]] = []
+    ctrls: list[dict[str, Any]] = []
+    skipped_missing: list[str] = []
     for e in m["cases"]:
         kind = str(e.get("kind", "revert")).strip()
         if kind not in VALID_KINDS:
@@ -191,28 +199,18 @@ def load_manifest(path: Path, repo_override: Path | None,
         if missing:
             raise ManifestError(f"case {e.get('id')}: missing {missing}")
         repo = repo_of(e)
-        bug = _resolve_commit(repo, e["bug_sha"], skip_missing)
-        if bug is None:
-            skipped_missing.append(str(e["id"]))
+        bug = resolve(repo, e["bug_sha"], e["id"])
+        resolved_base = resolve(repo, e["base_sha"], e["id"]) if bug and e.get("base_sha") else None
+        if not bug or (e.get("base_sha") and not resolved_base):
             continue
-        resolved_base: str | None = None
-        if e.get("base_sha"):
-            resolved_base = _resolve_commit(repo, e["base_sha"], skip_missing)
-            if resolved_base is None:
-                skipped_missing.append(str(e["id"]))
-                continue
         if kind == "revert":
-            fix = _resolve_commit(repo, e["fix_sha"], skip_missing)
-            if fix is None:
-                skipped_missing.append(str(e["id"]))
+            fix = resolve(repo, e["fix_sha"], e["id"])
+            if not fix:
                 continue
             if bug not in git(repo, "log", "-1", "--format=%B", fix):
                 raise ManifestError(f"case {e['id']}: fix_sha {fix[:10]} does not say it reverts bug_sha {bug[:10]}")
-        elif e.get("fix_sha"):
-            fix_res = _resolve_commit(repo, e["fix_sha"], skip_missing)
-            if fix_res is None:
-                skipped_missing.append(str(e["id"]))
-                continue
+        elif e.get("fix_sha") and not resolve(repo, e["fix_sha"], e["id"]):
+            continue
         entry = {**e, "kind": kind, "repo": repo, "head": bug}
         if resolved_base:
             entry["base_sha"] = resolved_base
@@ -222,16 +220,10 @@ def load_manifest(path: Path, repo_override: Path | None,
         if missing:
             raise ManifestError(f"control {e.get('id')}: missing {missing}")
         repo = repo_of(e)
-        head = _resolve_commit(repo, e["sha"], skip_missing)
-        if head is None:
-            skipped_missing.append(str(e["id"]))
+        head = resolve(repo, e["sha"], e["id"])
+        resolved_base = resolve(repo, e["base_sha"], e["id"]) if head and e.get("base_sha") else None
+        if not head or (e.get("base_sha") and not resolved_base):
             continue
-        resolved_base = None
-        if e.get("base_sha"):
-            resolved_base = _resolve_commit(repo, e["base_sha"], skip_missing)
-            if resolved_base is None:
-                skipped_missing.append(str(e["id"]))
-                continue
         entry = {**e, "repo": repo, "head": head}
         if resolved_base:
             entry["base_sha"] = resolved_base
@@ -347,9 +339,7 @@ def cmd_fix_diff(hdir: Path, state: dict[str, Any], wt_fix: Path) -> dict[str, s
         return out
     files = load_json(hdir / "D" / "response.json")["files"]
     targets = {t["dir"] for t in state["targets"]}
-    by_unit: dict[str, list[dict[str, str]]] = {}
-    for f in files:
-        by_unit.setdefault(run._unit_key(str(f.get("path", ""))), []).append(f)
+    by_unit = run.group_by_unit(files)
     wt_base = Path(state["wt_base"])
     run.ensure_clean(wt_fix)
     run.ensure_clean(wt_base)
@@ -361,21 +351,22 @@ def cmd_fix_diff(hdir: Path, state: dict[str, Any], wt_fix: Path) -> dict[str, s
             td = Path(td_str)
             fix_placed: list[Path] = []
             base_placed: list[Path] = []
+
+            def _two_passes(wt_side: Path, placed: list[Path], p1: str, p2: str,
+                            uk: str = u_key, tdir: Path = td) -> tuple[Any, Any, Any, Any]:
+                o1, r1, _, gone, _ = run._diff_unit_pass(wt_side, state, "D", [(uk, placed)], tdir, p1, base=True)
+                _, r2, _, _, _ = run._diff_unit_pass(wt_side, state, "D", [(uk, placed)], tdir, p2, base=True)
+                return o1, r1, r2, gone
+
             try:
                 try:
                     fix_placed = run.place(wt_fix, u_files, targets)
-                    o, fix_recs, _, fix_gone, _ = run._diff_unit_pass(wt_fix, state, "D", [(u_key, fix_placed)], td,
-                                                                      "fix", base=True)
-                    _, fix_recs2, _, _, _ = run._diff_unit_pass(wt_fix, state, "D", [(u_key, fix_placed)], td,
-                                                                "fix2", base=True)
+                    o, fix_recs, fix_recs2, fix_gone = _two_passes(wt_fix, fix_placed, "fix", "fix2")
                 except run.CompileError:
                     out.update(dict.fromkeys(idents, Verdict.FIX_INCOMPATIBLE))
                     continue
                 base_placed = run.place(wt_base, u_files, targets)
-                _, base_recs, _, _, _ = run._diff_unit_pass(wt_base, state, "D", [(u_key, base_placed)], td,
-                                                            "fixbase", base=True)
-                _, base_recs2, _, _, _ = run._diff_unit_pass(wt_base, state, "D", [(u_key, base_placed)], td,
-                                                             "fixbase2", base=True)
+                _, base_recs, base_recs2, _ = _two_passes(wt_base, base_placed, "fixbase", "fixbase2")
             finally:
                 run.unplace(fix_placed)
                 run.unplace(base_placed)
@@ -405,29 +396,36 @@ def _mark_fix_not_run(row: dict[str, Any], tests: list[str], reason: str) -> Non
     row["fix_reason"] = reason
 
 
+def _run_with_repair(num: int, hdir: Path, tag: str, row: dict[str, Any], dispatch_cmd: str | None,
+                     fn: Any, *, compile_pop: tuple[str, ...], infra_pop: tuple[str, ...]) -> None:
+    try:
+        try:
+            fn()
+        except run.CompileError as err:
+            if not dispatch_cmd:
+                raise
+            row.pop(compile_pop[0], None)
+            row["repaired"] = True
+            _repair(num, hdir, tag, err, dispatch_cmd)
+            fn()
+    except run.CompileError as err:
+        for k in compile_pop:
+            row.pop(k, None)
+        row["compile_error"] = str(err)[-400:]
+    except InfraError as err:
+        for k in infra_pop:
+            row.pop(k, None)
+        row["error"] = str(err)[-400:]
+
+
 def hunt_tag(num: int, hdir: Path, state: dict[str, Any], tag: str, batch: int, dispatch_cmd: str | None,
              wt_fix: Path | None = None, fix_not_run: str | None = None) -> dict[str, Any]:
     """One hunter's run and base tables, plus the fix table when the entry has a fix commit. Its own failures stay on
     its row: a compile error is a miss (as in a real hunt that exhausted its repair round), an InfraError loses only
     this hunter (and an InfraError on the fix commit only the fix table)."""
     row: dict[str, Any] = {"batch": batch, "hunter": tag}
-    try:
-        try:
-            _attempt(hdir, state, tag, row)
-        except run.CompileError as err:
-            if not dispatch_cmd:
-                raise
-            row.pop("run", None)
-            row["repaired"] = True
-            _repair(num, hdir, tag, err, dispatch_cmd)
-            _attempt(hdir, state, tag, row)
-    except run.CompileError as err:
-        row.pop("run", None)
-        row.pop("base", None)
-        row["compile_error"] = str(err)[-400:]
-    except InfraError as err:
-        row.pop("base", None)
-        row["error"] = str(err)[-400:]
+    _run_with_repair(num, hdir, tag, row, dispatch_cmd, lambda: _attempt(hdir, state, tag, row),
+                     compile_pop=("run", "base"), infra_pop=("base",))
     if wt_fix is not None and "base" in row:
         try:
             row["fix"] = cmd_fix(hdir, state, tag, wt_fix)
@@ -443,21 +441,8 @@ def hunt_diff(num: int, hdir: Path, state: dict[str, Any], batch: int, dispatch_
     """Mode D differential recorders for one batch, with the same 1-round repair and per-hunter isolation. With a fix
     commit, every DIFF test is also run on it (cmd_fix_diff)."""
     row: dict[str, Any] = {"batch": batch, "hunter": "D"}
-    try:
-        try:
-            row["diff"] = run.cmd_diff(hdir, state, "D")
-        except run.CompileError as err:
-            if not dispatch_cmd:
-                raise
-            row["repaired"] = True
-            _repair(num, hdir, "D", err, dispatch_cmd)
-            row["diff"] = run.cmd_diff(hdir, state, "D")
-    except run.CompileError as err:
-        row.pop("diff", None)
-        row["compile_error"] = str(err)[-400:]
-    except InfraError as err:
-        row.pop("diff", None)
-        row["error"] = str(err)[-400:]
+    _run_with_repair(num, hdir, "D", row, dispatch_cmd, lambda: row.__setitem__("diff", run.cmd_diff(hdir, state, "D")),
+                     compile_pop=("diff",), infra_pop=("diff",))
     if "diff" in row:
         if wt_fix is not None:
             try:
@@ -512,10 +497,7 @@ def review_signal(num: int, hdir: Path, state: dict[str, Any], meta: dict[str, A
         ctx_stub = {"pr": {"number": pr_num, "title": meta["title"], "description": meta["body"]}}
         r_meta, user = review_threads.build_review_context(str(pr_num), hdir, state, ctx_stub, raw_threads=raw)
         if user is not None and dispatch_cmd and not (hdir / "R" / "response.json").exists():
-            r_ctx = {"changed_files_head_source": user["thread_files_head_source"],
-                     "diff_production_code": user["diff_production_code"],
-                     "sibling_tests_and_helpers": user["sibling_tests_and_helpers"]}
-            build_requests.write(hdir, "R", build_requests.review_system(r_meta["targets"], r_ctx),
+            build_requests.write(hdir, "R", build_requests.review_system(r_meta["targets"], user),
                                  user, build_requests.REVIEW_SCHEMA)
             dispatch(dispatch_cmd, hdir / "R" / "request.json")
     if not (hdir / "R" / "response.json").exists():
@@ -567,20 +549,17 @@ def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None,
         if "hunters" in signals or "diff" in signals or "review" in signals:
             if e.get("responses") and batch == 1:
                 shutil.copytree(e["responses"], hdir, dirs_exist_ok=True)
-            if "hunters" in signals:
+            for sig, what, tags in (("hunters", "hunters", ("A", "B")), ("diff", "diff", ("D",))):
+                if sig not in signals:
+                    continue
                 if not (e.get("responses") and batch == 1) and dispatch_cmd:
-                    build_requests.main(str(num), "hunters")  # writes <hdir>/A and B request.json
-                    for tag in ("A", "B"):
+                    build_requests.main(str(num), what)
+                    for tag in tags:
                         dispatch(dispatch_cmd, hdir / tag / "request.json")
-                for tag in ("A", "B"):
+                for tag in tags:
                     if (hdir / tag / "response.json").exists():
-                        results.append(hunt_tag(num, hdir, state, tag, batch, dispatch_cmd, wt_fix, fix_not_run))
-            if "diff" in signals:
-                if not (e.get("responses") and batch == 1) and dispatch_cmd:
-                    build_requests.main(str(num), "diff")
-                    dispatch(dispatch_cmd, hdir / "D" / "request.json")
-                if (hdir / "D" / "response.json").exists():
-                    results.append(hunt_diff(num, hdir, state, batch, dispatch_cmd, wt_fix, fix_not_run))
+                        results.append(hunt_diff(num, hdir, state, batch, dispatch_cmd, wt_fix, fix_not_run)
+                                       if tag == "D" else hunt_tag(num, hdir, state, tag, batch, dispatch_cmd, wt_fix, fix_not_run))
         else:
             batches = 1  # the whole-commit signals need only the state, not one per batch
         batch += 1

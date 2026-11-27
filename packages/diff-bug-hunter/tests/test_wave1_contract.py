@@ -15,10 +15,10 @@ import eval_bugs
 import ledger
 import pytest
 import verdict
+from conftest import SCRIPTS, SKILL
+from conftest import vetted_row as _vetted_row
 from verdicts import MEANINGS, MODE_NAMES, Verdict, render_glossary
 
-SKILL = Path(__file__).resolve().parents[1] / ".claude" / "skills" / "hunt"
-SCRIPTS = SKILL / "scripts"
 VERDICT_VALUES = {v.value for v in Verdict}
 
 # ALL_CAPS words in SKILL.md that are not verdicts or statuses. Anything else in caps must be a Verdict member.
@@ -38,17 +38,6 @@ def _load_schema(name: str) -> dict[str, Any]:
     data = json.loads((SKILL / name).read_text())
     assert isinstance(data, dict)
     return data
-
-
-def _vetted_row(**over: Any) -> dict[str, Any]:
-    row: dict[str, Any] = {
-        "id": "p::TestHuntA_X", "source": "A", "decision": "KEEP", "reason": "real",
-        "file_line": "server/x.go:10", "caller": "api4 POST /x", "entry_point": "api4 POST /api/v4/x",
-        "repro_cmd": "go test ./server/x -run TestHuntA_X", "evidence_path": "run_A.json",
-        "severity": "major", "fix_check": None,
-    }
-    row.update(over)
-    return row
 
 
 def _hunt(tmp_path: Path, base_a: dict[str, str] | None = None, run_a: dict[str, str] | None = None) -> Path:

@@ -6,16 +6,15 @@ The fixture is one http.server class started twice, once per "version" of a serv
 ids and timestamps and a per-server version and origin, so a SAME verdict proves the normalisation works; the one field
 that really differs is set per test."""
 
-import http.server
 import json
 import random
 import subprocess
-import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
-from test_hunt_engine import VERIFY_UI, _module, _node_env, needs_node, needs_playwright
+from conftest import VERIFY_UI, JsonHandler, _module, _node_env, http_server, needs_node, needs_playwright
 
 ID_ALPHABET = "ybndrfg8ejkmcpqxot1uwisza345h769"  # the characters Mattermost ids are made of
 SECRET = "*" * 32
@@ -25,16 +24,7 @@ def _id() -> str:
     return "".join(random.choice(ID_ALPHABET) for _ in range(26))
 
 
-class _Server(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        pass
-
-    def _send(self, code: int, body: str, ctype: str = "application/json"):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.end_headers()
-        self.wfile.write(body.encode())
-
+class _Server(JsonHandler):
     def do_GET(self):
         o = self.server.opts
         origin = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -69,27 +59,15 @@ class _Server(http.server.BaseHTTPRequestHandler):
             self._send(404, "{}")
 
 
-def _start(**opts) -> tuple[str, http.server.ThreadingHTTPServer]:
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Server)
-    srv.opts = {"version": "11.0.2", **opts}
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return f"http://127.0.0.1:{srv.server_address[1]}", srv
-
-
 @pytest.fixture
 def servers():
-    started = []
+    with ExitStack() as stack:
+        def make(base: dict, head: dict) -> tuple[str, str]:
+            _, b = stack.enter_context(http_server(_Server, opts={"version": "11.0.2", **base}))
+            _, h = stack.enter_context(http_server(_Server, opts={"version": "11.0.2", **head}))
+            return b, h
 
-    def make(base: dict, head: dict) -> tuple[str, str]:
-        b, bs = _start(**base)
-        h, hs = _start(**head)
-        started.extend([bs, hs])
-        return b, h
-
-    yield make
-    for srv in started:
-        srv.shutdown()
-        srv.server_close()
+        yield make
 
 
 def compare(tmp: Path, plan: dict, base: str, head: str, *extra: str) -> tuple[int, str]:

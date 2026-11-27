@@ -18,23 +18,28 @@ import pytest
 import report
 import skeptic_eval
 import trusted
+from conftest import (
+    FAKE_DISPATCH,
+    cli_json,
+    make_repo,
+)
+from conftest import (
+    canned_responses as _canned,
+)
+from conftest import (
+    e2e_repo as _e2e_repo,
+)
+from conftest import (
+    fake_script as _fake,
+)
 from hunt_common import SKILL_DIR, hunt_dir, scratch, write_json
-from test_hunt_engine import _git
-from test_wave2_driver import FAKE_DISPATCH, _canned, _e2e_repo, _fake
 
 
 def _inline_cli_json(answer: object, *, stop_reason: str = "end_turn", subtype: str = "success",
                      is_error: bool = False) -> str:
-    payload: dict[str, object] = {
-        "result": json.dumps(answer),
-        "stop_reason": stop_reason,
-        "subtype": subtype,
-        "is_error": is_error,
-        "total_cost_usd": 0.1,
-        "usage": {"input_tokens": 10, "cache_creation_input_tokens": 0,
-                  "cache_read_input_tokens": 0, "output_tokens": 5},
-    }
-    return json.dumps(payload)
+    return cli_json(answer, stop_reason=stop_reason, subtype=subtype, is_error=is_error, total_cost_usd=0.1,
+                    usage={"input_tokens": 10, "cache_creation_input_tokens": 0,
+                           "cache_read_input_tokens": 0, "output_tokens": 5})
 
 
 # ------------------------------------------------------------------ Step 3: Budget, prompt_version, Skip, Mode D
@@ -105,18 +110,12 @@ def test_completed_hunt_skips_unless_force_or_prompt_version_changes(tmp_path, m
 
 
 def test_docs_and_webapp_test_only_diffs_skip_npm_ci_and_exit_zero(tmp_path, monkeypatch, capsys):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    (repo / "README.md").write_text("hello\n")
-    (repo / "webapp" / "channels" / "src").mkdir(parents=True)
-    (repo / "webapp" / "channels" / "src" / "a.test.tsx").write_text("test('x', () => {})\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    _git(repo, "checkout", "-qb", "feature")
-    (repo / "README.md").write_text("updated docs\n")
-    (repo / "webapp" / "channels" / "src" / "a.test.tsx").write_text("test('x', () => { expect(1).toBe(1); })\n")
-    _git(repo, "commit", "-qam", "docs and test only")
+    repo = make_repo(
+        tmp_path,
+        {"README.md": "hello\n", "webapp/channels/src/a.test.tsx": "test('x', () => {})\n"},
+        {"README.md": "updated docs\n", "webapp/channels/src/a.test.tsx": "test('x', () => { expect(1).toBe(1); })\n"},
+        head_msg="docs and test only",
+    )
 
     monkeypatch.setenv("HUNT_MM", str(repo))
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
@@ -435,3 +434,47 @@ def test_skeptic_eval_uses_opus_and_scores_9_of_9(tmp_path, monkeypatch):
     assert all(a[a.index("--model") + 1] == "opus" for a in seen_argv)
     card = json.loads((out / "skeptic_scorecard.json").read_text())
     assert card["totals"] == {"pass": 9, "held": 0, "FAIL": 0}
+
+
+# ------------------------------------------------------------------ M2 minor cleanup regressions
+
+def test_requests_done_requires_r_artifacts_when_r_added_to_modes(tmp_path):
+    hdir = tmp_path / "h"
+    write_json(hdir / "A" / "request.json", {})
+    write_json(hdir / "B" / "request.json", {})
+    assert not hunt._requests_done(hdir, ("A", "B", "R"))
+    write_json(hdir / "R" / "threads.json", {"threads": []})
+    assert hunt._requests_done(hdir, ("A", "B", "R"))
+
+
+def test_escalate_tag_does_not_burn_cap_when_over_budget(tmp_path, monkeypatch):
+    hdir = tmp_path / "h"
+    build_requests.write_request(hdir / "A" / "request.json", "sys", {"x": 1},
+                                 build_requests.HUNTER_SCHEMA, hdir / "A" / "response.json")
+    monkeypatch.setattr(hunt, "over_budget", lambda _hdir: True)
+    ok, res, err = hunt.escalate_tag(hdir, "A", "schema_validation_failed")
+    assert (ok, res, err) == (False, None, None)
+    assert not (hdir / "A" / "request.opus.json").exists()
+    assert hunt.can_escalate(hdir)
+
+
+def test_stage_v_resume_honors_existing_request_opus_json(tmp_path, monkeypatch):
+    hdir = tmp_path / "h"
+    write_json(hdir / "state.json", {"pr": "1", "wt": str(tmp_path), "batches": 1})
+    write_json(hdir / "base_A.json", {"calc::TestA": "NEW_PR_BUG"})
+    write_json(hdir / "A" / "response.json", {"files": [{"path": "calc/a_test.go", "content": "func TestA() {}"}]})
+    opus_req = build_requests.write_request(
+        hdir / "V" / "request.opus.json", hunt.V_SYSTEM, {"candidates": []},
+        build_requests.HUNTER_SCHEMA, hdir / "V" / "response.json", tier="opus")
+
+    seen_reqs: list[Path] = []
+
+    def fake_dispatch(_hdir, _tag, req, *, strict_schema=False, no_prompt_cache=None):
+        seen_reqs.append(req)
+        return True, dispatch.DispatchResult(status="ok", model="opus"), None
+
+    monkeypatch.setattr(hunt, "dispatch_with_result", fake_dispatch)
+    monkeypatch.setattr(hunt, "script", lambda *a: subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+    hunt.stage_v("1", hdir)
+    assert seen_reqs == [opus_req]
+    assert not (hdir / "V" / "request.json").exists()

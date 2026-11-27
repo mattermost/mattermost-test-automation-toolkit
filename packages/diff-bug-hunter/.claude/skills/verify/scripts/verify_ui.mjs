@@ -113,11 +113,14 @@ const VAR_REF_RE = /\$([A-Za-z_]\w*)/g;
 const URL_VAR_VAL_RE = /^[A-Za-z0-9._-]+$/;
 const TOP_KEYS = ['name', 'base_url', 'login', 'scope', 'allow_origins', 'steps', 'expect', 'ignore', 'covers', 'verified_at'];
 const MAX_DIFFS = 200;
+const NET_ERR_RE = /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|net::ERR_/;
+const SINGLE_LINE_RE = /[\r\n\u2028\u2029]/;
 
 class PlanError extends Error {}
 class InfraError extends Error {}
 
 const firstLine = (err) => String(err instanceof Error ? err.message : err).split('\n')[0];
+const normApi = (spec) => (typeof spec === 'string' ? {path: spec} : spec);
 
 // Why an action timed out, from Playwright's call log (e.g. an overlay that "intercepts pointer events"). The call log
 // is otherwise never printed: it can list request headers.
@@ -143,6 +146,7 @@ function loadPlaywright() {
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const nonEmpty = (v) => typeof v === 'string' && v.length > 0;
+const singleLine = (v) => nonEmpty(v) && !SINGLE_LINE_RE.test(v);
 
 function httpOrigin(url, what) {
     let u;
@@ -312,10 +316,10 @@ export function validatePlan(plan, env = process.env) {
     if ('ignore' in plan && !(Array.isArray(plan.ignore) && plan.ignore.every(nonEmpty))) {
         throw new PlanError('ignore must be an array of non-empty json-path strings');
     }
-    if ('covers' in plan && !(Array.isArray(plan.covers) && plan.covers.length > 0 && plan.covers.every((c) => nonEmpty(c) && !/[\r\n\u2028\u2029]/.test(c)))) {
+    if ('covers' in plan && !(Array.isArray(plan.covers) && plan.covers.length > 0 && plan.covers.every(singleLine))) {
         throw new PlanError('covers must be a non-empty array of single-line file paths');
     }
-    if ('verified_at' in plan && !(nonEmpty(plan.verified_at) && !/[\r\n\u2028\u2029]/.test(plan.verified_at))) {
+    if ('verified_at' in plan && !singleLine(plan.verified_at)) {
         throw new PlanError('verified_at must be a non-empty single-line string');
     }
     const allowOrigins = plan.allow_origins ?? [];
@@ -432,23 +436,19 @@ function settleMs(env) {
 
 // ---------------------------------------------------------------- locators and snapshots
 
-function locateAll(page, loc) {
+const LOC_METHODS = {testid: 'getByTestId', label: 'getByLabel', placeholder: 'getByPlaceholder', text: 'getByText', css: 'locator'};
+
+function locatorCall(loc) {
     if (loc.role) {
-        return page.getByRole(loc.role, loc.name === undefined ? {} : {name: loc.name, exact: Boolean(loc.exact)});
+        return ['getByRole', loc.name === undefined ? [loc.role] : [loc.role, {name: loc.name, exact: Boolean(loc.exact)}]];
     }
-    if (loc.testid) {
-        return page.getByTestId(loc.testid);
-    }
-    if (loc.label) {
-        return page.getByLabel(loc.label);
-    }
-    if (loc.placeholder) {
-        return page.getByPlaceholder(loc.placeholder);
-    }
-    if (loc.text) {
-        return page.getByText(loc.text);
-    }
-    return page.locator(loc.css);
+    const k = Object.keys(LOC_METHODS).find((key) => loc[key]);
+    return [LOC_METHODS[k], [loc[k]]];
+}
+
+function locateAll(page, loc) {
+    const [method, args] = locatorCall(loc);
+    return page[method](...args);
 }
 
 // Strict by default: omitting `nth` requires a unique match so an ambiguous locator fails loudly instead of silently
@@ -492,15 +492,15 @@ async function snapshot(page, loc) {
 
 // ---------------------------------------------------------------- shared with frozen specs (copied via toString)
 
-// Self-contained on purpose: --freeze copies this function's source into the generated spec, so frozen tests log in
-// exactly the way the run that produced them did. Errors carry only Playwright's first line: the full message lists
-// request headers, which would include the token.
+// Self-contained on purpose: --freeze copies this function's source into the generated spec.
 export async function apiLogin(context, base, env) {
+    const hasBrowser = typeof context.route === 'function';
     const headers = {'X-Requested-With': 'XMLHttpRequest'};
     if (env.VERIFY_TOKEN) {
         const token = env.VERIFY_TOKEN;
-        // A session cookie from a loaded storageState would win over the header and run as another user.
-        await context.clearCookies({name: 'MMAUTHTOKEN'});
+        if (hasBrowser) {
+            await context.clearCookies({name: 'MMAUTHTOKEN'});
+        }
         let me;
         try {
             me = await context.request.get(new URL('/api/v4/users/me', base).toString(),
@@ -512,30 +512,24 @@ export async function apiLogin(context, base, env) {
             throw new Error(`VERIFY_TOKEN rejected by GET /api/v4/users/me: HTTP ${me.status()}`);
         }
         const user = await me.json();
-        // No MMAUTHTOKEN cookie: Mattermost reads that cookie before the Authorization header, and a cookie session
-        // gets CSRF checks on every non-GET request, which a bare token cannot satisfy. With the token only in the
-        // header the server authenticates by header and skips CSRF. MMUSERID tells the webapp it is signed in.
+        if (!hasBrowser) {
+            return `token auth as ${user.username} (API-only, no browser)`;
+        }
+        // No MMAUTHTOKEN cookie: header auth skips CSRF; MMUSERID tells the webapp it is signed in.
         await context.addCookies([{name: 'MMUSERID', value: user.id, url: base}]);
         const origin = new URL(base).origin;
         await context.route('**/*', async (route) => {
             const request = route.request();
-            // Only the webapp's API calls (fetch/XHR) to the server under test carry the token. Pages and static
-            // assets are served without auth and pass through untouched (fulfilling a document would also change
-            // how Chromium classifies the page for local-network checks).
             if (new URL(request.url()).origin !== origin || !['fetch', 'xhr'].includes(request.resourceType())) {
                 return route.fallback();
             }
             try {
-                // Fetched here with the token and no redirect following: a redirect response goes back to the page
-                // without the token, so the token never reaches another host.
                 const response = await route.fetch({
                     headers: {...request.headers(), authorization: `Bearer ${token}`},
                     maxRedirects: 0,
                 });
                 return await route.fulfill({response});
             } catch {
-                // A dropped connection or a closing context: fail the request quietly (the error would echo the
-                // token header) and let the page's own error handling and the oracle report it.
                 return route.abort('failed').catch(() => {});
             }
         });
@@ -543,7 +537,6 @@ export async function apiLogin(context, base, env) {
     }
     let res;
     try {
-        // maxRedirects: 0, so a 307/308 can never replay the password to another host.
         res = await context.request.post(new URL('/api/v4/users/login', base).toString(),
             {data: {login_id: env.VERIFY_USER, password: env.VERIFY_PASSWORD}, headers, maxRedirects: 0});
     } catch (err) {
@@ -552,12 +545,14 @@ export async function apiLogin(context, base, env) {
     if (!res.ok()) {
         throw new Error(`login as ${env.VERIFY_USER} failed: HTTP ${res.status()}`);
     }
-    const names = new Set((await context.cookies(base)).map((c) => c.name));
+    const cookies = typeof context.cookies === 'function'
+        ? await context.cookies(base) : ((await context.storageState()).cookies ?? []);
+    const names = new Set(cookies.map((c) => c.name));
     const missing = ['MMAUTHTOKEN', 'MMUSERID', 'MMCSRF'].filter((name) => !names.has(name));
     if (missing.length) {
         throw new Error(`login as ${env.VERIFY_USER} set no ${missing.join(', ')} cookie`);
     }
-    return `password login as ${env.VERIFY_USER} (MMAUTHTOKEN, MMUSERID, MMCSRF set)`;
+    return `password login as ${env.VERIFY_USER} (${hasBrowser ? 'MMAUTHTOKEN, MMUSERID, MMCSRF set' : 'API-only, no browser'})`;
 }
 
 // Same semantics as Playwright's toMatchObject: objects may have extra keys, arrays must match element by element.
@@ -729,17 +724,27 @@ function readJsonPath(obj, dotPath) {
 }
 
 function expandPath(raw, origin, vars, mustBeApi) {
-    const out = raw.replace(VAR_REF_RE, (_, name) => {
+    const out = raw.replace(/\$([A-Za-z_]\w*)/g, (_, name) => {
         if (!Object.hasOwn(vars, name)) {
             throw new Error(`unknown saved variable $${name}`);
         }
         const val = String(vars[name]);
-        if (!URL_VAR_VAL_RE.test(val)) {
+        if (!/^[A-Za-z0-9._-]+$/.test(val)) {
             throw new Error(`saved variable $${name} has unsafe URL token ${JSON.stringify(val)}`);
         }
         return val;
     });
-    if (mustBeApi ? !isApiPath(out, origin) : (!out.startsWith('/') || out.startsWith('//') || out.includes('\\') || !staysOn(out, origin))) {
+    let u = null;
+    try {
+        u = new URL(out, origin);
+    } catch {
+        u = null;
+    }
+    const apiRe = /^\/(?:api\/v4\/|oauth\/|plugins\/[A-Za-z0-9][A-Za-z0-9._-]*\/)/;
+    const okPath = mustBeApi
+        ? apiRe.test(out) && apiRe.test(u?.pathname ?? '')
+        : out.startsWith('/') && !out.startsWith('//') && !out.includes('\\');
+    if (!u || u.origin !== origin || !okPath) {
         throw new Error(`resolved path ${JSON.stringify(out)} left ${mustBeApi ? '/api/v4/, /oauth/ or /plugins/<id>/' : origin}`);
     }
     return out;
@@ -747,7 +752,7 @@ function expandPath(raw, origin, vars, mustBeApi) {
 
 function expandBody(val, vars) {
     if (typeof val === 'string') {
-        return val.replace(VAR_REF_RE, (_, name) => {
+        return val.replace(/\$([A-Za-z_]\w*)/g, (_, name) => {
             if (!Object.hasOwn(vars, name)) {
                 throw new Error(`unknown saved variable $${name}`);
             }
@@ -757,28 +762,25 @@ function expandBody(val, vars) {
     if (Array.isArray(val)) {
         return val.map((v) => expandBody(v, vars));
     }
-    if (isObj(val)) {
+    if (val !== null && typeof val === 'object') {
         return Object.fromEntries(Object.entries(val).map(([k, v]) => [k, expandBody(v, vars)]));
     }
     return val;
 }
 
+const SIMPLE_STEPS = {
+    click: ['click'], fill: ['fill', 'value'], select: ['selectOption', 'value'],
+    check: ['check'], wait_for: ['waitFor', null, {state: 'visible'}],
+};
+
 async function runStep(page, base, origin, step, vars) {
     if ('goto' in step) {
         const target = expandPath(step.goto, origin, vars, false);
         await page.goto(new URL(target, base).toString(), {waitUntil: 'domcontentloaded'});
-    } else if ('click' in step) {
-        await locate(page, step.click).click();
-    } else if ('fill' in step) {
-        await locate(page, step.fill).fill(step.value);
     } else if ('press' in step) {
         await (step.on ? locate(page, step.on).press(step.press) : page.keyboard.press(step.press));
-    } else if ('select' in step) {
-        await locate(page, step.select).selectOption(step.value);
-    } else if ('check' in step) {
-        await locate(page, step.check).check();
-    } else if ('wait_for' in step) {
-        await locate(page, step.wait_for).waitFor({state: 'visible'});
+    } else if ('mouse_up' in step) {
+        await page.mouse.up();
     } else if ('drag' in step) {
         const d = step.drag;
         const src = await locate(page, d.from).boundingBox();
@@ -787,8 +789,8 @@ async function runStep(page, base, origin, step, vars) {
         }
         const sx = src.x + src.width / 2;
         const sy = src.y + src.height / 2;
-        let tx;
-        let ty;
+        let tx = sx + (d.dx ?? 0);
+        let ty = sy + (d.dy ?? 0);
         if (d.to) {
             const dst = await locate(page, d.to).boundingBox();
             if (!dst) {
@@ -796,9 +798,6 @@ async function runStep(page, base, origin, step, vars) {
             }
             tx = dst.x + dst.width / 2;
             ty = dst.y + dst.height / 2;
-        } else {
-            tx = sx + (d.dx ?? 0);
-            ty = sy + (d.dy ?? 0);
         }
         await page.mouse.move(sx, sy);
         await page.mouse.down();
@@ -806,25 +805,96 @@ async function runStep(page, base, origin, step, vars) {
         if (d.release !== false) {
             await page.mouse.up();
         }
-    } else if ('mouse_up' in step) {
-        await page.mouse.up();
+    } else {
+        const [k, [fn, argKey, fixed]] = Object.entries(SIMPLE_STEPS).find(([key]) => key in step);
+        await locate(page, step[k])[fn](...(argKey ? [step[argKey]] : fixed ? [fixed] : []));
     }
 }
 
-// Waits until no request has been in flight for QUIET_MS, at most `limit` ms; a request still running then fails the
-// run, so a slow response can never be skipped into a PASS. page.waitForLoadState('networkidle') cannot do this: it
-// returns at once on a page that already reached that state, missing requests a click starts.
-async function settle(page, limit) {
+async function waitSettle(page, inflight, lastAt, limit, quietMs) {
     const start = Date.now();
-    while (Date.now() - start < limit
-           && (page.inflight.size || Date.now() - Math.max(start, page.lastActivityAt ?? start) < QUIET_MS)) {
+    while (Date.now() - start < limit && (inflight.size || Date.now() - Math.max(start, lastAt()) < quietMs)) {
         await page.waitForTimeout(50);
     }
-    if (!page.inflight.size) {
+    if (!inflight.size) {
         return null;
     }
-    const urls = [...page.inflight].map((r) => `${r.method()} ${new URL(r.url()).pathname}`).slice(0, 5);
-    return `${page.inflight.size} request(s) still in flight after ${limit}ms: ${urls.join(', ')}`;
+    const urls = [...inflight].map((r) => `${r.method()} ${new URL(r.url()).pathname}`).slice(0, 5);
+    return `${inflight.size} request(s) still in flight after ${limit}ms: ${urls.join(', ')}`;
+}
+
+async function attachPageGuards(context, page, allowedSet, originOfFn, timeoutMs, problems, soft, onBlocked, diagnostics) {
+    const inflight = new Set();
+    const loading = new Set();
+    let lastActivityAt = Date.now();
+    await context.route('**/*', (route) => {
+        const o = originOfFn(route.request().url());
+        if (o === null || allowedSet.has(o)) {
+            return route.continue();
+        }
+        onBlocked(o);
+        return route.abort('blockedbyclient');
+    });
+    page.on('request', (r) => {
+        inflight.add(r);
+        lastActivityAt = Date.now();
+        if (r.isNavigationRequest()) {
+            loading.add(r.frame());
+        }
+        const o = originOfFn(r.url());
+        if (o !== null && !allowedSet.has(o)) {
+            onBlocked(o);
+            if (r.redirectedFrom()) {
+                problems.push(`redirected to a non-allowed origin: ${r.method()} ${o}`);
+            } else if (r.isNavigationRequest() && r.frame() === page.mainFrame()) {
+                problems.push(`navigated to a non-allowed origin: ${o}`);
+            }
+        }
+    });
+    const done = (r) => {
+        inflight.delete(r);
+        lastActivityAt = Date.now();
+    };
+    page.on('requestfinished', done);
+    page.on('requestfailed', done);
+    page.on('framenavigated', (frame) => {
+        if (!loading.delete(frame)) {
+            return;
+        }
+        for (const r of inflight) {
+            if (r.frame() === frame && !r.isNavigationRequest()) {
+                done(r);
+            }
+        }
+    });
+    page.on('websocket', (ws) => {
+        const o = originOfFn(ws.url());
+        if (o !== null && !allowedSet.has(o)) {
+            problems.push(`websocket to a non-allowed origin: ${o}`);
+        }
+    });
+    page.on('pageerror', (err) => soft.push(`pageerror: ${String(err instanceof Error ? err.message : err).split('\n')[0]}`));
+    if (diagnostics) {
+        const diag = diagnostics;
+        page.on('console', (msg) => {
+            if (msg.type() === 'error' && diag.length < 20) {
+                diag.push(`console.error: ${String(msg.text()).split('\n')[0]}`);
+            }
+        });
+    }
+    page.on('response', (res) => {
+        const pathname = new URL(res.url()).pathname;
+        if (!pathname.startsWith('/api/v4/')) {
+            return;
+        }
+        if (res.status() >= 500) {
+            soft.push(`HTTP ${res.status()} from ${res.request().method()} ${pathname}`);
+        } else if (diagnostics && res.status() >= 400 && diagnostics.length < 20) {
+            diagnostics.push(`HTTP ${res.status()} from ${res.request().method()} ${pathname}`);
+        }
+    });
+    page.setDefaultTimeout(timeoutMs);
+    return {inflight, lastAt: () => lastActivityAt};
 }
 
 // Errors that mean the plan is wrong (a malformed selector, an unknown key name), not that the app is.
@@ -845,72 +915,40 @@ async function poll(read, ok) {
     return value;
 }
 
-// Browser-less login for API-only plans (same semantics as apiLogin, using APIRequestContext directly).
-async function apiOnlyLogin(reqCtx, base, env) {
+// Self-contained (--freeze copies it): sends an API request with Bearer token or MMCSRF, no redirects, bounded body.
+async function sendApiRequest(reqHost, base, method, apiPath, body, env, maxBytes) {
     const headers = {'X-Requested-With': 'XMLHttpRequest'};
     if (env.VERIFY_TOKEN) {
-        let me;
-        try {
-            me = await reqCtx.get(new URL('/api/v4/users/me', base).toString(),
-                {headers: {...headers, Authorization: `Bearer ${env.VERIFY_TOKEN}`}, maxRedirects: 0});
-        } catch (err) {
-            throw new Error(firstLine(err));
+        headers.Authorization = `Bearer ${env.VERIFY_TOKEN}`;
+    } else if (method !== 'GET') {
+        const cookies = typeof reqHost.cookies === 'function'
+            ? await reqHost.cookies(base) : ((await reqHost.storageState()).cookies ?? []);
+        const c = cookies.find((x) => x.name === 'MMCSRF');
+        if (c) {
+            headers['X-CSRF-Token'] = c.value;
         }
-        if (!me.ok()) {
-            throw new Error(`VERIFY_TOKEN rejected by GET /api/v4/users/me: HTTP ${me.status()}`);
-        }
-        const user = await me.json();
-        return `token auth as ${user.username} (API-only, no browser)`;
     }
-    let res;
+    const serialized = body !== undefined ? JSON.stringify(body) : undefined;
+    if (serialized !== undefined) {
+        if (new TextEncoder().encode(serialized).length > maxBytes) {
+            throw new Error(`${method} ${apiPath}: expanded api.body exceeds ${maxBytes} bytes`);
+        }
+        headers['Content-Type'] = 'application/json';
+    }
+    const opts = {method, headers, maxRedirects: 0, ...(serialized !== undefined ? {data: serialized} : {})};
     try {
-        res = await reqCtx.post(new URL('/api/v4/users/login', base).toString(),
-            {data: {login_id: env.VERIFY_USER, password: env.VERIFY_PASSWORD}, headers, maxRedirects: 0});
+        return await reqHost.request.fetch(new URL(apiPath, base).toString(), opts);
     } catch (err) {
-        throw new Error(firstLine(err));
+        throw new Error(String(err instanceof Error ? err.message : err).split('\n')[0]);
     }
-    if (!res.ok()) {
-        throw new Error(`login as ${env.VERIFY_USER} failed: HTTP ${res.status()}`);
-    }
-    const state = await reqCtx.storageState();
-    const names = new Set((state.cookies ?? []).map((c) => c.name));
-    const missing = ['MMAUTHTOKEN', 'MMUSERID', 'MMCSRF'].filter((name) => !names.has(name));
-    if (missing.length) {
-        throw new Error(`login as ${env.VERIFY_USER} set no ${missing.join(', ')} cookie`);
-    }
-    return `password login as ${env.VERIFY_USER} (API-only, no browser)`;
 }
 
-async function csrfHeader(reqHost, base, env) {
-    if (env.VERIFY_TOKEN) {
-        return {};
-    }
-    const cookies = typeof reqHost.cookies === 'function'
-        ? await reqHost.cookies(base)
-        : ((await reqHost.storageState()).cookies ?? []);
-    const csrf = cookies.find((c) => c.name === 'MMCSRF');
-    return csrf ? {'X-CSRF-Token': csrf.value} : {};
-}
-
-// No redirects: an answer from another host must never satisfy an expectation or be captured.
 async function apiCall(reqHost, base, origin, spec, env, vars) {
-    const rawSpec = typeof spec === 'string' ? {path: spec} : spec;
+    const rawSpec = normApi(spec);
     const method = (rawSpec.method ?? 'GET').toUpperCase();
     const apiPath = expandPath(rawSpec.path, origin, vars, true);
     const body = 'body' in rawSpec ? expandBody(rawSpec.body, vars) : undefined;
-    const serialized = body !== undefined ? JSON.stringify(body) : undefined;
-    if (serialized !== undefined && Buffer.byteLength(serialized, 'utf8') > MAX_BODY_BYTES) {
-        throw new Error(`${method} ${apiPath}: expanded api.body exceeds ${MAX_BODY_BYTES} bytes`);
-    }
-    const auth = env.VERIFY_TOKEN ? {Authorization: `Bearer ${env.VERIFY_TOKEN}`} : {};
-    const csrf = method !== 'GET' ? await csrfHeader(reqHost, base, env) : {};
-    const req = reqHost.request ?? reqHost;
-    const contentType = serialized !== undefined ? {'Content-Type': 'application/json'} : {};
-    const opts = {method, headers: {'X-Requested-With': 'XMLHttpRequest', ...contentType, ...auth, ...csrf}, maxRedirects: 0};
-    if (serialized !== undefined) {
-        opts.data = serialized;
-    }
-    const res = await req.fetch(new URL(apiPath, base).toString(), opts);
+    const res = await sendApiRequest(reqHost, base, method, apiPath, body, env, MAX_BODY_BYTES);
     return {res, method, apiPath};
 }
 
@@ -974,12 +1012,22 @@ async function checkExpect(reqHost, page, base, origin, e, env, vars) {
 
 async function reachable(reqHost, base) {
     try {
-        const req = reqHost.request ?? reqHost;
-        await req.get(new URL('/api/v4/system/ping', base).toString(), {timeout: 5000, maxRedirects: 0});
+        await reqHost.request.get(new URL('/api/v4/system/ping', base).toString(), {timeout: 5000, maxRedirects: 0});
         return true;
     } catch {
         return false;
     }
+}
+
+async function classifyStepErr(where, err, reqHost, base) {
+    const msg = firstLine(err);
+    if (planMistake(err)) {
+        throw new PlanError(`${where}: ${msg}`);
+    }
+    if (NET_ERR_RE.test(msg) && !(await reachable(reqHost, base))) {
+        throw new InfraError(`server unreachable at ${base}: ${msg}`);
+    }
+    return msg;
 }
 
 // `record` ({captures: [], snapshots: [], expects: [], problems: []}) is compare mode: what each step saw is stored for
@@ -1039,115 +1087,34 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
         return code;
     };
     const failSnap = async () => (page ? await snapshot(page, scope).catch(() => '(no snapshot)') : '');
+    let tracker = null;
     try {
         if (needsBrowser) {
             const context = await browser.newContext({viewport: {width: 1280, height: 800}});
             reqHost = context;
-            // Skip the "Where would you like to view this?" desktop-app landing (see the header): set before any page script.
             await context.addInitScript(landingPageSeen, origin);
-            await context.route('**/*', (route) => {
-                const o = originOf(route.request().url());
-                if (o === null || allowedSet.has(o)) {
-                    return route.continue();
-                }
-                blocked.add(o);
-                return route.abort('blockedbyclient');
-            });
             page = await context.newPage();
-            page.inflight = new Set();
-            page.lastActivityAt = Date.now();
-            const loading = new Set();  // frames with a navigation request in progress
-            page.on('request', (r) => {
-                page.inflight.add(r);
-                page.lastActivityAt = Date.now();
-                if (r.isNavigationRequest()) {
-                    loading.add(r.frame());
-                }
-                // Redirect hops are not routed, so the route above cannot block them: check every request here.
-                const o = originOf(r.url());
-                if (o !== null && !allowedSet.has(o)) {
-                    blocked.add(o);
-                    if (r.redirectedFrom()) {
-                        problems.push(`redirected to a non-allowed origin: ${r.method()} ${o}`);
-                    } else if (r.isNavigationRequest() && r.frame() === page.mainFrame()) {
-                        problems.push(`navigated to a non-allowed origin: ${o}`);
-                    }
-                }
-            });
-            page.on('requestfinished', (r) => {
-                page.inflight.delete(r);
-                page.lastActivityAt = Date.now();
-            });
-            page.on('requestfailed', (r) => {
-                page.inflight.delete(r);
-                page.lastActivityAt = Date.now();
-            });
-            // A request the page cancels by loading another document never gets requestfinished/requestfailed; forget it
-            // then. Only a real load counts: an in-page URL change (history.pushState) cancels nothing.
-            page.on('framenavigated', (frame) => {
-                if (!loading.delete(frame)) {
-                    return;
-                }
-                for (const r of page.inflight) {
-                    if (r.frame() === frame && !r.isNavigationRequest()) {
-                        page.inflight.delete(r);
-                        page.lastActivityAt = Date.now();
-                    }
-                }
-            });
-            page.on('websocket', (ws) => {
-                const o = originOf(ws.url());
-                if (o !== null && !allowedSet.has(o)) {
-                    problems.push(`websocket to a non-allowed origin: ${o}`);
-                }
-            });
-            page.setDefaultTimeout(ACTION_TIMEOUT_MS);
-            // Compare mode records page errors and >= 500 /api/v4/ responses (a noisy plugin throws on both servers) and diffs
-            // them; a run alone treats each as a failure. 4xx /api/v4/ and console.error are fail-only diagnostics.
-            const soft = record ? record.problems : problems;
-            page.on('pageerror', (err) => soft.push(`pageerror: ${firstLine(err)}`));
-            page.on('console', (msg) => {
-                if (msg.type() === 'error' && diagnostics.length < 20) {
-                    diagnostics.push(`console.error: ${firstLine(msg.text())}`);
-                }
-            });
-            page.on('response', (res) => {
-                const pathname = new URL(res.url()).pathname;
-                if (!pathname.startsWith('/api/v4/')) {
-                    return;
-                }
-                if (res.status() >= 500) {
-                    soft.push(`HTTP ${res.status()} from ${res.request().method()} ${pathname}`);
-                } else if (res.status() >= 400 && diagnostics.length < 20) {
-                    diagnostics.push(`HTTP ${res.status()} from ${res.request().method()} ${pathname}`);
-                }
-            });
-            if (authed) {
-                try {
-                    log(await apiLogin(context, base, env));
-                } catch (err) {
-                    const msg = firstLine(err);
-                    throw new InfraError(/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|net::ERR_/.test(msg) ? `server unreachable at ${base}: ${msg}` : msg);
-                }
-            }
+            tracker = await attachPageGuards(
+                context, page, allowedSet, originOf, ACTION_TIMEOUT_MS,
+                problems, record ? record.problems : problems, (o) => blocked.add(o), diagnostics,
+            );
         } else {
-            // Browser-less fast path: API-only plans skip Chromium and run directly on Playwright's APIRequestContext.
             apiCtx = await request.newContext();
-            reqHost = apiCtx;
-            if (authed) {
-                try {
-                    log(await apiOnlyLogin(apiCtx, base, env));
-                } catch (err) {
-                    const msg = firstLine(err);
-                    throw new InfraError(/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|net::ERR_/.test(msg) ? `server unreachable at ${base}: ${msg}` : msg);
-                }
+            reqHost = {request: apiCtx, storageState: () => apiCtx.storageState()};
+        }
+        if (authed) {
+            try {
+                log(await apiLogin(reqHost, base, env));
+            } catch (err) {
+                const msg = firstLine(err);
+                throw new InfraError(NET_ERR_RE.test(msg) ? `server unreachable at ${base}: ${msg}` : msg);
             }
         }
         const afterStep = async () => {
-            if (!page) {
+            if (!page || !tracker) {
                 return;
             }
-            const late = await settle(page, limit);
+            const late = await waitSettle(page, tracker.inflight, tracker.lastAt, limit, QUIET_MS);
             if (late) {
                 problems.push(late);
             }
@@ -1177,13 +1144,7 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                 await runStep(page, base, origin, step, vars);
                 await afterStep();
             } catch (err) {
-                const msg = firstLine(err);
-                if (planMistake(err)) {
-                    throw new PlanError(`${label}: ${msg}`);
-                }
-                if (/net::ERR_|ECONNREFUSED/.test(msg) && !(await reachable(reqHost, base))) {
-                    throw new InfraError(`server unreachable at ${base}: ${msg}`);
-                }
+                const msg = await classifyStepErr(label, err, reqHost, base);
                 return await finish(1, `${label} failed: ${problems.length ? `${problems.join('; ')}; ` : ''}${msg}${actionHint(err)}`, await failSnap());
             }
             if (problems.length) {
@@ -1196,14 +1157,7 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
             try {
                 why = await checkExpect(reqHost, page, base, origin, e, env, vars);
             } catch (err) {
-                const msg = firstLine(err);
-                if (planMistake(err)) {
-                    throw new PlanError(`expect ${i + 1}: ${msg}`);
-                }
-                if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|net::ERR_/.test(msg) && !(await reachable(reqHost, base))) {
-                    throw new InfraError(`server unreachable at ${base}: ${msg}`);
-                }
-                why = msg;
+                why = await classifyStepErr(`expect ${i + 1}`, err, reqHost, base);
             }
             record?.expects.push({n: i + 1, ok: !why, why: why ?? null});
             if (why && record) {
@@ -1462,27 +1416,23 @@ export async function compare(plan, baseUrl, env = process.env, log = console.lo
     const {base_url: _drop, ...basePlan} = plan;
     const baseEnv = {...env, VERIFY_BASE_URL: baseOrigin};
     const sides = [['base', basePlan, baseEnv], ['head', plan, env]];
-    const origins = [];
-    // Validate both sides upfront so an invalid head plan fails fast without running Chromium against base.
-    for (const [name, p, e] of sides) {
+    const wrapSide = async (name, fn) => {
         try {
-            origins.push(validatePlan(p, e).origin);
+            return await fn();
         } catch (err) {
-            const wrap = err instanceof PlanError ? PlanError : InfraError;
-            throw new wrap(`${name} run: ${firstLine(err)}`);
+            const Wrap = err instanceof PlanError ? PlanError : InfraError;
+            throw new Wrap(`${name} run: ${firstLine(err)}`);
         }
+    };
+    const origins = [];
+    for (const [name, p, e] of sides) {
+        origins.push(await wrapSide(name, () => validatePlan(p, e).origin));
     }
     const recs = {};
     for (const [name, p, e] of sides) {
         const rec = {captures: [], snapshots: [], expects: [], problems: [], verdict: ''};
         recs[name] = rec;
-        let code;
-        try {
-            code = await verify(p, tagged(name, rec, log), null, e, {record: rec});
-        } catch (err) {
-            const wrap = err instanceof PlanError ? PlanError : InfraError;
-            throw new wrap(`${name} run: ${firstLine(err)}`);
-        }
+        const code = await wrapSide(name, () => verify(p, tagged(name, rec, log), null, e, {record: rec}));
         if (code !== 0) {
             log(`VERDICT: FAIL ${name} run failed: ${rec.verdict.replace(/^FAIL /, '')}`);
             return 1;
@@ -1505,79 +1455,46 @@ export async function compare(plan, baseUrl, env = process.env, log = console.lo
 // ---------------------------------------------------------------- --freeze
 
 function locatorCode(loc) {
-    const q = JSON.stringify;
-    if (loc.role) {
-        return loc.name === undefined ? `page.getByRole(${q(loc.role)})` :
-            `page.getByRole(${q(loc.role)}, {name: ${q(loc.name)}, exact: ${Boolean(loc.exact)}})`;
-    }
-    if (loc.testid) {
-        return `page.getByTestId(${q(loc.testid)})`;
-    }
-    if (loc.label) {
-        return `page.getByLabel(${q(loc.label)})`;
-    }
-    if (loc.placeholder) {
-        return `page.getByPlaceholder(${q(loc.placeholder)})`;
-    }
-    if (loc.text) {
-        return `page.getByText(${q(loc.text)})`;
-    }
-    return `page.locator(${q(loc.css)})`;
+    const [method, args] = locatorCall(loc);
+    return `page.${method}(${args.map((a) => JSON.stringify(a)).join(', ')})`;
 }
 
 const one = (loc) => (loc.nth === undefined ? locatorCode(loc) : `${locatorCode(loc)}.nth(${Number(loc.nth)})`);
 
-// The spec gets the runner's own startOriginGuard(); its one helper with an untyped parameter gets a type.
-function typedGuard() {
-    const src = startOriginGuard.toString();
-    const typed = src.replace('const strip = (h) => {', 'const strip = (h: Record<string, string | string[] | undefined>) => {');
-    if (typed === src) {
-        throw new Error('startOriginGuard() changed; update typedGuard()');
+function typedFn(fn, ...replacements) {
+    let src = fn.toString();
+    for (const [from, to] of replacements) {
+        const next = src.replace(from, to);
+        if (next === src) {
+            throw new Error(`${fn.name}() changed; update typedFn()`);
+        }
+        src = next;
     }
-    return typed;
-}
-
-// The spec gets the runner's own subset(), with TypeScript types added to its signature (it is recursive, so a typed
-// const cannot infer them).
-function typedSubset() {
-    const src = subset.toString();
-    const typed = src.replace('function subset(want, got) {', 'function subset(want: any, got: any): boolean {');
-    if (typed === src) {
-        throw new Error('subset() signature changed; update typedSubset()');
-    }
-    return typed;
+    return src;
 }
 
 export function freeze(plan, base, allowOrigins = [], authed = false) {
     const q = JSON.stringify;
     const lines = [];
-    const emittedSteps = (plan.steps ?? []).filter((s) => {
-        if ('snapshot' in s) {
-            return false;
-        }
-        if ('capture' in s) {
-            const rawApi = typeof s.capture.api === 'string' ? {path: s.capture.api} : s.capture.api;
-            return Boolean(s.capture.save) || (rawApi.method ?? 'GET').toUpperCase() !== 'GET';
-        }
-        return true;
-    });
+    const emittedSteps = (plan.steps ?? []).filter((s) =>
+        !('snapshot' in s) && (!('capture' in s) || Boolean(s.capture.save) || (normApi(s.capture.api).method ?? 'GET').toUpperCase() !== 'GET'));
     const steps = emittedSteps.length;
     const expects = plan.expect.length;
+    const frozenSimple = {
+        click: (s) => `${one(s.click)}.click()`,
+        fill: (s) => `${one(s.fill)}.fill(${q(s.value)})`,
+        press: (s) => (s.on ? `${one(s.on)}.press(${q(s.press)})` : `page.keyboard.press(${q(s.press)})`),
+        select: (s) => `${one(s.select)}.selectOption(${q(s.value)})`,
+        check: (s) => `${one(s.check)}.check()`,
+        wait_for: (s) => `${one(s.wait_for)}.waitFor({state: 'visible'})`,
+        mouse_up: () => 'page.mouse.up()',
+    };
     for (const s of plan.steps ?? []) {
+        const simpleKey = Object.keys(frozenSimple).find((k) => k in s);
         if ('goto' in s) {
-            lines.push(`await page.goto(new URL(expandPath(${q(s.goto)}, false), BASE).toString(), {waitUntil: 'domcontentloaded'});`);
-        } else if ('click' in s) {
-            lines.push(`await ${one(s.click)}.click();`);
-        } else if ('fill' in s) {
-            lines.push(`await ${one(s.fill)}.fill(${q(s.value)});`);
-        } else if ('press' in s) {
-            lines.push(s.on ? `await ${one(s.on)}.press(${q(s.press)});` : `await page.keyboard.press(${q(s.press)});`);
-        } else if ('select' in s) {
-            lines.push(`await ${one(s.select)}.selectOption(${q(s.value)});`);
-        } else if ('check' in s) {
-            lines.push(`await ${one(s.check)}.check();`);
-        } else if ('wait_for' in s) {
-            lines.push(`await ${one(s.wait_for)}.waitFor({state: 'visible'});`);
+            lines.push(`await page.goto(new URL(expandPath(${q(s.goto)}, BASE_ORIGIN, vars, false), BASE).toString(), {waitUntil: 'domcontentloaded'});`);
+        } else if (simpleKey) {
+            lines.push(`await ${frozenSimple[simpleKey](s)};`);
         } else if ('drag' in s) {
             const d = s.drag;
             lines.push('{',
@@ -1598,16 +1515,14 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
                 lines.push('  await page.mouse.up();');
             }
             lines.push('}');
-        } else if ('mouse_up' in s) {
-            lines.push('await page.mouse.up();');
         } else if ('capture' in s) {
-            const rawApi = typeof s.capture.api === 'string' ? {path: s.capture.api} : s.capture.api;
+            const rawApi = normApi(s.capture.api);
             const method = (rawApi.method ?? 'GET').toUpperCase();
             if (!s.capture.save && method === 'GET') {
-                continue; // read-only captures without save are for --compare / the agent's eyes
+                continue;
             }
-            const bodyArg = 'body' in rawApi ? `, expandBody(${q(rawApi.body)})` : '';
-            lines.push('{', `  const res = await apiCall(page, expandPath(${q(rawApi.path)}, true), ${q(method)}${bodyArg});`);
+            const bodyArg = 'body' in rawApi ? `, expandBody(${q(rawApi.body)}, vars)` : '';
+            lines.push('{', `  const res = await sendApiRequest(context, BASE, ${q(method)}, expandPath(${q(rawApi.path)}, BASE_ORIGIN, vars, true), ${bodyArg ? bodyArg.slice(2) : 'undefined'}, AUTHED ? process.env : {}, MAX_BODY_BYTES);`);
             lines.push("  expect(res.status(), 'no server error').toBeLessThan(500);");
             if (s.capture.save) {
                 lines.push('  const data: unknown = await res.json();');
@@ -1617,7 +1532,7 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
             }
             lines.push('}');
         } else {
-            continue; // snapshots are for the agent's eyes; the frozen test asserts only the deterministic oracle
+            continue;
         }
         lines.push('await settle();');
     }
@@ -1630,8 +1545,8 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
             lines.push(`await expect.poll(() => ${locatorCode(e.count)}.count(), {timeout: TIMEOUT}).toBeGreaterThanOrEqual(${Number(e.min ?? 1)});`);
         } else {
             const method = (e.api.method ?? 'GET').toUpperCase();
-            const bodyArg = 'body' in e.api ? `, expandBody(${q(e.api.body)})` : '';
-            lines.push('{', `  const res = await apiCall(page, expandPath(${q(e.api.path)}, true), ${q(method)}${bodyArg});`,
+            const bodyArg = 'body' in e.api ? `expandBody(${q(e.api.body)}, vars)` : 'undefined';
+            lines.push('{', `  const res = await sendApiRequest(context, BASE, ${q(method)}, expandPath(${q(e.api.path)}, BASE_ORIGIN, vars, true), ${bodyArg}, AUTHED ? process.env : {}, MAX_BODY_BYTES);`,
                 "  expect(res.status(), 'no server error').toBeLessThan(500);",
                 `  expect(res.status()).toBe(${Number(e.api.status ?? 200)});`);
             if (e.api.json_has) {
@@ -1645,16 +1560,12 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
     const login = needsLogin ? `
   expect(Boolean(process.env.VERIFY_TOKEN || (process.env.VERIFY_USER && process.env.VERIFY_PASSWORD)),
     'set VERIFY_TOKEN or VERIFY_USER + VERIFY_PASSWORD').toBe(true);
-  // The runner's cookie rule, checked again for the replay target: cookies ignore the port, so with password login an
-  // allowed origin on BASE's host would receive the session cookie.
   const host = new URL(BASE).hostname;
-  const sameHost = [...ALLOWED].filter((o) => o !== new URL(BASE).origin && new URL(o).hostname === host);
+  const sameHost = [...ALLOWED].filter((o) => o !== BASE_ORIGIN && new URL(o).hostname === host);
   expect(Boolean(process.env.VERIFY_TOKEN) || sameHost.length === 0,
     \`allowed origins \${sameHost.join(', ')} share the host of \${BASE}; with password login the session cookie would be sent there\`).toBe(true);
   await apiLogin(context, BASE, process.env);` : '';
-    // Contextual typing gives the copied functions typed parameters, so the spec passes `tsc --strict`.
     const loginFn = needsLogin ? `
-// Same API login as verify_ui.mjs (copied from its apiLogin): no steps spent on the login form.
 const apiLogin: (context: BrowserContext, base: string, env: NodeJS.ProcessEnv) => Promise<string> = ${apiLogin.toString()};
 ` : '';
     const metaLines = [
@@ -1665,70 +1576,30 @@ const apiLogin: (context: BrowserContext, base: string, env: NodeJS.ProcessEnv) 
     return `// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-// Frozen by verify_ui.mjs from a passing plan, with the same oracle: allowed origins only, every step settles, and page
-// errors, >= 500 /api/v4/ responses, requests still running at the deadline, or leaving the allowed origins fail.
-// It checks the server the run checked; set VERIFY_REPLAY_BASE_URL to point it at another one.
-${metaBlock}import {chromium, expect, test, type Browser, type BrowserContext, type Page, type Request} from '@playwright/test';
+// Frozen by verify_ui.mjs from a passing plan, with the same oracle. Set VERIFY_REPLAY_BASE_URL to retarget.
+${metaBlock}import {chromium, expect, test, type APIResponse, type Browser, type BrowserContext, type Page, type Request} from '@playwright/test';
 import * as http from 'node:http';
 import * as net from 'node:net';
 
 const BASE = process.env.VERIFY_REPLAY_BASE_URL || ${q(base)};
-const AUTHED = ${needsLogin ? 'true' : 'false'}; // an anonymous plan stays anonymous even where VERIFY_TOKEN is set
-const ALLOWED = new Set([new URL(BASE).origin, ...${q(allowOrigins)}.map((o: string) => new URL(o).origin)]);
+const BASE_ORIGIN = new URL(BASE).origin;
+const AUTHED = ${needsLogin ? 'true' : 'false'};
+const ALLOWED = new Set([BASE_ORIGIN, ...${q(allowOrigins)}.map((o: string) => new URL(o).origin)]);
 const SETTLE_MS = Number(process.env.VERIFY_SETTLE_MS ?? ${DEFAULT_SETTLE_MS});
 const QUIET_MS = ${QUIET_MS};
 const TIMEOUT = ${ACTION_TIMEOUT_MS};
 const MAX_BODY_BYTES = ${MAX_BODY_BYTES};
 
 const originOf: (url: string) => string | null = ${originOf.toString()};
-${typedSubset()}
-
-// API calls of a signed-in plan carry the token or auto X-CSRF-Token on writes; errors keep only their first line.
-async function apiCall(page: Page, path: string, method = 'GET', body?: unknown) {
-  const token = AUTHED ? process.env.VERIFY_TOKEN : undefined;
-  const auth: Record<string, string> = token ? {Authorization: \`Bearer \${token}\`} : {};
-  let csrf: Record<string, string> = {};
-  if (method !== 'GET' && !token) {
-    const c = (await page.context().cookies(BASE)).find((x) => x.name === 'MMCSRF');
-    if (c) {
-      csrf = {'X-CSRF-Token': c.value};
-    }
-  }
-  const serialized = body !== undefined ? JSON.stringify(body) : undefined;
-  if (serialized !== undefined) {
-    expect(new TextEncoder().encode(serialized).length, \`expanded api.body exceeds \${MAX_BODY_BYTES} bytes\`).toBeLessThanOrEqual(MAX_BODY_BYTES);
-  }
-  const contentType: Record<string, string> = serialized !== undefined ? {'Content-Type': 'application/json'} : {};
-  const opts: {method: string; headers: Record<string, string>; maxRedirects: number; data?: string} = {
-    method,
-    headers: {'X-Requested-With': 'XMLHttpRequest', ...contentType, ...auth, ...csrf},
-    maxRedirects: 0,
-  };
-  if (serialized !== undefined) {
-    opts.data = serialized;
-  }
-  try {
-    return await page.request.fetch(new URL(path, BASE).toString(), opts);
-  } catch (err) {
-    throw new Error(String(err instanceof Error ? err.message : err).split('\\n')[0]);
-  }
-}
-
-function readJsonPath(obj: unknown, dotPath: string): unknown {
-  let cur: unknown = obj;
-  for (const seg of dotPath.replace(/\\[(\\d+)\\]/g, '.$1').split('.').filter(Boolean)) {
-    if (cur === null || cur === undefined || typeof cur !== 'object') {
-      return undefined;
-    }
-    cur = (cur as Record<string, unknown>)[seg];
-  }
-  return cur;
-}
-${loginFn}
-// Same origin guard as verify_ui.mjs (copied from its startOriginGuard): Chromium connects only through this local
-// proxy, so a redirect hop never reaches an origin outside ALLOWED.
+${typedFn(subset, ['function subset(want, got) {', 'function subset(want: any, got: any): boolean {'])}
+const sendApiRequest: (reqHost: BrowserContext, base: string, method: string, apiPath: string, body: unknown, env: NodeJS.ProcessEnv, maxBytes: number) => Promise<APIResponse> = ${typedFn(sendApiRequest, ["const headers = {'X-Requested-With': 'XMLHttpRequest'};", "const headers: Record<string, string> = {'X-Requested-With': 'XMLHttpRequest'};"])};
+const readJsonPath: (obj: unknown, dotPath: string) => unknown = ${typedFn(readJsonPath, ['cur = cur[seg];', 'cur = (cur as Record<string, unknown>)[seg];'])};
+const expandPath: (raw: string, origin: string, vars: Record<string, string>, mustBeApi: boolean) => string = ${expandPath.toString()};
+${typedFn(expandBody, ['function expandBody(val, vars) {', 'function expandBody(val: unknown, vars: Record<string, string>): unknown {'], ['Object.entries(val)', 'Object.entries(val as Record<string, unknown>)'])}${loginFn}
 const startOriginGuard: (httpMod: typeof http, netMod: typeof net, allowed: Set<string>, onBlocked: (origin: string) => void) =>
-  Promise<{port: number, close: () => void}> = ${typedGuard()};
+  Promise<{port: number, close: () => void}> = ${typedFn(startOriginGuard, ['const strip = (h) => {', 'const strip = (h: Record<string, string | string[] | undefined>) => {'])};
+const attachPageGuards: (context: BrowserContext, page: Page, allowedSet: Set<string>, originOfFn: (url: string) => string | null, timeoutMs: number, problems: string[], soft: string[], onBlocked: (origin: string) => void, diagnostics: string[] | null) => Promise<{inflight: Set<Request>; lastAt: () => number}> = ${typedFn(attachPageGuards, ['const inflight = new Set();', 'const inflight = new Set<Request>();'], ['const loading = new Set();', 'const loading = new Set<unknown>();'], ['const done = (r) => {', 'const done = (r: Request) => {'])};
+const waitSettle: (page: Page, inflight: Set<Request>, lastAt: () => number, limit: number, quietMs: number) => Promise<string | null> = ${waitSettle.toString()};
 
 let browser: Browser | undefined;
 let guard: {port: number, close: () => void} | undefined;
@@ -1744,117 +1615,18 @@ test.afterEach(async () => {
 
 test(${q(plan.name ?? 'frozen /verify plan')}, async () => {
   expect(Number.isFinite(SETTLE_MS) && SETTLE_MS > 0, 'VERIFY_SETTLE_MS must be a positive number').toBe(true);
-  // As long as the runner may take: login, every step and expectation at their limits, and the final settle.
   test.setTimeout(60000 + ${steps} * (TIMEOUT + SETTLE_MS) + ${expects} * TIMEOUT + SETTLE_MS);
   const vars: Record<string, string> = {};
-  const expandPath = (raw: string, mustBeApi: boolean): string => {
-    const out = raw.replace(/\\$([A-Za-z_][A-Za-z0-9_]*)/g, (_: string, name: string) => {
-      expect(Object.prototype.hasOwnProperty.call(vars, name), \`unknown saved variable $\${name}\`).toBe(true);
-      const val = vars[name];
-      expect(/^[A-Za-z0-9._~-]+$/.test(val), \`saved variable $\${name} has unsafe URL token\`).toBe(true);
-      return val;
-    });
-    const u = new URL(out, BASE);
-    expect(u.origin, \`path \${out} left \${BASE}\`).toBe(new URL(BASE).origin);
-    if (mustBeApi) {
-      expect(/^\\/(?:api\\/v4\\/|oauth\\/|plugins\\/[A-Za-z0-9][A-Za-z0-9._-]*\\/)/.test(u.pathname), \`path \${out} left /api/v4/, /oauth/ or /plugins/<id>/\`).toBe(true);
-    }
-    return out;
-  };
-  const expandBody = (val: unknown): unknown => {
-    if (typeof val === 'string') {
-      return val.replace(/\\$([A-Za-z_][A-Za-z0-9_]*)/g, (_: string, name: string) => {
-        expect(Object.prototype.hasOwnProperty.call(vars, name), \`unknown saved variable $\${name}\`).toBe(true);
-        return vars[name];
-      });
-    }
-    if (Array.isArray(val)) {
-      return val.map((v) => expandBody(v));
-    }
-    if (val !== null && typeof val === 'object') {
-      const rec = val as Record<string, unknown>;
-      const out: Record<string, unknown> = {};
-      for (const k of Object.keys(rec)) {
-        out[k] = expandBody(rec[k]);
-      }
-      return out;
-    }
-    return val;
-  };
   guard = await startOriginGuard(http, net, ALLOWED, () => {});
   browser = await chromium.launch({args: [\`--proxy-server=http://127.0.0.1:\${guard.port}\`, '--proxy-bypass-list=<-loopback>']});
   const context = await browser.newContext({viewport: {width: 1280, height: 800}});
-  // Skip the webapp's desktop-app landing page, as verify_ui.mjs does.
-  await context.addInitScript((origin: string) => {
-    try {
-      if (location.origin === origin) {
-        localStorage.setItem('__landingPageSeen__', 'true');
-      }
-    } catch {
-      // about:blank or storage blocked
-    }
-  }, new URL(BASE).origin);
+  await context.addInitScript(${landingPageSeen.toString().replace('(origin)', '(origin: string)')}, BASE_ORIGIN);
   const page = await context.newPage();
   const problems: string[] = [];
-  const inflight = new Set<Request>();
-  let lastActivityAt = Date.now();
-  await context.route('**/*', (route) => {
-    const origin = originOf(route.request().url());
-    return origin === null || ALLOWED.has(origin) ? route.continue() : route.abort('blockedbyclient');
-  });
-  const loading = new Set<unknown>();
-  page.on('request', (r) => {
-    inflight.add(r);
-    lastActivityAt = Date.now();
-    if (r.isNavigationRequest()) {
-      loading.add(r.frame());
-    }
-    const origin = originOf(r.url());
-    if (origin !== null && !ALLOWED.has(origin) && r.redirectedFrom()) {
-      problems.push(\`redirected to a non-allowed origin: \${r.method()} \${origin}\`);
-    } else if (origin !== null && !ALLOWED.has(origin) && r.isNavigationRequest() && r.frame() === page.mainFrame()) {
-      problems.push(\`navigated to a non-allowed origin: \${origin}\`);
-    }
-  });
-  page.on('requestfinished', (r) => {
-    inflight.delete(r);
-    lastActivityAt = Date.now();
-  });
-  page.on('requestfailed', (r) => {
-    inflight.delete(r);
-    lastActivityAt = Date.now();
-  });
-  page.on('framenavigated', (frame) => {
-    if (!loading.delete(frame)) {
-      return; // an in-page URL change (history.pushState) cancels nothing
-    }
-    for (const r of inflight) {
-      if (r.frame() === frame && !r.isNavigationRequest()) {
-        inflight.delete(r);
-        lastActivityAt = Date.now();
-      }
-    }
-  });
-  page.on('websocket', (ws) => {
-    const origin = originOf(ws.url());
-    if (origin !== null && !ALLOWED.has(origin)) {
-      problems.push(\`websocket to a non-allowed origin: \${origin}\`);
-    }
-  });
-  page.on('pageerror', (err) => problems.push(\`pageerror: \${err.message.split('\\n')[0]}\`));
-  page.on('response', (res) => {
-    if (res.status() >= 500 && new URL(res.url()).pathname.startsWith('/api/v4/')) {
-      problems.push(\`HTTP \${res.status()} from \${new URL(res.url()).pathname}\`);
-    }
-  });
-  page.setDefaultTimeout(TIMEOUT);
-  // Wait until nothing has been in flight for QUIET_MS (at most SETTLE_MS), then apply the oracle, as verify_ui.mjs does.
+  const tracker = await attachPageGuards(context, page, ALLOWED, originOf, TIMEOUT, problems, problems, () => {}, null);
   const settle = async () => {
-    const start = Date.now();
-    while (Date.now() - start < SETTLE_MS && (inflight.size || Date.now() - Math.max(start, lastActivityAt) < QUIET_MS)) {
-      await page.waitForTimeout(50);
-    }
-    expect(inflight.size, 'requests still in flight at the settle deadline').toBe(0);
+    const late = await waitSettle(page, tracker.inflight, tracker.lastAt, SETTLE_MS, QUIET_MS);
+    expect(tracker.inflight.size, late ?? 'requests still in flight at the settle deadline').toBe(0);
     const origin = originOf(page.url());
     expect(!page.url().startsWith('chrome-error:') && (origin === null || ALLOWED.has(origin)),
       \`the page left the allowed origins: \${page.url()}\`).toBe(true);

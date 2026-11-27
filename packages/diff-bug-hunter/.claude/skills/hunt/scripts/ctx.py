@@ -26,7 +26,18 @@ from typing import Any, NamedTuple
 
 import prefilter
 import reliability
-from hunt_common import REPO, InfraError, git, git_cmd, hunt_dir, hunt_lock, read_text_lossy, sh, write_json
+from hunt_common import (
+    REPO,
+    InfraError,
+    git,
+    git_cmd,
+    hunt_dir,
+    hunt_lock,
+    read_optional_dict,
+    read_text_lossy,
+    sh,
+    write_json,
+)
 
 MAX_SOURCE_LINES = 1500     # bigger changed files are shown as windows around the hunks
 MAX_SIBLING_LINES = 3000    # total sibling test lines per batch
@@ -53,15 +64,20 @@ def hunk_ranges(patch: str) -> list[tuple[int, int]]:
     return [(int(m.group(1)), int(m.group(2) or 1)) for m in re.finditer(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", patch, re.M)]
 
 
-def source_view(wt: Path, path: str, patch: str) -> str:
+def source_view(wt: Path, path: str, patch: str, focus_lines: list[int] | None = None, window: int = 40) -> str:
     lines = (wt / path).read_text(errors="replace").split("\n")
     if len(lines) <= MAX_SOURCE_LINES:
         return numbered(lines, 1, len(lines))
-    parts = []
-    for start, n in hunk_ranges(patch):
-        a, b = max(1, start - 40), min(len(lines), start + n + 40)
-        parts.append(numbered(lines, a, b))
-    return "\n   ...\n".join(parts)
+    spans = [(max(1, start - 40), min(len(lines), start + n + 40)) for start, n in hunk_ranges(patch)]
+    if focus_lines is not None:
+        for ln in focus_lines:
+            c = min(len(lines), max(1, ln))
+            spans.append((max(1, c - window), min(len(lines), c + window)))
+        spans = [(a, b) for a, b in spans if a <= b]
+        if not spans:
+            return numbered(lines, 1, min(len(lines), 120))
+        spans = _merge_spans(spans)
+    return "\n   ...\n".join(numbered(lines, a, b) for a, b in spans)
 
 
 def request_patch(patch: str) -> str:
@@ -519,6 +535,14 @@ def caller_counts(wt: Path, chosen: list[prefilter.FileDiff]) -> dict[str, int]:
 
 
 SQL_TEST_DIR = "server/channels/store/sqlstore"  # Go store tests exercise the migrations
+GO_TEST = re.compile(r"^func (Test(?:[A-Z_0-9]\w*)?)\((?:\w+ )?\*(?:\w+\.)?T\)")
+
+
+def target_entry(d: str, lang: str, mode_tag: str, sample: Path | None = None) -> dict[str, str]:
+    if lang == "go":
+        m = re.search(r"^package (\w+)", read_text_lossy(sample), re.M) if sample else None
+        return {"lang": "go", "dir": d, "path": f"{d}/hunt_hunt{mode_tag}_test.go", "package": m.group(1) if m else "?"}
+    return {"lang": "jest", "dir": d, "path": f"{d}/hunt_{mode_tag}.test.tsx"}
 
 
 def test_targets(wt: Path, files: list[str]) -> list[dict[str, str]]:
@@ -528,62 +552,43 @@ def test_targets(wt: Path, files: list[str]) -> list[dict[str, str]]:
     for f in files:
         d = str(Path(f).parent)
         if f.endswith(".sql"):
-            gofiles = sorted((wt / SQL_TEST_DIR).glob("*.go")) if (wt / SQL_TEST_DIR).is_dir() else []
-            gofiles = [p for p in gofiles if not p.name.endswith("_test.go")]
+            gofiles = [p for p in (sorted((wt / SQL_TEST_DIR).glob("*.go")) if (wt / SQL_TEST_DIR).is_dir() else [])
+                       if not p.name.endswith("_test.go")]
             if not gofiles:
                 continue
             d, f = SQL_TEST_DIR, str(gofiles[0].relative_to(wt))
         if d in seen:
             continue
         seen.add(d)
-        if f.endswith(".go"):
-            m = re.search(r"^package (\w+)", read_text_lossy(wt / f), re.M)
-            out.append({"lang": "go", "dir": d, "path": f"{d}/hunt_hunt<mode>_test.go", "package": m.group(1) if m else "?"})
-        else:
-            out.append({"lang": "jest", "dir": d, "path": f"{d}/hunt_<mode>.test.tsx"})
+        out.append(target_entry(d, "go" if f.endswith(".go") else "jest", "<mode>", wt / f))
     return out
 
 
 def go_code(line: str) -> str:
     """One Go line without its trailing // comment (string, raw-string and rune literals respected), right-stripped."""
-    quote = ""
-    i = 0
-    while i < len(line):
-        c = line[i]
-        if quote:
-            if c == "\\" and quote != "`":
-                i += 1
-            elif c == quote:
-                quote = ""
-        elif c in "\"`'":
-            quote = c
-        elif line.startswith("//", i):
-            return line[:i].rstrip()
-        i += 1
-    return line.rstrip()
+    return code_only(line, "go", keep_strings=True)[0].rstrip()
+
+
+def go_bodies(src: str) -> dict[str, str]:
+    lines = src.split("\n")
+    return {name: "\n".join(lines[a - 1:b]) for name, a, b in top_blocks(lines, "go")}
 
 
 def changed_go_tests(patch: str, head_src: str) -> list[str]:
     """Top-level Test functions that contain an added or removed line (new tests and edited bodies alike)."""
     lines = head_src.split("\n")
-    decls = []  # (first line, last line, name); gofmt puts a top-level closing brace in column 0
-    for i, line in enumerate(lines, 1):
-        if line.startswith("func "):
-            # A trailing comment (`} // TestA`) does not hide the brace; `//` inside a literal is not a comment.
-            if go_code(line).endswith("}"):  # one-line body: func TestA(t *testing.T) {}
-                end = i
-            else:
-                end = next((j for j in range(i + 1, len(lines) + 1) if go_code(lines[j - 1]) == "}"), len(lines))
-            # Only what `go test -run` executes: top-level func TestX(t *testing.T), with the parameter name optional
-            # and any package qualifier (aliased or dot-imported testing). Not TestMain, benchmarks, helpers, or
-            # methods whose names happen to start with Test.
-            m = re.match(r"func (Test(?:[A-Z_0-9]\w*)?)\((?:\w+ )?\*(?:\w+\.)?T\)", line)
-            decls.append((i, end, m.group(1) if m else ""))
+    decls = [(a, b, m.group(1)) for _, a, b in top_blocks(lines, "go") if (m := GO_TEST.match(lines[a - 1]))]
     touched = changed_lines(patch)
-    names = set()
-    for t in touched:
-        names |= {name for start, end, name in decls if name and start <= t <= end}
-    return sorted(names)
+    return sorted({name for t in touched for start, end, name in decls if start <= t <= end})
+
+
+def changed_test_files(repo: Path, mb: str, head: str, dirs: set[str] | None = None, *, skip_hunt: bool = True) -> list[str]:
+    return [
+        f for f in git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head).splitlines()
+        if (dirs is None or str(Path(f).parent) in dirs)
+        and not (skip_hunt and Path(f).name.startswith("hunt_"))
+        and (f.endswith("_test.go") or re.search(r"\.test\.[jt]sx?$", f))
+    ]
 
 
 def own_tests(repo: Path, mb: str, head: str, dirs: set[str]) -> dict[str, Any]:
@@ -591,16 +596,13 @@ def own_tests(repo: Path, mb: str, head: str, dirs: set[str]) -> dict[str, Any]:
     names: list[str] = []
     by_dir: dict[str, set[str]] = {}
     jest: list[str] = []
-    for f in git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head).splitlines():
-        if str(Path(f).parent) not in dirs:
-            continue
+    for f in changed_test_files(repo, mb, head, dirs, skip_hunt=False):
         if f.endswith("_test.go"):
-            patch = git(repo, "diff", mb, head, "--", f)
-            found = changed_go_tests(patch, git(repo, "show", f"{head}:{f}"))
+            found = changed_go_tests(git(repo, "diff", mb, head, "--", f), git(repo, "show", f"{head}:{f}"))
             names += found
             if found:
                 by_dir.setdefault(str(Path(f).parent), set()).update(found)
-        elif re.search(r"\.test\.[jt]sx?$", f):
+        else:
             jest.append(f)
     return {"go": sorted(set(names)), "go_by_dir": {d: sorted(v) for d, v in sorted(by_dir.items())},
             "jest": sorted(jest)}
@@ -614,13 +616,9 @@ def pr_tests_diff(repo: Path, mb: str, head: str, dirs: set[str]) -> list[dict[s
     Added lines only, with their head line numbers, capped at MAX_PR_TEST_LINES in all."""
     out = []
     budget = MAX_PR_TEST_LINES
-    for f in git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head).splitlines():
+    for f in changed_test_files(repo, mb, head, dirs):
         if budget <= 0:
             break
-        if str(Path(f).parent) not in dirs or not (f.endswith("_test.go") or re.search(r"\.test\.[jt]sx?$", f)):
-            continue
-        if Path(f).name.startswith("hunt_"):
-            continue
         rows = []
         new = 0
         for line in git(repo, "diff", "-U0", mb, head, "--", f).splitlines():
@@ -744,7 +742,7 @@ def changed_lines(patch: str) -> set[int]:
 REGEX_BEFORE = re.compile(r"(^|[(,=:\[!&|?{};]|\breturn)\s*$")
 
 
-def code_only(line: str, lang: str, open_quote: str = "") -> tuple[str, str]:
+def code_only(line: str, lang: str, open_quote: str = "", *, keep_strings: bool = False) -> tuple[str, str]:
     """(code, quote still open at the end) for one Go or JS/TS line: string, rune, template-literal and JS regex
     contents and any `//` comment removed, so braces and `//` inside them don't count as code. `open_quote` carries a
     Go raw string or JS template literal across lines. Go raw strings have no escapes; JS template literals do. JSX
@@ -755,11 +753,16 @@ def code_only(line: str, lang: str, open_quote: str = "") -> tuple[str, str]:
     while i < len(line):
         c = line[i]
         if quote:
+            if keep_strings:
+                out.append(c)
             if c == "\\" and not (quote == "`" and lang == "go"):
                 i += 1
+                if keep_strings and i < len(line):
+                    out.append(line[i])
             elif c == quote:
                 quote = ""
-                out.append(c)
+                if not keep_strings:
+                    out.append(c)
         elif c in "\"'`":
             quote = c
             out.append(c)
@@ -1057,10 +1060,7 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any], *, al
     prev_state_path = hdir / "state.json"
     head_changed = False
     if prev_state_path.exists():
-        try:
-            prev = json.loads(prev_state_path.read_text())
-        except (OSError, ValueError):
-            prev = {}
+        prev = read_optional_dict(prev_state_path)
         prev_head = prev.get("head")
         prev_batch = prev.get("batch")
         if prev_head and prev_head != head:

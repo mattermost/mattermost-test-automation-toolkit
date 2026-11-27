@@ -3,18 +3,12 @@
 """Wave 2 /verify: license upload (V1), feature flags (V2), same-origin /oauth/ and /plugins/<id>/ plan paths (V3),
 ancestor base image (V6), two-dot range base (G1)."""
 
-import http.server
 import json
 import subprocess
-import sys
-import threading
-from pathlib import Path
 
-import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".claude" / "skills" / "verify" / "scripts"))
 import pr_server
-from test_hunt_engine import GIT_ENV, _module, needs_node
+import pytest
+from conftest import JsonHandler, _git, _module, http_server, needs_node
 
 SECRET = "SECRET-LICENSE-BODY-123"
 IMG = pr_server.IMAGE_REPO
@@ -34,26 +28,17 @@ def test_license_comes_from_the_file_first_then_the_env_and_is_none_when_unset(t
         pr_server.read_license({"MM_LICENSE_FILE": str(tmp_path / "missing")})
 
 
-class _LicenseFake(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        pass
-
+class _LicenseFake(JsonHandler):
     def do_POST(self):
         raw = self.rfile.read(int(self.headers["Content-Length"]))
         self.server.seen.append((self.path, self.headers["Content-Type"], self.headers["Authorization"], raw))
-        code = self.server.code
-        self.send_response(code)
-        self.end_headers()
-        self.wfile.write(json.dumps({"id": "api.license.add_license.invalid.app_error", "message": SECRET}).encode())
+        self._send(self.server.code, {"id": "api.license.add_license.invalid.app_error", "message": SECRET})
 
 
 @pytest.fixture
 def license_server():
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _LicenseFake)
-    srv.seen, srv.code = [], 200
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    yield srv, f"http://127.0.0.1:{srv.server_address[1]}"
-    srv.shutdown()
+    with http_server(_LicenseFake, seen=[], code=200) as res:
+        yield res
 
 
 def test_upload_license_posts_multipart_and_an_error_never_echoes_the_license(license_server):
@@ -117,10 +102,6 @@ def test_flag_names_are_validated_and_become_mm_env_pairs():
         with pytest.raises(pr_server.InfraError, match="not a feature flag name"):
             pr_server.parse_flags(bad)
     assert pr_server.flags_env(["FeatureA", "Other"]) == "MM_FEATUREFLAGS_FEATUREA=true,MM_FEATUREFLAGS_OTHER=true"
-
-
-def _git(cwd, *args):
-    subprocess.run(["git", *args], cwd=cwd, env=GIT_ENV, check=True, capture_output=True)
 
 
 def test_flags_come_from_added_diff_lines_only(tmp_path):

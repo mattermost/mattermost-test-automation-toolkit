@@ -268,7 +268,24 @@ def mutant_system(state: dict[str, Any], count: int, ids: str, avoid: str = "") 
 def review_system(targets: list[dict[str, str]], r_ctx: dict[str, Any]) -> str:
     r_langs = sorted({t["lang"] for t in targets})
     lang_rules = "".join(prompt(f"lang_{lang}") for lang in r_langs)
-    return prompt("mode_r").replace("{lang_rules}", lang_rules).replace("{lessons}", lessons.render(lessons.match(r_ctx)))
+    match_ctx = {**r_ctx, "changed_files_head_source": r_ctx.get("changed_files_head_source")
+                 or r_ctx.get("thread_files_head_source", [])}
+    return prompt("mode_r").replace("{lang_rules}", lang_rules).replace("{lessons}", lessons.render(lessons.match(match_ctx)))
+
+
+def _active_tier(hdir: Path, tag: str, default_when_missing: str = "sonnet") -> str:
+    opus_path, req_path = hdir / tag / "request.opus.json", hdir / tag / "request.json"
+    if opus_path.exists():
+        return str(json.loads(opus_path.read_text()).get("tier") or "opus")
+    if req_path.exists():
+        return str(json.loads(req_path.read_text()).get("tier") or "sonnet")
+    return default_when_missing
+
+
+def _backup_prev_response(hdir: Path, tag: str) -> tuple[Path, Path]:
+    prev, kept = hdir / tag / "response.json", hdir / tag / "response.prev.json"
+    kept.write_text(prev.read_text())
+    return prev, kept
 
 
 def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
@@ -291,10 +308,7 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
             reason = meta.get("skipped_reason") or f"0 qualifying CodeRabbit threads ({len(meta.get('skipped', []))} skipped)"
             print(f"[R] {reason}; no request written")
             return
-        r_ctx = {"changed_files_head_source": user["thread_files_head_source"],
-                 "diff_production_code": user["diff_production_code"],
-                 "sibling_tests_and_helpers": user["sibling_tests_and_helpers"]}
-        print(write(hdir, "R", review_system(meta["targets"], r_ctx), user, REVIEW_SCHEMA))
+        print(write(hdir, "R", review_system(meta["targets"], user), user, REVIEW_SCHEMA))
     elif what == "retry":
         tag = arg
         if tag.upper() == "R":
@@ -307,22 +321,14 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
             sys.exit(f"{prev} must be a JSON object")
         if prev_data.get("files"):
             sys.exit(f"{prev} is not empty: retry is only for hunters that returned files: []")
-        kept = hdir / tag / "response.prev.json"
-        kept.write_text(prev.read_text())
+        _backup_prev_response(hdir, tag)
         req_path = hdir / tag / "request.json"
-        opus_path = hdir / tag / "request.opus.json"
-        tier = "sonnet"
-        if opus_path.exists():
-            tier = str(json.loads(opus_path.read_text()).get("tier") or "opus")
+        tier = _active_tier(hdir, tag)
         if req_path.exists():
             prev_req = json.loads(req_path.read_text())
             system = prev_req["system"] + prompt("retry_empty")
             user = {**json.loads(prev_req["user"]), "previous_response": prev_data}
             schema = prev_req["schema"]
-            if not opus_path.exists():
-                tier = str(prev_req.get("tier") or "sonnet")
-        elif tag.upper() == "R":
-            sys.exit(f"{req_path} missing: run `build_requests.py <pr> review` before retrying R")
         else:
             system = hunter_system(tag[0], state, ctx, strategies=True) + prompt("retry_empty")
             user = {**hunter_user(tag, ctx), "previous_response": prev_data}
@@ -362,16 +368,9 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
         log = hdir / f"compile_{tag}.log"
         if not log.exists():
             sys.exit(f"{log} missing: run.py run {pr} {tag} must have reported COMPILE_ERROR")
-        prev = hdir / tag / "response.json"
-        kept = hdir / tag / "response.prev.json"
-        kept.write_text(prev.read_text())
+        prev, kept = _backup_prev_response(hdir, tag)
         req_path = hdir / tag / "request.json"
-        opus_path = hdir / tag / "request.opus.json"
-        tier = "sonnet"
-        if opus_path.exists():
-            tier = str(json.loads(opus_path.read_text()).get("tier") or "opus")
-        elif req_path.exists():
-            tier = str(json.loads(req_path.read_text()).get("tier") or "sonnet")
+        tier = _active_tier(hdir, tag)
         if tag == "R":
             if not req_path.exists():
                 sys.exit(f"{req_path} missing: run `build_requests.py {pr} review` first")

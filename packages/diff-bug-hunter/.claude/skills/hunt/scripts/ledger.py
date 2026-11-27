@@ -22,7 +22,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from hunt_common import InfraError, hunt_dir, load_json, read_state, scratch, target_key, under, write_json
+from hunt_common import (
+    InfraError,
+    hunt_dir,
+    load_json,
+    read_optional_dict,
+    read_optional_json,
+    read_state,
+    scratch,
+    target_key,
+    under,
+    write_json,
+)
 from verdict import admissibility
 from verdicts import Verdict
 
@@ -36,20 +47,6 @@ def ledger_path(override: Path | None = None) -> Path:
         return override.resolve()
     env = os.environ.get("HUNT_LEDGER", "").strip()
     return Path(env).resolve() if env else scratch() / "hunt_ledger.jsonl"
-
-
-def _read_optional_json(path: Path) -> Any:
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def _read_optional_dict(path: Path) -> dict[str, Any]:
-    data = _read_optional_json(path)
-    return data if isinstance(data, dict) else {}
 
 
 def _batch_sort_key(path: Path) -> tuple[int, int, int, str]:
@@ -74,7 +71,7 @@ def _read_verdict_json(bdir: Path) -> dict[str, Any] | None:
     vpath = bdir / "verdict.json"
     if not vpath.is_file():
         return None
-    data = _read_optional_dict(vpath)
+    data = read_optional_dict(vpath)
     keep, held = data.get("keep"), data.get("held")
     if not (isinstance(keep, list) or isinstance(held, list)):
         return None
@@ -103,13 +100,13 @@ def _batch_verdicts(bdir: Path, root: Path, *, require_verdict_json: bool = Fals
 
 def _batch_has_raw_bug(bdir: Path) -> bool:
     for tag in ("A", "A2", "B"):
-        base_data = _read_optional_json(bdir / f"base_{tag}.json")
+        base_data = read_optional_json(bdir / f"base_{tag}.json")
         if isinstance(base_data, dict) and any(
             k not in ("*", "detail", "new_api") and v == Verdict.NEW_PR_BUG
             for k, v in base_data.items()
         ):
             return True
-    diff_data = _read_optional_json(bdir / "diff_D.json")
+    diff_data = read_optional_json(bdir / "diff_D.json")
     return isinstance(diff_data, dict) and any(v == Verdict.DIFF for v in diff_data.values())
 
 
@@ -162,19 +159,19 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
     reached_sum = 0
     exec_sum = 0
     mode_gaps = False
-    raw_modes = _read_optional_dict(hdir / "driver.json").get("modes") or _read_optional_dict(hdir / "state.json").get("modes")
+    raw_modes = read_optional_dict(hdir / "driver.json").get("modes") or read_optional_dict(hdir / "state.json").get("modes")
     recorded_modes = [str(m) for m in raw_modes] if isinstance(raw_modes, list) else None
 
     for bdir in _batch_dirs(hdir):
         for tag in ("A", "A2", "B"):
-            resp = _read_optional_dict(bdir / tag / "response.json")
+            resp = read_optional_dict(bdir / tag / "response.json")
             empty_resp = resp.get("files") == []
             if tag == "A" and empty_resp:
                 counts["mode_a_empty"] += 1
             if empty_resp:
                 mode_gaps = True
 
-            run_data = _read_optional_json(bdir / f"run_{tag}.json")
+            run_data = read_optional_json(bdir / f"run_{tag}.json")
             head_fails: set[str] = set()
             if isinstance(run_data, dict):
                 for k, v in run_data.items():
@@ -189,7 +186,7 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
                     or (bdir / f"compile_{tag}.log").exists():
                 mode_gaps = True
 
-            base_data = _read_optional_json(bdir / f"base_{tag}.json")
+            base_data = read_optional_json(bdir / f"base_{tag}.json")
             if isinstance(base_data, dict):
                 if head_fails and any(str(base_data.get(t, "")) not in (Verdict.NEW_PR_BUG, Verdict.PRE_EXISTING) for t in head_fails):
                     mode_gaps = True
@@ -216,10 +213,10 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
         d_present = any((bdir / p).exists() for p in ("D/request.json", "D/response.json", "compile_D.log", "diff_D.json"))
         d_expected = ("D" in recorded_modes) if recorded_modes is not None else d_present
         if d_expected or d_present:
-            d_resp = _read_optional_dict(bdir / "D" / "response.json")
+            d_resp = read_optional_dict(bdir / "D" / "response.json")
             if (bdir / "D" / "response.json").exists() and not d_resp.get("files"):
                 mode_gaps = True
-            diff_data = _read_optional_json(bdir / "diff_D.json")
+            diff_data = read_optional_json(bdir / "diff_D.json")
             if isinstance(diff_data, dict):
                 if not diff_data:
                     mode_gaps = True
@@ -229,7 +226,7 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
             else:
                 mode_gaps = True
 
-        cov_data = _read_optional_json(bdir / "run_A.coverage.json")
+        cov_data = read_optional_json(bdir / "run_A.coverage.json")
         if isinstance(cov_data, dict):
             reached_sum += int(cov_data.get("reached") or 0)
             exec_sum += int(cov_data.get("executable") or 0)
@@ -258,8 +255,8 @@ def _tier_and_gaps(hdir: Path, counts: dict[str, int],
                    reached: int, executable: int, deferred_count: int,
                    batches_hunted: int, batches_total: int,
                    mode_gaps: bool, verdicts: dict[str, Any]) -> tuple[str, list[str]]:
-    pr_tests_data = _read_optional_dict(hdir / "pr_tests.json")
-    old_tests_data = _read_optional_dict(hdir / "old_tests.json")
+    pr_tests_data = read_optional_dict(hdir / "pr_tests.json")
+    old_tests_data = read_optional_dict(hdir / "old_tests.json")
     pr_tests_map = pr_tests_data.get("tests")
     old_tests_map = old_tests_data.get("tests")
     pr_vals = set(pr_tests_map.values()) if isinstance(pr_tests_map, dict) else set()
@@ -289,7 +286,7 @@ def _tier_and_gaps(hdir: Path, counts: dict[str, int],
         for h in resolved_held
     )
 
-    threads_doc = _read_optional_dict(hdir / "R" / "threads.json")
+    threads_doc = read_optional_dict(hdir / "R" / "threads.json")
     has_pending_r = bool(threads_doc.get("included")) and not verdicts
     r_compile_gap = (hdir / "compile_R.log").exists() and not (hdir / "run_R.json").exists()
     r_gaps = any(
@@ -325,7 +322,7 @@ def _export_escapes(hdir: Path, state: dict[str, Any], pr_key: str,
     """Export verified Mode R escapes (Mode R PROVEN NEW_PR_BUG/NEW_API while standalone A/B/D missed)."""
     if any(caught_by_tag.values()) or counts["diff"] > 0:
         return []
-    resp = _read_optional_dict(hdir / "R" / "response.json")
+    resp = read_optional_dict(hdir / "R" / "response.json")
     raw_files = resp.get("files")
     files_by_path = {
         str(f["path"]): str(f.get("content", ""))
@@ -380,7 +377,7 @@ def record(pr: str, hdir: Path | None = None, out_path: Path | None = None) -> d
     counts, caught_by_tag, reached, executable, mode_gaps = _aggregate_modes(hdir)
     deferred_count, skip_reasons = _skipped_info(hdir)
 
-    verdict_doc = _read_optional_dict(hdir / "review_verdicts.json")
+    verdict_doc = read_optional_dict(hdir / "review_verdicts.json")
     raw_verdicts = verdict_doc.get("verdicts")
     verdicts = raw_verdicts if isinstance(raw_verdicts, dict) else {}
     r_summary = {"proven": 0, "disproven": 0, "unprovable": 0, "unprovable_high_severity": 0}
@@ -397,10 +394,10 @@ def record(pr: str, hdir: Path | None = None, out_path: Path | None = None) -> d
             if item.get("severity") in ("critical", "major"):
                 r_summary["unprovable_high_severity"] += 1
 
-    pr_tests_data = _read_optional_dict(hdir / "pr_tests.json")
+    pr_tests_data = read_optional_dict(hdir / "pr_tests.json")
     pr_tests_map = pr_tests_data.get("tests")
     pr_statuses = sorted(set(pr_tests_map.values())) if isinstance(pr_tests_map, dict) else []
-    cov_data = _read_optional_dict(hdir / "run_A.coverage.json") or None
+    cov_data = read_optional_dict(hdir / "run_A.coverage.json") or None
     pr_key = target_key(pr)
     escapes = _export_escapes(hdir, state, pr_key, verdicts, caught_by_tag, counts, skip_reasons, cov_data, out_file)
 

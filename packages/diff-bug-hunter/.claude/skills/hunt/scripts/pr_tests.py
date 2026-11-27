@@ -24,15 +24,14 @@ if not sys.pycache_prefix:
 
 import fcntl
 import os
-import signal
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
-from ctx import changed_go_tests
-from hunt_common import InfraError, clean_untracked, git, hunt_dir, hunt_lock, read_state, terminate_handler, write_json
+from ctx import changed_go_tests, changed_test_files
+from hunt_common import InfraError, clean_untracked, git, hunt_dir, read_state, run_locked_cli, write_json
 from run import PACKAGE_FAILED, CompileError, Outcome, classify, ensure_clean, go_run
 from verdicts import Verdict
 
@@ -98,9 +97,8 @@ def ci_env(parallel: bool) -> Iterator[None]:
 def plan(repo: Path, mb: str, head: str) -> tuple[list[dict[str, Any]], list[str]]:
     """One unit per directory with added or modified Go test files: the Test functions those files add or change."""
     by_dir: dict[str, set[str]] = {}
-    for line in git(repo, "diff", "--name-status", "--no-renames", "--diff-filter=AM", mb, head).splitlines():
-        _, _, path = line.partition("\t")
-        if not path.endswith("_test.go") or Path(path).name.startswith("hunt_"):
+    for path in changed_test_files(repo, mb, head):
+        if not path.endswith("_test.go"):
             continue
         found = changed_go_tests(git(repo, "diff", mb, head, "--", path), git(repo, "show", f"{head}:{path}"))
         if found:
@@ -111,12 +109,8 @@ def plan(repo: Path, mb: str, head: str) -> tuple[list[dict[str, Any]], list[str
 
 def _run(wt: Path, unit: dict[str, Any], tests: list[str], parallel: bool) -> Outcome:
     o = Outcome()
-    with ci_env(parallel):
-        if parallel:
-            with pg_pool_lock():
-                go_run(wt, {unit["dir"]: "^(" + "|".join(tests) + ")$"}, False, o)
-        else:
-            go_run(wt, {unit["dir"]: "^(" + "|".join(tests) + ")$"}, False, o)
+    with ci_env(parallel), (pg_pool_lock() if parallel else nullcontext()):
+        go_run(wt, {unit["dir"]: "^(" + "|".join(tests) + ")$"}, False, o)
     return o
 
 
@@ -176,22 +170,19 @@ def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(__doc__)
         return 1
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, terminate_handler)
     hdir = hunt_dir(argv[1])
-    try:
-        with hunt_lock(hdir, argv[1]):
-            out = cmd_pr(hdir, read_state(hdir))
-    except InfraError as e:
-        print(f"INFRA_ERROR {e}")
-        return 2
-    if not out["units"]:
-        print("[pr] the PR adds or edits no Go test: nothing to run")
-    for n, v in out["tests"].items():
-        print(f"[pr] {n}: {v}")
-    for k in out["skipped"]:
-        print(f"[pr] skipped: {k}")
-    return 0
+
+    def _run() -> int:
+        out = cmd_pr(hdir, read_state(hdir))
+        if not out["units"]:
+            print("[pr] the PR adds or edits no Go test: nothing to run")
+        for n, v in out["tests"].items():
+            print(f"[pr] {n}: {v}")
+        for k in out["skipped"]:
+            print(f"[pr] skipped: {k}")
+        return 0
+
+    return run_locked_cli(argv[1], hdir, _run)
 
 
 if __name__ == "__main__":

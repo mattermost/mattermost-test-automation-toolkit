@@ -5,21 +5,15 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from pathlib import Path
 
 import pytest
-from test_hunt_engine import FUZZ_CLAMP, JESTDEPS, _add_to_response, make_hunt, run  # imports the scripts
-
-needs_jest = pytest.mark.skipif(not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir(),
-                                reason="run `make jest-deps` first")
+from conftest import assert_clean_wts, make_hunt, needs_jest
+from test_hunt_engine import FUZZ_CLAMP, _add_to_response, run  # imports the scripts
 
 
 def _clean(state: dict) -> None:
-    for key in ("wt", "wt_base"):
-        wt = Path(state[key])
-        assert not list(wt.rglob("hunt_*")) and not (wt / "calc" / "testdata").exists()
-        run.ensure_clean(wt)
+    assert_clean_wts(state, check_testdata=True)
 
 
 def test_go_test_of_an_api_the_pr_adds_is_new_api_and_does_not_hide_the_rest(tmp_path):

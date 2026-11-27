@@ -36,28 +36,26 @@ import math
 import os
 import re
 import shutil
-import signal
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ctx import changed_lines, top_blocks
+from ctx import changed_lines, go_bodies, top_blocks
 from hunt_common import (
     InfraError,
     git,
     git_cmd,
     hunt_dir,
-    hunt_lock,
     load_json,
     node_env,
     read_state,
     read_text_lossy,
     require_disk,
+    run_locked_cli,
     scratch,
     sh,
-    terminate_handler,
     under,
     write_json,
 )
@@ -557,12 +555,26 @@ JS_MISSING = re.compile(r"\(0 , (?:\w+\.)?(\w+)\) is not a function|(\S+) is not
 MAX_SALVAGE_ROUNDS = 3  # rounds that remove tests; dropping an import a removal left unused is not counted
 
 
-def go_build_errors(wt: Path, d: str) -> str:
+def go_build_errors(wt: Path, d: str, extra_dirs: set[str] | None = None) -> str:
     """Every compiler error of one package's tests (-gcflags=-e lifts the default cap of 10)."""
     root = go_root(wt, d)
-    p = sh(["go", "test", "-c", "-o", os.devnull, "-gcflags=-e", "./" + _rel(wt, d, root)], root,
-           check=False, timeout=900)
+    flags = ["-gcflags=-e"]
+    if extra_dirs is not None:
+        flags = []
+        for ed in sorted(extra_dirs):
+            lp = sh(["go", "list", "-f", "{{.ImportPath}}", "./" + _rel(wt, ed, root)], root, check=False, timeout=300)
+            if lp.returncode == 0 and lp.stdout.strip():
+                flags.append(f"-gcflags={lp.stdout.strip().splitlines()[0]}=-e")
+    p = sh(["go", "test", "-c", "-o", os.devnull, *flags, "./" + _rel(wt, d, root)], root, check=False, timeout=900)
     return p.stdout + p.stderr
+
+
+def parse_go_errors(errors: str, root: Path, rx: re.Pattern[str] = GO_ERROR) -> list[tuple[Path, int, str]]:
+    out: list[tuple[Path, int, str]] = []
+    for m in rx.finditer(errors):
+        raw = Path(m.group(1))
+        out.append(((raw if raw.is_absolute() else root / raw).resolve(), int(m.group(2)), m.group(3).strip()))
+    return out
 
 
 def undefined_names(msg: str) -> list[str]:
@@ -581,9 +593,7 @@ def go_repair(wt: Path, placed: list[Path], d: str) -> tuple[dict[str, list[str]
     drop_import: dict[Path, set[int]] = {}
     texts = {p: p.read_text().split("\n") for p in mine.values()}
     blocks = {p: top_blocks(texts[p], "go") for p in mine.values()}
-    for m in GO_ERROR.finditer(go_build_errors(wt, d)):
-        f = (root / m.group(1)).resolve()
-        line, msg = int(m.group(2)), m.group(3).strip()
+    for f, line, msg in parse_go_errors(go_build_errors(wt, d), root):
         if f not in mine:
             return None
         p = mine[f]
@@ -739,15 +749,34 @@ def _unit_key(rel: str) -> str:
     return str(Path(rel).parent) if rel.endswith(".go") else os.path.normpath(rel)
 
 
+def group_by_unit(files: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for f in files:
+        grouped.setdefault(_unit_key(str(f.get("path", ""))), []).append(f)
+    return grouped
+
+
+def _place_units(
+    root: Path, by_unit: dict[str, list[dict[str, str]]], targets: set[str], keys: list[str] | None = None,
+) -> list[tuple[str, list[Path]]]:
+    all_placed: list[Path] = []
+    units: list[tuple[str, list[Path]]] = []
+    try:
+        for uk in (by_unit if keys is None else keys):
+            up = place(root, by_unit[uk], targets)
+            all_placed.extend(up)
+            units.append((uk, up))
+    except BaseException:
+        unplace(all_placed)
+        raise
+    return units
+
+
 def _failing_base_units(
     files: list[dict[str, str]], failing: set[str],
 ) -> list[tuple[str, list[dict[str, str]], set[str]]]:
     """Group response files into independent base-vetting units (Go package dir or Jest file) that have FAIL_3_OF_3."""
-    grouped: dict[str, list[dict[str, str]]] = {}
-    for f in files:
-        key = _unit_key(str(f.get("path", "")))
-        grouped.setdefault(key, []).append(f)
-    return [(k, grp, uf) for k, grp in grouped.items()
+    return [(k, grp, uf) for k, grp in group_by_unit(files).items()
             if (uf := {n for n in failing if n.startswith(f"{k}::")})]
 
 
@@ -965,22 +994,16 @@ def _confirm_diff_on_base(
     """R5: rerun the merge-base once, only for the units that hold a DIFF recorder, and keep the DIFF only on records
     the two base runs agree on. A DIFF whose every differing record is unstable on base becomes NONDETERMINISTIC; a
     unit that cannot be rerun keeps its first-run verdict."""
-    units = sorted({u for _, u, *_ in pending})
-    placed_all: list[Path] = []
-    unit_paths: list[tuple[str, list[Path]]] = []
+    unit_paths = _place_units(wt_base, by_unit, targets, sorted({u for _, u, *_ in pending}))
     try:
-        for u in units:
-            up = place(wt_base, by_unit[u], targets)
-            placed_all.extend(up)
-            unit_paths.append((u, up))
         with tempfile.TemporaryDirectory() as td:
             try:
                 _, recs2, errors2, _, _ = _diff_unit_pass(wt_base, state, tag, unit_paths, Path(td), "base2",
                                                           base=True)
             except InfraError:  # the rerun could not run: every pending DIFF keeps its first-run verdict
-                recs2, errors2 = {}, dict.fromkeys(units, "base rerun failed")
+                recs2, errors2 = {}, {u: "base rerun failed" for u, _ in unit_paths}
     finally:
-        unplace(placed_all)
+        unplace([p for _, ps in unit_paths for p in ps])
     for ident, u_key, rkey, a, stable, base1, cmp_idx in pending:
         if u_key in errors2 or rkey not in recs2:
             detail[ident]["base_rerun"] = "not available; DIFF from one base run"
@@ -1025,29 +1048,14 @@ def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str
         write_json(hdir / f"diff_{tag}.examples.json", detail)
         return verdicts
     targets = {t["dir"] for t in state["targets"]}
-    by_unit: dict[str, list[dict[str, str]]] = {}
-    for f in files:
-        by_unit.setdefault(_unit_key(str(f.get("path", ""))), []).append(f)
-
-    def _place_units(root: Path) -> list[tuple[str, list[Path]]]:
-        all_placed: list[Path] = []
-        units: list[tuple[str, list[Path]]] = []
-        try:
-            for uk, ufiles in by_unit.items():
-                up = place(root, ufiles, targets)
-                all_placed.extend(up)
-                units.append((uk, up))
-        except BaseException:
-            unplace(all_placed)
-            raise
-        return units
+    by_unit = group_by_unit(files)
 
     with tempfile.TemporaryDirectory() as td_str:
         td = Path(td_str)
         runs: list[Outcome] = []
         head_recs: list[dict[tuple[str, str], dict[int, dict[str, Any]]]] = []
         head_raw: list[str] = []
-        head_units = _place_units(wt)
+        head_units = _place_units(wt, by_unit, targets)
         try:
             for pass_i in range(2):
                 o, recs, _, _, raw = _diff_unit_pass(wt, state, tag, head_units, td, f"head{pass_i + 1}")
@@ -1063,7 +1071,7 @@ def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str
         base = Outcome()
         base_recs: dict[tuple[str, str], dict[int, dict[str, Any]]] = {}
         base_raw: list[str] = []
-        base_units = _place_units(wt_base)
+        base_units = _place_units(wt_base, by_unit, targets)
         try:
             base, base_recs, base_errors, gone, base_raw = _diff_unit_pass(wt_base, state, tag, base_units, td, "base", base=True)
         finally:
@@ -1268,29 +1276,18 @@ def go_cover_binary(wt: Path, d: str, changed: dict[str, set[int]], td: Path) ->
 def go_test_coverage(wt: Path, d: str, name: str, changed: dict[str, set[int]],
                      prebuilt: tuple[Path | None, list[str]] | None = None) -> dict[str, tuple[set[int], set[int]]] | None:
     """Run one Go test alone with coverage of the changed packages in its module; None if no profile was written."""
+    if prebuilt is None:
+        with tempfile.TemporaryDirectory() as bin_td:
+            return go_test_coverage(wt, d, name, changed, prebuilt=go_cover_binary(wt, d, changed, Path(bin_td)))
     root = go_root(wt, d)
-    if prebuilt is not None:
-        bin_path, go_files = prebuilt
-        if not go_files:
-            return {}
-        if bin_path is None:
-            return None
-        with tempfile.TemporaryDirectory() as td:
-            prof = Path(td) / "cover.out"
-            sh([str(bin_path), f"-test.run=^{name}$", f"-test.coverprofile={prof}"], wt / d, check=False, timeout=1800)
-            if not prof.exists():
-                return None
-            text = prof.read_text()
-        return {f: go_profile_lines(text, _rel(wt, f, root)) for f in go_files}
-    go_files = [f for f in changed if f.endswith(".go") and not f.endswith("_test.go")
-                and (wt / f).resolve().is_relative_to(root.resolve())]
+    bin_path, go_files = prebuilt
     if not go_files:
         return {}
-    pkgs = sorted({"./" + _rel(wt, Path(f).parent, root) for f in go_files})
+    if bin_path is None:
+        return None
     with tempfile.TemporaryDirectory() as td:
         prof = Path(td) / "cover.out"
-        sh(["go", "test", "-count=1", "-run", f"^{name}$", f"-coverprofile={prof}", "-coverpkg=" + ",".join(pkgs),
-            "./" + _rel(wt, d, root)], root, check=False, timeout=1800)
+        sh([str(bin_path), f"-test.run=^{name}$", f"-test.coverprofile={prof}"], wt / d, check=False, timeout=1800)
         if not prof.exists():
             return None
         text = prof.read_text()
@@ -1409,11 +1406,7 @@ def fuzz_time() -> str:
 
 
 def func_body(src: str, name: str) -> str | None:
-    lines = src.split("\n")
-    for sym, a, b in top_blocks(lines, "go"):
-        if sym == name:
-            return "\n".join(lines[a - 1:b])
-    return None
+    return go_bodies(src).get(name)
 
 
 def corpus_args(entry: str) -> list[str] | None:
@@ -1519,11 +1512,10 @@ def main(argv: list[str]) -> int:
         print(__doc__)
         return 1
     cmd, pr, tag = argv[1], argv[2], argv[3]
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, terminate_handler)
     hdir = hunt_dir(pr)
-    try:
-        with hunt_lock(hdir, pr):
+
+    def _run_cmd() -> int:
+        try:
             state = read_state(hdir)  # inside the lock: ctx.py may be rewriting it
             if cmd == "run":
                 table = cmd_run(hdir, state, tag)
@@ -1569,14 +1561,13 @@ def main(argv: list[str]) -> int:
                 for v in cmd_mutants(hdir, state, tag):
                     extra = v["killers"] or v.get("detail", "")[:160]
                     print(f"{v['id']}{' (held back)' if v['held_back'] else ''}: {v['verdict']} {extra}")
-    except InfraError as e:
-        print(f"INFRA_ERROR {e}")
-        return 2
-    except CompileError as e:
-        (hdir / f"compile_{tag}.log").write_text(str(e))  # input for `build_requests.py <pr> repair <tag>`
-        print(f"COMPILE_ERROR {e}")
-        return 3
-    return 0
+        except CompileError as e:
+            (hdir / f"compile_{tag}.log").write_text(str(e))  # input for `build_requests.py <pr> repair <tag>`
+            print(f"COMPILE_ERROR {e}")
+            return 3
+        return 0
+
+    return run_locked_cli(pr, hdir, _run_cmd)
 
 
 if __name__ == "__main__":
