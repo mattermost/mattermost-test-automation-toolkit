@@ -42,6 +42,7 @@ if not sys.pycache_prefix:
 
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -68,12 +69,15 @@ from run import (
     classify,
     ensure_clean,
     go_build_errors,
+    go_compile_binary,
     go_root,
     go_run,
     jest_run,
     parse_go_errors,
 )
 from verdicts import Verdict
+
+_REAL_GO_RUN = go_run
 
 JEST_TEST = re.compile(r"\.test\.[jt]sx?$")
 MAX_UNITS = 20  # Go packages plus Jest files per hunt; the rest are listed as skipped
@@ -293,10 +297,13 @@ def _run_unit(wt: Path, wt_base: Path, unit: dict[str, Any], swap: Swap,
     tests = list(unit["tests"])
     removed: dict[str, str] = {}  # Test functions the salvage had to delete -> compiler errors
 
-    def run_once(w: Path, only: list[str]) -> Outcome:
+    def run_once(w: Path, only: list[str], bins: dict[str, Path] | None = None) -> Outcome:
         o = Outcome()
         if go:
-            go_run(w, {unit["dir"]: "^(" + "|".join(only) + ")$"}, False, o)
+            if bins is not None:
+                go_run(w, {unit["dir"]: "^(" + "|".join(only) + ")$"}, False, o, bins=bins)
+            else:
+                go_run(w, {unit["dir"]: "^(" + "|".join(only) + ")$"}, False, o)
         else:
             jest_run(w, [unit["file"]], "", o)
         return o
@@ -309,7 +316,12 @@ def _run_unit(wt: Path, wt_base: Path, unit: dict[str, Any], swap: Swap,
         rounds = 0
         while not heads:
             try:
-                heads = [run_once(wt, tests) for _ in range(RUNS)]
+                if go and RUNS > 1 and go_run is _REAL_GO_RUN and (wt / unit["dir"]).is_dir():
+                    with tempfile.TemporaryDirectory() as td:
+                        bins = {unit["dir"]: go_compile_binary(wt, unit["dir"], False, Path(td) / "old.test")}
+                        heads = [run_once(wt, tests, bins=bins) for _ in range(RUNS)]
+                else:
+                    heads = [run_once(wt, tests) for _ in range(RUNS)]
             except CompileError as e:
                 first_error = first_error or str(e)
                 step = None

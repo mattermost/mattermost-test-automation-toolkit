@@ -17,7 +17,7 @@ import signal
 import subprocess
 import tempfile
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -89,17 +89,64 @@ class InfraError(RuntimeError):
 
 
 @contextmanager
-def hunt_lock(hdir: Path, pr: str | int) -> Iterator[None]:
-    """One step at a time per PR: prepare.py resets the worktrees, ctx.py rewrites the hunt dir and run.py places
-    tests in the worktrees, so any two of them running together would corrupt each other's results."""
+def hunt_lock(hdir: Path, pr: str | int, scope: str = "all", *, tag: str = "") -> Iterator[None]:
+    """Coordinate concurrent hunt steps per PR.
+
+    - 'all': exclusive lock on .lock (prepare.py, ctx.py, old_tests.py, run.py diff).
+    - 'wt' / 'wt_base': shared lock on .lock plus exclusive lock on .lock.<scope> so head and base can run together.
+      With `tag`, also an exclusive .lock.tag.<tag>: head and base of one tag share its artifacts, so they serialize.
+    """
+    if scope not in ("all", "wt", "wt_base"):
+        raise ValueError(f"unknown hunt_lock scope: {scope!r}")
+    if tag and not re.fullmatch(r"[A-Za-z0-9_]+", tag):
+        raise ValueError(f"invalid hunt_lock tag: {tag!r}")
     hdir.mkdir(parents=True, exist_ok=True)
-    with (hdir / ".lock").open("w") as fh:
+    with ExitStack() as stack:
+        fh = stack.enter_context((hdir / ".lock").open("w"))
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if scope == "all":
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                sub_fh = stack.enter_context((hdir / f".lock.{scope}").open("w"))
+                fcntl.flock(sub_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if tag:
+                    tag_fh = stack.enter_context((hdir / f".lock.tag.{tag}").open("w"))
+                    fcntl.flock(tag_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as e:
             raise InfraError(f"another hunt step (prepare.py, ctx.py or run.py) is using PR {pr}; "
                              "run them one at a time") from e
         yield
+
+
+STATEFUL_GO_PREFIXES = (
+    "server/channels/api4",
+    "server/channels/app",
+    "server/channels/store",
+    "server/channels/web",
+    "server/channels/wsapi",
+)
+
+
+@contextmanager
+def pg_pool_lock() -> Iterator[None]:
+    """Serialize parallel Postgres test-pool runs across concurrent hunts on the same host."""
+    lock_path = Path(os.environ.get("HUNT_PG_LOCK") or Path(tempfile.gettempdir()) / f"hunt-pg-pool-{os.getuid()}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def maybe_pg_pool_lock(pkg_dir: str) -> AbstractContextManager[None]:
+    """Acquire pg_pool_lock for stateful Mattermost Go packages when ENABLE_FULLY_PARALLEL_TESTS is not 'true'."""
+    is_stateful = any(pkg_dir == p or pkg_dir.startswith(p + "/") for p in STATEFUL_GO_PREFIXES)
+    if os.environ.get("ENABLE_FULLY_PARALLEL_TESTS") == "true" or not is_stateful:
+        return nullcontext()
+    return pg_pool_lock()
 
 
 def node_env() -> dict[str, str]:
@@ -219,11 +266,11 @@ def write_atomic(path: Path, data: Any) -> None:
     os.replace(tmp, path)
 
 
-def run_locked_cli(pr: str, hdir: Path, fn: Callable[[], int]) -> int:
+def run_locked_cli(pr: str, hdir: Path, fn: Callable[[], int], *, scope: str = "all", tag: str = "") -> int:
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, terminate_handler)
     try:
-        with hunt_lock(hdir, pr):
+        with hunt_lock(hdir, pr, scope=scope, tag=tag):
             return fn()
     except InfraError as e:
         print(f"INFRA_ERROR {e}")
