@@ -137,6 +137,59 @@ def normalize_failure(text: str, wt: Path) -> str:
     return text[-4000:]
 
 
+_COMPARE_RE: tuple[tuple[re.Pattern[str], str], ...] = (
+    # 1. Temp dir paths (macOS /var/folders, Linux/Go /tmp, /private/tmp)
+    (re.compile(
+        r"(?:/private)?/var/folders/[A-Za-z0-9_+-]+/[A-Za-z0-9_+-]+/T"
+        r"(?:/(?:Test[A-Za-z0-9_.-]*\d{4,}|[^\s\"'`<>()\[\]{},;:/]*\d{5,}[^\s\"'`<>()\[\]{},;:/]*))?"
+    ), "<tmpdir>"),
+    (re.compile(
+        r"(?:/private)?/tmp/(?:Test[A-Za-z0-9_.-]*\d{4,}|[^\s\"'`<>()\[\]{},;:/]*\d{5,}[^\s\"'`<>()\[\]{},;:/]*)"
+    ), "<tmpdir>"),
+    # 2. Ephemeral loopback ports (preserve loopback host form)
+    (re.compile(r"\b(127\.0\.0\.1|localhost):\d+\b", re.I), r"\1:<port>"),
+    (re.compile(r"\[::1\]:\d+\b"), "[::1]:<port>"),
+    # 3. Go time.Time monotonic clock suffix
+    (re.compile(r"\bm=[+-]\d+\.\d+\b"), "m=<mono>"),
+    # 4. UUIDs (8-4-4-4-12 hex; before long hex so the 12-char final group is not split)
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<uuid>"),
+    # 5. Mattermost storetest random DB names: db<NewId> / db<random> (before 26-char ID because 'db' has no \b)
+    (re.compile(r"\bdb(?:[ybndrfg8ejkmcpqxot1uwisza345h769]{26}|(?=[a-z0-9]*\d)[a-z0-9]{20,})\b"), "<db>"),
+    # 6. Mattermost 26-char zbase32 model.NewId() (digit+letter lookahead spares 26-letter English words & 'a'*26)
+    (re.compile(
+        r"(?<![A-Za-z0-9])"
+        r"(?=[ybndrfg8ejkmcpqxot1uwisza345h769]*[13456789])"
+        r"(?=[ybndrfg8ejkmcpqxot1uwisza345h769]*[a-z])"
+        r"[ybndrfg8ejkmcpqxot1uwisza345h769]{26}"
+        r"(?![A-Za-z0-9])"
+    ), "<id>"),
+    # 7. Epoch timestamps (13-19 digit millis/micros/nanos; before long hex so 16-19 digit ints don't become <hex>)
+    (re.compile(r"(?<![A-Za-z0-9.])\d{13,19}(?![A-Za-z0-9.])"), "<epoch>"),
+    # 8. Long hex IDs / container IDs / hashes (12-64 mixed hex+digit; spares 'a'*26, '0'*16, and 0x02/0xdeadbeef)
+    (re.compile(
+        r"(?<![A-Za-z0-9])(?=[0-9a-fA-F]*[0-9])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{12,64}(?![A-Za-z0-9])"
+    ), "<hex>"),
+    # 9. React useId() tokens (:r...:, _r_..._; digit/1-char rule spares emojis/CSS like :rocket:, :rage:, :root:)
+    (re.compile(r":(?:r|R)(?:[0-9a-z]|(?=[0-9a-z]*\d)[0-9a-z]{2,}):"), "<react-id>"),
+    (re.compile(r"(?<![A-Za-z0-9])_r_(?:[0-9a-z]|(?=[0-9a-z]*\d)[0-9a-z]{2,})_(?![A-Za-z0-9])"), "<react-id>"),
+    # 10. Keyed request/trace/correlation/session/container/instance IDs (handles '=' and JSON '": "')
+    (re.compile(
+        r"(?i)\b((?:x[-_])?(?:request|req|trace|span|correlation|session|container|instance)[_-]?id)\b"
+        r"([\"']?\s*[:=]\s*[\"']?)"
+        r"(?:(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{8,}|[A-Za-z0-9_-]{16,})"
+        r"(?![A-Za-z0-9_-])"
+    ), r"\1\2<id>"),
+)
+
+
+def normalize_for_compare(text: str) -> str:
+    """Redact ephemeral per-run IDs/ports/temp-paths/timestamps only when comparing head vs base failures.
+    Raw failure text in run_<tag>.messages.json is kept unredacted for reporting, Mode V, and Skeptic."""
+    for rx, rep in _COMPARE_RE:
+        text = rx.sub(rep, text)
+    return text
+
+
 def go_test_output(out: str) -> dict[str, str]:
     """Output lines per top-level Go test, from -v output (=== RUN / === CONT switch the current test)."""
     blocks: dict[str, list[str]] = {}
@@ -633,7 +686,7 @@ def base_verdict(name: str, base_status: str, head: dict[str, str], head_msgs: d
         return Verdict.NEW_PR_BUG
     if base_status != Verdict.FAIL:
         return base_status
-    if name in head_msgs and head_msgs[name] == base_msg:
+    if name in head_msgs and normalize_for_compare(head_msgs[name]) == normalize_for_compare(base_msg):
         return Verdict.PRE_EXISTING
     if MISSING_ON_BASE.search(base_msg):
         # Jest (Babel, no type check) loads a test of a function the PR adds; on base it fails as "not a function".
