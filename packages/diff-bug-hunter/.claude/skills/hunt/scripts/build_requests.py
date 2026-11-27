@@ -26,6 +26,7 @@ sys.dont_write_bytecode = True
 if not sys.pycache_prefix:
     sys.pycache_prefix = "/dev/null/hunt-pyc"
 
+import hashlib
 import json
 import os
 import re
@@ -36,13 +37,143 @@ import lessons
 import reliability
 import review_threads
 import trusted
-from hunt_common import InfraError, hunt_dir, load_json, read_state, write_json
+from hunt_common import SCHEMA_VERSION, SKILL_DIR, InfraError, hunt_dir, load_json, read_state, write_json
 
-HUNTER_SCHEMA = {"type": "object", "required": ["files", "tests"],
-                 "properties": {"files": {"type": "array"}, "tests": {"type": "array"}}}
-REVIEW_SCHEMA = {"type": "object", "required": ["files", "tests", "claims"],
-                 "properties": {"files": {"type": "array"}, "tests": {"type": "array"}, "claims": {"type": "array"}}}
+HUNTER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["files"],
+    "properties": {
+        "files": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "required": ["path", "content"],
+                "properties": {
+                    "path": {"type": "string", "minLength": 1, "maxLength": 240},
+                    "content": {"type": "string", "maxLength": 32000},
+                },
+            },
+        },
+        "tests": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "test_name": {"type": "string", "maxLength": 200},
+                    "source": {"type": "string", "maxLength": 300},
+                },
+            },
+        },
+    },
+}
+REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["files", "claims"],
+    "properties": {
+        "files": {
+            "type": "array",
+            "maxItems": 12,
+            "items": {
+                "type": "object",
+                "required": ["path", "content"],
+                "properties": {
+                    "path": {"type": "string", "minLength": 1, "maxLength": 240},
+                    "content": {"type": "string", "maxLength": 32000},
+                },
+            },
+        },
+        "tests": {
+            "type": "array",
+            "maxItems": 45,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "test_name": {"type": "string", "maxLength": 200},
+                    "claim_id": {"type": "string", "maxLength": 40},
+                    "source": {"type": "string", "maxLength": 300},
+                },
+            },
+        },
+        "claims": {
+            "type": "array",
+            "maxItems": 15,
+            "items": {
+                "type": "object",
+                "required": ["id", "testable", "tests", "reason"],
+                "properties": {
+                    "id": {"type": "string", "minLength": 1, "maxLength": 40},
+                    "testable": {"type": "boolean"},
+                    "tests": {"type": "array", "maxItems": 10, "items": {"type": "string", "maxLength": 200}},
+                    "reason": {"type": "string", "maxLength": 400},
+                },
+            },
+        },
+    },
+}
 MUTANT_SCHEMA = {"type": "object", "required": ["mutants"], "properties": {"mutants": {"type": "array"}}}
+
+V_SYSTEM = (
+    "You are the diagnostic step of a bug hunt. Each candidate below is a test that failed 3 of 3 times on the PR head "
+    "and passed on the merge-base. Write exactly one bounded diagnostic test per candidate. It must isolate the root "
+    "cause with the smallest input, use only the code given in this request, and assert the merge-base behaviour that "
+    "the candidate asserts. Name Go tests TestHuntV_<Name> and Jest tests 'HuntV_<name>' (the title must start with HuntV_), in the same package or "
+    "component directory as the candidate. Report only what the test shows, never the PR's intent. Put the tests in "
+    "the `files` array and name each in `tests`. Output one JSON object matching the schema, nothing else."
+)
+SKEPTIC_SYSTEM = (
+    "You are the skeptic of a bug hunt. For each candidate, decide KEEP, DROP or HELD. The request gives the PR's "
+    "title and description, the production diff, callers of the changed code (an `entry_point: true` caller is an API "
+    "route, websocket handler, plugin hook or UI entry), and per candidate the test source, its head failure or "
+    "differential examples, and the command that reproduces it. "
+    "KEEP when the failure is a behaviour a production user or caller can hit and the PR's description does not ask "
+    "for it: name the real caller in `caller`, the entry point in `entry_point` (API route, UI component or screen, "
+    "job, plugin hook), the root-cause `file_line` from the diff, and copy the candidate's `repro_cmd`. "
+    "DROP when the evidence shows intended behaviour (the description or diff asks for it), a test that asserts the "
+    "wrong thing, or input no caller can produce. HELD only when the request lacks something you need to decide; "
+    "say what in `reason`. A candidate with mechanical_verdict NEW_API has no merge-base to compare with: KEEP it "
+    "only when the failing assertion contradicts the PR's own description or an existing invariant shown in the "
+    "diff. Give `reason` in one or two sentences. Copy the candidate's `id` and `source`. Set `evidence_path` to "
+    "the artifact the evidence came from, and `fix_check` to null. Output JSON {\"rows\": [...]} matching the "
+    "schema, one row per candidate, and nothing else. "
+    "Every row also carries `reason_code` and `evidence_quote`, which code checks: KEEP uses BUG. A DROP must use "
+    "INTENDED (evidence_quote is copied verbatim from the PR description, the production diff or pr_tests_diff), "
+    "UNREACHABLE (evidence_quote names the guard, copied verbatim from the diff or a caller's source) or "
+    "WRONG_ASSERTION (evidence_quote is the wrong assertion, copied verbatim from the candidate's test_source). "
+    "HELD uses NEEDS_INPUT. A DROP whose quote is not found verbatim is held, not dropped."
+)
+
+
+def prompt_version(skill_dir: Path = SKILL_DIR, schema_version: int = SCHEMA_VERSION) -> str:
+    """Deterministic hash of prompts, rules, schemas, driver system prompts, and schema version."""
+    h = hashlib.sha256()
+
+    def _read(rel: str) -> str:
+        path = skill_dir / rel
+        try:
+            return trusted.read(rel, skill_dir)
+        except InfraError:
+            return path.read_text() if path.exists() else ""
+
+    prompts_dir = skill_dir / "prompts"
+    names = sorted(p.name for p in prompts_dir.glob("*.md")) if prompts_dir.is_dir() else []
+    for name in names:
+        h.update(f"prompts/{name}\0".encode())
+        h.update(_read(f"prompts/{name}").encode())
+        h.update(b"\0")
+    for rel in ("RELIABILITY.md", "lessons.jsonl", "vetted.schema.json", "finding.schema.json"):
+        h.update(f"{rel}\0".encode())
+        h.update(_read(rel).encode())
+        h.update(b"\0")
+    h.update(json.dumps({"HUNTER_SCHEMA": HUNTER_SCHEMA, "REVIEW_SCHEMA": REVIEW_SCHEMA}, sort_keys=True).encode())
+    h.update(b"\0")
+    h.update(V_SYSTEM.encode())
+    h.update(b"\0")
+    h.update(SKEPTIC_SYSTEM.encode())
+    h.update(b"\0")
+    h.update(str(schema_version).encode())
+    return h.hexdigest()[:16]
 
 
 def prompt(name: str) -> str:
@@ -80,9 +211,10 @@ def render_text(value: Any, level: int = 2) -> str:
     return json.dumps(value)
 
 
-def write_request(path: Path, system: str, user: dict[str, Any], schema: dict[str, Any], response_path: Path) -> Path:
+def write_request(path: Path, system: str, user: dict[str, Any], schema: dict[str, Any], response_path: Path,
+                  *, tier: str = "sonnet") -> Path:
     """request.json for the scripts, and the same request as text next to it (.md) for the agent that answers it."""
-    req = {"tier": "opus", "system": system, "user": json.dumps(user, indent=1), "schema": schema,
+    req = {"tier": tier, "system": system, "user": json.dumps(user, indent=1), "schema": schema,
            "response_path": str(response_path)}
     write_json(path, req)
     text = "\n\n".join([
@@ -93,8 +225,9 @@ def write_request(path: Path, system: str, user: dict[str, Any], schema: dict[st
     return path
 
 
-def write(hdir: Path, tag: str, system: str, user: dict[str, Any], schema: dict[str, Any]) -> Path:
-    return write_request(hdir / tag / "request.json", system, user, schema, hdir / tag / "response.json")
+def write(hdir: Path, tag: str, system: str, user: dict[str, Any], schema: dict[str, Any],
+          *, tier: str = "sonnet") -> Path:
+    return write_request(hdir / tag / "request.json", system, user, schema, hdir / tag / "response.json", tier=tier)
 
 
 def hunter_system(mode: str, state: dict[str, Any], ctx: dict[str, Any], strategies: bool = False) -> str:
@@ -177,18 +310,24 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
         kept = hdir / tag / "response.prev.json"
         kept.write_text(prev.read_text())
         req_path = hdir / tag / "request.json"
+        opus_path = hdir / tag / "request.opus.json"
+        tier = "sonnet"
+        if opus_path.exists():
+            tier = str(json.loads(opus_path.read_text()).get("tier") or "opus")
         if req_path.exists():
             prev_req = json.loads(req_path.read_text())
             system = prev_req["system"] + prompt("retry_empty")
             user = {**json.loads(prev_req["user"]), "previous_response": prev_data}
             schema = prev_req["schema"]
+            if not opus_path.exists():
+                tier = str(prev_req.get("tier") or "sonnet")
         elif tag.upper() == "R":
             sys.exit(f"{req_path} missing: run `build_requests.py <pr> review` before retrying R")
         else:
             system = hunter_system(tag[0], state, ctx, strategies=True) + prompt("retry_empty")
             user = {**hunter_user(tag, ctx), "previous_response": prev_data}
             schema = HUNTER_SCHEMA
-        write_request(hdir / tag / "request.retry.json", system, user, schema, prev)
+        write_request(hdir / tag / "request.retry.json", system, user, schema, prev, tier=tier)
         print(hdir / tag / "request.retry.json")
     elif what == "mutants":
         print(write(hdir, "M", mutant_system(state, 3, "M1, M2, M3"), mutant_user(ctx), MUTANT_SCHEMA))
@@ -227,6 +366,12 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
         kept = hdir / tag / "response.prev.json"
         kept.write_text(prev.read_text())
         req_path = hdir / tag / "request.json"
+        opus_path = hdir / tag / "request.opus.json"
+        tier = "sonnet"
+        if opus_path.exists():
+            tier = str(json.loads(opus_path.read_text()).get("tier") or "opus")
+        elif req_path.exists():
+            tier = str(json.loads(req_path.read_text()).get("tier") or "sonnet")
         if tag == "R":
             if not req_path.exists():
                 sys.exit(f"{req_path} missing: run `build_requests.py {pr} review` first")
@@ -243,7 +388,7 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
                     "compiler_error": log.read_text()[-4000:]}
             system = hunter_system(tag[0], state, ctx) + prompt("repair")
             schema = HUNTER_SCHEMA
-        write_request(hdir / tag / "request.repair.json", system, user, schema, prev)
+        write_request(hdir / tag / "request.repair.json", system, user, schema, prev, tier=tier)
         print(hdir / tag / "request.repair.json")
     else:
         sys.exit(__doc__)

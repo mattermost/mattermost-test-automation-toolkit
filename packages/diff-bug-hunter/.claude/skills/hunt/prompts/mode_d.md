@@ -29,7 +29,7 @@ Rules:
   `describe('HuntD', ...)`. Go file `hunt_huntd_test.go`, Jest file `hunt_d.test.tsx` (or `.ts`), at the path in
   `your_test_files`. The Mode A and Mode B rules about invariants, citations and assertions do not apply to you.
 - `source` of each entry in `tests` names the target, why you chose it over the changed function (or that you could not),
-  and the `file:line` of its callers or of the base code the edge cases came from. `checks` is "differential recorder".
+  and the `file:line` of its callers or of the base code the edge cases came from.
 Go helpers: copy these into your file once (they must not be redeclared; add the imports encoding/json, fmt, math/rand, os):
 ```go
 func huntDErr(err error) any {

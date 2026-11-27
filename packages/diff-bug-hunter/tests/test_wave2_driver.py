@@ -436,11 +436,27 @@ def test_end_to_end_go_bug_driver_writes_findings_audit_and_telemetry_and_resume
             "dispatch"} <= stages
     assert all(r["exit"] == "ok" for r in rows)
     calls_first = log.read_text().splitlines()
-    assert {"A", "B", "D", "vet"} <= set(calls_first)
+    assert {"A", "B", "vet"} <= set(calls_first)
+    assert "D" not in calls_first
     # Resume: every output exists, so nothing is dispatched again and the findings are unchanged.
     assert _run_driver(monkeypatch, tmp_path, "master..feature", responses, log, cmd) == 0
     assert log.read_text().splitlines() == calls_first
     assert json.loads((hdir / "findings.json").read_text()) == findings
+
+
+def test_end_to_end_go_bug_driver_runs_mode_d_when_opted_in(tmp_path, monkeypatch):
+    _e2e_repo(tmp_path, "go_bug", monkeypatch)
+    responses, log = _canned(tmp_path, "go_bug", "calc::TestHuntA_ClampRangeAndIdentity", "A")
+    cmd = _fake(tmp_path, "fake_dispatch.py", FAKE_DISPATCH)
+    monkeypatch.setenv("HUNT_DISPATCH_CMD", cmd)
+    monkeypatch.setenv("FAKE_RESPONSES", str(responses))
+    monkeypatch.setenv("FAKE_LOG", str(log))
+    assert hunt.main(["hunt.py", "master..feature", "--modes", "A,B,D"]) == 0
+    calls = log.read_text().splitlines()
+    assert {"A", "B", "D", "vet"} <= set(calls)
+    hdir = hunt_dir("master..feature")
+    assert json.loads((hdir / "driver.json").read_text())["modes"] == ["A", "B", "D"]
+    assert json.loads((hdir / "state.json").read_text())["modes"] == ["A", "B", "D"]
 
 
 def test_end_to_end_react_bug_driver_finds_the_react_regression(tmp_path, monkeypatch):

@@ -22,6 +22,7 @@ from typing import Any
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 LESSONS_FILE = SKILL_DIR / "lessons.jsonl"
+SCHEMA_VERSION = 1
 
 REPO = os.environ.get("HUNT_REPO", "mattermost/mattermost")
 

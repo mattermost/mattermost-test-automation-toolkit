@@ -30,7 +30,7 @@ NON_VERDICT_CAPS = frozenset({
     "M1", "M2", "M3", "M5",  # mutant ids
     "S1", "S2", "S3", "S4",  # strategy ids in strategy_x.md
     "REQ", "RELIABILITY",  # placeholder and file name
-    "ENABLE_FULLY_PARALLEL_TESTS", "HUNT_FUZZ", "HUNT_FUZZ_TIME", "HUNT_PR_TEST_PARALLEL", "HUNT_SCRATCH",  # env vars
+    "DISABLE_PROMPT_CACHING", "ENABLE_FULLY_PARALLEL_TESTS", "HUNT_FUZZ", "HUNT_FUZZ_TIME", "HUNT_PR_TEST_PARALLEL", "HUNT_SCRATCH",  # env vars
 })
 
 

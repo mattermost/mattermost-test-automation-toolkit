@@ -35,9 +35,12 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import build_requests
+import prefilter
 from ctx import reset_hunt_dir
 from hunt_common import (
     REPO,
+    SCHEMA_VERSION,
     SKILL_DIR,
     InfraError,
     git,
@@ -54,7 +57,6 @@ from hunt_common import (
     write_json,
 )
 
-SCHEMA_VERSION = 1  # bump when the hunt dir layout or prepare.json changes meaning: resuming an older one is refused
 PG_MAX_CONNECTIONS = 400  # 4 parallel hunts x parallel Go test packages, each with its own pool
 PG_CONTAINER, PG_IMAGE = "hunt-pg", "postgres:18.3"  # the pinned Postgres (CLAUDE.md); mmuser/mostest as start_pg.sh
 REDIS_CONTAINER, REDIS_IMAGE = "hunt-redis", "redis:7"
@@ -248,10 +250,15 @@ def webapp_deps(wt: Path, wt_base: Path, mb: str, head: str) -> None:
             dst.symlink_to(src)
 
 
+def huntable_changed(repo: Path, mb: str, head_ref: str) -> list[str]:
+    changed = git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head_ref).splitlines()
+    return [f for f in changed if not prefilter.excluded(f)]
+
+
 def deps(repo: Path, wt: Path, wt_base: Path, mb: str, head_ref: str) -> tuple[bool, bool]:
     """What the changed files need: go.work for Go, Postgres and Redis for stateful server code, npm ci for the webapp.
     Returns (go_changed, web_changed). Shared with eval_bugs.py, which hunts historical commits instead of PRs."""
-    changed = git(repo, "diff", "--name-only", "--no-renames", mb, head_ref).splitlines()
+    changed = huntable_changed(repo, mb, head_ref)
     go_changed = any(f.startswith("server/") and f.endswith(".go") for f in changed)
     web_changed = any(f.startswith("webapp/") for f in changed)
     if go_changed:
@@ -289,6 +296,24 @@ def existing_results(hdir: Path, head: str) -> list[str]:
     return sorted(str(p.relative_to(hdir)) for pattern in RESULTS for p in hdir.glob(pattern))
 
 
+def _prepare_meta(hdir: Path) -> dict[str, object]:
+    try:
+        data = json.loads((hdir / "prepare.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def prompt_matches(hdir: Path, pv: str) -> bool:
+    prev = _prepare_meta(hdir)
+    return "prompt_version" not in prev or prev.get("prompt_version") == pv
+
+
+def base_mode_matches(hdir: Path, base_mode: str) -> bool:
+    prev = _prepare_meta(hdir)
+    return "base_mode" not in prev or prev.get("base_mode") == base_mode
+
+
 def main(pr: str, fresh: bool = False) -> None:
     # Held from the fetch to prepare.json: a run.py still using these worktrees must finish first.
     with hunt_lock(hunt_dir(pr), pr):
@@ -320,16 +345,19 @@ def resolve_ref(mm: Path, ref: str) -> str:
 def prepare(pr: str, fresh: bool = False) -> None:
     require_disk(scratch())  # worktrees, node_modules and Go builds: refuse early rather than half-prepare
     hdir = hunt_dir(pr)
+    pv = build_requests.prompt_version(SKILL_DIR, SCHEMA_VERSION)
     rng = parse_range(pr)
     wt, wt_base = worktree_paths(pr)
     if rng is not None:
         base_spec, head_spec = rng
         two_dot = is_two_dot(pr)
+        base_mode = "two-dot" if two_dot else "merge-base"
         mm = mm_clone()
         ensure_clone(mm)
         base_sha = resolve_ref(mm, base_spec)
         head_sha = resolve_ref(mm, head_spec)
-        done = [] if fresh else existing_results(hdir, head_sha)
+        done = ([] if (fresh or not prompt_matches(hdir, pv) or not base_mode_matches(hdir, base_mode))
+                else existing_results(hdir, head_sha))
         if done:
             raise AlreadyHunted(f"{hdir.name}/ already has results for head {head_sha[:10]}: {', '.join(done)}. "
                                 "Do not start over: continue from the first step whose output is missing, or report. "
@@ -341,15 +369,17 @@ def prepare(pr: str, fresh: bool = False) -> None:
             (hdir / name).unlink(missing_ok=True)
         mb = worktrees(mm, head_sha, base_sha, wt, wt_base, two_dot=two_dot)
         go_changed, web_changed = deps(mm, wt, wt_base, mb, head_sha)
+        huntable = huntable_changed(mm, mb, head_sha)
         write_json(hdir / "prepare.json", {"schema_version": SCHEMA_VERSION, "pr": pr, "range": [base_spec, head_spec],
-                                           "base_mode": "two-dot" if two_dot else "merge-base", "repo": str(mm),
+                                           "base_mode": base_mode, "repo": str(mm),
                                            "wt": str(wt), "wt_base": str(wt_base), "head": head_sha,
-                                           "merge_base": mb, "base_ref": base_spec})
+                                           "merge_base": mb, "base_ref": base_spec, "prompt_version": pv,
+                                           "huntable_files": len(huntable)})
         print(f"ready: head {wt} ({head_spec} @ {head_sha[:10]})  base {wt_base} ({base_spec} @ {mb[:10]}, "
-              f"{'two-dot' if two_dot else 'merge-base'})  go={go_changed} webapp={web_changed}")
+              f"{base_mode})  go={go_changed} webapp={web_changed}")
         return
     meta = pr_meta(pr)
-    done = [] if fresh else existing_results(hdir, meta["head"]["sha"])
+    done = [] if (fresh or not prompt_matches(hdir, pv)) else existing_results(hdir, meta["head"]["sha"])
     if done:
         raise AlreadyHunted(f"hunt{pr}/ already has results for head {meta['head']['sha'][:10]}: {', '.join(done)}. "
                             "Do not start over: continue from the first step whose output is missing, or report. "
@@ -368,9 +398,11 @@ def prepare(pr: str, fresh: bool = False) -> None:
         git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", f"+{base}:refs/remotes/origin/{base}")
     mb = worktrees(mm, f"pr-{pr}", f"origin/{base}", wt, wt_base)
     go_changed, web_changed = deps(mm, wt, wt_base, mb, f"pr-{pr}")
+    huntable = huntable_changed(mm, mb, f"pr-{pr}")
     write_json(hdir / "prepare.json", {"schema_version": SCHEMA_VERSION, "pr": pr, "repo": str(mm), "wt": str(wt),
                                        "wt_base": str(wt_base), "head": git(mm, "rev-parse", f"pr-{pr}"),
-                                       "merge_base": mb, "base_ref": base})
+                                       "merge_base": mb, "base_ref": base, "prompt_version": pv,
+                                       "huntable_files": len(huntable)})
     print(f"ready: head {wt}  base {wt_base} ({base} @ {mb[:10]})  go={go_changed} webapp={web_changed}")
 
 

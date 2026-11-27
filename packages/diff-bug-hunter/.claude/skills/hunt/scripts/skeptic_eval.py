@@ -69,7 +69,7 @@ def run_fixture(fixture: Path, out: Path) -> dict[str, Any]:
     hdir = out / fixture.stem
     schema = json.loads((SKILL_DIR / "vetted.schema.json").read_text())
     req = build_requests.write_request(hdir / "vet" / "request.json", hunt.SKEPTIC_SYSTEM, user, schema,
-                                       hdir / "vet" / "response.json")
+                                       hdir / "vet" / "response.json", tier="opus")
     res = dispatch.dispatch(req, hdir=hdir, tag="vet")
     answer = load_json(hdir / "vet" / "response.json")
     rows = [r for r in (answer.get("rows") if isinstance(answer, dict) else None) or [] if isinstance(r, dict)]

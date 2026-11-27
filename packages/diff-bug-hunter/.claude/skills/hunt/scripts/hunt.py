@@ -4,7 +4,7 @@
 """Unattended driver: a deterministic state machine over the hunt scripts. The model answers only the requests it is
 given (hunters, Mode V diagnostics, the skeptic); every other step is a script.
 
-usage: hunt.py <pr | base..head | base...head> [--fresh]
+usage: hunt.py <pr | base..head | base...head> [--fresh] [--force] [--modes A,B,D,R] [--no-prompt-cache]
        hunt.py --help
 
 Stages. A stage whose output exists is skipped, so running again resumes at the first missing output:
@@ -23,8 +23,8 @@ Stages. A stage whose output exists is skipped, so running again resumes at the 
 
 Every stage runs inside telemetry.stage (telemetry.jsonl); dispatch rows carry tokens and cost. Gaps (a hunter that
 wrote no response, a COMPILE_ERROR after its repair round) are kept in driver.json and degrade the confidence tier.
-Circuit breaker: once the hunt's model calls have cost $HUNT_BUDGET_USD (default 25, about 3x the highest measured
-hunt, $8.32 on PR 40256), no further call is made; the hunt finishes on what it has, as Partial with a `budget` gap.
+Circuit breaker: once the hunt's model calls have cost $HUNT_BUDGET_USD (default 8), no further call is made;
+the hunt finishes on what it has, as Partial with a `budget` gap.
 Exit codes: 0 done, 1 usage, 2 INFRA_ERROR, 5 SCHEMA_MISMATCH. A second driver on the same target stops with
 INFRA_ERROR. The trust gate (trusted.check) runs first.
 """
@@ -40,61 +40,49 @@ import concurrent.futures
 import fcntl
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import build_requests
 import dispatch
 import lessons
+import prefilter
 import report
 import telemetry
 import trusted
 import verdict
-from hunt_common import SKILL_DIR, InfraError, hunt_dir, read_dict, terminate_handler, write_json
+from build_requests import SKEPTIC_SYSTEM, V_SYSTEM
+from hunt_common import (
+    SCHEMA_VERSION,
+    SKILL_DIR,
+    InfraError,
+    hunt_dir,
+    read_dict,
+    scratch,
+    target_key,
+    terminate_handler,
+    write_json,
+)
 
 SCRIPTS = Path(__file__).resolve().parent
 HUNTER_TAGS = ("A", "B", "D", "R")
 BASE_TAGS = ("A", "B", "R")
+DEFAULT_MODES = ("A", "B", "R")
+MODE_ORDER = ("A", "B", "D", "R")
+VALID_MODES = frozenset(MODE_ORDER)
+MAX_TOKENS_REASONS = ("max_tokens", "error_max_tokens")
 MAX_PAYLOAD_CHARS = 20000  # per request: a candidate's test source and failure text, capped so a request stays readable
+_CITED_LINE_RE = re.compile(r"(?<![A-Za-z0-9_./:-])([A-Za-z0-9_./-]+\.(?:go|tsx?|jsx?|sql)):(\d+)\b")
 
-V_SYSTEM = (
-    "You are the diagnostic step of a bug hunt. Each candidate below is a test that failed 3 of 3 times on the PR head "
-    "and passed on the merge-base. Write exactly one bounded diagnostic test per candidate. It must isolate the root "
-    "cause with the smallest input, use only the code given in this request, and assert the merge-base behaviour that "
-    "the candidate asserts. Name Go tests TestHuntV_<Name> and Jest tests 'HuntV_<name>' (the title must start with HuntV_), in the same package or "
-    "component directory as the candidate. Report only what the test shows, never the PR's intent. Put the tests in "
-    "the `files` array and describe each in `tests`. Output one JSON object matching the schema, nothing else."
-)
-SKEPTIC_SYSTEM = (
-    "You are the skeptic of a bug hunt. For each candidate, decide KEEP, DROP or HELD. The request gives the PR's "
-    "title and description, the production diff, callers of the changed code (an `entry_point: true` caller is an API "
-    "route, websocket handler, plugin hook or UI entry), and per candidate the test source, its head failure or "
-    "differential examples, and the command that reproduces it. "
-    "KEEP when the failure is a behaviour a production user or caller can hit and the PR's description does not ask "
-    "for it: name the real caller in `caller`, the entry point in `entry_point` (API route, UI component or screen, "
-    "job, plugin hook), the root-cause `file_line` from the diff, and copy the candidate's `repro_cmd`. "
-    "DROP when the evidence shows intended behaviour (the description or diff asks for it), a test that asserts the "
-    "wrong thing, or input no caller can produce. HELD only when the request lacks something you need to decide; "
-    "say what in `reason`. A candidate with mechanical_verdict NEW_API has no merge-base to compare with: KEEP it "
-    "only when the failing assertion contradicts the PR's own description or an existing invariant shown in the "
-    "diff. Give `reason` in one or two sentences. Copy the candidate's `id` and `source`. Set `evidence_path` to "
-    "the artifact the evidence came from, and `fix_check` to null. Output JSON {\"rows\": [...]} matching the "
-    "schema, one row per candidate, and nothing else. "
-    "Every row also carries `reason_code` and `evidence_quote`, which code checks: KEEP uses BUG. A DROP must use "
-    "INTENDED (evidence_quote is copied verbatim from the PR description, the production diff or pr_tests_diff), "
-    "UNREACHABLE (evidence_quote names the guard, copied verbatim from the diff or a caller's source) or "
-    "WRONG_ASSERTION (evidence_quote is the wrong assertion, copied verbatim from the candidate's test_source). "
-    "HELD uses NEEDS_INPUT. A DROP whose quote is not found verbatim is held, not dropped."
-)
-
-
-DEFAULT_BUDGET_USD = 25.0
+DEFAULT_BUDGET_USD = 8.0
 
 
 class Stop(RuntimeError):
@@ -127,19 +115,49 @@ def expect_ok(p: subprocess.CompletedProcess[str], what: str) -> None:
 _GAP_LOCK = threading.Lock()  # dispatch threads record gaps concurrently
 
 
+def _update_driver(hdir: Path, fn: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    with _GAP_LOCK:
+        path = hdir / "driver.json"
+        doc = read_dict(path)
+        fn(doc)
+        tmp = path.with_name(path.name + ".tmp")
+        write_json(tmp, doc)
+        os.replace(tmp, path)
+        return doc
+
+
 def set_gap(hdir: Path, key: str, message: str | None) -> None:
     """Record (or, with None, clear) a gap for the audit. Keyed, so a resumed run overwrites instead of duplicating.
     Serialized and written atomically: parallel hunters must not read a half-written file or lose each other's gap."""
-    with _GAP_LOCK:
-        path = hdir / "driver.json"
-        gaps = read_dict(path).get("gaps", {})
+    def _apply(doc: dict[str, Any]) -> None:
+        raw = doc.get("gaps")
+        gaps = dict(raw) if isinstance(raw, dict) else {}
         if message is None:
             gaps.pop(key, None)
         else:
             gaps[key] = message
-        tmp = path.with_name(path.name + ".tmp")
-        write_json(tmp, {"gaps": gaps})
-        os.replace(tmp, path)
+        doc["gaps"] = gaps
+    _update_driver(hdir, _apply)
+
+
+def read_escalations(hdir: Path) -> list[dict[str, Any]]:
+    raw = read_dict(hdir / "driver.json").get("escalations")
+    return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+
+
+def can_escalate(hdir: Path) -> bool:
+    return len(read_escalations(hdir)) < 1
+
+
+def record_escalation(hdir: Path, tag: str, reason: str, *, from_tier: str = "sonnet",
+                      to_tier: str = "opus") -> None:
+    def _apply(doc: dict[str, Any]) -> None:
+        raw = doc.get("escalations")
+        items = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+        items.append({"tag": tag, "reason": reason, "from_tier": from_tier, "to_tier": to_tier})
+        doc["escalations"] = items
+    _update_driver(hdir, _apply)
+    telemetry.record(hdir, "escalate", tag=tag, reason=reason, from_tier=from_tier, to_tier=to_tier)
 
 
 @contextmanager
@@ -180,21 +198,234 @@ def over_budget(hdir: Path) -> bool:
     return True
 
 
-def dispatch_one(hdir: Path, tag: str, request: Path) -> bool:
+def dispatch_with_result(hdir: Path, tag: str, request: Path, *, strict_schema: bool = False,
+                         no_prompt_cache: bool | None = None) -> tuple[
+                             bool, dispatch.DispatchResult | None, dispatch.DispatchError | None]:
     """One model call for one request. A failed call is a gap, not a stop: the hunter is reported as failed."""
     if over_budget(hdir):
         print(f"[dispatch {tag}] skipped: budget reached")
-        return False
+        return False, None, None
     try:
-        res = dispatch.dispatch(request, hdir=hdir, tag=tag)
+        res = dispatch.dispatch(request, hdir=hdir, tag=tag, strict_schema=strict_schema,
+                                no_prompt_cache=no_prompt_cache)
     except dispatch.DispatchError as e:
         print(f"[dispatch {tag}] FAILED {str(e)[:300]}")
         set_gap(hdir, f"dispatch:{tag}", str(e)[:500])
-        return False
+        return False, None, e
     print(f"[dispatch {tag}] {res.status} retries={res.retries} tokens_in={res.tokens_in} "
           f"cache_write={res.cache_write} cache_read={res.cache_read} tokens_out={res.tokens_out}")
     set_gap(hdir, f"dispatch:{tag}", None)
-    return True
+    return True, res, None
+
+
+def dispatch_one(hdir: Path, tag: str, request: Path) -> bool:
+    """One model call for one request. A failed call is a gap, not a stop: the hunter is reported as failed."""
+    ok, _, _ = dispatch_with_result(hdir, tag, request)
+    return ok
+
+
+_ORIG_DISPATCH_ONE = dispatch_one
+
+
+def _call_dispatch(hdir: Path, tag: str, request: Path, *, strict_schema: bool = False,
+                   no_prompt_cache: bool | None = None) -> tuple[
+                       bool, dispatch.DispatchResult | None, dispatch.DispatchError | None]:
+    if dispatch_one is not _ORIG_DISPATCH_ONE:
+        return dispatch_one(hdir, tag, request), None, None
+    return dispatch_with_result(hdir, tag, request, strict_schema=strict_schema, no_prompt_cache=no_prompt_cache)
+
+
+def _add_diff_hunk_lines(diff_text: str, valid: dict[str, set[int]], default_path: str = "") -> None:
+    cur_path = default_path
+    old_n = new_n = 0
+    in_hunk = False
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split(" b/", 1)
+            if len(parts) == 2:
+                cur_path = parts[1].strip().strip('"')
+            in_hunk = False
+        elif line.startswith("+++ b/"):
+            cur_path = line[6:].strip().strip('"')
+        elif line.startswith("@@ "):
+            m = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            if m:
+                old_n, new_n, in_hunk = int(m.group(1)), int(m.group(2)), True
+        elif not in_hunk or not cur_path or line.startswith("\\"):
+            continue
+        elif line.startswith("+"):
+            valid.setdefault(cur_path, set()).add(new_n)
+            new_n += 1
+        elif line.startswith("-"):
+            valid.setdefault(cur_path, set()).add(old_n)
+            old_n += 1
+        else:
+            valid.setdefault(cur_path, set()).update((old_n, new_n))
+            old_n += 1
+            new_n += 1
+
+
+def _add_numbered_lines(path: str, text: str, valid: dict[str, set[int]]) -> None:
+    if not path or not text:
+        return
+    nums = valid.setdefault(path, set())
+    for line in text.splitlines():
+        m = re.match(r"^\s*(\d+)(?:\s|:)", line)
+        if m:
+            nums.add(int(m.group(1)))
+
+
+def _extract_valid_lines(req_path: Path) -> dict[str, set[int]]:
+    req = read_dict(req_path)
+    raw_user = req.get("user")
+    if isinstance(raw_user, str):
+        try:
+            user = json.loads(raw_user)
+        except ValueError:
+            user = {}
+    elif isinstance(raw_user, dict):
+        user = raw_user
+    else:
+        user = {}
+    if not isinstance(user, dict):
+        return {}
+    valid: dict[str, set[int]] = {}
+    _add_diff_hunk_lines(str(user.get("diff_production_code") or ""), valid)
+    for key in ("changed_files_head_source", "thread_files_head_source"):
+        for item in user.get(key) or []:
+            if isinstance(item, dict):
+                _add_numbered_lines(str(item.get("file") or ""), str(item.get("source") or ""), valid)
+    for key in ("neighbors_same_file", "changed_functions_base_source", "callers", "sibling_tests_and_helpers"):
+        for item in user.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            fpath = str(item.get("file") or "")
+            if fpath and isinstance(item.get("lines"), str):
+                m = re.match(r"^(\d+)-(\d+)$", item["lines"].strip())
+                if m:
+                    valid.setdefault(fpath, set()).update(range(int(m.group(1)), int(m.group(2)) + 1))
+            _add_numbered_lines(fpath, str(item.get("source") or ""), valid)
+            for chk in item.get("permission_checks") or []:
+                cm = _CITED_LINE_RE.search(str(chk))
+                if cm:
+                    valid.setdefault(cm.group(1), set()).add(int(cm.group(2)))
+    for item in user.get("pr_tests_diff") or []:
+        if not isinstance(item, dict):
+            continue
+        fpath = str(item.get("file") or item.get("path") or "")
+        _add_numbered_lines(fpath, str(item.get("added") or ""), valid)
+        if isinstance(item.get("diff"), str):
+            _add_diff_hunk_lines(item["diff"], valid, default_path=fpath)
+    for item in user.get("review_threads") or []:
+        if isinstance(item, dict) and isinstance(item.get("path"), str) and isinstance(item.get("line"), int):
+            valid.setdefault(item["path"], set()).add(item["line"])
+    return valid
+
+
+def _has_uncited_line(req_path: Path, resp_path: Path) -> bool:
+    resp = read_dict(resp_path)
+    tests = resp.get("tests")
+    if not isinstance(tests, list) or not tests:
+        return False
+    citations: list[tuple[str, int]] = []
+    for t in tests:
+        if not isinstance(t, dict):
+            continue
+        src = str(t.get("source") or "")
+        for m in _CITED_LINE_RE.finditer(src):
+            citations.append((m.group(1), int(m.group(2))))
+    if not citations:
+        return False
+    valid = _extract_valid_lines(req_path)
+    for path, line in citations:
+        if path in valid:
+            if line not in valid[path]:
+                return True
+            continue
+        matches = [k for k in valid if Path(k).name == path or k.endswith("/" + path)]
+        if len(matches) == 1:
+            if line not in valid[matches[0]]:
+                return True
+        else:
+            return True
+    return False
+
+
+def _split_diff_patches(diff_text: str) -> dict[str, str]:
+    patches: dict[str, str] = {}
+    cur_path = ""
+    buf: list[str] = []
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            if cur_path:
+                patches[cur_path] = "\n".join(buf)
+            parts = line.split(" b/", 1)
+            cur_path = parts[1].strip().strip('"') if len(parts) == 2 else ""
+            buf = [line]
+        elif cur_path:
+            buf.append(line)
+    if cur_path:
+        patches[cur_path] = "\n".join(buf)
+    return patches
+
+
+def _batch_has_risky_file(hdir: Path) -> bool:
+    state = read_dict(hdir / "state.json")
+    ctx = read_dict(hdir / "ctx.json")
+    changed = [str(p) for p in state.get("changed", []) if isinstance(p, str)]
+    patches = _split_diff_patches(str(ctx.get("diff_production_code") or ""))
+    paths = changed or list(patches)
+    for path in paths:
+        patch = patches.get(path, "")
+        added = sum(1 for ln in patch.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
+        removed = sum(1 for ln in patch.splitlines() if ln.startswith("-") and not ln.startswith("---"))
+        fd = prefilter.FileDiff(path, added, removed, patch)
+        if prefilter.risk(fd) >= 5.0 or fd.lines >= 100:
+            return True
+    return False
+
+
+def escalate_tag(hdir: Path, tag: str, reason: str, *, no_prompt_cache: bool | None = None) -> tuple[
+        bool, dispatch.DispatchResult | None, dispatch.DispatchError | None]:
+    if not can_escalate(hdir):
+        return False, None, None
+    orig = hdir / tag / "request.json"
+    opus_req = hdir / tag / "request.opus.json"
+    if not orig.exists() or opus_req.exists():
+        return False, None, None
+    req_data = read_dict(orig)
+    from_tier = str(req_data.get("tier") or "sonnet").lower()
+    if from_tier != "sonnet":
+        return False, None, None
+    raw_user = req_data.get("user")
+    user_obj = json.loads(raw_user) if isinstance(raw_user, str) else (raw_user if isinstance(raw_user, dict) else {})
+    resp_path = Path(str(req_data.get("response_path") or (hdir / tag / "response.json")))
+    raw_schema = req_data.get("schema")
+    schema: dict[str, Any] = raw_schema if isinstance(raw_schema, dict) else build_requests.HUNTER_SCHEMA
+    build_requests.write_request(
+        opus_req, str(req_data.get("system") or ""), user_obj, schema, resp_path, tier="opus",
+    )
+    record_escalation(hdir, tag, reason, from_tier=from_tier, to_tier="opus")
+    ok, res, err = _call_dispatch(hdir, tag, opus_req, strict_schema=True, no_prompt_cache=no_prompt_cache)
+    if ok:
+        set_gap(hdir, f"dispatch:{tag}", None)
+    return ok, res, err
+
+
+def _escalation_reason(hdir: Path, tag: str, req_path: Path, res: dispatch.DispatchResult | None,
+                       err: dispatch.DispatchError | None) -> str | None:
+    if err is not None and err.schema_errors:
+        return "schema_validation_failed"
+    if (res is not None and res.stop_reason in MAX_TOKENS_REASONS) or (
+            err is not None and err.stop_reason in MAX_TOKENS_REASONS):
+        return "max_tokens"
+    resp_path = hdir / tag / "response.json"
+    if resp_path.exists():
+        if _has_uncited_line(req_path, resp_path):
+            return "cited_line_not_in_diff"
+        if tag in ("A", "B", "D") and read_dict(resp_path).get("files") == [] and _batch_has_risky_file(hdir):
+            return "empty_on_risky_file"
+    return None
 
 
 # ------------------------------------------------------------------ stages
@@ -208,44 +439,80 @@ def stage_prepare(target: str, hdir: Path, fresh: bool) -> None:
     expect_ok(p, "prepare.py")
 
 
-def stage_requests(target: str, hdir: Path) -> None:
+def stage_requests(target: str, hdir: Path, modes: tuple[str, ...] = DEFAULT_MODES) -> None:
     # Review first: a failure there leaves no hunter request behind, so the next run builds everything again.
-    expect_ok(script("build_requests.py", target, "review"), "build_requests review")
-    expect_ok(script("build_requests.py", target, "hunters"), "build_requests hunters")
-    expect_ok(script("build_requests.py", target, "diff"), "build_requests diff")
+    if "R" in modes:
+        expect_ok(script("build_requests.py", target, "review"), "build_requests review")
+    if "A" in modes or "B" in modes:
+        expect_ok(script("build_requests.py", target, "hunters"), "build_requests hunters")
+        for m in ("A", "B"):
+            if m not in modes:
+                for name in ("request.json", "request.md"):
+                    (hdir / m / name).unlink(missing_ok=True)
+    if "D" in modes:
+        expect_ok(script("build_requests.py", target, "diff"), "build_requests diff")
+
+
+def effective_request(hdir: Path, tag: str) -> Path:
+    opus_req = hdir / tag / "request.opus.json"
+    return opus_req if opus_req.exists() else hdir / tag / "request.json"
 
 
 def requests_present(hdir: Path, tags: tuple[str, ...]) -> list[tuple[str, Path]]:
-    return [(t, hdir / t / "request.json") for t in tags if (hdir / t / "request.json").exists()]
+    return [(t, effective_request(hdir, t)) for t in tags
+            if (hdir / t / "request.json").exists() or (hdir / t / "request.opus.json").exists()]
 
 
-def stage_dispatch(hdir: Path) -> None:
-    reqs = requests_present(hdir, HUNTER_TAGS)
+def stage_dispatch(hdir: Path, modes: tuple[str, ...] = DEFAULT_MODES, *,
+                   no_prompt_cache: bool | None = None) -> None:
+    active_tags = tuple(t for t in HUNTER_TAGS if t in modes)
+    reqs = requests_present(hdir, active_tags)
+    results: dict[str, tuple[Path, bool, dispatch.DispatchResult | None, dispatch.DispatchError | None]] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(reqs))) as pool:
-        list(pool.map(lambda tr: dispatch_one(hdir, *tr), reqs))
+        futs = {
+            t: pool.submit(_call_dispatch, hdir, t, path, strict_schema=True, no_prompt_cache=no_prompt_cache)
+            for t, path in reqs
+        }
+        for t, _path in reqs:
+            ok, res, err = futs[t].result()
+            results[t] = (_path, ok, res, err)
+    for t in active_tags:
+        if t not in results or not can_escalate(hdir):
+            continue
+        req_path, _ok, res, err = results[t]
+        req_tier = str(read_dict(req_path).get("tier") or "sonnet").lower()
+        if req_tier != "sonnet":
+            continue
+        reason = _escalation_reason(hdir, t, req_path, res, err)
+        if reason:
+            escalate_tag(hdir, t, reason, no_prompt_cache=no_prompt_cache)
 
 
-def dispatched(hdir: Path) -> bool:
-    reqs = requests_present(hdir, HUNTER_TAGS)
+def dispatched(hdir: Path, modes: tuple[str, ...] = DEFAULT_MODES) -> bool:
+    active_tags = tuple(t for t in HUNTER_TAGS if t in modes)
+    reqs = requests_present(hdir, active_tags)
     if over_budget(hdir):
         return True  # the breaker tripped: run on the answers that exist
     return bool(reqs) and all(dispatch.is_answered(path) for _, path in reqs)
 
 
-def repair_round(target: str, hdir: Path, tag: str) -> bool:
+def repair_round(target: str, hdir: Path, tag: str, *, no_prompt_cache: bool | None = None) -> bool:
     """One repair round after a COMPILE_ERROR (SKILL.md step 4): the failing files go back to the same hunter."""
     expect_ok(script("build_requests.py", target, "repair", tag), f"build_requests repair {tag}")
-    return dispatch_one(hdir, f"{tag}:repair", hdir / tag / "request.repair.json")
+    ok, _, _ = _call_dispatch(hdir, f"{tag}:repair", hdir / tag / "request.repair.json",
+                              strict_schema=True, no_prompt_cache=no_prompt_cache)
+    return ok
 
 
-def run_tag(target: str, hdir: Path, tag: str, *, retry_empty: bool = False) -> None:
+def run_tag(target: str, hdir: Path, tag: str, *, retry_empty: bool = False,
+            no_prompt_cache: bool | None = None) -> None:
     if (hdir / f"run_{tag}.json").exists():
         return
     if not (hdir / tag / "response.json").exists():
         set_gap(hdir, f"run:{tag}", f"hunter {tag} wrote no response")
         return
     p = script("run.py", "run", target, tag)
-    if p.returncode == 3 and repair_round(target, hdir, tag):
+    if p.returncode == 3 and repair_round(target, hdir, tag, no_prompt_cache=no_prompt_cache):
         p = script("run.py", "run", target, tag)
     if p.returncode == 3:
         set_gap(hdir, f"run:{tag}", f"{tag} COMPILE_ERROR after one repair round")
@@ -253,21 +520,35 @@ def run_tag(target: str, hdir: Path, tag: str, *, retry_empty: bool = False) -> 
     expect_ok(p, f"run.py run {tag}")
     if retry_empty and "EMPTY_RESPONSE" in p.stdout and not (hdir / tag / "request.retry.json").exists():
         expect_ok(script("build_requests.py", target, "retry", tag), f"build_requests retry {tag}")
-        if dispatch_one(hdir, f"{tag}:retry", hdir / tag / "request.retry.json"):
+        ok, _, _ = _call_dispatch(hdir, f"{tag}:retry", hdir / tag / "request.retry.json",
+                                  strict_schema=True, no_prompt_cache=no_prompt_cache)
+        if ok:
             p = script("run.py", "run", target, tag)
             expect_ok(p, f"run.py run {tag} after retry")
+    if retry_empty and "EMPTY_RESPONSE" in p.stdout and can_escalate(hdir):
+        req_tier = str(read_dict(effective_request(hdir, tag)).get("tier") or "sonnet").lower()
+        if req_tier == "sonnet" and not (hdir / tag / "request.opus.json").exists():
+            ok, _, _ = escalate_tag(hdir, tag, "empty_after_retry", no_prompt_cache=no_prompt_cache)
+            if ok:
+                p = script("run.py", "run", target, tag)
+                if p.returncode == 3 and repair_round(target, hdir, tag, no_prompt_cache=no_prompt_cache):
+                    p = script("run.py", "run", target, tag)
+                if p.returncode == 3:
+                    set_gap(hdir, f"run:{tag}", f"{tag} COMPILE_ERROR after one repair round")
+                    return
+                expect_ok(p, f"run.py run {tag} after opus escalation")
     set_gap(hdir, f"empty:{tag}", "Mode A emitted no tests after one retry" if "EMPTY_RESPONSE" in p.stdout else None)
     set_gap(hdir, f"run:{tag}", None)
 
 
-def run_diff(target: str, hdir: Path) -> None:
+def run_diff(target: str, hdir: Path, *, no_prompt_cache: bool | None = None) -> None:
     if (hdir / "diff_D.json").exists():
         return
     if not (hdir / "D" / "response.json").exists():
         set_gap(hdir, "run:D", "hunter D wrote no response")
         return
     p = script("run.py", "diff", target, "D")
-    if p.returncode == 3 and repair_round(target, hdir, "D"):
+    if p.returncode == 3 and repair_round(target, hdir, "D", no_prompt_cache=no_prompt_cache):
         p = script("run.py", "diff", target, "D")
     if p.returncode == 3:
         set_gap(hdir, "run:D", "D COMPILE_ERROR after one repair round")
@@ -276,12 +557,16 @@ def run_diff(target: str, hdir: Path) -> None:
     set_gap(hdir, "run:D", None)
 
 
-def stage_run(target: str, hdir: Path) -> None:
-    run_tag(target, hdir, "A", retry_empty=True)
-    run_tag(target, hdir, "B")
-    run_diff(target, hdir)
-    if (hdir / "R" / "request.json").exists():
-        run_tag(target, hdir, "R")
+def stage_run(target: str, hdir: Path, modes: tuple[str, ...] = DEFAULT_MODES, *,
+              no_prompt_cache: bool | None = None) -> None:
+    if "A" in modes:
+        run_tag(target, hdir, "A", retry_empty=True, no_prompt_cache=no_prompt_cache)
+    if "B" in modes:
+        run_tag(target, hdir, "B", no_prompt_cache=no_prompt_cache)
+    if "D" in modes:
+        run_diff(target, hdir, no_prompt_cache=no_prompt_cache)
+    if "R" in modes and (hdir / "R" / "request.json").exists():
+        run_tag(target, hdir, "R", no_prompt_cache=no_prompt_cache)
 
 
 def failing(hdir: Path, tag: str) -> list[str]:
@@ -292,8 +577,8 @@ def base_pending(hdir: Path, tag: str) -> bool:
     return bool(failing(hdir, tag)) and not (hdir / f"base_{tag}.json").exists()
 
 
-def stage_base(target: str, hdir: Path) -> None:
-    for tag in BASE_TAGS:
+def stage_base(target: str, hdir: Path, modes: tuple[str, ...] = DEFAULT_MODES) -> None:
+    for tag in tuple(t for t in BASE_TAGS if t in modes):
         if base_pending(hdir, tag):
             p = script("run.py", "base", target, tag)
             if p.returncode == 3:
@@ -339,7 +624,7 @@ def candidates_all(hdir: Path) -> list[dict[str, Any]]:
     return out
 
 
-def stage_v(target: str, hdir: Path) -> None:
+def stage_v(target: str, hdir: Path, *, no_prompt_cache: bool | None = None) -> None:
     cands = candidates_ab(hdir)
     if not cands:
         return
@@ -354,9 +639,18 @@ def stage_v(target: str, hdir: Path) -> None:
         messages.update(read_dict(hdir / f"run_{tag}.messages.json"))
     user = {"candidates": [{"id": c["id"], "tag": c["source"], "head_failure": str(messages.get(c["id"], ""))[:1500],
                             "test_source": files_by_tag[c["source"]]} for c in cands]}
-    build_requests.write_request(hdir / "V" / "request.json", V_SYSTEM, user, build_requests.HUNTER_SCHEMA,
-                                 hdir / "V" / "response.json")
-    if not dispatch_one(hdir, "V", hdir / "V" / "request.json"):
+    req = build_requests.write_request(hdir / "V" / "request.json", V_SYSTEM, user, build_requests.HUNTER_SCHEMA,
+                                       hdir / "V" / "response.json")
+    ok, res, err = _call_dispatch(hdir, "V", req, strict_schema=True, no_prompt_cache=no_prompt_cache)
+    reason: str | None = None
+    if err is not None and err.schema_errors:
+        reason = "schema_validation_failed"
+    elif (res is not None and res.stop_reason in MAX_TOKENS_REASONS) or (
+            err is not None and err.stop_reason in MAX_TOKENS_REASONS):
+        reason = "max_tokens"
+    if reason and can_escalate(hdir):
+        ok, _, _ = escalate_tag(hdir, "V", reason, no_prompt_cache=no_prompt_cache)
+    if not ok:
         return
     p = script("run.py", "run", target, "V")
     if p.returncode == 3:  # the diagnostic tests did not compile: vet the candidates on the A/B evidence alone
@@ -451,7 +745,7 @@ def skeptic_context(hdir: Path) -> dict[str, Any]:
             "callers": picked}
 
 
-def stage_vet(hdir: Path) -> None:
+def stage_vet(hdir: Path, *, no_prompt_cache: bool | None = None) -> None:
     cands = candidates_all(hdir)
     if not cands:
         write_json(hdir / "vetted.json", {"rows": []})
@@ -475,10 +769,11 @@ def stage_vet(hdir: Path) -> None:
         items.append(item)
     schema = json.loads((SKILL_DIR / "vetted.schema.json").read_text())
     context = skeptic_context(hdir)
-    build_requests.write_request(hdir / "vet" / "request.json", SKEPTIC_SYSTEM,
-                                 {**context, "candidates": items}, schema,
-                                 hdir / "vet" / "response.json")
-    if not dispatch_one(hdir, "vet", hdir / "vet" / "request.json"):
+    req = build_requests.write_request(hdir / "vet" / "request.json", SKEPTIC_SYSTEM,
+                                       {**context, "candidates": items}, schema,
+                                       hdir / "vet" / "response.json", tier="opus")
+    ok, _, _ = _call_dispatch(hdir, "vet", req, strict_schema=False, no_prompt_cache=no_prompt_cache)
+    if not ok:
         return
     data = read_dict(hdir / "vet" / "response.json")
     rows = data.get("rows")
@@ -531,42 +826,184 @@ def stage_verdict(hdir: Path) -> None:
 
 # ------------------------------------------------------------------ driver
 
-def drive(target: str, fresh: bool) -> int:
+def _completed_hunt_meta(hdir: Path, pv: str) -> dict[str, Any] | None:
+    done_path = hdir / "hunt_done.json"
+    if not done_path.is_file() or not (hdir / "prepare.json").is_file():
+        return None
+    done = read_dict(done_path)
+    prep = read_dict(hdir / "prepare.json")
+    if not done or not prep or not done.get("head"):
+        return None
+    if (done.get("head") != prep.get("head")
+            or done.get("merge_base") != prep.get("merge_base")
+            or done.get("base_mode") != prep.get("base_mode")
+            or done.get("prompt_version") != pv):
+        return None
+    return done
+
+
+def is_completed_hunt(hdir: Path, pv: str, requested_modes: tuple[str, ...]) -> dict[str, Any] | None:
+    if not ((hdir / "findings.json").is_file() and (hdir / "audit.md").is_file()):
+        return None
+    done = _completed_hunt_meta(hdir, pv)
+    if done is None:
+        return None
+    completed_modes = {str(m) for m in (done.get("modes") or [])}
+    if not (set(requested_modes) <= completed_modes):
+        return None
+    return done
+
+
+def _record_hunt_done(hdir: Path, target: str, pv: str, modes: tuple[str, ...]) -> None:
+    prep = read_dict(hdir / "prepare.json")
+    state = read_dict(hdir / "state.json")
+    doc = {
+        "target": target,
+        "target_key": target_key(target),
+        "head": prep.get("head") or state.get("head", ""),
+        "merge_base": prep.get("merge_base") or state.get("merge_base", ""),
+        "base_mode": prep.get("base_mode"),
+        "prompt_version": pv,
+        "modes": list(modes),
+        "completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    tmp = hdir / "hunt_done.json.tmp"
+    write_json(tmp, doc)
+    os.replace(tmp, hdir / "hunt_done.json")
+    idx = scratch() / "hunted_index.jsonl"
+    idx.parent.mkdir(parents=True, exist_ok=True)
+    with idx.open("a") as fh:
+        fh.write(json.dumps(doc) + "\n")
+
+
+def _requests_done(hdir: Path, modes: tuple[str, ...]) -> bool:
+    for t in ("A", "B", "D"):
+        if t in modes and not (hdir / t / "request.json").exists():
+            return False
+    if modes == ("R",):
+        return (hdir / "R" / "threads.json").exists() or (hdir / "R" / "request.json").exists()
+    return True
+
+
+def _run_done(hdir: Path, modes: tuple[str, ...]) -> bool:
+    if "A" in modes and not (hdir / "run_A.json").exists():
+        return False
+    if "B" in modes and not (hdir / "run_B.json").exists():
+        return False
+    if "D" in modes and not (hdir / "diff_D.json").exists():
+        return False
+    return not ("R" in modes and (hdir / "R" / "request.json").exists() and not (hdir / "run_R.json").exists())
+
+
+def _sync_modes_in_state(hdir: Path, modes: tuple[str, ...]) -> None:
+    state_path = hdir / "state.json"
+    if not state_path.exists():
+        return
+    state = read_dict(state_path)
+    if state and state.get("modes") != list(modes):
+        state["modes"] = list(modes)
+        tmp = state_path.with_name(state_path.name + ".tmp")
+        write_json(tmp, state)
+        os.replace(tmp, state_path)
+
+
+def drive(target: str, fresh: bool = False, *, force: bool = False, modes: tuple[str, ...] = DEFAULT_MODES,
+          no_prompt_cache: bool | None = None) -> int:
     hdir = hunt_dir(target)
     with driver_lock(hdir, target):
         print(trusted.check())
-        step(hdir, "prepare", lambda: False, lambda: stage_prepare(target, hdir, fresh))
-        step(hdir, "ctx", lambda: (hdir / "ctx.json").exists(),
+        pv = build_requests.prompt_version(SKILL_DIR, SCHEMA_VERSION)
+        step(hdir, "prepare", lambda: False, lambda: stage_prepare(target, hdir, fresh=fresh or force))
+        if not fresh and not force:
+            completed = is_completed_hunt(hdir, pv, modes)
+            if completed is not None:
+                head = str(completed.get("head") or "")
+                print(f"[hunt] skip: already hunted {target} (head={head[:10]}, prompt_version={pv}); pass --force to re-run")
+                return 0
+            if _completed_hunt_meta(hdir, pv) is not None:
+                for stale in ("vetted.json", "verdict.json", "findings.json", "audit.md", "hunt_done.json"):
+                    (hdir / stale).unlink(missing_ok=True)
+        if read_dict(hdir / "prepare.json").get("huntable_files") == 0:
+            print("[hunt] skip: no huntable source files (docs-only/test-only diff; see skipped.log)")
+            return 0
+        _update_driver(hdir, lambda doc: doc.__setitem__("modes", list(modes)))
+        step(hdir, "ctx", lambda: (hdir / "ctx.json").exists() or read_dict(hdir / "state.json").get("batches") == 0,
              lambda: expect_ok(script("ctx.py", target), "ctx.py"))
-        step(hdir, "requests", lambda: all((hdir / t / "request.json").exists() for t in ("A", "B", "D")),
-             lambda: stage_requests(target, hdir))
-        step(hdir, "dispatch", lambda: dispatched(hdir), lambda: stage_dispatch(hdir))
-        step(hdir, "run", lambda: (hdir / "run_A.json").exists() and (hdir / "run_B.json").exists()
-             and (hdir / "diff_D.json").exists(), lambda: stage_run(target, hdir))
-        step(hdir, "base", lambda: not any(base_pending(hdir, t) for t in BASE_TAGS),
-             lambda: stage_base(target, hdir))
+        if read_dict(hdir / "state.json").get("batches") == 0:
+            print("[hunt] skip: no huntable source files (docs-only/test-only diff; see skipped.log)")
+            return 0
+        _sync_modes_in_state(hdir, modes)
+        step(hdir, "requests", lambda: _requests_done(hdir, modes),
+             lambda: stage_requests(target, hdir, modes))
+        step(hdir, "dispatch", lambda: dispatched(hdir, modes),
+             lambda: stage_dispatch(hdir, modes, no_prompt_cache=no_prompt_cache))
+        step(hdir, "run", lambda: _run_done(hdir, modes),
+             lambda: stage_run(target, hdir, modes, no_prompt_cache=no_prompt_cache))
+        base_tags = tuple(t for t in BASE_TAGS if t in modes)
+        step(hdir, "base", lambda: not any(base_pending(hdir, t) for t in base_tags),
+             lambda: stage_base(target, hdir, modes))
         step(hdir, "old_tests", lambda: (hdir / "old_tests.json").exists(),
              lambda: expect_ok(script("old_tests.py", target), "old_tests.py"))
         step(hdir, "pr_tests", lambda: (hdir / "pr_tests.json").exists(),
              lambda: expect_ok(script("pr_tests.py", target), "pr_tests.py"))
-        step(hdir, "vet_v", lambda: v_done(hdir), lambda: stage_v(target, hdir))
-        step(hdir, "vet", lambda: vet_done(hdir), lambda: stage_vet(hdir))
+        step(hdir, "vet_v", lambda: v_done(hdir),
+             lambda: stage_v(target, hdir, no_prompt_cache=no_prompt_cache))
+        step(hdir, "vet", lambda: vet_done(hdir),
+             lambda: stage_vet(hdir, no_prompt_cache=no_prompt_cache))
         step(hdir, "verdict", lambda: False, lambda: stage_verdict(hdir))
         step(hdir, "report", lambda: False, lambda: report.write(hdir, target))
+        _record_hunt_done(hdir, target, pv, modes)
     return 0
 
 
+def parse_modes(raw: str) -> tuple[str, ...] | None:
+    parts = [p.strip().upper() for p in raw.split(",") if p.strip()]
+    if not parts or any(p not in VALID_MODES for p in parts):
+        return None
+    picked = set(parts)
+    return tuple(m for m in MODE_ORDER if m in picked)
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) == 2 and argv[1] in ("-h", "--help"):
+    args = argv[1:]
+    if any(a in ("-h", "--help") for a in args):
         print(__doc__)
         return 0
-    if len(argv) not in (2, 3) or argv[2:] not in ([], ["--fresh"]) or argv[1].startswith("-"):
+    fresh = force = False
+    no_prompt_cache: bool | None = None
+    modes: tuple[str, ...] = DEFAULT_MODES
+    target: str | None = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--fresh":
+            fresh = True
+        elif a == "--force":
+            force = True
+        elif a == "--no-prompt-cache":
+            no_prompt_cache = True
+        elif a == "--modes" or a.startswith("--modes="):
+            val = a.split("=", 1)[1] if "=" in a else (args[i + 1] if i + 1 < len(args) else "")
+            if "=" not in a:
+                i += 1
+            parsed = parse_modes(val)
+            if parsed is None:
+                print(__doc__)
+                return 1
+            modes = parsed
+        elif a.startswith("-") or target is not None:
+            print(__doc__)
+            return 1
+        else:
+            target = a
+        i += 1
+    if target is None:
         print(__doc__)
         return 1
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, terminate_handler)
     try:
-        return drive(argv[1], fresh=argv[2:] == ["--fresh"])
+        return drive(target, fresh=fresh, force=force, modes=modes, no_prompt_cache=no_prompt_cache)
     except InfraError as e:
         print(f"INFRA_ERROR {e}")
         return 2

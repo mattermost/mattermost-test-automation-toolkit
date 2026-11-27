@@ -10,4 +10,4 @@ Rules:
 {lang_rules}{lessons}
 Output ONE JSON object, no prose, no markdown fences:
 {"files": [{"path": "<repo path>", "content": "<complete source>"}],
- "tests": [{"test_name": "...", "checks": "...", "source": "..."}]}
+ "tests": [{"test_name": "...", "source": "..."}]}

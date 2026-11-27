@@ -653,7 +653,7 @@ def file_diffs(repo: Path, mb: str, head: str) -> list[prefilter.FileDiff]:
 STALE = ("A", "B", "D", "A2", "M", "M2", "R_*", "run_A*", "run_B*", "run_D*", "base_A*", "base_B*", "base_D*",
          "mutants_*", "compile_A*", "compile_B*", "compile_D*", "fuzz_*", "diff_*", "ctx.json", "state.json", "skipped.log",
          # driver outputs: a new batch or head must be vetted again, never reuse the last run's decisions
-         "V", "run_V*", "base_V*", "vet", "vetted.json", "verdict.json", "findings.json", "audit.md")
+         "V", "run_V*", "base_V*", "vet", "vetted.json", "verdict.json", "findings.json", "audit.md", "hunt_done.json")
 WHOLE_PR_STALE = ("old_tests.json", "old_tests.messages.json", "pr_tests.json", "pr_tests.messages.json",
                   "R", "run_R*", "base_R*", "compile_R*", "review_verdicts.json", "batches")
 
@@ -1031,10 +1031,12 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any], *, al
           first_batch: bool = False) -> dict[str, Any]:
     repo, wt, mb, head = Path(prep["repo"]), Path(prep["wt"]), prep["merge_base"], prep["head"]
     diffs = file_diffs(repo, mb, head)
+    has_huntable = False
     for f in diffs:
         if not prefilter.excluded(f.path):
             f.patch = git(repo, "diff", mb, head, "--", f.path)
-    plan = prefilter.plan(diffs, callers=caller_counts(wt, diffs))
+            has_huntable = True
+    plan = prefilter.plan(diffs, callers=caller_counts(wt, diffs) if has_huntable else {})
     deleted = git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=D", mb, head).splitlines()
     plan.skipped += [(path, "deleted") for path in deleted]
     forced = forced_all_batches(diffs, deleted) if first_batch and len(plan.batches) > 1 else []
@@ -1043,7 +1045,13 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any], *, al
     if not plan.batches:
         reset_hunt_dir(hdir)
         (hdir / "skipped.log").write_text("\n".join(prefilter.describe(plan, batch)) + "\n")
-        raise InfraError("prefilter left no source files to hunt (see skipped.log)")
+        state: dict[str, Any] = {
+            "pr": pr, "batch": 0, "batches": 0, "skipped_diff": True,
+            "repo": str(repo), "wt": str(wt), "wt_base": prep["wt_base"],
+            "merge_base": mb, "head": head, "changed": [], "targets": [],
+        }
+        write_json(hdir / "state.json", state)
+        return state
     if not 1 <= batch <= len(plan.batches):
         raise InfraError(f"batch {batch} requested; batches are 1..{len(plan.batches)}")
     prev_state_path = hdir / "state.json"
@@ -1132,6 +1140,9 @@ def main() -> None:
             if meta.get("draft"):
                 print(f"note: PR #{a.pr} is a draft")
         st = build(a.pr, batch, prep, meta, all_batches=not a.first_batch, first_batch=a.first_batch)
+    if st["batches"] == 0:
+        print("skip: prefilter left no source files to hunt (see skipped.log)")
+        return
     ctx = json.loads((hunt_dir(a.pr) / "ctx.json").read_text())
     print(f"batch {st['batch']}/{st['batches']}: {len(st['changed'])} files, {len(ctx['callers'])} caller excerpts, "
           f"{len(ctx['sibling_tests_and_helpers'])} sibling test files, {len(ctx['neighbors_same_file'])} neighbour and "

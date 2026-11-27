@@ -11,7 +11,7 @@ solely because fewer than 3 caller excerpts appear in `callers`: if `changed_fil
 code, emit concrete tests (S1/S2/S4, lifted properties, or triggered `RELIABILITY.md` probes); emit `files: []` only when
 the batch changes no executable logic (e.g. types or constants only).
 Generate inputs with a property loop: `testing/quick` or a seeded PRNG loop in Go, a seeded PRNG loop in Jest. Fixed seeds only. Also try S4 (existing-data compatibility) on every changed function that reads, validates or stores data.
-Property shapes to try on each changed function, where its callers support them (start `checks` with the shape's name):
+Property shapes to try on each changed function, where its callers support them:
 - round-trip: decode(encode(x)) == x (marshal/unmarshal, ToJSON/FromJSON, serialize/parse, escape/unescape).
 - idempotence: f(f(x)) == f(x) (sanitize, normalize, migrate, dedupe, PreSave/PreUpdate).
 - no-panic: nil, empty, zero, oversized, deeply nested structures, malformed UTF-8 and unicode boundaries return an error or a value, never panic or throw.

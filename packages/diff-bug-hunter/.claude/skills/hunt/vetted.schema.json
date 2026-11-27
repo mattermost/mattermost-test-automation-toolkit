@@ -10,6 +10,7 @@
   "properties": {
     "rows": {
       "type": "array",
+      "maxItems": 30,
       "items": {
         "type": "object",
         "required": [
@@ -30,6 +31,7 @@
           "id": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 300,
             "description": "Test id (path::TestName) for A/B/D/old rows, or the CodeRabbit claim id (CR1..) for R rows. Looked up in base_<tag>.json, review_verdicts.json, diff_D.json or old_tests.json."
           },
           "source": {
@@ -54,14 +56,17 @@
           },
           "reason": {
             "type": "string",
+            "maxLength": 400,
             "description": "One or two sentences: why the decision was made."
           },
           "file_line": {
             "type": "string",
+            "maxLength": 240,
             "description": "Root-cause location, path:line."
           },
           "caller": {
             "type": "string",
+            "maxLength": 300,
             "description": "The real caller (HTTP route, websocket handler, plugin API, UI) that reaches the input, or a note that none does."
           },
           "entry_point": {
@@ -69,14 +74,17 @@
               "string",
               "null"
             ],
+            "maxLength": 300,
             "description": "Real entry point the reproduction goes through, e.g. \"api4 DELETE /api/v4/x\" or \"verify plan path\". Null when the finding is not reproduced through an entry point; such a row is always held."
           },
           "repro_cmd": {
             "type": "string",
+            "maxLength": 500,
             "description": "One shell command that reproduces the failure. Empty means held."
           },
           "evidence_path": {
             "type": "string",
+            "maxLength": 240,
             "description": "Path to the artifact that backs the decision (run log, base_<tag>.json, diff_D.examples.json, ...)."
           },
           "severity": {
@@ -112,6 +120,7 @@
           },
           "evidence_quote": {
             "type": "string",
+            "maxLength": 500,
             "description": "Verbatim text backing the decision: from the PR description, diff or pr_tests_diff (INTENDED), the diff or a caller (UNREACHABLE), or the candidate's test source (WRONG_ASSERTION)."
           }
         }

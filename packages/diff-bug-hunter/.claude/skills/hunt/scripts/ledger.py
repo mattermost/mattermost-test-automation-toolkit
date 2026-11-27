@@ -162,6 +162,8 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
     reached_sum = 0
     exec_sum = 0
     mode_gaps = False
+    raw_modes = _read_optional_dict(hdir / "driver.json").get("modes") or _read_optional_dict(hdir / "state.json").get("modes")
+    recorded_modes = [str(m) for m in raw_modes] if isinstance(raw_modes, list) else None
 
     for bdir in _batch_dirs(hdir):
         for tag in ("A", "A2", "B"):
@@ -183,7 +185,8 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
                         head_fails.add(str(k))
                     if v in _BAD_RUN or "::(package failed)" in str(k):
                         mode_gaps = True
-            elif tag in ("A", "B") or (bdir / f"compile_{tag}.log").exists():
+            elif (tag in recorded_modes if recorded_modes is not None else tag in ("A", "B")) \
+                    or (bdir / f"compile_{tag}.log").exists():
                 mode_gaps = True
 
             base_data = _read_optional_json(bdir / f"base_{tag}.json")
@@ -210,18 +213,21 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
             elif head_fails:
                 mode_gaps = True
 
-        d_resp = _read_optional_dict(bdir / "D" / "response.json")
-        if (bdir / "D" / "response.json").exists() and not d_resp.get("files"):
-            mode_gaps = True
-        diff_data = _read_optional_json(bdir / "diff_D.json")
-        if isinstance(diff_data, dict):
-            if not diff_data:
+        d_present = any((bdir / p).exists() for p in ("D/request.json", "D/response.json", "compile_D.log", "diff_D.json"))
+        d_expected = ("D" in recorded_modes) if recorded_modes is not None else d_present
+        if d_expected or d_present:
+            d_resp = _read_optional_dict(bdir / "D" / "response.json")
+            if (bdir / "D" / "response.json").exists() and not d_resp.get("files"):
                 mode_gaps = True
-            counts["diff"] += sum(1 for v in diff_data.values() if v == Verdict.DIFF)
-            if any(v in _BAD_DIFF for v in diff_data.values()):
+            diff_data = _read_optional_json(bdir / "diff_D.json")
+            if isinstance(diff_data, dict):
+                if not diff_data:
+                    mode_gaps = True
+                counts["diff"] += sum(1 for v in diff_data.values() if v == Verdict.DIFF)
+                if any(v in _BAD_DIFF for v in diff_data.values()):
+                    mode_gaps = True
+            else:
                 mode_gaps = True
-        else:
-            mode_gaps = True
 
         cov_data = _read_optional_json(bdir / "run_A.coverage.json")
         if isinstance(cov_data, dict):
