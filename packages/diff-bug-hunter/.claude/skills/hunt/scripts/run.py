@@ -3,7 +3,7 @@
 # See LICENSE.txt for license information.
 """Steps 4-5: run hunter tests, vet on the merge-base, score mutants. Go and Jest adapters.
 
-usage: run.py run <pr> <A|B|A2|R|V>    1 run on unmodified PR head, failures rerun up to 3 in all (Go with -race); writes run_<tag>.json
+usage: run.py run <pr> <A|B|A2|R|V>    1 run on unmodified PR head, failures rerun up to 3 in all (Go with -race; full-suite confirmation runs when a filtered rerun passes are additional); writes run_<tag>.json
        run.py base <pr> <A|B|A2|R|V>   the same tests once on the merge-base worktree; writes base_<tag>.json
        run.py diff <pr> D              differential recorders (build_requests.py <pr> diff): run on the PR head twice (records
                                        that differ are dropped; too few stable = NONDETERMINISTIC) and on the merge-base (a
@@ -37,7 +37,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -135,7 +135,7 @@ def normalize_failure(text: str, wt: Path) -> str:
     return text[-4000:]
 
 
-_COMPARE_RE: tuple[tuple[re.Pattern[str], str], ...] = (
+_COMPARE_RE: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = (
     # 1. Temp dir paths (macOS /var/folders, Linux/Go /tmp, /private/tmp)
     (re.compile(
         r"(?:/private)?/var/folders/[A-Za-z0-9_+-]+/[A-Za-z0-9_+-]+/T"
@@ -144,13 +144,25 @@ _COMPARE_RE: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(
         r"(?:/private)?/tmp/(?:Test[A-Za-z0-9_.-]*\d{4,}|[^\s\"'`<>()\[\]{},;:/]*\d{5,}[^\s\"'`<>()\[\]{},;:/]*)"
     ), "<tmpdir>"),
-    # 2. Ephemeral loopback ports (preserve loopback host form)
-    (re.compile(r"\b(127\.0\.0\.1|localhost):\d+\b", re.I), r"\1:<port>"),
-    (re.compile(r"\[::1\]:\d+\b"), "[::1]:<port>"),
+    # 2. Ephemeral loopback ports in transport diagnostics (preserve configured host:port assertions)
+    (re.compile(
+        r"(\b(?:dial|listen)\s+(?:tcp|udp)\s+)(127\.0\.0\.1|localhost|\[::1\]):\d+\b",
+        re.I,
+    ), r"\1\2:<port>"),
+    (re.compile(
+        r"((?:https?|wss?|postgres(?:ql)?|redis|grpc)://|\b(?:addr|address|listen|bind|endpoint|server|url)\s*[:=]\s*[\"']?(?:(?:https?|wss?|postgres(?:ql)?|redis|grpc)://)?)"
+        r"(127\.0\.0\.1|localhost|\[::1\]):\d+"
+        r"(?=[^\s\"']*[\"']?:\s*(?:dial\b|connect\b|bind\b|connection\s+(?:refused|reset)|EOF|i/o\s+timeout|read:|write:|TLS|reset\s+by\s+peer|broken\s+pipe))",
+        re.I,
+    ), r"\1\2:<port>"),
     # 3. Go time.Time monotonic clock suffix
     (re.compile(r"\bm=[+-]\d+\.\d+\b"), "m=<mono>"),
-    # 4. UUIDs (8-4-4-4-12 hex; before long hex so the 12-char final group is not split)
-    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<uuid>"),
+    # 4. UUIDs in diagnostic/keyed contexts (8-4-4-4-12 hex; preserves fixed UUID assertion expectations)
+    (re.compile(
+        r"(?i)\b((?:x[-_])?(?:request|req|trace|span|correlation|session|container|instance|job|run|build|node|worker|cluster|cid|tid|sid|uuid|guid)(?:[_-]?id)?)"
+        r"([\"']?\s*[:=\s]\s*[\"']?)"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
+    ), r"\1\2<uuid>"),
     # 5. Mattermost storetest random DB names: db<NewId> / db<random> (before 26-char ID because 'db' has no \b)
     (re.compile(r"\bdb(?:[ybndrfg8ejkmcpqxot1uwisza345h769]{26}|(?=[a-z0-9]*\d)[a-z0-9]{20,})\b"), "<db>"),
     # 6. Mattermost 26-char zbase32 model.NewId() (digit+letter lookahead spares 26-letter English words & 'a'*26)
@@ -161,22 +173,29 @@ _COMPARE_RE: tuple[tuple[re.Pattern[str], str], ...] = (
         r"[ybndrfg8ejkmcpqxot1uwisza345h769]{26}"
         r"(?![A-Za-z0-9])"
     ), "<id>"),
-    # 7. Epoch timestamps (13-19 digit millis/micros/nanos; before long hex so 16-19 digit ints don't become <hex>)
-    (re.compile(r"(?<![A-Za-z0-9.])\d{13,19}(?![A-Za-z0-9.])"), "<epoch>"),
-    # 8. Long hex IDs / container IDs / hashes (12-64 mixed hex+digit; spares 'a'*26, '0'*16, and 0x02/0xdeadbeef)
+    # 7. Epoch timestamps (13-19 digit millis/micros/nanos) only when identified as a timestamp; spares numeric assertions
     (re.compile(
-        r"(?<![A-Za-z0-9])(?=[0-9a-fA-F]*[0-9])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{12,64}(?![A-Za-z0-9])"
-    ), "<hex>"),
+        r"(?i)\b([a-z0-9_]*_at|at|timestamp|ts|time|epoch|unix(?:_[a-z]+)?|created|updated|deleted|expires|ns|ms|us)"
+        r"([\"']?\s*[:=]\s*[\"']?)\d{13,19}(?![A-Za-z0-9.])"
+    ), r"\1\2<epoch>"),
+    (re.compile(r"(?i)\b(timestamp|epoch|unix(?:_[a-z]+)?)\s+\d{13,19}(?![A-Za-z0-9.])"), r"\1 <epoch>"),
+    # 8. Labelled ephemeral hex IDs / container IDs / trace IDs (12-64 mixed hex+digit); preserves deterministic checksum assertions
+    (re.compile(
+        r"(?i)\b(container|docker|pod|trace|span|correlation|request|req|session|instance|run|job|build|node|worker|cid|tid|sid)"
+        r"(?:[_-]?id)?([\"']?\s*[:=\s]\s*[\"']?)(?=[0-9a-fA-F]*[0-9])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{12,64}(?![A-Za-z0-9])"
+    ), r"\1\2<hex>"),
     # 9. React useId() tokens (:r...:, _r_..._; digit/1-char rule spares emojis/CSS like :rocket:, :rage:, :root:)
     (re.compile(r":(?:r|R)(?:[0-9a-z]|(?=[0-9a-z]*\d)[0-9a-z]{2,}):"), "<react-id>"),
     (re.compile(r"(?<![A-Za-z0-9])_r_(?:[0-9a-z]|(?=[0-9a-z]*\d)[0-9a-z]{2,})_(?![A-Za-z0-9])"), "<react-id>"),
-    # 10. Keyed request/trace/correlation/session/container/instance IDs (handles '=' and JSON '": "')
+    # 10. Keyed request/trace/correlation/session/container/instance IDs (handles '=' and JSON '": "');
+    #     preserves explicit assertion operands (`got|want|expected|expect|actual ...`).
     (re.compile(
-        r"(?i)\b((?:x[-_])?(?:request|req|trace|span|correlation|session|container|instance)[_-]?id)\b"
+        r"(?i)(?:(\b(?:got|want|expected|expect|actual)\b\s*[:=]?\s*[\"']?)|)"
+        r"\b((?:x[-_])?(?:request|req|trace|span|correlation|session|container|instance)[_-]?id)\b"
         r"([\"']?\s*[:=]\s*[\"']?)"
         r"(?:(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{8,}|[A-Za-z0-9_-]{16,})"
         r"(?![A-Za-z0-9_-])"
-    ), r"\1\2<id>"),
+    ), lambda m: m.group(0) if m.group(1) else f"{m.group(2)}{m.group(3)}<id>"),
 )
 
 
@@ -491,6 +510,14 @@ def target_dirs_for(hdir: Path, state: dict[str, Any], tag: str) -> set[str]:
     return dirs
 
 
+def _failure_changed(first: Outcome, rerun: Outcome, ident: str) -> bool:
+    if rerun.results.get(ident) != Verdict.FAIL:
+        return True
+    m1 = first.messages.get(ident, "")
+    m2 = rerun.messages.get(ident, "")
+    return bool(m1 and m2 and normalize_for_compare(m1) != normalize_for_compare(m2))
+
+
 def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[str, Any]:
     wt = Path(state["wt"])
     ensure_clean(wt)
@@ -498,12 +525,14 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
     # Clear outputs of any earlier run for this tag so a compile error or rerun never leaves stale head/base verdicts.
     # Keep compile_<tag>.log as the audit record of any prior repair round (compute_verdicts checks run_R freshness).
     for stale in (f"run_{tag}.json", f"run_{tag}.messages.json", f"run_{tag}.runtimes.json",
-                  f"run_{tag}.coverage.json", f"run_{tag}.response.sha256",
+                  f"run_{tag}.full_pkgs.json", f"run_{tag}.coverage.json", f"run_{tag}.response.sha256",
                   f"base_{tag}.json", f"base_{tag}.errors.json", f"base_{tag}.response.sha256"):
         (hdir / stale).unlink(missing_ok=True)
+    _clear_adjudication(hdir, tag)
     if not files:  # e.g. a Mode B hunter for a PR whose description promises nothing testable
         write_json(hdir / f"run_{tag}.json", {})
         (hdir / f"run_{tag}.response.sha256").write_text(fingerprint(files))
+        _clear_adjudication(hdir, tag)
         return {}
     if tag == "A" and fuzz_enabled() and any(str(f.get("path", "")).endswith(".go") and FUZZ_TARGET.search(
             str(f.get("content", ""))) for f in files):
@@ -522,14 +551,47 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
         for n, st in first.results.items():
             statuses[n] = [st]
         # Lazy confirmation (C2): a test that did not fail on the first run is not run again. Only the failures are
-        # rerun, up to `runs` runs in all; a rerun that passes ends that test's reruns (it is FLAKY).
+        # rerun, up to `runs` runs in all; if a filtered rerun passes/changes, confirm under the original suite first
+        # so passing tests that pollute package state do not mask a deterministic failure as FLAKY.
         failing = {n for n, st in first.results.items() if st == Verdict.FAIL}
-        for _ in range(runs - 1):
+        full_pkgs: set[str] = set()
+        for run_idx in range(1, runs):
             suite = _filter_base_suite(full, failing, {}) if failing else Suite()
+            for d in full_pkgs:
+                if d in full.go_patterns and d in suite.go_patterns:
+                    suite.go_patterns[d] = full.go_patterns[d]
             if suite.empty():
                 break
             o = run_suite(wt, suite, race=True)
             outcomes.append(o)
+            changed = {n for n in failing if _failure_changed(first, o, n)}
+            if changed:
+                confirm_suite = Suite(
+                    go_patterns={d: full.go_patterns[d] for d in full.go_patterns
+                                 if any(n.startswith(f"{d}::") for n in changed)
+                                 and suite.go_patterns.get(d) != full.go_patterns[d]},
+                    jest_files=[rel for rel in full.jest_files
+                                if any(n.startswith(f"{rel}::") for n in changed)
+                                and rel not in suite.jest_files],
+                    jest_prefix=full.jest_prefix,
+                )
+                if not confirm_suite.empty():
+                    c = run_suite(wt, confirm_suite, race=True)
+                    outcomes.append(c)
+                    confirmed_units = set(confirm_suite.go_patterns) | set(confirm_suite.jest_files)
+                    for n in failing:
+                        unit = n.split("::", 1)[0]
+                        if unit in confirmed_units:
+                            st_c = c.results.get(n, Verdict.MISSING)
+                            o.results[n] = st_c
+                            if st_c == Verdict.FAIL and n in changed:
+                                full_pkgs.add(unit)
+                    for n, st_c in c.results.items():
+                        if n not in failing and st_c != Verdict.PASS:
+                            statuses.setdefault(n, [Verdict.MISSING] * run_idx).append(st_c)
+            for n, st_o in o.results.items():
+                if n not in failing and st_o != Verdict.PASS:
+                    statuses.setdefault(n, [Verdict.MISSING] * run_idx).append(st_o)
             for n in failing:
                 statuses[n].append(o.results.get(n, Verdict.MISSING))
             failing = {n for n in failing if o.results.get(n) == Verdict.FAIL}
@@ -542,8 +604,11 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
                 for d in set().union(*(o.runtimes for o in outcomes))}
     if runtimes:
         write_json(hdir / f"run_{tag}.runtimes.json", runtimes)
+    if full_pkgs:
+        write_json(hdir / f"run_{tag}.full_pkgs.json", sorted(full_pkgs))
     (hdir / f"run_{tag}.log").write_text("\n\n=== run ===\n".join(o.log for o in outcomes))
     (hdir / f"run_{tag}.response.sha256").write_text(fingerprint(files))
+    _clear_adjudication(hdir, tag)
     return table
 
 
@@ -582,14 +647,67 @@ def undefined_names(msg: str) -> list[str]:
     return [g for g in m.groups() if g] if m else []
 
 
-def go_repair(wt: Path, placed: list[Path], d: str) -> tuple[dict[str, list[str]], bool] | None:
+def _uses_unshadowed_helper(code_body: str, hname: str) -> bool:
+    esc = re.escape(hname)
+    word = re.compile(rf"(?<!\.)\b{esc}\b")
+    if not word.search(code_body):
+        return False
+    var_decl = re.compile(rf"^(?:var|const|type)\s+(?:\w+\s*,\s*)*{esc}\b")
+    param_decl = re.compile(rf"\bfunc\b[^{{]*\([^)]*\b{esc}\b")
+    block_hdr = re.compile(r"^\s*(?:else\s+if|if|for|switch|select)\b")
+    depth = 0
+    shadow_at: set[int] = set()
+    pending_hdr = False
+    for tok in re.split(r"([{}])", code_body):
+        if tok == "{":
+            depth += 1
+            if pending_hdr:
+                shadow_at.add(depth)
+                pending_hdr = False
+            continue
+        if tok == "}":
+            shadow_at.discard(depth)
+            depth = max(0, depth - 1)
+            pending_hdr = False
+            continue
+        if param_decl.search(tok):
+            pending_hdr = True
+        for raw in re.split(r"[\n;]", tok):
+            s = raw.strip()
+            if not s:
+                continue
+            if block_hdr.match(s):
+                pending_hdr = False
+            if var_decl.match(s):
+                _, _, rhs = s.partition("=")
+                if rhs and not shadow_at and not pending_hdr and word.search(rhs):
+                    return True
+                shadow_at.add(depth)
+                continue
+            if ":=" in s:
+                lhs, _, rhs = s.partition(":=")
+                if not shadow_at and not pending_hdr and word.search(rhs):
+                    return True
+                if word.search(lhs):
+                    if block_hdr.match(lhs):
+                        pending_hdr = True
+                    else:
+                        shadow_at.add(depth)
+                continue
+            if not shadow_at and not pending_hdr and not param_decl.search(s) and word.search(s):
+                return True
+    return False
+
+
+def go_repair(wt: Path, placed: list[Path], d: str,
+              raw_errs: dict[str, str] | None = None) -> tuple[dict[str, list[str]], bool] | None:
     """Remove from the placed copies in package dir `d` the top-level funcs that the base compiler rejects, with every
     helper-dependent func, and drop imports that a removal left unused. Removed lines are blanked, so later error line
     numbers stay valid. Returns ({test identity: undefined identifiers} for removed tests, whether any func was
     removed), or None when an error lies outside any placed hunter func (nothing can be salvaged then)."""
     root = go_root(wt, d)
     mine = {p.resolve(): p for p in placed if p.suffix == ".go" and p.parent.resolve() == (wt / d).resolve()}
-    by_func: dict[Path, dict[str, list[str]]] = {}   # file -> func -> messages
+    by_func: dict[Path, dict[str, list[tuple[int, str]]]] = {}   # file -> func -> [(line, msg)]
     drop_import: dict[Path, set[int]] = {}
     texts = {p: p.read_text().split("\n") for p in mine.values()}
     blocks = {p: top_blocks(texts[p], "go") for p in mine.values()}
@@ -603,31 +721,51 @@ def go_repair(wt: Path, placed: list[Path], d: str) -> tuple[dict[str, list[str]
         owner = next((sym for sym, a, b in blocks[p] if a <= line <= b), None)
         if owner is None:
             return None
-        by_func.setdefault(p, {}).setdefault(owner, []).append(msg)
+        by_func.setdefault(p, {}).setdefault(owner, []).append((line, msg))
     if not by_func and not drop_import:
         return None
     removed: dict[str, list[str]] = {}
     cut = False
+    wt_res = wt.resolve()
+    idents: dict[tuple[Path, str], list[str]] = {}
+    err_blocks: dict[tuple[Path, str], list[str]] = {}
     for p, funcs in by_func.items():
-        idents: dict[str, list[str]] = {}
-        for sym, msgs in funcs.items():
-            idents[sym] = sorted({n for m in msgs for n in undefined_names(m)}) or msgs[:1]
-        # a removed helper takes down every func that mentions it, which inherit the helper's identifiers
-        spans = {sym: (a, b) for sym, a, b in blocks[p]}
-        grew = True
-        while grew:
-            grew = False
-            for sym in [s for s in idents if not s.split(".")[-1].startswith("TestHunt")]:
-                word = re.compile(rf"\b{re.escape(sym.split('.')[-1])}\b")
-                for other, (a, b) in spans.items():
-                    if other not in idents and word.search("\n".join(texts[p][a - 1:b])):
-                        idents[other] = idents[sym]
+        p_res = p.resolve()
+        rel_p = (p_res.relative_to(wt_res) if p_res.is_relative_to(wt_res) else p.relative_to(root)).as_posix()
+        for sym, items in funcs.items():
+            msgs = [m for _, m in items]
+            idents[(p, sym)] = sorted({n for m in msgs for n in undefined_names(m)}) or msgs[:1]
+            err_blocks[(p, sym)] = [f"{rel_p}:{ln}:1: {m}" for ln, m in items]
+    # a removed helper takes down every func that mentions it across the package, merging all helper diagnostics
+    all_spans = [(p, sym, a, b) for p in mine.values() for sym, a, b in blocks[p]]
+    span_by_key = {(p, sym): (a, b) for p, sym, a, b in all_spans}
+    grew = True
+    while grew:
+        grew = False
+        for sym_key in [k for k in idents if not k[1].split(".")[-1].startswith("TestHunt")]:
+            hname = sym_key[1].split(".")[-1]
+            for op, other, a, b in all_spans:
+                okey = (op, other)
+                code_body = _GO_COMMENT_OR_STR.sub(" ", "\n".join(texts[op][a - 1:b]))
+                if okey != sym_key and _uses_unshadowed_helper(code_body, hname):
+                    cur_id = idents.get(okey, [])
+                    merged_id = sorted(set(cur_id) | set(idents[sym_key]))
+                    cur_err = err_blocks.get(okey, [])
+                    merged_err = list(dict.fromkeys(cur_err + err_blocks[sym_key]))
+                    if okey not in idents or merged_id != cur_id or merged_err != cur_err:
+                        idents[okey] = merged_id
+                        err_blocks[okey] = merged_err
                         grew = True
-        for sym, (a, b) in ((s, spans[s]) for s in idents):
-            texts[p][a - 1:b] = [""] * (b - a + 1)
-            cut = True
-            if sym.startswith("Test"):
-                removed[f"{d}::{sym}"] = idents[sym]
+    for (p, sym), (a, b) in ((k, span_by_key[k]) for k in idents):
+        texts[p][a - 1:b] = [""] * (b - a + 1)
+        cut = True
+        if sym.startswith("Test"):
+            key = f"{d}::{sym}"
+            removed[key] = idents[(p, sym)]
+            if raw_errs is not None:
+                prev = raw_errs.get(key, "")
+                joined = "\n".join(err_blocks[(p, sym)])
+                raw_errs[key] = f"{prev}\n{joined}" if prev else joined
     for p, nums in drop_import.items():
         for n in nums:
             texts[p][n - 1] = ""
@@ -654,7 +792,8 @@ def _filter_base_suite(suite: Suite, failing: set[str], gone: dict[str, list[str
 
 def salvage_go(wt: Path, state: dict[str, Any], tag: str, placed: list[Path],
                race: bool = True, failing: set[str] | None = None,
-               go_timeouts: dict[str, int] | None = None) -> tuple[Outcome, dict[str, list[str]]]:
+               go_timeouts: dict[str, int] | None = None,
+               raw_errs: dict[str, str] | None = None) -> tuple[Outcome, dict[str, list[str]]]:
     """run_suite on the merge-base, but a Go test file that does not build there loses only the funcs the compiler
     rejects (the placed copies, never response.json) and is retried, up to MAX_SALVAGE_ROUNDS rounds. Returns the
     outcome of what remained and {removed test identity: identifiers it could not resolve}."""
@@ -674,7 +813,7 @@ def salvage_go(wt: Path, state: dict[str, Any], tag: str, placed: list[Path],
         try:
             return run_suite(wt, suite, race=race, go_timeouts=go_timeouts), gone
         except GoBuildError as e:
-            fixed = go_repair(wt, live, e.pkg_dir) if rounds < MAX_SALVAGE_ROUNDS and fixups < 3 else None
+            fixed = go_repair(wt, live, e.pkg_dir, raw_errs=raw_errs) if rounds < MAX_SALVAGE_ROUNDS and fixups < 3 else None
             if fixed is None:
                 raise
             gone.update(fixed[0])
@@ -721,28 +860,196 @@ def base_table(head: dict[str, str], head_msgs: dict[str, str], o: Outcome) -> d
     return out
 
 
-def _on_head(wt_head: Path, name: str) -> bool:
-    """True when `name` appears in a tracked file of the (clean) PR-head worktree. A name the base compiler calls
-    undefined and the head tree mentions is a symbol the PR adds."""
-    p = sh(git_cmd("grep", "-q", "-w", "-F", "-e", name), wt_head, check=False)
-    return p.returncode == 0
+_GO_COMMENT_OR_STR = re.compile(r'"(?:\\.|[^"\\])*"|`[^`]*`|//[^\n]*|/\*[\s\S]*?\*/')
+_RECV_TYPE_ERR = re.compile(r"\(type \*?(?:(\w+)\.)?(\w+) has no field or method \w+")
+_GO_IMPORT_SPEC = re.compile(r'^(?:\s*(?:import\s+)?(?:(\w+)\s+)?"([^"]+)")', re.M)
 
 
-def go_pr_added_names(wt_head: Path, errors: str) -> list[str] | None:
+def _clear_adjudication(hdir: Path, tag: str) -> None:
+    if tag not in ("A", "A2", "B", "D"):
+        return
+    for name in ("vetted.json", "verdict.json", "findings.json", "audit.md", "hunt_done.json"):
+        (hdir / name).unlink(missing_ok=True)
+
+
+def _strip_go_comments(src: str) -> str:
+    return _GO_COMMENT_OR_STR.sub(lambda m: m.group(0) if m.group(0)[0] in ('"', '`') else "", src)
+
+
+def _go_import_dir(wt: Path, err_file: str, pkg_alias: str, source_texts: dict[str, str] | None = None) -> str | None:
+    """Resolve a Go selector qualifier (`pkg_alias`) to a repo-relative directory under wt via imports + go.mod."""
+    texts: list[str] = []
+    if source_texts and err_file in source_texts:
+        texts.append(source_texts[err_file])
+    if (wt / err_file).is_file():
+        texts.append((wt / err_file).read_text(errors="replace"))
+    pkg_dir = str(Path(err_file).parent)
+    if (wt / pkg_dir).is_dir():
+        for p in sorted((wt / pkg_dir).glob("*.go"))[:10]:
+            texts.append(p.read_text(errors="replace"))
+    try:
+        root = go_root(wt, pkg_dir if pkg_dir != "." else "")
+    except InfraError:
+        root = wt
+    mod_m = re.search(r"^module\s+(\S+)", (root / "go.mod").read_text(errors="replace"), re.M) if (root / "go.mod").is_file() else None
+    mod_name = mod_m.group(1) if mod_m else ""
+    for src in texts:
+        for m in _GO_IMPORT_SPEC.finditer(_strip_go_comments(src)):
+            alias, imp = m.group(1), m.group(2)
+            inferred = alias or imp.rsplit("/", 1)[-1]
+            if inferred != pkg_alias:
+                continue
+            if mod_name and (imp == mod_name or imp.startswith(mod_name + "/")):
+                sub = imp[len(mod_name):].lstrip("/")
+                cand = (root / sub) if sub else root
+                if cand.is_dir() and cand.is_relative_to(wt.resolve()):
+                    rel = cand.relative_to(wt.resolve()).as_posix()
+                    return "" if rel == "." else rel
+    return None
+
+
+def _matches_pkg_decl(src: str, pkg_alias: str | None) -> bool:
+    if not pkg_alias:
+        return True
+    m = re.search(r"^\s*package\s+(\w+)\b", _strip_go_comments(src), re.M)
+    return bool(m and m.group(1) == pkg_alias)
+
+
+def _has_go_decl(src: str, name: str, recv: str | None = None) -> bool:
+    """True when `src` contains a package-level Go declaration for `name` (or member when `recv` is specified)."""
+    clean = _GO_COMMENT_OR_STR.sub(lambda m: "\n" * m.group(0).count("\n") + " ", src)
+    sym = re.escape(name)
+    block_kind: str | None = None
+    depth = 0
+    member_re = re.compile(rf"^{sym}(?:\s*,\s*\w+)*(?:\s|\(|\[|=|$)")
+    for line in clean.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if depth == 0:
+            if recv:
+                r = re.escape(recv)
+                if re.match(rf"^func\s+\([^)]*\*?\s*{r}\b[^)]*\)\s*{sym}\s*(?:\[|\()", s):
+                    return True
+            else:
+                if (re.match(rf"^func\s+{sym}\s*(?:\[|\()", s)
+                        or re.match(rf"^type\s+{sym}\b", s)
+                        or re.match(rf"^(?:var|const)\s+(?:\w+\s*,\s*)*{sym}\b", s)):
+                    return True
+            inline = ""
+            if recv:
+                m_type = re.match(rf"^type\s+{re.escape(recv)}\b.*\b(?:struct|interface)\s*\{{(.*)$", s)
+                if m_type:
+                    block_kind = "type"
+                    inline = m_type.group(1)
+            else:
+                m_grp = re.match(r"^(?:const|var|type)\s*\((.*)$", s)
+                if m_grp:
+                    block_kind = "group"
+                    inline = m_grp.group(1)
+            if inline:
+                cur_d = 1
+                stmt_buf: list[str] = []
+                for ch in inline:
+                    if cur_d == 1 and ch in (";", "}", ")"):
+                        part = "".join(stmt_buf).strip()
+                        if part and member_re.match(part):
+                            return True
+                        stmt_buf = []
+                    elif not (cur_d == 1 and ch in ("}", ")")):
+                        stmt_buf.append(ch)
+                    if ch in ("{", "("):
+                        cur_d += 1
+                    elif ch in ("}", ")"):
+                        cur_d -= 1
+                        if cur_d <= 0:
+                            break
+                if cur_d == 1:
+                    part = "".join(stmt_buf).strip()
+                    if part and member_re.match(part):
+                        return True
+        elif depth == 1 and block_kind is not None and any(member_re.match(p.strip()) for p in s.split(";")):
+            return True
+        depth += s.count("{") + s.count("(") - s.count("}") - s.count(")")
+        if depth <= 0:
+            depth = 0
+            block_kind = None
+    return False
+
+
+def _go_files_matching(wt: Path, name: str, scope_dir: str | None = None) -> list[Path]:
+    args = ["grep", "-l", "-w", "-F", "-e", name, "--"]
+    if scope_dir and scope_dir != ".":
+        args.append(f"{scope_dir}/*.go")
+    else:
+        args.append("*.go")
+    p = sh(git_cmd(*args), wt, check=False)
+    if p.returncode == 0:
+        return [
+            wt / rel for rel in p.stdout.splitlines()
+            if rel.endswith(".go") and (wt / rel).is_file()
+            and (scope_dir is None or Path(rel).parent.as_posix() == scope_dir)
+        ]
+    if p.returncode == 1:
+        return []
+    root = (wt / scope_dir) if scope_dir and scope_dir != "." else wt
+    if not root.is_dir():
+        return []
+    return list(root.glob("*.go") if scope_dir is not None else root.rglob("*.go"))
+
+
+def _decl_added_on_head(wt_head: Path, name: str, scope_dir: str | None, recv: str | None,
+                        wt_base: Path | None, pkg_alias: str | None = None) -> bool:
+    head_files = _go_files_matching(wt_head, name, scope_dir)
+    if not any(_matches_pkg_decl(txt := p.read_text(errors="replace"), pkg_alias) and _has_go_decl(txt, name, recv)
+               for p in head_files):
+        return False
+    if wt_base is not None:
+        base_files = _go_files_matching(wt_base, name, scope_dir)
+        if any(_matches_pkg_decl(txt := p.read_text(errors="replace"), pkg_alias) and _has_go_decl(txt, name, recv)
+               for p in base_files):
+            return False
+    return True
+
+
+def go_pr_added_names(wt_head: Path, errors: str, *, pkg_dir: str = "",
+                      wt_base: Path | None = None,
+                      source_texts: dict[str, str] | None = None) -> list[str] | None:
     """A8: the identifiers a Go build failure on the merge-base leaves undefined, when EVERY error is an undefined
-    name (an import left unused does not count) and every such name exists on the PR head. None otherwise: another
-    kind of error, or a name the PR did not add, means the failure is not explained by a new API."""
-    msgs = [m.group(3).strip() for m in GO_ERROR.finditer(errors)]
-    msgs = [m for m in msgs if not GO_UNUSED_IMPORT.match(m)]
-    if not msgs:
+    name (an import left unused does not count) and every such name has a declaration on the PR head in the relevant
+    package or receiver (and absent from that scope on base when provided). None otherwise."""
+    entries = [(m.group(1), m.group(3).strip()) for m in GO_ERROR.finditer(errors)]
+    entries = [(f, msg) for f, msg in entries if not GO_UNUSED_IMPORT.match(msg)]
+    if not entries:
         return None
-    names: set[str] = set()
-    for m in msgs:
-        found = undefined_names(m)
+    checks: dict[tuple[str, str | None, str | None, str | None], str] = {}
+    for err_file, msg in entries:
+        found = undefined_names(msg)
         if not found:
             return None
-        names |= {x.split(".")[-1] for x in found}
-    return sorted(names) if all(_on_head(wt_head, n) for n in names) else None
+        recv_m = _RECV_TYPE_ERR.search(msg)
+        recv_pkg = recv_m.group(1) if recv_m else None
+        recv = recv_m.group(2) if recv_m else None
+        for raw in found:
+            sym = raw.split(".")[-1]
+            if "." in raw or recv is not None:
+                alias = recv_pkg if recv is not None else raw.rsplit(".", 1)[0]
+                imp_dir = _go_import_dir(wt_head, err_file, alias, source_texts) if alias else None
+                if imp_dir is not None:
+                    checks[(sym, imp_dir or ".", recv, None)] = sym
+                else:
+                    local_scope = None
+                    if recv is not None and not recv_pkg:
+                        sc = pkg_dir or str(Path(err_file).parent)
+                        local_scope = sc if (wt_head / sc).is_dir() else None
+                    checks[(sym, local_scope, recv, alias)] = sym
+            else:
+                scope = pkg_dir or str(Path(err_file).parent)
+                scope_val = scope if (wt_head / scope).is_dir() else None
+                checks[(sym, scope_val, None, None)] = sym
+    return sorted(set(checks.values())) if all(
+        _decl_added_on_head(wt_head, sym, sc, rv, wt_base, pa) for sym, sc, rv, pa in checks
+    ) else None
 
 
 def _unit_key(rel: str) -> str:
@@ -808,38 +1115,52 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     out: dict[str, Any] = {n: Verdict.NOT_A_HEAD_FAILURE for n in head if n not in failing}
     approved_dirs = target_dirs_for(hdir, state, tag)
     new_api: dict[str, list[str]] = {}
-    uncompilable: list[tuple[str, set[str], str, list[str] | None]] = []  # unit, failing tests, error, PR-added names
+    uncompilable: list[tuple[str, set[str], str, list[str] | None, bool]] = []  # unit, failing tests, error, PR-added names, is_go
     any_ran = False
+    evidence: dict[str, str] = {}
+    src_texts = {str(f.get("path", "")): str(f.get("content", "")) for f in files if isinstance(f, dict)}
     units = _failing_base_units(files, failing) if files and failing else []
+    full_pkgs_path = hdir / f"run_{tag}.full_pkgs.json"
+    full_pkgs = set(load_json(full_pkgs_path)) if full_pkgs_path.exists() else set()
     for unit_key, unit_files, unit_failing in units:
         placed: list[Path] = []
         try:
             placed = place(wt, unit_files, approved_dirs)
-            o, gone = salvage_go(wt, state, tag, placed, failing=unit_failing, go_timeouts=go_timeouts)
+            raw_errs: dict[str, str] = {}
+            failing_arg = None if unit_key in full_pkgs else unit_failing
+            o, gone = salvage_go(wt, state, tag, placed, failing=failing_arg, go_timeouts=go_timeouts, raw_errs=raw_errs)
             out.update(base_table({n: head[n] for n in unit_failing}, head_msgs, o))
-            for n, idents in gone.items():  # removed from the base copies: vetted by what head said about them
+            for n, idents in gone.items():  # removed from the base copies: only confirmed PR-added APIs are NEW_API
                 if n in unit_failing:
-                    out[n] = Verdict.NEW_API
-                    new_api[n] = idents
+                    err_txt = raw_errs.get(n) or "\n".join(f"{unit_key}/x_test.go:1:1: {m}" for m in idents)
+                    added = go_pr_added_names(Path(state["wt"]), err_txt, pkg_dir=unit_key, wt_base=wt,
+                                              source_texts=src_texts)
+                    if added:
+                        out[n] = Verdict.NEW_API
+                        new_api[n] = added
+                    else:
+                        out[n] = Verdict.BASE_UNCOMPILABLE
+                        prev = evidence.get(unit_key, "")
+                        evidence[unit_key] = f"{prev}\n{err_txt}" if prev else err_txt
             for n in unit_failing:
                 if out.get(n) == Verdict.NEW_API and n not in new_api:  # Jest: the failure text names what is missing
                     new_api[n] = jest_missing(o.messages.get(n, ""))
             any_ran = True
         except CompileError as e:
-            err, added = str(e), None
+            err, added, is_go = str(e), None, isinstance(e, GoBuildError)
             if isinstance(e, GoBuildError):  # the full error list: the message keeps only the tail of a long one
                 err_full = go_build_errors(wt, e.pkg_dir)
-                added = go_pr_added_names(Path(state["wt"]), err_full)
+                added = go_pr_added_names(Path(state["wt"]), err_full, pkg_dir=e.pkg_dir, wt_base=wt,
+                                          source_texts=src_texts)
                 err = f"{err[:200]}\n...\n{err_full}" if err_full.strip() else err
-            uncompilable.append((unit_key, unit_failing, err, added))
+            uncompilable.append((unit_key, unit_failing, err, added, is_go))
         finally:
             unplace(placed)
     if uncompilable:
         details: list[str] = []
-        evidence: dict[str, str] = {}
-        for unit_key, unit_failing, err, added in uncompilable:
-            is_missing = bool(MISSING_ON_BASE.search(err))
-            evidence[unit_key] = err[-6000:]
+        for unit_key, unit_failing, err, added, is_go in uncompilable:
+            is_missing = (not is_go) and bool(MISSING_ON_BASE.search(err))
+            evidence[unit_key] = err
             for n in sorted(unit_failing):
                 if added or is_missing:
                     out[n] = Verdict.NEW_API
@@ -853,11 +1174,13 @@ def cmd_base(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
         if not any_ran and failing and all(out.get(n) == Verdict.BASE_UNCOMPILABLE for n in failing):
             out["*"] = Verdict.BASE_UNCOMPILABLE  # nothing could be salvaged: the file-wide verdict
             out["detail"] = uncompilable[-1][2][-800:]
+    if evidence:
         write_json(hdir / f"base_{tag}.errors.json", evidence)
     if new_api:
         out["new_api"] = new_api
     write_json(hdir / f"base_{tag}.json", out)
     (hdir / f"base_{tag}.response.sha256").write_text(digest)
+    _clear_adjudication(hdir, tag)
     return out
 
 
@@ -954,7 +1277,7 @@ def _merge_outcome(dst: Outcome, src: Outcome) -> None:
 
 def _diff_unit_pass(
     wt: Path, state: dict[str, Any], tag: str, units: list[tuple[str, list[Path]]],
-    td: Path, stem: str, *, base: bool = False,
+    td: Path, stem: str, *, base: bool = False, only: str | None = None,
 ) -> tuple[Outcome, dict[tuple[str, str], dict[int, dict[str, Any]]], dict[str, str], dict[str, list[str]], list[str]]:
     """Execute Mode D units one at a time so identically named recorders across packages never overwrite each other."""
     merged = Outcome()
@@ -962,24 +1285,32 @@ def _diff_unit_pass(
     errors: dict[str, str] = {}
     gone: dict[str, list[str]] = {}
     raw_lines: list[str] = []
+    only_set = {only} if only else None
     for idx, (u_key, u_placed) in enumerate(units):
         uf = td / f"{stem}_{idx}.jsonl"
         try:
             with diff_out(uf):
                 if base:
-                    o, u_gone = salvage_go(wt, state, tag, u_placed, race=False)
+                    o, u_gone = salvage_go(wt, state, tag, u_placed, race=False, failing=only_set)
                     gone.update(u_gone)
                 else:
-                    o = run_suite(wt, suite_for(tag, state, u_placed, wt), race=False)
+                    suite = suite_for(tag, state, u_placed, wt)
+                    if only_set is not None:
+                        suite = _filter_base_suite(suite, only_set, {})
+                    o = run_suite(wt, suite, race=False)
             _merge_outcome(merged, o)
             if uf.exists():
-                text = uf.read_text()
+                text = read_text_lossy(uf)
                 if text:
                     raw_lines.append(text.rstrip("\n") + "\n")
             for cname, u_recs in read_records(uf).items():
                 recs[(u_key, cname)] = u_recs
         except CompileError as e:
             if not base:
+                raise
+            errors[u_key] = str(e)[-800:]
+        except InfraError as e:
+            if not (base and stem == "base2"):
                 raise
             errors[u_key] = str(e)[-800:]
     return merged, recs, errors, gone, raw_lines
@@ -989,26 +1320,28 @@ def _confirm_diff_on_base(
     wt_base: Path, state: dict[str, Any], tag: str, by_unit: dict[str, list[dict[str, str]]], targets: set[str],
     pending: list[tuple[str, str, tuple[str, str], dict[int, dict[str, Any]], set[int],
                         dict[int, dict[str, Any]], set[int]]],
-    verdicts: dict[str, str], detail: dict[str, Any],
+    verdicts: dict[str, str], detail: dict[str, Any], *, only: str | None = None,
 ) -> None:
     """R5: rerun the merge-base once, only for the units that hold a DIFF recorder, and keep the DIFF only on records
     the two base runs agree on. A DIFF whose every differing record is unstable on base becomes NONDETERMINISTIC; a
     unit that cannot be rerun keeps its first-run verdict."""
     unit_paths = _place_units(wt_base, by_unit, targets, sorted({u for _, u, *_ in pending}))
+    kw: dict[str, Any] = {"only": only} if only is not None else {}
     try:
         with tempfile.TemporaryDirectory() as td:
             try:
-                _, recs2, errors2, _, _ = _diff_unit_pass(wt_base, state, tag, unit_paths, Path(td), "base2",
-                                                          base=True)
+                base2_out, recs2, errors2, gone2, _ = _diff_unit_pass(wt_base, state, tag, unit_paths, Path(td),
+                                                                      "base2", base=True, **kw)
             except InfraError:  # the rerun could not run: every pending DIFF keeps its first-run verdict
-                recs2, errors2 = {}, {u: "base rerun failed" for u, _ in unit_paths}
+                base2_out, recs2, errors2, gone2 = Outcome(), {}, {u: "base rerun failed" for u, _ in unit_paths}, {}
     finally:
         unplace([p for _, ps in unit_paths for p in ps])
     for ident, u_key, rkey, a, stable, base1, cmp_idx in pending:
-        if u_key in errors2 or rkey not in recs2:
+        if (u_key in errors2 or ident in gone2 or base2_out.results.get(ident) != Verdict.PASS
+                or base2_out.results.get(f"{u_key}::{PACKAGE_FAILED}") == Verdict.FAIL):
             detail[ident]["base_rerun"] = "not available; DIFF from one base run"
             continue
-        base2 = recs2[rkey]
+        base2 = recs2.get(rkey, {})
         base_ok = stable_indices(base1, base2)
         keep = {i for i in cmp_idx if i in base_ok or (i not in base1 and i not in base2)}
         unstable = len(cmp_idx - keep)
@@ -1016,15 +1349,18 @@ def _confirm_diff_on_base(
         if diffs:
             detail[ident].update({"differing": len(diffs), "compared": len(keep), "examples": diffs[:DIFF_EXAMPLES]})
         else:  # every differing record changed between the two base runs: no stable evidence
+            prior_dropped = detail[ident].get("dropped", 0)
             verdicts[ident] = Verdict.NONDETERMINISTIC
             detail[ident] = {"detail": f"the {detail[ident]['differing']} differing record(s) are not stable between two "
-                                       "runs on the merge-base; dropped", "dropped": unstable}
+                                       "runs on the merge-base; dropped", "dropped": prior_dropped + unstable}
             continue
         if unstable:
             detail[ident]["dropped"] = detail[ident].get("dropped", 0) + unstable
 
 
-def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str]:
+def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D", *,
+             only: str | None = None, write_outputs: bool = True,
+             detail_out: dict[str, Any] | None = None) -> dict[str, str]:
     """Run the Mode D recorders on the PR head (twice) and on the merge-base (once), then compare their records.
     The model wrote the inputs and the recorder; code decides: SAME (all records equal), DIFF (some differ: up to
     DIFF_EXAMPLES smallest examples per test in diff_D.examples.json), NONDETERMINISTIC (fewer than MIN_STABLE_RECORDS
@@ -1040,15 +1376,25 @@ def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str
     require_disk(scratch())
     files = load_json(hdir / tag / "response.json")["files"]
     verdicts: dict[str, str] = {}
-    detail: dict[str, Any] = {}
-    for stale in (f"diff_{tag}.json", f"diff_{tag}.examples.json"):
-        (hdir / stale).unlink(missing_ok=True)
+    detail: dict[str, Any] = detail_out if detail_out is not None else {}
+    if write_outputs:
+        for stale in (f"diff_{tag}.json", f"diff_{tag}.examples.json", f"diff_{tag}.response.sha256"):
+            (hdir / stale).unlink(missing_ok=True)
+        _clear_adjudication(hdir, tag)
     if not files:
-        write_json(hdir / f"diff_{tag}.json", verdicts)
-        write_json(hdir / f"diff_{tag}.examples.json", detail)
+        if write_outputs:
+            write_json(hdir / f"diff_{tag}.json", verdicts)
+            write_json(hdir / f"diff_{tag}.examples.json", detail)
+            (hdir / f"diff_{tag}.response.sha256").write_text(fingerprint(files))
+            _clear_adjudication(hdir, tag)
         return verdicts
     targets = {t["dir"] for t in state["targets"]}
     by_unit = group_by_unit(files)
+    if only is not None:
+        only_unit = only.split("::", 1)[0]
+        by_unit = {k: v for k, v in by_unit.items() if k == only_unit}
+        if not by_unit:
+            raise InfraError(f"no Mode D unit found for {only!r} in {hdir / tag / 'response.json'}")
 
     with tempfile.TemporaryDirectory() as td_str:
         td = Path(td_str)
@@ -1056,9 +1402,10 @@ def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str
         head_recs: list[dict[tuple[str, str], dict[int, dict[str, Any]]]] = []
         head_raw: list[str] = []
         head_units = _place_units(wt, by_unit, targets)
+        kw: dict[str, Any] = {"only": only} if only is not None else {}
         try:
             for pass_i in range(2):
-                o, recs, _, _, raw = _diff_unit_pass(wt, state, tag, head_units, td, f"head{pass_i + 1}")
+                o, recs, _, _, raw = _diff_unit_pass(wt, state, tag, head_units, td, f"head{pass_i + 1}", **kw)
                 runs.append(o)
                 head_recs.append(recs)
                 if pass_i == 0:
@@ -1073,23 +1420,30 @@ def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str
         base_raw: list[str] = []
         base_units = _place_units(wt_base, by_unit, targets)
         try:
-            base, base_recs, base_errors, gone, base_raw = _diff_unit_pass(wt_base, state, tag, base_units, td, "base", base=True)
+            base, base_recs, base_errors, gone, base_raw = _diff_unit_pass(
+                wt_base, state, tag, base_units, td, "base", base=True, **kw)
         finally:
             unplace([p for _, ps in base_units for p in ps])
 
-        (hdir / f"diff_{tag}.head.jsonl").write_text("".join(head_raw))
-        (hdir / f"diff_{tag}.base.jsonl").write_text("".join(base_raw))
+        if write_outputs:
+            (hdir / f"diff_{tag}.head.jsonl").write_text("".join(head_raw))
+            (hdir / f"diff_{tag}.base.jsonl").write_text("".join(base_raw))
     pending_diff: list[tuple[str, str, tuple[str, str], dict[int, dict[str, Any]], set[int],
                              dict[int, dict[str, Any]], set[int]]] = []
     for ident in sorted(set(runs[0].results) | set(runs[1].results)):
+        if only is not None and ident != only:
+            continue
         u_key = ident.split("::", 1)[0]
         rkey = (u_key, record_name(ident))
         statuses = [r.results.get(ident, Verdict.MISSING) for r in runs]
         a, b = head_recs[0].get(rkey, {}), head_recs[1].get(rkey, {})
         stable = stable_indices(a, b)
-        if any(s != Verdict.PASS for s in statuses):
+        head_pkg_failed = any(r.results.get(f"{u_key}::{PACKAGE_FAILED}") == Verdict.FAIL for r in runs)
+        if any(s != Verdict.PASS for s in statuses) or head_pkg_failed:
             verdicts[ident] = Verdict.RECORDER_FAILED
-            msg = runs[0].messages.get(ident) or runs[1].messages.get(ident, "")
+            msg = (runs[0].messages.get(ident) or runs[1].messages.get(ident)
+                   or runs[0].messages.get(f"{u_key}::{PACKAGE_FAILED}")
+                   or runs[1].messages.get(f"{u_key}::{PACKAGE_FAILED}", ""))
             detail[ident] = {"detail": f"head runs: {statuses}; {normalize_failure(msg, wt)[-600:]}"}
         elif not a and not b:
             verdicts[ident] = Verdict.NO_RECORDS
@@ -1107,8 +1461,9 @@ def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str
             detail[ident] = {"detail": "undefined on the merge-base: " + ", ".join(gone[ident])}
         else:
             status = base.results.get(ident, Verdict.MISSING)
-            msg = base.messages.get(ident, "")
-            if status != Verdict.PASS:
+            pkg_failed = base.results.get(f"{u_key}::{PACKAGE_FAILED}") == Verdict.FAIL
+            msg = base.messages.get(ident) or base.messages.get(f"{u_key}::{PACKAGE_FAILED}", "")
+            if status != Verdict.PASS or pkg_failed:
                 missing = MISSING_ON_BASE.search(msg) or TARGET_MISSING.search(msg)
                 verdicts[ident] = Verdict.BASE_UNCOMPILABLE if missing else Verdict.BASE_FAILED
                 detail[ident] = {"detail": f"base run: {status}; {normalize_failure(msg, wt_base)[-600:]}"}
@@ -1129,9 +1484,12 @@ def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D") -> dict[str, str
                 if dropped:
                     detail.setdefault(ident, {})["dropped"] = dropped
     if pending_diff:
-        _confirm_diff_on_base(wt_base, state, tag, by_unit, targets, pending_diff, verdicts, detail)
-    write_json(hdir / f"diff_{tag}.json", verdicts)
-    write_json(hdir / f"diff_{tag}.examples.json", detail)
+        _confirm_diff_on_base(wt_base, state, tag, by_unit, targets, pending_diff, verdicts, detail, only=only)
+    if write_outputs:
+        write_json(hdir / f"diff_{tag}.json", verdicts)
+        write_json(hdir / f"diff_{tag}.examples.json", detail)
+        (hdir / f"diff_{tag}.response.sha256").write_text(fingerprint(files))
+        _clear_adjudication(hdir, tag)
     return verdicts
 
 
@@ -1507,11 +1865,63 @@ def cmd_fuzz(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     return report
 
 
+def _diff_dir_for(hdir: Path, tag: str, only: str) -> Path:
+    only_unit = only.split("::", 1)[0]
+    candidates = [hdir]
+    broot = hdir / "batches"
+    if broot.is_dir():
+        candidates.extend(sorted(p for p in broot.iterdir() if p.is_dir() and p.name.startswith("batch_")))
+    for bdir in candidates:
+        resp = bdir / tag / "response.json"
+        if resp.is_file():
+            files = load_json(resp).get("files") or []
+            if only_unit in group_by_unit(files):
+                return bdir
+    return hdir
+
+
+def cmd_repro(hdir: Path, state: dict[str, Any], tag: str, only: str) -> int:
+    """Restore generated test files for `only`'s unit, run the selected test on PR head, and clean up the worktree."""
+    wt = Path(state["wt"])
+    ensure_clean(wt)
+    files = load_json(hdir / tag / "response.json")["files"]
+    targets = {t["dir"] for t in state["targets"]}
+    only_unit, _, only_name = only.partition("::")
+    by_unit = {k: v for k, v in group_by_unit(files).items() if k == only_unit}
+    if not by_unit:
+        raise InfraError(f"no {tag} test unit found for {only!r} in {hdir / tag / 'response.json'}")
+    placed_units = _place_units(wt, by_unit, targets)
+    placed = [p for _, ps in placed_units for p in ps]
+    try:
+        suite = _filter_base_suite(suite_for(tag, state, placed, wt), {only}, {})
+        o = run_suite(wt, suite, race=True)
+    finally:
+        unplace(placed)
+    only_top = f"{only_unit}::{only_name.split('/', 1)[0]}" if only_name else only
+    status = o.results.get(only, o.results.get(only_top, Verdict.MISSING))
+    print(f"[{tag} repro] {only}: {status}")
+    msg = o.messages.get(only) or o.messages.get(only_top, "")
+    if msg:
+        print(msg)
+    return 0 if status == Verdict.PASS else 1
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 4 or argv[1] not in ("run", "base", "mutants", "cover", "fuzz", "diff"):
+    only: str | None = None
+    args = list(argv[1:])
+    if "--only" in args:
+        idx = args.index("--only")
+        if idx + 1 >= len(args):
+            print(__doc__)
+            return 1
+        only = args[idx + 1]
+        del args[idx:idx + 2]
+    if (len(args) != 3 or args[0] not in ("run", "base", "mutants", "cover", "fuzz", "diff", "repro")
+            or (only and args[0] not in ("diff", "repro"))
+            or (args[0] == "repro" and not only)):
         print(__doc__)
         return 1
-    cmd, pr, tag = argv[1], argv[2], argv[3]
+    cmd, pr, tag = args[0], args[1], args[2]
     hdir = hunt_dir(pr)
 
     def _run_cmd() -> int:
@@ -1536,9 +1946,20 @@ def main(argv: list[str]) -> int:
                 for n, t in cov["tests"].items():
                     print(f"[{tag} cover] {n}: {t['verdict']} {sum(len(v) for v in t['hit'].values())} changed lines")
                 print(f"[{tag} cover] changed lines reached: {cov['reached']}/{cov['executable']}")
+            elif cmd == "repro":
+                assert only is not None
+                bdir = _diff_dir_for(hdir, tag, only)
+                bstate = read_state(bdir) if bdir != hdir else state
+                return cmd_repro(bdir, bstate, tag, only)
             elif cmd == "diff":
-                verdicts = cmd_diff(hdir, state, tag)
-                info = load_json(hdir / f"diff_{tag}.examples.json")
+                if only is not None:
+                    bdir = _diff_dir_for(hdir, tag, only)
+                    bstate = read_state(bdir) if bdir != hdir else state
+                    info: dict[str, Any] = {}
+                    verdicts = cmd_diff(bdir, bstate, tag, only=only, write_outputs=False, detail_out=info)
+                else:
+                    verdicts = cmd_diff(hdir, state, tag)
+                    info = load_json(hdir / f"diff_{tag}.examples.json")
                 for n, verdict in verdicts.items():
                     d = info.get(n, {})
                     count = f" ({d['differing']} of {d['compared']} inputs differ)" if verdict == Verdict.DIFF else ""

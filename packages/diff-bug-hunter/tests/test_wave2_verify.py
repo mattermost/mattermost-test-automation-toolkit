@@ -69,9 +69,11 @@ def _stack(tmp_path, monkeypatch):
 def test_up_requires_a_license_only_with_require_license_and_before_touching_the_stack(tmp_path, monkeypatch, capsys):
     e2e = _stack(tmp_path, monkeypatch)
     monkeypatch.setattr(pr_server, "make", lambda *a: pytest.fail("started a stack"))
+    monkeypatch.setattr(pr_server, "running_build", lambda *a: pytest.fail("probed running server"))
     with pytest.raises(pr_server.InfraError, match="--require-license"):
         pr_server.up(f"{IMG}:3f535d1", e2e, require_license=True)
     # without the flag a missing license is only reported in the profile
+    (tmp_path / "profile").write_text("[]")
     state = {"build": "3f535d1aaa", "seeded": []}
     monkeypatch.setattr(pr_server, "running_build", lambda url: state["build"])
     monkeypatch.setattr(pr_server, "seed", lambda *a: state["seeded"].append(a))
@@ -82,6 +84,7 @@ def test_up_requires_a_license_only_with_require_license_and_before_touching_the
 
 def test_up_passes_the_license_to_seed_and_never_prints_it(tmp_path, monkeypatch, capsys):
     e2e = _stack(tmp_path, monkeypatch)
+    (tmp_path / "profile").write_text("[]")
     monkeypatch.setenv("MM_LICENSE", SECRET)
     seeded = []
     monkeypatch.setattr(pr_server, "running_build", lambda url: "3f535d1aaa")

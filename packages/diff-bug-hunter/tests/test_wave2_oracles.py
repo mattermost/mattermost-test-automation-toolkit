@@ -35,22 +35,24 @@ def test_c2_passing_tests_run_once_and_only_failures_are_rerun(tmp_path, monkeyp
     a, b, c = HEAD_TESTS
     seen = _scripted_run_suite(monkeypatch, [
         {a: "FAIL", b: "PASS", c: "FAIL"},
-        {a: "FAIL", c: "PASS"},   # c passes on the rerun: FLAKY, and it is not run a third time
+        {a: "FAIL", c: "PASS"},   # c passes on filtered rerun: confirm against full suite before marking FLAKY
+        {a: "FAIL", b: "PASS", c: "PASS"},
         {a: "FAIL"},
     ])
     table = run.cmd_run(hdir, state, "A")
     assert table == {a: "FAIL_3_OF_3", b: "PASS", c: "FLAKY"}
-    assert len(seen) == 3
+    assert len(seen) == 4
     assert seen[0] == {"calc": "^TestHuntA_"}
     assert seen[1] == {"calc": "^(TestHuntA_ClampAllClamps|TestHuntA_ClampKeepsUpperBound)$"}
-    assert seen[2] == {"calc": "^(TestHuntA_ClampAllClamps)$"}
+    assert seen[2] == {"calc": "^TestHuntA_"}
+    assert seen[3] == {"calc": "^(TestHuntA_ClampAllClamps)$"}
     _clean(state)
 
 
 def test_c2_all_passing_is_one_run(tmp_path, monkeypatch):
     hdir, state = make_hunt(tmp_path, "go_newapi")
     seen = _scripted_run_suite(monkeypatch, [dict.fromkeys(HEAD_TESTS, "PASS")])
-    assert set(run.cmd_run(hdir, state, "A").values()) == {"PASS"}
+    assert run.cmd_run(hdir, state, "A") == dict.fromkeys(HEAD_TESTS, "PASS")
     assert len(seen) == 1
     _clean(state)
 
@@ -58,9 +60,28 @@ def test_c2_all_passing_is_one_run(tmp_path, monkeypatch):
 def test_c2_a_failure_that_passes_on_the_first_rerun_stops_there(tmp_path, monkeypatch):
     hdir, state = make_hunt(tmp_path, "go_newapi")
     a, b, c = HEAD_TESTS
-    seen = _scripted_run_suite(monkeypatch, [{a: "FAIL", b: "PASS", c: "SKIP"}, {a: "PASS"}])
+    seen = _scripted_run_suite(monkeypatch, [
+        {a: "FAIL", b: "PASS", c: "SKIP"},
+        {a: "PASS"},
+        {a: "PASS", b: "PASS", c: "SKIP"},
+    ])
     assert run.cmd_run(hdir, state, "A") == {a: "FLAKY", b: "PASS", c: "SKIP"}
-    assert len(seen) == 2
+    assert seen == [{"calc": "^TestHuntA_"}, {"calc": "^(TestHuntA_ClampAllClamps)$"}, {"calc": "^TestHuntA_"}]
+    _clean(state)
+
+
+def test_c2_package_order_dependent_failure_is_confirmed_under_original_suite(tmp_path, monkeypatch):
+    hdir, state = make_hunt(tmp_path, "go_newapi")
+    a, b, c = HEAD_TESTS
+    seen = _scripted_run_suite(monkeypatch, [
+        {a: "PASS", b: "PASS", c: "FAIL"},
+        {c: "PASS"},                        # filtered rerun drops b, so c passes
+        {a: "PASS", b: "PASS", c: "FAIL"},  # full suite confirmation reproduces c failing
+        {a: "PASS", b: "PASS", c: "FAIL"},  # 3rd attempt stays on full suite
+    ])
+    assert run.cmd_run(hdir, state, "A") == {a: "PASS", b: "PASS", c: "FAIL_3_OF_3"}
+    assert seen == [{"calc": "^TestHuntA_"}, {"calc": "^(TestHuntA_ClampKeepsUpperBound)$"},
+                    {"calc": "^TestHuntA_"}, {"calc": "^TestHuntA_"}]
     _clean(state)
 
 
@@ -139,6 +160,8 @@ def test_a8_other_build_errors_keep_per_test_rows_and_every_error(tmp_path, monk
     assert "NoSuchThingAnywhere" in evidence["calc"] and "cannot use" in evidence["calc"]
     run_again = run.cmd_base(hdir, state, "A")  # the evidence file is rewritten, not appended
     assert run_again == out
+    evidence_again = json.loads((hdir / "base_A.errors.json").read_text())
+    assert evidence_again == evidence
     _clean(state)
 
 

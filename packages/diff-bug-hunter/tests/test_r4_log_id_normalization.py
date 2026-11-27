@@ -46,13 +46,13 @@ _HEAD_FAIL = {"pkg::TestHuntA_X": Verdict.FAIL_3_OF_3}
             id="storetest_db_alnum_fallback",
         ),
         pytest.param(
-            "unexpected token 550e8400-e29b-41d4-a716-446655440000 in payload",
-            "unexpected token 11111111-2222-3333-4444-555555555555 in payload",
+            "request_id=550e8400-e29b-41d4-a716-446655440000 in payload",
+            "request_id=11111111-2222-3333-4444-555555555555 in payload",
             id="uuid_lowercase",
         ),
         pytest.param(
-            "unexpected token 550E8400-E29B-41D4-A716-446655440000 in payload",
-            "unexpected token A1B2C3D4-E5F6-7890-ABCD-EF1234567890 in payload",
+            "uuid=550E8400-E29B-41D4-A716-446655440000 in payload",
+            "uuid=A1B2C3D4-E5F6-7890-ABCD-EF1234567890 in payload",
             id="uuid_uppercase",
         ),
         pytest.param(
@@ -89,11 +89,6 @@ _HEAD_FAIL = {"pkg::TestHuntA_X": Verdict.FAIL_3_OF_3}
             "trace 4bf92f3577b34da6a3ce929d0e0e4736 span 00f067aa0ba902b7 failed",
             "trace 99887766554433221100aabbccddeeff span aabbccddeeff0011 failed",
             id="long_hex_otel_trace_and_span",
-        ),
-        pytest.param(
-            "sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 mismatch",
-            "sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef mismatch",
-            id="long_hex_64_sha256",
         ),
         pytest.param(
             "created_at=1700000000123 ns=1764212431123456789",
@@ -148,7 +143,19 @@ def test_base_verdict_normalizes_ephemeral_ids_to_pre_existing(head_msg: str, ba
         pytest.param("open /tmp/a: fail", "open /tmp/b: fail", id="deterministic_tmp_subpaths"),
         pytest.param("ratio=0.1234567890123456", "ratio=0.9876543210987654", id="long_floats"),
         pytest.param("max=18446744073709551615", "max=18446744073709551614", id="20_digit_max_uint64"),
+        pytest.param("received 1099511627776 bytes; want 512", "received 2199023255552 bytes; want 512",
+                     id="13_digit_byte_counts"),
+        pytest.param(
+            "sha256 got e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 want 0000",
+            "sha256 got 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef want 0000",
+            id="deterministic_sha256_checksums",
+        ),
         pytest.param("hunt_huntb_test.go:42: fail", "hunt_huntb_test.go:99: fail", id="test_line_numbers"),
+        pytest.param(
+            "got 11111111-2222-3333-4444-555555555555, want 00000000-0000-0000-0000-000000000000",
+            "got 22222222-3333-4444-5555-666666666666, want 00000000-0000-0000-0000-000000000000",
+            id="fixed_uuid_assertion_expectations",
+        ),
     ],
 )
 def test_base_verdict_preserves_deterministic_differences(head_msg: str, base_msg: str) -> None:
@@ -190,7 +197,7 @@ def test_cmd_run_preserves_raw_ids_while_cmd_base_classifies_pre_existing(
     def _go_out(nid: str, uid: str, hostport: str, tmppath: str) -> str:
         return (
             "=== RUN   TestHuntA_Scope\n"
-            f"    hunt_hunta_test.go:12: channel={nid} req={uid} url=http://{hostport}/ping file={tmppath}\n"
+            f'    hunt_hunta_test.go:12: channel={nid} req={uid} Get "http://{hostport}/ping": connection refused file={tmppath}\n'
             "--- FAIL: TestHuntA_Scope (0.01s)\n"
             "FAIL\n"
             "FAIL\texample.com/test/calc\t0.012s\n"
@@ -205,6 +212,7 @@ def test_cmd_run_preserves_raw_ids_while_cmd_base_classifies_pre_existing(
         return subprocess.CompletedProcess(cmd, 1, stdout=out, stderr="")
 
     monkeypatch.setattr(run, "ensure_clean", lambda wt: None)
+    monkeypatch.setattr(run, "require_disk", lambda p: None)
     monkeypatch.setattr(run, "sh", fake_sh)
 
     head_table = run.cmd_run(hdir, state, "A", runs=3)

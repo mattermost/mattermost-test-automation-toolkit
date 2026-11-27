@@ -272,7 +272,8 @@ def _error_id(e: urllib.error.HTTPError) -> str:
 def _create_user(url: str, username: str, password: str, token: str | None = None) -> str:
     try:
         _, user = request("POST", f"{url}/api/v4/users",
-                          {"username": username, "email": f"{username}@example.com", "password": password})
+                          {"username": username, "email": f"{username}@example.com", "password": password},
+                          token=token)
         return str((user or {}).get("id") or "")
     except urllib.error.HTTPError as e:
         reason = _error_id(e)
@@ -350,11 +351,12 @@ def _require_e2e(e2e: Path) -> None:
         raise InfraError(f"{e2e} is not the mattermost repo's e2e-tests dir (pass --e2e or set MM_E2E_DIR)")
 
 
-def _stored_profile() -> list[str]:
+def _stored_profile() -> list[str] | None:
     try:
-        return list(json.loads(profile_path().read_text()))
+        raw = json.loads(profile_path().read_text())
+        return list(raw) if isinstance(raw, list) else None
     except (OSError, ValueError, TypeError):
-        return []
+        return None
 
 
 def up(image: str, e2e: Path, flags: list[str] | None = None, require_license: bool = False) -> None:
@@ -374,13 +376,14 @@ def up(image: str, e2e: Path, flags: list[str] | None = None, require_license: b
             if build is not None:
                 why = f"runs {build[:10]}, not {image}" if wrong_build else "runs another feature-flag profile"
                 print(f"server on {SERVER_URL} {why}: replacing it")
+            profile_path().write_text(json.dumps({"pending": True}))
             started = time.time()
             make(e2e, "stop-server", image)
             if flags:
                 make(e2e, "start-server", image, flags_env(flags))
             else:
                 make(e2e, "start-server", image)
-            with contextlib.suppress(OSError):  # without the marker a later `up` just restarts when flags are given
+            with contextlib.suppress(OSError):  # pending marker stays if write fails, forcing replacement next `up`
                 profile_path().write_text(json.dumps(flags))
             print(f"stack up in {time.time() - started:.0f}s")
         build = running_build(SERVER_URL)

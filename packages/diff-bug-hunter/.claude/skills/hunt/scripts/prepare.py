@@ -30,8 +30,11 @@ if not sys.pycache_prefix:
 import fcntl
 import hashlib
 import json
+import re
 import shutil
-from collections.abc import Iterator
+import threading
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -163,11 +166,29 @@ def _container_running(name: str) -> bool | None:
 
 
 def _ensure_container(name: str, run_args: list[str]) -> None:
-    state = _container_running(name)
-    if state is None:
-        sh(["docker", "run", "-d", "--name", name, *run_args], Path("."))
-    elif not state:
-        sh(["docker", "start", name], Path("."))
+    lock_file = scratch() / f"{name}.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    with lock_file.open("w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            state = _container_running(name)
+            if state is None:
+                sh(["docker", "run", "-d", "--name", name, *run_args], Path("."))
+            elif not state:
+                sh(["docker", "start", name], Path("."))
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _wait_until(probe: Callable[[], bool], timeout: float, interval: float = 0.5) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        if probe():
+            return True
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            return False
+        threading.Event().wait(min(interval, rem))
 
 
 def _docker_services() -> None:
@@ -179,10 +200,11 @@ def _docker_services() -> None:
     The setting applies when the container is created; remove an older hunt-pg container to pick it up."""
     _ensure_container(PG_CONTAINER, ["-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-p", "127.0.0.1:5432:5432", PG_IMAGE,
                                      "-c", f"max_connections={PG_MAX_CONNECTIONS}"])
-    # One bounded readiness poll (60 s) inside the container's shell: a wait for startup, not a retry of a test.
-    poll = ("i=0; until pg_isready -h localhost -U postgres -q; do i=$((i+1)); "
-            "[ $i -ge 60 ] && exit 1; done; exit 0")
-    if sh(["docker", "exec", PG_CONTAINER, "sh", "-c", poll], Path("."), check=False).returncode != 0:
+    if not _wait_until(
+        lambda: sh(["docker", "exec", PG_CONTAINER, "pg_isready", "-h", "localhost", "-U", "postgres", "-q"],
+                   Path("."), check=False).returncode == 0,
+        timeout=60.0,
+    ):
         raise InfraError(f"Postgres container {PG_CONTAINER} not ready after 60s")
     psql = ["docker", "exec", PG_CONTAINER, "psql", "-h", "localhost", "-U", "postgres"]
     if sh([*psql, "-tAc", "SELECT 1 FROM pg_roles WHERE rolname='mmuser'"], Path("."), check=False).stdout.strip() != "1":
@@ -191,8 +213,11 @@ def _docker_services() -> None:
           check=False).stdout.strip() != "1":
         sh([*psql, "-qc", "CREATE DATABASE mattermost_test OWNER mmuser"], Path("."))
     _ensure_container(REDIS_CONTAINER, ["-p", "127.0.0.1:6379:6379", REDIS_IMAGE])
-    poll = "i=0; until [ \"$(redis-cli ping)\" = PONG ]; do i=$((i+1)); [ $i -ge 30 ] && exit 1; done; exit 0"
-    if sh(["docker", "exec", REDIS_CONTAINER, "sh", "-c", poll], Path("."), check=False).returncode != 0:
+    if not _wait_until(
+        lambda: sh(["docker", "exec", REDIS_CONTAINER, "redis-cli", "ping"],
+                   Path("."), check=False).stdout.strip() == "PONG",
+        timeout=30.0,
+    ):
         raise InfraError(f"Redis container {REDIS_CONTAINER} did not answer PING")
 
 
@@ -210,10 +235,11 @@ def services_up() -> None:
     if sh(["redis-cli", "ping"], Path("."), check=False).stdout.strip() != "PONG":
         sh(["redis-server", "--daemonize", "yes", "--port", "6379", "--save", "", "--appendonly", "no",
             "--dir", str(scratch())], Path("."))
-        for _ in range(30):
-            if sh(["redis-cli", "ping"], Path("."), check=False).stdout.strip() == "PONG":
-                return
-        raise InfraError("Redis not reachable on localhost:6379 after daemon start")
+        if not _wait_until(
+            lambda: sh(["redis-cli", "ping"], Path("."), check=False).stdout.strip() == "PONG",
+            timeout=15.0,
+        ):
+            raise InfraError("Redis not reachable on localhost:6379 after daemon start")
 
 
 def npm_ci_for_lock(webapp: Path) -> None:
@@ -260,8 +286,13 @@ def deps(repo: Path, wt: Path, wt_base: Path, mb: str, head_ref: str) -> tuple[b
     """What the changed files need: go.work for Go, Postgres and Redis for stateful server code, npm ci for the webapp.
     Returns (go_changed, web_changed). Shared with eval_bugs.py, which hunts historical commits instead of PRs."""
     changed = huntable_changed(repo, mb, head_ref)
+    all_changed = (git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head_ref).splitlines()
+                   if changed else [])
     go_changed = any(f.startswith("server/") and f.endswith(".go") for f in changed)
-    web_changed = any(f.startswith("webapp/") for f in changed)
+    web_changed = any(f.startswith("webapp/") for f in changed) or any(
+        f.startswith("webapp/") and re.search(r"\.test\.[jt]sx?$", f) and not Path(f).name.startswith("hunt_")
+        for f in all_changed
+    )
     if go_changed:
         for w in (wt, wt_base):
             go_work(w)
@@ -334,14 +365,19 @@ def resolve_ref(mm: Path, ref: str) -> str:
     raise InfraError(f"cannot resolve ref {ref!r} in {mm}: {(p.stdout + p.stderr).strip()[-400:]}")
 
 
-def _prepare_reset(hdir: Path, label: str, head_sha: str, fresh: bool, pv: str, base_mode: str | None = None) -> None:
-    stale_meta = fresh or not prompt_matches(hdir, pv) or (base_mode is not None and not base_mode_matches(hdir, base_mode))
+def _prepare_reset(hdir: Path, label: str, head_sha: str, fresh: bool, pv: str, base_mode: str | None = None,
+                   merge_base: str | None = None) -> None:
+    check_schema(hdir, head_sha, fresh)
+    stale_meta = (
+        fresh or not prompt_matches(hdir, pv)
+        or (base_mode is not None and not base_mode_matches(hdir, base_mode))
+        or (merge_base is not None and not _meta_matches(hdir, "merge_base", merge_base))
+    )
     done = [] if stale_meta else existing_results(hdir, head_sha)
     if done:
         raise AlreadyHunted(f"{label} already has results for head {head_sha[:10]}: {', '.join(done)}. "
                             "Do not start over: continue from the first step whose output is missing, or report. "
                             "Pass --fresh only if the user asked for a new hunt.")
-    check_schema(hdir, head_sha, fresh)
     # The worktrees are about to move: context, responses and verdicts from the previous preparation no longer apply.
     reset_hunt_dir(hdir, include_whole_pr=True)
     for name in ("prepare.json", *RUN_STALE):
@@ -361,7 +397,8 @@ def prepare(pr: str, fresh: bool = False) -> None:
         mm = mm_clone()
         ensure_clone(mm)
         base_sha, head_sha = resolve_ref(mm, base_spec), resolve_ref(mm, head_spec)
-        _prepare_reset(hdir, f"{hdir.name}/", head_sha, fresh, pv, base_mode=base_mode)
+        eff_mb = base_sha if two_dot else git(mm, "merge-base", base_sha, head_sha)
+        _prepare_reset(hdir, f"{hdir.name}/", head_sha, fresh, pv, base_mode=base_mode, merge_base=eff_mb)
         head_ref, base_ref, extra = head_sha, base_sha, {"range": [base_spec, head_spec], "base_mode": base_mode}
         base_label, extra_note = base_spec, f", {base_mode}"
         head_note = f" ({head_spec} @ {head_sha[:10]})"

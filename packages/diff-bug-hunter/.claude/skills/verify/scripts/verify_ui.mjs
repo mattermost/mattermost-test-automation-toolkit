@@ -6,7 +6,7 @@
 // given, and then exactly one, failure.png, only when the run FAILs, for a person to look at; the agent never reads it.
 //
 // usage: verify_ui.mjs <plan.json> [--freeze <dir>/<name>.spec.ts] [--screenshot-on-fail]
-//        verify_ui.mjs <plan.json> --compare <base_url>
+//        verify_ui.mjs <plan.json> --compare <base_url> [--all-diffs]
 //        verify_ui.mjs --feature-map <route or feature> [FEATURE_MAP.md]
 // Exit codes: 0 PASS, 1 FAIL (an expectation, a page error, a >= 500 /api/v4/ response, a request still running at the
 // settle deadline, or leaving the allowed origins), 2 INVALID_PLAN or INFRA_ERROR. Errors print only their first line
@@ -97,6 +97,7 @@ import path from 'node:path';
 
 const MAX_STEPS = 10;
 const ACTION_TIMEOUT_MS = 10000;
+const API_TIMEOUT_MS = 30000;
 const SNAPSHOT_CHARS = 4000;
 const QUIET_MS = 300;
 const DEFAULT_SETTLE_MS = 10000;
@@ -113,11 +114,12 @@ const VAR_REF_RE = /\$([A-Za-z_]\w*)/g;
 const URL_VAR_VAL_RE = /^[A-Za-z0-9._-]+$/;
 const TOP_KEYS = ['name', 'base_url', 'login', 'scope', 'allow_origins', 'steps', 'expect', 'ignore', 'covers', 'verified_at'];
 const MAX_DIFFS = 200;
-const NET_ERR_RE = /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|net::ERR_/;
+const NET_ERR_RE = /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|net::ERR_(?:CONNECTION_|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED|ADDRESS_UNREACHABLE|TIMED_OUT|(?:CERT|SSL)_[A-Z0-9_]+)|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_VERIFY_LEAF_SIGNATURE|ERR_TLS_CERT_ALTNAME_INVALID|CERT_HAS_EXPIRED|CERT_NOT_YET_VALID|self[- ]signed certificate|unable to verify the first certificate|unable to get local issuer certificate|certificate has expired|hostname\/IP does not match certificate/i;
 const SINGLE_LINE_RE = /[\r\n\u2028\u2029]/;
 
 class PlanError extends Error {}
 class InfraError extends Error {}
+class StepFailureError extends Error {}
 
 const firstLine = (err) => String(err instanceof Error ? err.message : err).split('\n')[0];
 const normApi = (spec) => (typeof spec === 'string' ? {path: spec} : spec);
@@ -181,7 +183,7 @@ function staysOn(p, origin) {
 // Checked after URL resolution too: "/api/v4/../../x" or a stray tab must not reach a non-API handler.
 // When `allowVars` is true (plan validation), `$var` placeholders are treated as safe path tokens and re-checked at runtime.
 // Same-origin server paths a capture or api expect may call: the API, OAuth endpoints and a plugin's own routes.
-const SERVER_PATH_RE = /^\/(?:api\/v4\/|oauth\/|plugins\/[A-Za-z0-9][A-Za-z0-9._-]*\/)/;
+const SERVER_PATH_RE = /^\/(?:api\/v4\/|oauth\/|plugins\/(?!\.{1,2}\/)[A-Za-z0-9._-]+\/)/;
 function isApiPath(p, origin, allowVars = false) {
     if (!nonEmpty(p)) {
         return false;
@@ -545,8 +547,24 @@ export async function apiLogin(context, base, env) {
     if (!res.ok()) {
         throw new Error(`login as ${env.VERIFY_USER} failed: HTTP ${res.status()}`);
     }
-    const cookies = typeof context.cookies === 'function'
-        ? await context.cookies(base) : ((await context.storageState()).cookies ?? []);
+    let cookies;
+    if (typeof context.cookies === 'function') {
+        cookies = await context.cookies(base);
+    } else {
+        const u = new URL(base);
+        const host = u.hostname.toLowerCase();
+        const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1' || host.endsWith('.localhost');
+        cookies = ((await context.storageState()).cookies ?? []).filter((x) => {
+            const raw = (x.domain ?? '').toLowerCase();
+            const dom = raw.replace(/^\./, '');
+            const domOk = !dom || host === dom || (raw.startsWith('.') && host.endsWith('.' + dom));
+            const cp = x.path ?? '';
+            const pathOk = !cp || cp === '/' || u.pathname === cp || u.pathname.startsWith(cp.endsWith('/') ? cp : cp + '/');
+            const secureOk = !x.secure || u.protocol === 'https:' || isLocal;
+            const expiryOk = x.expires === undefined || x.expires === -1 || x.expires * 1000 > Date.now();
+            return domOk && pathOk && secureOk && expiryOk;
+        });
+    }
     const names = new Set(cookies.map((c) => c.name));
     const missing = ['MMAUTHTOKEN', 'MMUSERID', 'MMCSRF'].filter((name) => !names.has(name));
     if (missing.length) {
@@ -740,7 +758,7 @@ function expandPath(raw, origin, vars, mustBeApi) {
     } catch {
         u = null;
     }
-    const apiRe = /^\/(?:api\/v4\/|oauth\/|plugins\/[A-Za-z0-9][A-Za-z0-9._-]*\/)/;
+    const apiRe = /^\/(?:api\/v4\/|oauth\/|plugins\/(?!\.{1,2}\/)[A-Za-z0-9._-]+\/)/;
     const okPath = mustBeApi
         ? apiRe.test(out) && apiRe.test(u?.pathname ?? '')
         : out.startsWith('/') && !out.startsWith('//') && !out.includes('\\');
@@ -775,39 +793,53 @@ const SIMPLE_STEPS = {
 
 async function runStep(page, base, origin, step, vars) {
     if ('goto' in step) {
-        const target = expandPath(step.goto, origin, vars, false);
+        let target;
+        try {
+            target = expandPath(step.goto, origin, vars, false);
+        } catch (err) {
+            throw new StepFailureError(firstLine(err));
+        }
         await page.goto(new URL(target, base).toString(), {waitUntil: 'domcontentloaded'});
-    } else if ('press' in step) {
-        await (step.on ? locate(page, step.on).press(step.press) : page.keyboard.press(step.press));
-    } else if ('mouse_up' in step) {
-        await page.mouse.up();
-    } else if ('drag' in step) {
-        const d = step.drag;
-        const src = await locate(page, d.from).boundingBox();
-        if (!src) {
-            throw new Error(`drag source has no bounding box: ${JSON.stringify(d.from)}`);
-        }
-        const sx = src.x + src.width / 2;
-        const sy = src.y + src.height / 2;
-        let tx = sx + (d.dx ?? 0);
-        let ty = sy + (d.dy ?? 0);
-        if (d.to) {
-            const dst = await locate(page, d.to).boundingBox();
-            if (!dst) {
-                throw new Error(`drag target has no bounding box: ${JSON.stringify(d.to)}`);
-            }
-            tx = dst.x + dst.width / 2;
-            ty = dst.y + dst.height / 2;
-        }
-        await page.mouse.move(sx, sy);
-        await page.mouse.down();
-        await page.mouse.move(tx, ty, {steps: 5});
-        if (d.release !== false) {
+        return;
+    }
+    try {
+        if ('press' in step) {
+            await (step.on ? locate(page, step.on).press(step.press) : page.keyboard.press(step.press));
+        } else if ('mouse_up' in step) {
             await page.mouse.up();
+        } else if ('drag' in step) {
+            const d = step.drag;
+            const src = await locate(page, d.from).boundingBox();
+            if (!src) {
+                throw new StepFailureError(`drag source has no bounding box: ${JSON.stringify(d.from)}`);
+            }
+            const sx = src.x + src.width / 2;
+            const sy = src.y + src.height / 2;
+            let tx = sx + (d.dx ?? 0);
+            let ty = sy + (d.dy ?? 0);
+            if (d.to) {
+                const dst = await locate(page, d.to).boundingBox();
+                if (!dst) {
+                    throw new StepFailureError(`drag target has no bounding box: ${JSON.stringify(d.to)}`);
+                }
+                tx = dst.x + dst.width / 2;
+                ty = dst.y + dst.height / 2;
+            }
+            await page.mouse.move(sx, sy);
+            await page.mouse.down();
+            await page.mouse.move(tx, ty, {steps: 5});
+            if (d.release !== false) {
+                await page.mouse.up();
+            }
+        } else {
+            const [k, [fn, argKey, fixed]] = Object.entries(SIMPLE_STEPS).find(([key]) => key in step);
+            await locate(page, step[k])[fn](...(argKey ? [step[argKey]] : fixed ? [fixed] : []));
         }
-    } else {
-        const [k, [fn, argKey, fixed]] = Object.entries(SIMPLE_STEPS).find(([key]) => key in step);
-        await locate(page, step[k])[fn](...(argKey ? [step[argKey]] : fixed ? [fixed] : []));
+    } catch (err) {
+        if (err instanceof Error && !(err instanceof StepFailureError)) {
+            err._verifyNonTransport = true;
+        }
+        throw err;
     }
 }
 
@@ -825,8 +857,9 @@ async function waitSettle(page, inflight, lastAt, limit, quietMs) {
 
 async function attachPageGuards(context, page, allowedSet, originOfFn, timeoutMs, problems, soft, onBlocked, diagnostics) {
     const inflight = new Set();
-    const loading = new Set();
+    const navFrames = new Map();
     let lastActivityAt = Date.now();
+    const frameOf = (r) => { try { return r.frame(); } catch { return null; } };
     await context.route('**/*', (route) => {
         const o = originOfFn(route.request().url());
         if (o === null || allowedSet.has(o)) {
@@ -838,34 +871,52 @@ async function attachPageGuards(context, page, allowedSet, originOfFn, timeoutMs
     page.on('request', (r) => {
         inflight.add(r);
         lastActivityAt = Date.now();
-        if (r.isNavigationRequest()) {
-            loading.add(r.frame());
+        const rf = frameOf(r);
+        if (r.isNavigationRequest() && rf) {
+            let set = navFrames.get(rf);
+            if (!set) {
+                set = new Set();
+                navFrames.set(rf, set);
+            }
+            set.add(r);
         }
         const o = originOfFn(r.url());
         if (o !== null && !allowedSet.has(o)) {
             onBlocked(o);
             if (r.redirectedFrom()) {
                 problems.push(`redirected to a non-allowed origin: ${r.method()} ${o}`);
-            } else if (r.isNavigationRequest() && r.frame() === page.mainFrame()) {
+            } else if (r.isNavigationRequest() && rf === page.mainFrame()) {
                 problems.push(`navigated to a non-allowed origin: ${o}`);
             }
         }
     });
     const done = (r) => {
         inflight.delete(r);
+        const rf = frameOf(r);
+        if (r.isNavigationRequest() && rf) {
+            const set = navFrames.get(rf);
+            if (set) {
+                set.delete(r);
+                if (!set.size) {
+                    navFrames.delete(rf);
+                }
+            }
+        }
         lastActivityAt = Date.now();
     };
     page.on('requestfinished', done);
     page.on('requestfailed', done);
     page.on('framenavigated', (frame) => {
-        if (!loading.delete(frame)) {
+        if (!navFrames.delete(frame)) {
             return;
         }
-        for (const r of inflight) {
-            if (r.frame() === frame && !r.isNavigationRequest()) {
-                done(r);
+        for (const r of [...inflight]) {
+            const rf = frameOf(r);
+            if (rf !== null && !r.isNavigationRequest() && rf === frame) {
+                inflight.delete(r);
             }
         }
+        lastActivityAt = Date.now();
     });
     page.on('websocket', (ws) => {
         const o = originOfFn(ws.url());
@@ -884,7 +935,7 @@ async function attachPageGuards(context, page, allowedSet, originOfFn, timeoutMs
     }
     page.on('response', (res) => {
         const pathname = new URL(res.url()).pathname;
-        if (!pathname.startsWith('/api/v4/')) {
+        if (!SERVER_PATH_RE.test(pathname)) {
             return;
         }
         if (res.status() >= 500) {
@@ -916,13 +967,30 @@ async function poll(read, ok) {
 }
 
 // Self-contained (--freeze copies it): sends an API request with Bearer token or MMCSRF, no redirects, bounded body.
-async function sendApiRequest(reqHost, base, method, apiPath, body, env, maxBytes) {
+async function sendApiRequest(reqHost, base, method, apiPath, body, env, maxBytes, timeoutMs) {
+    const reqUrl = new URL(apiPath, base).toString();
     const headers = {'X-Requested-With': 'XMLHttpRequest'};
     if (env.VERIFY_TOKEN) {
         headers.Authorization = `Bearer ${env.VERIFY_TOKEN}`;
     } else if (method !== 'GET') {
-        const cookies = typeof reqHost.cookies === 'function'
-            ? await reqHost.cookies(base) : ((await reqHost.storageState()).cookies ?? []);
+        let cookies;
+        if (typeof reqHost.cookies === 'function') {
+            cookies = await reqHost.cookies(reqUrl);
+        } else {
+            const u = new URL(reqUrl);
+            const host = u.hostname.toLowerCase();
+            const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1' || host.endsWith('.localhost');
+            cookies = ((await reqHost.storageState()).cookies ?? []).filter((x) => {
+                const raw = (x.domain ?? '').toLowerCase();
+                const dom = raw.replace(/^\./, '');
+                const domOk = !dom || host === dom || (raw.startsWith('.') && host.endsWith('.' + dom));
+                const cp = x.path ?? '';
+                const pathOk = !cp || cp === '/' || u.pathname === cp || u.pathname.startsWith(cp.endsWith('/') ? cp : cp + '/');
+                const secureOk = !x.secure || u.protocol === 'https:' || isLocal;
+                const expiryOk = x.expires === undefined || x.expires === -1 || x.expires * 1000 > Date.now();
+                return domOk && pathOk && secureOk && expiryOk;
+            });
+        }
         const c = cookies.find((x) => x.name === 'MMCSRF');
         if (c) {
             headers['X-CSRF-Token'] = c.value;
@@ -935,20 +1003,42 @@ async function sendApiRequest(reqHost, base, method, apiPath, body, env, maxByte
         }
         headers['Content-Type'] = 'application/json';
     }
-    const opts = {method, headers, maxRedirects: 0, ...(serialized !== undefined ? {data: serialized} : {})};
+    const opts = {method, headers, maxRedirects: 0, timeout: timeoutMs, ...(serialized !== undefined ? {data: serialized} : {})};
     try {
-        return await reqHost.request.fetch(new URL(apiPath, base).toString(), opts);
+        return await reqHost.request.fetch(reqUrl, opts);
     } catch (err) {
-        throw new Error(String(err instanceof Error ? err.message : err).split('\n')[0]);
+        const out = new Error(String(err instanceof Error ? err.message : err).split('\n')[0]);
+        if (err instanceof Error && err.name) {
+            out.name = err.name;
+        }
+        throw out;
     }
 }
 
 async function apiCall(reqHost, base, origin, spec, env, vars) {
     const rawSpec = normApi(spec);
     const method = (rawSpec.method ?? 'GET').toUpperCase();
-    const apiPath = expandPath(rawSpec.path, origin, vars, true);
-    const body = 'body' in rawSpec ? expandBody(rawSpec.body, vars) : undefined;
-    const res = await sendApiRequest(reqHost, base, method, apiPath, body, env, MAX_BODY_BYTES);
+    let apiPath;
+    let body;
+    try {
+        apiPath = expandPath(rawSpec.path, origin, vars, true);
+        body = 'body' in rawSpec ? expandBody(rawSpec.body, vars) : undefined;
+    } catch (err) {
+        throw new StepFailureError(firstLine(err));
+    }
+    let res;
+    try {
+        res = await sendApiRequest(reqHost, base, method, apiPath, body, env, MAX_BODY_BYTES, API_TIMEOUT_MS);
+    } catch (err) {
+        const msg = firstLine(err);
+        if (msg.includes(`exceeds ${MAX_BODY_BYTES} bytes`)) {
+            throw new StepFailureError(msg);
+        }
+        if (err instanceof Error && (err.name === 'TimeoutError' || /\btimed?\s*out\b/i.test(msg))) {
+            err._verifyApiTimeout = true;
+        }
+        throw err;
+    }
     return {res, method, apiPath};
 }
 
@@ -966,7 +1056,7 @@ async function captureApi(reqHost, base, origin, capSpec, env, vars) {
         for (const [name, dotPath] of Object.entries(capSpec.save)) {
             const val = readJsonPath(json, dotPath);
             if (val === undefined || val === null || typeof val === 'object') {
-                throw new Error(`capture.save.${name}: path ${JSON.stringify(dotPath)} not found as scalar in ${method} ${apiPath} (HTTP ${res.status()})`);
+                throw new StepFailureError(`capture.save.${name}: path ${JSON.stringify(dotPath)} not found as scalar in ${method} ${apiPath} (HTTP ${res.status()})`);
             }
             vars[name] = String(val);
         }
@@ -975,23 +1065,30 @@ async function captureApi(reqHost, base, origin, capSpec, env, vars) {
 }
 
 async function checkExpect(reqHost, page, base, origin, e, env, vars) {
-    if (e.visible) {
-        const ok = await locate(page, e.visible).waitFor({state: 'visible', timeout: ACTION_TIMEOUT_MS}).then(() => true, (err) => {
-            if (err?.name === 'TimeoutError') {
-                return false;
+    if (e.visible || e.text || e.count) {
+        try {
+            if (e.visible) {
+                const ok = await locate(page, e.visible).waitFor({state: 'visible', timeout: ACTION_TIMEOUT_MS}).then(() => true, (err) => {
+                    if (err?.name === 'TimeoutError') {
+                        return false;
+                    }
+                    throw err;
+                });
+                return ok ? null : `not visible within ${ACTION_TIMEOUT_MS}ms: ${JSON.stringify(e.visible)}`;
+            }
+            if (e.text) {
+                const got = await poll(() => locate(page, e.text).innerText({timeout: ACTION_TIMEOUT_MS}), (t) => t.includes(e.contains));
+                return got.includes(e.contains) ? null : `text of ${JSON.stringify(e.text)} is ${JSON.stringify(got.slice(0, 200))}, want it to contain ${JSON.stringify(e.contains)}`;
+            }
+            const min = e.min ?? 1;
+            const n = await poll(() => locateAll(page, e.count).count(), (c) => c >= min);
+            return n >= min ? null : `count of ${JSON.stringify(e.count)} is ${n}, want >= ${min}`;
+        } catch (err) {
+            if (err instanceof Error && !(err instanceof StepFailureError)) {
+                err._verifyNonTransport = true;
             }
             throw err;
-        });
-        return ok ? null : `not visible within ${ACTION_TIMEOUT_MS}ms: ${JSON.stringify(e.visible)}`;
-    }
-    if (e.text) {
-        const got = await poll(() => locate(page, e.text).innerText({timeout: ACTION_TIMEOUT_MS}), (t) => t.includes(e.contains));
-        return got.includes(e.contains) ? null : `text of ${JSON.stringify(e.text)} is ${JSON.stringify(got.slice(0, 200))}, want it to contain ${JSON.stringify(e.contains)}`;
-    }
-    if (e.count) {
-        const min = e.min ?? 1;
-        const n = await poll(() => locateAll(page, e.count).count(), (c) => c >= min);
-        return n >= min ? null : `count of ${JSON.stringify(e.count)} is ${n}, want >= ${min}`;
+        }
     }
     const {res, method, apiPath} = await apiCall(reqHost, base, origin, e.api, env, vars);
     if (res.status() >= 500) {
@@ -1010,22 +1107,37 @@ async function checkExpect(reqHost, page, base, origin, e, env, vars) {
     return null;
 }
 
-async function reachable(reqHost, base) {
+async function serverReachable(base) {
     try {
-        await reqHost.request.get(new URL('/api/v4/system/ping', base).toString(), {timeout: 5000, maxRedirects: 0});
+        await fetch(new URL('/api/v4/system/ping', base).toString(), {method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(3000)});
         return true;
     } catch {
         return false;
     }
 }
 
-async function classifyStepErr(where, err, reqHost, base) {
+async function classifyStepErr(where, err, base) {
     const msg = firstLine(err);
+    if (err instanceof StepFailureError) {
+        return msg;
+    }
     if (planMistake(err)) {
         throw new PlanError(`${where}: ${msg}`);
     }
-    if (NET_ERR_RE.test(msg) && !(await reachable(reqHost, base))) {
-        throw new InfraError(`server unreachable at ${base}: ${msg}`);
+    if (err?._verifyApiTimeout) {
+        if (!(await serverReachable(base))) {
+            throw new InfraError(`server unreachable at ${base}: ${msg}`);
+        }
+        return msg;
+    }
+    if (err?.name === 'TimeoutError' || err?._verifyNonTransport) {
+        return msg;
+    }
+    const reset = /ERR_CONNECTION_(?:RESET|ABORTED|CLOSED)|ERR_EMPTY_RESPONSE|ECONNRESET|socket hang up/i.test(msg);
+    if (NET_ERR_RE.test(msg) || reset) {
+        if (!reset || !(await serverReachable(base))) {
+            throw new InfraError(`server unreachable at ${base}: ${msg}`);
+        }
     }
     return msg;
 }
@@ -1144,7 +1256,7 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
                 await runStep(page, base, origin, step, vars);
                 await afterStep();
             } catch (err) {
-                const msg = await classifyStepErr(label, err, reqHost, base);
+                const msg = await classifyStepErr(label, err, base);
                 return await finish(1, `${label} failed: ${problems.length ? `${problems.join('; ')}; ` : ''}${msg}${actionHint(err)}`, await failSnap());
             }
             if (problems.length) {
@@ -1157,7 +1269,7 @@ export async function verify(plan, log = console.log, freezeTo = null, env = pro
             try {
                 why = await checkExpect(reqHost, page, base, origin, e, env, vars);
             } catch (err) {
-                why = await classifyStepErr(`expect ${i + 1}`, err, reqHost, base);
+                why = await classifyStepErr(`expect ${i + 1}`, err, base);
             }
             record?.expects.push({n: i + 1, ok: !why, why: why ?? null});
             if (why && record) {
@@ -1409,7 +1521,7 @@ function tagged(prefix, rec, log = console.log) {
 }
 
 // Runs the plan against the target (head) and `baseUrl`, and returns the exit code after printing the verdict.
-export async function compare(plan, baseUrl, env = process.env, log = console.log) {
+export async function compare(plan, baseUrl, env = process.env, log = console.log, opts = {}) {
     const baseOrigin = httpOrigin(baseUrl, '--compare');
     // The base run uses the plan without its own base_url: the head target is the plan's or the environment's, the base
     // is the command line's, and both get the same credentials.
@@ -1439,11 +1551,12 @@ export async function compare(plan, baseUrl, env = process.env, log = console.lo
         }
     }
     const diffs = diffRuns(recs.base, recs.head, origins, plan.ignore ?? []);
-    for (const d of diffs.slice(0, MAX_DIFFS)) {
+    const limit = opts.allDiffs ? diffs.length : MAX_DIFFS;
+    for (const d of diffs.slice(0, limit)) {
         log(`DIFF ${d.step} ${d.path}: base=${d.base} head=${d.head}`);
     }
-    if (diffs.length > MAX_DIFFS) {
-        log(`... ${diffs.length - MAX_DIFFS} more differences not shown`);
+    if (diffs.length > limit) {
+        log(`... ${diffs.length - limit} more differences not shown (rerun with --all-diffs to print all)`);
     }
     const regressions = recs.base.expects.filter((b) => b.ok && !recs.head.expects.find((h) => h.n === b.n)?.ok);
     log(`${diffs.length} difference(s) after normalising ids, timestamps, versions and origins; ${regressions.length} expect regression(s)`);
@@ -1476,10 +1589,12 @@ function typedFn(fn, ...replacements) {
 export function freeze(plan, base, allowOrigins = [], authed = false) {
     const q = JSON.stringify;
     const lines = [];
-    const emittedSteps = (plan.steps ?? []).filter((s) =>
-        !('snapshot' in s) && (!('capture' in s) || Boolean(s.capture.save) || (normApi(s.capture.api).method ?? 'GET').toUpperCase() !== 'GET'));
-    const steps = emittedSteps.length;
-    const expects = plan.expect.length;
+    const emittedSteps = (plan.steps ?? []).filter((s) => !('snapshot' in s));
+    const domSteps = emittedSteps.filter((s) => !('capture' in s)).length;
+    const targetDrags = emittedSteps.filter((s) => 'drag' in s && s.drag.to).length;
+    const captureSteps = emittedSteps.filter((s) => 'capture' in s).length;
+    const domExpects = plan.expect.filter((e) => !('api' in e)).length;
+    const apiExpects = plan.expect.filter((e) => 'api' in e).length;
     const frozenSimple = {
         click: (s) => `${one(s.click)}.click()`,
         fill: (s) => `${one(s.fill)}.fill(${q(s.value)})`,
@@ -1518,19 +1633,18 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
         } else if ('capture' in s) {
             const rawApi = normApi(s.capture.api);
             const method = (rawApi.method ?? 'GET').toUpperCase();
-            if (!s.capture.save && method === 'GET') {
-                continue;
-            }
-            const bodyArg = 'body' in rawApi ? `, expandBody(${q(rawApi.body)}, vars)` : '';
-            lines.push('{', `  const res = await sendApiRequest(context, BASE, ${q(method)}, expandPath(${q(rawApi.path)}, BASE_ORIGIN, vars, true), ${bodyArg ? bodyArg.slice(2) : 'undefined'}, AUTHED ? process.env : {}, MAX_BODY_BYTES);`);
+            const bodyArg = 'body' in rawApi ? `, expandBody(JSON.parse(${q(q(rawApi.body))}), vars)` : '';
+            lines.push('{', `  const res = await sendApiRequest(context, BASE, ${q(method)}, expandPath(${q(rawApi.path)}, BASE_ORIGIN, vars, true), ${bodyArg ? bodyArg.slice(2) : 'undefined'}, AUTHED ? process.env : {}, MAX_BODY_BYTES, API_TIMEOUT);`);
             lines.push("  expect(res.status(), 'no server error').toBeLessThan(500);");
-            if (s.capture.save) {
+            const saveEntries = Object.entries(s.capture.save ?? {});
+            if (saveEntries.length > 0) {
                 lines.push('  const data: unknown = await res.json();');
-                for (const [k, dotPath] of Object.entries(s.capture.save)) {
+                for (const [k, dotPath] of saveEntries) {
                     lines.push(`  { const v = readJsonPath(data, ${q(dotPath)}); expect(v !== undefined && v !== null && typeof v !== 'object', ${q(`capture.save.${k}`)}).toBe(true); vars[${q(k)}] = String(v); }`);
                 }
             }
             lines.push('}');
+            continue;
         } else {
             continue;
         }
@@ -1545,8 +1659,8 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
             lines.push(`await expect.poll(() => ${locatorCode(e.count)}.count(), {timeout: TIMEOUT}).toBeGreaterThanOrEqual(${Number(e.min ?? 1)});`);
         } else {
             const method = (e.api.method ?? 'GET').toUpperCase();
-            const bodyArg = 'body' in e.api ? `expandBody(${q(e.api.body)}, vars)` : 'undefined';
-            lines.push('{', `  const res = await sendApiRequest(context, BASE, ${q(method)}, expandPath(${q(e.api.path)}, BASE_ORIGIN, vars, true), ${bodyArg}, AUTHED ? process.env : {}, MAX_BODY_BYTES);`,
+            const bodyArg = 'body' in e.api ? `expandBody(JSON.parse(${q(q(e.api.body))}), vars)` : 'undefined';
+            lines.push('{', `  const res = await sendApiRequest(context, BASE, ${q(method)}, expandPath(${q(e.api.path)}, BASE_ORIGIN, vars, true), ${bodyArg}, AUTHED ? process.env : {}, MAX_BODY_BYTES, API_TIMEOUT);`,
                 "  expect(res.status(), 'no server error').toBeLessThan(500);",
                 `  expect(res.status()).toBe(${Number(e.api.status ?? 200)});`);
             if (e.api.json_has) {
@@ -1555,7 +1669,10 @@ export function freeze(plan, base, allowOrigins = [], authed = false) {
             lines.push('}');
         }
     }
-    lines.push('await settle(); // late events count too');
+    const needsBrowser = (plan.steps ?? []).some((s) => !('capture' in s)) || plan.expect.some((e) => !e.api);
+    if (needsBrowser) {
+        lines.push('await settle(); // late events count too');
+    }
     const needsLogin = plan.login || authed;
     const login = needsLogin ? `
   expect(Boolean(process.env.VERIFY_TOKEN || (process.env.VERIFY_USER && process.env.VERIFY_PASSWORD)),
@@ -1573,6 +1690,44 @@ const apiLogin: (context: BrowserContext, base: string, env: NodeJS.ProcessEnv) 
         ...(plan.verified_at ? [`// verified-at: ${plan.verified_at}`] : []),
     ];
     const metaBlock = metaLines.length ? `${metaLines.join('\n')}\n` : '';
+    const sharedHelpers = `${typedFn(subset, ['function subset(want, got) {', 'function subset(want: any, got: any): boolean {'])}
+const sendApiRequest: (reqHost: BrowserContext, base: string, method: string, apiPath: string, body: unknown, env: NodeJS.ProcessEnv, maxBytes: number, timeoutMs: number) => Promise<APIResponse> = ${typedFn(sendApiRequest, ["const headers = {'X-Requested-With': 'XMLHttpRequest'};", "const headers: Record<string, string> = {'X-Requested-With': 'XMLHttpRequest'};"])};
+const readJsonPath: (obj: unknown, dotPath: string) => unknown = ${typedFn(readJsonPath, ['cur = cur[seg];', 'cur = (cur as Record<string, unknown>)[seg];'])};
+const expandPath: (raw: string, origin: string, vars: Record<string, string>, mustBeApi: boolean) => string = ${expandPath.toString()};
+${typedFn(expandBody, ['function expandBody(val, vars) {', 'function expandBody(val: unknown, vars: Record<string, string>): unknown {'], ['Object.entries(val)', 'Object.entries(val as Record<string, unknown>)'])}${loginFn}`;
+    if (!needsBrowser) {
+        return `// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+// Frozen by verify_ui.mjs from a passing plan, with the same oracle. Set VERIFY_REPLAY_BASE_URL to retarget.
+${metaBlock}import {expect, request, test, type APIRequestContext, type APIResponse, type BrowserContext} from '@playwright/test';
+
+const BASE = process.env.VERIFY_REPLAY_BASE_URL || ${q(base)};
+const BASE_ORIGIN = new URL(BASE).origin;
+const AUTHED = ${needsLogin ? 'true' : 'false'};
+const ALLOWED = new Set([BASE_ORIGIN, ...${q(allowOrigins)}.map((o: string) => new URL(o).origin)]);
+const API_TIMEOUT = ${API_TIMEOUT_MS};
+const MAX_BODY_BYTES = ${MAX_BODY_BYTES};
+
+${sharedHelpers}
+let apiCtx: APIRequestContext | undefined;
+test.afterEach(async () => {
+  try {
+    await apiCtx?.dispose();
+  } finally {
+    apiCtx = undefined;
+  }
+});
+
+test(${q(plan.name ?? 'frozen /verify plan')}, async () => {
+  test.setTimeout(60000 + ${captureSteps + apiExpects} * API_TIMEOUT);
+  const vars: Record<string, string> = {};
+  apiCtx = await request.newContext();
+  const context = {request: apiCtx, storageState: () => apiCtx!.storageState()} as unknown as BrowserContext;${login}
+${lines.map((l) => `  ${l}`).join('\n')}
+});
+`;
+    }
     return `// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
@@ -1588,17 +1743,15 @@ const ALLOWED = new Set([BASE_ORIGIN, ...${q(allowOrigins)}.map((o: string) => n
 const SETTLE_MS = Number(process.env.VERIFY_SETTLE_MS ?? ${DEFAULT_SETTLE_MS});
 const QUIET_MS = ${QUIET_MS};
 const TIMEOUT = ${ACTION_TIMEOUT_MS};
+const API_TIMEOUT = ${API_TIMEOUT_MS};
 const MAX_BODY_BYTES = ${MAX_BODY_BYTES};
+const SERVER_PATH_RE = ${SERVER_PATH_RE};
 
 const originOf: (url: string) => string | null = ${originOf.toString()};
-${typedFn(subset, ['function subset(want, got) {', 'function subset(want: any, got: any): boolean {'])}
-const sendApiRequest: (reqHost: BrowserContext, base: string, method: string, apiPath: string, body: unknown, env: NodeJS.ProcessEnv, maxBytes: number) => Promise<APIResponse> = ${typedFn(sendApiRequest, ["const headers = {'X-Requested-With': 'XMLHttpRequest'};", "const headers: Record<string, string> = {'X-Requested-With': 'XMLHttpRequest'};"])};
-const readJsonPath: (obj: unknown, dotPath: string) => unknown = ${typedFn(readJsonPath, ['cur = cur[seg];', 'cur = (cur as Record<string, unknown>)[seg];'])};
-const expandPath: (raw: string, origin: string, vars: Record<string, string>, mustBeApi: boolean) => string = ${expandPath.toString()};
-${typedFn(expandBody, ['function expandBody(val, vars) {', 'function expandBody(val: unknown, vars: Record<string, string>): unknown {'], ['Object.entries(val)', 'Object.entries(val as Record<string, unknown>)'])}${loginFn}
+${sharedHelpers}
 const startOriginGuard: (httpMod: typeof http, netMod: typeof net, allowed: Set<string>, onBlocked: (origin: string) => void) =>
   Promise<{port: number, close: () => void}> = ${typedFn(startOriginGuard, ['const strip = (h) => {', 'const strip = (h: Record<string, string | string[] | undefined>) => {'])};
-const attachPageGuards: (context: BrowserContext, page: Page, allowedSet: Set<string>, originOfFn: (url: string) => string | null, timeoutMs: number, problems: string[], soft: string[], onBlocked: (origin: string) => void, diagnostics: string[] | null) => Promise<{inflight: Set<Request>; lastAt: () => number}> = ${typedFn(attachPageGuards, ['const inflight = new Set();', 'const inflight = new Set<Request>();'], ['const loading = new Set();', 'const loading = new Set<unknown>();'], ['const done = (r) => {', 'const done = (r: Request) => {'])};
+const attachPageGuards: (context: BrowserContext, page: Page, allowedSet: Set<string>, originOfFn: (url: string) => string | null, timeoutMs: number, problems: string[], soft: string[], onBlocked: (origin: string) => void, diagnostics: string[] | null) => Promise<{inflight: Set<Request>; lastAt: () => number}> = ${typedFn(attachPageGuards, ['const inflight = new Set();', 'const inflight = new Set<Request>();'], ['const navFrames = new Map();', 'const navFrames = new Map<ReturnType<Page["mainFrame"]>, Set<Request>>();'], ['const frameOf = (r) => {', 'const frameOf = (r: Request) => {'], ['const done = (r) => {', 'const done = (r: Request) => {'])};
 const waitSettle: (page: Page, inflight: Set<Request>, lastAt: () => number, limit: number, quietMs: number) => Promise<string | null> = ${waitSettle.toString()};
 
 let browser: Browser | undefined;
@@ -1615,7 +1768,7 @@ test.afterEach(async () => {
 
 test(${q(plan.name ?? 'frozen /verify plan')}, async () => {
   expect(Number.isFinite(SETTLE_MS) && SETTLE_MS > 0, 'VERIFY_SETTLE_MS must be a positive number').toBe(true);
-  test.setTimeout(60000 + ${steps} * (TIMEOUT + SETTLE_MS) + ${expects} * TIMEOUT + SETTLE_MS);
+  test.setTimeout(60000 + ${domSteps} * (TIMEOUT + SETTLE_MS) + ${captureSteps} * API_TIMEOUT + ${domExpects + targetDrags} * TIMEOUT + ${apiExpects} * API_TIMEOUT + SETTLE_MS);
   const vars: Record<string, string> = {};
   guard = await startOriginGuard(http, net, ALLOWED, () => {});
   browser = await chromium.launch({args: [\`--proxy-server=http://127.0.0.1:\${guard.port}\`, '--proxy-bypass-list=<-loopback>']});
@@ -1693,7 +1846,7 @@ function featureMapCli(query, file) {
 // ---------------------------------------------------------------- CLI
 
 const USAGE = 'usage: verify_ui.mjs <plan.json> [--freeze <dir>/<name>.spec.ts] [--screenshot-on-fail]\n' +
-    '       verify_ui.mjs <plan.json> --compare <base_url>\n' +
+    '       verify_ui.mjs <plan.json> --compare <base_url> [--all-diffs]\n' +
     '       verify_ui.mjs --feature-map <route or feature> [FEATURE_MAP.md]';
 
 async function main() {
@@ -1707,12 +1860,18 @@ async function main() {
     }
     const si = args.indexOf('--screenshot-on-fail');
     const screenshotOnFail = si >= 0 ? (args.splice(si, 1), 'failure.png') : null;
+    const ai = args.indexOf('--all-diffs');
+    const allDiffs = ai >= 0 ? (args.splice(ai, 1), true) : false;
     const fi = args.indexOf('--freeze');
     const freezeTo = fi >= 0 ? args.splice(fi, 2)[1] : null;
     const ci = args.indexOf('--compare');
     const compareTo = ci >= 0 ? args.splice(ci, 2)[1] : null;
     if (args.length !== 1 || (fi >= 0 && !freezeTo) || (ci >= 0 && !compareTo)) {
         console.error(USAGE);
+        return 2;
+    }
+    if (allDiffs && !compareTo) {
+        console.log('VERDICT: INVALID_PLAN --all-diffs requires --compare');
         return 2;
     }
     if (compareTo && (freezeTo || screenshotOnFail)) {
@@ -1726,7 +1885,7 @@ async function main() {
         } catch (err) {
             throw new PlanError(`cannot read ${args[0]}: ${firstLine(err)}`);
         }
-        return compareTo ? await compare(plan, compareTo) : await verify(plan, console.log, freezeTo, process.env, {screenshotOnFail});
+        return compareTo ? await compare(plan, compareTo, process.env, console.log, {allDiffs}) : await verify(plan, console.log, freezeTo, process.env, {screenshotOnFail});
     } catch (err) {
         // Anything unexpected is an infrastructure problem, never a FAIL, and only its first line is printed.
         const kind = err instanceof PlanError ? 'INVALID_PLAN' : 'INFRA_ERROR';

@@ -154,7 +154,7 @@ def prompt_version(skill_dir: Path = SKILL_DIR, schema_version: int = SCHEMA_VER
         try:
             return trusted.read(rel, skill_dir)
         except InfraError:
-            return path.read_text() if path.exists() else ""
+            return path.read_text(encoding="utf-8") if path.exists() else ""
 
     prompts_dir = skill_dir / "prompts"
     names = sorted(p.name for p in prompts_dir.glob("*.md")) if prompts_dir.is_dir() else []
@@ -293,7 +293,9 @@ def main(pr: str, what: str, arg: str = "", tag: str = "") -> None:
     state = read_state(hdir)
     ctx = json.loads((hdir / "ctx.json").read_text())
     if what == "hunters":
-        lessons.log_hits(str(pr), lessons.match(ctx))  # input for `lessons.py prune`
+        known = lessons.load()
+        shown = lessons.match(ctx, known) + lessons.probes_for(ctx.get("diff_production_code", ""), known)
+        lessons.log_hits(str(pr), shown)  # input for `lessons.py prune` (both fp lessons and miss probes)
         for mode in ("A", "B"):
             print(write(hdir, mode, hunter_system(mode, state, ctx, strategies=True), hunter_user(mode, ctx),
                         HUNTER_SCHEMA))

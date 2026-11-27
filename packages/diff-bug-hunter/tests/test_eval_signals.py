@@ -152,8 +152,10 @@ def test_eval_records_a_missing_or_failing_pr_signal_and_keeps_the_entry(tmp_pat
     path, _ = _fixture_manifest(tmp_path)
     monkeypatch.setattr(old_tests, "cmd_old", lambda hdir, state: {"tests": {}})
     monkeypatch.setitem(sys.modules, "pr_tests", None)  # import raises ImportError
-    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out")]) == 0
-    rows = {r["id"]: r for r in _card(tmp_path)["rows"]}
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out")]) == 1
+    card = _card(tmp_path)
+    assert card["fp_checks"]["pr_ci_fp_rate"] is False
+    rows = {r["id"]: r for r in card["rows"]}
     assert "signal not available" in rows["clamp"]["pr_error"] and rows["clamp"]["error"] is None
     assert rows["clamp"]["vetted"] is True  # the hunters' result stands
 
@@ -163,8 +165,10 @@ def test_eval_records_a_missing_or_failing_pr_signal_and_keeps_the_entry(tmp_pat
     fake = types.ModuleType("pr_tests")
     fake.cmd_pr = infra  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "pr_tests", fake)
-    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out2")]) == 0
-    rows = {r["id"]: r for r in _card(tmp_path, "out2")["rows"]}
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out2")]) == 1
+    card2 = _card(tmp_path, "out2")
+    assert card2["fp_checks"]["pr_ci_fp_rate"] is False
+    rows = {r["id"]: r for r in card2["rows"]}
     assert rows["clamp"]["pr_error"] == "no CI config here" and rows["clamp"]["error"] is None
     assert "pr-tests ERROR no CI config here" in capsys.readouterr().out
 

@@ -322,8 +322,9 @@ def test_escalation_triggers_max_tokens_uncited_line_and_risky_empty(tmp_path, m
 def test_escalation_mode_a_empty_after_retry_and_mode_v(tmp_path, monkeypatch):
     hdir = tmp_path / "hunt"
     write_json(hdir / "state.json", {"pr": "1", "batches": 1, "changed": []})
-    build_requests.write(hdir, "A", "sys", {"x": 1}, build_requests.HUNTER_SCHEMA)
+    req_a = build_requests.write(hdir, "A", "sys", {"x": 1}, build_requests.HUNTER_SCHEMA)
     write_json(hdir / "A" / "response.json", {"files": [], "tests": []})
+    dispatch.sidecar(req_a).write_text(dispatch.request_sha(req_a))
 
     calls: list[str] = []
 
@@ -388,7 +389,15 @@ def test_step5_schemas_enforce_caps_and_prompts_drop_checks():
     assert dispatch.validate_schema({"files": [{"path": "a", "content": "x" * 32001}]}, build_requests.HUNTER_SCHEMA)
     vet_schema = json.loads((SKILL_DIR / "vetted.schema.json").read_text())
     assert vet_schema["properties"]["rows"]["maxItems"] == 30
-    assert dispatch.validate_schema({"rows": [{}] * 31}, vet_schema)
+    valid_row = {
+        "id": "pkg::TestA", "source": "A", "decision": "KEEP", "reason": "bug",
+        "file_line": "pkg/a.go:1", "caller": "F", "entry_point": "API",
+        "repro_cmd": "go test ./pkg -run ^TestA$ -count=1", "evidence_path": "run_A.json",
+        "severity": "major", "fix_check": None,
+    }
+    assert dispatch.validate_schema({"rows": [valid_row] * 30}, vet_schema) == []
+    cap_errs = dispatch.validate_schema({"rows": [valid_row] * 31}, vet_schema)
+    assert cap_errs and any("maxItems" in e for e in cap_errs)
 
     # Legacy fixtures with _note and tests[].checks still validate
     fixture_resp = json.loads((Path(__file__).parent / "hunt_fixtures" / "go_bug" / "responses" / "A" / "response.json").read_text())

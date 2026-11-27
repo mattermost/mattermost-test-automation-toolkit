@@ -26,6 +26,7 @@ Stdlib only, like the rest of the skill.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -97,46 +98,91 @@ def _lookup(path: Path, key: str) -> Any:
     return data.get(key) if isinstance(data, dict) else None
 
 
-def mechanical_verdict(hdir: Path, row: dict[str, Any]) -> str | None:
-    """The oracle's verdict for the row's test, or None when no mechanical file knows it.
-
-    A/B/A2: base_<tag>.json (NEW_PR_BUG, PRE_EXISTING, ...). R: review_verdicts.json, where a PROVEN thread reports
-    its base_verdict. D: diff_D.json. old: old_tests.json "tests". verify and V have no mechanical source yet.
-    """
+def _mechanical_verdict_and_tag(hdir: Path, row: dict[str, Any]) -> tuple[str | None, str | None]:
     rid = str(row.get("id", ""))
     source = str(row.get("source", ""))
     if source in _BASE_TAGS:
         for tag in _BASE_TAGS[source]:
             v = _lookup(hdir / f"base_{tag}.json", rid)
             if isinstance(v, str):
-                return v
-        return None
+                return v, tag
+        return None, None
     if source == "R":
         entry = _lookup(hdir / "review_verdicts.json", "verdicts")
         item = entry.get(rid) if isinstance(entry, dict) else None
         if not isinstance(item, dict):
-            return None
+            return None, None
         if item.get("verdict") == Verdict.PROVEN.value:
             base = item.get("base_verdict")
-            return base if isinstance(base, str) else None
+            return (base, "R") if isinstance(base, str) else (None, None)
         v = item.get("verdict")
-        return v if isinstance(v, str) else None
+        return (v, "R") if isinstance(v, str) else (None, None)
     if source == "D":
         v = _lookup(hdir / "diff_D.json", rid)
-        return v if isinstance(v, str) else None
+        return (v, "D") if isinstance(v, str) else (None, None)
     if source == "old":
         tests = _lookup(hdir / "old_tests.json", "tests")
         v = tests.get(rid) if isinstance(tests, dict) else None
-        return v if isinstance(v, str) else None
-    return None
+        return (v, "old") if isinstance(v, str) else (None, None)
+    return None, None
 
 
-def mechanical_fix(hdir: Path, row: dict[str, Any]) -> str | None:
+def mechanical_verdict(hdir: Path, row: dict[str, Any]) -> str | None:
+    """The oracle's verdict for the row's test, or None when no mechanical candidate oracle applies.
+
+    A/B/A2: base_<tag>.json (NEW_PR_BUG, PRE_EXISTING, ...). R: review_verdicts.json, where a PROVEN thread reports
+    its base_verdict. D: diff_D.json. old: old_tests.json "tests".
+    verify (no mechanical oracle) and V (diagnostic-only Mode V runs attached to A/B candidates, never standalone
+    candidates) intentionally return None so any standalone verify/V row stays in the HELD queue.
+    """
+    return _mechanical_verdict_and_tag(hdir, row)[0]
+
+
+def _r_fix_verdict(hdir: Path, claim_id: str) -> str | None:
+    """Resolve Mode R claim id (e.g. CR1) against test-keyed fix_R.json.
+
+    Any STRICTLY_WEAK among linked tests is decisive so a weak sibling test is never masked by a STRONG one;
+    otherwise priority follows STRONG > FIX_INCOMPATIBLE > FIX_NOT_RUN.
+    """
+    data = read_optional_json(hdir / "fix_R.json")
+    if not isinstance(data, dict):
+        return None
+    if isinstance(data.get(claim_id), str):
+        return str(data[claim_id])
+    resp = read_optional_json(hdir / "R" / "response.json")
+    declared: set[str] = set()
+    if isinstance(resp, dict) and isinstance(resp.get("claims"), list):
+        for c in resp["claims"]:
+            if isinstance(c, dict) and str(c.get("id", "")) == claim_id and isinstance(c.get("tests"), list):
+                declared = {str(x).strip() for x in c["tests"] if str(x).strip()}
+                break
+    pat = re.compile(rf"(?:^|::|\s)(?:Test)?HuntR_{re.escape(claim_id)}(?:_|[^A-Za-z0-9]|$)")
+    matches: list[str] = []
+    for k, v in data.items():
+        if not isinstance(v, str):
+            continue
+        tail = str(k).split("::", 1)[1] if "::" in str(k) else str(k)
+        if str(k) in declared or any(tail == w or tail.endswith(" " + w) for w in declared) or pat.search(str(k)):
+            matches.append(v)
+    if not matches:
+        return None
+    for pref in (Verdict.STRICTLY_WEAK.value, Verdict.STRONG.value, Verdict.FIX_INCOMPATIBLE.value,
+                 Verdict.FIX_NOT_RUN.value):
+        if pref in matches:
+            return pref
+    return matches[0]
+
+
+def mechanical_fix(hdir: Path, row: dict[str, Any], *, tag: str | None = None) -> str | None:
     """The fix-commit verdict for the row's test, or None when no fix check ran."""
     rid, source = str(row.get("id", "")), str(row.get("source", ""))
-    tags = ("D",) if source == "D" else _BASE_TAGS.get(source, ())
-    for tag in tags:
-        v = _lookup(hdir / f"fix_{tag}.json", rid)
+    if source == "R":
+        return _r_fix_verdict(hdir, rid)
+    if tag is None:
+        _, tag = _mechanical_verdict_and_tag(hdir, row)
+    tags = (tag,) if tag else (("D",) if source == "D" else _BASE_TAGS.get(source, ()))
+    for t in tags:
+        v = _lookup(hdir / f"fix_{t}.json", rid)
         if isinstance(v, str):
             return v
     return None
@@ -149,20 +195,20 @@ def _held_reasons(hdir: Path, row: dict[str, Any]) -> list[str]:
         return [f"invalid row: {'; '.join(errs)}"]
     if row["decision"] != Verdict.KEEP.value:
         reasons.append(f"decision={row['decision']}")
-    mech = mechanical_verdict(hdir, row)
+    mech, mech_tag = _mechanical_verdict_and_tag(hdir, row)
     if mech is None:
         reasons.append("no mechanical verdict for this id")
     elif not (mech == Verdict.NEW_PR_BUG.value or (row["source"] == "D" and mech == Verdict.DIFF.value)
               or (row["source"] in ("A", "B") and mech == Verdict.NEW_API.value)):
         reasons.append(f"mechanical={mech} (need NEW_PR_BUG, Mode A/B NEW_API, or Mode D DIFF)")
-    elif mech == Verdict.NEW_API.value and _lookup(hdir / f"run_{row['source']}.json", str(row["id"])) \
+    elif mech == Verdict.NEW_API.value and _lookup(hdir / f"run_{mech_tag or row['source']}.json", str(row["id"])) \
             != Verdict.FAIL_3_OF_3.value:
         reasons.append("NEW_API without a 3 of 3 head failure")
     if not row["entry_point"]:
         reasons.append("entry_point missing")
     if not str(row["repro_cmd"]).strip():
         reasons.append("repro_cmd missing")
-    if Verdict.STRICTLY_WEAK.value in (row["fix_check"], mechanical_fix(hdir, row)):
+    if Verdict.STRICTLY_WEAK.value in (row["fix_check"], mechanical_fix(hdir, row, tag=mech_tag)):
         reasons.append("fix_check=STRICTLY_WEAK")
     return reasons
 
@@ -185,6 +231,22 @@ def admissibility(hdir: Path) -> dict[str, Any]:
         else:
             keep.append({**row, "mechanical_verdict": mechanical_verdict(hdir, row)})
     return {"vetted_present": True, "keep": keep, "held": held}
+
+
+def apply_lessons(adm: dict[str, Any], hits: list[dict[str, str]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Apply lessons.post_filter hits onto admissibility() output; returns (keep, held, applied_lesson_ids)."""
+    lesson_hits = {h["test_id"]: h["lesson_id"] for h in hits}
+    keep: list[dict[str, Any]] = []
+    held: list[dict[str, Any]] = list(adm["held"])
+    applied: list[str] = []
+    for row in adm["keep"]:
+        lid = lesson_hits.get(str(row.get("id", "")))
+        if lid is None:
+            keep.append(row)
+        else:
+            applied.append(lid)
+            held.append({"row": row, "reasons": [f"failure text matches false-positive lesson {lid}"]})
+    return keep, held, list(dict.fromkeys(applied))
 
 
 def _norm(text: str) -> str:

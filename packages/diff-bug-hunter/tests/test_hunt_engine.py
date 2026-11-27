@@ -1511,8 +1511,9 @@ def test_frozen_spec_type_checks_strictly(tmp_path, ui_server):
                        {"api": {"path": "/api/v4/users/me", "status": 200, "json_has": {"username": "tester"}}}]}
     code, out = verify(tmp_path, plan, "--freeze", "typed.spec.ts", auth="token")
     assert code == 0, out
-    # the test timeout covers the plan at its limits: 2 steps and 4 expectations
-    assert "test.setTimeout(60000 + 2 * (TIMEOUT + SETTLE_MS) + 4 * TIMEOUT + SETTLE_MS);" in (tmp_path / "typed.spec.ts").read_text()
+    # the test timeout covers the plan at its limits: 2 DOM steps, 3 DOM expects, and 1 API expect
+    assert ("test.setTimeout(60000 + 2 * (TIMEOUT + SETTLE_MS) + 0 * API_TIMEOUT "
+            "+ 3 * TIMEOUT + 1 * API_TIMEOUT + SETTLE_MS);") in (tmp_path / "typed.spec.ts").read_text()
     run_frozen_spec(tmp_path, "typed.spec.ts", check_tsc=True, run_test=False)
 
 
@@ -2392,7 +2393,7 @@ def test_prepare_drops_the_previous_context_and_verdicts_first(tmp_path, monkeyp
 
 def _hunted(hdir: Path, head: str) -> None:
     hdir.mkdir()
-    (hdir / "prepare.json").write_text(json.dumps({"head": head}))
+    (hdir / "prepare.json").write_text(json.dumps({"head": head, "schema_version": prepare.SCHEMA_VERSION}))
     (hdir / "A").mkdir()
     (hdir / "A" / "response.json").write_text("{}")
     (hdir / "run_A.json").write_text("{}")

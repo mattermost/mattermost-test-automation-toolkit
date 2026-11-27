@@ -39,6 +39,8 @@ NOT_CHECKED = ["actor roles: the role matrix is not run by the driver",
 def finding(row: dict[str, Any]) -> dict[str, Any]:
     """One author-facing item from a KEEP row. Mode D rows compare outputs (DIFF); test rows fail 3 of 3 on head."""
     is_diff = row.get("source") == "D"
+    mech = str(row.get("mechanical_verdict") or "")
+    base_result = "DIFF" if is_diff else (Verdict.NEW_API.value if mech == Verdict.NEW_API.value else Verdict.NEW_PR_BUG.value)
     checked = [f"mechanical verdict {row.get('mechanical_verdict')} for {row.get('id')}",
                f"caller: {row.get('caller')}", f"evidence: {row.get('evidence_path')}"]
     if row.get("fix_check"):
@@ -49,7 +51,7 @@ def finding(row: dict[str, Any]) -> dict[str, Any]:
         "actor_roles": [],
         "entry_point": row["entry_point"],
         "repro_cmd": row["repro_cmd"],
-        "base_result": "DIFF" if is_diff else Verdict.NEW_PR_BUG.value,
+        "base_result": base_result,
         "head_result": "DIFF" if is_diff else Verdict.FAIL_3_OF_3.value,
         "contradicts": None,
         "file_line": row["file_line"],
@@ -92,7 +94,8 @@ def _tier(hdir: Path, state: dict[str, Any], keep: list[dict[str, Any]], driver_
     verdicts = read_dict(hdir / "review_verdicts.json").get("verdicts")
     tier, gaps = ledger._tier_and_gaps(hdir, counts, reached, executable, deferred, len(ledger._batch_dirs(hdir)),
                                        int(state.get("batches") or 1), mode_gaps,
-                                       verdicts if isinstance(verdicts, dict) else {})
+                                       verdicts if isinstance(verdicts, dict) else {},
+                                       require_verdict_json=True)
     if keep:
         return "Bug Proven", driver_gaps, reached, executable
     if tier == "Bug Proven":  # the ledger saw a vetted row the lesson filter has since held
