@@ -69,9 +69,50 @@ def hits_log() -> Path:
     return Path(env).resolve() if env else scratch() / "lessons_hits.jsonl"
 
 
-def _records(path: Path | None) -> list[dict[str, Any]]:
-    text = trusted.read(LESSONS_FILE.name) if path is None else (path.read_text() if path.exists() else "")
+def _is_writable_target(path: Path) -> bool:
+    if path.exists():
+        return os.access(path, os.W_OK) and os.access(path.parent, os.W_OK)
+    return path.parent.is_dir() and os.access(path.parent, os.W_OK)
+
+
+def overlay_file() -> Path | None:
+    """Writable overlay path for user-local lesson additions/retirements when cached read-only or overridden."""
+    state_dir = os.environ.get("HUNT_STATE_DIR", "").strip()
+    if state_dir:
+        return Path(state_dir).expanduser().resolve() / LESSONS_FILE.name
+    plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA", "").strip()
+    if plugin_data:
+        return Path(plugin_data).expanduser().resolve() / LESSONS_FILE.name
+    if not _is_writable_target(LESSONS_FILE):
+        xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+        base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+        return base.resolve() / "diff-bug-hunter" / LESSONS_FILE.name
+    return None
+
+
+def _write_path(path: Path | None) -> Path:
+    resolved = LESSONS_FILE if path is None else path
+    if path is not None and path.resolve() != LESSONS_FILE.resolve():
+        return path
+    ov = overlay_file()
+    if ov is not None:
+        ov.parent.mkdir(parents=True, exist_ok=True)
+        return ov
+    return resolved
+
+
+def _parse_jsonl(text: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def _records(path: Path | None) -> list[dict[str, Any]]:
+    if path is not None:
+        return _parse_jsonl(path.read_text()) if path.exists() else []
+    rows = _parse_jsonl(trusted.read(LESSONS_FILE.name, skill_dir=LESSONS_FILE.parent))
+    ov = overlay_file()
+    if ov is not None and ov.exists():
+        rows.extend(_parse_jsonl(ov.read_text()))
+    return rows
 
 
 def load(path: Path | None = None, include_retired: bool = False) -> list[dict[str, Any]]:
@@ -110,7 +151,7 @@ def validate_candidate(lesson: dict[str, Any], base: Path | None = None) -> None
         raise ValueError(f"failure_regex does not match fixture {ref}: it does not reproduce the false positive")
 
 
-def add(lesson: dict[str, Any], path: Path = LESSONS_FILE, fixture_base: Path | None = None,
+def add(lesson: dict[str, Any], path: Path | None = None, fixture_base: Path | None = None,
         require_fixture: bool = False) -> dict[str, Any]:
     missing = [k for k in REQUIRED if not lesson.get(k)]
     if missing:
@@ -121,7 +162,12 @@ def add(lesson: dict[str, Any], path: Path = LESSONS_FILE, fixture_base: Path | 
         validate_candidate(lesson, fixture_base)
     # random ids: concurrent appenders cannot collide, and ids are never reused
     lesson = {"id": f"L-{uuid.uuid4().hex[:12]}", **{k: v for k, v in lesson.items() if k != "id"}}
-    _append_line(path, lesson, unique_pattern=True)
+    target = _write_path(path)
+    if (path is None or path.resolve() == LESSONS_FILE.resolve()) and any(
+        r.get("pattern") == lesson["pattern"] for r in _records(None)
+    ):
+        raise ValueError(f"duplicate pattern: {lesson['pattern']}")
+    _append_line(target, lesson, unique_pattern=True)
     return lesson
 
 
@@ -294,10 +340,11 @@ def main(argv: list[str]) -> None:
         for r in retire:
             print(json.dumps(r))
         if a.write and retire:
-            already = {r["retire"] for r in _records(LESSONS_FILE) if "retire" in r}
+            target = _write_path(LESSONS_FILE)
+            already = {r["retire"] for r in _records(target) + _records(None) if "retire" in r}
             for r in retire:
                 if r["retire"] not in already:
-                    _append_line(LESSONS_FILE, r)
+                    _append_line(target, r)
         hunts_logged = len({re.sub(r"/\d+$", "", str(x["run"])) for x in lines if "run" in x})
         print(f"{len(retire)} to retire; {hunts_logged} hunts logged in {log}")
     else:

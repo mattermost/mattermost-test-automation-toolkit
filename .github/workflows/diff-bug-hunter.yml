@@ -46,3 +46,9 @@ jobs:
         env:
           HUNT_REQUIRE_DEPS: "1"
         run: make -C packages/diff-bug-hunter self-test
+      - name: ci/plugin-package
+        run: |
+          tmp_mp="$(mktemp -d)"
+          trap 'rm -rf "$tmp_mp"' EXIT
+          ./packages/diff-bug-hunter/scripts/sync-marketplace.sh --allow-branch "$tmp_mp"
+          test -x "$tmp_mp/plugins/diff-bug-hunter/skills/hunt/scripts/start_pg.sh"
