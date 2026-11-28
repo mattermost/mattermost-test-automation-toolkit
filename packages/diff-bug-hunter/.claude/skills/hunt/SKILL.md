@@ -2,6 +2,7 @@
 name: hunt
 description: Blind Mode A (caller invariants), Mode B (PR/release-promise falsifier), Mode D (differential recorders), and parallel Mode R (CodeRabbit review-claim verifier) bug hunt on one mattermost/mattermost PR or release/commit range, with merge-base vetting and an opt-in (--mutants) compile-verified mutation gate. Use when asked to hunt, bug-hunt or falsify a Mattermost PR or release diff.
 argument-hint: <pr_number | base...head> [--batch N | --all-batches] [--mutants]
+disable-model-invocation: true
 ---
 
 Hunt `$ARGUMENTS`. Target `<target>` is either a PR number (`40260`) or a git branch/tag/commit range (`release-11...release-12`, `release-12.0.0-rc1...release-12.1.0-rc3`, `base..head`; strip spaces around `..`/`...` so it is one shell argument). Scripts are in `scripts/` next to this file; run them with `cd <this dir>/scripts && python3 <script>`.

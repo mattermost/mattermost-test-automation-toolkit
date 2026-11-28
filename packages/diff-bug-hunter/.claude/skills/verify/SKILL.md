@@ -2,6 +2,7 @@
 name: verify
 description: Cheap, text-only UI smoke check of a change against a running Mattermost server (default http://localhost:8065), using scoped accessibility snapshots instead of screenshots. Use when asked to verify, smoke-test or confirm a UI change works in the browser.
 argument-hint: <what to verify> [base_url]
+disable-model-invocation: true
 ---
 
 Verify: $ARGUMENTS. The runner is `scripts/verify_ui.mjs` next to this file. It reads a JSON plan and drives Chromium.

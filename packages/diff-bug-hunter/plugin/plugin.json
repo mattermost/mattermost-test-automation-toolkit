@@ -1,0 +1,18 @@
+{
+  "name": "diff-bug-hunter",
+  "version": "0.1.0",
+  "description": "Hunts for bugs introduced by a Mattermost PR diff: multi-mode LLM review plus real Go/Jest execution, fuzzing, and optional Playwright UI verification.",
+  "author": {
+    "name": "Mattermost"
+  },
+  "homepage": "https://github.com/mattermost/mattermost-test-automation-toolkit/tree/main/packages/diff-bug-hunter",
+  "repository": "https://github.com/mattermost/mattermost-test-automation-toolkit",
+  "keywords": [
+    "bug-hunting",
+    "code-review",
+    "go",
+    "jest",
+    "playwright",
+    "mattermost"
+  ]
+}
