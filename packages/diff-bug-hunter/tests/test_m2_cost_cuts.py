@@ -270,6 +270,7 @@ def test_escalation_schema_fail_capped_at_one_and_preserves_clean_tier(tmp_path,
     write_json(hdir / "driver.json", {"gaps": {}, "escalations": drv["escalations"], "modes": ["A", "B"]})
     write_json(hdir / "run_A.json", {"calc::TestA": "PASS"})
     write_json(hdir / "run_B.json", {"calc::TestB": "PASS"})
+    write_json(hdir / "run_A.coverage.json", {"reached": 1, "executable": 1})
     write_json(hdir / "verdict.json", {"vetted_present": True, "keep": [], "held": []})
     out = report.write(hdir, "1")
     assert out["tier"] == "High-Confidence Clean"

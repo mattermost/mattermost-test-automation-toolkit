@@ -266,12 +266,12 @@ def test_empty_verdict_json_does_not_clear_unvetted_pr_old_or_r_failures(tmp_pat
     assert rec_r["confidence_tier"] == PARTIAL
     assert "unvetted findings" in rec_r["gaps"]
 
-    # 5. Explicitly vetting the R claim as DROP clears unvetted and allows High-Confidence Clean.
+    # 5. Vetting the R claim as DROP clears unvetted, but its merge-base oracle is NEW_PR_BUG: the dismissal is a gap.
     drop_r = {"row": vetted_row(id="CR1", source="R", decision="DROP"), "reasons": ["decision=DROP"]}
     write_json(h_r / "verdict.json", {"vetted_present": True, "keep": [], "held": [drop_r]})
     rec_r_clean = ledger.record("1", hdir=h_r, out_path=tmp_path / "l_r_clean.jsonl")
-    assert rec_r_clean["confidence_tier"] == "High-Confidence Clean"
-    assert rec_r_clean["gaps"] == []
+    assert rec_r_clean["confidence_tier"] == PARTIAL
+    assert rec_r_clean["gaps"] == ["1 mechanical failure(s) dismissed by the skeptic"]
 
 
 # ------------------------------------------------------------------ #15: chronological archive order
@@ -305,8 +305,8 @@ def test_archive_batch_order_supersedes_by_chronology_not_batch_number(tmp_path)
     assert keep == []
     assert [h["row"]["id"] for h in held] == ["p::TestBug"]
 
-    tier, _ = ledger._tier_and_gaps(hdir, {"mode_a_empty": 0}, 1, 1, 0, 3, 3, False, {})
-    assert tier == "High-Confidence Clean"
+    tier, gaps = ledger._tier_and_gaps(hdir, {"mode_a_empty": 0}, 1, 1, 0, 3, 3, False, {})
+    assert tier == PARTIAL and gaps == ["1 mechanical failure(s) dismissed by the skeptic"]
 
     # Also when batch 2 is archived first and batch 1 second, batch 1 must win.
     hdir2 = tmp_path / "h_reverse"

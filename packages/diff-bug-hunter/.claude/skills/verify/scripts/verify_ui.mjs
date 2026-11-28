@@ -27,6 +27,7 @@
 //   VERDICT: SAME        nothing differs                                                   exit 0
 //   VERDICT: DIFF        only captures / snapshots / expects that fail on base but pass on head differ   exit 1
 //   VERDICT: REGRESSION  an expect passes on base and fails on head                       exit 1
+//   VERDICT: BOTH_FAIL   an expect fails on base and on head, and nothing else differs: the plan says nothing about the change   exit 1
 //   VERDICT: FAIL ...    a run itself failed (a step that fails, a request still running at the deadline, leaving the
 //                        allowed origins). A base run that fails is reported as `FAIL base run failed`.   exit 1
 // Unlike a plain run, compare mode does not stop at an unmet expect, a page error or a >= 500 /api/v4/ response: it records
@@ -1560,7 +1561,8 @@ export async function compare(plan, baseUrl, env = process.env, log = console.lo
     }
     const regressions = recs.base.expects.filter((b) => b.ok && !recs.head.expects.find((h) => h.n === b.n)?.ok);
     log(`${diffs.length} difference(s) after normalising ids, timestamps, versions and origins; ${regressions.length} expect regression(s)`);
-    const verdict = regressions.length ? 'REGRESSION' : diffs.length ? 'DIFF' : 'SAME';
+    const bothFail = recs.base.expects.filter((b) => !b.ok && !recs.head.expects.find((h) => h.n === b.n)?.ok);
+    const verdict = regressions.length ? 'REGRESSION' : diffs.length ? 'DIFF' : bothFail.length ? 'BOTH_FAIL' : 'SAME';
     log(`VERDICT: ${verdict}`);
     return verdict === 'SAME' ? 0 : 1;
 }
