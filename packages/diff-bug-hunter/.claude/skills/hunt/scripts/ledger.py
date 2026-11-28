@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import telemetry
 from hunt_common import (
     InfraError,
     hunt_dir,
@@ -603,6 +604,30 @@ def _export_escapes(hdir: Path, state: dict[str, Any], pr_key: str,
     return exported
 
 
+def _collect_ledger_telemetry(hdir: Path) -> tuple[dict[str, Any], float]:
+    """Collect unified telemetry usage, repair/retry counts, and test runtimes across batches and root."""
+    summaries = [telemetry.summarize(bdir) for bdir in _batch_dirs(hdir) if (bdir / telemetry.LEDGER).is_file()]
+    usage = telemetry.merge_summaries(summaries)
+    repairs = 0
+    retries = 0
+    test_runtime_s = 0.0
+    for bdir in _batch_dirs(hdir):
+        for p in bdir.iterdir():
+            if not p.is_dir() or p.name == "batches":
+                continue
+            if (p / "request.repair.json").is_file():
+                repairs += 1
+            if (p / "request.retry.json").is_file():
+                retries += 1
+        for rt_path in sorted(bdir.glob("run_*.runtimes.json")):
+            rt_data = read_optional_dict(rt_path)
+            for v in rt_data.values():
+                num = telemetry.valid_nonneg_num(v)
+                if num is not None:
+                    test_runtime_s += num
+    return {**usage, "repairs": repairs, "retries": retries}, round(test_runtime_s, 3)
+
+
 def record(pr: str, hdir: Path | None = None, out_path: Path | None = None) -> dict[str, Any]:
     hdir = hdir or hunt_dir(pr)
     state = read_state(hdir)
@@ -639,6 +664,7 @@ def record(pr: str, hdir: Path | None = None, out_path: Path | None = None) -> d
     tier, tier_gaps = _tier_and_gaps(
         hdir, counts, reached, executable, deferred_count, batches_hunted, batches_total, mode_gaps, verdicts,
     )
+    usage_info, test_runtime_s = _collect_ledger_telemetry(hdir)
     entry: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "target": str(state.get("pr", pr)),
@@ -657,6 +683,8 @@ def record(pr: str, hdir: Path | None = None, out_path: Path | None = None) -> d
         "pr_tests_statuses": pr_statuses,
         "mode_r_summary": r_summary,
         "escapes": escapes,
+        "usage": usage_info,
+        "test_runtime_s": test_runtime_s,
     }
     out_file.parent.mkdir(parents=True, exist_ok=True)
     with out_file.open("a") as fh:

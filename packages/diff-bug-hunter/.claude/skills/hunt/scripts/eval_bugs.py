@@ -74,6 +74,7 @@ if not sys.pycache_prefix:
     sys.pycache_prefix = "/dev/null/hunt-pyc"
 
 import argparse
+import contextlib
 import importlib
 import json
 import math
@@ -94,6 +95,7 @@ import old_tests
 import prepare
 import review_threads
 import run
+import telemetry
 import verdict
 from hunt_common import InfraError, git, load_json, read_optional_dict, require_disk, sh, write_json
 from verdicts import Verdict
@@ -245,8 +247,9 @@ def load_manifest(path: Path, repo_override: Path | None,
 
 def dispatch(cmd: str, request: Path) -> None:
     req = json.loads(request.read_text())
+    env = {**os.environ, "HUNT_TELEMETRY": str((request.parent.parent / telemetry.LEDGER).resolve())}
     p = subprocess.run(f"{cmd} {shlex.quote(str(request))}", shell=True, capture_output=True, text=True, check=False,
-                       timeout=3600)
+                       timeout=3600, env=env)
     if p.returncode != 0 or not Path(req["response_path"]).exists():
         raise InfraError(f"dispatch failed for {request} (exit {p.returncode}): {(p.stdout + p.stderr)[-800:]}")
 
@@ -474,6 +477,19 @@ def _run_with_repair(num: int, hdir: Path, tag: str, row: dict[str, Any], dispat
         row["error"] = str(err)[-400:]
 
 
+def _attach_tag_telemetry(row: dict[str, Any], hdir: Path, tag: str) -> dict[str, Any]:
+    repairs = 1 if row.get("repaired") else 0
+    retries = 1 if (hdir / tag / "request.retry.json").exists() else 0
+    tag_usage = telemetry.summarize(hdir, tag=tag)
+    has_usage = (tag_usage["calls"] > 0 or tag_usage["tokens_in"] > 0
+                 or tag_usage["tokens_out"] > 0 or tag_usage["total_cost_usd"] > 0)
+    if has_usage or repairs > 0 or retries > 0:
+        row["repairs"] = repairs
+        row["retries"] = retries
+        row["usage"] = tag_usage
+    return row
+
+
 def hunt_tag(num: int, hdir: Path, state: dict[str, Any], tag: str, batch: int, dispatch_cmd: str | None,
              wt_fix: Path | None = None, fix_not_run: str | None = None) -> dict[str, Any]:
     """One hunter's run and base tables, plus the fix table when the entry has a fix commit. Its own failures stay on
@@ -489,7 +505,7 @@ def hunt_tag(num: int, hdir: Path, state: dict[str, Any], tag: str, batch: int, 
             row["fix_error"] = str(err)[-400:]
     elif fix_not_run and "base" in row:
         _mark_fix_not_run(row, sorted(n for n, v in row["base"].items() if v == Verdict.NEW_PR_BUG), fix_not_run)
-    return row
+    return _attach_tag_telemetry(row, hdir, tag)
 
 
 def hunt_diff(num: int, hdir: Path, state: dict[str, Any], batch: int, dispatch_cmd: str | None,
@@ -507,7 +523,7 @@ def hunt_diff(num: int, hdir: Path, state: dict[str, Any], batch: int, dispatch_
                 row["fix_error"] = str(err)[-400:]
         elif fix_not_run:
             _mark_fix_not_run(row, sorted(n for n, v in row["diff"].items() if v == Verdict.DIFF), fix_not_run)
-    return row
+    return _attach_tag_telemetry(row, hdir, "D")
 
 
 def old_signal(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
@@ -702,7 +718,10 @@ def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None,
         results.append(old_signal(hdir, state))
     if "pr" in signals:
         results.append(pr_signal(hdir, state))
-    return {"results": results}
+    out_entry: dict[str, Any] = {"results": results}
+    if (hdir / telemetry.LEDGER).is_file():
+        out_entry["usage"] = telemetry.summarize(hdir)
+    return out_entry
 
 
 def score(entry: dict[str, Any]) -> tuple[bool, bool]:
@@ -737,6 +756,28 @@ def fix_counts(entry: dict[str, Any]) -> dict[str, dict[str, int]]:
 
 def _first(entry: dict[str, Any], key: str) -> str | None:
     return next((r[key] for r in entry.get("results", []) if r.get(key)), None)
+
+
+def _aggregate_entry_usage(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Deterministically aggregate telemetry summaries, repairs, and retries across hunted entries."""
+    repairs = 0
+    retries = 0
+    usages: list[dict[str, Any]] = []
+    for h in entries:
+        if not isinstance(h, dict):
+            continue
+        has_entry_usage = isinstance(h.get("usage"), dict)
+        if has_entry_usage:
+            usages.append(h["usage"])
+        items = h["results"] if isinstance(h.get("results"), list) else []
+        for r in items:
+            if not isinstance(r, dict):
+                continue
+            repairs += telemetry.valid_nonneg_int(r.get("repairs")) or 0
+            retries += telemetry.valid_nonneg_int(r.get("retries")) or 0
+            if not has_entry_usage and isinstance(r.get("usage"), dict):
+                usages.append(r["usage"])
+    return {**telemetry.merge_summaries(usages), "repairs": repairs, "retries": retries}
 
 
 def scorecard(manifest: dict[str, Any], hunted: dict[str, dict[str, Any]],
@@ -840,9 +881,11 @@ def scorecard(manifest: dict[str, Any], hunted: dict[str, dict[str, Any]],
         "cases_fix_forward": len(forward),
         "skipped_missing": manifest.get("skipped_missing", []),
     }
+    all_hunted = [hunted[e["id"]] for e in manifest["cases"] + manifest["controls"]]
     return {"rows": rows, "metrics": metrics, "summary": summary, "thresholds": t, "checks": checks, "fp_checks": fp_checks,
             "errors": errors, "verdict": verdict, "signals": list(signals),
-            "cases": len(cases), "controls": len(controls)}
+            "cases": len(cases), "controls": len(controls),
+            "usage": _aggregate_entry_usage(all_hunted)}
 
 
 def render(card: dict[str, Any]) -> str:
@@ -914,6 +957,18 @@ def render(card: dict[str, Any]) -> str:
                 lines.append(f"  read {r['id']}: {', '.join(r['strictly_weak'][:5])}")
             if r.get("fix_not_run_reasons"):
                 lines.append(f"  fix not run {r['id']}: {'; '.join(r['fix_not_run_reasons'])}")
+    u = card.get("usage") or {}
+    if isinstance(u, dict) and (
+        (telemetry.valid_nonneg_int(u.get("calls")) or 0) > 0
+        or (telemetry.valid_nonneg_int(u.get("repairs")) or 0) > 0
+        or (telemetry.valid_nonneg_int(u.get("retries")) or 0) > 0
+        or (telemetry.valid_nonneg_int(u.get("tokens_in")) or 0) > 0
+    ):
+        lines.append(
+            f"usage: calls={u.get('calls', 0)} repairs={u.get('repairs', 0)} retries={u.get('retries', 0)} "
+            f"tokens_in={u.get('tokens_in', 0)} tokens_out={u.get('tokens_out', 0)} "
+            f"cost=${u.get('total_cost_usd', 0.0):.4f} duration={u.get('total_secs', 0.0):.1f}s"
+        )
     lines.append(f"VERDICT: {card['verdict']}")
     return "\n".join(lines)
 
@@ -1000,6 +1055,49 @@ def diff_scorecards(base: dict[str, Any], cand: dict[str, Any], max_fp: float = 
     missing_signals = (sorted(set(base_signals) - set(cand.get("signals") or []))
                        if isinstance(base_signals, list) else [])
     signals_ok = not missing_signals
+
+    def _validate_usage(raw_u: Any, label: str) -> dict[str, Any] | None:
+        if raw_u is None:
+            return None
+        if not isinstance(raw_u, dict):
+            raise TypeError(f"{label} usage must be a JSON object")
+        norm_u: dict[str, Any] = {}
+        for k in ("calls", "repairs", "retries", *telemetry.TOKEN_KEYS):
+            raw_v = raw_u.get(k)
+            if raw_v is None:
+                norm_u[k] = 0
+            else:
+                iv = telemetry.valid_nonneg_int(raw_v)
+                if iv is None:
+                    raise ValueError(f"{label} usage.{k} must be a non-negative integer")
+                norm_u[k] = iv
+        for k in ("total_cost_usd", "total_secs"):
+            raw_v = raw_u.get(k)
+            if raw_v is None:
+                norm_u[k] = 0.0
+            else:
+                fv = telemetry.valid_nonneg_num(raw_v)
+                if fv is None:
+                    raise ValueError(f"{label} usage.{k} must be a non-negative finite number")
+                norm_u[k] = fv
+        return norm_u
+
+    bu = _validate_usage(base.get("usage"), "base")
+    cu = _validate_usage(cand.get("usage"), "cand")
+    usage_delta: dict[str, Any] | None = None
+    if bu is not None and cu is not None:
+        cost_pct = round(((cu["total_cost_usd"] - bu["total_cost_usd"]) / bu["total_cost_usd"]) * 100.0, 2) if bu["total_cost_usd"] > 0 else None
+        usage_delta = {
+            "base_calls": bu["calls"], "cand_calls": cu["calls"],
+            "base_tokens_in": bu["tokens_in"], "cand_tokens_in": cu["tokens_in"],
+            "base_tokens_out": bu["tokens_out"], "cand_tokens_out": cu["tokens_out"],
+            "base_cost_usd": bu["total_cost_usd"], "cand_cost_usd": cu["total_cost_usd"],
+            "cost_delta_pct": cost_pct,
+            "base_secs": bu["total_secs"], "cand_secs": cu["total_secs"],
+            "base_repairs": bu["repairs"], "cand_repairs": cu["repairs"],
+            "base_retries": bu["retries"], "cand_retries": cu["retries"],
+        }
+
     passed = (cand_ok and base_ok and population_ok and signals_ok and recall_ok and fp_ok and strong_ok and fwd_ok
               and not weak_regressions and not gate_fp_failures and not lock_regressions)
     return {
@@ -1025,6 +1123,7 @@ def diff_scorecards(base: dict[str, Any], cand: dict[str, Any], max_fp: float = 
         "cand_strong_recall_fix_forward": cand_fwd,
         "weak_ratio_regressions": weak_regressions,
         "fp_gate_failures": gate_fp_failures,
+        "usage_delta": usage_delta,
     }
 
 
@@ -1056,6 +1155,12 @@ def _cmd_diff(args: list[str]) -> int:
     if res["missing_signals"]:
         print(f"missing_signals: {res['missing_signals']}")
     print(f"lock_regressions: {res['lock_regressions']}")
+    ud = res.get("usage_delta")
+    if isinstance(ud, dict) and (ud["base_calls"] or ud["cand_calls"] or ud["base_cost_usd"] or ud["cand_cost_usd"]):
+        pct = f" ({ud['cost_delta_pct']:+.2f}%)" if ud.get("cost_delta_pct") is not None else ""
+        print(f"usage: cost ${ud['base_cost_usd']:.4f} -> ${ud['cand_cost_usd']:.4f}{pct}, "
+              f"tokens_in {ud['base_tokens_in']} -> {ud['cand_tokens_in']}, "
+              f"repairs {ud['base_repairs']} -> {ud['cand_repairs']}")
     if not res["base_ok"]:
         print("baseline scorecard has errors: rerun the baseline before gating on it")
     print(f"VERDICT: {res['verdict']}")
@@ -1111,7 +1216,13 @@ def main(argv: list[str] | None = None) -> int:
             hunted[e["id"]] = hunt_entry(e, num, out, a.dispatch, signals)
         except ENTRY_FAILURES as err:
             # an ERROR verdict (exit 2): the entry could not run, which is not the same as a miss or a clean result
-            hunted[e["id"]] = {"error": f"{type(err).__name__}: {str(err).splitlines()[0] if str(err) else 'no detail'}"}
+            fail_entry: dict[str, Any] = {
+                "error": f"{type(err).__name__}: {str(err).splitlines()[0] if str(err) else 'no detail'}",
+            }
+            if (out / f"hunt{num}" / telemetry.LEDGER).is_file():
+                with contextlib.suppress(OSError):
+                    fail_entry["usage"] = telemetry.summarize(out / f"hunt{num}")
+            hunted[e["id"]] = fail_entry
         timings[e["id"]] = round(time.monotonic() - start, 1)
         write_json(out / "timings.json", timings)  # each entry as it ends: a long run can be followed
         write_json(out / f"entry_{num}_{e['id']}.json", hunted[e["id"]])
