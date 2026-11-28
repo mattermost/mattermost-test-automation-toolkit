@@ -69,8 +69,9 @@ Two Claude Code skills that find bugs cheaply and only report what a determinist
 - **Large-diff guard & `--all-batches`:** lockfiles, generated code, snapshots, i18n and existing tests are skipped. The
   rest is ranked by risk and hunted in batches of at most 5 files / 800 diff lines (`--all-batches` hunts every batch
   sequentially, archiving prior batches under `batches/batch_<N>/`); `skipped.log` lists the rest.
-- **3-tier confidence verdict:** reports end with `Bug Proven`, `Partial or Unverified Coverage` (listing every deferred
-  batch, `EMPTY` hunter, `NOT_RUN`, or `UNPROVABLE_DYNAMICALLY` claim), or `High-Confidence Clean`.
+- **Confidence verdict:** reports end with `Bug Proven`, `Behaviour change, needs review` (a kept Mode D `DIFF` or Mode A/B
+  `NEW_API` with no merge-base `NEW_PR_BUG`), `Partial or Unverified Coverage` (listing every deferred batch, `EMPTY` hunter,
+  `NOT_RUN`, `UNPROVABLE_DYNAMICALLY` claim, race report or unmeasured changed lines), or `High-Confidence Clean`.
 - **Restart safety:** `prepare.py` will not wipe a hunt that already has results for the PR's current head (`ALREADY_HUNTED`,
   exit 4), so a restarted session resumes instead of paying for the hunters again. `--fresh` starts over.
 - **Resource discipline:** `prepare.py` and every Go `-race` run stop with `INFRA_ERROR` when less than 2 GiB is free
@@ -169,7 +170,7 @@ validated strictly (one action per step, one locator kind, known keys only) befo
 - **Deterministic oracle:** `expect` must hold at least one DOM check (`visible`, `text` + `contains`,
   `count` + `min`) or an `/api/v4/` check (`method`, `path`, `body`, `status`, `json_has`).
 - **Compare (base vs head):** `verify_ui.mjs plan.json --compare <base_url>` runs the plan's capture steps against both
-  servers. Verdicts `SAME`, `DIFF` or `REGRESSION`; a `DIFF` the PR does not explain is a finding.
+  servers. Verdicts `SAME`, `DIFF`, `REGRESSION` or `BOTH_FAIL` (an `expect` fails on both servers: the plan shows nothing about the change); a `DIFF` the PR does not explain is a finding.
 - **A PR's or release's build, no local build:** `scripts/pr_server.py images <pr | base...head> --pull` pulls the published enterprise images of
   the head and its merge-base (`/hunt` starts it at step 1, so the pull overlaps the hunt).
   `scripts/pr_server.py up <image>` runs the mattermost repo's own `e2e-tests` stack on that image at `:8065`, replaces a
