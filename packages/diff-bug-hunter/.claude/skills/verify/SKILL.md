@@ -84,7 +84,7 @@ steps (GET an `/api/v4/` path, record the body, assert nothing) and snapshots, k
 is the head. Same steps, same credentials, both servers. Ids, timestamps, version/build fields and origins are
 normalised away; add `"ignore": ["json.path"]` for other known noise.
 - Output: `DIFF <step#> <json-path>: base=<v> head=<v>` lines, then `VERDICT: SAME` (exit 0), `DIFF` or `REGRESSION`
-(an `expect` passes on base, fails on head; exit 1), `FAIL` (a step failed; page errors and 5xx are diffed, not fatal, so noise both servers share is not a difference) or exit 2 `INVALID_PLAN` /
+(an `expect` passes on base, fails on head; exit 1), `BOTH_FAIL` (an `expect` fails on both servers and nothing else differs: the plan shows nothing about the change; exit 1), `FAIL` (a step failed; page errors and 5xx are diffed, not fatal, so noise both servers share is not a difference) or exit 2 `INVALID_PLAN` /
 `INFRA_ERROR`. `--freeze` is not supported with `--compare`.
 - **Rule:** every `DIFF` must be explained by the PR (the diff or its description names that field or behaviour) or it
 is a finding: report path, base value, head value. Never add an `ignore` just to silence one. A diff between two

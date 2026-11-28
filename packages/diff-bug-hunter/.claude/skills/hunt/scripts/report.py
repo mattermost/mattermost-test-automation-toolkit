@@ -94,8 +94,8 @@ def _tier(hdir: Path, state: dict[str, Any], keep: list[dict[str, Any]], driver_
                                        int(state.get("batches") or 1), mode_gaps,
                                        verdicts if isinstance(verdicts, dict) else {})
     if keep:
-        return "Bug Proven", driver_gaps, reached, executable
-    if tier == "Bug Proven":  # the ledger saw a vetted row the lesson filter has since held
+        return ledger.keep_tier(hdir, keep), driver_gaps, reached, executable
+    if tier in ("Bug Proven", "Behaviour change, needs review"):  # the ledger saw a vetted row the lesson filter held
         tier, gaps = "Partial or Unverified Coverage", ["findings held by a false-positive lesson"]
     if held:  # an unresolved candidate is neither a finding nor evidence of a clean PR
         tier, gaps = "Partial or Unverified Coverage", [*gaps, f"{held} candidate(s) HELD: unresolved, not reported"]

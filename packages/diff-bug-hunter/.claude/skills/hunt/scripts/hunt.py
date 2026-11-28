@@ -51,6 +51,7 @@ from typing import Any
 
 import build_requests
 import dispatch
+import ledger
 import lessons
 import report
 import telemetry
@@ -514,6 +515,18 @@ def vet_done(hdir: Path) -> bool:
     return (hdir / "vetted.json").exists()
 
 
+def cover_done(hdir: Path) -> bool:
+    """Mode A's changed lines are measured unless nothing needs it: no Mode A run, or a kept NEW_PR_BUG already decides
+    the tier as Bug Proven. Otherwise Clean would rest on lines the hunter tests never touched."""
+    if not (hdir / "run_A.json").exists() or (hdir / "run_A.coverage.json").exists():
+        return True
+    return ledger.keep_tier(hdir, verdict.admissibility(hdir)["keep"]) == "Bug Proven"
+
+
+def stage_cover(target: str, hdir: Path) -> None:
+    expect_ok(script("run.py", "cover", target, "A"), "run.py cover A")
+
+
 def stage_verdict(hdir: Path) -> None:
     adm = verdict.admissibility(hdir)
     lesson_hits = {h["test_id"]: h["lesson_id"] for h in lessons.post_filter(hdir)}
@@ -551,6 +564,7 @@ def drive(target: str, fresh: bool) -> int:
              lambda: expect_ok(script("pr_tests.py", target), "pr_tests.py"))
         step(hdir, "vet_v", lambda: v_done(hdir), lambda: stage_v(target, hdir))
         step(hdir, "vet", lambda: vet_done(hdir), lambda: stage_vet(hdir))
+        step(hdir, "cover", lambda: cover_done(hdir), lambda: stage_cover(target, hdir))
         step(hdir, "verdict", lambda: False, lambda: stage_verdict(hdir))
         step(hdir, "report", lambda: False, lambda: report.write(hdir, target))
     return 0

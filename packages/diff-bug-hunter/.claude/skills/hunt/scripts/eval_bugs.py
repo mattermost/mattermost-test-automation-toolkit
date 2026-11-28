@@ -584,6 +584,10 @@ def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None,
         else:
             batches = 1  # the whole-commit signals need only the state, not one per batch
         batch += 1
+    if (("hunters" in signals or "diff" in signals) and batches
+            and not any(r.get("hunter") in ("A", "B", "D") for r in results)
+            and not (hdir / "verdict.json").exists()):
+        raise InfraError(f"no hunter response for {e['id']}: pass --dispatch or a responses directory")
     if "review" in signals:
         results.append(review_signal(num, hdir, state, meta, e, dispatch_cmd, wt_fix, fix_not_run))
     if ("hunters" in signals or "diff" in signals) and (hdir / "vetted.json").exists():
@@ -817,6 +821,7 @@ def diff_scorecards(base: dict[str, Any], cand: dict[str, Any], max_fp: float = 
     base_recall, cand_recall = _num(bm, "vetted_recall"), _num(cm, "vetted_recall")
     base_fp, cand_fp = _num(bm, "fp_rate"), _num(cm, "fp_rate")
     cand_ok = not cand.get("errors") and cand.get("verdict") != Verdict.ERROR
+    base_ok = not base.get("errors") and base.get("verdict") != Verdict.ERROR
     recall_ok = cand_recall >= base_recall
     fp_limit = max_fp  # no tolerance for a worse baseline: the limit is absolute
     fp_ok = cand_fp <= fp_limit
@@ -836,11 +841,12 @@ def diff_scorecards(base: dict[str, Any], cand: dict[str, Any], max_fp: float = 
         k for k in bm if k.startswith("strictly_weak_ratio_") and k in cm and _num(cm, k) > _num(bm, k))
     # the other author-reaching signals hold controls to the same absolute limit as fp_rate
     gate_fp_failures = sorted(k for k in FP_GATE_METRICS if k in cm and _num(cm, k) > fp_limit)
-    passed = (cand_ok and population_ok and recall_ok and fp_ok and strong_ok and fwd_ok and not weak_regressions
+    passed = (cand_ok and base_ok and population_ok and recall_ok and fp_ok and strong_ok and fwd_ok and not weak_regressions
               and not gate_fp_failures and not lock_regressions)
     return {
         "verdict": Verdict.PASS if passed else Verdict.FAIL,
         "cand_ok": cand_ok,
+        "base_ok": base_ok,
         "population_ok": population_ok,
         "recall_ok": recall_ok,
         "fp_ok": fp_ok,
@@ -887,6 +893,8 @@ def _cmd_diff(args: list[str]) -> int:
     print(f"strictly_weak_ratio regressions: {res['weak_ratio_regressions']}")
     print(f"fp gates exceeded (diff/review/pr_ci/admissibility): {res['fp_gate_failures']}")
     print(f"lock_regressions: {res['lock_regressions']}")
+    if not res["base_ok"]:
+        print("baseline scorecard has errors: rerun the baseline before gating on it")
     print(f"VERDICT: {res['verdict']}")
     return 0 if res["verdict"] == Verdict.PASS else 1
 

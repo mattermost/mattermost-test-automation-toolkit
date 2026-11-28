@@ -146,9 +146,9 @@ def test_compare_regression_when_an_expect_passes_on_base_and_fails_on_head(tmp_
     # the other direction (fails on base, passes on head) is a difference, not a regression
     code, out = compare(tmp_path, plan, head, base)
     assert code == 1 and verdict(out) == "VERDICT: DIFF", out
-    # both fail: nothing differs
+    # both fail: the plan's expectation holds on neither server, so it shows nothing about the change
     code, out = compare(tmp_path, plan, head, head)
-    assert code == 0 and verdict(out) == "VERDICT: SAME", out
+    assert code == 1 and verdict(out) == "VERDICT: BOTH_FAIL", out
 
 
 @needs_playwright
