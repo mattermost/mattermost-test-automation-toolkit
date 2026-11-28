@@ -1,0 +1,146 @@
+{
+ "pr": 40364,
+ "repo": "mattermost/mattermost",
+ "note": "DROP verified by hand: the base already refuses E10/E20, so the poll stopping is intended.",
+ "labels": {
+  "server/channels/app::TestHuntD_HealthCheckWatcherPollByLicense": "DROP"
+ },
+ "user": {
+  "pr": {
+   "title": "[MM-72282] Stop polling for health_check jobs on servers without a Professional license",
+   "description": "#### Summary\nEvery app server runs a health-check worker set with its own watcher. That watcher queried the Jobs table for pending `health_check` jobs every 15 seconds, and skipped the query only while the `HealthDashboard` feature flag was off. Without a Professional license, no `health_check` job can ever be created, because both the scheduler and Run now refuse. So each node on an unlicensed server ran 5,760 useless queries per day.\n\nThe fix gives the health-check watcher its own poll condition:\n- `MakeJobTypeWatcher` takes an optional `shouldPoll func() bool`, checked before every poll.\n- `health_check.MakeWorkers` takes a license function and passes `MinimumProfessionalLicense`. The app passes `Channels.License`.\n- The worker's own `isEnabled` still checks only the feature flag. The workers framework starts and stops workers only at startup and on config changes, and installing a license is not a config change. If the license check were in `isEnabled`, a server started unlicensed would never start the worker, and every run would stay pending after a license was added. With this approach the worker goroutine stays running and idle, and only the query is skipped.\n\nTests:\n- `TestWorkersWatcherSkipsPolling` covers no query when the flag is off, when there is no license, and when the license is below Professional.\n- `TestHealthCheckWorkersPollOnlyWhileLicensed` runs against a real DB. It starts the workers unlicensed and checks they make no `health_check` query. It then adds a Professional license, with no restart and no config change, and checks that both a Run now job and a scheduler-created job are picked up and succeed. Finally it removes the license and checks that polling stops.\n- I confirmed both tests fail when the poll condition is disabled.\n\nQA steps:\n1. Start a server with no license and with `MM_FEATUREFLAGS_ENABLEMATTERMOSTENTRY=false`, so it doesn't fall back to an Entry license. Turn on Postgres `log_statement=all`.\n2. Check that no `SELECT ... FROM Jobs WHERE Status = 'pending' AND Type = 'health_check'` appears in the Postgres log. Before this fix, one appeared every 15 seconds.\n3. Upload a Professional or higher license in System Console > Edition and License, without restarting the server. The query now appears every 15 seconds.\n4. In System Console > Site health, click **Re-run checks**. The run completes and the page shows \"Last evaluated just now\".\n\n#### Ticket Link\nFixes: https://mattermost.atlassian.net/browse/MM-72282\n\n#### Screenshots\n**Before (master):** an unlicensed server polls for `health_check` jobs every 15 seconds.\n\nhttps://cursor-plugin-pr-assets.s3.amazonaws.com/cursor/MM-72282-health-check-poll-license/before-unlicensed-server-polls-health-check-jobs.mp4\n\n[Postgres log, before](https://cursor-plugin-pr-assets.s3.amazonaws.com/cursor/MM-72282-health-check-poll-license/before-unlicensed-health-check-polling.log)\n\n**After (this branch):** no polls while unlicensed. Polling starts as soon as a license is uploaded \n[truncated]"
+  },
+  "diff_production_code": "diff --git a/server/channels/jobs/health_check/worker.go b/server/channels/jobs/health_check/worker.go\nindex 750898bed5..2d97aca580 100644\n--- a/server/channels/jobs/health_check/worker.go\n+++ b/server/channels/jobs/health_check/worker.go\n@@ -22,10 +22,15 @@ func MakeWorker(jobServer *jobs.JobServer, runHealthCheck func(rctx request.CTX)\n }\n \n // MakeWorkers returns a worker set holding only the health-check worker, with its own watcher\n-// that polls only pending health_check jobs, and only while the worker is enabled.\n-func MakeWorkers(jobServer *jobs.JobServer, worker model.Worker) *jobs.Workers {\n+// that polls only pending health_check jobs, and only while the worker is enabled and the server\n+// has a Professional license. The license gates the polling, not the worker: the framework only\n+// starts and stops workers on config changes, so a license added later would find no worker\n+// running.\n+func MakeWorkers(jobServer *jobs.JobServer, worker model.Worker, licenseFunc func() *model.License) *jobs.Workers {\n \tworkers := jobs.NewWorkers(jobServer.ConfigService)\n \tworkers.AddWorker(model.JobTypeHealthCheck, worker)\n-\tworkers.Watcher = jobServer.MakeJobTypeWatcher(workers, jobs.DefaultWatcherPollingInterval, model.JobTypeHealthCheck)\n+\tworkers.Watcher = jobServer.MakeJobTypeWatcher(workers, jobs.DefaultWatcherPollingInterval, model.JobTypeHealthCheck, func() bool {\n+\t\treturn model.MinimumProfessionalLicense(licenseFunc())\n+\t})\n \treturn workers\n }\ndiff --git a/server/channels/jobs/jobs_watcher.go b/server/channels/jobs/jobs_watcher.go\nindex 53be1e5026..ce7f249593 100644\n--- a/server/channels/jobs/jobs_watcher.go\n+++ b/server/channels/jobs/jobs_watcher.go\n@@ -25,8 +25,9 @@ type Watcher struct {\n \tpollingInterval int\n \n \t// jobType, when set, limits polling to pending jobs of that type, and skips polling while\n-\t// that type's worker is disabled.\n-\tjobType string\n+\t// that type's worker is disabled or shouldPoll, if set, returns false.\n+\tjobType    string\n+\tshouldPoll func() bool\n }\n \n func (srv *JobServer) MakeWatcher(workers *Workers, pollingInterval int) *Watcher {\n@@ -40,10 +41,12 @@ func (srv *JobServer) MakeWatcher(workers *Workers, pollingInterval int) *Watche\n }\n \n // MakeJobTypeWatcher returns a watcher that polls only pending jobs of jobType, for a worker set\n-// that runs that one type.\n-func (srv *JobServer) MakeJobTypeWatcher(workers *Workers, pollingInterval int, jobType string) *Watcher {\n+// that runs that one type. shouldPoll, if not nil, is checked before every poll, for conditions\n+// such as the license that don't start or stop the worker.\n+func (srv *JobServer) MakeJobTypeWatcher(workers *Workers, pollingInterval int, jobType string, shouldPoll func() bool) *Watcher {\n \twatcher := srv.MakeWatcher(workers, pollingInterval)\n \twatcher.jobType = jobType\n+\twatcher.shouldPoll = shouldPoll\n \treturn watcher\n }\n \n@@ -96,6 +99,9 @@ func (watcher *Watcher) PollAndNotify() {\n \t\tif worker := watcher.workers.Get(watcher.jobType); worker == nil || !worker.IsEnabled(watcher.srv.Config()) {\n \t\t\treturn\n \t\t}\n+\t\tif watcher.shouldPoll != nil && !watcher.shouldPoll() {\n+\t\t\treturn\n+\t\t}\n \t\tjobs, err = watcher.srv.Store.Job().GetAllByTypeAndStatus(rctx, watcher.jobType, model.JobStatusPending)\n \t} else {\n \t\tjobs, err = watcher.srv.Store.Job().GetAllByStatus(rctx, model.JobStatusPending)\ndiff --git a/server/channels/app/health_check.go b/server/channels/app/health_check.go\nindex 5e1876452b..d51e278252 100644\n--- a/server/channels/app/health_check.go\n+++ b/server/channels/app/health_check.go\n@@ -62,7 +62,7 @@ func (ch *Channels) startHealthCheckWorkersWithRun(run func(rctx request.CTX) er\n \t})\n \n \tch.cancelHealthCheck = cancel\n-\tch.healthCheckWorkers = health_check.MakeWorkers(ch.srv.Jobs, worker)\n+\tch.healthCheckWorkers = health_check.MakeWorkers(ch.srv.Jobs, worker, ch.License)\n \tch.healthCheckWorkers.Start()\n }",
+  "callers": [
+   {
+    "file": "server/channels/jobs/server.go",
+    "symbol": "MakeWatcher",
+    "lines": "39-51",
+    "hop": 1,
+    "entry_point": false,
+    "enclosing": "initWorkers",
+    "source": "   39  \tsrv.initSchedulers()\n   40  \treturn srv\n   41  }\n   42  \n   43  func (srv *JobServer) initWorkers() {\n   44  \tworkers := NewWorkers(srv.ConfigService)\n   45  \tworkers.Watcher = srv.MakeWatcher(workers, DefaultWatcherPollingInterval)\n   46  \tsrv.workers = workers\n   47  }\n   48  \n   49  func (srv *JobServer) initSchedulers() {\n   50  \tschedulers := &Schedulers{\n   51  \t\tconfigChanged:        make(chan *model.Config),"
+   },
+   {
+    "file": "server/einterfaces/autotranslation.go",
+    "symbol": "MakeWorker",
+    "lines": "66-78",
+    "hop": 1,
+    "entry_point": false,
+    "source": "   66  \t// Start initializes and starts the auto-translation service, including workers.\n   67  \tStart() error\n   68  \n   69  \t// Shutdown gracefully shuts down the auto-translation service.\n   70  \tShutdown() error\n   71  \n   72  \t// MakeWorker creates a worker for the autotranslation recovery sweep job.\n   73  \t// The worker picks up stuck translations and re-queues them for processing.\n   74  \tMakeWorker() model.Worker\n   75  \n   76  \t// MakeScheduler creates a scheduler for the autotranslation recovery sweep job.\n   77  \t// The scheduler runs periodically to detect stuck translations.\n   78  \tMakeScheduler() ejobs.Scheduler"
+   },
+   {
+    "file": "server/einterfaces/push_proxy.go",
+    "symbol": "MakeWorker",
+    "lines": "16-28",
+    "hop": 1,
+    "entry_point": false,
+    "source": "   16  \t// GenerateAuthToken generates and stores an authentication token\n   17  \tGenerateAuthToken() *model.AppError\n   18  \n   19  \t// DeleteAuthToken deletes the stored authentication token\n   20  \tDeleteAuthToken() *model.AppError\n   21  \n   22  \t// MakeWorker creates a worker for the auth token generation job\n   23  \tMakeWorker() model.Worker\n   24  \n   25  \t// MakeScheduler creates a scheduler for the auth token generation job\n   26  \tMakeScheduler() ejobs.Scheduler\n   27  }\n   28  "
+   },
+   {
+    "file": "server/channels/app/server.go",
+    "symbol": "MakeWorker",
+    "lines": "1741-1753",
+    "hop": 1,
+    "entry_point": false,
+    "enclosing": "initJobs",
+    "source": " 1741  \n 1742  func (s *Server) initJobs() {\n 1743  \ts.Jobs = jobs.NewJobServer(s.platform, s.Store(), s.GetMetrics(), s.Log(), s.platform.Publish)\n 1744  \n 1745  \tif jobsDataRetentionJobInterface != nil {\n 1746  \t\tbuilder := jobsDataRetentionJobInterface(s)\n 1747  \t\ts.Jobs.RegisterJobType(model.JobTypeDataRetention, builder.MakeWorker(), builder.MakeScheduler())\n 1748  \t}\n 1749  \n 1750  \tif jobsMessageExportJobInterface != nil {\n 1751  \t\tbuilder := jobsMessageExportJobInterface(s)\n 1752  \t\ts.Jobs.RegisterJobType(model.JobTypeMessageExport, builder.MakeWorker(), builder.MakeScheduler())\n 1753  \t}"
+   },
+   {
+    "file": "server/channels/app/server.go",
+    "symbol": "MakeWorker",
+    "lines": "1746-1758",
+    "hop": 1,
+    "entry_point": false,
+    "enclosing": "initJobs",
+    "source": " 1746  \t\tbuilder := jobsDataRetentionJobInterface(s)\n 1747  \t\ts.Jobs.RegisterJobType(model.JobTypeDataRetention, builder.MakeWorker(), builder.MakeScheduler())\n 1748  \t}\n 1749  \n 1750  \tif jobsMessageExportJobInterface != nil {\n 1751  \t\tbuilder := jobsMessageExportJobInterface(s)\n 1752  \t\ts.Jobs.RegisterJobType(model.JobTypeMessageExport, builder.MakeWorker(), builder.MakeScheduler())\n 1753  \t}\n 1754  \n 1755  \tif jobsElasticsearchAggregatorInterface != nil {\n 1756  \t\tbuilder := jobsElasticsearchAggregatorInterface(s)\n 1757  \t\ts.Jobs.RegisterJobType(model.JobTypeElasticsearchPostAggregation, builder.MakeWorker(), builder.MakeScheduler())\n 1758  \t}"
+   },
+   {
+    "file": "server/channels/app/server.go",
+    "symbol": "MakeWorker",
+    "lines": "1756-1768",
+    "hop": 1,
+    "entry_point": false,
+    "enclosing": "initJobs",
+    "source": " 1756  \t\tbuilder := jobsElasticsearchAggregatorInterface(s)\n 1757  \t\ts.Jobs.RegisterJobType(model.JobTypeElasticsearchPostAggregation, builder.MakeWorker(), builder.MakeScheduler())\n 1758  \t}\n 1759  \n 1760  \tif jobsElasticsearchIndexerInterface != nil {\n 1761  \t\tbuilder := jobsElasticsearchIndexerInterface(s)\n 1762  \t\ts.Jobs.RegisterJobType(model.JobTypeElasticsearchPostIndexing, builder.MakeWorker(), nil)\n 1763  \t}\n 1764  \n 1765  \tif jobsLdapSyncInterface != nil {\n 1766  \t\tbuilder := jobsLdapSyncInterface(New(ServerConnector(s.Channels())))\n 1767  \t\ts.Jobs.RegisterJobType(model.JobTypeLdapSync, builder.MakeWorker(), builder.MakeScheduler())\n 1768  \t}"
+   },
+   {
+    "file": "server/channels/app/server.go",
+    "symbol": "MakeWorker",
+    "lines": "1766-1778",
+    "hop": 1,
+    "entry_point": false,
+    "enclosing": "initJobs",
+    "source": " 1766  \t\tbuilder := jobsLdapSyncInterface(New(ServerConnector(s.Channels())))\n 1767  \t\ts.Jobs.RegisterJobType(model.JobTypeLdapSync, builder.MakeWorker(), builder.MakeScheduler())\n 1768  \t}\n 1769  \n 1770  \tif jobsAccessControlSyncJobInterface != nil {\n 1771  \t\tbuilder := jobsAccessControlSyncJobInterface(s)\n 1772  \t\ts.Jobs.RegisterJobType(model.JobTypeAccessControlSync, builder.MakeWorker(), builder.MakeScheduler())\n 1773  \t}\n 1774  \n 1775  \tif jobsAccessControlTeamSyncJobInterface != nil {\n 1776  \t\tbuilder := jobsAccessControlTeamSyncJobInterface(s)\n 1777  \t\ts.Jobs.RegisterJobType(model.JobTypeAccessControlTeamSync, builder.MakeWorker(), builder.MakeScheduler())\n 1778  \t}"
+   }
+  ],
+  "candidates": [
+   {
+    "id": "server/channels/app::TestHuntD_HealthCheckWatcherPollByLicense",
+    "source": "D",
+    "mechanical_verdict": "DIFF",
+    "repro_cmd": "cd server && go test ./channels/app -run '^TestHuntD_HealthCheckWatcherPollByLicense$' -count=1",
+    "examples": [
+     {
+      "i": 0,
+      "input": {
+       "license": "nil",
+       "flag": true
+      },
+      "base": {
+       "flag": true,
+       "health_check_queries": 1,
+       "license_sku": "<nil>",
+       "workers_running": true
+      },
+      "head": {
+       "flag": true,
+       "health_check_queries": 0,
+       "license_sku": "<nil>",
+       "workers_running": true
+      }
+     },
+     {
+      "i": 1,
+      "input": {
+       "license": "nil",
+       "flag": true
+      },
+      "base": {
+       "flag": true,
+       "health_check_queries": 1,
+       "license_sku": "<nil>",
+       "workers_running": true
+      },
+      "head": {
+       "flag": true,
+       "health_check_queries": 0,
+       "license_sku": "<nil>",
+       "workers_running": true
+      }
+     },
+     {
+      "i": 2,
+      "input": {
+       "license": "e10",
+       "flag": true
+      },
+      "base": {
+       "flag": true,
+       "health_check_queries": 1,
+       "license_sku": "E10",
+       "workers_running": true
+      },
+      "head": {
+       "flag": true,
+       "health_check_queries": 0,
+       "license_sku": "E10",
+       "workers_running": true
+      }
+     }
+    ],
+    "test_source": "\n\t\treturn model.NewTestLicenseSKU(model.LicenseShortSkuEnterprise)\n\tcase \"enterprise_cloud\":\n\t\treturn model.NewTestLicenseSKU(model.LicenseShortSkuEnterprise, \"cloud\")\n\tcase \"test_default\":\n\t\treturn model.NewTestLicense()\n\t}\n\treturn nil\n}\n\n// TestHuntD_HealthCheckWatcherPollByLicense records, for a sequence of license / feature-flag\n// states applied at runtime, how many health_check queries one PollAndNotify of the app's\n// health-check watcher makes.\nfunc TestHuntD_HealthCheckWatcherPollByLicense(t *testing.T) {\n\tconst name = \"TestHuntD_HealthCheckWatcherPollByLicense\"\n\n\tth := SetupConfig(t, func(cfg *model.Config) {\n\t\tcfg.FeatureFlags.HealthDashboard = true\n\t})\n\tth.App.Srv().SetLicense(nil)\n\tt.Cleanup(func() { th.App.Srv().SetLicense(nil) })\n\n\t// Keep the background watcher loop from polling during the recording.\n\toldInterval := jobs.DefaultWatcherPollingInterval\n\tjobs.DefaultWatcherPollingInterval = 1 << 30\n\tt.Cleanup(func() { jobs.DefaultWatcherPollingInterval = oldInterval })\n\n\tjobServer := th.Server.Jobs\n\tcounting := &huntDPollStore{Store: jobServer.Store}\n\tjobServer.Store = counting\n\tt.Cleanup(func() { jobServer.Store = counting.Store })\n\n\tch := th.Server.Channels()\n\tch.startHealthCheckWorkersWithRun(func(request.CTX) error { return nil })\n\tt.Cleanup(ch.stopHealthCheckWorkers)\n\tif ch.healthCheckWorkers == nil || ch.healthCheckWorkers.Watcher == nil {\n\t\tt.Fatal(\"health-check workers not started\")\n\t}\n\n\ttype step struct {\n\t\tLicense string `json:\"license\"`\n\t\tFlag    bool   `json:\"flag\"`\n\t}\n\n\t// Hand-picked sequence: unlicensed, below Professional, license added at runtime, removed\n\t// again, flag off with a license, cloud variants.\n\tsteps := []step{\n\t\t{\"nil\", true},\n\t\t{\"nil\", true},\n\t\t{\"e10\", true},\n\t\t{\"e20\", true},\n\t\t{\"professional\", true},\n\t\t{\"nil\", true},\n\t\t{\"enterprise\", true},\n\t\t{\"enterprise\", false},\n\t\t{\"nil\", false},\n\t\t{\"professional_cloud\", true},\n\t\t{\"e20_cloud\", true},\n\t\t{\"enterprise_cloud\", true},\n\t\t{\"test_default\", true},\n\t\t{\"nil\", true},\n\t}\n\n\tunlicensedKinds := []string{\"nil\", \"e10\", \"e20\", \"e20_cloud\"}\n\tallKinds := []string{\"nil\", \"e10\", \"e20\", \"e20_cloud\", \"professional\", \"professional_cloud\", \"enterprise\", \"enterprise_cloud\", \"test_default\"}\n\tr := rand.New(rand.NewSource(40364))\n\tfor i := 0; i < 200; i++ {\n\t\tif i%2 == 0 {\n\t\t\t// Changed branch: flag on, no Professional license.\n\t\t\tsteps = append(steps, step{unlicensedKinds[r.Intn(len(unlicensedKinds))], true})\n\t\t} else {\n\t\t\t// Untouched paths: licensed, or flag off.\n\t\t\tsteps = append(steps, step{allKinds[r.Intn(len(allKinds))], r.Intn(4) != 0})\n\t\t}\n\t}\n\n\tcurrentFlag := true\n\tfor i, s := range steps {\n\t\ts := s\n\t\tif s.Flag != currentFlag {\n\t\t\tflag := s.Flag\n\t\t\tth.App.UpdateConfig(func(cfg *model.Config) { cfg.FeatureFlags.HealthDashboard = flag })\n\t\t\tcurrentFlag = flag\n\t\t}\n\t\tth.App.Srv().SetLicense(huntDLicense(s.License))\n\n\t\thuntDRecord(name, i, s, func() any {\n\t\t\tbefore := counting.polls.Load()\n\t\t\tch.healthCheckWorkers.Watcher.PollAndNotify()\n\t\t\tafter := counting.polls.Load()\n\t\t\t\n[truncated]"
+   }
+  ]
+ }
+}

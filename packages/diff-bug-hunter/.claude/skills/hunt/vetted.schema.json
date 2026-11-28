@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hunt/vetted.schema.json",
+  "title": "vetted.json: one vetting decision per candidate",
+  "description": "Written by the vetting step into the hunt dir. scripts/verdict.py admissibility() decides what reaches the author; the model's decision can downgrade a row but never upgrade it. Enum values are the tokens in scripts/verdicts.py.",
+  "type": "object",
+  "required": [
+    "rows"
+  ],
+  "properties": {
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "source",
+          "decision",
+          "reason",
+          "file_line",
+          "caller",
+          "entry_point",
+          "repro_cmd",
+          "evidence_path",
+          "severity",
+          "fix_check"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Test id (path::TestName) for A/B/D/old rows, or the CodeRabbit claim id (CR1..) for R rows. Looked up in base_<tag>.json, review_verdicts.json, diff_D.json or old_tests.json."
+          },
+          "source": {
+            "enum": [
+              "A",
+              "B",
+              "D",
+              "R",
+              "V",
+              "old",
+              "verify"
+            ],
+            "description": "Mode that produced the candidate. old = existing test on new code. verify = /verify UI or API compare. V and verify are both accepted; neither has a mechanical verdict yet, so such rows are always held."
+          },
+          "decision": {
+            "enum": [
+              "KEEP",
+              "DROP",
+              "HELD"
+            ],
+            "description": "Model decision. KEEP is necessary but not sufficient for the author."
+          },
+          "reason": {
+            "type": "string",
+            "description": "One or two sentences: why the decision was made."
+          },
+          "file_line": {
+            "type": "string",
+            "description": "Root-cause location, path:line."
+          },
+          "caller": {
+            "type": "string",
+            "description": "The real caller (HTTP route, websocket handler, plugin API, UI) that reaches the input, or a note that none does."
+          },
+          "entry_point": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Real entry point the reproduction goes through, e.g. \"api4 DELETE /api/v4/x\" or \"verify plan path\". Null when the finding is not reproduced through an entry point; such a row is always held."
+          },
+          "repro_cmd": {
+            "type": "string",
+            "description": "One shell command that reproduces the failure. Empty means held."
+          },
+          "evidence_path": {
+            "type": "string",
+            "description": "Path to the artifact that backs the decision (run log, base_<tag>.json, diff_D.examples.json, ...)."
+          },
+          "severity": {
+            "enum": [
+              "critical",
+              "major",
+              "minor"
+            ]
+          },
+          "fix_check": {
+            "anyOf": [
+              {
+                "enum": [
+                  "STRONG",
+                  "STRICTLY_WEAK"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Result of the fix-commit check, or null when no fix exists. STRICTLY_WEAK means the test fails on the fix too, so the row is held."
+          },
+          "reason_code": {
+            "enum": [
+              "BUG",
+              "INTENDED",
+              "UNREACHABLE",
+              "WRONG_ASSERTION",
+              "NEEDS_INPUT"
+            ],
+            "description": "Kind of evidence behind the decision. KEEP: BUG. DROP: INTENDED, UNREACHABLE or WRONG_ASSERTION, checked by verdict.check_drop. HELD: NEEDS_INPUT. A DROP without a checkable code is held."
+          },
+          "evidence_quote": {
+            "type": "string",
+            "description": "Verbatim text backing the decision: from the PR description, diff or pr_tests_diff (INTENDED), the diff or a caller (UNREACHABLE), or the candidate's test source (WRONG_ASSERTION)."
+          }
+        }
+      }
+    }
+  }
+}

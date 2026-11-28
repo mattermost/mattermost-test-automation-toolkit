@@ -1,0 +1,524 @@
+{
+ "pr": 40256,
+ "repo": "mattermost/mattermost",
+ "note": "DROP verified by hand: isValidWriteGrant makes the forged scope unreachable through CreateScopedSession. The D rows are not labelled.",
+ "labels": {
+  "server/channels/app::TestHuntB_WriteDeniedWhenScopeCannotReadChannel": "DROP"
+ },
+ "user": {
+  "pr": {
+   "title": "Let scoped sessions write reactions and bookmarks on listed channels",
+   "description": "<!-- CURSOR_AGENT_PR_BODY_BEGIN -->\n#### Summary\nStacked on #39368 (which stacks on #39367). Review those first; this diff only adds the write grant.\n\nScoped sessions from #39367 are read-only. This adds a small, generic write grant so a plugin can let a scoped bot session react to posts and manage bookmarks in a short list of channels, while keeping every other write denied. Nothing here is specific to any plugin feature.\n\n**Model (`server/public/model`)**\n- `SessionScope.WritePermissions []string` (`write_permissions`): a subset of the new `model.ScopeWritePermissions`: `add_reaction`, `add_bookmark_{public,private}_channel`, `edit_bookmark_{public,private}_channel`, `order_bookmark_{public,private}_channel`.\n- `SessionScopeResources.WriteChannelIDs []string` (`write_channel_ids`): at most `model.SessionScopeMaxWriteChannelIDs` (5), each also in `ChannelIDs` (so never a DM or GM, which `CreateScopedSession` already rejects).\n- `IsValid` requires write permissions and write channels to come together, and the scope to hold `read_channel_content`. Write permissions in `Permissions` are still rejected.\n- Helpers: `IsSessionScopeWritePermission`, `HasWritePermission`, `ListsWriteChannel`, `GrantsWrites`.\n- Both fields are `omitempty`, so read-only scopes serialize exactly as before.\n\n**Enforcement (`EvaluateSessionScope`)**\n- A write permission is allowed only if all of these hold:\n  - the scope grants it\n  - the target resolves to a channel in `WriteChannelIDs`\n  - the scope can read that channel (not archived, not policy-enforced, not a DM or GM)\n  - the bot holds the permission there without the scope (normal RBAC plus channel access enforcement)\n- So the grant only narrows the bot's own permissions and never adds to any. Team-wide and system-wide checks for these permissions are always denied.\n- Read checks now also require the permission to be in `ScopeReadPermissions`. That way a tampered stored scope that lists `create_post` in `Permissions` fails closed.\n\n**Routes**\n- New `scopedSessionWrite` handler flag. It admits a scoped session only when its scope grants writes, and the handler's own permission checks then decide each write.\n- Flagged write routes: `POST /reactions`, `POST /channels/{id}/bookmarks`, `PATCH /channels/{id}/bookmarks/{id}`, and `POST /channels/{id}/bookmarks/{id}/sort_order`.\n- `GET /channels/{id}/bookmarks` gets the read flag.\n- `POST /posts`, deleting reactions or bookmarks, and every other write route stay denied.\n- On write routes, a scoped session gets the scope error for every refusal. For example, writing to an archived channel no longer returns a distinct \"archived\" error that would reveal the channel exists.\n\n**Exact channel lists:** a scope with only `ChannelIDs` (no `OpenTeamPublicChannels` and no `PublicChannelTeamIDs`) already reads exactly those channels. The new tests pin this down for an open team: other public channels, member channels, the team channel list and post search all stay limited to the listed c\n[truncated]"
+  },
+  "diff_production_code": "diff --git a/server/public/model/session_scope.go b/server/public/model/session_scope.go\nindex a491286fc7..70764112b3 100644\n--- a/server/public/model/session_scope.go\n+++ b/server/public/model/session_scope.go\n@@ -31,12 +31,37 @@ var ScopeReadPermissions = []string{\n \t\"view_team\",\n }\n \n+const SessionScopeMaxWriteChannelIDs = 5\n+\n+// ScopeWritePermissions are the only permissions a session scope may grant as\n+// writes. Literals for the same reason as ScopeReadPermissions.\n+var ScopeWritePermissions = []string{\n+\t\"add_reaction\",\n+\t\"add_bookmark_public_channel\",\n+\t\"add_bookmark_private_channel\",\n+\t\"edit_bookmark_public_channel\",\n+\t\"edit_bookmark_private_channel\",\n+\t\"order_bookmark_public_channel\",\n+\t\"order_bookmark_private_channel\",\n+}\n+\n+// IsSessionScopeWritePermission reports whether permissionID is one a scope can\n+// only grant through WritePermissions.\n+func IsSessionScopeWritePermission(permissionID string) bool {\n+\treturn slices.Contains(ScopeWritePermissions, permissionID)\n+}\n+\n // SessionScope restricts a session to a set of read permissions over a set of\n // channels. For a scoped session, read access is exactly the scope: channel and\n // team memberships neither add to it nor are required for it.\n+//\n+// A scope may also grant a few writes (WritePermissions) on a short list of its\n+// channels (Resources.WriteChannelIDs). Unlike reads, writes also need the user\n+// to hold the permission on the channel: the grant only narrows them.\n type SessionScope struct {\n-\tPermissions []string              `json:\"permissions\"`\n-\tResources   SessionScopeResources `json:\"resources\"`\n+\tPermissions      []string              `json:\"permissions\"`\n+\tWritePermissions []string              `json:\"write_permissions,omitempty\"`\n+\tResources        SessionScopeResources `json:\"resources\"`\n \n \t// OnBehalfOfUserID records the user who triggered the session, for audit only.\n \t// It grants nothing.\n@@ -49,6 +74,10 @@ type SessionScope struct {\n type SessionScopeResources struct {\n \tChannelIDs []string `json:\"channel_ids,omitempty\"`\n \n+\t// WriteChannelIDs are the channels WritePermissions apply to. Each must also\n+\t// be in ChannelIDs.\n+\tWriteChannelIDs []string `json:\"write_channel_ids,omitempty\"`\n+\n \t// OpenTeamPublicChannels adds every public channel on a team that any user\n \t// can join, see Team.IsOpenToAllUsers.\n \tOpenTeamPublicChannels bool `json:\"open_team_public_channels,omitempty\"`\n@@ -78,7 +107,7 @@ func (l SessionScopeLimits) openTeamGrantOff() bool {\n \n // WithLimits returns the resources without the grants limits turns off.\n func (r SessionScopeResources) WithLimits(limits SessionScopeLimits) SessionScopeResources {\n-\teffective := SessionScopeResources{ChannelIDs: slices.Clone(r.ChannelIDs)}\n+\teffective := SessionScopeResources{ChannelIDs: slices.Clone(r.ChannelIDs), WriteChannelIDs: slices.Clone(r.WriteChannelIDs)}\n \tif !limits.openTeamGrantOff() {\n \t\teffective.OpenTeamPublicChannels = r.OpenTeamPublicChannels\n \t}\n@@ -116,6 +145,10 @@ func (s *SessionScope) IsValid() *AppError {\n \t\t}\n \t}\n \n+\tif appErr := s.isValidWriteGrant(); appErr != nil {\n+\t\treturn appErr\n+\t}\n+\n \tif s.OnBehalfOfUserID != \"\" && !IsValidId(s.OnBehalfOfUserID) {\n \t\treturn NewAppError(\"SessionScope.IsValid\", \"model.session_scope.is_valid.on_behalf_of_user_id.app_error\", nil, \"\", http.StatusBadRequest)\n \t}\n@@ -127,14 +160,63 @@ func (s *SessionScope) IsValid() *AppError {\n \treturn nil\n }\n \n+// isValidWriteGrant requires write permissions and write channels to come\n+// together, the channels to be few, readable and listed in ChannelIDs.\n+func (s *SessionScope) isValidWriteGrant() *AppError {\n+\tif len(s.WritePermissions) == 0 && len(s.Resources.WriteChannelIDs) == 0 {\n+\t\treturn nil\n+\t}\n+\tif len(s.WritePermissions) == 0 {\n+\t\treturn NewAppError(\"SessionScope.IsValid\", \"model.session_scope.is_valid.write_permissions.app_error\", nil, \"write channels without write permissions\", http.StatusBadRequest)\n+\t}\n+\tfor _, permission := range s.WritePermissions {\n+\t\tif !IsSessionScopeWritePermission(permission) {\n+\t\t\treturn NewAppError(\"SessionScope.IsValid\", \"model.session_scope.is_valid.write_permissions.app_error\", nil, \"permission=\"+permission, http.StatusBadRequest)\n+\t\t}\n+\t}\n+\tif !s.HasPermission(PermissionReadChannelContent.Id) {\n+\t\treturn NewAppError(\"SessionScope.IsValid\", \"model.session_scope.is_valid.write_permissions.app_error\", nil, \"write permissions without read_channel_content\", http.StatusBadRequest)\n+\t}\n+\n+\twriteChannelsErr := func(details string) *AppError {\n+\t\treturn NewAppError(\"SessionScope.IsValid\", \"model.session_scope.is_valid.write_channel_ids.app_error\", map[string]any{\"Max\": SessionScopeMaxWriteChannelIDs}, details, http.StatusBadRequest)\n+\t}\n+\tif len(s.Resources.WriteChannelIDs) == 0 {\n+\t\treturn writeChannelsErr(\"write permissions without write channels\")\n+\t}\n+\tif len(s.Resources.WriteChannelIDs) > SessionScopeMaxWriteChannelIDs {\n+\t\treturn writeChannelsErr(\"\")\n+\t}\n+\tfor _, channelID := range s.Resources.WriteChannelIDs {\n+\t\tif !IsValidId(channelID) || !s.ListsChannel(channelID) {\n+\t\t\treturn writeChannelsErr(\"channel_id=\" + channelID)\n+\t\t}\n+\t}\n+\treturn nil\n+}\n+\n+// HasPermission reports whether the scope holds a read permission.\n func (s *SessionScope) HasPermission(permissionID string) bool {\n \treturn slices.Contains(s.Permissions, permissionID)\n }\n \n+func (s *SessionScope) HasWritePermission(permissionID string) bool {\n+\treturn slices.Contains(s.WritePermissions, permissionID)\n+}\n+\n+// GrantsWrites reports whether the scope grants any write at all.\n+func (s *SessionScope) GrantsWrites() bool {\n+\treturn s != nil && len(s.WritePermissions) > 0 && len(s.Resources.WriteChannelIDs) > 0\n+}\n+\n func (s *SessionScope) ListsChannel(channelID string) bool {\n \treturn slices.Contains(s.Resources.ChannelIDs, channelID)\n }\n \n+func (s *SessionScope) ListsWriteChannel(channelID string) bool {\n+\treturn slices.Contains(s.Resources.WriteChannelIDs, channelID)\n+}\n+\n // IsScoped reports whether the session carries a scope, without parsing it.\n func (s *Session) IsScoped() bool {\n \t_, ok := s.Props[SessionPropScope]\ndiff --git a/server/channels/app/session_scope.go b/server/channels/app/session_scope.go\nindex 61227ebb20..cc4e52b792 100644\n--- a/server/channels/app/session_scope.go\n+++ b/server/channels/app/session_scope.go\n@@ -33,7 +33,8 @@ type SessionScopeTarget struct {\n // on a channel in the scope (see model.SessionScopeAllowsChannel), or for\n // view_team/list_team_channels, on a team a public-channel grant covers (see\n // model.SessionScopeGrantsTeamPublicChannels) or holding a channel the scope\n-// lists by ID. Everything else, including every system-wide check, is denied.\n+// lists by ID. Write permissions follow scopeAllowsWrite. Everything else,\n+// including every system-wide check, is denied.\n func (a *App) EvaluateSessionScope(rctx request.CTX, session *model.Session, permissionID string, target SessionScopeTarget) (scoped bool, allowed bool) {\n \tif session == nil {\n \t\treturn false, false\n@@ -42,25 +43,16 @@ func (a *App) EvaluateSessionScope(rctx request.CTX, session *model.Session, per\n \tif !scoped {\n \t\treturn false, false\n \t}\n-\tif !scope.HasPermission(permissionID) {\n+\tif model.IsSessionScopeWritePermission(permissionID) {\n+\t\treturn true, a.scopeAllowsWrite(rctx, session, scope, permissionID, target)\n+\t}\n+\tif !scope.HasPermission(permissionID) || !slices.Contains(model.ScopeReadPermissions, permissionID) {\n \t\treturn true, false\n \t}\n \n \tswitch {\n-\tcase target.Channel != nil:\n-\t\treturn true, a.ScopeAllowsChannel(rctx, scope, target.Channel)\n-\tcase target.ChannelID != \"\":\n-\t\tchannel, appErr := a.GetChannel(rctx, target.ChannelID)\n-\t\tif appErr != nil {\n-\t\t\treturn true, false\n-\t\t}\n-\t\treturn true, a.ScopeAllowsChannel(rctx, scope, channel)\n-\tcase target.PostID != \"\":\n-\t\tchannel, err := a.Srv().Store().Channel().GetForPost(target.PostID)\n-\t\tif err != nil {\n-\t\t\treturn true, false\n-\t\t}\n-\t\treturn true, a.ScopeAllowsChannel(rctx, scope, channel)\n+\tcase target.Channel != nil, target.ChannelID != \"\", target.PostID != \"\":\n+\t\treturn true, a.ScopeAllowsChannel(rctx, scope, a.sessionScopeTargetChannel(rctx, target))\n \tcase target.TeamID != \"\":\n \t\tif permissionID != model.PermissionViewTeam.Id && permissionID != model.PermissionListTeamChannels.Id {\n \t\t\treturn true, false\n@@ -78,6 +70,54 @@ func (a *App) EvaluateSessionScope(rctx request.CTX, session *model.Session, per\n \treturn true, false\n }\n \n+// sessionScopeTargetChannel returns the channel a channel or post target is\n+// about, or nil if there is none or it can't be loaded.\n+func (a *App) sessionScopeTargetChannel(rctx request.CTX, target SessionScopeTarget) *model.Channel {\n+\tswitch {\n+\tcase target.Channel != nil:\n+\t\treturn target.Channel\n+\tcase target.ChannelID != \"\":\n+\t\tchannel, appErr := a.GetChannel(rctx, target.ChannelID)\n+\t\tif appErr != nil {\n+\t\t\treturn nil\n+\t\t}\n+\t\treturn channel\n+\tcase target.PostID != \"\":\n+\t\tchannel, err := a.Srv().Store().Channel().GetForPost(target.PostID)\n+\t\tif err != nil {\n+\t\t\treturn nil\n+\t\t}\n+\t\treturn channel\n+\t}\n+\treturn nil\n+}\n+\n+// scopeAllowsWrite allows a write permission only if the scope grants it, the\n+// target is a channel the scope lists for writes and can read, and the\n+// session's user holds the permission on that channel without the scope. The\n+// write grant narrows the user's own permissions and never adds to them.\n+func (a *App) scopeAllowsWrite(rctx request.CTX, session *model.Session, scope *model.SessionScope, permissionID string, target SessionScopeTarget) bool {\n+\tif !scope.HasWritePermission(permissionID) {\n+\t\treturn false\n+\t}\n+\tchannel := a.sessionScopeTargetChannel(rctx, target)\n+\tif channel == nil || !scope.ListsWriteChannel(channel.Id) || !a.ScopeAllowsChannel(rctx, scope, channel) {\n+\t\treturn false\n+\t}\n+\n+\tunscoped := session.DeepCopy()\n+\tdelete(unscoped.Props, model.SessionPropScope)\n+\tunscoped.Local = false\n+\tpermission := &model.Permission{Id: permissionID}\n+\tif ok, _ := a.sessionHasPermissionToChannelRBAC(rctx, *unscoped, channel, permission); !ok {\n+\t\treturn false\n+\t}\n+\tif isChannelWritePermission(permission) {\n+\t\treturn a.EnforceChannelWriteAccess(rctx, session.UserId, channel)\n+\t}\n+\treturn a.EnforceChannelManagementAccess(rctx, session.UserId, channel)\n+}\n+\n // sessionScopeLimits returns the server settings that turn a scope's\n // public-channel grants off. Failing to read the system user role turns the\n // open-team grant off.\n@@ -214,9 +254,9 @@ func (a *App) scopedViewUsersRestrictions(rctx request.CTX, session *model.Sessi\n \treturn restrictions\n }\n \n-// CreateScopedSession creates a session for userID that can only read what scope\n-// allows, on behalf of the plugin pluginID. It is the only way to create a\n-// scoped session.\n+// CreateScopedSession creates a session for userID that can only read, and\n+// write, what scope allows, on behalf of the plugin pluginID. It is the only way\n+// to create a scoped session.\n func (a *App) CreateScopedSession(rctx request.CTX, pluginID, userID string, scope *model.SessionScope, expiresAt int64) (session *model.Session, err error) {\n \tauditRec := a.MakeAuditRecord(rctx, model.AuditEventCreateScopedSession, model.AuditStatusFail)\n \tdefer func() {\n@@ -237,6 +277,8 @@ func (a *App) CreateScopedSession(rctx request.CTX, pluginID, userID string, sco\n \tmodel.AddEventParameterToAuditRec(auditRec, \"open_team_public_channels\", scopeCopy.Resources.OpenTeamPublicChannels)\n \tmodel.AddEventParameterToAuditRec(auditRec, \"public_channel_team_ids\", scopeCopy.Resources.PublicChannelTeamIDs)\n \tmodel.AddEventParameterToAuditRec(auditRec, \"permissions\", scopeCopy.Permissions)\n+\tmodel.AddEventParameterToAuditRec(auditRec, \"write_permissions\", scopeCopy.WritePermissions)\n+\tmodel.AddEventParameterToAuditRec(auditRec, \"write_channel_ids\", scopeCopy.Resources.WriteChannelIDs)\n \n \tif validErr := scopeCopy.IsValid(); validErr != nil {\n \t\treturn nil, validErr\ndiff --git a/server/channels/web/handlers.go b/server/channels/web/handlers.go\nindex 7cd35278f9..5094ebca84 100644\n--- a/serv\n[truncated]",
+  "callers": [
+   {
+    "file": "server/channels/api4/license.go",
+    "symbol": "Create",
+    "lines": "301-313",
+    "hop": 1,
+    "entry_point": true,
+    "enclosing": "getLicenseLoadMetric",
+    "source": "  301  \t\t\treturn\n  302  \t\t}\n  303  \n  304  \t\tloadMetric = int(math.Round((float64(monthlyActiveUsers) / float64(licenseUsers) * float64(1000))))\n  305  \t}\n  306  \n  307  \t// Create response object\n  308  \tdata := map[string]int{\n  309  \t\t\"load\": loadMetric,\n  310  \t}\n  311  \n  312  \tw.Header().Set(\"Content-Type\", \"application/json\")\n  313  \tif err := json.NewEncoder(w).Encode(data); err != nil {"
+   },
+   {
+    "file": "server/channels/app/plugin_api.go",
+    "symbol": "CreateScopedSession",
+    "lines": "364-376",
+    "hop": 1,
+    "entry_point": true,
+    "enclosing": "CreateScopedSession",
+    "source": "  364  }\n  365  \n  366  func (api *PluginAPI) CreateSession(session *model.Session) (*model.Session, *model.AppError) {\n  367  \treturn api.app.CreateSession(api.ctx, session)\n  368  }\n  369  \n  370  func (api *PluginAPI) CreateScopedSession(userID string, scope *model.SessionScope, expiresAt int64) (*model.Session, *model.AppError) {\n  371  \tsession, err := api.app.CreateScopedSession(api.ctx, api.id, userID, scope, expiresAt)\n  372  \tif err != nil {\n  373  \t\treturn nil, model.AsAppError(err)\n  374  \t}\n  375  \treturn session, nil\n  376  }"
+   },
+   {
+    "file": "server/channels/api4/access_control.go",
+    "symbol": "IsValid",
+    "lines": "88-100",
+    "hop": 1,
+    "entry_point": true,
+    "enclosing": "searchAccessControlDecisionActions",
+    "permission_checks": [
+     "server/channels/api4/access_control.go:102: if hasPermission, _ := c.App.SessionHasPermissionToChannelRBACOnly(c.AppContext, *c.AppContext.Session(), req.Resource.ID, model.PermissionReadChannel); !hasPermission {"
+    ],
+    "source": "   88  func searchAccessControlDecisionActions(c *Context, w http.ResponseWriter, r *http.Request) {\n   89  \tvar req model.ActionSearchRequest\n   90  \tif jsonErr := json.NewDecoder(r.Body).Decode(&req); jsonErr != nil {\n   91  \t\tc.SetInvalidParamWithErr(\"action_search\", jsonErr)\n   92  \t\treturn\n   93  \t}\n   94  \tif appErr := req.IsValid(); appErr != nil {\n   95  \t\tc.Err = appErr\n   96  \t\treturn\n   97  \t}\n   98  \t// Fail closed on resource types we can't authorize: only channel decisions are exposed\n   99  \t// today, so anything else is rejected rather than silently skipping the access check.\n  100  \tswitch req.Resource.Type {"
+   },
+   {
+    "file": "server/channels/api4/compression.go",
+    "symbol": "ServeHTTP",
+    "lines": "34-46",
+    "hop": 1,
+    "entry_point": true,
+    "enclosing": "compressionHandler",
+    "source": "   34  \t\t\tbbw := newBrotliResponseWriter(w)\n   35  \t\t\tdefer func() {\n   36  \t\t\t\tif err := bbw.Close(); err != nil {\n   37  \t\t\t\t\tmlog.Warn(\"Failed to close brotli response writer\", mlog.Err(err))\n   38  \t\t\t\t}\n   39  \t\t\t}()\n   40  \t\t\th.ServeHTTP(bbw, r)\n   41  \t\t\treturn\n   42  \t\t}\n   43  \t\tgzipWrapped.ServeHTTP(w, r)\n   44  \t})\n   45  }\n   46  "
+   },
+   {
+    "file": "server/channels/api4/shared_channel_test_utils.go",
+    "symbol": "Create",
+    "lines": "96-108",
+    "hop": 1,
+    "entry_point": true,
+    "enclosing": "HandleRequest",
+    "source": "   96  \t\t\t\t\tif len(syncMsg.Acknowledgements) > 0 && h.OnAcknowledgementSync != nil {\n   97  \t\t\t\t\t\tfor _, ack := range syncMsg.Acknowledgements {\n   98  \t\t\t\t\t\t\th.OnAcknowledgementSync(ack)\n   99  \t\t\t\t\t\t}\n  100  \t\t\t\t\t}\n  101  \n  102  \t\t\t\t\t// Create success response\n  103  \t\t\t\t\tsyncResp := &model.SyncResponse{\n  104  \t\t\t\t\t\tUsersSyncd: make([]string, 0),\n  105  \t\t\t\t\t}\n  106  \t\t\t\t\t_ = response.SetPayload(syncResp)\n  107  \t\t\t\t}\n  108  \t\t\t}"
+   },
+   {
+    "file": "server/public/plugin/api.go",
+    "symbol": "CreateScopedSession",
+    "lines": "1977-1989",
+    "hop": 1,
+    "entry_point": true,
+    "source": " 1977  \t// (table) AST.\n 1978  \t//\n 1979  \t// @tag AccessControl\n 1980  \t// Minimum server version: 11.10\n 1981  \tGetAccessControlVisualAST(actingUserID, resourceType, expression string) (*model.VisualExpression, *model.AppError)\n 1982  \n 1983  \t// CreateScopedSession creates a session for userID that can only read what\n 1984  \t// scope allows, expiring at expiresAt (unix milliseconds, at most 24 hours\n 1985  \t// ahead; ExtendSessionExpiry can't move it past 24 hours after the session\n 1986  \t// was created). scope.Permissions must be a non-empty subset of\n 1987  \t// model.ScopeReadPermissions, and scope.Resources.ChannelIDs must not name\n 1988  \t// direct or group channels. The server sets scope.CreatedByPluginID to the\n 1989  \t// calling plugin. Read access is exactly the scope: the user\n[truncated]"
+   },
+   {
+    "file": "server/channels/api4/cloud.go",
+    "symbol": "IsValid",
+    "lines": "166-178",
+    "hop": 1,
+    "entry_point": true,
+    "enclosing": "validateBusinessEmail",
+    "source": "  166  \t\treturn\n  167  \t}\n  168  \n  169  \terr = c.App.Cloud().ValidateBusinessEmail(user.Id, emailToValidate.Email)\n  170  \tif err != nil {\n  171  \t\tc.Err = model.NewAppError(\"Api4.validateBusinessEmail\", \"api.cloud.request_error\", nil, \"\", http.StatusForbidden).Wrap(err)\n  172  \t\temailResp := model.ValidateBusinessEmailResponse{IsValid: false}\n  173  \t\tif err := json.NewEncoder(w).Encode(emailResp); err != nil {\n  174  \t\t\tc.Logger.Warn(\"Error while writing response\", mlog.Err(err))\n  175  \t\t}\n  176  \t\treturn\n  177  \t}\n  178  \temailResp := model.ValidateBusinessEmailResponse{IsValid: true}"
+   },
+   {
+    "file": "server/channels/web/static.go",
+    "symbol": "ServeHTTP",
+    "lines": "154-166",
+    "hop": 1,
+    "entry_point": true,
+    "enclosing": "staticFilesHandler",
+    "source": "  154  \n  155  \t\tif strings.HasSuffix(r.URL.Path, \"/\") {\n  156  \t\t\thttp.NotFound(w, r)\n  157  \t\t\treturn\n  158  \t\t}\n  159  \n  160  \t\thandler.ServeHTTP(w, r)\n  161  \t})\n  162  }\n  163  \n  164  type notFoundNoCacheResponseWriter struct {\n  165  \thttp.ResponseWriter\n  166  }"
+   }
+  ],
+  "candidates": [
+   {
+    "id": "server/channels/app::TestHuntB_WriteDeniedWhenScopeCannotReadChannel",
+    "source": "B",
+    "mechanical_verdict": "NEW_API",
+    "repro_cmd": "cd server && go test ./channels/app -run '^TestHuntB_WriteDeniedWhenScopeCannotReadChannel$' -count=1",
+    "head_failure": "/hunt_huntb_test.go:42\n Error: Should be false\n Test: TestHuntB_WriteDeniedWhenScopeCannotReadChannel/no_read_permissions\n Messages: scope permissions=[] write_permissions=[add_reaction add_bookmark_public_channel add_bookmark_private_channel edit_bookmark_public_channel edit_bookmark_private_channel order_bookmark_public_channel order_bookmark_private_channel] write_channels=[znxtf5fd7bys9xafezubcqfwxc q14auxhbopbu9f7i6iru5ikg7w rdhzhwhobidzmyhs4qu6f1d9pe]: edit_bookmark_private_channel allowed on channel q14auxhbopbu9f7i6iru5ikg7w the scope cannot read\n hunt_huntb_test.go:42: \n Error Trace: <wt>/server/channels/app/hunt_huntb_test.go:42\n Error: Should be false\n Test: TestHuntB_WriteDeniedWhenScopeCannotReadChannel/no_read_permissions\n Messages: scope permissions=[] write_permissions=[add_reaction add_bookmark_public_channel add_bookmark_private_channel edit_bookmark_public_channel edit_bookmark_private_channel order_bookmark_public_channel order_bookmark_private_channel] write_channels=[znxtf5fd7bys9xafezubcqfwxc q14auxhbopbu9f7i6iru5ikg7w rdhzhwhobidzmyhs4qu6f1d9pe]: order_bookmark_private_channel allowed on channel q14auxhbopbu9f7i6iru5ikg7w the scope cannot read\n hunt_huntb_te",
+    "diagnostic_v_results": {
+     "run_V": {},
+     "base_V": {}
+    },
+    "test_source": "\n// See LICENSE.txt for license information.\n\npackage app\n\nimport (\n\t\"testing\"\n\n\t\"github.com/stretchr/testify/assert\"\n\t\"github.com/stretchr/testify/require\"\n\n\t\"github.com/mattermost/mattermost/server/public/model\"\n)\n\nfunc TestHuntB_WriteDeniedWhenScopeCannotReadChannel(t *testing.T) {\n\tmainHelper.Parallel(t)\n\tth := Setup(t).InitBasic(t)\n\tf := newWriteScopeFixture(t, th)\n\n\tfor name, permissions := range map[string][]string{\n\t\t\"no read permissions\": nil,\n\t\t\"view_team only\":      {model.PermissionViewTeam.Id},\n\t} {\n\t\tt.Run(name, func(t *testing.T) {\n\t\t\tscope := f.writeScope()\n\t\t\tscope.Permissions = permissions\n\t\t\tforged := forgeScoped(t, f.bot.Id, scope)\n\t\t\tforged.Roles = f.bot.Roles\n\t\t\trctx := th.Context.WithSession(forged)\n\n\t\t\tcanRead, _ := th.App.SessionHasPermissionToChannel(rctx, *forged, f.writePrivate.Id, model.PermissionReadChannelContent)\n\t\t\trequire.False(t, canRead, \"precondition: scope permissions=%v must not read channel %s\", permissions, f.writePrivate.Id)\n\n\t\t\tfor _, permission := range []*model.Permission{\n\t\t\t\tmodel.PermissionAddReaction,\n\t\t\t\tmodel.PermissionAddBookmarkPrivateChannel,\n\t\t\t\tmodel.PermissionEditBookmarkPrivateChannel,\n\t\t\t\tmodel.PermissionOrderBookmarkPrivateChannel,\n\t\t\t} {\n\t\t\t\tscoped, allowed := th.App.EvaluateSessionScope(rctx, forged, permission.Id, SessionScopeTarget{ChannelID: f.writePrivate.Id})\n\t\t\t\tassert.True(t, scoped)\n\t\t\t\tassert.False(t, allowed, \"scope permissions=%v write_permissions=%v write_channels=%v: %s allowed on channel %s the scope cannot read\", permissions, scope.WritePermissions, scope.Resources.WriteChannelIDs, permission.Id, f.writePrivate.Id)\n\t\t\t}\n\t\t})\n\t}\n}\n\nfunc TestHuntB_WriteDeniedOnPolicyEnforcedWriteChannel(t *testing.T) {\n\tmainHelper.Parallel(t)\n\tth := Setup(t).InitBasic(t)\n\tf := newWriteScopeFixture(t, th)\n\tsession := mintScoped(t, th, f.bot.Id, f.writeScope())\n\trctx := th.Context.WithSession(session)\n\n\t_, allowed := th.App.EvaluateSessionScope(rctx, session, model.PermissionAddReaction.Id, SessionScopeTarget{Channel: f.writePrivate})\n\trequire.True(t, allowed, \"control: add_reaction on listed write channel %s\", f.writePrivate.Id)\n\n\tpolicy := *f.writePrivate\n\tpolicy.PolicyEnforced = true\n\tfor _, permissionID := range []string{\n\t\tmodel.PermissionAddReaction.Id,\n\t\tmodel.PermissionAddBookmarkPrivateChannel.Id,\n\t\tmodel.PermissionEditBookmarkPrivateChannel.Id,\n\t\tmodel.PermissionOrderBookmarkPrivateChannel.Id,\n\t} {\n\t\tscoped, allowed := th.App.EvaluateSessionScope(rctx, session, permissionID, SessionScopeTarget{Channel: &policy})\n\t\tassert.True(t, scoped)\n\t\tassert.False(t, allowed, \"%s allowed on policy-enforced write channel %s\", permissionID, policy.Id)\n\t}\n}\n\nfunc TestHuntB_WriteDeniedForUnresolvableOrWideTargets(t *testing.T) {\n\tmainHelper.Parallel(t)\n\tth := Setup(t).InitBasic(t)\n\tf := newWriteScopeFixture(t, th)\n\tsession := mintScoped(t, th, f.bot.Id, f.writeScope())\n\trctx := th.Context.WithSession(session)\n\n\tfor name, target := range map[string]SessionScopeTarget{\n\t\t\"missing channel\": {ChannelID\n[truncated]"
+   },
+   {
+    "id": "server/channels/app::TestHuntD_EvaluateSessionScope",
+    "source": "D",
+    "mechanical_verdict": "DIFF",
+    "repro_cmd": "cd server && go test ./channels/app -run '^TestHuntD_EvaluateSessionScope$' -count=1",
+    "examples": [
+     {
+      "i": 230,
+      "input": {
+       "kind": "channel",
+       "permission": "add_reaction",
+       "raw": "raw_write_in_read_list",
+       "target": "basic"
+      },
+      "base": {
+       "allowed": true,
+       "scoped": true
+      },
+      "head": {
+       "allowed": false,
+       "scoped": true
+      }
+     },
+     {
+      "i": 164,
+      "input": {
+       "channels": [
+        "archived",
+        "missing",
+        "public"
+       ],
+       "kind": "channel",
+       "local": false,
+       "open_team": false,
+       "permission": "edit_bookmark_public_channel",
+       "read_perms": [
+        "view_team",
+        "read_channel_content"
+       ],
+       "target": "public",
+       "write_channels": [
+        "public"
+       ],
+       "write_perms": [
+        "add_bookmark_private_channel",
+        "edit_bookmark_public_channel",
+        "order_bookmark_public_channel",
+        "create_post"
+       ]
+      },
+      "base": {
+       "allowed": false,
+       "scoped": true
+      },
+      "head": {
+       "allowed": true,
+       "scoped": true
+      }
+     },
+     {
+      "i": 32,
+      "input": {
+       "channels": [
+        "basic",
+        "public"
+       ],
+       "kind": "channel",
+       "local": false,
+       "open_team": false,
+       "permission": "add_bookmark_public_channel",
+       "read_perms": [
+        "view_team",
+        "read_channel_content",
+        "edit_bookmark_private_channel"
+       ],
+       "target": "basic",
+       "write_channels": [
+        "basic"
+       ],
+       "write_perms": [
+        "add_bookmark_public_channel",
+        "edit_bookmark_private_channel",
+        "order_bookmark_private_channel"
+       ]
+      },
+      "base": {
+       "allowed": false,
+       "scoped": true
+      },
+      "head": {
+       "allowed": true,
+       "scoped": true
+      }
+     }
+    ],
+    "test_source": "\nvar huntDAppWritePerms = []string{\"add_reaction\", \"add_bookmark_public_channel\", \"add_bookmark_private_channel\", \"edit_bookmark_public_channel\", \"edit_bookmark_private_channel\", \"order_bookmark_public_channel\", \"order_bookmark_private_channel\"}\n\nvar huntDAppOtherPerms = []string{\"create_post\", \"remove_reaction\", \"delete_bookmark_public_channel\", \"upload_file\", \"manage_public_channel_properties\"}\n\nfunc TestHuntD_EvaluateSessionScope(t *testing.T) {\n\tth := Setup(t).InitBasic(t)\n\n\tpublicCh := th.CreateChannel(t, th.BasicTeam)\n\tprivateCh := th.CreatePrivateChannel(t, th.BasicTeam)\n\tarchivedCh := th.CreatePrivateChannel(t, th.BasicTeam)\n\tif appErr := th.App.DeleteChannel(th.Context, archivedCh, th.BasicUser.Id); appErr != nil {\n\t\tt.Fatalf(\"setup: delete channel: %v\", appErr)\n\t}\n\n\tids := map[string]string{\n\t\t\"archived\": archivedCh.Id,\n\t\t\"basic\":    th.BasicChannel.Id,\n\t\t\"missing\":  \"huntdmissingchannel0000000\",\n\t\t\"private\":  privateCh.Id,\n\t\t\"public\":   publicCh.Id,\n\t}\n\tlabels := []string{\"archived\", \"basic\", \"missing\", \"private\", \"public\"}\n\tchannels := map[string]*model.Channel{}\n\tfor _, label := range labels {\n\t\tif label == \"missing\" {\n\t\t\tcontinue\n\t\t}\n\t\tch, appErr := th.App.GetChannel(th.Context, ids[label])\n\t\tif appErr != nil {\n\t\t\tt.Fatalf(\"setup: get channel %s: %v\", label, appErr)\n\t\t}\n\t\tchannels[label] = ch\n\t}\n\ttoIDs := func(ls []string) []string {\n\t\tout := []string{}\n\t\tfor _, l := range ls {\n\t\t\tout = append(out, ids[l])\n\t\t}\n\t\treturn out\n\t}\n\n\tallPerms := append(append(append([]string{}, huntDAppWritePerms...), huntDAppReadPerms...), huntDAppOtherPerms...)\n\tkinds := []string{\"channel\", \"channel_id\", \"team\", \"none\"}\n\n\trng := rand.New(rand.NewSource(40256))\n\tpick := func(from []string, p int) []string {\n\t\tout := []string{}\n\t\tfor _, v := range from {\n\t\t\tif rng.Intn(p) == 0 {\n\t\t\t\tout = append(out, v)\n\t\t\t}\n\t\t}\n\t\treturn out\n\t}\n\n\ttargetFor := func(kind, label string) SessionScopeTarget {\n\t\tswitch kind {\n\t\tcase \"channel\":\n\t\t\tif ch, ok := channels[label]; ok {\n\t\t\t\treturn SessionScopeTarget{Channel: ch}\n\t\t\t}\n\t\t\treturn SessionScopeTarget{ChannelID: ids[label]}\n\t\tcase \"channel_id\":\n\t\t\treturn SessionScopeTarget{ChannelID: ids[label]}\n\t\tcase \"team\":\n\t\t\treturn SessionScopeTarget{TeamID: th.BasicTeam.Id}\n\t\t}\n\t\treturn SessionScopeTarget{}\n\t}\n\n\tcall := func(raw string, permission string, tgt SessionScopeTarget, local bool) any {\n\t\tsession := &model.Session{\n\t\t\tId:     model.NewId(),\n\t\t\tUserId: th.BasicUser.Id,\n\t\t\tRoles:  th.BasicUser.Roles,\n\t\t\tLocal:  local,\n\t\t\tProps:  model.StringMap{model.SessionPropScope: raw},\n\t\t}\n\t\tscoped, allowed := th.App.EvaluateSessionScope(th.Context, session, permission, tgt)\n\t\treturn map[string]any{\"scoped\": scoped, \"allowed\": allowed}\n\t}\n\n\ti := 0\n\tfor ; i < 200; i++ {\n\t\twrite := i%2 == 0\n\t\treadPerms := pick(huntDAppReadPerms, 2)\n\t\tif write && rng.Intn(10) < 8 && !slices.Contains(readPerms, \"read_channel_content\") {\n\t\t\treadPerms = append(readPerms, \"read_channel_content\")\n\t\t}\n\t\tif rng.Intn(10) == 0 {\n\t\t\treadPerms = append(readPerms, hunt\n[truncated]"
+   },
+   {
+    "id": "server/public/model::TestHuntD_SessionScopeIsValid",
+    "source": "D",
+    "mechanical_verdict": "DIFF",
+    "repro_cmd": "cd server/public && go test ./model -run '^TestHuntD_SessionScopeIsValid$' -count=1",
+    "examples": [
+     {
+      "i": 16,
+      "input": "{\"permissions\":[\"read_channel_content\"],\"write_permissions\":\"add_reaction\",\"resources\":{\"channel_ids\":[\"hfb5afq5x3eve2aert36hrvj0s\"]},\"created_by_plugin_id\":\"p\"}",
+      "base": {
+       "err": null,
+       "marshal_err": null,
+       "remarshal": "{\"permissions\":[\"read_channel_content\"],\"resources\":{\"channel_ids\":[\"hfb5afq5x3eve2aert36hrvj0s\"]},\"created_by_plugin_id\":\"p\"}"
+      },
+      "head": {
+       "unmarshal_err": "json: cannot unmarshal string into Go struct field SessionScope.write_permissions of type []string"
+      }
+     },
+     {
+      "i": 12,
+      "input": "{\"permissions\":[\"read_channel_content\"],\"write_permissions\":[\"add_reaction\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}",
+      "base": {
+       "err": null,
+       "marshal_err": null,
+       "remarshal": "{\"permissions\":[\"read_channel_content\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}"
+      },
+      "head": {
+       "err": {
+        "detailed": "write permissions without write channels",
+        "id": "model.session_scope.is_valid.write_channel_ids.app_error",
+        "status": 400,
+        "where": "SessionScope.IsValid"
+       },
+       "marshal_err": null,
+       "remarshal": "{\"permissions\":[\"read_channel_content\"],\"write_permissions\":[\"add_reaction\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}"
+      }
+     },
+     {
+      "i": 11,
+      "input": "{\"permissions\":[\"read_channel_content\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"],\"write_channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}",
+      "base": {
+       "err": null,
+       "marshal_err": null,
+       "remarshal": "{\"permissions\":[\"read_channel_content\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}"
+      },
+      "head": {
+       "err": {
+        "detailed": "write channels without write permissions",
+        "id": "model.session_scope.is_valid.write_permissions.app_error",
+        "status": 400,
+        "where": "SessionScope.IsValid"
+       },
+       "marshal_err": null,
+       "remarshal": "{\"permissions\":[\"read_channel_content\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"],\"write_channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}"
+      }
+     }
+    ],
+    "test_source": "\n\t\t`{\"permissions\":[\"read_channel\"],\"on_behalf_of_user_id\":\"bad\",\"created_by_plugin_id\":\"p\"}`,\n\t}\n\trng := rand.New(rand.NewSource(40256))\n\tfor i := 0; i < 200; i++ {\n\t\tinputs = append(inputs, huntDGenScope(rng, pool, i%2 == 0))\n\t}\n\treturn inputs, pool\n}\n\nfunc TestHuntD_SessionScopeIsValid(t *testing.T) {\n\tinputs, _ := huntDScopeInputs()\n\tfor i, raw := range inputs {\n\t\thuntDRecord(\"TestHuntD_SessionScopeIsValid\", i, raw, func() any {\n\t\t\tvar s SessionScope\n\t\t\tif err := json.Unmarshal([]byte(raw), &s); err != nil {\n\t\t\t\treturn map[string]any{\"unmarshal_err\": err.Error()}\n\t\t\t}\n\t\t\tappErr := s.IsValid()\n\t\t\tb, err := json.Marshal(&s)\n\t\t\treturn map[string]any{\"err\": huntDAppErr(appErr), \"remarshal\": string(b), \"marshal_err\": huntDErr(err)}\n\t\t})\n\t}\n}\n\nfunc TestHuntD_SessionScopeParse(t *testing.T) {\n\tinputs, pool := huntDScopeInputs()\n\tallPerms := append(append([]string{}, huntDReadPerms...), huntDWritePerms...)\n\tallPerms = append(allPerms, \"create_post\")\n\tfor i, raw := range inputs {\n\t\thuntDRecord(\"TestHuntD_SessionScopeParse\", i, raw, func() any {\n\t\t\tsess := &Session{Props: StringMap{SessionPropScope: raw}}\n\t\t\tscope, scoped := sess.Scope()\n\t\t\tb, err := json.Marshal(scope)\n\t\t\thas := map[string]bool{}\n\t\t\tfor _, p := range allPerms {\n\t\t\t\thas[p] = scope.HasPermission(p)\n\t\t\t}\n\t\t\tlists := map[string]bool{}\n\t\t\tfor _, id := range pool {\n\t\t\t\tlists[id] = scope.ListsChannel(id)\n\t\t\t}\n\t\t\treturn map[string]any{\"scoped\": scoped, \"is_scoped\": sess.IsScoped(), \"scope\": string(b), \"marshal_err\": huntDErr(err), \"has\": has, \"lists\": lists}\n\t\t})\n\t}\n}\n\nfunc TestHuntD_SessionScopeResourcesWithLimits(t *testing.T) {\n\tinputs, _ := huntDScopeInputs()\n\trng := rand.New(rand.NewSource(99))\n\tfor i, raw := range inputs {\n\t\tlimits := SessionScopeLimits{ComplianceMode: rng.Intn(3) == 0, UsersCannotJoinOpenTeams: rng.Intn(3) == 0}\n\t\tinput := map[string]any{\"scope\": raw, \"compliance\": limits.ComplianceMode, \"cannot_join\": limits.UsersCannotJoinOpenTeams}\n\t\thuntDRecord(\"TestHuntD_SessionScopeResourcesWithLimits\", i, input, func() any {\n\t\t\tvar s SessionScope\n\t\t\tif err := json.Unmarshal([]byte(raw), &s); err != nil {\n\t\t\t\treturn map[string]any{\"unmarshal_err\": err.Error()}\n\t\t\t}\n\t\t\teff := s.Resources.WithLimits(limits)\n\t\t\tb, err := json.Marshal(eff)\n\t\t\treturn map[string]any{\"effective\": string(b), \"marshal_err\": huntDErr(err)}\n\t\t})\n\t}\n}\n"
+   },
+   {
+    "id": "server/public/model::TestHuntD_SessionScopeParse",
+    "source": "D",
+    "mechanical_verdict": "DIFF",
+    "repro_cmd": "cd server/public && go test ./model -run '^TestHuntD_SessionScopeParse$' -count=1",
+    "examples": [
+     {
+      "i": 16,
+      "input": "{\"permissions\":[\"read_channel_content\"],\"write_permissions\":\"add_reaction\",\"resources\":{\"channel_ids\":[\"hfb5afq5x3eve2aert36hrvj0s\"]},\"created_by_plugin_id\":\"p\"}",
+      "base": {
+       "has": {
+        "add_bookmark_private_channel": false,
+        "add_bookmark_public_channel": false,
+        "add_reaction": false,
+        "create_post": false,
+        "edit_bookmark_private_channel": false,
+        "edit_bookmark_public_channel": false,
+        "list_team_channels": false,
+        "order_bookmark_private_channel": false,
+        "order_bookmark_public_channel": false,
+        "read_channel": false,
+        "read_channel_content": true,
+        "read_public_channel": false,
+        "view_team": false
+       },
+       "is_scoped": true,
+       "lists": {
+        "72s9c1ks6nnkwj33eotjsaynah": false,
+        "hfb5afq5x3eve2aert36hrvj0s": true,
+        "jzi88tbzk87hi15ek9vujjg4bn": false,
+        "mofso3uhv09j3uafge9krvzxne": false,
+        "n9jtjsindlblttuke7ws90x7yz": false,
+        "o4j1u62wqm6n0ch624f0m419fv": false,
+        "ozr3twnk6pop4cnu19l5i4hcgx": false,
+        "zkpu7s1bui8h415bh516q3rovg": false
+       },
+       "marshal_err": null,
+       "scope": "{\"permissions\":[\"read_channel_content\"],\"resources\":{\"channel_ids\":[\"hfb5afq5x3eve2aert36hrvj0s\"]},\"created_by_plugin_id\":\"p\"}",
+       "scoped": true
+      },
+      "head": {
+       "has": {
+        "add_bookmark_private_channel": false,
+        "add_bookmark_public_channel": false,
+        "add_reaction": false,
+        "create_post": false,
+        "edit_bookmark_private_channel": false,
+        "edit_bookmark_public_channel": false,
+        "list_team_channels": false,
+        "order_bookmark_private_channel": false,
+        "order_bookmark_public_channel": false,
+        "read_channel": false,
+        "read_channel_content": false,
+        "read_public_channel": false,
+        "view_team": false
+       },
+       "is_scoped": true,
+       "lists": {
+        "72s9c1ks6nnkwj33eotjsaynah": false,
+        "hfb5afq5x3eve2aert36hrvj0s": false,
+        "jzi88tbzk87hi15ek9vujjg4bn": false,
+        "mofso3uhv09j3uafge9krvzxne": false,
+        "n9jtjsindlblttuke7ws90x7yz": false,
+        "o4j1u62wqm6n0ch624f0m419fv": false,
+        "ozr3twnk6pop4cnu19l5i4hcgx": false,
+        "zkpu7s1bui8h415bh516q3rovg": false
+       },
+       "marshal_err": null,
+       "scope": "{\"permissions\":null,\"resources\":{},\"created_by_plugin_id\":\"\"}",
+       "scoped": true
+      }
+     },
+     {
+      "i": 12,
+      "input": "{\"permissions\":[\"read_channel_content\"],\"write_permissions\":[\"add_reaction\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}",
+      "base": {
+       "has": {
+        "add_bookmark_private_channel": false,
+        "add_bookmark_public_channel": false,
+        "add_reaction": false,
+        "create_post": false,
+        "edit_bookmark_private_channel": false,
+        "edit_bookmark_public_channel": false,
+        "list_team_channels": false,
+        "order_bookmark_private_channel": false,
+        "order_bookmark_public_channel": false,
+        "read_channel": false,
+        "read_channel_content": true,
+        "read_public_channel": false,
+        "view_team": false
+       },
+       "is_scoped": true,
+       "lists": {
+        "72s9c1ks6nnkwj33eotjsaynah": false,
+        "hfb5afq5x3eve2aert36hrvj0s": false,
+        "jzi88tbzk87hi15ek9vujjg4bn": false,
+        "mofso3uhv09j3uafge9krvzxne": false,
+        "n9jtjsindlblttuke7ws90x7yz": false,
+        "o4j1u62wqm6n0ch624f0m419fv": true,
+        "ozr3twnk6pop4cnu19l5i4hcgx": false,
+        "zkpu7s1bui8h415bh516q3rovg": false
+       },
+       "marshal_err": null,
+       "scope": "{\"permissions\":[\"read_channel_content\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}",
+       "scoped": true
+      },
+      "head": {
+       "has": {
+        "add_bookmark_private_channel": false,
+        "add_bookmark_public_channel": false,
+        "add_reaction": false,
+        "create_post": false,
+        "edit_bookmark_private_channel": false,
+        "edit_bookmark_public_channel": false,
+        "list_team_channels": false,
+        "order_bookmark_private_channel": false,
+        "order_bookmark_public_channel": false,
+        "read_channel": false,
+        "read_channel_content": true,
+        "read_public_channel": false,
+        "view_team": false
+       },
+       "is_scoped": true,
+       "lists": {
+        "72s9c1ks6nnkwj33eotjsaynah": false,
+        "hfb5afq5x3eve2aert36hrvj0s": false,
+        "jzi88tbzk87hi15ek9vujjg4bn": false,
+        "mofso3uhv09j3uafge9krvzxne": false,
+        "n9jtjsindlblttuke7ws90x7yz": false,
+        "o4j1u62wqm6n0ch624f0m419fv": true,
+        "ozr3twnk6pop4cnu19l5i4hcgx": false,
+        "zkpu7s1bui8h415bh516q3rovg": false
+       },
+       "marshal_err": null,
+       "scope": "{\"permissions\":[\"read_channel_content\"],\"write_permissions\":[\"add_reaction\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}",
+       "scoped": true
+      }
+     },
+     {
+      "i": 11,
+      "input": "{\"permissions\":[\"read_channel_content\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"],\"write_channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}",
+      "base": {
+       "has": {
+        "add_bookmark_private_channel": false,
+        "add_bookmark_public_channel": false,
+        "add_reaction": false,
+        "create_post": false,
+        "edit_bookmark_private_channel": false,
+        "edit_bookmark_public_channel": false,
+        "list_team_channels": false,
+        "order_bookmark_private_channel": false,
+        "order_bookmark_public_channel": false,
+        "read_channel": false,
+        "read_channel_content": true,
+        "read_public_channel": false,
+        "view_team": false
+       },
+       "is_scoped": true,
+       "lists": {
+        "72s9c1ks6nnkwj33eotjsaynah": false,
+        "hfb5afq5x3eve2aert36hrvj0s": false,
+        "jzi88tbzk87hi15ek9vujjg4bn": false,
+        "mofso3uhv09j3uafge9krvzxne": false,
+        "n9jtjsindlblttuke7ws90x7yz": false,
+        "o4j1u62wqm6n0ch624f0m419fv": true,
+        "ozr3twnk6pop4cnu19l5i4hcgx": false,
+        "zkpu7s1bui8h415bh516q3rovg": false
+       },
+       "marshal_err": null,
+       "scope": "{\"permissions\":[\"read_channel_content\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}",
+       "scoped": true
+      },
+      "head": {
+       "has": {
+        "add_bookmark_private_channel": false,
+        "add_bookmark_public_channel": false,
+        "add_reaction": false,
+        "create_post": false,
+        "edit_bookmark_private_channel": false,
+        "edit_bookmark_public_channel": false,
+        "list_team_channels": false,
+        "order_bookmark_private_channel": false,
+        "order_bookmark_public_channel": false,
+        "read_channel": false,
+        "read_channel_content": true,
+        "read_public_channel": false,
+        "view_team": false
+       },
+       "is_scoped": true,
+       "lists": {
+        "72s9c1ks6nnkwj33eotjsaynah": false,
+        "hfb5afq5x3eve2aert36hrvj0s": false,
+        "jzi88tbzk87hi15ek9vujjg4bn": false,
+        "mofso3uhv09j3uafge9krvzxne": false,
+        "n9jtjsindlblttuke7ws90x7yz": false,
+        "o4j1u62wqm6n0ch624f0m419fv": true,
+        "ozr3twnk6pop4cnu19l5i4hcgx": false,
+        "zkpu7s1bui8h415bh516q3rovg": false
+       },
+       "marshal_err": null,
+       "scope": "{\"permissions\":[\"read_channel_content\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"],\"write_channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}",
+       "scoped": true
+      }
+     }
+    ],
+    "test_source": "\n\t\t\t\treturn map[string]any{\"unmarshal_err\": err.Error()}\n\t\t\t}\n\t\t\tappErr := s.IsValid()\n\t\t\tb, err := json.Marshal(&s)\n\t\t\treturn map[string]any{\"err\": huntDAppErr(appErr), \"remarshal\": string(b), \"marshal_err\": huntDErr(err)}\n\t\t})\n\t}\n}\n\nfunc TestHuntD_SessionScopeParse(t *testing.T) {\n\tinputs, pool := huntDScopeInputs()\n\tallPerms := append(append([]string{}, huntDReadPerms...), huntDWritePerms...)\n\tallPerms = append(allPerms, \"create_post\")\n\tfor i, raw := range inputs {\n\t\thuntDRecord(\"TestHuntD_SessionScopeParse\", i, raw, func() any {\n\t\t\tsess := &Session{Props: StringMap{SessionPropScope: raw}}\n\t\t\tscope, scoped := sess.Scope()\n\t\t\tb, err := json.Marshal(scope)\n\t\t\thas := map[string]bool{}\n\t\t\tfor _, p := range allPerms {\n\t\t\t\thas[p] = scope.HasPermission(p)\n\t\t\t}\n\t\t\tlists := map[string]bool{}\n\t\t\tfor _, id := range pool {\n\t\t\t\tlists[id] = scope.ListsChannel(id)\n\t\t\t}\n\t\t\treturn map[string]any{\"scoped\": scoped, \"is_scoped\": sess.IsScoped(), \"scope\": string(b), \"marshal_err\": huntDErr(err), \"has\": has, \"lists\": lists}\n\t\t})\n\t}\n}\n\nfunc TestHuntD_SessionScopeResourcesWithLimits(t *testing.T) {\n\tinputs, _ := huntDScopeInputs()\n\trng := rand.New(rand.NewSource(99))\n\tfor i, raw := range inputs {\n\t\tlimits := SessionScopeLimits{ComplianceMode: rng.Intn(3) == 0, UsersCannotJoinOpenTeams: rng.Intn(3) == 0}\n\t\tinput := map[string]any{\"scope\": raw, \"compliance\": limits.ComplianceMode, \"cannot_join\": limits.UsersCannotJoinOpenTeams}\n\t\thuntDRecord(\"TestHuntD_SessionScopeResourcesWithLimits\", i, input, func() any {\n\t\t\tvar s SessionScope\n\t\t\tif err := json.Unmarshal([]byte(raw), &s); err != nil {\n\t\t\t\treturn map[string]any{\"unmarshal_err\": err.Error()}\n\t\t\t}\n\t\t\teff := s.Resources.WithLimits(limits)\n\t\t\tb, err := json.Marshal(eff)\n\t\t\treturn map[string]any{\"effective\": string(b), \"marshal_err\": huntDErr(err)}\n\t\t})\n\t}\n}\n"
+   },
+   {
+    "id": "server/public/model::TestHuntD_SessionScopeResourcesWithLimits",
+    "source": "D",
+    "mechanical_verdict": "DIFF",
+    "repro_cmd": "cd server/public && go test ./model -run '^TestHuntD_SessionScopeResourcesWithLimits$' -count=1",
+    "examples": [
+     {
+      "i": 16,
+      "input": {
+       "cannot_join": true,
+       "compliance": false,
+       "scope": "{\"permissions\":[\"read_channel_content\"],\"write_permissions\":\"add_reaction\",\"resources\":{\"channel_ids\":[\"hfb5afq5x3eve2aert36hrvj0s\"]},\"created_by_plugin_id\":\"p\"}"
+      },
+      "base": {
+       "effective": "{\"channel_ids\":[\"hfb5afq5x3eve2aert36hrvj0s\"]}",
+       "marshal_err": null
+      },
+      "head": {
+       "unmarshal_err": "json: cannot unmarshal string into Go struct field SessionScope.write_permissions of type []string"
+      }
+     },
+     {
+      "i": 11,
+      "input": {
+       "cannot_join": true,
+       "compliance": false,
+       "scope": "{\"permissions\":[\"read_channel_content\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"],\"write_channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}"
+      },
+      "base": {
+       "effective": "{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]}",
+       "marshal_err": null
+      },
+      "head": {
+       "effective": "{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"],\"write_channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]}",
+       "marshal_err": null
+      }
+     },
+     {
+      "i": 10,
+      "input": {
+       "cannot_join": false,
+       "compliance": false,
+       "scope": "{\"permissions\":[\"read_channel\"],\"write_permissions\":[\"add_reaction\"],\"resources\":{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"],\"write_channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]},\"created_by_plugin_id\":\"p\"}"
+      },
+      "base": {
+       "effective": "{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]}",
+       "marshal_err": null
+      },
+      "head": {
+       "effective": "{\"channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"],\"write_channel_ids\":[\"o4j1u62wqm6n0ch624f0m419fv\"]}",
+       "marshal_err": null
+      }
+     }
+    ],
+    "test_source": "\n\t\t\t\tlists[id] = scope.ListsChannel(id)\n\t\t\t}\n\t\t\treturn map[string]any{\"scoped\": scoped, \"is_scoped\": sess.IsScoped(), \"scope\": string(b), \"marshal_err\": huntDErr(err), \"has\": has, \"lists\": lists}\n\t\t})\n\t}\n}\n\nfunc TestHuntD_SessionScopeResourcesWithLimits(t *testing.T) {\n\tinputs, _ := huntDScopeInputs()\n\trng := rand.New(rand.NewSource(99))\n\tfor i, raw := range inputs {\n\t\tlimits := SessionScopeLimits{ComplianceMode: rng.Intn(3) == 0, UsersCannotJoinOpenTeams: rng.Intn(3) == 0}\n\t\tinput := map[string]any{\"scope\": raw, \"compliance\": limits.ComplianceMode, \"cannot_join\": limits.UsersCannotJoinOpenTeams}\n\t\thuntDRecord(\"TestHuntD_SessionScopeResourcesWithLimits\", i, input, func() any {\n\t\t\tvar s SessionScope\n\t\t\tif err := json.Unmarshal([]byte(raw), &s); err != nil {\n\t\t\t\treturn map[string]any{\"unmarshal_err\": err.Error()}\n\t\t\t}\n\t\t\teff := s.Resources.WithLimits(limits)\n\t\t\tb, err := json.Marshal(eff)\n\t\t\treturn map[string]any{\"effective\": string(b), \"marshal_err\": huntDErr(err)}\n\t\t})\n\t}\n}\n"
+   }
+  ]
+ }
+}

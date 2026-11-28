@@ -1,0 +1,219 @@
+{
+  "_about": "2026 MatterWolf benchmark manifest: merged v12.0/v12.1 RC hotfix pairs, 2026 PR regression locks & recall targets, and merged 2026 clean controls. Run from packages/diff-bug-hunter with: .claude/skills/hunt/scripts/eval_bugs.py eval/bugs_2026.json --repo <mattermost clone> [--skip-missing] --dispatch '<cmd>'.",
+  "thresholds": {"raw_recall_min": 0.4, "vetted_recall_min": 0.3, "fp_rate_max": 0.05},
+  "cases": [
+    {
+      "id": "rc-000223-md5-fips",
+      "kind": "rc_hotfix",
+      "area": "server/channels/db/migrations",
+      "bug_sha": "9ef793301ab3b74feda5d6cc22f41d78741a4786",
+      "base_sha": "b2c92d7ae3dc9af7e94231bd16c8bbb75101a226",
+      "fix_sha": "6e31410e3140b8246116b7d2b1f851f8ea31f7ae",
+      "bug": "Migration 000223 uses md5() for fallback property option IDs, which fails on FIPS PostgreSQL.",
+      "source": "https://github.com/mattermost/mattermost/pull/39654",
+      "lock": false
+    },
+    {
+      "id": "rc-000216-attribute-view",
+      "kind": "rc_hotfix",
+      "area": "server/channels/db/migrations",
+      "bug_sha": "c3a5a087d7f40b201656f19ff6fc149f1547eb97",
+      "base_sha": "e7360779e068f9e3267e7fde578efeef64bb1a9f",
+      "fix_sha": "a36fd51ee9aa9a1e2e060c98fa8f15c8f873d6fb",
+      "bug": "Migration 000216 drops legacy AttributeView while 11.10 rolling-upgrade servers still query it against a 12.x DB.",
+      "source": "https://github.com/mattermost/mattermost/pull/39638",
+      "lock": false
+    },
+    {
+      "id": "rc-doublecheck-password",
+      "kind": "rc_hotfix",
+      "area": "server/channels/app",
+      "bug_sha": "48ad8258406e4a669c800de160d0b59dfbf4183e",
+      "base_sha": "5e4e72fb34096b064351be7f1dc7e4d66e24fd42",
+      "fix_sha": "7b83e287a8ab50fd9162290f179b73d73f079842",
+      "bug": "User password handling update required v12.1 RC fix in UpdatePassword session revocation flow.",
+      "source": "https://github.com/mattermost/mattermost/pull/39653",
+      "lock": false
+    },
+    {
+      "id": "rc-burn-on-read-file-perms",
+      "kind": "rc_hotfix",
+      "area": "server/channels/api4",
+      "bug_sha": "91b4450e49cd6e6b427fac629a71705aed793a75",
+      "base_sha": "24ef18fda7ca58b8ef59c8dd880fd17bccabe12b",
+      "fix_sha": "b9fd23e542a2f544033e2b385313bc43ab18e490",
+      "bug": "File attachment permission checks in api4 diverged from post access rules after Burn-on-Read changes.",
+      "source": "https://github.com/mattermost/mattermost/pull/39413",
+      "lock": false
+    },
+    {
+      "id": "rc-log-target-dirs",
+      "kind": "rc_hotfix",
+      "area": "server/channels/app/platform",
+      "bug_sha": "c4e83c682f37eeaa95f40e5185607f81eba419af",
+      "base_sha": "d9cfd5f44f097e3a19ff405f4e545f6d8ea8de59",
+      "fix_sha": "501becc7f6bd299f23c09d1716ba2ea3b54b077b",
+      "bug": "Log target validation accepted targets inside server-managed directories.",
+      "source": "https://github.com/mattermost/mattermost/pull/39296",
+      "lock": false
+    },
+    {
+      "id": "rc-000217-resize-fresh-only",
+      "kind": "rc_hotfix",
+      "area": "server/channels/db/migrations",
+      "bug_sha": "b3c66c7d17f1c55d7551a162fcac8455104918e0",
+      "base_sha": "dd83cc144d2e4bda6768a0ddbbdec3d3711f5138",
+      "fix_sha": "ce6915538d28fee4c2f160a9aebc6f921d92b97a",
+      "bug": "Migration 000217 widens posts.message on large live installations instead of fresh installations only.",
+      "source": "https://github.com/mattermost/mattermost/pull/39332",
+      "lock": false
+    },
+    {
+      "id": "pr-39734-mention-or-search",
+      "kind": "pre_merge_review",
+      "pr": 39734,
+      "area": "server/channels/store/searchtest",
+      "bug_sha": "3dc0d8feab1ccef4ccceaefb2e329f450a0bebe2",
+      "base_sha": "bc15e733bd58e9e08c2aa04a1bc123c7821856c1",
+      "fix_sha": "f81f9b9b3f68f2681a8e082460f614dd7773bad5",
+      "bug": "Mention OR search (`the @job -zzz`) returns nearly every post.",
+      "source": "https://github.com/mattermost/mattermost/pull/39734",
+      "lock": true
+    },
+    {
+      "id": "pr-40094-site-url-stall",
+      "kind": "pre_merge_review",
+      "pr": 40094,
+      "area": "server/channels/app",
+      "bug_sha": "5e62cb15e58d1cd6fbbcdb862424b051f5a5e925",
+      "base_sha": "3f535d172f4f8e9495798e3e1e60068835000a07",
+      "fix_sha": "4dc633575f7368b7fe0363a1f9f209f9f412fb0d",
+      "bug": "TestTestSiteURL waits the full 10s timeout on non-200 HTTP replies with stalled bodies.",
+      "source": "https://github.com/mattermost/mattermost/pull/40094",
+      "lock": true
+    },
+    {
+      "id": "pr-40114-health-manage-system",
+      "kind": "pre_merge_review",
+      "pr": 40114,
+      "area": "server/channels/api4",
+      "bug_sha": "1ab58c584c93863bf87c9d5f4af6fcbe99a344c5",
+      "base_sha": "3d4ea21e36f57f426a19c270b350ae270c4da4a6",
+      "fix_sha": "46641b937a0f070976c2c5a608fd5d6013afdd04",
+      "bug": "readableFindings drops compliance and job findings for manage_system holders.",
+      "source": "https://github.com/mattermost/mattermost/pull/40114",
+      "lock": true
+    },
+    {
+      "id": "pr-40186-job-summary-omitempty",
+      "kind": "pre_merge_review",
+      "pr": 40186,
+      "area": "server/public/model",
+      "bug_sha": "916ef456048d74b584c5f0e7eafbc75dc9ea78e3",
+      "base_sha": "f53535865d6acf20b9b5404e7655a44a81c8e3b9",
+      "fix_sha": "65ce1146401fd88777304d94ca7d0e638745635b",
+      "bug": "SupportPacketJobList.JobSummary yaml omitempty misclassifies empty jobs.yaml summary as not collected.",
+      "source": "https://github.com/mattermost/mattermost/pull/40186",
+      "lock": true
+    },
+    {
+      "id": "pr-40204-resizable-threads-unmount",
+      "kind": "pre_merge_review",
+      "pr": 40204,
+      "area": "webapp/channels/src/components/threading",
+      "bug_sha": "e625b2d9a30c88a3335240f04d3ffa325b221945",
+      "base_sha": "8381b54525f08e0c3776d9ff79c558d13ec200d5",
+      "fix_sha": "015412e64aae7b79aa3af0428bfc10c25333279f",
+      "bug": "Unmounting the resizable threads list mid-drag leaves a stuck grid width override.",
+      "source": "https://github.com/mattermost/mattermost/pull/40204",
+      "lock": true
+    },
+    {
+      "id": "pr-40256-scoped-bookmark-dm-gm",
+      "kind": "pre_merge_review",
+      "pr": 40256,
+      "area": "server/channels/api4",
+      "bug_sha": "ece5b4c61431abfb78b4999e6a94482d3c994e0e",
+      "base_sha": "e4fd62b3fe6496e09b62bbcd0526d9e42dc1dcd4",
+      "bug": "Scoped write sessions bypass WriteChannelIDs on DM/GM bookmarks and leak 400 vs 403 oracle on cross-channel PATCH.",
+      "source": "https://github.com/mattermost/mattermost/pull/40256",
+      "lock": true
+    },
+    {
+      "id": "pr-40163-webhook-http-search",
+      "kind": "pre_merge_review",
+      "pr": 40163,
+      "area": "webapp/channels/src/components/integrations",
+      "bug_sha": "e988cf64d9b27530a011faeb30bdd985ef90bdb0",
+      "base_sha": "2d6c2852eaebf2e23336332b8feeacf9db0ea0e8",
+      "bug": "Incoming webhook search (`http` / `hooks`) matches every hook via full URL prefix.",
+      "source": "https://github.com/mattermost/mattermost/pull/40163",
+      "lock": true
+    },
+    {
+      "id": "pr-40294-primary-read-replica-lag",
+      "kind": "pre_merge_review",
+      "pr": 40294,
+      "area": "server/channels/app",
+      "bug_sha": "5b863171212349618ba3191620e85fc28c5e7ead",
+      "base_sha": "a3f2632f4007fa8a6abefdfbe7f1333d641b72f2",
+      "bug": "UpdatePropertyFields reads before-snapshot from replica instead of primary via RequestContextWithMaster.",
+      "source": "https://github.com/mattermost/mattermost/pull/40294",
+      "lock": false
+    },
+    {
+      "id": "pr-40299-masked-reorder-and-ws-refetch",
+      "kind": "pre_merge_review",
+      "pr": 40299,
+      "area": "server/channels/api4",
+      "bug_sha": "acb8f87ebac90785bac5fb4df3d2b65ed529d90b",
+      "base_sha": "a2fe7c4e52062674277a7b9c85a3d823735bcaa2",
+      "bug": "Masked reorder combined with rename returns 200 instead of 403, and options_omitted WS skips refetch for non-admin clients.",
+      "source": "https://github.com/mattermost/mattermost/pull/40299",
+      "lock": false
+    },
+    {
+      "id": "pr-40272-marketplace-url-normalization",
+      "kind": "pre_merge_review",
+      "pr": 40272,
+      "area": "server/channels/api4",
+      "bug_sha": "de95bd470b579c3f5ae79ab23bb23ccc4ee6e030",
+      "base_sha": "2d6c2852eaebf2e23336332b8feeacf9db0ea0e8",
+      "bug": "patchConfig rejects empty or legacy-default MarketplaceURL before SetDefaults normalization when EnableUploads is false.",
+      "source": "https://github.com/mattermost/mattermost/pull/40272",
+      "lock": false
+    }
+  ],
+  "controls": [
+    {
+      "id": "ctl-2026-bot-disable",
+      "area": "server/channels/app",
+      "sha": "4a38cfa4164d01db704464b62f0ee516f5f3a933"
+    },
+    {
+      "id": "ctl-2026-smtp-health",
+      "area": "server/channels/app/platform",
+      "sha": "13fc2f1280c8bbe71f52619214dc08665ec68bd2"
+    },
+    {
+      "id": "ctl-2026-post-props",
+      "area": "server/channels/app",
+      "sha": "ccc5ac4ddd1058155aa8911724f6a67768193a25"
+    },
+    {
+      "id": "ctl-2026-s3-loopback",
+      "area": "server/platform/shared/healthcheck",
+      "sha": "ab07ef22ca7c90c8545e1b51f7bf1a52037a81b4"
+    },
+    {
+      "id": "ctl-2026-property-write-marker",
+      "area": "server/channels/app",
+      "sha": "1026fc9aeb1a4cf565a2c8c6be41bf486e26cf9d"
+    },
+    {
+      "id": "ctl-2026-channel-classification",
+      "area": "webapp/channels/src/components",
+      "sha": "be59ffe2ebc45352e5d68b8aab24128d114b10ad"
+    }
+  ]
+}
