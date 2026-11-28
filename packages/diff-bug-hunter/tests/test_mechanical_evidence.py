@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import eval_bugs
@@ -190,3 +191,11 @@ def test_a_drop_is_not_cleared_by_a_newer_batch_that_says_pre_existing(tmp_path)
                                                   "held": [{"row": _drop("A", "p::T"), "reasons": ["decision=DROP"]}]}))
     row = ledger.record("1", hdir=h, out_path=tmp_path / "l.jsonl")
     assert row["confidence_tier"] == "Partial or Unverified Coverage" and DISMISSED in row["gaps"]
+
+def test_a_failed_cover_run_is_a_gap_and_the_hunt_reaches_the_verdict(tmp_path, monkeypatch):
+    h = tmp_path / "h"
+    h.mkdir()
+    monkeypatch.setattr(hunt, "script", lambda *a: subprocess.CompletedProcess(a, 1, "", "boom"))
+    hunt.stage_cover("target", h)
+    gaps = json.loads((h / "driver.json").read_text())["gaps"]
+    assert gaps == {"cover:A": "run.py cover A failed (exit 1): changed lines not measured"}
