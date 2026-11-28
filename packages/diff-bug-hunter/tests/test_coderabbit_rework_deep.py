@@ -1907,18 +1907,20 @@ def test_round13_hunt_partial_v_d_only_vet_and_terminal_batch_advance(tmp_path, 
 def test_round14_ledger_a2_invalid_drop_and_pr_server_profile(tmp_path, monkeypatch):
     import importlib.util
 
-    # 1. A2 strengthen-round NEW_PR_BUG maps to Mode A source so a valid DROP achieves High-Confidence Clean
+    # 1. A2 strengthen-round NEW_PR_BUG maps to Mode A source; a skeptic DROP of it no longer yields High-Confidence Clean
     h_a2 = tmp_path / "h_a2"
     write_json(h_a2 / "state.json", {"pr": "1", "batch": 1, "batches": 1, "changed": ["p/a.go"], "modes": ["A"]})
     write_json(h_a2 / "A" / "response.json", {"files": [{"path": "p/hunt_hunta_test.go", "content": "x"}]})
     write_json(h_a2 / "run_A.json", {"p::T1": "PASS"})
+    write_json(h_a2 / "run_A.coverage.json", {"reached": 1, "executable": 1})
     write_json(h_a2 / "run_A2.json", {"p::T2": "FAIL_3_OF_3"})
     write_json(h_a2 / "base_A2.json", {"p::T2": "NEW_PR_BUG"})
     write_json(h_a2 / "old_tests.json", {"tests": {}})
     write_json(h_a2 / "pr_tests.json", {"tests": {}})
     write_json(h_a2 / "vetted.json", {"rows": [vetted_row(id="p::T2", source="A", decision="DROP")]})
     rec_a2 = ledger.record("1", hdir=h_a2, out_path=tmp_path / "l_a2.jsonl")
-    assert rec_a2["confidence_tier"] == "High-Confidence Clean" and rec_a2["gaps"] == []
+    assert rec_a2["confidence_tier"] == "Partial or Unverified Coverage"
+    assert rec_a2["gaps"] == ["1 mechanical failure(s) dismissed by the skeptic"]
 
     # 2. Validation-failed DROP row (missing required field -> invalid row) stays Partial with unvetted gap
     bad_drop = vetted_row(id="p::T2", source="A", decision="DROP")
@@ -3118,11 +3120,13 @@ print(json.dumps({"total_cost_usd": 0.05}))
     for t in ("A", "B"):
         write_json(h_bm / "batches" / "batch_1" / t / "response.json", {"files": [{"path": f"p/{t}.go", "content": "x"}]})
         write_json(h_bm / "batches" / "batch_1" / f"run_{t}.json", {f"p::{t}": Verdict.PASS})
+    write_json(h_bm / "batches" / "batch_1" / "run_A.coverage.json", {"reached": 1, "executable": 1})
     write_json(h_bm / "driver.json", {"modes": ["A", "B", "D"]})
     write_json(h_bm / "state.json", {"batch": 2, "batches": 2, "modes": ["A", "B", "D"]})
     for t in ("A", "B"):
         write_json(h_bm / t / "response.json", {"files": [{"path": f"p/{t}.go", "content": "x"}]})
         write_json(h_bm / f"run_{t}.json", {f"p::{t}": Verdict.PASS})
+    write_json(h_bm / "run_A.coverage.json", {"reached": 1, "executable": 1})
     write_json(h_bm / "D" / "response.json", {"files": [{"path": "p/d.go", "content": "x"}]})
     write_json(h_bm / "diff_D.json", {"p::D": Verdict.SAME})
     _, _, _, _, mg_bm = ledger._aggregate_modes(h_bm)

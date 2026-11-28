@@ -118,7 +118,7 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
        (`batch 1/N` with `N > 1` without `--all-batches`), any hunter `EMPTY` or failed repair, any `NOT_RUN` / `INFRA_ERROR`
        / `BASE_UNCOMPILABLE` / `BASE_FAILED` / `RECORDER_FAILED` / `NO_RECORDS` / `NONDETERMINISTIC` / `FLAKY` /
        `PR_TEST_FAILS` / unresolved `NEW_API`, any Mode R thread `UNPROVABLE_DYNAMICALLY` (including `UNVETTED`), or Mode A
-       `0/Y` changed lines reached (`Y > 0`), or a Mode A run whose changed lines were never measured (no
+       `0/Y` changed lines reached (`Y > 0`), or a skeptic DROP of a mechanical `NEW_PR_BUG` or Mode D `DIFF` (`N mechanical failure(s) dismissed by the skeptic`), or a Mode A run whose changed lines were never measured (no
        `run_A.coverage.json`), or a race-detector failure on head (`race detector fired on head in <test>`). List every
        specific gap explicitly so a reviewer knows exactly what was not proven clean.
      - **`High-Confidence Clean`** — no bug proven, AND every batch ran, Modes A/B/D (and R when qualifying threads exist)

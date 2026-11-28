@@ -428,6 +428,17 @@ def keep_tier(hdir: Path, keep: list[dict[str, Any]]) -> str:
     return "Behaviour change, needs review"
 
 
+def _dismissed_mechanical(hdir: Path, row: dict[str, Any]) -> bool:
+    """True when the row's test failed the merge-base oracle the mechanical way: NEW_PR_BUG, or a Mode D DIFF. The
+    oracle is looked up newest batch first, since a dropped row may come from an archived batch."""
+    mech = None
+    for bdir in reversed(_batch_dirs(hdir)):
+        mech = mechanical_verdict(bdir, row)
+        if mech is not None:
+            break
+    return mech == Verdict.NEW_PR_BUG or (row.get("source") == "D" and mech == Verdict.DIFF)
+
+
 def race_reports(hdir: Path) -> list[str]:
     """One gap line per hunter test the Go race detector failed on head. A race the merge-base reports too is left
     out. The detector is mechanical evidence, so it stands whatever the run count or the skeptic made of the test."""
@@ -531,9 +542,11 @@ def _tier_and_gaps(hdir: Path, counts: dict[str, int],
         or (executable > 0 and reached == 0)
     )
     races = race_reports(hdir)
-    if not gaps and not races:
+    dismissed = sum(1 for h in resolved_held if _is_valid_drop(h) and _dismissed_mechanical(hdir, h["row"]))
+    dismissed_gap = [f"{dismissed} mechanical failure(s) dismissed by the skeptic"] if dismissed else []
+    if not gaps and not races and not dismissed_gap:
         return "High-Confidence Clean", []
-    return "Partial or Unverified Coverage", (["unvetted findings"] if unvetted else []) + races
+    return "Partial or Unverified Coverage", (["unvetted findings"] if unvetted else []) + races + dismissed_gap
 
 
 def _export_escapes(hdir: Path, state: dict[str, Any], pr_key: str,
