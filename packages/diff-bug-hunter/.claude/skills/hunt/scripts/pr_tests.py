@@ -22,7 +22,6 @@ sys.dont_write_bytecode = True
 if not sys.pycache_prefix:
     sys.pycache_prefix = "/dev/null/hunt-pyc"
 
-import fcntl
 import os
 import tempfile
 from collections.abc import Iterator
@@ -31,9 +30,11 @@ from pathlib import Path
 from typing import Any
 
 from ctx import changed_go_tests, changed_test_files
-from hunt_common import InfraError, clean_untracked, git, hunt_dir, read_state, run_locked_cli, write_json
-from run import PACKAGE_FAILED, CompileError, Outcome, classify, ensure_clean, go_run
+from hunt_common import InfraError, clean_untracked, git, hunt_dir, pg_pool_lock, read_state, run_locked_cli, write_json
+from run import PACKAGE_FAILED, CompileError, Outcome, classify, ensure_clean, go_compile_binary, go_run
 from verdicts import Verdict
+
+_REAL_GO_RUN = go_run
 
 FLAG = "ENABLE_FULLY_PARALLEL_TESTS"
 PARALLEL_ENV = "HUNT_GO_PARALLEL"
@@ -53,19 +54,6 @@ def parallelism() -> int:
     except ValueError as e:
         raise InfraError(f"invalid HUNT_PR_TEST_PARALLEL={raw!r}: expected integer >= 2") from e
     return max(2, val)
-
-
-@contextmanager
-def pg_pool_lock() -> Iterator[None]:
-    """Serialize parallel Postgres test-pool runs across concurrent hunts on the same host."""
-    lock_path = Path(os.environ.get("HUNT_PG_LOCK") or Path(tempfile.gettempdir()) / f"hunt-pg-pool-{os.getuid()}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 @contextmanager
@@ -107,23 +95,31 @@ def plan(repo: Path, mb: str, head: str) -> tuple[list[dict[str, Any]], list[str
     return units[:MAX_UNITS], [f"{u['key']} (over {MAX_UNITS} units)" for u in units[MAX_UNITS:]]
 
 
-def _run(wt: Path, unit: dict[str, Any], tests: list[str], parallel: bool) -> Outcome:
+def _run(wt: Path, unit: dict[str, Any], tests: list[str], parallel: bool,
+         bins: dict[str, Path] | None = None) -> Outcome:
     o = Outcome()
     with ci_env(parallel), (pg_pool_lock() if parallel else nullcontext()):
-        go_run(wt, {unit["dir"]: "^(" + "|".join(tests) + ")$"}, False, o)
+        if bins is not None:
+            go_run(wt, {unit["dir"]: "^(" + "|".join(tests) + ")$"}, False, o, bins=bins)
+        else:
+            go_run(wt, {unit["dir"]: "^(" + "|".join(tests) + ")$"}, False, o)
     return o
 
 
 def _run_unit(wt: Path, unit: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
     key = unit["key"]
     try:
-        heads = [_run(wt, unit, unit["tests"], True) for _ in range(RUNS)]
-        names = sorted(set().union(*(h.results for h in heads)))
-        seen = {n: classify([h.results.get(n, Verdict.MISSING) for h in heads]) for n in names}
-        failing = [n for n in names if seen[n] == Verdict.FAIL_3_OF_3]
-        pkg_failed = any(n.endswith(f"::{PACKAGE_FAILED}") for n in failing)
-        retest = list(unit["tests"]) if pkg_failed else [n.split("::", 1)[1] for n in failing]
-        plain = _run(wt, unit, retest, False) if retest else Outcome()
+        with tempfile.TemporaryDirectory() as td:
+            bins: dict[str, Path] | None = None
+            if RUNS > 1 and go_run is _REAL_GO_RUN and (wt / unit["dir"]).is_dir():
+                bins = {unit["dir"]: go_compile_binary(wt, unit["dir"], False, Path(td) / "pr.test")}
+            heads = [_run(wt, unit, unit["tests"], True, bins=bins) for _ in range(RUNS)]
+            names = sorted(set().union(*(h.results for h in heads)))
+            seen = {n: classify([h.results.get(n, Verdict.MISSING) for h in heads]) for n in names}
+            failing = [n for n in names if seen[n] == Verdict.FAIL_3_OF_3]
+            pkg_failed = any(n.endswith(f"::{PACKAGE_FAILED}") for n in failing)
+            retest = list(unit["tests"]) if pkg_failed else [n.split("::", 1)[1] for n in failing]
+            plain = _run(wt, unit, retest, False, bins=bins) if retest else Outcome()
     except CompileError as e:  # not a finding: generated code or build tags may be missing in this worktree
         return {f"{key}::*": Verdict.NOT_RUN}, {f"{key}::*": str(e)[-1500:]}
     table: dict[str, str] = {}
@@ -182,7 +178,7 @@ def main(argv: list[str]) -> int:
             print(f"[pr] skipped: {k}")
         return 0
 
-    return run_locked_cli(argv[1], hdir, _run)
+    return run_locked_cli(argv[1], hdir, _run, scope="wt")
 
 
 if __name__ == "__main__":

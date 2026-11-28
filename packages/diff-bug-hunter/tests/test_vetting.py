@@ -143,3 +143,40 @@ def test_cmd_base_caps_timeout_and_skips_passing_tests(tmp_path, monkeypatch):
     assert seen and all("ClampAllEmpty" not in pat for pats, _ in seen for pat in pats.values())
     assert all(caps and caps.get("calc") == expected_cap for _, caps in seen)
     _clean(state)
+
+
+def test_cmd_base_retains_fuzz_companion_file_for_deterministic_helper_callers(tmp_path, monkeypatch):
+    monkeypatch.delenv("HUNT_FUZZ", raising=False)
+    monkeypatch.setenv("HUNT_FUZZ_TIME", "1s")
+    det_src = (
+        'package calc\n\nimport "testing"\n\n'
+        "func TestHuntA_ViaCompanion(t *testing.T) { huntCheckA_Companion(t) }\n"
+    )
+    companion_helper = (
+        'package calc\n\nimport "testing"\n\n'
+        "func huntCheckA_Companion(t *testing.T) {\n"
+        "\tif got := Clamp(10, 0, 10); got != 10 {\n"
+        '\t\tt.Fatalf("Clamp(10, 0, 10) = %d, want 10", got)\n\t}\n}\n\n'
+    )
+    cases = [
+        companion_helper
+        + "func huntCheckA_Pass(t *testing.T, v int) { _ = Clamp(v, 0, 10) }\n"
+        + "func FuzzHuntA_Pass(f *testing.F) {\n\tf.Add(0)\n"
+        + "\tf.Fuzz(func(t *testing.T, v int) { huntCheckA_Pass(t, v) })\n}\n",
+        companion_helper
+        + "func FuzzHuntA_NewAPI(f *testing.F) {\n\tf.Add(0)\n"
+        + "\tf.Fuzz(func(t *testing.T, v int) { _ = ClampAll([]int{v}, 0, 10) })\n}\n",
+    ]
+    for i, fz_src in enumerate(cases):
+        case_dir = tmp_path / f"case{i}"
+        case_dir.mkdir()
+        hdir, state = make_hunt(case_dir, "go_newapi")
+        (hdir / "A" / "response.json").write_text(json.dumps({"files": [
+            {"path": "calc/hunt_hunta_test.go", "content": det_src},
+            {"path": "calc/hunt_huntafuzz_test.go", "content": fz_src},
+        ]}))
+        assert run.cmd_run(hdir, state, "A")["calc::TestHuntA_ViaCompanion"] == "FAIL_3_OF_3"
+        out = run.cmd_base(hdir, state, "A")
+        assert out["calc::TestHuntA_ViaCompanion"] == "NEW_PR_BUG"
+        assert "new_api" not in out
+        _clean(state)

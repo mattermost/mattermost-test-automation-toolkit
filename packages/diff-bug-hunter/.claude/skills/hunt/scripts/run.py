@@ -35,9 +35,12 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import tempfile
+import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,6 +52,7 @@ from hunt_common import (
     git_cmd,
     hunt_dir,
     load_json,
+    maybe_pg_pool_lock,
     node_env,
     read_state,
     read_text_lossy,
@@ -62,6 +66,8 @@ from hunt_common import (
 from verdicts import Verdict
 
 HUNT_FILE = re.compile(r"^(hunt_hunt[a-z0-9]+_test\.go|hunt_[a-z0-9]+\.test\.tsx?)$")
+MODE_A_FUZZ_TARGET = re.compile(r"^func (FuzzHuntA_\w+)\(", re.M)
+_FROZEN_FUZZ_RE = re.compile(r"^func (TestHuntA_\w+_Fuzz[0-9a-f]{8})\(", re.M)
 RESULT_GO = re.compile(r"^\s*--- (PASS|FAIL|SKIP): (\S+)", re.M)
 PACKAGE_FAILED = "(package failed)"
 # `ok  \t<import path>\t15.116s` / `FAIL\t<import path>\t2.5s`: how long one package's test binary ran.
@@ -289,9 +295,12 @@ def suite_for(tag: str, state: dict[str, Any], placed: list[Path], wt: Path) -> 
         rel = str(p.resolve().relative_to(wt.resolve()))
         if rel.endswith(".go"):
             # One -run pattern per package: another file's match would hide a file whose tests are misnamed.
-            if not re.search(rf"^func TestHunt{mode}_\w*\(", p.read_text(), re.M):
+            src = p.read_text()
+            has_det = re.search(rf"^func TestHunt{mode}_\w*\(", src, re.M)
+            if not has_det and not (tag == "A" and fuzz_enabled() and MODE_A_FUZZ_TARGET.search(src)):
                 raise CompileError(f"{rel}: no test named TestHunt{mode}_<Name>(t *testing.T); rename the tests")
-            s.go_patterns[str(Path(rel).parent)] = f"^TestHunt{mode}_"
+            if has_det:  # a fuzz-only companion file runs in the fuzz phase, not under this -run pattern
+                s.go_patterns[str(Path(rel).parent)] = f"^TestHunt{mode}_"
         else:
             s.jest_files.append(rel)
     s.jest_prefix = f"Hunt{mode}_"
@@ -330,23 +339,82 @@ def _rel(wt: Path, sub: str | Path, root: Path) -> str:
     return os.path.relpath((wt / sub).resolve(), root.resolve())
 
 
-def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome,
-           timeouts: dict[str, int] | None = None) -> None:
+def go_compile_binary(wt: Path, d: str, race: bool, out_bin: Path) -> Path:
+    """Precompile one Go package test binary with -vet=off; raises GoBuildError on build/setup failure."""
     if race:
+        require_disk(scratch())
+    root = go_root(wt, d)
+    pkg = "./" + _rel(wt, d, root)
+    args = ["go", "test", "-c", "-vet=off"] + (["-race"] if race else []) + ["-o", str(out_bin), pkg]
+    p = sh(args, root, check=False, timeout=1800)
+    if p.returncode != 0 or not out_bin.exists():
+        out = p.stdout + p.stderr
+        raise GoBuildError(f"{pkg}:\n{out[-2500:]}", d)
+    return out_bin
+
+
+def _goflags_binary_timeout() -> str | None:
+    """Return timeout for a prebuilt test binary from GOFLAGS, or None when GOFLAGS sets unsupported runtime flags."""
+    raw = os.environ.get("GOFLAGS", "").strip()
+    if not raw:
+        return "10m"
+    try:
+        toks = shlex.split(raw)
+    except ValueError:
+        return None
+    timeout = "10m"
+    i = 0
+    while i < len(toks):
+        tok = toks[i]
+        if tok.startswith(("-timeout=", "--timeout=", "-test.timeout=")):
+            timeout = tok.split("=", 1)[1] or timeout
+        elif tok in ("-timeout", "--timeout", "-test.timeout") and i + 1 < len(toks):
+            timeout = toks[i + 1] or timeout
+            i += 1
+        elif tok.startswith(("-vet=", "-mod=", "-tags=", "-count=")) or tok in ("-race", "-trimpath"):
+            pass
+        elif tok in ("-vet", "-mod", "-tags") and i + 1 < len(toks):
+            i += 1
+        else:
+            return None
+        i += 1
+    return timeout
+
+
+def go_run(wt: Path, patterns: dict[str, str], race: bool, into: Outcome,
+           timeouts: dict[str, int] | None = None, *,
+           bins: dict[str, Path] | None = None, failfast: bool = False) -> None:
+    if race and not bins:
         require_disk(scratch())  # before the -race build starts, not after it fails for lack of space
+    gf_timeout = _goflags_binary_timeout() if bins else "10m"
     for d, pattern in sorted(patterns.items()):
         root = go_root(wt, d)
         pkg = "./" + _rel(wt, d, root)
         cap = (timeouts or {}).get(d)
         par = os.environ.get("HUNT_GO_PARALLEL", "").strip()
-        args = (["go", "test", "-count=1", "-v", "-run", pattern] + (["-race"] if race else [])
-                + ([f"-parallel={par}"] if par else [])
-                + ([f"-timeout={cap}s"] if cap else []) + [pkg])
-        p = sh(args, root, check=False, timeout=1800)
+        bin_path = (bins or {}).get(d) if gf_timeout is not None else None
+        if bin_path is not None:
+            args = ([str(bin_path), "-test.v", f"-test.run={pattern}"]
+                    + ([f"-test.parallel={par}"] if par else [])
+                    + [f"-test.timeout={cap}s" if cap else f"-test.timeout={gf_timeout}", "-test.paniconexit0"]
+                    + (["-test.failfast"] if failfast else []))
+            cwd = wt / d
+        else:
+            args = (["go", "test", "-count=1", "-vet=off", "-v", "-run", pattern] + (["-race"] if race else [])
+                    + ([f"-parallel={par}"] if par else [])
+                    + ([f"-timeout={cap}s"] if cap else [])
+                    + (["-failfast"] if failfast else []) + [pkg])
+            cwd = root
+        with maybe_pg_pool_lock(d):
+            t0 = time.monotonic()
+            p = sh(args, cwd, check=False, timeout=1800)
+        elapsed = round(time.monotonic() - t0, 3)
         out = p.stdout + p.stderr
         runtime = go_package_runtime(out)
         if runtime is not None:
             into.runtimes[d] = runtime
+        elif bin_path is not None:
+            into.runtimes[d] = elapsed
         # Identities are package-qualified ("<dir>::<Test>") so equal test names in two packages never overwrite.
         got = {f"{d}::{m.group(2)}": m.group(1) for m in RESULT_GO.finditer(out) if "/" not in m.group(2)}
         if not got:
@@ -473,12 +541,27 @@ def jest_compiles(wt: Path, file: str) -> str | None:
 
 # ---------------------------------------------------------------- suite level
 
-def run_suite(wt: Path, s: Suite, race: bool, go_timeouts: dict[str, int] | None = None) -> Outcome:
+def run_suite(wt: Path, s: Suite, race: bool, go_timeouts: dict[str, int] | None = None,
+              *, go_bins: dict[str, Path] | None = None, failfast: bool = False) -> Outcome:
     if s.empty():
         raise InfraError("suite is empty: no Go packages or Jest files to run")
+    go_kw: dict[str, Any] = {}
+    if go_bins is not None:
+        go_kw["bins"] = go_bins
+    if failfast:
+        go_kw["failfast"] = True
+    if s.go_patterns and s.jest_files:
+        go_o, jest_o = Outcome(), Outcome()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fg = pool.submit(go_run, wt, s.go_patterns, race, go_o, go_timeouts, **go_kw)
+            fj = pool.submit(jest_run, wt, s.jest_files, s.jest_prefix, jest_o)
+            fg.result()
+            fj.result()
+        _merge_outcome(go_o, jest_o)
+        return go_o
     o = Outcome()
     if s.go_patterns:
-        go_run(wt, s.go_patterns, race, o, go_timeouts)
+        go_run(wt, s.go_patterns, race, o, go_timeouts, **go_kw)
     if s.jest_files:
         jest_run(wt, s.jest_files, s.jest_prefix, o)
     return o
@@ -518,6 +601,147 @@ def _failure_changed(first: Outcome, rerun: Outcome, ident: str) -> bool:
     return bool(m1 and m2 and normalize_for_compare(m1) != normalize_for_compare(m2))
 
 
+def _precompile_go_bins(wt: Path, go_patterns: dict[str, str], race: bool, bin_td: Path) -> dict[str, Path] | None:
+    if not go_patterns or not all((wt / d).is_dir() for d in go_patterns):
+        return None
+    if sh is not _REAL_SH and go_compile_binary is _REAL_GO_COMPILE_BINARY:
+        return None
+    return {
+        d: go_compile_binary(wt, d, race, bin_td / f"{hashlib.sha256(d.encode()).hexdigest()[:8]}.test")
+        for d in sorted(go_patterns)
+    }
+
+
+_REAL_RUN_SUITE: Any = None
+_REAL_DIFF_UNIT_PASS: Any = None
+_REAL_COMPILES: Any = None
+_REAL_SH: Any = None
+_REAL_GO_COMPILE_BINARY: Any = None
+
+
+def _call_run_suite(wt: Path, suite: Suite, race: bool, go_bins: dict[str, Path] | None) -> Outcome:
+    if go_bins is not None and run_suite is _REAL_RUN_SUITE:
+        return run_suite(wt, suite, race=race, go_bins=go_bins)
+    return run_suite(wt, suite, race=race)
+
+
+def _run_lazy_phase(
+    hdir: Path, wt: Path, state: dict[str, Any], tag: str, files: list[dict[str, str]], runs: int,
+    *, frozen_only: set[str] | None = None,
+) -> tuple[dict[str, str], dict[str, str], dict[str, float], set[str], list[Outcome]]:
+    placed: list[Path] = []
+    outcomes: list[Outcome] = []
+    statuses: dict[str, list[str]] = {}  # identity -> one status per run that executed it
+    full_pkgs: set[str] = set()
+    try:
+        placed = place(wt, files, target_dirs_for(hdir, state, tag))
+        full = suite_for(tag, state, placed, wt)
+        if frozen_only is not None:
+            go_files: dict[str, list[str]] = {}
+            for f in files:
+                if str(f.get("path", "")).endswith(".go"):
+                    go_files.setdefault(str(Path(str(f["path"])).parent), []).append(str(f.get("content", "")))
+            f_patterns: dict[str, str] = {}
+            for d in full.go_patterns:
+                src = "\n".join(go_files.get(d, []))
+                names = sorted(t for t in frozen_only if re.search(rf"^func {re.escape(t)}\(", src, re.M))
+                if names:
+                    f_patterns[d] = "^(" + "|".join(re.escape(t) for t in names) + ")$"
+            full = Suite(go_patterns=f_patterns)
+        if full.empty():
+            return {}, {}, {}, full_pkgs, outcomes
+        with tempfile.TemporaryDirectory() as bin_td:
+            go_bins = (
+                _precompile_go_bins(wt, full.go_patterns, True, Path(bin_td))
+                if runs > 1 and run_suite is _REAL_RUN_SUITE else None
+            )
+            first = _call_run_suite(wt, full, True, go_bins)
+            outcomes.append(first)
+            for n, st in first.results.items():
+                statuses[n] = [st]
+            # Lazy confirmation (C2): a test that did not fail on the first run is not run again. Only the failures are
+            # rerun, up to `runs` runs in all; if a filtered rerun passes/changes, confirm under the original suite first
+            # so passing tests that pollute package state do not mask a deterministic failure as FLAKY.
+            failing = {n for n, st in first.results.items() if st == Verdict.FAIL}
+            for run_idx in range(1, runs):
+                suite = _filter_base_suite(full, failing, {}) if failing else Suite()
+                for d in full_pkgs:
+                    if d in full.go_patterns and d in suite.go_patterns:
+                        suite.go_patterns[d] = full.go_patterns[d]
+                if suite.empty():
+                    break
+                o = _call_run_suite(wt, suite, True, go_bins)
+                outcomes.append(o)
+                changed = {n for n in failing if _failure_changed(first, o, n)}
+                if changed:
+                    confirm_suite = Suite(
+                        go_patterns={d: full.go_patterns[d] for d in full.go_patterns
+                                     if any(n.startswith(f"{d}::") for n in changed)
+                                     and suite.go_patterns.get(d) != full.go_patterns[d]},
+                        jest_files=[rel for rel in full.jest_files
+                                    if any(n.startswith(f"{rel}::") for n in changed)
+                                    and rel not in suite.jest_files],
+                        jest_prefix=full.jest_prefix,
+                    )
+                    if not confirm_suite.empty():
+                        c = _call_run_suite(wt, confirm_suite, True, go_bins)
+                        outcomes.append(c)
+                        confirmed_units = set(confirm_suite.go_patterns) | set(confirm_suite.jest_files)
+                        for n in failing:
+                            unit = n.split("::", 1)[0]
+                            if unit in confirmed_units:
+                                st_c = c.results.get(n, Verdict.MISSING)
+                                o.results[n] = st_c
+                                if st_c == Verdict.FAIL and n in changed:
+                                    full_pkgs.add(unit)
+                        for n, st_c in c.results.items():
+                            if n not in failing and st_c != Verdict.PASS:
+                                statuses.setdefault(n, [Verdict.MISSING] * run_idx).append(st_c)
+                for n, st_o in o.results.items():
+                    if n not in failing and st_o != Verdict.PASS:
+                        statuses.setdefault(n, [Verdict.MISSING] * run_idx).append(st_o)
+                for n in failing:
+                    statuses[n].append(o.results.get(n, Verdict.MISSING))
+                failing = {n for n in failing if o.results.get(n) == Verdict.FAIL}
+    finally:
+        unplace(placed)
+    table: dict[str, str] = {n: classify(statuses[n]).value for n in sorted(statuses)}
+    messages = {
+        n: next(o.messages[n] for o in outcomes if n in o.messages)
+        for n in set().union(*(o.messages for o in outcomes))
+    }
+    runtimes = {d: max(o.runtimes[d] for o in outcomes if d in o.runtimes)
+                for d in set().union(*(o.runtimes for o in outcomes))}
+    return table, messages, runtimes, full_pkgs, outcomes
+
+
+def _merge_phase_tables(
+    table: dict[str, str], messages: dict[str, str], runtimes: dict[str, float],
+    f_table: dict[str, str], f_messages: dict[str, str], f_runtimes: dict[str, float],
+) -> None:
+    """Merge deterministic and frozen-fuzz phase verdicts, keeping failure text from any unanimous FAIL_3_OF_3 phase."""
+    for k, v in f_table.items():
+        old = table.get(k)
+        if old in (None, v):
+            table[k] = v
+        elif Verdict.FAIL_3_OF_3 in (old, v):
+            table[k] = Verdict.FAIL_3_OF_3
+        else:
+            table[k] = Verdict.FLAKY
+        if v == Verdict.FAIL_3_OF_3 and old != Verdict.FAIL_3_OF_3:
+            if k in f_messages:
+                messages[k] = f_messages[k]
+            else:
+                messages.pop(k, None)
+        elif (old != Verdict.FAIL_3_OF_3 or v == Verdict.FAIL_3_OF_3) and k in f_messages:
+            messages.setdefault(k, f_messages[k])
+    for k, m in f_messages.items():
+        if k not in f_table and table.get(k) != Verdict.FAIL_3_OF_3:
+            messages.setdefault(k, m)
+    for d, t in f_runtimes.items():
+        runtimes[d] = max(t, runtimes.get(d, t))
+
+
 def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[str, Any]:
     wt = Path(state["wt"])
     ensure_clean(wt)
@@ -534,74 +758,41 @@ def cmd_run(hdir: Path, state: dict[str, Any], tag: str, runs: int = 3) -> dict[
         (hdir / f"run_{tag}.response.sha256").write_text(fingerprint(files))
         _clear_adjudication(hdir, tag)
         return {}
-    if tag == "A" and fuzz_enabled() and any(str(f.get("path", "")).endswith(".go") and FUZZ_TARGET.search(
-            str(f.get("content", ""))) for f in files):
-        # Discovery first: a failing input is frozen into the response, so the runs below (and cover and base, which
-        # fingerprint these files) see it as an ordinary test.
-        cmd_fuzz(hdir, state, tag)
-        files = load_json(hdir / tag / "response.json")["files"]
-    placed: list[Path] = []
+    mode = tag[0]
+    has_fuzz = (tag == "A" and fuzz_enabled() and any(
+        str(f.get("path", "")).endswith(".go") and MODE_A_FUZZ_TARGET.search(str(f.get("content", ""))) for f in files))
+    persisted_frozen: set[str] = (
+        {m.group(1) for f in files if str(f.get("path", "")).endswith(".go")
+         for m in _FROZEN_FUZZ_RE.finditer(str(f.get("content", "")))}
+        if tag == "A" else set()
+    )
+    has_det = any(
+        not str(f.get("path", "")).endswith(".go")
+        or any(t not in persisted_frozen
+               for t in re.findall(rf"^func (TestHunt{mode}_\w*)\(", str(f.get("content", "")), re.M))
+        for f in files
+    )
+    table: dict[str, str] = {}
+    messages: dict[str, str] = {}
+    runtimes: dict[str, float] = {}
+    full_pkgs: set[str] = set()
     outcomes: list[Outcome] = []
-    statuses: dict[str, list[str]] = {}  # identity -> one status per run that executed it
-    try:
-        placed = place(wt, files, target_dirs_for(hdir, state, tag))
-        full = suite_for(tag, state, placed, wt)
-        first = run_suite(wt, full, race=True)
-        outcomes.append(first)
-        for n, st in first.results.items():
-            statuses[n] = [st]
-        # Lazy confirmation (C2): a test that did not fail on the first run is not run again. Only the failures are
-        # rerun, up to `runs` runs in all; if a filtered rerun passes/changes, confirm under the original suite first
-        # so passing tests that pollute package state do not mask a deterministic failure as FLAKY.
-        failing = {n for n, st in first.results.items() if st == Verdict.FAIL}
-        full_pkgs: set[str] = set()
-        for run_idx in range(1, runs):
-            suite = _filter_base_suite(full, failing, {}) if failing else Suite()
-            for d in full_pkgs:
-                if d in full.go_patterns and d in suite.go_patterns:
-                    suite.go_patterns[d] = full.go_patterns[d]
-            if suite.empty():
-                break
-            o = run_suite(wt, suite, race=True)
-            outcomes.append(o)
-            changed = {n for n in failing if _failure_changed(first, o, n)}
-            if changed:
-                confirm_suite = Suite(
-                    go_patterns={d: full.go_patterns[d] for d in full.go_patterns
-                                 if any(n.startswith(f"{d}::") for n in changed)
-                                 and suite.go_patterns.get(d) != full.go_patterns[d]},
-                    jest_files=[rel for rel in full.jest_files
-                                if any(n.startswith(f"{rel}::") for n in changed)
-                                and rel not in suite.jest_files],
-                    jest_prefix=full.jest_prefix,
-                )
-                if not confirm_suite.empty():
-                    c = run_suite(wt, confirm_suite, race=True)
-                    outcomes.append(c)
-                    confirmed_units = set(confirm_suite.go_patterns) | set(confirm_suite.jest_files)
-                    for n in failing:
-                        unit = n.split("::", 1)[0]
-                        if unit in confirmed_units:
-                            st_c = c.results.get(n, Verdict.MISSING)
-                            o.results[n] = st_c
-                            if st_c == Verdict.FAIL and n in changed:
-                                full_pkgs.add(unit)
-                    for n, st_c in c.results.items():
-                        if n not in failing and st_c != Verdict.PASS:
-                            statuses.setdefault(n, [Verdict.MISSING] * run_idx).append(st_c)
-            for n, st_o in o.results.items():
-                if n not in failing and st_o != Verdict.PASS:
-                    statuses.setdefault(n, [Verdict.MISSING] * run_idx).append(st_o)
-            for n in failing:
-                statuses[n].append(o.results.get(n, Verdict.MISSING))
-            failing = {n for n in failing if o.results.get(n) == Verdict.FAIL}
-    finally:
-        unplace(placed)
-    table = {n: classify(statuses[n]) for n in sorted(statuses)}
+    if has_det or not (has_fuzz or persisted_frozen):
+        table, messages, runtimes, full_pkgs, outcomes = _run_lazy_phase(hdir, wt, state, tag, files, runs)
+    frozen = set(persisted_frozen)
+    if has_fuzz:
+        rep = cmd_fuzz(hdir, state, tag)
+        files = load_json(hdir / tag / "response.json")["files"]
+        frozen |= set(rep.get("frozen") or [])
+    if frozen:
+        f_table, f_messages, f_runtimes, f_pkgs, f_outcomes = _run_lazy_phase(
+            hdir, wt, state, tag, files, runs, frozen_only=frozen,
+        )
+        _merge_phase_tables(table, messages, runtimes, f_table, f_messages, f_runtimes)
+        full_pkgs |= f_pkgs
+        outcomes.extend(f_outcomes)
     write_json(hdir / f"run_{tag}.json", table)
-    write_json(hdir / f"run_{tag}.messages.json", outcomes[0].messages)
-    runtimes = {d: max(o.runtimes[d] for o in outcomes if d in o.runtimes)
-                for d in set().union(*(o.runtimes for o in outcomes))}
+    write_json(hdir / f"run_{tag}.messages.json", messages)
     if runtimes:
         write_json(hdir / f"run_{tag}.runtimes.json", runtimes)
     if full_pkgs:
@@ -799,13 +990,16 @@ def salvage_go(wt: Path, state: dict[str, Any], tag: str, placed: list[Path],
     outcome of what remained and {removed test identity: identifiers it could not resolve}."""
     gone: dict[str, list[str]] = {}
     rounds = fixups = 0
+    test_pat = re.compile(rf"^func TestHunt{tag[0]}_\w*\(", re.M)
     while True:
         live = [p for p in placed if p.exists()]
-        for p in live:  # a file left without a TestHunt<mode>_ func has nothing to run
-            if p.suffix == ".go" and not re.search(rf"^func TestHunt{tag[0]}_\w*\(", p.read_text(), re.M):
+        has_test = {p for p in live if p.suffix == ".go" and test_pat.search(p.read_text())}
+        active_go_dirs = {p.parent.resolve() for p in has_test}
+        for p in live:  # drop helper/fuzz-only .go files once their package has no TestHunt<mode>_ left
+            if p.suffix == ".go" and p not in has_test and p.parent.resolve() not in active_go_dirs:
                 p.unlink()
         live = [p for p in placed if p.exists()]
-        suite = suite_for(tag, state, live, wt)
+        suite = suite_for(tag, state, [p for p in live if p.suffix != ".go" or p in has_test], wt)
         if failing is not None:
             suite = _filter_base_suite(suite, failing, gone)
         if suite.empty():
@@ -1278,6 +1472,7 @@ def _merge_outcome(dst: Outcome, src: Outcome) -> None:
 def _diff_unit_pass(
     wt: Path, state: dict[str, Any], tag: str, units: list[tuple[str, list[Path]]],
     td: Path, stem: str, *, base: bool = False, only: str | None = None,
+    go_bins: dict[str, Path] | None = None,
 ) -> tuple[Outcome, dict[tuple[str, str], dict[int, dict[str, Any]]], dict[str, str], dict[str, list[str]], list[str]]:
     """Execute Mode D units one at a time so identically named recorders across packages never overwrite each other."""
     merged = Outcome()
@@ -1297,7 +1492,7 @@ def _diff_unit_pass(
                     suite = suite_for(tag, state, u_placed, wt)
                     if only_set is not None:
                         suite = _filter_base_suite(suite, only_set, {})
-                    o = run_suite(wt, suite, race=False)
+                    o = run_suite(wt, suite, race=False, go_bins=go_bins) if go_bins is not None else run_suite(wt, suite, race=False)
             _merge_outcome(merged, o)
             if uf.exists():
                 text = read_text_lossy(uf)
@@ -1404,8 +1599,13 @@ def cmd_diff(hdir: Path, state: dict[str, Any], tag: str = "D", *,
         head_units = _place_units(wt, by_unit, targets)
         kw: dict[str, Any] = {"only": only} if only is not None else {}
         try:
+            head_bins: dict[str, Path] | None = None
+            if _diff_unit_pass is _REAL_DIFF_UNIT_PASS:
+                go_dirs = sorted({d for _, ps in head_units for d in suite_for(tag, state, ps, wt).go_patterns})
+                head_bins = _precompile_go_bins(wt, dict.fromkeys(go_dirs, "^TestHunt"), False, td)
             for pass_i in range(2):
-                o, recs, _, _, raw = _diff_unit_pass(wt, state, tag, head_units, td, f"head{pass_i + 1}", **kw)
+                pass_kw = {**kw, **({"go_bins": head_bins} if head_bins is not None and _diff_unit_pass is _REAL_DIFF_UNIT_PASS else {})}
+                o, recs, _, _, raw = _diff_unit_pass(wt, state, tag, head_units, td, f"head{pass_i + 1}", **pass_kw)
                 runs.append(o)
                 head_recs.append(recs)
                 if pass_i == 0:
@@ -1513,8 +1713,32 @@ def is_kill(name: str, status: str, base: Outcome) -> bool:
     return base.results.get(name) == Verdict.PASS
 
 
+def _covering_units(hdir: Path, tag: str) -> dict[str, set[str]]:
+    """Map changed source file -> set of test unit keys (Go package dir or Jest file) that hit it in coverage."""
+    cov_path = hdir / f"run_{tag}.coverage.json"
+    if not cov_path.exists():
+        return {}
+    out: dict[str, set[str]] = {}
+    for ident, t in load_json(cov_path).get("tests", {}).items():
+        if t.get("verdict") != Verdict.REACHES:
+            continue
+        loc = ident.split("::", 1)[0]
+        for f in t.get("hit", {}):
+            out.setdefault(f, set()).add(loc)
+    return out
+
+
+def _ordered_mutant_units(suite: Suite, m_file: str, covering: dict[str, set[str]] | None) -> list[tuple[str, Suite]]:
+    m_dir = str(Path(m_file).parent)
+    cov_locs = (covering or {}).get(m_file, set())
+    units = ([(d, Suite(go_patterns={d: pat})) for d, pat in suite.go_patterns.items()]
+             + [(rel, Suite(jest_files=[rel], jest_prefix=suite.jest_prefix)) for rel in suite.jest_files])
+    return sorted(units, key=lambda u: 0 if u[0] == m_dir else (1 if u[0] in cov_locs else 2))
+
+
 def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: Outcome,
-                 m: dict[str, Any], vacuous: frozenset[str] = frozenset()) -> dict[str, Any]:
+                 m: dict[str, Any], vacuous: frozenset[str] = frozenset(),
+                 covering: dict[str, set[str]] | None = None) -> dict[str, Any]:
     v: dict[str, Any] = {"id": m["id"], "held_back": m["held_back"], "file": m["file"],
                          "what_breaks": m["what_breaks"], "killers": [], "mutant": m}
     # A mutant that cannot be applied as written goes back to a planter (regen), like one that does not compile.
@@ -1525,19 +1749,40 @@ def score_mutant(wt: Path, state: dict[str, Any], suite: Suite, base: Outcome,
     if orig.count(m["old"]) != 1:
         return {**v, "verdict": Verdict.NEEDS_REGENERATION,
                 "detail": f"`old` occurs {orig.count(m['old'])} times in {m['file']}; it must occur exactly once"}
+    m_dir = str(Path(m["file"]).parent)
     try:
         path.write_text(orig.replace(m["old"], m["new"], 1))
-        try:
-            err = compiles(wt, m["file"])
-            if err:
-                return {**v, "verdict": Verdict.NEEDS_REGENERATION, "detail": err}
-            r = run_suite(wt, suite, race=False, go_timeouts=mutant_timeouts(base)).results
-        except CompileError as e:
-            return {**v, "verdict": Verdict.NEEDS_REGENERATION, "detail": str(e)[-1500:]}
-        except InfraError as e:  # one mutant's environment failure (a compile-check timeout too) loses no other verdict
-            return {**v, "verdict": Verdict.ERROR, "detail": str(e)[-1500:]}
-        killers = sorted(n for n, s in r.items() if is_kill(n, s, base) and n not in vacuous)
-        return {**v, "verdict": Verdict.KILLED if killers else Verdict.SURVIVED, "killers": killers}
+        with tempfile.TemporaryDirectory() as bin_td:
+            bins: dict[str, Path] = {}
+            try:
+                if m["file"].endswith(".go") and suite.go_patterns and compiles is _REAL_COMPILES:
+                    for d in sorted(suite.go_patterns):
+                        bins[d] = go_compile_binary(
+                            wt, d, False, Path(bin_td) / f"{hashlib.sha256(d.encode()).hexdigest()[:8]}.test",
+                        )
+                    if m_dir not in suite.go_patterns:
+                        err = compiles(wt, m["file"])
+                        if err:
+                            return {**v, "verdict": Verdict.NEEDS_REGENERATION, "detail": err}
+                else:
+                    err = compiles(wt, m["file"])
+                    if err:
+                        return {**v, "verdict": Verdict.NEEDS_REGENERATION, "detail": err}
+                timeouts = mutant_timeouts(base)
+                for u_key, u_suite in _ordered_mutant_units(suite, m["file"], covering):
+                    ff = (all(base.results.get(n) == Verdict.PASS for n in base.results if n.startswith(f"{u_key}::"))
+                          and not any(vac.startswith(f"{u_key}::") for vac in vacuous))
+                    u_bins = {u_key: bins[u_key]} if u_key in bins else None
+                    r = run_suite(wt, u_suite, race=False, go_timeouts=timeouts,
+                                  go_bins=u_bins, failfast=ff).results
+                    killers = sorted(n for n, s in r.items() if is_kill(n, s, base) and n not in vacuous)
+                    if killers:
+                        return {**v, "verdict": Verdict.KILLED, "killers": killers}
+            except CompileError as e:
+                return {**v, "verdict": Verdict.NEEDS_REGENERATION, "detail": str(e)[-1500:]}
+            except InfraError as e:  # one mutant's environment failure (a compile-check timeout too) loses no other verdict
+                return {**v, "verdict": Verdict.ERROR, "detail": str(e)[-1500:]}
+        return {**v, "verdict": Verdict.SURVIVED, "killers": []}
     finally:
         path.write_text(orig)
 
@@ -1562,7 +1807,8 @@ def cmd_mutants(hdir: Path, state: dict[str, Any], tag: str) -> list[dict[str, A
             base = run_suite(wt, suite, race=False)
             # A test that executes none of the PR's changed lines does not count as a killer (run.py cover).
             vacuous = frozenset(vacuous_tests(hdir, tag))
-            verdicts = [score_mutant(wt, state, suite, base, m, vacuous) for m in all_mutants(hdir)]
+            covering = _covering_units(hdir, tag)
+            verdicts = [score_mutant(wt, state, suite, base, m, vacuous, covering) for m in all_mutants(hdir)]
     finally:
         unplace(placed)
     write_json(hdir / f"mutants_{tag}.json", verdicts)
@@ -1626,7 +1872,7 @@ def go_cover_binary(wt: Path, d: str, changed: dict[str, set[int]], td: Path) ->
         return None, []
     pkgs = sorted({"./" + _rel(wt, Path(f).parent, root) for f in go_files})
     bin_path = td / f"cover-{hashlib.sha256(d.encode()).hexdigest()[:8]}.test"
-    p = sh(["go", "test", "-c", "-cover", "-coverpkg=" + ",".join(pkgs), "-o", str(bin_path),
+    p = sh(["go", "test", "-c", "-vet=off", "-cover", "-coverpkg=" + ",".join(pkgs), "-o", str(bin_path),
             "./" + _rel(wt, d, root)], root, check=False, timeout=1800)
     return (bin_path if p.returncode == 0 and bin_path.exists() else None), go_files
 
@@ -1645,7 +1891,8 @@ def go_test_coverage(wt: Path, d: str, name: str, changed: dict[str, set[int]],
         return None
     with tempfile.TemporaryDirectory() as td:
         prof = Path(td) / "cover.out"
-        sh([str(bin_path), f"-test.run=^{name}$", f"-test.coverprofile={prof}"], wt / d, check=False, timeout=1800)
+        with maybe_pg_pool_lock(d):
+            sh([str(bin_path), f"-test.run=^{name}$", f"-test.coverprofile={prof}"], wt / d, check=False, timeout=1800)
         if not prof.exists():
             return None
         text = prof.read_text()
@@ -1824,36 +2071,55 @@ def cmd_fuzz(hdir: Path, state: dict[str, Any], tag: str) -> dict[str, Any]:
     placed: list[Path] = []
     try:
         placed = place(wt, resp["files"], {t["dir"] for t in state["targets"]})
-        for i, name, mode, base in candidates:
-            d = str(Path(resp["files"][i]["path"]).parent)
-            root = go_root(wt, d)
-            corpus = wt / d / "testdata" / "fuzz" / name
-            created = [p for p in (wt / d / "testdata", wt / d / "testdata" / "fuzz", corpus) if not p.exists()]
-            try:
-                p = sh(["go", "test", "-count=1", "-run", "^$", "-fuzz", f"^{name}$", f"-fuzztime={fuzz_time()}",
-                        "./" + _rel(wt, d, root)], root, check=False, timeout=1800)
-                entries = sorted(corpus.glob("*")) if corpus.is_dir() else []
-                if p.returncode == 0:
-                    report["targets"][name] = Verdict.PASS
-                elif not entries:
-                    out = p.stdout + p.stderr
-                    if "[build failed]" in out or "[setup failed]" in out:
-                        raise CompileError(f"{name}:\n{out[-2500:]}")
-                    report["targets"][name] = "ERROR " + normalize_failure(out[-1500:], wt)
-                else:
+        shared_created: list[Path] = []
+        if candidates:
+            fuzz_par = max(1, (os.cpu_count() or 2) // len(candidates))
+            pkg_dirs = sorted({str(Path(resp["files"][i]["path"]).parent) for i, _, _, _ in candidates})
+            for d in pkg_dirs:
+                for p in (wt / d / "testdata", wt / d / "testdata" / "fuzz"):
+                    if not p.exists():
+                        shared_created.append(p)
+
+            def _fuzz_one(cand: tuple[int, str, str, str]) -> tuple[int, str, str, str | None, str | None]:
+                i, name, mode, base = cand
+                d = str(Path(resp["files"][i]["path"]).parent)
+                root = go_root(wt, d)
+                corpus = wt / d / "testdata" / "fuzz" / name
+                corpus_existed = corpus.exists()
+                try:
+                    with maybe_pg_pool_lock(d):
+                        p = sh(["go", "test", "-count=1", "-vet=off", "-run", "^$", "-fuzz", f"^{name}$",
+                                f"-fuzztime={fuzz_time()}", f"-parallel={fuzz_par}",
+                                "./" + _rel(wt, d, root)], root, check=False, timeout=1800)
+                    entries = sorted(corpus.glob("*")) if corpus.is_dir() else []
+                    if p.returncode == 0:
+                        return i, name, Verdict.PASS, None, None
+                    if not entries:
+                        out = p.stdout + p.stderr
+                        if "[build failed]" in out or "[setup failed]" in out:
+                            raise CompileError(f"{name}:\n{out[-2500:]}")
+                        return i, name, "ERROR " + normalize_failure(out[-1500:], wt), None, None
                     args = corpus_args(entries[0].read_text())
                     if args is None:
-                        report["targets"][name] = "FAIL (input not freezable: " + entries[0].read_text()[:200] + ")"
-                    else:
-                        test, code = freeze(name, mode, base, args)
-                        report["targets"][name] = f"FAIL frozen as {test}"
-                        report["frozen"].append(test)
-                        additions.setdefault(i, []).append(code)
+                        return i, name, "FAIL (input not freezable: " + entries[0].read_text()[:200] + ")", None, None
+                    test, code = freeze(name, mode, base, args)
+                    return i, name, f"FAIL frozen as {test}", test, code
+                finally:
+                    if not corpus_existed and corpus.exists():
+                        shutil.rmtree(corpus)
+
+            try:
+                max_w = min(len(candidates), max(1, (os.cpu_count() or 2) // 2))
+                with ThreadPoolExecutor(max_workers=max_w) as pool:
+                    for i, name, status, test, code in pool.map(_fuzz_one, candidates):
+                        report["targets"][name] = status
+                        if test and code:
+                            report["frozen"].append(test)
+                            additions.setdefault(i, []).append(code)
             finally:
-                # The corpus lands next to the package; remove only what this run created so the worktree stays clean.
-                for c in reversed(created):
-                    if c.exists():
-                        shutil.rmtree(c)
+                for p in reversed(shared_created):
+                    if p.exists():
+                        shutil.rmtree(p)
     finally:
         unplace(placed)
     if additions:
@@ -1932,9 +2198,26 @@ def main(argv: list[str]) -> int:
                 for n, c in table.items():
                     print(f"[{tag}] {n}: {c}")
                 if not table:
-                    if tag == "A" and state.get("changed"):
+                    resp_files = load_json(hdir / tag / "response.json").get("files") or []
+                    if tag == "A" and state.get("changed") and not resp_files:
                         print(f"[{tag}] EMPTY_RESPONSE: Mode A emitted 0 test files despite {len(state['changed'])} "
                               f"changed source file(s); run `build_requests.py {pr} retry A` once before accepting empty output")
+                    elif resp_files and (hdir / f"fuzz_{tag}.json").exists():
+                        targets = load_json(hdir / f"fuzz_{tag}.json").get("targets", {})
+                        skipped = sum(1 for v in targets.values() if str(v).startswith("SKIPPED"))
+                        errored = sum(1 for v in targets.values() if str(v).startswith(Verdict.ERROR))
+                        ran = len(targets) - skipped - errored
+                        if errored:
+                            print(f"[{tag}] {errored} fuzz target(s) failed with ERROR"
+                                  + (f" ({ran} ran, {skipped} skipped)" if (ran or skipped) else "")
+                                  + f"; see fuzz_{tag}.json")
+                        elif ran == 0 and skipped:
+                            print(f"[{tag}] {skipped} fuzz target(s) skipped (0 executed); see fuzz_{tag}.json")
+                        else:
+                            print(f"[{tag}] {ran} fuzz target(s) ran with 0 frozen failures"
+                                  + (f" ({skipped} skipped)" if skipped else ""))
+                    elif resp_files:
+                        print(f"[{tag}] {len(resp_files)} fuzz file(s) ran with 0 frozen failures")
                     else:
                         print(f"[{tag}] no tests in the hunter response")
             elif cmd == "base":
@@ -1988,7 +2271,18 @@ def main(argv: list[str]) -> int:
             return 3
         return 0
 
-    return run_locked_cli(pr, hdir, _run_cmd)
+    return run_locked_cli(
+        pr, hdir, _run_cmd,
+        scope="wt_base" if cmd == "base" else ("all" if cmd in ("diff", "mutants") else "wt"),
+        tag=tag,
+    )
+
+
+_REAL_RUN_SUITE = run_suite
+_REAL_DIFF_UNIT_PASS = _diff_unit_pass
+_REAL_COMPILES = compiles
+_REAL_SH = sh
+_REAL_GO_COMPILE_BINARY = go_compile_binary
 
 
 if __name__ == "__main__":
