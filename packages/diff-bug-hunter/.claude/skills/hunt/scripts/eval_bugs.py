@@ -702,6 +702,11 @@ def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None,
                 fp = hdir / fname
                 if not fp.exists():
                     fp.write_bytes(raw)
+    vet_inputs = ((hdir / "vet.partial").is_file() or (hdir / "vetted.json").exists()
+                  or (hdir / "verdict.json").exists() or (hdir / "batches").is_dir())
+    if (("hunters" in signals or "diff" in signals) and batches and not vet_inputs
+            and not any(r.get("hunter") in ("A", "B", "D") for r in results)):
+        raise InfraError(f"no hunter response for {e['id']}: pass --dispatch or a responses directory")
     if "review" in signals:
         results.append(review_signal(num, hdir, state, meta, e, dispatch_cmd, wt_fix, fix_not_run))
     if ("hunters" in signals or "diff" in signals) and (
@@ -1026,6 +1031,7 @@ def diff_scorecards(base: dict[str, Any], cand: dict[str, Any], max_fp: float = 
     base_recall, cand_recall = _num(bm, "vetted_recall"), _num(cm, "vetted_recall")
     base_fp, cand_fp = _num(bm, "fp_rate"), _num(cm, "fp_rate")
     cand_ok = not cand.get("errors") and cand.get("verdict") != Verdict.ERROR
+    base_ok = not base.get("errors") and base.get("verdict") != Verdict.ERROR
     recall_ok = cand_recall >= base_recall
     fp_limit = max_fp  # no tolerance for a worse baseline: the limit is absolute
     fp_ok = _raw_fp("fp_rate") <= fp_limit
@@ -1092,11 +1098,12 @@ def diff_scorecards(base: dict[str, Any], cand: dict[str, Any], max_fp: float = 
             "base_retries": bu["retries"], "cand_retries": cu["retries"],
         }
 
-    passed = (cand_ok and population_ok and signals_ok and recall_ok and fp_ok and strong_ok and fwd_ok
+    passed = (cand_ok and base_ok and population_ok and signals_ok and recall_ok and fp_ok and strong_ok and fwd_ok
               and not weak_regressions and not gate_fp_failures and not lock_regressions)
     return {
         "verdict": Verdict.PASS if passed else Verdict.FAIL,
         "cand_ok": cand_ok,
+        "base_ok": base_ok,
         "population_ok": population_ok,
         "signals_ok": signals_ok,
         "missing_signals": missing_signals,
@@ -1154,6 +1161,8 @@ def _cmd_diff(args: list[str]) -> int:
         print(f"usage: cost ${ud['base_cost_usd']:.4f} -> ${ud['cand_cost_usd']:.4f}{pct}, "
               f"tokens_in {ud['base_tokens_in']} -> {ud['cand_tokens_in']}, "
               f"repairs {ud['base_repairs']} -> {ud['cand_repairs']}")
+    if not res["base_ok"]:
+        print("baseline scorecard has errors: rerun the baseline before gating on it")
     print(f"VERDICT: {res['verdict']}")
     return 0 if res["verdict"] == Verdict.PASS else 1
 
