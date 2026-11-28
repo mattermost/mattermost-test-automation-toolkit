@@ -157,15 +157,17 @@ def score(lesson: dict[str, Any], files: list[str], text: str) -> int:
     return 3 * path_hits + kw_hits if (path_hits or kw_hits) else 0
 
 
+def _top_matches(items: list[dict[str, Any]], files: list[str], text: str) -> list[dict[str, Any]]:
+    ranked = sorted(((score(lsn, files, text), i, lsn) for i, lsn in enumerate(items)), key=lambda t: (-t[0], t[1]))
+    return [lsn for s, _, lsn in ranked if s > 0][:TOP]
+
+
 def match(ctx: dict[str, Any], lessons: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Lessons still shown to hunters as prompt text: fp lessons without a failure_regex. Those with one are applied
     after the run by post_filter; miss lessons go through probes_for."""
-    lessons = load() if lessons is None else lessons
-    lessons = [lsn for lsn in lessons if kind_of(lsn) == "fp" and not lsn.get("failure_regex")]
-    files = [c["file"] for c in ctx.get("changed_files_head_source", [])]
-    text = ctx.get("diff_production_code", "").lower()
-    ranked = sorted(((score(lsn, files, text), i, lsn) for i, lsn in enumerate(lessons)), key=lambda t: (-t[0], t[1]))
-    return [lsn for s, _, lsn in ranked if s > 0][:TOP]
+    items = [lsn for lsn in (load() if lessons is None else lessons) if kind_of(lsn) == "fp" and not lsn.get("failure_regex")]
+    return _top_matches(items, [c["file"] for c in ctx.get("changed_files_head_source", [])],
+                        ctx.get("diff_production_code", "").lower())
 
 
 def _diff_files(diff: str) -> list[str]:
@@ -174,11 +176,8 @@ def _diff_files(diff: str) -> list[str]:
 
 def probes_for(diff: str, lessons: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Miss lessons (bugs earlier hunts failed to find) that apply to this diff, best first; fed to hunters as probes."""
-    lessons = load() if lessons is None else lessons
-    files, text = _diff_files(diff), diff.lower()
-    ranked = sorted(((score(lsn, files, text), i, lsn) for i, lsn in enumerate(lessons) if kind_of(lsn) == "miss"),
-                    key=lambda t: (-t[0], t[1]))
-    return [lsn for s, _, lsn in ranked if s > 0][:TOP]
+    items = [lsn for lsn in (load() if lessons is None else lessons) if kind_of(lsn) == "miss"]
+    return _top_matches(items, _diff_files(diff), diff.lower())
 
 
 def render_probes(probes: list[dict[str, Any]]) -> str:
@@ -191,12 +190,15 @@ def render_probes(probes: list[dict[str, Any]]) -> str:
 def post_filter(hdir: Path, lessons: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
     """Failing tests whose head failure text matches an fp lesson's failure_regex, from <hdir>/run_*.messages.json.
     Returns [{test_id, lesson_id}] (first matching lesson per test) for the caller to move to HELD and log."""
+    msg_files = sorted(Path(hdir).glob("run_*.messages.json"))
+    if not msg_files:
+        return []
     lessons = load() if lessons is None else lessons
     rules = [(lsn["id"], re.compile(lsn["failure_regex"], re.MULTILINE)) for lsn in lessons
              if kind_of(lsn) == "fp" and lsn.get("failure_regex")]
     out: list[dict[str, str]] = []
     seen: set[str] = set()
-    for f in sorted(Path(hdir).glob("run_*.messages.json")):
+    for f in msg_files:
         for test_id, msg in json.loads(f.read_text()).items():
             if test_id in seen:
                 continue
@@ -221,11 +223,12 @@ def render(matched: list[dict[str, Any]]) -> str:
 
 
 def log_hits(run: str, matched: list[dict[str, Any]], log: Path | None = None) -> None:
-    """One line per hunt: which lessons its hunters were shown. prune reads this."""
+    """One line per hunt: which lessons/probes its hunters were shown or applied to hold findings. prune reads this."""
     log = log or hits_log()
     log.parent.mkdir(parents=True, exist_ok=True)
+    ids = list(dict.fromkeys(str(m["id"]) for m in matched if m.get("id")))
     with log.open("a") as fh:
-        fh.write(json.dumps({"run": run, "matched": [m["id"] for m in matched]}) + "\n")
+        fh.write(json.dumps({"run": run, "matched": ids}) + "\n")
 
 
 MONOREPO_ROOTS = {("server", "channels"), ("server", "public"), ("webapp", "channels"), ("webapp", "platform")}

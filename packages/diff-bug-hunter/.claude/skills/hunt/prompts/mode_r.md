@@ -30,5 +30,5 @@ Rules:
 {lang_rules}{lessons}
 Output ONE JSON object, no prose, no markdown fences:
 {"files": [{"path": "<repo path>", "content": "<complete source>"}],
- "tests": [{"test_name": "TestHuntR_CR1_...", "claim_id": "CR1", "checks": "...", "source": "CR1 path:line"}],
+ "tests": [{"test_name": "TestHuntR_CR1_...", "claim_id": "CR1", "source": "CR1 path:line"}],
  "claims": [{"id": "CR1", "testable": true, "tests": ["TestHuntR_CR1_..."], "reason": ""}]}

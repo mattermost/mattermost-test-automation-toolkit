@@ -333,8 +333,7 @@ def review_targets(wt: Path, files: list[str], extra_paths: list[str] | None = N
     out: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for f in [*files, *(extra_paths or [])]:
-        d = str(Path(f).parent)
-        lang = "go" if f.endswith(".go") else "jest"
+        d, lang = str(Path(f).parent), "go" if f.endswith(".go") else "jest"
         if (d, lang) in seen:
             continue
         try:
@@ -344,43 +343,18 @@ def review_targets(wt: Path, files: list[str], extra_paths: list[str] | None = N
         if not dpath.is_dir():
             continue
         seen.add((d, lang))
+        sample = None
         if lang == "go":
             # Prefer a non-test Go file in `d` for package name (a *_test.go file might use package foo_test).
             prod = sorted(p for p in dpath.glob("*.go") if not p.name.endswith("_test.go") and not p.name.startswith("hunt_"))
             sample = prod[0] if prod else (wt / f if (wt / f).is_file() else next(iter(sorted(dpath.glob("*.go"))), None))
-            m = re.search(r"^package (\w+)", sample.read_text(errors="replace"), re.M) if sample else None
-            out.append({"lang": "go", "dir": d, "path": f"{d}/hunt_huntr_test.go", "package": m.group(1) if m else "?"})
-        else:
-            out.append({"lang": "jest", "dir": d, "path": f"{d}/hunt_r.test.tsx"})
+        out.append(ctx_mod.target_entry(d, lang, "r", sample))
     return out
 
 
 def thread_source_view(wt: Path, path: str, patch: str, focus_lines: list[int]) -> str:
     """Full numbered file if <= MAX_SOURCE_LINES, else merged windows around diff hunks AND thread focus lines."""
-    lines = (wt / path).read_text(errors="replace").split("\n")
-    if len(lines) <= ctx_mod.MAX_SOURCE_LINES:
-        return ctx_mod.numbered(lines, 1, len(lines))
-    spans: list[tuple[int, int]] = []
-    for start, n in ctx_mod.hunk_ranges(patch):
-        a, b = max(1, start - 40), min(len(lines), start + n + 40)
-        if a <= b:
-            spans.append((a, b))
-    for ln in focus_lines:
-        clamped = min(len(lines), max(1, ln))
-        a, b = max(1, clamped - THREAD_WINDOW), min(len(lines), clamped + THREAD_WINDOW)
-        if a <= b:
-            spans.append((a, b))
-    if not spans:
-        return ctx_mod.numbered(lines, 1, min(len(lines), 120))
-    spans.sort()
-    merged: list[tuple[int, int]] = [spans[0]]
-    for a, b in spans[1:]:
-        pa, pb = merged[-1]
-        if a <= pb + 1:
-            merged[-1] = (pa, max(pb, b))
-        else:
-            merged.append((a, b))
-    return "\n   ...\n".join(ctx_mod.numbered(lines, a, b) for a, b in merged)
+    return ctx_mod.source_view(wt, path, patch, focus_lines=focus_lines, window=THREAD_WINDOW)
 
 
 def build_review_context(pr: str, hdir: Path, state: dict[str, Any], ctx_data: dict[str, Any],

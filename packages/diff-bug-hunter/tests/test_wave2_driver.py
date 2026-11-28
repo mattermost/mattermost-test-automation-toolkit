@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,28 +17,26 @@ import prepare
 import pytest
 import report
 import telemetry
-import trusted
 import verdict
+from conftest import (
+    FAKE_DISPATCH,
+    JESTDEPS,
+    _git,
+    cli_json,
+    make_repo,
+    needs_jest,
+    vetted_row,
+)
+from conftest import (
+    canned_responses as _canned,
+)
+from conftest import (
+    e2e_repo as _e2e_repo,
+)
+from conftest import (
+    fake_script as _fake,
+)
 from hunt_common import hunt_dir, worktree_paths, write_json
-from test_hunt_engine import FIX, JESTDEPS, _git
-
-FAKE_DISPATCH = '''
-import json, os, sys
-from pathlib import Path
-req = Path(sys.argv[-1])
-data = json.loads(req.read_text())
-tag = req.parent.name
-with Path(os.environ["FAKE_LOG"]).open("a") as fh:
-    fh.write(tag + "\\n")
-src = Path(os.environ["FAKE_RESPONSES"]) / tag / "response.json"
-if src.exists():
-    text = src.read_text()
-elif tag == "vet":
-    text = json.dumps({"rows": []})
-else:
-    text = json.dumps({"files": [], "tests": []})
-Path(data["response_path"]).write_text(text)
-'''
 
 FLAKY_THEN_OK = '''
 import json, os, sys
@@ -56,12 +52,6 @@ Path(json.loads(req.read_text())["response_path"]).write_text(json.dumps({"files
 '''
 
 
-def _fake(tmp: Path, name: str, body: str) -> str:
-    path = tmp / name
-    path.write_text(body)
-    return f"{shlex.quote(sys.executable)} {shlex.quote(str(path))}"
-
-
 def _request(hdir: Path, tag: str) -> Path:
     d = hdir / tag
     d.mkdir(parents=True, exist_ok=True)
@@ -73,16 +63,13 @@ def _request(hdir: Path, tag: str) -> Path:
 
 # ------------------------------------------------------------------ dispatch.py
 
-def test_dispatch_retries_a_502_with_backoff_then_succeeds(tmp_path):
+def test_dispatch_retries_a_502_with_backoff_then_succeeds(tmp_path, monkeypatch):
     cmd = _fake(tmp_path, "flaky.py", FLAKY_THEN_OK)
-    os.environ["FAKE_COUNT"] = str(tmp_path / "count")
-    try:
-        hdir = tmp_path / "hunt"
-        req = _request(hdir, "A")
-        sleeps: list[float] = []
-        res = dispatch.dispatch(req, cmd=cmd, hdir=hdir, tag="A", sleep=sleeps.append)
-    finally:
-        del os.environ["FAKE_COUNT"]
+    monkeypatch.setenv("FAKE_COUNT", str(tmp_path / "count"))
+    hdir = tmp_path / "hunt"
+    req = _request(hdir, "A")
+    sleeps: list[float] = []
+    res = dispatch.dispatch(req, cmd=cmd, hdir=hdir, tag="A", sleep=sleeps.append)
     assert res.status == "ok" and res.retries == 1
     assert sleeps == [1.0]  # first backoff; the second attempt succeeded
     assert json.loads((hdir / "A" / "response.json").read_text()) == {"files": [], "tests": []}
@@ -111,32 +98,23 @@ def test_a_non_transient_failure_is_not_retried(tmp_path):
     assert sleeps == []
 
 
-def test_dispatch_is_idempotent_per_request_sha(tmp_path):
+def test_dispatch_is_idempotent_per_request_sha(tmp_path, monkeypatch):
     cmd = _fake(tmp_path, "fake.py", FAKE_DISPATCH)
     log = tmp_path / "log"
     responses = tmp_path / "responses"
     (responses / "D").mkdir(parents=True)
     (responses / "D" / "response.json").write_text(json.dumps({"files": [{"path": "x"}], "tests": []}))
-    os.environ.update({"FAKE_LOG": str(log), "FAKE_RESPONSES": str(responses)})
-    try:
-        hdir = tmp_path / "hunt"
-        req = _request(hdir, "D")
-        first = dispatch.dispatch(req, cmd=cmd, hdir=hdir, tag="D")
-        second = dispatch.dispatch(req, cmd=cmd, hdir=hdir, tag="D")
-        req.write_text(req.read_text().replace('"system": "s"', '"system": "changed"'))  # a new request: dispatch again
-        third = dispatch.dispatch(req, cmd=cmd, hdir=hdir, tag="D")
-    finally:
-        for k in ("FAKE_LOG", "FAKE_RESPONSES"):
-            os.environ.pop(k, None)
+    monkeypatch.setenv("FAKE_LOG", str(log))
+    monkeypatch.setenv("FAKE_RESPONSES", str(responses))
+    hdir = tmp_path / "hunt"
+    req = _request(hdir, "D")
+    first = dispatch.dispatch(req, cmd=cmd, hdir=hdir, tag="D")
+    second = dispatch.dispatch(req, cmd=cmd, hdir=hdir, tag="D")
+    req.write_text(req.read_text().replace('"system": "s"', '"system": "changed"'))  # a new request: dispatch again
+    third = dispatch.dispatch(req, cmd=cmd, hdir=hdir, tag="D")
     assert (first.status, second.status, third.status) == ("ok", "skipped", "ok")
     assert log.read_text().splitlines() == ["D", "D"]  # the fake ran for the first and the changed request only
     assert json.loads((hdir / "D" / "response.json").read_text()) == {"files": [{"path": "x"}], "tests": []}
-
-
-def _cli_answer(answer: object, **usage: int) -> str:
-    return json.dumps({"result": f"Here it is:\n```json\n{json.dumps(answer)}\n```", "total_cost_usd": 0.5,
-                       "usage": usage or {"input_tokens": 4, "cache_creation_input_tokens": 5,
-                                          "cache_read_input_tokens": 1, "output_tokens": 4}})
 
 
 def test_default_command_is_one_inline_turn_with_no_tools(tmp_path, monkeypatch):
@@ -147,10 +125,9 @@ def test_default_command_is_one_inline_turn_with_no_tools(tmp_path, monkeypatch)
     def fake_run(argv, **kw):
         seen["argv"], seen["input"] = argv, kw["input"]
         seen["system"] = Path(argv[argv.index("--system-prompt-file") + 1]).read_text()
-        return subprocess.CompletedProcess(argv, 0, stdout=_cli_answer({"files": [], "tests": ["t"]}), stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=cli_json({"files": [], "tests": ["t"]}, markdown=True), stderr="")
 
     monkeypatch.delenv("HUNT_DISPATCH_CMD", raising=False)
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
     monkeypatch.setattr(dispatch.subprocess, "run", fake_run)
     hdir = tmp_path / "hunt"
     req = _request(hdir, "A")
@@ -164,9 +141,9 @@ def test_default_command_is_one_inline_turn_with_no_tools(tmp_path, monkeypatch)
     assert "# Schema" in str(seen["input"]) and str(req) not in str(seen["input"])
     assert json.loads((hdir / "A" / "response.json").read_text()) == {"files": [], "tests": ["t"]}
     assert (res.tokens_in, res.cache_write, res.cache_read, res.tokens_out, res.cost_usd) == (10, 5, 1, 4, 0.5)
-    row = [json.loads(x) for x in (hdir / "telemetry.jsonl").read_text().splitlines()][-1]
-    assert (row["tokens_in"], row["cache_write"], row["cache_read"], row["tokens_out"], row["cost_usd"]) == (
-        10, 5, 1, 4, 0.5)
+    summ = telemetry.summarize(hdir)
+    assert (summ["tokens_in"], summ["cache_write"], summ["cache_read"], summ["tokens_out"],
+            summ["total_cost_usd"]) == (10, 5, 1, 4, 0.5)
 
 
 def test_failed_call_reports_the_cli_result_text(tmp_path, monkeypatch):
@@ -177,7 +154,6 @@ def test_failed_call_reports_the_cli_result_text(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(argv, 1, stdout=out, stderr="")
 
     monkeypatch.delenv("HUNT_DISPATCH_CMD", raising=False)
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
     monkeypatch.setattr(dispatch.subprocess, "run", fake_run)
     hdir = tmp_path / "hunt"
     with pytest.raises(dispatch.DispatchError) as e:
@@ -190,7 +166,6 @@ def test_inline_answer_without_json_fails_and_writes_nothing(tmp_path, monkeypat
         return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"result": "I cannot help."}), stderr="")
 
     monkeypatch.delenv("HUNT_DISPATCH_CMD", raising=False)
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
     monkeypatch.setattr(dispatch.subprocess, "run", fake_run)
     hdir = tmp_path / "hunt"
     req = _request(hdir, "A")
@@ -202,15 +177,17 @@ def test_inline_answer_without_json_fails_and_writes_nothing(tmp_path, monkeypat
 def test_inline_input_sends_the_md_user_and_schema_sections(tmp_path):
     hdir = tmp_path / "hunt"
     req = _request(hdir, "A")
-    req.with_suffix(".md").write_text("# Request\n\nWrite to /x\n\n# System\n\nsys\n\n# User\n\nline1\nline2\n\n"
+    doc = json.loads(req.read_text())
+    doc["user"] = "line1\nline2"
+    req.write_text(json.dumps(doc))
+    req.with_suffix(".md").write_text("# Request\n\nWrite to /x\n\n# System\n\nsys\n\n# User\n\nstale_md\n\n"
                                       "# Schema\n\n```json\n{}\n```\n")
     system, stdin = dispatch._inline_input(req)
-    assert stdin.startswith("# User\n\nline1\nline2") and "# Schema" in stdin and "Write to /x" not in stdin
+    assert stdin.startswith("# User\n\nline1\nline2") and "# Schema" in stdin and "stale_md" not in stdin
     assert system.startswith("s\n\n")
 
 
 def test_dispatch_slots_cap_concurrent_calls_and_wait_with_jitter(tmp_path, monkeypatch):
-    monkeypatch.setenv("HUNT_SCRATCH", str(tmp_path / "scratch"))
     monkeypatch.setenv("HUNT_MAX_DISPATCH", "1")
     monkeypatch.setattr(dispatch, "TIMEOUT_S", 2)
     naps: list[float] = []
@@ -224,17 +201,11 @@ def test_dispatch_slots_cap_concurrent_calls_and_wait_with_jitter(tmp_path, monk
 # ------------------------------------------------------------------ prepare.py
 
 def _two_commit_repo(tmp: Path, master_advances: bool) -> Path:
-    repo = tmp / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    (repo / "calc").mkdir()
-    (repo / "calc" / "calc.go").write_text("package calc\n\nfunc F() int { return 1 }\n")
-    (repo / "go.mod").write_text("module x\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    _git(repo, "checkout", "-qb", "feature")
-    (repo / "calc" / "calc.go").write_text("package calc\n\nfunc F() int { return 2 }\n")
-    _git(repo, "commit", "-qam", "head")
+    repo = make_repo(
+        tmp,
+        {"calc/calc.go": "package calc\n\nfunc F() int { return 1 }\n", "go.mod": "module x\n"},
+        {"calc/calc.go": "package calc\n\nfunc F() int { return 2 }\n"},
+    )
     if master_advances:
         _git(repo, "checkout", "-q", "master")
         (repo / "other.txt").write_text("later\n")
@@ -249,6 +220,7 @@ def test_two_dot_range_uses_the_base_ref_itself_not_the_merge_base(tmp_path, mon
     prepare.main("master..feature")
     prep = json.loads((hunt_dir("master..feature") / "prepare.json").read_text())
     assert prep["merge_base"] == _git(repo, "rev-parse", "master")  # the tip, not the fork point
+    assert _git(Path(prep["wt_base"]), "rev-parse", "HEAD") == prep["merge_base"]
     assert prep["base_mode"] == "two-dot" and prep["schema_version"] == prepare.SCHEMA_VERSION
     assert "return 1" in (Path(prep["wt_base"]) / "calc" / "calc.go").read_text()
 
@@ -312,10 +284,11 @@ def test_without_docker_services_use_the_host_tools(monkeypatch):
 # ------------------------------------------------------------------ report.py
 
 def _keep_row() -> dict:
-    return {"id": "calc::TestHuntA_Clamp", "source": "A", "decision": "KEEP", "reason": "Clamp returns hi+1 for hi.",
-            "file_line": "calc/calc.go:9", "caller": "api4 PUT /x", "entry_point": "api4 PUT /x",
-            "repro_cmd": "go test ./calc -run TestHuntA_Clamp", "evidence_path": "run_A.json", "severity": "major",
-            "fix_check": None, "mechanical_verdict": "NEW_PR_BUG"}
+    return vetted_row(
+        id="calc::TestHuntA_Clamp", reason="Clamp returns hi+1 for hi.", file_line="calc/calc.go:9",
+        caller="api4 PUT /x", entry_point="api4 PUT /x", repro_cmd="go test ./calc -run TestHuntA_Clamp",
+        mechanical_verdict="NEW_PR_BUG",
+    )
 
 
 def test_report_writes_only_kept_findings_in_the_schema_shape_and_gaps_in_the_audit(tmp_path):
@@ -379,37 +352,6 @@ def test_only_dropped_candidates_leave_the_tier_clean(tmp_path):
 
 # ------------------------------------------------------------------ hunt.py end to end
 
-def _e2e_repo(tmp: Path, name: str, monkeypatch) -> Path:
-    """Fixture repo: master = fixture base, feature = base + head. HUNT_MM points at it (no origin, local refs)."""
-    repo = tmp / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "master")
-    shutil.copytree(FIX / name / "base", repo, dirs_exist_ok=True)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    _git(repo, "checkout", "-qb", "feature")
-    shutil.copytree(FIX / name / "head", repo, dirs_exist_ok=True)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "head")
-    monkeypatch.setenv("HUNT_MM", str(repo))
-    monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
-    return repo
-
-
-def _canned(tmp: Path, name: str, row_id: str, source: str) -> tuple[Path, Path]:
-    responses = tmp / "responses"
-    shutil.copytree(FIX / name / "responses" / "A", responses / "A")
-    (responses / "vet").mkdir(parents=True)
-    row = {"id": row_id, "source": source, "decision": "KEEP",
-           "reason": "The hunted input returns a value outside the documented range.",
-           "file_line": "calc/calc.go:1", "caller": "calc.Clamp is the exported API the PR changes",
-           "entry_point": "calc.Clamp (library API)", "repro_cmd": f"go test ./calc -run {row_id.split('::')[1]}",
-           "evidence_path": "run_A.json", "severity": "major", "fix_check": None}
-    (responses / "vet" / "response.json").write_text(json.dumps({"rows": [row]}))
-    log = tmp / "dispatch.log"
-    return responses, log
-
-
 def _run_driver(monkeypatch, tmp: Path, target: str, responses: Path, log: Path, cmd: str) -> int:
     monkeypatch.setenv("HUNT_DISPATCH_CMD", cmd)
     monkeypatch.setenv("FAKE_RESPONSES", str(responses))
@@ -425,7 +367,7 @@ def test_end_to_end_go_bug_driver_writes_findings_audit_and_telemetry_and_resume
     hdir = hunt_dir("master..feature")
     findings = json.loads((hdir / "findings.json").read_text())
     assert len(findings) == 1 and findings[0]["head_result"] == "FAIL_3_OF_3"
-    assert findings[0]["repro_cmd"].startswith("go test ./calc -run")
+    assert "run.py repro master..feature A --only calc::TestHuntA_ClampRangeAndIdentity" in findings[0]["repro_cmd"]
     assert json.loads((hdir / "run_A.json").read_text()) == {"calc::TestHuntA_ClampRangeAndIdentity": "FAIL_3_OF_3"}
     assert json.loads((hdir / "base_A.json").read_text()) == {"calc::TestHuntA_ClampRangeAndIdentity": "NEW_PR_BUG"}
     audit = (hdir / "audit.md").read_text()
@@ -436,16 +378,31 @@ def test_end_to_end_go_bug_driver_writes_findings_audit_and_telemetry_and_resume
             "dispatch"} <= stages
     assert all(r["exit"] == "ok" for r in rows)
     calls_first = log.read_text().splitlines()
-    assert {"A", "B", "D", "vet"} <= set(calls_first)
+    assert {"A", "B", "vet"} <= set(calls_first)
+    assert "D" not in calls_first
     # Resume: every output exists, so nothing is dispatched again and the findings are unchanged.
     assert _run_driver(monkeypatch, tmp_path, "master..feature", responses, log, cmd) == 0
     assert log.read_text().splitlines() == calls_first
     assert json.loads((hdir / "findings.json").read_text()) == findings
 
 
+def test_end_to_end_go_bug_driver_runs_mode_d_when_opted_in(tmp_path, monkeypatch):
+    _e2e_repo(tmp_path, "go_bug", monkeypatch)
+    responses, log = _canned(tmp_path, "go_bug", "calc::TestHuntA_ClampRangeAndIdentity", "A")
+    cmd = _fake(tmp_path, "fake_dispatch.py", FAKE_DISPATCH)
+    monkeypatch.setenv("HUNT_DISPATCH_CMD", cmd)
+    monkeypatch.setenv("FAKE_RESPONSES", str(responses))
+    monkeypatch.setenv("FAKE_LOG", str(log))
+    assert hunt.main(["hunt.py", "master..feature", "--modes", "A,B,D"]) == 0
+    calls = log.read_text().splitlines()
+    assert {"A", "B", "D", "vet"} <= set(calls)
+    hdir = hunt_dir("master..feature")
+    assert json.loads((hdir / "driver.json").read_text())["modes"] == ["A", "B", "D"]
+    assert json.loads((hdir / "state.json").read_text())["modes"] == ["A", "B", "D"]
+
+
+@needs_jest
 def test_end_to_end_react_bug_driver_finds_the_react_regression(tmp_path, monkeypatch):
-    if not os.environ.get("HUNT_REQUIRE_DEPS") and not JESTDEPS.is_dir():
-        pytest.skip("run `make jest-deps` first")
     _e2e_repo(tmp_path, "react_bug", monkeypatch)
     target = "master..feature"
     prepare.main(target)  # prepare first, then link the jest deps into the worktrees the driver will use
@@ -454,6 +411,15 @@ def test_end_to_end_react_bug_driver_finds_the_react_regression(tmp_path, monkey
         (w / "web" / "node_modules").unlink(missing_ok=True)
         (w / "web" / "node_modules").symlink_to(JESTDEPS)
     responses, log = _canned(tmp_path, "react_bug", "web/src/hunt_a.test.tsx::HuntA HuntA_neverExceedsMax", "A")
+    vet_p = responses / "vet" / "response.json"
+    vet_doc = json.loads(vet_p.read_text())
+    vet_doc["rows"][0].update(
+        file_line="web/src/counter.tsx:10",
+        caller="Counter component under test",
+        entry_point="Counter (React component)",
+        repro_cmd="npx jest web/src/hunt_a.test.tsx",
+    )
+    vet_p.write_text(json.dumps(vet_doc))
     cmd = _fake(tmp_path, "fake_dispatch.py", FAKE_DISPATCH)
     assert _run_driver(monkeypatch, tmp_path, target, responses, log, cmd) == 0
     hdir = hunt_dir(target)
@@ -462,7 +428,7 @@ def test_end_to_end_react_bug_driver_finds_the_react_regression(tmp_path, monkey
     assert json.loads((hdir / "base_A.json").read_text()) == {
         "web/src/hunt_a.test.tsx::HuntA HuntA_neverExceedsMax": "NEW_PR_BUG"}
     findings = json.loads((hdir / "findings.json").read_text())
-    assert [f["file_line"] for f in findings] == ["calc/calc.go:1"]
+    assert [f["file_line"] for f in findings] == ["web/src/counter.tsx:10"]
 
 
 
@@ -528,10 +494,10 @@ def _skeptic_hunt(tmp: Path) -> Path:
 
 def test_repro_cmd_runs_from_the_nearest_go_module_or_jest_root(tmp_path):
     hdir = _skeptic_hunt(tmp_path)
-    assert hunt.repro_cmd(hdir, "server/channels/app::TestHuntB_X") == \
-        "cd server && go test ./channels/app -run '^TestHuntB_X$' -count=1"
-    assert hunt.repro_cmd(hdir, "server/public/model::TestHuntD_Y/sub") == \
-        "cd server/public && go test ./model -run '^TestHuntD_Y$' -count=1"
+    c1 = hunt.repro_cmd(hdir, "server/channels/app::TestHuntB_X")
+    assert "run.py" in c1 and "repro 1 A --only server/channels/app::TestHuntB_X" in c1
+    c2 = hunt.repro_cmd(hdir, "server/public/model::TestHuntD_Y/sub", tag="B")
+    assert "run.py" in c2 and "repro 1 B --only server/public/model::TestHuntD_Y/sub" in c2
     assert hunt.repro_cmd(hdir, "webapp/channels/src/c/hunt_b.test.tsx::HuntB HuntB_z") == \
         "cd webapp/channels && npx jest src/c/hunt_b.test.tsx -t 'HuntB HuntB_z'"
 
@@ -567,7 +533,7 @@ def test_the_skeptic_gets_intent_diff_entry_point_callers_test_source_and_a_mech
     cand = user["candidates"][0]
     assert cand["mechanical_verdict"] == "NEW_API" and "func TestHuntB_WriteDenied" in cand["test_source"]
     row = json.loads((hdir / "vetted.json").read_text())["rows"][0]
-    assert row["repro_cmd"] == "cd server && go test ./channels/app -run '^TestHuntB_WriteDenied$' -count=1"
+    assert "run.py" in row["repro_cmd"] and "repro 1 B --only server/channels/app::TestHuntB_WriteDenied" in row["repro_cmd"]
     adm = verdict.admissibility(hdir)
     assert [r["id"] for r in adm["keep"]] == [tid] and adm["held"] == []
 
@@ -683,10 +649,10 @@ def test_kept_rows_are_grouped_by_root_cause_for_the_author(tmp_path):
 
 
 def test_findings_match_the_finding_schema_keys_and_types():
+    import dispatch
     schema = json.loads((report.Path(hunt.SKILL_DIR) / "finding.schema.json").read_text())
     item = report.grouped_findings([_kept("t1", "a.go:1"), _kept("t2", "a.go:1")])[0]
-    assert set(schema["required"]) <= set(item) <= set(schema["properties"])
-    assert set(item["related"][0]) == set(schema["properties"]["related"]["items"]["required"])
+    assert dispatch.validate_schema(item, schema) == []
 
 
 def test_skeptic_eval_scores_decisions_against_labels():
@@ -765,7 +731,7 @@ def test_the_skeptic_cannot_replace_the_mechanical_repro_command(tmp_path, monke
     monkeypatch.setattr(hunt, "dispatch_one", fake_dispatch)
     hunt.stage_vet(hdir)
     row = json.loads((hdir / "vetted.json").read_text())["rows"][0]
-    assert row["repro_cmd"] == "cd server && go test ./channels/app -run '^TestHuntB_X$' -count=1"
+    assert "run.py" in row["repro_cmd"] and "repro 1 B --only server/channels/app::TestHuntB_X" in row["repro_cmd"]
 
 
 def test_repro_for_a_jest_test_outside_the_root_names_its_roots(tmp_path):
@@ -820,10 +786,12 @@ def test_the_mode_d_fix_check_ignores_records_that_change_between_runs(tmp_path,
     ident = f"{u}::TestHuntD_X"
     rkey = (u, run.record_name(ident))
     write_json(hdir / "diff_D.json", {ident: "DIFF"})
+    write_json(hdir / "diff_D.examples.json", {ident: {"examples": [{"i": 0, "input": 1, "base": "old", "head": "new"}]}})
     write_json(hdir / "D" / "response.json", {"files": [{"path": path, "content": ""}]})
-    runs = {"fix": {0: {"output": "same"}, 1: {"output": "t1"}}, "fix2": {0: {"output": "same"}, 1: {"output": "t2"}},
-            "fixbase": {0: {"output": "same"}, 1: {"output": "t3"}},
-            "fixbase2": {0: {"output": "same"}, 1: {"output": "t4"}}}
+    runs = {"fix": {0: {"input": 1, "output": "old"}, 1: {"input": 2, "output": "t1"}},
+            "fix2": {0: {"input": 1, "output": "old"}, 1: {"input": 2, "output": "t2"}},
+            "fixbase": {0: {"input": 1, "output": "old"}, 1: {"input": 2, "output": "t3"}},
+            "fixbase2": {0: {"input": 1, "output": "old"}, 1: {"input": 2, "output": "t4"}}}
 
     def fake_pass(wt, state, tag, units, td, stem, base=False):
         o = run.Outcome()
@@ -906,7 +874,7 @@ def test_raising_the_budget_lets_a_resumed_hunt_dispatch_again(tmp_path, monkeyp
 def test_a_jest_repro_title_is_shell_quoted(tmp_path):
     hdir = _skeptic_hunt(tmp_path)
     cmd = hunt.repro_cmd(hdir, "webapp/channels/src/c/hunt_b.test.tsx::HuntB $(touch pwned)")
-    assert cmd.endswith("-t 'HuntB $(touch pwned)'")
+    assert cmd.endswith(r"-t 'HuntB \$\(touch pwned\)'")
 
 
 # ------------------------------------------------------------------ v3 rerun defects (2026-11-26)

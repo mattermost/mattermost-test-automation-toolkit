@@ -11,17 +11,8 @@ from pathlib import Path
 import old_tests
 import pr_tests
 import pytest
-import run
-from test_hunt_engine import _git, make_hunt
-
-
-def _clean(*wts: str) -> bool:
-    try:
-        for wt in wts:
-            run.ensure_clean(Path(wt))
-    except run.InfraError:
-        return False
-    return True
+from conftest import _git, make_hunt
+from conftest import wts_clean as _clean
 
 
 def _msgs(hdir: Path, name: str) -> dict:

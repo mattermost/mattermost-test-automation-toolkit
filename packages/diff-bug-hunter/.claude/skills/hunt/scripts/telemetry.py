@@ -7,6 +7,8 @@ effort_tier, schema_version). Each line is appended with a single write.
 from __future__ import annotations
 
 import json
+import math
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -20,7 +22,8 @@ TOKEN_KEYS = ("tokens_in", "cache_write", "cache_read", "tokens_out")  # tokens_
 def _append(hdir: str | Path, row: dict[str, Any]) -> None:
     path = Path(hdir)
     path.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(row, sort_keys=True, default=str) + "\n"
+    clean = {k: (None if isinstance(v, float) and not math.isfinite(v) else v) for k, v in row.items()}
+    line = json.dumps(clean, sort_keys=True, default=str, allow_nan=False) + "\n"
     with open(path / LEDGER, "a", encoding="utf-8") as fh:
         fh.write(line)
 
@@ -43,16 +46,23 @@ def stage(hdir: str | Path, name: str, **fields: Any) -> Iterator[dict[str, Any]
     extra: dict[str, Any] = dict(fields)
     start, t0 = time.time(), time.monotonic()
     exit_status = "ok"
+    in_exc = False
     try:
         yield extra
     except BaseException as err:
+        in_exc = True
         exit_status = type(err).__name__
         raise
     finally:
         secs = round(time.monotonic() - t0, 6)
         row: dict[str, Any] = {"stage": name, "start": start, "end": start + secs, "secs": secs, "exit": exit_status}
         row.update(extra)
-        _append(hdir, row)
+        try:
+            _append(hdir, row)
+        except OSError as log_err:
+            if not in_exc:
+                raise
+            print(f"[telemetry] failed to record {name} ({exit_status}): {log_err}", file=sys.stderr)
 
 
 def _num(v: Any) -> float:

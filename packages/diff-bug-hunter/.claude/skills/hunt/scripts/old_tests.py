@@ -40,15 +40,13 @@ sys.dont_write_bytecode = True
 if not sys.pycache_prefix:
     sys.pycache_prefix = "/dev/null/hunt-pyc"
 
-import os
 import re
-import signal
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import prefilter
-from ctx import is_generated, top_blocks
+from ctx import GO_TEST, go_bodies, is_generated, top_blocks
 from hunt_common import (
     InfraError,
     clean_untracked,
@@ -56,23 +54,32 @@ from hunt_common import (
     git_cmd,
     git_env,
     hunt_dir,
-    hunt_lock,
     read_state,
+    run_locked_cli,
     sh,
-    terminate_handler,
     under,
     write_json,
 )
-from run import PACKAGE_FAILED, CompileError, Outcome, classify, ensure_clean, go_root, go_run, jest_run
+from run import (
+    GO_UNUSED_IMPORT,
+    PACKAGE_FAILED,
+    CompileError,
+    Outcome,
+    classify,
+    ensure_clean,
+    go_build_errors,
+    go_root,
+    go_run,
+    jest_run,
+    parse_go_errors,
+)
 from verdicts import Verdict
 
-GO_TEST = re.compile(r"^func (Test(?:[A-Z_0-9]\w*)?)\((?:\w+ )?\*(?:\w+\.)?T\)")
 JEST_TEST = re.compile(r"\.test\.[jt]sx?$")
 MAX_UNITS = 20  # Go packages plus Jest files per hunt; the rest are listed as skipped
 RUNS = 3
 SALVAGE_ROUNDS = 3  # compile, delete the functions the compiler names, retry: at most this many deletions rounds
 GO_ERR = re.compile(r"^(?:vet: )?(\S+?\.go):(\d+):(?:\d+:)? (.+)$", re.M)  # path.go:LINE:COL: message
-UNUSED_IMPORT = re.compile(r'"[^"]+" imported (?:as \w+ )?and not used')
 
 
 def edited_tests(repo: Path, mb: str, head: str) -> dict[str, str]:
@@ -88,15 +95,10 @@ def edited_tests(repo: Path, mb: str, head: str) -> dict[str, str]:
     return out
 
 
-def _bodies(src: str) -> dict[str, str]:
-    lines = src.split("\n")
-    return {name: "\n".join(lines[a - 1:b]) for name, a, b in top_blocks(lines, "go")}
-
-
 def go_candidates(base_src: str, head_src: str | None) -> list[str]:
     """Test functions of the base file to run: their body changed or is gone at head, or they call a helper (a non-test
     top-level function of the same file) that changed or is gone. TestMain changing makes every test a candidate."""
-    base, head = _bodies(base_src), _bodies(head_src or "")
+    base, head = go_bodies(base_src), go_bodies(head_src or "")
     tests = {}
     for name, body in base.items():
         m = GO_TEST.match(body.split("\n", 1)[0])
@@ -145,7 +147,7 @@ def support_scope(path: str) -> str:
 def support_exports(base_src: str, head_src: str | None) -> set[str]:
     """Exported top-level functions another package can reference whose behaviour differs at head: the ones whose body
     changed or is gone, plus those that call (even through unexported helpers) a changed function of the same file."""
-    base, head = _bodies(base_src), _bodies(head_src or "")
+    base, head = go_bodies(base_src), go_bodies(head_src or "")
     plain = {n: b for n, b in base.items() if "." not in n and "#" not in n}
     changed = {n for n, b in plain.items() if head.get(n) != b}
     grew = True
@@ -167,7 +169,7 @@ def store_callers(repo: Path, head: str, scope: str, names: set[str], pkg: str =
         path = line.split(":", 1)[1] if ":" in line else line
         if not path.endswith("_test.go"):
             continue
-        for body in _bodies(git(repo, "show", f"{head}:{path}")).values():
+        for body in go_bodies(git(repo, "show", f"{head}:{path}")).values():
             m = GO_TEST.match(body)
             if m and ref.search(body):  # the whole body: `func TestX(t *testing.T) { storetest.F(t) }` is one line
                 out.setdefault(str(Path(path).parent), {})[m.group(1)] = path
@@ -238,17 +240,8 @@ def verdict(head: list[str], base: str | None, pkg_base: str | None, name: str) 
 def _compile_errors(wt: Path, unit: dict[str, Any]) -> str:
     """The compiler's errors for the unit's package, all of them: -e lifts the 10-error cap on the test package and on
     every package a swapped file lives in (storetest, say, which sqlstore's tests import)."""
-    root = go_root(wt, unit["dir"])
     dirs = {unit["dir"]} | {str(Path(f).parent) for f, _ in unit["swap"] if f.endswith(".go")}
-    flags = []
-    for d in sorted(dirs):
-        p = sh(["go", "list", "-f", "{{.ImportPath}}", "./" + os.path.relpath(wt / d, root)], root, check=False,
-               timeout=300)
-        if p.returncode == 0 and p.stdout.strip():
-            flags.append(f"-gcflags={p.stdout.strip().splitlines()[0]}=-e")
-    p = sh(["go", "test", "-c", "-o", os.devnull, *flags, "./" + os.path.relpath(wt / unit["dir"], root)], root,
-           check=False, timeout=900)
-    return p.stdout + p.stderr
+    return go_build_errors(wt, unit["dir"], dirs)
 
 
 def _salvage(wt: Path, unit: dict[str, Any], swap: Swap, tests: list[str], errors: str) -> dict[str, str] | None:
@@ -259,9 +252,8 @@ def _salvage(wt: Path, unit: dict[str, Any], swap: Swap, tests: list[str], error
     swapped = {under(wt, f) for f, st in unit["swap"] if f.endswith(".go") and st != "A"}
     callers = {under(wt, f) for f in unit.get("callers", [])}
     by_file: dict[Path, list[tuple[int, str]]] = {}
-    for e in GO_ERR.finditer(errors):
-        raw = Path(e.group(1))
-        by_file.setdefault((raw if raw.is_absolute() else root / raw).resolve(), []).append((int(e.group(2)), e.group(3)))
+    for f, line, msg in parse_go_errors(errors, root, GO_ERR):
+        by_file.setdefault(f, []).append((line, msg))
     if not by_file or not set(by_file) <= swapped | callers:
         return None
     removed: dict[str, str] = {}
@@ -273,7 +265,7 @@ def _salvage(wt: Path, unit: dict[str, Any], swap: Swap, tests: list[str], error
         for line, msg in errs:
             blk = next((b for b in blocks if b[1] <= line <= b[2]), None)
             if blk is None:
-                if UNUSED_IMPORT.fullmatch(msg):
+                if GO_UNUSED_IMPORT.match(msg):
                     gone.add(line)  # a deleted function left its import unused
                     continue
                 return None
@@ -485,22 +477,19 @@ def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(__doc__)
         return 1
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, terminate_handler)
     hdir = hunt_dir(argv[1])
-    try:
-        with hunt_lock(hdir, argv[1]):
-            out = cmd_old(hdir, read_state(hdir))
-    except InfraError as e:
-        print(f"INFRA_ERROR {e}")
-        return 2
-    if not out["units"]:
-        print("[old] the PR edits or deletes no existing test: nothing to run")
-    for n, v in out["tests"].items():
-        print(f"[old] {n}: {v}")
-    for k in out["skipped"]:
-        print(f"[old] skipped: {k}")
-    return 0
+
+    def _run() -> int:
+        out = cmd_old(hdir, read_state(hdir))
+        if not out["units"]:
+            print("[old] the PR edits or deletes no existing test: nothing to run")
+        for n, v in out["tests"].items():
+            print(f"[old] {n}: {v}")
+        for k in out["skipped"]:
+            print(f"[old] skipped: {k}")
+        return 0
+
+    return run_locked_cli(argv[1], hdir, _run)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,24 @@
     "entry_point": false,
     "enclosing": "initJobs",
     "source": " 1766  \t\tbuilder := jobsLdapSyncInterface(New(ServerConnector(s.Channels())))\n 1767  \t\ts.Jobs.RegisterJobType(model.JobTypeLdapSync, builder.MakeWorker(), builder.MakeScheduler())\n 1768  \t}\n 1769  \n 1770  \tif jobsAccessControlSyncJobInterface != nil {\n 1771  \t\tbuilder := jobsAccessControlSyncJobInterface(s)\n 1772  \t\ts.Jobs.RegisterJobType(model.JobTypeAccessControlSync, builder.MakeWorker(), builder.MakeScheduler())\n 1773  \t}\n 1774  \n 1775  \tif jobsAccessControlTeamSyncJobInterface != nil {\n 1776  \t\tbuilder := jobsAccessControlTeamSyncJobInterface(s)\n 1777  \t\ts.Jobs.RegisterJobType(model.JobTypeAccessControlTeamSync, builder.MakeWorker(), builder.MakeScheduler())\n 1778  \t}"
+   },
+   {
+    "file": "server/channels/jobs/health_check/scheduler.go",
+    "symbol": "ScheduleJob",
+    "lines": "46-57",
+    "hop": 1,
+    "entry_point": false,
+    "enclosing": "ScheduleJob",
+    "source": "   46  // ScheduleJob skips without a Professional license, as the run would only fail. The license is\n   47  // checked here rather than in Enabled, which the framework only re-reads on config changes, so\n   48  // a license added later still gets the next hourly run.\n   49  //\n   50  // It also keeps runs from overlapping, which the framework doesn't: it passes pendingJobs but\n   51  // PeriodicScheduler ignores it and creates a job every period. A job pending or in progress\n   52  // skips the run; CreateJobOnce checks again atomically as it saves.\n   53  func (s *Scheduler) ScheduleJob(rctx request.CTX, _ *model.Config, pendingJobs bool, _ *model.Job) (*model.Job, *model.AppError) {\n   54  \tif !model.MinimumProfessionalLicense(s.licenseFunc()) || pendingJobs {\n   55  \t\treturn nil, nil\n   56  \t}"
+   },
+   {
+    "file": "server/channels/app/health_check.go",
+    "symbol": "StartHealthCheckRun",
+    "lines": "126-135",
+    "hop": 1,
+    "entry_point": true,
+    "enclosing": "StartHealthCheckRun",
+    "source": "  126  // It refuses with 501 unless the health dashboard is enabled and licensed: the health-check\n  127  // workers don't run otherwise, so the job would never be picked up.\n  128  func (a *App) StartHealthCheckRun(rctx request.CTX) (*model.Job, error) {\n  129  \tif !a.Config().FeatureFlags.HealthDashboard {\n  130  \t\treturn nil, model.NewAppError(\"StartHealthCheckRun\", \"api.health_finding.feature_disabled.app_error\", nil, \"\", http.StatusNotImplemented)\n  131  \t}\n  132  \tif !model.MinimumProfessionalLicense(a.Channels().License()) {\n  133  \t\treturn nil, model.NewAppError(\"StartHealthCheckRun\", \"api.health_finding.license.app_error\", nil, \"\", http.StatusNotImplemented)\n  134  \t}"
    }
   ],
   "candidates": [

@@ -10,6 +10,7 @@ from pathlib import Path
 import eval_bugs
 import hunt
 import ledger
+import report
 import trusted
 
 from tests.test_hunt_engine import _eval_manifest
@@ -118,17 +119,78 @@ def test_a_mode_a_run_without_changed_line_coverage_blocks_clean(tmp_path):
 def test_the_driver_measures_changed_lines_unless_a_bug_is_kept(tmp_path):
     h = tmp_path / "h"
     h.mkdir()
-    assert hunt.cover_done(h) is True  # no Mode A run: nothing to measure
+    assert hunt.cover_done(h, ("A",)) is True  # no Mode A run: nothing to measure
     (h / "run_A.json").write_text(json.dumps({"p::T": "PASS"}))
-    assert hunt.cover_done(h) is False
+    assert hunt.cover_done(h, ("A",)) is False
     (h / "run_A.coverage.json").write_text('{"reached": 0, "executable": 0}')
-    assert hunt.cover_done(h) is True
+    assert hunt.cover_done(h, ("A",)) is True
     (h / "run_A.coverage.json").unlink()
     (h / "base_A.json").write_text(json.dumps({"p::T": "NEW_PR_BUG"}))
     (h / "run_A.json").write_text(json.dumps({"p::T": "FAIL_3_OF_3"}))
     (h / "vetted.json").write_text(json.dumps({"rows": [_keep("A", "p::T")]}))
-    assert hunt.cover_done(h) is True  # a kept NEW_PR_BUG is Bug Proven: the coverage run is skipped
+    assert hunt.cover_done(h, ("A",)) is True  # a kept NEW_PR_BUG is Bug Proven: the coverage run is skipped
 
+
+DISMISSED = "1 mechanical failure(s) dismissed by the skeptic"
+
+
+def _drop(source: str, rid: str) -> dict:
+    return {**_keep(source, rid), "decision": "DROP"}
+
+
+def test_a_model_drop_of_a_mechanical_failure_is_partial_not_clean(tmp_path):
+    row = _record(tmp_path, {"p::T": "FAIL_3_OF_3"}, {"p::T": "NEW_PR_BUG"}, [_drop("A", "p::T")])
+    assert row["confidence_tier"] == "Partial or Unverified Coverage" and row["gaps"] == [DISMISSED]
+
+
+def test_a_model_drop_of_a_mode_d_diff_is_partial_not_clean(tmp_path):
+    row = _record(tmp_path, {}, {}, [_drop("D", "p::D")], diff={"p::D": "DIFF"})
+    assert row["confidence_tier"] == "Partial or Unverified Coverage" and row["gaps"] == [DISMISSED]
+
+
+def test_a_drop_of_a_non_mechanical_row_stays_clean(tmp_path):
+    row = _record(tmp_path, {"p::T": "PASS"}, {"p::T": "PRE_EXISTING"}, [_drop("A", "p::T")])
+    assert row["confidence_tier"] == "High-Confidence Clean" and row["gaps"] == []
+
+
+def test_a_drop_in_an_archived_batch_is_counted_against_that_batch(tmp_path):
+    h = tmp_path / "h"
+    h.mkdir()
+    (h / "state.json").write_text(json.dumps({"pr": "1", "head": "h", "merge_base": "b", "batches": 2}))
+    (h / "run_A.json").write_text(json.dumps({"p::T": "PASS"}))
+    (h / "run_B.json").write_text(json.dumps({}))
+    (h / "diff_D.json").write_text(json.dumps({"p::D": "SAME"}))
+    (h / "run_A.coverage.json").write_text('{"reached": 1, "executable": 1}')
+    (h / "base_A.json").write_text(json.dumps({"p::T": "PRE_EXISTING"}))
+    b1 = h / "batches" / "batch_1"
+    b1.mkdir(parents=True)
+    (b1 / "state.json").write_text(json.dumps({"changed": ["a.go"]}))
+    (b1 / "base_A.json").write_text(json.dumps({"p::U": "NEW_PR_BUG"}))
+    (b1 / "verdict.json").write_text(json.dumps({"vetted_present": True, "keep": [],
+                                                  "held": [{"row": _drop("A", "p::U"), "reasons": ["decision=DROP"]}]}))
+    row = ledger.record("1", hdir=h, out_path=tmp_path / "l.jsonl")
+    assert row["confidence_tier"] == "Partial or Unverified Coverage" and DISMISSED in row["gaps"]
+    tier, gaps, _, _ = report._tier(h, {"batches": 2}, [], [])
+    assert tier == "Partial or Unverified Coverage" and DISMISSED in gaps
+
+
+def test_a_drop_is_not_cleared_by_a_newer_batch_that_says_pre_existing(tmp_path):
+    h = tmp_path / "h"
+    h.mkdir()
+    (h / "state.json").write_text(json.dumps({"pr": "1", "head": "h", "merge_base": "b", "batches": 2}))
+    (h / "run_A.json").write_text(json.dumps({"p::T": "PASS"}))
+    (h / "run_B.json").write_text(json.dumps({}))
+    (h / "diff_D.json").write_text(json.dumps({"p::D": "SAME"}))
+    (h / "run_A.coverage.json").write_text('{"reached": 1, "executable": 1}')
+    (h / "base_A.json").write_text(json.dumps({"p::T": "PRE_EXISTING"}))
+    b1 = h / "batches" / "batch_1"
+    b1.mkdir(parents=True)
+    (b1 / "state.json").write_text(json.dumps({"changed": ["a.go"]}))
+    (b1 / "base_A.json").write_text(json.dumps({"p::T": "NEW_PR_BUG"}))
+    (b1 / "verdict.json").write_text(json.dumps({"vetted_present": True, "keep": [],
+                                                  "held": [{"row": _drop("A", "p::T"), "reasons": ["decision=DROP"]}]}))
+    row = ledger.record("1", hdir=h, out_path=tmp_path / "l.jsonl")
+    assert row["confidence_tier"] == "Partial or Unverified Coverage" and DISMISSED in row["gaps"]
 
 def test_a_failed_cover_run_is_a_gap_and_the_hunt_reaches_the_verdict(tmp_path, monkeypatch):
     h = tmp_path / "h"

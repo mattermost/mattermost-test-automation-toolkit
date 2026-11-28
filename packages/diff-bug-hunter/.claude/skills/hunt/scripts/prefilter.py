@@ -56,7 +56,7 @@ RISK: list[tuple[str, int]] = [
     (_w("sync") + r"\.|" + _w("go") + r" func|" + _w("atomic") + r"\.|" + _w("mutex", "cache", "cluster", "queue")
      + r"|" + _w("lock") + r"\(|" + _w("chan") + r" |" + _w("select") + r" \{|" + _w("job", "jobs"), 7),
     (r"/public/model/", 6),
-    (_w("config", "featureflag", "audit", "license"), 5),
+    (_w("config", "featureflag", "feature_flag", "audit", "license"), 5),
     (_w("reducer", "selector", "dispatch") + r"|" + _w("action", "actions") + r"/", 4),
     (r"/app/|/platform/|/cmd/mmctl/|/src/components/|/src/utils/", 3),
 ]

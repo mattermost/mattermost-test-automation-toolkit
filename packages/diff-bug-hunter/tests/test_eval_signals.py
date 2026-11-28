@@ -7,37 +7,25 @@ path runs for real on the same fixture repos as test_hunt_engine.py's eval tests
 from __future__ import annotations
 
 import json
-import os
 import shlex
-import subprocess
 import sys
 import types
 from pathlib import Path
 from typing import Any
 
+import eval_bugs
+import hunt_common
+import mine_controls
+import old_tests
 import pytest
-
-FIX = Path(__file__).resolve().parent / "hunt_fixtures"
-
-import eval_bugs  # noqa: E402
-import hunt_common  # noqa: E402
-import mine_controls  # noqa: E402
-import old_tests  # noqa: E402
-import run  # noqa: E402
-import trusted  # noqa: E402
-
-GIT_ENV = {**hunt_common.git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
-           "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+import run
+import trusted
+from conftest import FIX, _git, make_repo
 
 
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch):
     monkeypatch.setenv("HUNT_TRUSTED_REF", trusted.WORKTREE)
-
-
-def _git(repo: Path, *args: str, when: str | None = None) -> str:
-    env = {**GIT_ENV, **({"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when} if when else {})}
-    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True, env=env).stdout.strip()
 
 
 # ------------------------------------------------------------------ scoring, no repository needed
@@ -99,20 +87,10 @@ def test_scorecard_ignores_a_signal_that_was_switched_off():
 def _fixture_manifest(tmp: Path, responses: bool = True) -> tuple[Path, Path]:
     """The clamp bug (go_bug) and the clean control (clean), as test_hunt_engine.py builds them. -> (manifest, bug repo)"""
     tmp.mkdir(parents=True, exist_ok=True)
-    repo = tmp / "bugrepo"
-    ctl_repo = tmp / "cleanrepo"
-    for r, name, msg in ((repo, "go_bug", "Make Clamp faster\n\nAvoid comparison in hot path."),
-                         (ctl_repo, "clean", "Handle zero total in Percent")):
-        r.mkdir()
-        _git(r, "init", "-q", "-b", "master")
-        for step in ("base", "head"):
-            for f in (FIX / name / step).rglob("*"):
-                if f.is_file():
-                    dst = r / f.relative_to(FIX / name / step)
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    dst.write_bytes(f.read_bytes())
-            _git(r, "add", "-A")
-            _git(r, "commit", "-qm", "base" if step == "base" else msg)
+    repo = make_repo(tmp, "go_bug", "go_bug", head_msg="Make Clamp faster\n\nAvoid comparison in hot path.",
+                     dirname="bugrepo", feature_branch=None)
+    ctl_repo = make_repo(tmp, "clean", "clean", head_msg="Handle zero total in Percent",
+                         dirname="cleanrepo", feature_branch=None)
     bug = _git(repo, "rev-parse", "HEAD")
     _git(repo, "revert", "--no-edit", "HEAD")
     manifest: dict[str, Any] = {
@@ -174,8 +152,10 @@ def test_eval_records_a_missing_or_failing_pr_signal_and_keeps_the_entry(tmp_pat
     path, _ = _fixture_manifest(tmp_path)
     monkeypatch.setattr(old_tests, "cmd_old", lambda hdir, state: {"tests": {}})
     monkeypatch.setitem(sys.modules, "pr_tests", None)  # import raises ImportError
-    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out")]) == 0
-    rows = {r["id"]: r for r in _card(tmp_path)["rows"]}
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out")]) == 1
+    card = _card(tmp_path)
+    assert card["fp_checks"]["pr_ci_fp_rate"] is False
+    rows = {r["id"]: r for r in card["rows"]}
     assert "signal not available" in rows["clamp"]["pr_error"] and rows["clamp"]["error"] is None
     assert rows["clamp"]["vetted"] is True  # the hunters' result stands
 
@@ -185,8 +165,10 @@ def test_eval_records_a_missing_or_failing_pr_signal_and_keeps_the_entry(tmp_pat
     fake = types.ModuleType("pr_tests")
     fake.cmd_pr = infra  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "pr_tests", fake)
-    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out2")]) == 0
-    rows = {r["id"]: r for r in _card(tmp_path, "out2")["rows"]}
+    assert eval_bugs.main(["eval_bugs.py", str(path), "--out", str(tmp_path / "out2")]) == 1
+    card2 = _card(tmp_path, "out2")
+    assert card2["fp_checks"]["pr_ci_fp_rate"] is False
+    rows = {r["id"]: r for r in card2["rows"]}
     assert rows["clamp"]["pr_error"] == "no CI config here" and rows["clamp"]["error"] is None
     assert "pr-tests ERROR no CI config here" in capsys.readouterr().out
 

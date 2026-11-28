@@ -88,12 +88,14 @@ from typing import Any
 
 import build_requests
 import ctx
+import ledger
+import lessons
 import old_tests
 import prepare
 import review_threads
 import run
 import verdict
-from hunt_common import InfraError, git, load_json, require_disk, sh, write_json
+from hunt_common import InfraError, git, load_json, read_optional_dict, require_disk, sh, write_json
 from verdicts import Verdict
 
 CASE_KEYS = ("id", "bug_sha", "fix_sha", "area", "bug", "source")
@@ -181,7 +183,15 @@ def load_manifest(path: Path, repo_override: Path | None,
             raise ManifestError(f"{e.get('id')}: no repo (set manifest repo or --repo)")
         return r if r.is_absolute() else (path.parent / r).resolve()
 
-    cases, ctrls, skipped_missing = [], [], []
+    def resolve(repo: Path, rev: str, eid: Any) -> str | None:
+        sha = _resolve_commit(repo, rev, skip_missing)
+        if sha is None:
+            skipped_missing.append(str(eid))
+        return sha
+
+    cases: list[dict[str, Any]] = []
+    ctrls: list[dict[str, Any]] = []
+    skipped_missing: list[str] = []
     for e in m["cases"]:
         kind = str(e.get("kind", "revert")).strip()
         if kind not in VALID_KINDS:
@@ -191,28 +201,18 @@ def load_manifest(path: Path, repo_override: Path | None,
         if missing:
             raise ManifestError(f"case {e.get('id')}: missing {missing}")
         repo = repo_of(e)
-        bug = _resolve_commit(repo, e["bug_sha"], skip_missing)
-        if bug is None:
-            skipped_missing.append(str(e["id"]))
+        bug = resolve(repo, e["bug_sha"], e["id"])
+        resolved_base = resolve(repo, e["base_sha"], e["id"]) if bug and e.get("base_sha") else None
+        if not bug or (e.get("base_sha") and not resolved_base):
             continue
-        resolved_base: str | None = None
-        if e.get("base_sha"):
-            resolved_base = _resolve_commit(repo, e["base_sha"], skip_missing)
-            if resolved_base is None:
-                skipped_missing.append(str(e["id"]))
-                continue
         if kind == "revert":
-            fix = _resolve_commit(repo, e["fix_sha"], skip_missing)
-            if fix is None:
-                skipped_missing.append(str(e["id"]))
+            fix = resolve(repo, e["fix_sha"], e["id"])
+            if not fix:
                 continue
             if bug not in git(repo, "log", "-1", "--format=%B", fix):
                 raise ManifestError(f"case {e['id']}: fix_sha {fix[:10]} does not say it reverts bug_sha {bug[:10]}")
-        elif e.get("fix_sha"):
-            fix_res = _resolve_commit(repo, e["fix_sha"], skip_missing)
-            if fix_res is None:
-                skipped_missing.append(str(e["id"]))
-                continue
+        elif e.get("fix_sha") and not resolve(repo, e["fix_sha"], e["id"]):
+            continue
         entry = {**e, "kind": kind, "repo": repo, "head": bug}
         if resolved_base:
             entry["base_sha"] = resolved_base
@@ -222,16 +222,10 @@ def load_manifest(path: Path, repo_override: Path | None,
         if missing:
             raise ManifestError(f"control {e.get('id')}: missing {missing}")
         repo = repo_of(e)
-        head = _resolve_commit(repo, e["sha"], skip_missing)
-        if head is None:
-            skipped_missing.append(str(e["id"]))
+        head = resolve(repo, e["sha"], e["id"])
+        resolved_base = resolve(repo, e["base_sha"], e["id"]) if head and e.get("base_sha") else None
+        if not head or (e.get("base_sha") and not resolved_base):
             continue
-        resolved_base = None
-        if e.get("base_sha"):
-            resolved_base = _resolve_commit(repo, e["base_sha"], skip_missing)
-            if resolved_base is None:
-                skipped_missing.append(str(e["id"]))
-                continue
         entry = {**e, "repo": repo, "head": head}
         if resolved_base:
             entry["base_sha"] = resolved_base
@@ -308,15 +302,18 @@ def cmd_fix(hdir: Path, state: dict[str, Any], tag: str, wt_fix: Path) -> dict[s
     runtimes = hdir / f"run_{tag}.runtimes.json"
     go_timeouts = run.timeout_caps(load_json(runtimes)) if runtimes.exists() else None
     approved = run.target_dirs_for(hdir, state, tag)
-    for _, unit_files, unit_vetted in run._failing_base_units(files, vetted):
+    full_pkgs_path = hdir / f"run_{tag}.full_pkgs.json"
+    full_pkgs = set(load_json(full_pkgs_path)) if full_pkgs_path.exists() else set()
+    for unit_key, unit_files, unit_vetted in run._failing_base_units(files, vetted):
         placed: list[Path] = []
         try:
             placed = run.place(wt_fix, unit_files, approved)
             statuses: dict[str, list[str]] = {n: [] for n in unit_vetted}
             gone: dict[str, list[str]] = {}
             msgs: dict[str, str] = {}
+            failing_arg = None if unit_key in full_pkgs else unit_vetted
             for _ in range(FIX_RUNS):
-                o, g = run.salvage_go(wt_fix, state, tag, placed, failing=unit_vetted, go_timeouts=go_timeouts)
+                o, g = run.salvage_go(wt_fix, state, tag, placed, failing=failing_arg, go_timeouts=go_timeouts)
                 gone.update(g)
                 msgs.update(o.messages)
                 for n in unit_vetted:
@@ -332,7 +329,12 @@ def cmd_fix(hdir: Path, state: dict[str, Any], tag: str, wt_fix: Path) -> dict[s
 
 def fix_descends(repo: Path, bug: str, fix: str) -> bool:
     """A fix check is valid only when fix_sha has bug_sha in its history: a fix on an unrelated line proves nothing."""
-    return sh(["git", "merge-base", "--is-ancestor", bug, fix], repo, check=False).returncode == 0
+    p = sh(["git", "merge-base", "--is-ancestor", bug, fix], repo, check=False)
+    if p.returncode == 0:
+        return True
+    if p.returncode == 1:
+        return False
+    raise InfraError(f"git merge-base --is-ancestor failed (exit {p.returncode}): {(p.stdout + p.stderr).strip()[-300:]}")
 
 
 def cmd_fix_diff(hdir: Path, state: dict[str, Any], wt_fix: Path) -> dict[str, str]:
@@ -346,10 +348,9 @@ def cmd_fix_diff(hdir: Path, state: dict[str, Any], wt_fix: Path) -> dict[str, s
     if not vetted:
         return out
     files = load_json(hdir / "D" / "response.json")["files"]
+    examples_doc = read_optional_dict(hdir / "diff_D.examples.json")
     targets = {t["dir"] for t in state["targets"]}
-    by_unit: dict[str, list[dict[str, str]]] = {}
-    for f in files:
-        by_unit.setdefault(run._unit_key(str(f.get("path", ""))), []).append(f)
+    by_unit = run.group_by_unit(files)
     wt_base = Path(state["wt_base"])
     run.ensure_clean(wt_fix)
     run.ensure_clean(wt_base)
@@ -361,40 +362,86 @@ def cmd_fix_diff(hdir: Path, state: dict[str, Any], wt_fix: Path) -> dict[str, s
             td = Path(td_str)
             fix_placed: list[Path] = []
             base_placed: list[Path] = []
+
+            def _two_passes(wt_side: Path, placed: list[Path], p1: str, p2: str,
+                            uk: str = u_key, tdir: Path = td) -> tuple[Any, Any, Any, Any, Any, Any]:
+                o1, r1, e1, gone, _ = run._diff_unit_pass(wt_side, state, "D", [(uk, placed)], tdir, p1, base=True)
+                o2, r2, e2, gone2, _ = run._diff_unit_pass(wt_side, state, "D", [(uk, placed)], tdir, p2, base=True)
+                return o1, o2, r1, r2, e1 | e2, gone | gone2
+
             try:
                 try:
                     fix_placed = run.place(wt_fix, u_files, targets)
-                    o, fix_recs, _, fix_gone, _ = run._diff_unit_pass(wt_fix, state, "D", [(u_key, fix_placed)], td,
-                                                                      "fix", base=True)
-                    _, fix_recs2, _, _, _ = run._diff_unit_pass(wt_fix, state, "D", [(u_key, fix_placed)], td,
-                                                                "fix2", base=True)
+                    o_fix1, o_fix2, fix_recs, fix_recs2, fix_errors, fix_gone = _two_passes(
+                        wt_fix, fix_placed, "fix", "fix2")
                 except run.CompileError:
                     out.update(dict.fromkeys(idents, Verdict.FIX_INCOMPATIBLE))
                     continue
                 base_placed = run.place(wt_base, u_files, targets)
-                _, base_recs, _, _, _ = run._diff_unit_pass(wt_base, state, "D", [(u_key, base_placed)], td,
-                                                            "fixbase", base=True)
-                _, base_recs2, _, _, _ = run._diff_unit_pass(wt_base, state, "D", [(u_key, base_placed)], td,
-                                                             "fixbase2", base=True)
+                o_base1, o_base2, base_recs, base_recs2, base_errors, base_gone = _two_passes(
+                    wt_base, base_placed, "fixbase", "fixbase2")
+            except InfraError:
+                out.update(dict.fromkeys(idents, Verdict.FIX_NOT_RUN))
+                continue
             finally:
                 run.unplace(fix_placed)
                 run.unplace(base_placed)
         for ident in idents:
             rkey = (u_key, run.record_name(ident))
-            if ident in fix_gone:
+            orig_examples = (examples_doc.get(ident) or {}).get("examples", []) if isinstance(examples_doc.get(ident), dict) else []
+            has_absent_ex = any(
+                isinstance(ex, dict) and (ex.get("base") == run.NO_RECORD or ex.get("head") == run.NO_RECORD)
+                for ex in orig_examples
+            )
+            if ident in fix_gone or u_key in fix_errors:
                 out[ident] = Verdict.FIX_INCOMPATIBLE
-            elif o.results.get(ident, Verdict.MISSING) != Verdict.PASS or not fix_recs.get(rkey) \
-                    or not base_recs.get(rkey):
+            elif (u_key in base_errors or ident in base_gone
+                  or any(o.results.get(ident, Verdict.MISSING) != Verdict.PASS
+                         or (getattr(o, "packages", None) or {}).get(u_key) == Verdict.FAIL
+                         or o.results.get(f"{u_key}::{run.PACKAGE_FAILED}") == Verdict.FAIL
+                         for o in (o_fix1, o_fix2, o_base1, o_base2))
+                  or (not has_absent_ex and (not fix_recs.get(rkey) or not base_recs.get(rkey)))):
                 out[ident] = Verdict.FIX_NOT_RUN
             else:  # like cmd_diff: only records each side reproduces in two runs count
-                keep = run.stable_indices(fix_recs[rkey], fix_recs2.get(rkey, {})) & \
-                    run.stable_indices(base_recs[rkey], base_recs2.get(rkey, {}))
-                fix_side = {i: r for i, r in fix_recs[rkey].items() if i in keep}
-                base_side = {i: r for i, r in base_recs[rkey].items() if i in keep}
-                if not keep:
+                fix1, fix2 = fix_recs.get(rkey, {}), fix_recs2.get(rkey, {})
+                base1, base2 = base_recs.get(rkey, {}), base_recs2.get(rkey, {})
+                keep = run.stable_indices(fix1, fix2) & run.stable_indices(base1, base2)
+
+                def _rec_val(rec: dict[str, Any] | None) -> Any:
+                    if rec is None:
+                        return run.NO_RECORD
+                    return {"panic": rec["panic"]} if "panic" in rec else rec.get("output")
+
+                orig_diff: set[int] = set()
+                for ex in orig_examples:
+                    if not isinstance(ex, dict):
+                        continue
+                    raw_i = ex.get("i")
+                    if not isinstance(raw_i, int) or isinstance(raw_i, bool):
+                        continue
+                    if not (run._json_eq(fix1.get(raw_i), fix2.get(raw_i)) and run._json_eq(base1.get(raw_i), base2.get(raw_i))):
+                        continue
+                    if "base" in ex and not run._json_eq(_rec_val(base1.get(raw_i)), ex["base"]):
+                        continue
+                    if "input" in ex:
+                        if raw_i in base1 and ("input" not in base1[raw_i] or not run._json_eq(base1[raw_i]["input"], ex.get("base_input", ex["input"]))):
+                            continue
+                        if raw_i in fix1 and ("input" not in fix1[raw_i] or not run._json_eq(fix1[raw_i]["input"], ex["input"])):
+                            continue
+                        if raw_i not in fix1 and raw_i not in base1 and ex.get("base") != run.NO_RECORD:
+                            continue
+                    elif raw_i not in keep and not (raw_i in base1 or raw_i in fix1 or ex.get("base") == run.NO_RECORD):
+                        continue
+                    orig_diff.add(raw_i)
+                extra_idx = {idx for idx in orig_diff if idx not in keep and (idx in fix1 or idx in base1)}
+                fix_side = {i: r for i, r in fix1.items() if i in (keep | extra_idx)}
+                base_side = {i: r for i, r in base1.items() if i in (keep | extra_idx)}
+                if not orig_diff:
                     out[ident] = Verdict.FIX_NOT_RUN
+                elif run.diff_records(fix_side, base_side):
+                    out[ident] = Verdict.STRICTLY_WEAK
                 else:
-                    out[ident] = Verdict.STRICTLY_WEAK if run.diff_records(fix_side, base_side) else Verdict.STRONG
+                    out[ident] = Verdict.STRONG
     write_json(hdir / "fix_D.json", out)
     return out
 
@@ -405,33 +452,40 @@ def _mark_fix_not_run(row: dict[str, Any], tests: list[str], reason: str) -> Non
     row["fix_reason"] = reason
 
 
+def _run_with_repair(num: int, hdir: Path, tag: str, row: dict[str, Any], dispatch_cmd: str | None,
+                     fn: Any, *, compile_pop: tuple[str, ...], infra_pop: tuple[str, ...]) -> None:
+    try:
+        try:
+            fn()
+        except run.CompileError as err:
+            if not dispatch_cmd:
+                raise
+            row.pop(compile_pop[0], None)
+            row["repaired"] = True
+            _repair(num, hdir, tag, err, dispatch_cmd)
+            fn()
+    except run.CompileError as err:
+        for k in compile_pop:
+            row.pop(k, None)
+        row["compile_error"] = str(err)[-400:]
+    except InfraError as err:
+        for k in infra_pop:
+            row.pop(k, None)
+        row["error"] = str(err)[-400:]
+
+
 def hunt_tag(num: int, hdir: Path, state: dict[str, Any], tag: str, batch: int, dispatch_cmd: str | None,
              wt_fix: Path | None = None, fix_not_run: str | None = None) -> dict[str, Any]:
     """One hunter's run and base tables, plus the fix table when the entry has a fix commit. Its own failures stay on
     its row: a compile error is a miss (as in a real hunt that exhausted its repair round), an InfraError loses only
     this hunter (and an InfraError on the fix commit only the fix table)."""
     row: dict[str, Any] = {"batch": batch, "hunter": tag}
-    try:
-        try:
-            _attempt(hdir, state, tag, row)
-        except run.CompileError as err:
-            if not dispatch_cmd:
-                raise
-            row.pop("run", None)
-            row["repaired"] = True
-            _repair(num, hdir, tag, err, dispatch_cmd)
-            _attempt(hdir, state, tag, row)
-    except run.CompileError as err:
-        row.pop("run", None)
-        row.pop("base", None)
-        row["compile_error"] = str(err)[-400:]
-    except InfraError as err:
-        row.pop("base", None)
-        row["error"] = str(err)[-400:]
+    _run_with_repair(num, hdir, tag, row, dispatch_cmd, lambda: _attempt(hdir, state, tag, row),
+                     compile_pop=("run", "base"), infra_pop=("base",))
     if wt_fix is not None and "base" in row:
         try:
             row["fix"] = cmd_fix(hdir, state, tag, wt_fix)
-        except InfraError as err:
+        except (InfraError, OSError) as err:
             row["fix_error"] = str(err)[-400:]
     elif fix_not_run and "base" in row:
         _mark_fix_not_run(row, sorted(n for n, v in row["base"].items() if v == Verdict.NEW_PR_BUG), fix_not_run)
@@ -443,26 +497,13 @@ def hunt_diff(num: int, hdir: Path, state: dict[str, Any], batch: int, dispatch_
     """Mode D differential recorders for one batch, with the same 1-round repair and per-hunter isolation. With a fix
     commit, every DIFF test is also run on it (cmd_fix_diff)."""
     row: dict[str, Any] = {"batch": batch, "hunter": "D"}
-    try:
-        try:
-            row["diff"] = run.cmd_diff(hdir, state, "D")
-        except run.CompileError as err:
-            if not dispatch_cmd:
-                raise
-            row["repaired"] = True
-            _repair(num, hdir, "D", err, dispatch_cmd)
-            row["diff"] = run.cmd_diff(hdir, state, "D")
-    except run.CompileError as err:
-        row.pop("diff", None)
-        row["compile_error"] = str(err)[-400:]
-    except InfraError as err:
-        row.pop("diff", None)
-        row["error"] = str(err)[-400:]
+    _run_with_repair(num, hdir, "D", row, dispatch_cmd, lambda: row.__setitem__("diff", run.cmd_diff(hdir, state, "D")),
+                     compile_pop=("diff",), infra_pop=("diff",))
     if "diff" in row:
         if wt_fix is not None:
             try:
                 row["fix"] = cmd_fix_diff(hdir, state, wt_fix)
-            except (InfraError, run.CompileError) as err:
+            except (InfraError, run.CompileError, OSError) as err:
                 row["fix_error"] = str(err)[-400:]
         elif fix_not_run:
             _mark_fix_not_run(row, sorted(n for n, v in row["diff"].items() if v == Verdict.DIFF), fix_not_run)
@@ -487,16 +528,53 @@ def pr_signal(hdir: Path, state: dict[str, Any]) -> dict[str, Any]:
         return {"hunter": "PR", "pr": {}, "pr_error": str(err)[-400:]}
 
 
+def _batch_post_lesson(bdir: Path, *, archived: bool = False) -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
+    if archived:
+        vdoc = ledger._read_verdict_json(bdir)
+        if vdoc is not None and vdoc.get("vetted_present"):
+            return True, vdoc["keep"], vdoc["held"]
+    out = verdict.admissibility(bdir)
+    if not out["vetted_present"]:
+        vdoc = ledger._read_verdict_json(bdir)
+        if vdoc is not None and vdoc.get("vetted_present"):
+            return True, vdoc["keep"], vdoc["held"]
+        return False, [], []
+    hits = lessons.post_filter(bdir) if out["keep"] else []
+    keep, held, _ = verdict.apply_lessons(out, hits)
+    return True, keep, held
+
+
 def vet_signal(hdir: Path) -> dict[str, Any]:
-    """What the author would see: verdict.admissibility over the entry's vetted.json (a recorded or dispatched vetting
-    step). A control with a keep row is an author-facing false positive. No vetted.json: nothing was vetted, no keeps."""
+    """What the author would see: post-lesson verdict over all evaluated batches (archived + active).
+    A control with a keep row is an author-facing false positive. No vetted.json: nothing was vetted, no keeps."""
     try:
-        out = verdict.admissibility(hdir)
-    except (OSError, ValueError, KeyError, TypeError) as err:
+        if (hdir / "vet.partial").is_file() or any((bdir / "vet.partial").is_file() for bdir in ledger._batch_dirs(hdir)):
+            return {"hunter": "V", "admissibility": {}, "vet_error": "vetting incomplete (vet.partial)"}
+        if not (hdir / "batches").is_dir():
+            vetted_present, keep, held = _batch_post_lesson(hdir)
+        else:
+            by_key: dict[tuple[Any, ...], tuple[str, dict[str, Any]]] = {}
+            key_batch: dict[tuple[Any, ...], tuple[int, tuple[str, ...]]] = {}
+            anon_keep: list[dict[str, Any]] = []
+            anon_held: list[dict[str, Any]] = []
+            vetted_present = False
+            for batch_idx, bdir in enumerate(ledger._batch_dirs(hdir)):
+                present, b_keep, b_held = _batch_post_lesson(bdir, archived=(bdir != hdir))
+                if not present:
+                    continue
+                vetted_present = True
+                st = read_optional_dict(bdir / "state.json")
+                batch_changed = tuple(sorted(str(x) for x in (st.get("changed") or [])))
+                ledger._merge_batch_verdict_items(
+                    by_key, anon_keep, anon_held, b_keep, b_held, batch_changed, key_batch, batch_idx=batch_idx,
+                )
+            keep = [item for kind, item in by_key.values() if kind == "keep"] + anon_keep
+            held = [item for kind, item in by_key.values() if kind == "held"] + anon_held
+    except (OSError, ValueError, KeyError, TypeError, InfraError) as err:
         return {"hunter": "V", "admissibility": {}, "vet_error": str(err)[-400:]}
-    return {"hunter": "V", "admissibility": {"vetted_present": out["vetted_present"],
-                                              "keep": [str(r.get("id")) for r in out["keep"]],
-                                              "held": len(out["held"])}}
+    return {"hunter": "V", "admissibility": {"vetted_present": vetted_present,
+                                              "keep": [str(r.get("id")) for r in keep],
+                                              "held": len(held)}}
 
 
 def review_signal(num: int, hdir: Path, state: dict[str, Any], meta: dict[str, Any],
@@ -512,10 +590,7 @@ def review_signal(num: int, hdir: Path, state: dict[str, Any], meta: dict[str, A
         ctx_stub = {"pr": {"number": pr_num, "title": meta["title"], "description": meta["body"]}}
         r_meta, user = review_threads.build_review_context(str(pr_num), hdir, state, ctx_stub, raw_threads=raw)
         if user is not None and dispatch_cmd and not (hdir / "R" / "response.json").exists():
-            r_ctx = {"changed_files_head_source": user["thread_files_head_source"],
-                     "diff_production_code": user["diff_production_code"],
-                     "sibling_tests_and_helpers": user["sibling_tests_and_helpers"]}
-            build_requests.write(hdir, "R", build_requests.review_system(r_meta["targets"], r_ctx),
+            build_requests.write(hdir, "R", build_requests.review_system(r_meta["targets"], user),
                                  user, build_requests.REVIEW_SCHEMA)
             dispatch(dispatch_cmd, hdir / "R" / "request.json")
     if not (hdir / "R" / "response.json").exists():
@@ -546,20 +621,27 @@ def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None,
     fix_not_run: str | None = None
     if e.get("fix_sha") and ("hunters" in signals or "review" in signals or "diff" in signals):
         # the commit that fixed the bug: a vetted test that passes there catches exactly what the fix removed
-        fix = git(repo, "rev-parse", f"{e['fix_sha']}^{{commit}}")
-        if not fix_descends(repo, head, fix):
-            # a fix on a line that does not contain the bug cannot show what it removed: no fix check, FIX_NOT_RUN
-            fix_not_run = f"fix_sha {fix[:10]} does not descend from bug_sha {head[:10]}"
-        else:
-            wt_fix = out / f"wt{num}.fix"
-            prepare.worktree(repo, wt_fix, fix)
-            if go_changed:
-                prepare.go_work(wt_fix)
-            if web_changed:
-                prepare.webapp_deps(wt, wt_fix, head, fix)
+        try:
+            fix = git(repo, "rev-parse", f"{e['fix_sha']}^{{commit}}")
+            if not fix_descends(repo, head, fix):
+                # a fix on a line that does not contain the bug cannot show what it removed: no fix check, FIX_NOT_RUN
+                fix_not_run = f"fix_sha {fix[:10]} does not descend from bug_sha {head[:10]}"
+            else:
+                candidate_wt_fix = out / f"wt{num}.fix"
+                prepare.worktree(repo, candidate_wt_fix, fix)
+                if go_changed:
+                    prepare.go_work(candidate_wt_fix)
+                if web_changed:
+                    prepare.webapp_deps(wt, candidate_wt_fix, head, fix)
+                wt_fix = candidate_wt_fix
+        except InfraError as err:
+            fix_not_run = f"fix setup failed: {str(err)[-240:]}"
+            wt_fix = None
     prep = {"repo": str(repo), "wt": str(wt), "wt_base": str(wt_base), "merge_base": mb, "head": head,
             "hunt_dir": str(hdir)}
     results: list[dict[str, Any]] = []
+    supplied_adj: dict[str, bytes] = {}
+    supplied_resp_digests: dict[str, str] = {}
     batch, batches = 1, 1
     while batch <= batches:
         state = ctx.build(str(num), batch, prep, meta)
@@ -567,30 +649,53 @@ def hunt_entry(e: dict[str, Any], num: int, out: Path, dispatch_cmd: str | None,
         if "hunters" in signals or "diff" in signals or "review" in signals:
             if e.get("responses") and batch == 1:
                 shutil.copytree(e["responses"], hdir, dirs_exist_ok=True)
-            if "hunters" in signals:
+                if batches <= 1:
+                    for fname in ("vetted.json", "verdict.json", "vet.partial"):
+                        fp = hdir / fname
+                        if fp.is_file():
+                            supplied_adj[fname] = fp.read_bytes()
+                    for rtag in ("A", "B", "D"):
+                        rp = hdir / rtag / "response.json"
+                        if rp.is_file():
+                            rfiles = read_optional_dict(rp).get("files")
+                            if isinstance(rfiles, list):
+                                supplied_resp_digests[rtag] = run.fingerprint(rfiles)
+            for sig, what, tags in (("hunters", "hunters", ("A", "B")), ("diff", "diff", ("D",))):
+                if sig not in signals or batches == 0:
+                    continue
                 if not (e.get("responses") and batch == 1) and dispatch_cmd:
-                    build_requests.main(str(num), "hunters")  # writes <hdir>/A and B request.json
-                    for tag in ("A", "B"):
+                    build_requests.main(str(num), what)
+                    for tag in tags:
                         dispatch(dispatch_cmd, hdir / tag / "request.json")
-                for tag in ("A", "B"):
+                for tag in tags:
                     if (hdir / tag / "response.json").exists():
-                        results.append(hunt_tag(num, hdir, state, tag, batch, dispatch_cmd, wt_fix, fix_not_run))
-            if "diff" in signals:
-                if not (e.get("responses") and batch == 1) and dispatch_cmd:
-                    build_requests.main(str(num), "diff")
-                    dispatch(dispatch_cmd, hdir / "D" / "request.json")
-                if (hdir / "D" / "response.json").exists():
-                    results.append(hunt_diff(num, hdir, state, batch, dispatch_cmd, wt_fix, fix_not_run))
+                        results.append(hunt_diff(num, hdir, state, batch, dispatch_cmd, wt_fix, fix_not_run)
+                                       if tag == "D" else hunt_tag(num, hdir, state, tag, batch, dispatch_cmd, wt_fix, fix_not_run))
         else:
             batches = 1  # the whole-commit signals need only the state, not one per batch
         batch += 1
-    if (("hunters" in signals or "diff" in signals) and batches
-            and not any(r.get("hunter") in ("A", "B", "D") for r in results)
-            and not (hdir / "verdict.json").exists()):
+    if supplied_adj and not (hdir / "batches").is_dir() and not any(r.get("repaired") for r in results):
+        same_responses = all(
+            (hdir / rtag / "response.json").is_file()
+            and not (hdir / rtag / "response.prev.json").exists()
+            and run.fingerprint(read_optional_dict(hdir / rtag / "response.json").get("files") or []) == digest
+            for rtag, digest in supplied_resp_digests.items()
+        )
+        if same_responses:
+            for fname, raw in supplied_adj.items():
+                fp = hdir / fname
+                if not fp.exists():
+                    fp.write_bytes(raw)
+    vet_inputs = ((hdir / "vet.partial").is_file() or (hdir / "vetted.json").exists()
+                  or (hdir / "verdict.json").exists() or (hdir / "batches").is_dir())
+    if (("hunters" in signals or "diff" in signals) and batches and not vet_inputs
+            and not any(r.get("hunter") in ("A", "B", "D") for r in results)):
         raise InfraError(f"no hunter response for {e['id']}: pass --dispatch or a responses directory")
     if "review" in signals:
         results.append(review_signal(num, hdir, state, meta, e, dispatch_cmd, wt_fix, fix_not_run))
-    if ("hunters" in signals or "diff" in signals) and (hdir / "vetted.json").exists():
+    if ("hunters" in signals or "diff" in signals) and (
+            (hdir / "vet.partial").is_file() or (hdir / "vetted.json").exists()
+            or (hdir / "verdict.json").exists() or (hdir / "batches").is_dir()):
         results.append(vet_signal(hdir))  # no vetted.json: nothing was vetted, so no row and no keeps
     # whole-commit, model-free: once per entry, after every batch (each run leaves the worktrees clean)
     if "old" in signals:
@@ -646,12 +751,15 @@ def scorecard(manifest: dict[str, Any], hunted: dict[str, dict[str, Any]],
             tag_errors += [f"{r['hunter']} fix: {r['fix_error']}" for r in h.get("results", []) if r.get("fix_error")]
             tag_errors += [f"{r['hunter']} vet: {r['vet_error']}" for r in h.get("results", []) if r.get("vet_error")]
             fixes = fix_counts(h)
-            admitted = any(r.get("admissibility", {}).get("keep") for r in h.get("results", []))
+            vet_error = _first(h, "vet_error")
+            admitted: bool | None = None if vet_error else any(
+                r.get("admissibility", {}).get("keep") for r in h.get("results", []))
             fix_reasons = sorted({r["fix_reason"] for r in h.get("results", []) if r.get("fix_reason")})
             rows.append({"kind": kind, "id": e["id"], "area": e["area"], "lock": bool(e.get("lock")),
                          "raw": raw and "hunters" in signals,
                          "vetted": f["hunters_vetted"], **f, "admitted": admitted, "any": any(f[k] for k in FINDINGS),
-                         "error": h.get("error"), "old_error": _first(h, "old_error"), "pr_error": _first(h, "pr_error"),
+                         "error": h.get("error"), "vet_error": vet_error,
+                         "old_error": _first(h, "old_error"), "pr_error": _first(h, "pr_error"),
                          "hunter_errors": tag_errors,
                          "has_fix": kind == "case" and bool(e.get("fix_sha")),
                          "fix_oracle": "revert" if e.get("kind", "revert") == "revert" else "fix_forward",
@@ -666,6 +774,19 @@ def scorecard(manifest: dict[str, Any], hunted: dict[str, dict[str, Any]],
     def ratio(hit: int, n: int) -> float:
         return round(hit / n, 4) if n else 0.0
 
+    def raw_rate(hit: int, n: int) -> float:
+        return (hit / n) if n else 0.0
+
+    pr_controls = [r for r in controls if not r.get("pr_error")]
+    raw_fp: dict[str, float] = {
+        "fp_rate": raw_rate(sum(r["vetted"] for r in controls), len(controls)),
+        "admissibility_fp_rate": raw_rate(sum(r["admitted"] is True for r in controls), len(controls)),
+        "review_fp_rate": raw_rate(sum(r["review_proven"] for r in controls), len(controls)),
+    }
+    for flag, name in METRIC_NAMES.items():
+        denom = pr_controls if flag in ("pr_ci", "pr_fails") else controls
+        raw_fp[f"{name}_fp_rate"] = raw_rate(sum(r[flag] for r in denom), len(denom))
+
     metrics = {
         "raw_recall": ratio(sum(r["raw"] for r in cases), len(cases)),
         "vetted_recall": ratio(sum(r["vetted"] for r in cases), len(cases)),
@@ -675,11 +796,12 @@ def scorecard(manifest: dict[str, Any], hunted: dict[str, dict[str, Any]],
         "combined_fp_rate": ratio(sum(r["any"] for r in controls), len(controls)),
     }
     for flag, name in METRIC_NAMES.items():
+        denom = pr_controls if flag in ("pr_ci", "pr_fails") else controls
         metrics[f"{name}_recall"] = ratio(sum(r[flag] for r in cases), len(cases))
-        metrics[f"{name}_fp_rate"] = ratio(sum(r[flag] for r in controls), len(controls))
+        metrics[f"{name}_fp_rate"] = ratio(sum(r[flag] for r in denom), len(denom))
     if "hunters" in signals or "diff" in signals:
-        metrics["admissibility_recall"] = ratio(sum(r["admitted"] for r in cases), len(cases))
-        metrics["admissibility_fp_rate"] = ratio(sum(r["admitted"] for r in controls), len(controls))
+        metrics["admissibility_recall"] = ratio(sum(r["admitted"] is True for r in cases), len(cases))
+        metrics["admissibility_fp_rate"] = ratio(sum(r["admitted"] is True for r in controls), len(controls))
     if "review" in signals:
         metrics["review_recall"] = ratio(sum(r["review_proven"] for r in cases), len(cases))
         metrics["review_fp_rate"] = ratio(sum(r["review_proven"] for r in controls), len(controls))
@@ -692,15 +814,19 @@ def scorecard(manifest: dict[str, Any], hunted: dict[str, dict[str, Any]],
     for tag in sorted({t for r in cases for t in r["fix_verdicts"]}):
         strong = sum(r["fix_verdicts"].get(tag, {}).get(Verdict.STRONG, 0) for r in cases)
         weak = sum(r["fix_verdicts"].get(tag, {}).get(Verdict.STRICTLY_WEAK, 0) for r in cases)
-        metrics[f"strictly_weak_ratio_{tag}"] = ratio(weak, strong + weak)
+        metrics[f"strictly_weak_ratio_{tag}"] = raw_rate(weak, strong + weak)
     t = manifest["thresholds"]
     checks = {"raw_recall": metrics["raw_recall"] >= t["raw_recall_min"],
               "vetted_recall": metrics["vetted_recall"] >= t["vetted_recall_min"],
-              "fp_rate": metrics["fp_rate"] <= t["fp_rate_max"]}
+              "fp_rate": raw_fp["fp_rate"] <= t["fp_rate_max"]}
     # every other author-reaching signal holds controls to the same limit (A6): D DIFF, R PROVEN, PR-CI, admissibility
-    fp_checks = {key: metrics[key] <= t["fp_rate_max"] for group, key in FP_GATES.items()
-                 if key in metrics and (group in signals or (group == "hunters" and "diff" in signals))}
-    errors = [r["id"] for r in rows if r["error"]]
+    fp_checks = {
+        key: (False if key == "pr_ci_fp_rate" and controls and not pr_controls else raw_fp[key] <= t["fp_rate_max"])
+        for group, key in FP_GATES.items()
+        if key in metrics and (group in signals or (group == "hunters" and "diff" in signals))
+    }
+    vet_gated = "hunters" in signals or "diff" in signals
+    errors = [r["id"] for r in rows if r["error"] or (vet_gated and r.get("vet_error"))]
     verdict = Verdict.ERROR if errors else (Verdict.PASS if all(checks.values()) and all(fp_checks.values()) else Verdict.FAIL)
     locked = [r for r in cases if r["lock"]]
     locks_missed = [r["id"] for r in locked if not (r["vetted"] or r["hunters_new_api"] or r.get("review_proven"))]
@@ -818,13 +944,42 @@ def diff_scorecards(base: dict[str, Any], cand: dict[str, Any], max_fp: float = 
         if (br.get("lock") or c_rows.get(cid, {}).get("lock")) and caught(br)
         and (cid not in c_rows or not caught(c_rows[cid]))
     )
+    ctrl_rows = [r for r in cand.get("rows", []) if isinstance(r, dict) and r.get("kind") == "control"]
+
+    def _raw_fp(metric_key: str) -> float:
+        if ctrl_rows:
+            if metric_key == "fp_rate":
+                return sum(bool(r.get("vetted")) for r in ctrl_rows) / len(ctrl_rows)
+            if metric_key == "admissibility_fp_rate":
+                return sum(r.get("admitted") is True for r in ctrl_rows) / len(ctrl_rows)
+            if metric_key == "review_fp_rate":
+                return sum(bool(r.get("review_proven")) for r in ctrl_rows) / len(ctrl_rows)
+            flag = next((fl for fl, name in METRIC_NAMES.items() if f"{name}_fp_rate" == metric_key), None)
+            if flag is not None:
+                if flag in ("pr_ci", "pr_fails"):
+                    denom = [r for r in ctrl_rows if not r.get("pr_error")]
+                    if not denom:
+                        return math.inf if flag == "pr_ci" else 0.0
+                    return sum(bool(r.get(flag)) for r in denom) / len(denom)
+                return sum(bool(r.get(flag)) for r in ctrl_rows) / len(ctrl_rows)
+        return _num(cm, metric_key)
+
+    def _weak_ratio(card: dict[str, Any], key: str) -> float:
+        tag = key.removeprefix("strictly_weak_ratio_")
+        case_rows = [r for r in card.get("rows", []) if isinstance(r, dict) and isinstance(r.get("fix_verdicts"), dict)]
+        if case_rows:
+            strong = sum(int(r["fix_verdicts"].get(tag, {}).get(Verdict.STRONG, 0)) for r in case_rows)
+            weak = sum(int(r["fix_verdicts"].get(tag, {}).get(Verdict.STRICTLY_WEAK, 0)) for r in case_rows)
+            return (weak / (strong + weak)) if (strong + weak) else 0.0
+        return _num(card["metrics"], key)
+
     base_recall, cand_recall = _num(bm, "vetted_recall"), _num(cm, "vetted_recall")
     base_fp, cand_fp = _num(bm, "fp_rate"), _num(cm, "fp_rate")
     cand_ok = not cand.get("errors") and cand.get("verdict") != Verdict.ERROR
     base_ok = not base.get("errors") and base.get("verdict") != Verdict.ERROR
     recall_ok = cand_recall >= base_recall
     fp_limit = max_fp  # no tolerance for a worse baseline: the limit is absolute
-    fp_ok = cand_fp <= fp_limit
+    fp_ok = _raw_fp("fp_rate") <= fp_limit
     # scorecards from before the fix oracle have no strong_recall: the gate then skips that check
     has_strong = "strong_recall" in bm and "strong_recall" in cm
     base_strong = _num(bm, "strong_recall") if has_strong else None
@@ -838,16 +993,22 @@ def diff_scorecards(base: dict[str, Any], cand: dict[str, Any], max_fp: float = 
         base_fwd, cand_fwd = _num(bm, fwd_key), _num(cm, fwd_key)
         fwd_ok = cand_fwd >= base_fwd
     weak_regressions = sorted(
-        k for k in bm if k.startswith("strictly_weak_ratio_") and k in cm and _num(cm, k) > _num(bm, k))
+        k for k in bm if k.startswith("strictly_weak_ratio_") and k in cm and _weak_ratio(cand, k) > _weak_ratio(base, k))
     # the other author-reaching signals hold controls to the same absolute limit as fp_rate
-    gate_fp_failures = sorted(k for k in FP_GATE_METRICS if k in cm and _num(cm, k) > fp_limit)
-    passed = (cand_ok and base_ok and population_ok and recall_ok and fp_ok and strong_ok and fwd_ok and not weak_regressions
-              and not gate_fp_failures and not lock_regressions)
+    gate_fp_failures = sorted(k for k in FP_GATE_METRICS if k in cm and _raw_fp(k) > fp_limit)
+    base_signals = base.get("signals")
+    missing_signals = (sorted(set(base_signals) - set(cand.get("signals") or []))
+                       if isinstance(base_signals, list) else [])
+    signals_ok = not missing_signals
+    passed = (cand_ok and base_ok and population_ok and signals_ok and recall_ok and fp_ok and strong_ok and fwd_ok
+              and not weak_regressions and not gate_fp_failures and not lock_regressions)
     return {
         "verdict": Verdict.PASS if passed else Verdict.FAIL,
         "cand_ok": cand_ok,
         "base_ok": base_ok,
         "population_ok": population_ok,
+        "signals_ok": signals_ok,
+        "missing_signals": missing_signals,
         "recall_ok": recall_ok,
         "fp_ok": fp_ok,
         "fp_limit": fp_limit,
@@ -892,6 +1053,8 @@ def _cmd_diff(args: list[str]) -> int:
               f"{res['cand_strong_recall_fix_forward']:.4f} ({'ok' if res['fwd_ok'] else 'REGRESSED'})")
     print(f"strictly_weak_ratio regressions: {res['weak_ratio_regressions']}")
     print(f"fp gates exceeded (diff/review/pr_ci/admissibility): {res['fp_gate_failures']}")
+    if res["missing_signals"]:
+        print(f"missing_signals: {res['missing_signals']}")
     print(f"lock_regressions: {res['lock_regressions']}")
     if not res["base_ok"]:
         print("baseline scorecard has errors: rerun the baseline before gating on it")

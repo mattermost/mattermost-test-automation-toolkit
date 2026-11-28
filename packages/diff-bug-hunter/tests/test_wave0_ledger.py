@@ -2,12 +2,10 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".claude" / "skills" / "hunt" / "scripts"))
-
 import ledger
+from conftest import vetted_row
 
 PARTIAL = "Partial or Unverified Coverage"
 
@@ -37,9 +35,8 @@ def test_raw_new_pr_bug_without_vetted_is_partial_with_gap(tmp_path):
 def test_vetted_keep_is_bug_proven(tmp_path):
     # A1: a KEEP reaches the author only when its mechanical verdict is NEW_PR_BUG and it has an entry point and repro.
     h = _hunt(tmp_path)
-    keep = {"id": "p::T", "source": "A", "decision": "KEEP", "reason": "real", "file_line": "x.go:1", "caller": "api4",
-            "entry_point": "api4 GET /x", "repro_cmd": "go test ./x -run TestHuntA_T", "evidence_path": "run_A.json",
-            "severity": "major", "fix_check": None}
+    keep = vetted_row(id="p::T", reason="real", file_line="x.go:1", caller="api4", entry_point="api4 GET /x",
+                      repro_cmd="go test ./x -run TestHuntA_T")
     (h / "vetted.json").write_text(json.dumps({"rows": [{"id": "x", "decision": "DROP"}, keep]}))
     row = _rec(h, tmp_path)
     assert row["confidence_tier"] == "Bug Proven" and row["gaps"] == []
@@ -47,9 +44,8 @@ def test_vetted_keep_is_bug_proven(tmp_path):
 
 def test_vetted_list_form_keep_is_bug_proven(tmp_path):
     h = _hunt(tmp_path)
-    keep = {"id": "p::T", "source": "A", "decision": "KEEP", "reason": "real", "file_line": "x.go:1", "caller": "api4",
-            "entry_point": "api4 GET /x", "repro_cmd": "go test ./x -run TestHuntA_T", "evidence_path": "run_A.json",
-            "severity": "major", "fix_check": None}
+    keep = vetted_row(id="p::T", reason="real", file_line="x.go:1", caller="api4", entry_point="api4 GET /x",
+                      repro_cmd="go test ./x -run TestHuntA_T")
     (h / "vetted.json").write_text(json.dumps([keep]))
     assert _rec(h, tmp_path)["confidence_tier"] == "Bug Proven"
 
@@ -103,3 +99,17 @@ def test_nonempty_d_response_is_not_gap(tmp_path):
     (h / "D").mkdir()
     (h / "D" / "response.json").write_text('{"files": [{"path": "a", "content": "b"}]}')
     assert _rec(h, tmp_path)["confidence_tier"] == "High-Confidence Clean"
+
+
+def test_omitted_mode_d_is_not_gap_and_requested_missing_mode_d_is_gap(tmp_path):
+    h_omit = _hunt(tmp_path, "omit_d")
+    _clean(h_omit)
+    (h_omit / "diff_D.json").unlink()
+    (h_omit / "driver.json").write_text(json.dumps({"modes": ["A", "B", "R"]}))
+    assert _rec(h_omit, tmp_path)["confidence_tier"] == "High-Confidence Clean"
+
+    h_req = _hunt(tmp_path, "req_d")
+    _clean(h_req)
+    (h_req / "diff_D.json").unlink()
+    (h_req / "driver.json").write_text(json.dumps({"modes": ["A", "B", "D", "R"]}))
+    assert _rec(h_req, tmp_path)["confidence_tier"] == PARTIAL

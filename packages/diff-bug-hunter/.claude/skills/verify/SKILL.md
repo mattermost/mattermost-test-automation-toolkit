@@ -11,19 +11,8 @@ single `failure.png` only if the run FAILs. Hand its path to the user and never 
 
 1. **Server and auth:** check that the target answers `GET /api/v4/system/ping`: the `base_url` the user gave, else
    `VERIFY_BASE_URL`, else `MM_URL`, else `http://localhost:8065`. If it doesn't, stop and report `INFRA_ERROR`; do not start or reconfigure servers unasked. If `VERIFY_TOKEN` or `VERIFY_USER`/`VERIFY_PASSWORD` are set against a non-default URL, set `VERIFY_BASE_URL` to that origin too (`base_url` in a plan cannot override the trusted origin once credentials are set).
-   - **A PR's or release's own build** (when the user asks to check a PR or release range): never build it locally. `scripts/pr_server.py images <pr | base...head> --pull`
-     gives and pulls the enterprise images of head and merge-base (`/hunt` starts this at step 1 when the diff
-     touches `webapp/` or a server API a page calls; otherwise start it yourself, a cold pull is 10-15 min). `scripts/pr_server.py up <image>` runs the mattermost repo's
-     own e2e stack on that image at `http://localhost:8065`, **replaces** a server running another build (`make stop-server`
-     drops its volumes: ask before running it over a stack the user is using), and seeds both the
-     `VERIFY_USER` system admin and a non-admin `verify_member` (same `VERIFY_PASSWORD`, joined to team `verify`,
-     onboarding overlay off for both). A license is uploaded when `MM_LICENSE_FILE` (path) or `MM_LICENSE` is set (never print it;
-     `--require-license` makes a missing one `INFRA_ERROR`). `up --flags FeatureA,FeatureB` and/or `--flags-from-diff <base>..<head>`
-     (every `FeatureFlags.<Name>` on an added diff line) set `MM_FEATUREFLAGS_<NAME>=true` on the server; the printed `PROFILE flags=... license=...`
-     line goes into the report. A range `base..head` uses `base` itself as the base image; if a base image is not published `images` prints
-     `BASE_SUBSTITUTION` (nearest published first-parent ancestor, max 20 back): state it in the report. Pass `VERIFY_USER=verify_member` to test non-admin / RBAC behavior. One stack at a time: run the plan on head, then `up` the base
-     image and run it again, and compare the two verdicts (`--compare` needs both up at once; two standalone `PASS` verdicts only show assertions held on each build, not whether captured values changed). An image swap takes
-     ~100 s, the plan seconds. A missing image = CI has not built that commit yet: say so, do not build it.
+   - **A PR's or release's own build** (when checking a PR or release range): never build locally. `scripts/pr_server.py images <pr | base...head> --pull`
+     fetches the head and merge-base images (`/hunt` starts this at step 1 for UI/API diffs; cold pulls take 10-15 min). `scripts/pr_server.py up <image>` runs the repo's e2e stack at `http://localhost:8065`, **replaces** any other build (`make stop-server` drops volumes: ask first), and seeds `VERIFY_USER` (admin) and `verify_member` (non-admin, team `verify`, onboarding off). `MM_LICENSE_FILE`/`MM_LICENSE` uploads a license silently (`--require-license` fails if missing); `--flags` / `--flags-from-diff <base>..<head>` sets `MM_FEATUREFLAGS_<NAME>=true` and prints `PROFILE flags=... license=...` (report this). `base..head` uses `base`; unpublished base images fall back to the nearest published first-parent ancestor (`BASE_SUBSTITUTION`, max 20 back — report it). Use `VERIFY_USER=verify_member` for RBAC checks. `pr_server.py up` runs one stack at `http://localhost:8065`, so when using it run head first, then `up` base, and compare the two sequential `VERDICT:` and snapshot outputs (`--compare <base_url>` requires two separate servers running at once on distinct URLs). Image swaps take ~100 s; missing images mean CI has not built that commit yet.
    - Logged-in pages: the runner authenticates through the API before the first step, so no step goes to the login
      form. Put `"login": true` in the plan so missing credentials fail as `INFRA_ERROR`.
    - `VERIFY_USER` + `VERIFY_PASSWORD`: `POST /api/v4/users/login`. The server sets `MMAUTHTOKEN`, `MMUSERID` and
@@ -77,19 +66,8 @@ single `failure.png` only if the run FAILs. Hand its path to the user and never 
      checking app content.
 4. **Iterate:** on `FAIL`, read the failure snapshot and fix the plan only when the plan was wrong (wrong name, wrong
    region). Never relax an `expect` to make it pass. Stop after 3 runs.
-5. **Compare (differential oracle):** when a base server (before the change) and a head server (with it) are both
-running, the oracle must come from code, not from you or the PR text. Add `{"capture": {"api": "/api/v4/config"}}`
-steps (GET an `/api/v4/` path, record the body, assert nothing) and snapshots, keep at least one `expect`, then run
-`node <this dir>/scripts/verify_ui.mjs plan.json --compare <base_url>`; the usual target (`VERIFY_BASE_URL` / `base_url`)
-is the head. Same steps, same credentials, both servers. Ids, timestamps, version/build fields and origins are
-normalised away; add `"ignore": ["json.path"]` for other known noise.
-- Output: `DIFF <step#> <json-path>: base=<v> head=<v>` lines, then `VERDICT: SAME` (exit 0), `DIFF` or `REGRESSION`
-(an `expect` passes on base, fails on head; exit 1), `BOTH_FAIL` (an `expect` fails on both servers and nothing else differs: the plan shows nothing about the change; exit 1; not evidence either way, so fix the plan's expectation before reading it as a result), `FAIL` (a step failed; page errors and 5xx are diffed, not fatal, so noise both servers share is not a difference) or exit 2 `INVALID_PLAN` /
-`INFRA_ERROR`. `--freeze` is not supported with `--compare`.
-- **Rule:** every `DIFF` must be explained by the PR (the diff or its description names that field or behaviour) or it
-is a finding: report path, base value, head value. Never add an `ignore` just to silence one. A diff between two
-different releases also holds version noise; judge each line, do not dismiss them all.
-- The runner pre-sets `__landingPageSeen__` in localStorage, so logged-in plans land on the app instead of the
-"Where would you like to view this?" desktop-app prompt.
+5. **Compare (differential oracle):** when two separate base and head servers are running at once, add `{"capture": {"api": "/api/v4/config"}}` steps and snapshots (keeping at least one `expect`) and run `node <this dir>/scripts/verify_ui.mjs plan.json --compare <base_url>` (`VERIFY_BASE_URL`/`base_url` is head; when using the single `pr_server.py up` stack at `:8065`, compare two sequential `verify_ui.mjs` runs by hand instead). Ids, timestamps, version/build fields, and origins are normalised away; `"ignore": ["json.path"]` skips other known noise.
+- Output: `DIFF <step#> <json-path>: base=<v> head=<v>` lines, then `VERDICT: SAME` (exit 0), `DIFF`, `REGRESSION` (expect passes on base, fails on head; exit 1), `BOTH_FAIL` (an `expect` fails on both servers and nothing else differs: the plan shows nothing about the change; exit 1; not evidence either way, so fix the plan's expectation before reading it as a result), or `FAIL` (step failed; page errors and 5xx are diffed, not fatal), or exit 2 `INVALID_PLAN`/`INFRA_ERROR`. (`--freeze` is incompatible with `--compare`.)
+- **Rule:** every `DIFF` must be explained by the PR or it is a finding (report path, base, head; never `ignore` a real difference). If output says `more differences not shown`, rerun with `--all-diffs` so every difference is reviewed. If `BASE_SUBSTITUTION` used an older ancestor image, confirm any difference against the requested base commit or its source before reporting it as a PR finding. Judge version noise across releases line by line. Runner pre-sets `__landingPageSeen__` in localStorage so logged-in plans skip `/landing`.
 6. **Report in chat:** the plan, the verdict line, the snapshot lines that prove it, and the frozen spec path if any. A `FAIL` caused by the app is a
    finding: give the steps to reproduce it, and pair it with a passing nearby control case (e.g. valid control input or passing base build) to prove the harness and auth work.

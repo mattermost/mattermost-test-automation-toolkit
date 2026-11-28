@@ -26,7 +26,19 @@ from typing import Any, NamedTuple
 
 import prefilter
 import reliability
-from hunt_common import REPO, InfraError, git, git_cmd, hunt_dir, hunt_lock, read_text_lossy, sh, write_json
+from hunt_common import (
+    REPO,
+    InfraError,
+    git,
+    git_cmd,
+    hunt_dir,
+    hunt_lock,
+    read_optional_dict,
+    read_optional_json,
+    read_text_lossy,
+    sh,
+    write_json,
+)
 
 MAX_SOURCE_LINES = 1500     # bigger changed files are shown as windows around the hunks
 MAX_SIBLING_LINES = 3000    # total sibling test lines per batch
@@ -53,15 +65,51 @@ def hunk_ranges(patch: str) -> list[tuple[int, int]]:
     return [(int(m.group(1)), int(m.group(2) or 1)) for m in re.finditer(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", patch, re.M)]
 
 
-def source_view(wt: Path, path: str, patch: str) -> str:
+def source_view(wt: Path, path: str, patch: str, focus_lines: list[int] | None = None, window: int = 40,
+                max_lines: int = MAX_SOURCE_LINES) -> str:
     lines = (wt / path).read_text(errors="replace").split("\n")
-    if len(lines) <= MAX_SOURCE_LINES:
+    if len(lines) <= max_lines:
         return numbered(lines, 1, len(lines))
-    parts = []
-    for start, n in hunk_ranges(patch):
-        a, b = max(1, start - 40), min(len(lines), start + n + 40)
-        parts.append(numbered(lines, a, b))
-    return "\n   ...\n".join(parts)
+    spans = [(max(1, start - 40), min(len(lines), start + n + 40)) for start, n in hunk_ranges(patch)]
+    if focus_lines is not None:
+        for ln in focus_lines:
+            c = min(len(lines), max(1, ln))
+            spans.append((max(1, c - window), min(len(lines), c + window)))
+        spans = [(a, b) for a, b in spans if a <= b]
+        if not spans:
+            return numbered(lines, 1, min(len(lines), min(120, max_lines)))
+    spans = _merge_spans(spans)
+    total = _rendered_span_lines(spans)
+    if total > max_lines:
+        anchors = changed_lines(patch) | set(focus_lines or ())
+        src_budget = max(1, max_lines - 1)  # reserve 1 line for `[source cut: ...]`
+        alloc = _allocate_budgets({i: b - a + 1 for i, (a, b) in enumerate(spans)}, src_budget)
+        non_empty = sum(1 for v in alloc.values() if v > 0)
+        if non_empty > 1 and sum(alloc.values()) + non_empty > max_lines:
+            alloc = _allocate_budgets({i: b - a + 1 for i, (a, b) in enumerate(spans)}, max(1, max_lines - non_empty))
+        capped: list[tuple[int, int]] = []
+        for i, (a, b) in enumerate(spans):
+            cap = alloc[i]
+            if cap <= 0:
+                continue
+            hits = [ln for ln in anchors if a <= ln <= b]
+            if hits and (b - a + 1) > cap:
+                lo_c, hi_c = min(hits), max(hits)
+                if hi_c - lo_c + 1 <= cap:
+                    pad = cap - (hi_c - lo_c + 1)
+                    lo = max(a, lo_c - pad // 2)
+                    hi = min(b, lo + cap - 1)
+                    lo = max(a, hi - cap + 1)
+                else:
+                    lo, hi = lo_c, min(b, lo_c + cap - 1)
+                capped.append((lo, hi))
+            else:
+                capped.append((a, min(b, a + cap - 1)))
+        spans = capped
+        shown = _rendered_span_lines(spans)
+        rendered = "\n   ...\n".join(numbered(lines, a, b) for a, b in spans)
+        return f"{rendered}\n[source cut: {total - shown} more lines not shown]"
+    return "\n   ...\n".join(numbered(lines, a, b) for a, b in spans)
 
 
 def request_patch(patch: str) -> str:
@@ -260,7 +308,7 @@ def _emit_sibling_group(
     return used_total
 
 
-GO_SETUP_DECL = re.compile(r"^(?:func (?!(?:Test|Benchmark|Fuzz|Example)[A-Z_(])(?:\([^)]*\) )?\w+\(|type \w+ )", re.M)
+GO_SETUP_DECL = re.compile(r"^(?:func (?:TestMain\(|(?!(?:Test|Benchmark|Fuzz|Example)[A-Z_(])(?:\([^)]*\) )?\w+\()|type \w+ )", re.M)
 
 
 HELPER_SRC_NAME = re.compile(r"testlib|test_?helpers?|test_?utils?|testutil", re.I)
@@ -294,15 +342,23 @@ def helper_sources(d: Path, exclude: set[str], wt: Path) -> list[Path]:
 def jest_fallback(d: Path, exclude: set[str], wt: Path) -> list[tuple[int, Path, list[str]]]:
     """A jest directory with no same-name or symbol-mentioning test: show its smallest sibling tests (same directory,
     else its __tests__ or the parent's __tests__) so the hunter sees how this code base mounts and mocks components."""
+    wt_root = wt.resolve()
     for where in (d, d / "__tests__", d.parent / "__tests__"):
-        if not where.is_dir():
+        if where.is_symlink() or not where.is_dir() or not where.resolve().is_relative_to(wt_root):
             continue
         found = []
         for p in sorted(where.iterdir()):
-            if (p.is_symlink() or not p.is_file() or not p.name.endswith(SIBLING_TEST_SUFFIXES[1:])
-                    or p.name.startswith("hunt_") or str(p.relative_to(wt)) in exclude):
+            if not p.name.endswith(SIBLING_TEST_SUFFIXES[1:]) or p.name.startswith("hunt_"):
                 continue
-            found.append((3, p, p.read_text(errors="replace").split("\n")))
+            try:
+                rel = str(p.relative_to(wt))
+            except ValueError:
+                continue
+            if rel in exclude:
+                continue
+            lines = read_source(p, wt)
+            if lines is not None:
+                found.append((3, p, lines))
         if found:
             found.sort(key=lambda item: len(item[2]))
             return found[:MAX_JEST_FALLBACK]
@@ -344,10 +400,12 @@ def sibling_tests(wt: Path, files: list[str], symbols: set[str]) -> list[dict[st
             else:
                 continue
             ranked.append((rank, p, lines))
-        if not ranked:
-            ranked = setup_fallback(cands, helper_sources(d, file_set, wt))
-        if not ranked and any(lang_of(f) == "jest" and not f.endswith(".sql") and (wt / f).parent == d for f in files):
-            ranked = jest_fallback(d, file_set, wt)
+        has_go = any(lang_of(f) == "go" and (wt / f).parent == d for f in files)
+        has_jest = any(lang_of(f) == "jest" and not f.endswith(".sql") and (wt / f).parent == d for f in files)
+        if not any(lang_of(p.name) == "go" for _, p, _ in ranked) and has_go:
+            ranked += setup_fallback(cands, helper_sources(d, file_set, wt))
+        if not any(lang_of(p.name) == "jest" for _, p, _ in ranked) and has_jest:
+            ranked += jest_fallback(d, file_set, wt)
         ranked.sort(key=lambda item: (item[0], item[1].name))
         if ranked:
             dir_cands[d] = ranked
@@ -372,7 +430,7 @@ GO_FUNC_DECL = re.compile(r"^func (?:\([^)]*\)\s*)?([A-Za-z_]\w*)")
 TS_FUNC_DECL = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s+([A-Za-z_]\w*)|const\s+([A-Za-z_]\w*)\s*[=:])")
 PERMISSION_CALL = re.compile(r"SessionHasPermissionTo\w*\(|\bHasPermissionTo\w*\(")
 MAX_ENCLOSING_LINES = 400
-CALLER_INCLUDES = ("--include=*.go", "--include=*.ts", "--include=*.tsx", "--include=*.js")
+CALLER_INCLUDES = ("--include=*.go", "--include=*.ts", "--include=*.tsx", "--include=*.js", "--include=*.jsx")
 CALLER_EXCLUDE_DIRS = ("--exclude-dir=node_modules", "--exclude-dir=vendor")
 
 
@@ -406,12 +464,22 @@ def enclosing_function(lines: list[str], n: int, lang: str) -> tuple[str, int, i
         if not m:
             continue
         name = next(g for g in m.groups() if g)
-        end = i + 1
-        for j in range(i + 1, min(len(lines), i + MAX_ENCLOSING_LINES)):
-            end = j + 1
-            if lines[j].startswith("}"):
+        limit = min(len(lines), i + MAX_ENCLOSING_LINES)
+        for k in range(i + 1, limit):
+            if rx.match(lines[k]):
+                limit = k
                 break
-        return name, i + 1, end
+        end, has_body = block_end(lines, i + 1, limit, lang)
+        if lang == "go" or m.group(1) is not None:
+            if not has_body:
+                return None
+        else:
+            decl = " ".join(code_lines(lines[i:end], lang))
+            if not ts_holds_function(decl):
+                return None
+            if not has_body and not decl.rstrip().endswith(";"):
+                end = i + 1
+        return (name, i + 1, end) if i + 1 <= n <= end else None
     return None
 
 
@@ -455,7 +523,7 @@ def callers(wt: Path, files: list[str], symbols: set[str]) -> list[dict[str, Any
             e["chain_for"] = root_sym
         return e
 
-    per_symbol: list[list[dict[str, Any]]] = []
+    per_symbol: list[list[tuple[str, int, str, str, int]]] = []
     for sym in sorted(symbols):
         direct: list[tuple[str, int]] = []
         seen: set[tuple[str, int]] = set()
@@ -464,38 +532,50 @@ def callers(wt: Path, files: list[str], symbols: set[str]) -> list[dict[str, Any
                 continue
             seen.add((f, n // 10))
             direct.append((f, n))
-        items: list[dict[str, Any]] = []
+        specs: list[tuple[str, int, str, str, int]] = []
         used: set[tuple[str, int]] = set()
         for k, (f, n) in enumerate(direct):
             if (f, n // 10) not in used:
-                items.append(excerpt(f, n, sym, sym, 1))
+                specs.append((f, n, sym, sym, 1))
             if k >= MAX_CHAINS_PER_SYMBOL:
                 continue
             cur_f, cur_n = f, n
+            visited: set[tuple[str, int]] = {(f, n)}
             for hop in range(2, MAX_HOPS + 1):
                 if is_entry_point(cur_f) or grep_budget[0] <= 0:
                     break
                 enc = enclosing_function(source(cur_f), cur_n, lang_of(cur_f))
                 if enc is None or len(enc[0]) <= 3 or enc[0].startswith("Test") or enc[0] == sym:
                     break
+                visited.add((cur_f, enc[1]))
                 grep_budget[0] -= 1
-                ups = [h for h in sorted(grep_word(wt, enc[0], roots), key=caller_rank)
-                       if h[0] not in file_set and h != (cur_f, cur_n)]
+                ups = [
+                    h for h in sorted(grep_word(wt, enc[0], roots), key=caller_rank)
+                    if h[0] not in file_set
+                    and not (h[0] == cur_f and enc[1] <= h[1] <= enc[2])
+                    and h not in visited
+                ]
                 if not ups:
                     break
                 cur_f, cur_n = ups[0]
+                visited.add((cur_f, cur_n))
                 used.add((cur_f, cur_n // 10))
-                items.append(excerpt(cur_f, cur_n, enc[0], sym, hop))
-        per_symbol.append(items)
+                specs.append((cur_f, cur_n, enc[0], sym, hop))
+        per_symbol.append(specs)
 
     out: list[dict[str, Any]] = []
     seen_out: set[tuple[str, str]] = set()
     for group in itertools.zip_longest(*per_symbol):
-        for item in group:
-            if item is None or (item["file"], item["lines"]) in seen_out:
+        for spec in group:
+            if spec is None:
                 continue
-            seen_out.add((item["file"], item["lines"]))
-            out.append(item)
+            f, n, hit_sym, root_sym, hop = spec
+            lines = source(f)
+            a, b = max(1, n - CALLER_PAD), min(len(lines), n + CALLER_PAD)
+            if (f, f"{a}-{b}") in seen_out:
+                continue
+            seen_out.add((f, f"{a}-{b}"))
+            out.append(excerpt(f, n, hit_sym, root_sym, hop))
             if len(out) >= MAX_CALLERS:
                 return out
     return out
@@ -519,6 +599,14 @@ def caller_counts(wt: Path, chosen: list[prefilter.FileDiff]) -> dict[str, int]:
 
 
 SQL_TEST_DIR = "server/channels/store/sqlstore"  # Go store tests exercise the migrations
+GO_TEST = re.compile(r"^func (Test(?:[A-Z_0-9]\w*)?)\((?:\w+ )?\*(?:\w+\.)?T\)")
+
+
+def target_entry(d: str, lang: str, mode_tag: str, sample: Path | None = None) -> dict[str, str]:
+    if lang == "go":
+        m = re.search(r"^package (\w+)", read_text_lossy(sample), re.M) if sample else None
+        return {"lang": "go", "dir": d, "path": f"{d}/hunt_hunt{mode_tag}_test.go", "package": m.group(1) if m else "?"}
+    return {"lang": "jest", "dir": d, "path": f"{d}/hunt_{mode_tag}.test.tsx"}
 
 
 def test_targets(wt: Path, files: list[str]) -> list[dict[str, str]]:
@@ -528,62 +616,53 @@ def test_targets(wt: Path, files: list[str]) -> list[dict[str, str]]:
     for f in files:
         d = str(Path(f).parent)
         if f.endswith(".sql"):
-            gofiles = sorted((wt / SQL_TEST_DIR).glob("*.go")) if (wt / SQL_TEST_DIR).is_dir() else []
-            gofiles = [p for p in gofiles if not p.name.endswith("_test.go")]
-            if not gofiles:
+            store_dir = wt / SQL_TEST_DIR
+            gofiles = [
+                p for p in (sorted(store_dir.glob("*.go")) if store_dir.is_dir() else [])
+                if not p.name.endswith("_test.go")
+                and not re.search(r"^//(?:go:build\s+ignore\b|\s*\+build\s+ignore\b)", read_text_lossy(p), re.M)
+            ]
+            pick = [p for p in gofiles if not re.search(r"^package main\b", read_text_lossy(p), re.M)] or gofiles
+            if not pick:
                 continue
-            d, f = SQL_TEST_DIR, str(gofiles[0].relative_to(wt))
+            d, f = SQL_TEST_DIR, str(pick[0].relative_to(wt))
         if d in seen:
             continue
         seen.add(d)
-        if f.endswith(".go"):
-            m = re.search(r"^package (\w+)", read_text_lossy(wt / f), re.M)
-            out.append({"lang": "go", "dir": d, "path": f"{d}/hunt_hunt<mode>_test.go", "package": m.group(1) if m else "?"})
-        else:
-            out.append({"lang": "jest", "dir": d, "path": f"{d}/hunt_<mode>.test.tsx"})
+        out.append(target_entry(d, "go" if f.endswith(".go") else "jest", "<mode>", wt / f))
     return out
 
 
 def go_code(line: str) -> str:
     """One Go line without its trailing // comment (string, raw-string and rune literals respected), right-stripped."""
-    quote = ""
-    i = 0
-    while i < len(line):
-        c = line[i]
-        if quote:
-            if c == "\\" and quote != "`":
-                i += 1
-            elif c == quote:
-                quote = ""
-        elif c in "\"`'":
-            quote = c
-        elif line.startswith("//", i):
-            return line[:i].rstrip()
-        i += 1
-    return line.rstrip()
+    return code_only(line, "go", keep_strings=True)[0].rstrip()
+
+
+def go_bodies(src: str) -> dict[str, str]:
+    lines = src.split("\n")
+    return {name: "\n".join(lines[a - 1:b]) for name, a, b in top_blocks(lines, "go")}
 
 
 def changed_go_tests(patch: str, head_src: str) -> list[str]:
     """Top-level Test functions that contain an added or removed line (new tests and edited bodies alike)."""
     lines = head_src.split("\n")
-    decls = []  # (first line, last line, name); gofmt puts a top-level closing brace in column 0
-    for i, line in enumerate(lines, 1):
-        if line.startswith("func "):
-            # A trailing comment (`} // TestA`) does not hide the brace; `//` inside a literal is not a comment.
-            if go_code(line).endswith("}"):  # one-line body: func TestA(t *testing.T) {}
-                end = i
-            else:
-                end = next((j for j in range(i + 1, len(lines) + 1) if go_code(lines[j - 1]) == "}"), len(lines))
-            # Only what `go test -run` executes: top-level func TestX(t *testing.T), with the parameter name optional
-            # and any package qualifier (aliased or dot-imported testing). Not TestMain, benchmarks, helpers, or
-            # methods whose names happen to start with Test.
-            m = re.match(r"func (Test(?:[A-Z_0-9]\w*)?)\((?:\w+ )?\*(?:\w+\.)?T\)", line)
-            decls.append((i, end, m.group(1) if m else ""))
+    decls: list[tuple[int, int, str]] = []
+    for _, a, b in top_blocks(lines, "go"):
+        sig = re.sub(r"\s+", " ", "\n".join(code_lines(lines[a - 1:b], "go")).split("{", 1)[0]).strip()
+        sig = re.sub(r",?\s*\)", ")", re.sub(r"\(\s+", "(", sig))
+        if m := GO_TEST.match(sig):
+            decls.append((a, b, m.group(1)))
     touched = changed_lines(patch)
-    names = set()
-    for t in touched:
-        names |= {name for start, end, name in decls if name and start <= t <= end}
-    return sorted(names)
+    return sorted({name for t in touched for start, end, name in decls if start <= t <= end})
+
+
+def changed_test_files(repo: Path, mb: str, head: str, dirs: set[str] | None = None, *, skip_hunt: bool = True) -> list[str]:
+    return [
+        f for f in git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head).splitlines()
+        if (dirs is None or str(Path(f).parent) in dirs)
+        and not (skip_hunt and Path(f).name.startswith("hunt_"))
+        and (f.endswith("_test.go") or re.search(r"\.test\.[jt]sx?$", f))
+    ]
 
 
 def own_tests(repo: Path, mb: str, head: str, dirs: set[str]) -> dict[str, Any]:
@@ -591,16 +670,13 @@ def own_tests(repo: Path, mb: str, head: str, dirs: set[str]) -> dict[str, Any]:
     names: list[str] = []
     by_dir: dict[str, set[str]] = {}
     jest: list[str] = []
-    for f in git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head).splitlines():
-        if str(Path(f).parent) not in dirs:
-            continue
+    for f in changed_test_files(repo, mb, head, dirs, skip_hunt=False):
         if f.endswith("_test.go"):
-            patch = git(repo, "diff", mb, head, "--", f)
-            found = changed_go_tests(patch, git(repo, "show", f"{head}:{f}"))
+            found = changed_go_tests(git(repo, "diff", mb, head, "--", f), git(repo, "show", f"{head}:{f}"))
             names += found
             if found:
                 by_dir.setdefault(str(Path(f).parent), set()).update(found)
-        elif re.search(r"\.test\.[jt]sx?$", f):
+        else:
             jest.append(f)
     return {"go": sorted(set(names)), "go_by_dir": {d: sorted(v) for d, v in sorted(by_dir.items())},
             "jest": sorted(jest)}
@@ -614,13 +690,9 @@ def pr_tests_diff(repo: Path, mb: str, head: str, dirs: set[str]) -> list[dict[s
     Added lines only, with their head line numbers, capped at MAX_PR_TEST_LINES in all."""
     out = []
     budget = MAX_PR_TEST_LINES
-    for f in git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head).splitlines():
+    for f in changed_test_files(repo, mb, head, dirs):
         if budget <= 0:
             break
-        if str(Path(f).parent) not in dirs or not (f.endswith("_test.go") or re.search(r"\.test\.[jt]sx?$", f)):
-            continue
-        if Path(f).name.startswith("hunt_"):
-            continue
         rows = []
         new = 0
         for line in git(repo, "diff", "-U0", mb, head, "--", f).splitlines():
@@ -651,11 +723,12 @@ def file_diffs(repo: Path, mb: str, head: str) -> list[prefilter.FileDiff]:
 # Outputs of an earlier hunt or batch. Left in place they would be reused (an old regenerated mutant, an old compile
 # log, old verdicts), so a new context removes them; prepare.json and whole-PR artifacts stay across batch switches.
 STALE = ("A", "B", "D", "A2", "M", "M2", "R_*", "run_A*", "run_B*", "run_D*", "base_A*", "base_B*", "base_D*",
+         "fix_A*", "fix_B*", "fix_D*",
          "mutants_*", "compile_A*", "compile_B*", "compile_D*", "fuzz_*", "diff_*", "ctx.json", "state.json", "skipped.log",
          # driver outputs: a new batch or head must be vetted again, never reuse the last run's decisions
-         "V", "run_V*", "base_V*", "vet", "vetted.json", "verdict.json", "findings.json", "audit.md")
+         "V", "V.*", "V_*", "run_V*", "base_V*", "vet", "vet.*", "vet_*", "vetted.json", "verdict.json", "findings.json", "audit.md", "hunt_done.json")
 WHOLE_PR_STALE = ("old_tests.json", "old_tests.messages.json", "pr_tests.json", "pr_tests.messages.json",
-                  "R", "run_R*", "base_R*", "compile_R*", "review_verdicts.json", "batches")
+                  "R", "run_R*", "base_R*", "fix_R*", "compile_R*", "review_verdicts.json", "batches")
 
 
 _BATCH_OUTPUTS = ("A/response.json", "B/response.json", "D/response.json", "A2/response.json",
@@ -677,6 +750,11 @@ def archive_batch(hdir: Path, batch_num: int) -> Path:
     for pattern in STALE:
         for p in sorted(hdir.glob(pattern)):
             shutil.move(str(p), str(dst / p.name))
+    order_path = dst.parent / "order.json"
+    raw_order = read_optional_json(order_path)
+    order = [str(x) for x in raw_order if str(x) != dst.name] if isinstance(raw_order, list) else []
+    order.append(dst.name)
+    write_json(order_path, order)
     return dst
 
 
@@ -744,7 +822,7 @@ def changed_lines(patch: str) -> set[int]:
 REGEX_BEFORE = re.compile(r"(^|[(,=:\[!&|?{};]|\breturn)\s*$")
 
 
-def code_only(line: str, lang: str, open_quote: str = "") -> tuple[str, str]:
+def code_only(line: str, lang: str, open_quote: str = "", *, keep_strings: bool = False) -> tuple[str, str]:
     """(code, quote still open at the end) for one Go or JS/TS line: string, rune, template-literal and JS regex
     contents and any `//` comment removed, so braces and `//` inside them don't count as code. `open_quote` carries a
     Go raw string or JS template literal across lines. Go raw strings have no escapes; JS template literals do. JSX
@@ -754,17 +832,34 @@ def code_only(line: str, lang: str, open_quote: str = "") -> tuple[str, str]:
     i = 0
     while i < len(line):
         c = line[i]
+        if quote == "/*":
+            end = line.find("*/", i)
+            if end < 0:
+                break
+            quote = ""
+            out.append(" ")
+            i = end + 2
+            continue
         if quote:
+            if keep_strings:
+                out.append(c)
             if c == "\\" and not (quote == "`" and lang == "go"):
                 i += 1
+                if keep_strings and i < len(line):
+                    out.append(line[i])
             elif c == quote:
                 quote = ""
-                out.append(c)
+                if not keep_strings:
+                    out.append(c)
         elif c in "\"'`":
             quote = c
             out.append(c)
         elif line.startswith("//", i):
             break
+        elif line.startswith("/*", i):
+            quote = "/*"
+            i += 2
+            continue
         elif c == "/" and lang != "go" and REGEX_BEFORE.search("".join(out)):
             in_class = False
             i += 1
@@ -861,8 +956,9 @@ def top_blocks(lines: list[str], lang: str) -> list[tuple[str, int, int]]:
     `default`, and a repeated name (several `init`) gets `#2`, `#3`. TS body-less overload signatures and declarations
     whose value is not a function are skipped."""
     rx = GO_FUNC if lang == "go" else TS_FUNC
+    scan = code_lines(lines, "go") if lang == "go" else lines
     cands: list[tuple[int, str, bool]] = []  # (0-based line, name, is a `func`/`function` declaration)
-    for i, line in enumerate(lines):
+    for i, line in enumerate(scan):
         m = rx.match(line)
         if not m:
             continue
@@ -1031,36 +1127,39 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any], *, al
           first_batch: bool = False) -> dict[str, Any]:
     repo, wt, mb, head = Path(prep["repo"]), Path(prep["wt"]), prep["merge_base"], prep["head"]
     diffs = file_diffs(repo, mb, head)
+    has_huntable = False
     for f in diffs:
         if not prefilter.excluded(f.path):
             f.patch = git(repo, "diff", mb, head, "--", f.path)
-    plan = prefilter.plan(diffs, callers=caller_counts(wt, diffs))
+            has_huntable = True
+    plan = prefilter.plan(diffs, callers=caller_counts(wt, diffs) if has_huntable else {})
     deleted = git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=D", mb, head).splitlines()
     plan.skipped += [(path, "deleted") for path in deleted]
     forced = forced_all_batches(diffs, deleted) if first_batch and len(plan.batches) > 1 else []
     hdir = Path(prep.get("hunt_dir") or hunt_dir(pr))
     hdir.mkdir(parents=True, exist_ok=True)
+    prev_state_path = hdir / "state.json"
+    prev = read_optional_dict(prev_state_path) if prev_state_path.exists() else {}
+    head_changed = prev.get("head") != head
     if not plan.batches:
-        reset_hunt_dir(hdir)
+        reset_hunt_dir(hdir, include_whole_pr=head_changed)
         (hdir / "skipped.log").write_text("\n".join(prefilter.describe(plan, batch)) + "\n")
-        raise InfraError("prefilter left no source files to hunt (see skipped.log)")
+        state: dict[str, Any] = {
+            "pr": pr, "batch": 0, "batches": 0, "skipped_diff": True,
+            "repo": str(repo), "wt": str(wt), "wt_base": prep["wt_base"],
+            "merge_base": mb, "head": head, "changed": [], "targets": [],
+        }
+        write_json(hdir / "state.json", state)
+        return state
     if not 1 <= batch <= len(plan.batches):
         raise InfraError(f"batch {batch} requested; batches are 1..{len(plan.batches)}")
-    prev_state_path = hdir / "state.json"
-    head_changed = False
-    if prev_state_path.exists():
-        try:
-            prev = json.loads(prev_state_path.read_text())
-        except (OSError, ValueError):
-            prev = {}
-        prev_head = prev.get("head")
+    if not head_changed and prev.get("head") == head:
         prev_batch = prev.get("batch")
-        if prev_head and prev_head != head:
-            head_changed = True
-        elif prev_head == head:
-            all_batches = all_batches or (bool(prev.get("all_batches")) and not first_batch)
-            if isinstance(prev_batch, int) and prev_batch != batch:
-                archive_batch(hdir, prev_batch)
+        all_batches = all_batches or (bool(prev.get("all_batches")) and not first_batch)
+        if not forced and not first_batch and isinstance(prev.get("forced_all_batches"), list):
+            forced = [str(r) for r in prev["forced_all_batches"]]
+        if isinstance(prev_batch, int) and prev_batch != batch:
+            archive_batch(hdir, prev_batch)
     all_batches = all_batches or bool(forced)
     reset_hunt_dir(hdir, include_whole_pr=head_changed)
     (hdir / "skipped.log").write_text("\n".join(prefilter.describe(plan, batch)) + "\n")
@@ -1076,10 +1175,15 @@ def build(pr: str, batch: int, prep: dict[str, Any], meta: dict[str, Any], *, al
                                "title": meta.get("title", ""), "description": meta.get("body") or ""}
     if prep.get("range"):
         pr_info["range"] = f"{prep['range'][0]}...{prep['range'][1]}"
+    src_needs = {f: max(1, min(MAX_SOURCE_LINES, len((wt / f).read_text(errors="replace").splitlines()))) for f in files}
+    src_alloc = _allocate_budgets(src_needs, MAX_SOURCE_LINES * 2) if files else {}
     ctx: dict[str, Any] = {
         "pr": pr_info,
         "diff_production_code": "\n".join(request_patch(patches[f]) for f in files),
-        "changed_files_head_source": [{"file": f, "source": source_view(wt, f, patches[f])} for f in files],
+        "changed_files_head_source": [
+            {"file": f, "source": source_view(wt, f, patches[f], max_lines=src_alloc.get(f, MAX_SOURCE_LINES))}
+            for f in files
+        ],
         "sibling_tests_and_helpers": sibling_tests(wt, files, syms),
         "callers": callers(wt, files, syms),
         "your_test_files": targets,
@@ -1132,6 +1236,9 @@ def main() -> None:
             if meta.get("draft"):
                 print(f"note: PR #{a.pr} is a draft")
         st = build(a.pr, batch, prep, meta, all_batches=not a.first_batch, first_batch=a.first_batch)
+    if st["batches"] == 0:
+        print("skip: prefilter left no source files to hunt (see skipped.log)")
+        return
     ctx = json.loads((hunt_dir(a.pr) / "ctx.json").read_text())
     print(f"batch {st['batch']}/{st['batches']}: {len(st['changed'])} files, {len(ctx['callers'])} caller excerpts, "
           f"{len(ctx['sibling_tests_and_helpers'])} sibling test files, {len(ctx['neighbors_same_file'])} neighbour and "

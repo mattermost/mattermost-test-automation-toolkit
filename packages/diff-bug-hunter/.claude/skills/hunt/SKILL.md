@@ -118,7 +118,7 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
        (`batch 1/N` with `N > 1` without `--all-batches`), any hunter `EMPTY` or failed repair, any `NOT_RUN` / `INFRA_ERROR`
        / `BASE_UNCOMPILABLE` / `BASE_FAILED` / `RECORDER_FAILED` / `NO_RECORDS` / `NONDETERMINISTIC` / `FLAKY` /
        `PR_TEST_FAILS` / unresolved `NEW_API`, any Mode R thread `UNPROVABLE_DYNAMICALLY` (including `UNVETTED`), or Mode A
-       `0/Y` changed lines reached (`Y > 0`), or a Mode A run whose changed lines were never measured (no
+       `0/Y` changed lines reached (`Y > 0`), or a skeptic DROP of a mechanical `NEW_PR_BUG` or Mode D `DIFF` (`N mechanical failure(s) dismissed by the skeptic`), or a Mode A run whose changed lines were never measured (no
        `run_A.coverage.json`), or a race-detector failure on head (`race detector fired on head in <test>`). List every
        specific gap explicitly so a reviewer knows exactly what was not proven clean.
      - **`High-Confidence Clean`** — no bug proven, AND every batch ran, Modes A/B/D (and R when qualifying threads exist)
@@ -164,29 +164,32 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
 
 ## Unattended driver
 
-`/hunt` above stays the interactive path. For an unattended run, `scripts/hunt.py <target> [--fresh]` drives the same
+`/hunt` above stays the interactive path. For an unattended run, `scripts/hunt.py <target> [--fresh] [--force] [--modes A,B,D,R] [--no-prompt-cache]` drives the same
 scripts as a state machine and calls the model only through `scripts/dispatch.py` (one request file in, one
-`response.json` out). Stages: prepare, ctx, requests, dispatch (hunters A, B, D, R in parallel), run (A with one empty
-retry, B, diff D, R; one repair round on `COMPILE_ERROR`), base, old_tests, pr_tests, vet_v (Mode V diagnostics for the
+`response.json` out). Stages: prepare, ctx, requests, dispatch (default modes A, B, and R when threads exist, in parallel;
+Mode D is opt-in via `--modes A,B,D`), run (A with one empty
+retry, B, diff D when requested, R; one repair round on `COMPILE_ERROR`), base, old_tests, pr_tests, vet_v (Mode V diagnostics for the
 A/B `NEW_PR_BUG` candidates, then `run.py run|base <target> V`), vet (skeptic writes `vetted.json`), verdict, report.
-Run it again to resume: a stage whose output exists is skipped, and dispatch is idempotent per request sha.
+Run it again to resume: a stage whose output exists is skipped, and dispatch is idempotent per request sha. Completed hunts
+for the same `(target, head, merge_base, prompt_version)` skip cleanly (exit 0) unless `--force` or `--fresh` is passed;
+docs-only and test-only diffs skip cleanly with exit 0 and zero model calls.
 
 - The dispatch command environment variable (named in `scripts/dispatch.py`) replaces the model call (`<cmd> <request.json>`; the response goes to the request's
-  `response_path`). Unset, it runs `claude -p --output-format json --tools ''`: one inline turn with the request's System
+  `response_path`). Unset, it runs `claude -p --output-format json --tools ''` with `--model` mapped from each request's effort tier (hunters and Mode V default to Sonnet; the skeptic runs on Opus, with at most 1 mechanical Opus escalation per hunt logged in `driver.json` on schema/retry failure, `max_tokens`, ungrounded `file:line` citation, or empty output on a risky file): one inline turn with the request's System
   section as system prompt and its User and Schema sections on stdin, no tools, and the printed answer written by the
-  script. At most 8 calls run at once per machine (the limit's variable is named in `scripts/dispatch.py`). Transient failures
+  script. Set `DISABLE_PROMPT_CACHING=1` or pass `--no-prompt-cache` to opt out of prompt caching per dispatch. At most 8 calls run at once per machine (the limit's variable is named in `scripts/dispatch.py`). Transient failures
   (5xx, `upstream_unreachable`, `overloaded`) retry up to 5 times with backoff, 1 s doubling to 60 s.
 - Head runs: each test runs once; only failures rerun to 3/3. A test that passes first and fails later is recorded
   PASS, not FLAKY, so that flake does not lower the tier.
-- Budget: once a hunt's calls cost $25 (the variable is named in `scripts/hunt.py`), no further call is made; the hunt
+- Budget: once a hunt's calls cost $8 (the variable is named in `scripts/hunt.py`), no further call is made; the hunt
   ends Partial with a `budget` gap.
 - Skeptic: every drop carries `reason_code` and `evidence_quote`; a quote not found verbatim in the request turns the
   drop into a held row (`verdict.check_drop`). Calibrate prompt or model changes with `scripts/skeptic_eval.py`
   (hand-labelled rows in `eval/skeptic/`; one model call per fixture).
 - Outputs: `findings.json` (author-facing KEEP items grouped by root cause, `finding.schema.json`), `audit.md` (tier, gaps, HELD with
   reasons, mutation gate not run, telemetry per stage), `telemetry.jsonl` (wall seconds per `step:*`, tokens and cost
-  per `dispatch` call), `driver.json` (gaps: a hunter with no response, a COMPILE_ERROR after repair).
+  per `dispatch` call), `driver.json` (gaps: a hunter with no response, a COMPILE_ERROR after repair; plus `modes` and `escalations`).
 - Exit codes: 0 done, 2 INFRA_ERROR (including a second driver on the same target), 5 schema mismatch (a hunt dir of this
   head from another `schema_version`: pass `--fresh`). Range targets `base..head` use the base ref itself as the base worktree;
   `base...head` uses the merge-base.
-- Not in the driver: `--mutants` (step 6 above), `--all-batches`, gateway failover, per-effort dispatch tiers.
+- Not in the driver: `--mutants` (step 6 above), `--all-batches`, gateway failover.

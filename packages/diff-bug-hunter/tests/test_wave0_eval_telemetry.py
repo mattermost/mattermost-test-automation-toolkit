@@ -2,14 +2,10 @@
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 from typing import Any
 
-import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / ".claude" / "skills" / "hunt" / "scripts"))
 import eval_bugs
+import pytest
 import telemetry
 
 

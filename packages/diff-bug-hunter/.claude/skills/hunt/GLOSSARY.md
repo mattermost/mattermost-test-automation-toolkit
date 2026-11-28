@@ -16,7 +16,7 @@ Prefix is the source that writes the token. Values are the exact strings in JSON
 | `NOT_A_HEAD_FAILURE` | RUN | Test did not fail on head. Nothing to vet. |
 | `NEW_PR_BUG` | BASE | Fails 3/3 on head and passes on merge-base: the PR introduced the failure. Candidate only until vetted. |
 | `PRE_EXISTING` | BASE | Fails on head and on merge-base: not introduced by the PR. |
-| `NEW_API` | BASE | Fails on head and cannot compile on merge-base because the PR adds the API it calls. Not a bug by itself. |
+| `NEW_API` | BASE | Fails on head and cannot compile or load on merge-base because the PR adds the API it calls. Not a bug by itself. |
 | `BASE_UNCOMPILABLE` | BASE | Cannot compile on merge-base for another reason. Mode D: decide from the diff. |
 | `BASE_FAILS_DIFFERENTLY` | BASE | Fails on merge-base with a different failure. Decide from the diff. |
 | `NOT_RUN_ON_BASE` | BASE | Test or package did not run on merge-base. Decide from the diff. |

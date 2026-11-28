@@ -123,8 +123,8 @@ MEANINGS: dict[Verdict, Meaning] = {
     Verdict.NEW_PR_BUG: Meaning("BASE", "Fails 3/3 on head and passes on merge-base: the PR introduced the failure. "
                                         "Candidate only until vetted."),
     Verdict.PRE_EXISTING: Meaning("BASE", "Fails on head and on merge-base: not introduced by the PR."),
-    Verdict.NEW_API: Meaning("BASE", "Fails on head and cannot compile on merge-base because the PR adds the API "
-                                     "it calls. Not a bug by itself."),
+    Verdict.NEW_API: Meaning("BASE", "Fails on head and cannot compile or load on merge-base because the PR adds the "
+                                     "API it calls. Not a bug by itself."),
     Verdict.BASE_UNCOMPILABLE: Meaning("BASE", "Cannot compile on merge-base for another reason. Mode D: decide "
                                                "from the diff."),
     Verdict.BASE_FAILS_DIFFERENTLY: Meaning("BASE", "Fails on merge-base with a different failure. Decide from the "

@@ -30,14 +30,20 @@ if not sys.pycache_prefix:
 import fcntl
 import hashlib
 import json
+import re
 import shutil
-from collections.abc import Iterator
+import threading
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import build_requests
+import prefilter
 from ctx import reset_hunt_dir
 from hunt_common import (
     REPO,
+    SCHEMA_VERSION,
     SKILL_DIR,
     InfraError,
     git,
@@ -47,6 +53,7 @@ from hunt_common import (
     mm_clone,
     node_env,
     parse_range,
+    read_optional_dict,
     require_disk,
     scratch,
     sh,
@@ -54,7 +61,6 @@ from hunt_common import (
     write_json,
 )
 
-SCHEMA_VERSION = 1  # bump when the hunt dir layout or prepare.json changes meaning: resuming an older one is refused
 PG_MAX_CONNECTIONS = 400  # 4 parallel hunts x parallel Go test packages, each with its own pool
 PG_CONTAINER, PG_IMAGE = "hunt-pg", "postgres:18.3"  # the pinned Postgres (CLAUDE.md); mmuser/mostest as start_pg.sh
 REDIS_CONTAINER, REDIS_IMAGE = "hunt-redis", "redis:7"
@@ -160,11 +166,29 @@ def _container_running(name: str) -> bool | None:
 
 
 def _ensure_container(name: str, run_args: list[str]) -> None:
-    state = _container_running(name)
-    if state is None:
-        sh(["docker", "run", "-d", "--name", name, *run_args], Path("."))
-    elif not state:
-        sh(["docker", "start", name], Path("."))
+    lock_file = scratch() / f"{name}.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    with lock_file.open("w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            state = _container_running(name)
+            if state is None:
+                sh(["docker", "run", "-d", "--name", name, *run_args], Path("."))
+            elif not state:
+                sh(["docker", "start", name], Path("."))
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _wait_until(probe: Callable[[], bool], timeout: float, interval: float = 0.5) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        if probe():
+            return True
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            return False
+        threading.Event().wait(min(interval, rem))
 
 
 def _docker_services() -> None:
@@ -176,10 +200,11 @@ def _docker_services() -> None:
     The setting applies when the container is created; remove an older hunt-pg container to pick it up."""
     _ensure_container(PG_CONTAINER, ["-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-p", "127.0.0.1:5432:5432", PG_IMAGE,
                                      "-c", f"max_connections={PG_MAX_CONNECTIONS}"])
-    # One bounded readiness poll (60 s) inside the container's shell: a wait for startup, not a retry of a test.
-    poll = ("i=0; until pg_isready -h localhost -U postgres -q; do i=$((i+1)); "
-            "[ $i -ge 60 ] && exit 1; done; exit 0")
-    if sh(["docker", "exec", PG_CONTAINER, "sh", "-c", poll], Path("."), check=False).returncode != 0:
+    if not _wait_until(
+        lambda: sh(["docker", "exec", PG_CONTAINER, "pg_isready", "-h", "localhost", "-U", "postgres", "-q"],
+                   Path("."), check=False).returncode == 0,
+        timeout=60.0,
+    ):
         raise InfraError(f"Postgres container {PG_CONTAINER} not ready after 60s")
     psql = ["docker", "exec", PG_CONTAINER, "psql", "-h", "localhost", "-U", "postgres"]
     if sh([*psql, "-tAc", "SELECT 1 FROM pg_roles WHERE rolname='mmuser'"], Path("."), check=False).stdout.strip() != "1":
@@ -188,8 +213,11 @@ def _docker_services() -> None:
           check=False).stdout.strip() != "1":
         sh([*psql, "-qc", "CREATE DATABASE mattermost_test OWNER mmuser"], Path("."))
     _ensure_container(REDIS_CONTAINER, ["-p", "127.0.0.1:6379:6379", REDIS_IMAGE])
-    poll = "i=0; until [ \"$(redis-cli ping)\" = PONG ]; do i=$((i+1)); [ $i -ge 30 ] && exit 1; done; exit 0"
-    if sh(["docker", "exec", REDIS_CONTAINER, "sh", "-c", poll], Path("."), check=False).returncode != 0:
+    if not _wait_until(
+        lambda: sh(["docker", "exec", REDIS_CONTAINER, "redis-cli", "ping"],
+                   Path("."), check=False).stdout.strip() == "PONG",
+        timeout=30.0,
+    ):
         raise InfraError(f"Redis container {REDIS_CONTAINER} did not answer PING")
 
 
@@ -207,10 +235,11 @@ def services_up() -> None:
     if sh(["redis-cli", "ping"], Path("."), check=False).stdout.strip() != "PONG":
         sh(["redis-server", "--daemonize", "yes", "--port", "6379", "--save", "", "--appendonly", "no",
             "--dir", str(scratch())], Path("."))
-        for _ in range(30):
-            if sh(["redis-cli", "ping"], Path("."), check=False).stdout.strip() == "PONG":
-                return
-        raise InfraError("Redis not reachable on localhost:6379 after daemon start")
+        if not _wait_until(
+            lambda: sh(["redis-cli", "ping"], Path("."), check=False).stdout.strip() == "PONG",
+            timeout=15.0,
+        ):
+            raise InfraError("Redis not reachable on localhost:6379 after daemon start")
 
 
 def npm_ci_for_lock(webapp: Path) -> None:
@@ -248,12 +277,22 @@ def webapp_deps(wt: Path, wt_base: Path, mb: str, head: str) -> None:
             dst.symlink_to(src)
 
 
+def huntable_changed(repo: Path, mb: str, head_ref: str) -> list[str]:
+    changed = git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head_ref).splitlines()
+    return [f for f in changed if not prefilter.excluded(f)]
+
+
 def deps(repo: Path, wt: Path, wt_base: Path, mb: str, head_ref: str) -> tuple[bool, bool]:
     """What the changed files need: go.work for Go, Postgres and Redis for stateful server code, npm ci for the webapp.
     Returns (go_changed, web_changed). Shared with eval_bugs.py, which hunts historical commits instead of PRs."""
-    changed = git(repo, "diff", "--name-only", "--no-renames", mb, head_ref).splitlines()
+    changed = huntable_changed(repo, mb, head_ref)
+    all_changed = (git(repo, "diff", "--name-only", "--no-renames", "--diff-filter=AM", mb, head_ref).splitlines()
+                   if changed else [])
     go_changed = any(f.startswith("server/") and f.endswith(".go") for f in changed)
-    web_changed = any(f.startswith("webapp/") for f in changed)
+    web_changed = any(f.startswith("webapp/") for f in changed) or any(
+        f.startswith("webapp/") and re.search(r"\.test\.[jt]sx?$", f) and not Path(f).name.startswith("hunt_")
+        for f in all_changed
+    )
     if go_changed:
         for w in (wt, wt_base):
             go_work(w)
@@ -280,13 +319,22 @@ def pr_meta(pr: str) -> dict:
 
 def existing_results(hdir: Path, head: str) -> list[str]:
     """Result files in hdir that were made for `head` (as prepare.json recorded it); [] if none or another head."""
-    try:
-        prepared = json.loads((hdir / "prepare.json").read_text()).get("head")
-    except (OSError, ValueError):
-        return []
-    if prepared != head:
+    if read_optional_dict(hdir / "prepare.json").get("head") != head:
         return []
     return sorted(str(p.relative_to(hdir)) for pattern in RESULTS for p in hdir.glob(pattern))
+
+
+def _meta_matches(hdir: Path, key: str, value: str) -> bool:
+    prev = read_optional_dict(hdir / "prepare.json")
+    return key not in prev or prev.get(key) == value
+
+
+def prompt_matches(hdir: Path, pv: str) -> bool:
+    return _meta_matches(hdir, "prompt_version", pv)
+
+
+def base_mode_matches(hdir: Path, base_mode: str) -> bool:
+    return _meta_matches(hdir, "base_mode", base_mode)
 
 
 def main(pr: str, fresh: bool = False) -> None:
@@ -317,61 +365,64 @@ def resolve_ref(mm: Path, ref: str) -> str:
     raise InfraError(f"cannot resolve ref {ref!r} in {mm}: {(p.stdout + p.stderr).strip()[-400:]}")
 
 
+def _prepare_reset(hdir: Path, label: str, head_sha: str, fresh: bool, pv: str, base_mode: str | None = None,
+                   merge_base: str | None = None) -> None:
+    check_schema(hdir, head_sha, fresh)
+    stale_meta = (
+        fresh or not prompt_matches(hdir, pv)
+        or (base_mode is not None and not base_mode_matches(hdir, base_mode))
+        or (merge_base is not None and not _meta_matches(hdir, "merge_base", merge_base))
+    )
+    done = [] if stale_meta else existing_results(hdir, head_sha)
+    if done:
+        raise AlreadyHunted(f"{label} already has results for head {head_sha[:10]}: {', '.join(done)}. "
+                            "Do not start over: continue from the first step whose output is missing, or report. "
+                            "Pass --fresh only if the user asked for a new hunt.")
+    # The worktrees are about to move: context, responses and verdicts from the previous preparation no longer apply.
+    reset_hunt_dir(hdir, include_whole_pr=True)
+    for name in ("prepare.json", *RUN_STALE):
+        (hdir / name).unlink(missing_ok=True)
+
+
 def prepare(pr: str, fresh: bool = False) -> None:
     require_disk(scratch())  # worktrees, node_modules and Go builds: refuse early rather than half-prepare
     hdir = hunt_dir(pr)
+    pv = build_requests.prompt_version(SKILL_DIR, SCHEMA_VERSION)
     rng = parse_range(pr)
     wt, wt_base = worktree_paths(pr)
     if rng is not None:
         base_spec, head_spec = rng
         two_dot = is_two_dot(pr)
+        base_mode = "two-dot" if two_dot else "merge-base"
         mm = mm_clone()
         ensure_clone(mm)
-        base_sha = resolve_ref(mm, base_spec)
-        head_sha = resolve_ref(mm, head_spec)
-        done = [] if fresh else existing_results(hdir, head_sha)
-        if done:
-            raise AlreadyHunted(f"{hdir.name}/ already has results for head {head_sha[:10]}: {', '.join(done)}. "
-                                "Do not start over: continue from the first step whose output is missing, or report. "
-                                "Pass --fresh only if the user asked for a new hunt.")
-        check_schema(hdir, head_sha, fresh)
-        reset_hunt_dir(hdir, include_whole_pr=True)
-        (hdir / "prepare.json").unlink(missing_ok=True)
-        for name in RUN_STALE:
-            (hdir / name).unlink(missing_ok=True)
-        mb = worktrees(mm, head_sha, base_sha, wt, wt_base, two_dot=two_dot)
-        go_changed, web_changed = deps(mm, wt, wt_base, mb, head_sha)
-        write_json(hdir / "prepare.json", {"schema_version": SCHEMA_VERSION, "pr": pr, "range": [base_spec, head_spec],
-                                           "base_mode": "two-dot" if two_dot else "merge-base", "repo": str(mm),
-                                           "wt": str(wt), "wt_base": str(wt_base), "head": head_sha,
-                                           "merge_base": mb, "base_ref": base_spec})
-        print(f"ready: head {wt} ({head_spec} @ {head_sha[:10]})  base {wt_base} ({base_spec} @ {mb[:10]}, "
-              f"{'two-dot' if two_dot else 'merge-base'})  go={go_changed} webapp={web_changed}")
-        return
-    meta = pr_meta(pr)
-    done = [] if fresh else existing_results(hdir, meta["head"]["sha"])
-    if done:
-        raise AlreadyHunted(f"hunt{pr}/ already has results for head {meta['head']['sha'][:10]}: {', '.join(done)}. "
-                            "Do not start over: continue from the first step whose output is missing, or report. "
-                            "Pass --fresh only if the user asked for a new hunt.")
-    check_schema(hdir, meta["head"]["sha"], fresh)
-    # The worktrees are about to move: context, responses and verdicts from the previous preparation no longer apply.
-    reset_hunt_dir(hdir, include_whole_pr=True)
-    (hdir / "prepare.json").unlink(missing_ok=True)
-    for name in RUN_STALE:
-        (hdir / name).unlink(missing_ok=True)
-    mm = mm_clone()
-    ensure_clone(mm)
-    # The PR's own base branch (release-* cherry-picks are common), not always master.
-    base = meta["base"]["ref"]
-    with clone_fetch_lock(mm):  # parallel hunts share the clone; two fetches of one ref fail with "cannot lock ref"
-        git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", f"+{base}:refs/remotes/origin/{base}")
-    mb = worktrees(mm, f"pr-{pr}", f"origin/{base}", wt, wt_base)
-    go_changed, web_changed = deps(mm, wt, wt_base, mb, f"pr-{pr}")
-    write_json(hdir / "prepare.json", {"schema_version": SCHEMA_VERSION, "pr": pr, "repo": str(mm), "wt": str(wt),
-                                       "wt_base": str(wt_base), "head": git(mm, "rev-parse", f"pr-{pr}"),
-                                       "merge_base": mb, "base_ref": base})
-    print(f"ready: head {wt}  base {wt_base} ({base} @ {mb[:10]})  go={go_changed} webapp={web_changed}")
+        base_sha, head_sha = resolve_ref(mm, base_spec), resolve_ref(mm, head_spec)
+        eff_mb = base_sha if two_dot else git(mm, "merge-base", base_sha, head_sha)
+        _prepare_reset(hdir, f"{hdir.name}/", head_sha, fresh, pv, base_mode=base_mode, merge_base=eff_mb)
+        head_ref, base_ref, extra = head_sha, base_sha, {"range": [base_spec, head_spec], "base_mode": base_mode}
+        base_label, extra_note = base_spec, f", {base_mode}"
+        head_note = f" ({head_spec} @ {head_sha[:10]})"
+    else:
+        meta = pr_meta(pr)
+        _prepare_reset(hdir, f"hunt{pr}/", meta["head"]["sha"], fresh, pv)
+        mm = mm_clone()
+        ensure_clone(mm)
+        base = meta["base"]["ref"]
+        with clone_fetch_lock(mm):  # parallel hunts share the clone; two fetches of one ref fail with "cannot lock ref"
+            git(mm, "fetch", "-q", "origin", f"+pull/{pr}/head:pr-{pr}", f"+{base}:refs/remotes/origin/{base}")
+        head_ref, base_ref, extra = f"pr-{pr}", f"origin/{base}", {}
+        base_label, extra_note, head_note = base, "", ""
+        two_dot = False
+    mb = worktrees(mm, head_ref, base_ref, wt, wt_base, two_dot=two_dot)
+    go_changed, web_changed = deps(mm, wt, wt_base, mb, head_ref)
+    huntable = huntable_changed(mm, mb, head_ref)
+    head_resolved = head_ref if rng is not None else git(mm, "rev-parse", head_ref)
+    write_json(hdir / "prepare.json", {"schema_version": SCHEMA_VERSION, "pr": pr, **extra, "repo": str(mm),
+                                       "wt": str(wt), "wt_base": str(wt_base), "head": head_resolved,
+                                       "merge_base": mb, "base_ref": base_label, "prompt_version": pv,
+                                       "huntable_files": len(huntable)})
+    print(f"ready: head {wt}{head_note}  base {wt_base} ({base_label} @ {mb[:10]}{extra_note})  "
+          f"go={go_changed} webapp={web_changed}")
 
 
 if __name__ == "__main__":

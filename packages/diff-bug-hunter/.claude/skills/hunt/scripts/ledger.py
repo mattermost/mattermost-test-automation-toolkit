@@ -22,8 +22,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from hunt_common import InfraError, hunt_dir, load_json, read_state, scratch, target_key, under, write_json
-from verdict import admissibility, mechanical_verdict
+from hunt_common import (
+    InfraError,
+    hunt_dir,
+    load_json,
+    read_optional_dict,
+    read_optional_json,
+    read_state,
+    scratch,
+    target_key,
+    under,
+    write_json,
+)
+from verdict import admissibility, mechanical_verdict, row_errors
 from verdicts import Verdict
 
 _BAD_RUN = frozenset({Verdict.FLAKY, Verdict.SKIP, "(package failed)"})
@@ -39,20 +50,6 @@ def ledger_path(override: Path | None = None) -> Path:
     return Path(env).resolve() if env else scratch() / "hunt_ledger.jsonl"
 
 
-def _read_optional_json(path: Path) -> Any:
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def _read_optional_dict(path: Path) -> dict[str, Any]:
-    data = _read_optional_json(path)
-    return data if isinstance(data, dict) else {}
-
-
 def _batch_sort_key(path: Path) -> tuple[int, int, int, str]:
     suffix = path.name.removeprefix("batch_")
     parts = suffix.split(".", 1)
@@ -65,8 +62,12 @@ def _batch_dirs(hdir: Path) -> list[Path]:
     dirs: list[Path] = []
     broot = hdir / "batches"
     if broot.is_dir():
-        dirs.extend(sorted((p for p in broot.iterdir() if p.is_dir() and p.name.startswith("batch_")),
-                           key=_batch_sort_key))
+        raw_order = read_optional_json(broot / "order.json")
+        order_idx = {str(name): idx for idx, name in enumerate(raw_order)} if isinstance(raw_order, list) else {}
+        dirs.extend(sorted(
+            (p for p in broot.iterdir() if p.is_dir() and p.name.startswith("batch_")),
+            key=lambda p: (1, order_idx[p.name], 0, 0, p.name) if p.name in order_idx else (0, *_batch_sort_key(p)),
+        ))
     dirs.append(hdir)
     return dirs
 
@@ -75,7 +76,7 @@ def _read_verdict_json(bdir: Path) -> dict[str, Any] | None:
     vpath = bdir / "verdict.json"
     if not vpath.is_file():
         return None
-    data = _read_optional_dict(vpath)
+    data = read_optional_dict(vpath)
     keep, held = data.get("keep"), data.get("held")
     if not (isinstance(keep, list) or isinstance(held, list)):
         return None
@@ -85,70 +86,199 @@ def _read_verdict_json(bdir: Path) -> dict[str, Any] | None:
         return None
     keep_rows = keep if isinstance(keep, list) else []
     held_rows = held if isinstance(held, list) else []
-    if not all(isinstance(r, dict) for r in keep_rows):
+    if not all(isinstance(r, dict) and not row_errors(r) for r in keep_rows):
         return None
     if not all(isinstance(h, dict) and isinstance(h.get("row"), dict) for h in held_rows):
         return None
-    return {"keep": keep_rows, "held": held_rows}
+    return {"vetted_present": bool(data.get("vetted_present")), "keep": keep_rows, "held": held_rows}
 
 
 def _batch_verdicts(bdir: Path, root: Path, *, require_verdict_json: bool = False) -> dict[str, Any]:
-    """Post-lesson verdict.json when valid; active batch may fall back to admissibility() for ledger tiering."""
+    """Post-lesson verdict.json when valid and vetted; active batch may fall back to admissibility()."""
     data = _read_verdict_json(bdir)
     if data is not None:
-        return data
+        if data.get("vetted_present"):
+            return data
+        return {"keep": [], "held": []} if (require_verdict_json or bdir != root) else admissibility(bdir)
     if require_verdict_json or bdir != root:
         return {"keep": [], "held": []}
     return admissibility(bdir)
 
 
-def _batch_has_raw_bug(bdir: Path) -> bool:
+def _batch_raw_bugs(bdir: Path) -> set[tuple[str, str]]:
+    bugs: set[tuple[str, str]] = set()
     for tag in ("A", "A2", "B"):
-        base_data = _read_optional_json(bdir / f"base_{tag}.json")
-        if isinstance(base_data, dict) and any(
-            k not in ("*", "detail", "new_api") and v == Verdict.NEW_PR_BUG
-            for k, v in base_data.items()
-        ):
-            return True
-    diff_data = _read_optional_json(bdir / "diff_D.json")
-    return isinstance(diff_data, dict) and any(v == Verdict.DIFF for v in diff_data.values())
+        base_data = read_optional_json(bdir / f"base_{tag}.json")
+        if isinstance(base_data, dict):
+            src = "A" if tag == "A2" else tag
+            for k, v in base_data.items():
+                if k not in ("*", "detail", "new_api") and v == Verdict.NEW_PR_BUG:
+                    bugs.add((src, str(k)))
+    diff_data = read_optional_json(bdir / "diff_D.json")
+    if isinstance(diff_data, dict):
+        for k, v in diff_data.items():
+            if v == Verdict.DIFF:
+                bugs.add(("D", str(k)))
+    return bugs
 
 
-def _batch_is_vetted(bdir: Path, root: Path) -> bool:
-    if _read_verdict_json(bdir) is not None:
-        return True
-    return bdir == root and (bdir / "vetted.json").is_file()
+def _is_invalid_held(h: dict[str, Any]) -> bool:
+    reasons = h.get("reasons")
+    return isinstance(reasons, list) and any(str(r).startswith("invalid row:") for r in reasons)
+
+
+def _is_valid_drop(h: dict[str, Any]) -> bool:
+    row = h.get("row")
+    if not isinstance(row, dict) or str(row.get("decision", "")).upper() != Verdict.DROP.value:
+        return False
+    return not _is_invalid_held(h)
+
+
+def _decided_candidates(data: dict[str, Any]) -> set[tuple[str, str]]:
+    decided: set[tuple[str, str]] = set()
+    for r in data.get("keep", []):
+        if isinstance(r, dict) and r.get("id"):
+            decided.add((str(r.get("source", "")), str(r["id"])))
+    for h in data.get("held", []):
+        row = h.get("row") if isinstance(h, dict) else None
+        if isinstance(row, dict) and row.get("id"):
+            if str(row.get("decision", "")).upper() == Verdict.DROP.value and not _is_valid_drop(h):
+                continue
+            decided.add((str(row.get("source", "")), str(row["id"])))
+    return decided
+
+
+def _batch_has_raw_bug(bdir: Path) -> bool:
+    return bool(_batch_raw_bugs(bdir))
+
+
+def _batch_is_vetted(bdir: Path, root: Path, *, require_verdict_json: bool = False) -> bool:
+    raw_bugs = _batch_raw_bugs(bdir)
+    vdata = _read_verdict_json(bdir)
+    if vdata is not None and vdata.get("vetted_present"):
+        return raw_bugs <= _decided_candidates(vdata)
+    if not require_verdict_json and bdir == root and (bdir / "vetted.json").is_file():
+        return raw_bugs <= _decided_candidates(admissibility(bdir))
+    return False
+
+
+def _finding_key(source: str, rid: str, row: dict[str, Any], batch_changed: tuple[str, ...]) -> tuple[Any, ...]:
+    """Key findings by (source, id, file_line) so later batches supersede the same finding regardless of batch
+    changed-file set, while batch-local findings with distinct root-cause locations stay separate (Mode R is PR-wide)."""
+    if source == "R":
+        return (source, rid)
+    fl = str(row.get("file_line") or "").strip()
+    if fl:
+        return (source, rid, fl)
+    return (source, rid, batch_changed)
+
+
+def _clear_overlapped_prior(by_key: dict[tuple[Any, ...], Any],
+                            key_batch: dict[tuple[Any, ...], tuple[int, tuple[str, ...]]],
+                            source: str, rid: str, fl: str, batch_changed: tuple[str, ...],
+                            batch_idx: int) -> None:
+    """Reconcile earlier-batch decisions for the same candidate when location changes or becomes locationless."""
+    if source == "R":
+        return
+    if not fl:
+        drop = []
+        for k in by_key:
+            if k[0] != source or k[1] != rid:
+                continue
+            prev_idx, prev_bc = key_batch.get(k, (-1, ()))
+            if prev_idx >= batch_idx:
+                continue
+            if not batch_changed:
+                if not prev_bc:
+                    drop.append(k)
+            elif prev_bc == batch_changed or (
+                len(k) == 3 and isinstance(k[2], str)
+                and k[2].split(":", 1)[0] in prev_bc and k[2].split(":", 1)[0] in batch_changed
+            ):
+                drop.append(k)
+    else:
+        fl_file = fl.split(":", 1)[0]
+        drop = []
+        for k in by_key:
+            if k[0] != source or k[1] != rid or len(k) != 3:
+                continue
+            prev_idx, prev_bc = key_batch.get(k, (-1, ()))
+            if prev_idx >= batch_idx:
+                continue
+            if isinstance(k[2], tuple):
+                if (k[2] == batch_changed or (not k[2] and not batch_changed)
+                        or (fl_file in k[2] and fl_file in batch_changed)):
+                    drop.append(k)
+            elif isinstance(k[2], str) and k[2].split(":", 1)[0] == fl_file and (
+                prev_bc == batch_changed
+                or (not prev_bc and not batch_changed)
+                or (fl_file in prev_bc and fl_file in batch_changed)
+            ):
+                drop.append(k)
+    for k in drop:
+        del by_key[k]
+        key_batch.pop(k, None)
+
+
+def _merge_batch_verdict_items(
+    by_key: dict[tuple[Any, ...], tuple[str, dict[str, Any]]],
+    anon_keep: list[dict[str, Any]],
+    anon_held: list[dict[str, Any]],
+    b_keep: list[dict[str, Any]],
+    b_held: list[dict[str, Any]],
+    batch_changed: tuple[str, ...],
+    key_batch: dict[tuple[Any, ...], tuple[int, tuple[str, ...]]] | None = None,
+    batch_idx: int = 0,
+) -> None:
+    batches = key_batch if key_batch is not None else {}
+    for r in b_keep:
+        if not isinstance(r, dict):
+            continue
+        rid = str(r.get("id", ""))
+        if rid:
+            src = str(r.get("source", ""))
+            fl = str(r.get("file_line") or "").strip()
+            _clear_overlapped_prior(by_key, batches, src, rid, fl, batch_changed, batch_idx)
+            key = _finding_key(src, rid, r, batch_changed)
+            by_key[key] = ("keep", r)
+            batches[key] = (batch_idx, batch_changed)
+        else:
+            anon_keep.append(r)
+    for h in b_held:
+        if not isinstance(h, dict):
+            continue
+        raw_row = h.get("row")
+        row = raw_row if isinstance(raw_row, dict) else {}
+        rid = str(row.get("id", ""))
+        if rid and not _is_invalid_held(h):
+            src = str(row.get("source", ""))
+            fl = str(row.get("file_line") or "").strip()
+            _clear_overlapped_prior(by_key, batches, src, rid, fl, batch_changed, batch_idx)
+            key = _finding_key(src, rid, row, batch_changed)
+            by_key[key] = ("held", h)
+            batches[key] = (batch_idx, batch_changed)
+        else:
+            anon_held.append(h)
 
 
 def resolved_verdicts(hdir: Path, *, require_verdict_json: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Resolve kept and held/dropped rows across archived batches and the active batch.
 
-    Batches are walked in numeric order (oldest -> newest -> active hdir), so later batches
-    supersede earlier decisions for the same (source, id) while unrelated archived findings remain.
+    Batches are walked in archive order (oldest -> newest -> active hdir), so later batches
+    supersede earlier decisions for the same finding while unrelated archived findings remain.
     """
-    by_key: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
+    by_key: dict[tuple[Any, ...], tuple[str, dict[str, Any]]] = {}
+    key_batch: dict[tuple[Any, ...], tuple[int, tuple[str, ...]]] = {}
     anon_keep: list[dict[str, Any]] = []
     anon_held: list[dict[str, Any]] = []
-    for bdir in _batch_dirs(hdir):
+    for batch_idx, bdir in enumerate(_batch_dirs(hdir)):
         adm = _batch_verdicts(bdir, root=hdir, require_verdict_json=require_verdict_json)
-        for r in adm.get("keep", []):
-            if not isinstance(r, dict):
-                continue
-            rid = str(r.get("id", ""))
-            if rid:
-                by_key[(str(r.get("source", "")), rid)] = ("keep", r)
-            else:
-                anon_keep.append(r)
-        for h in adm.get("held", []):
-            if not isinstance(h, dict):
-                continue
-            raw_row = h.get("row")
-            row = raw_row if isinstance(raw_row, dict) else {}
-            rid = str(row.get("id", ""))
-            if rid:
-                by_key[(str(row.get("source", "")), rid)] = ("held", h)
-            else:
-                anon_held.append(h)
+        st = read_optional_dict(bdir / "state.json")
+        batch_changed = tuple(sorted(str(x) for x in (st.get("changed") or [])))
+        _merge_batch_verdict_items(
+            by_key, anon_keep, anon_held, adm.get("keep", []), adm.get("held", []),
+            batch_changed, key_batch, batch_idx=batch_idx,
+        )
     keep = [item for kind, item in by_key.values() if kind == "keep"] + anon_keep
     not_kept = [item for kind, item in by_key.values() if kind == "held"] + anon_held
     return keep, not_kept
@@ -163,17 +293,26 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
     reached_sum = 0
     exec_sum = 0
     mode_gaps = False
+    root_raw = read_optional_dict(hdir / "driver.json").get("modes") or read_optional_dict(hdir / "state.json").get("modes")
+    root_modes = [str(m) for m in root_raw] if isinstance(root_raw, list) else None
 
     for bdir in _batch_dirs(hdir):
+        b_raw = read_optional_dict(bdir / "state.json").get("modes")
+        if isinstance(b_raw, list):
+            recorded_modes: list[str] | None = [str(m) for m in b_raw]
+        elif bdir == hdir:
+            recorded_modes = root_modes
+        else:
+            recorded_modes = None
         for tag in ("A", "A2", "B"):
-            resp = _read_optional_dict(bdir / tag / "response.json")
+            resp = read_optional_dict(bdir / tag / "response.json")
             empty_resp = resp.get("files") == []
             if tag == "A" and empty_resp:
                 counts["mode_a_empty"] += 1
             if empty_resp:
                 mode_gaps = True
 
-            run_data = _read_optional_json(bdir / f"run_{tag}.json")
+            run_data = read_optional_json(bdir / f"run_{tag}.json")
             head_fails: set[str] = set()
             if isinstance(run_data, dict):
                 for k, v in run_data.items():
@@ -184,10 +323,12 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
                         head_fails.add(str(k))
                     if v in _BAD_RUN or "::(package failed)" in str(k):
                         mode_gaps = True
-            elif tag in ("A", "B") or (bdir / f"compile_{tag}.log").exists():
+            elif (tag in recorded_modes if recorded_modes is not None
+                  else (tag in ("A", "B") and (root_modes is None or tag in root_modes))) \
+                    or (bdir / f"compile_{tag}.log").exists():
                 mode_gaps = True
 
-            base_data = _read_optional_json(bdir / f"base_{tag}.json")
+            base_data = read_optional_json(bdir / f"base_{tag}.json")
             if isinstance(base_data, dict):
                 if head_fails and any(str(base_data.get(t, "")) not in (Verdict.NEW_PR_BUG, Verdict.PRE_EXISTING) for t in head_fails):
                     mode_gaps = True
@@ -211,20 +352,23 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
             elif head_fails:
                 mode_gaps = True
 
-        d_resp = _read_optional_dict(bdir / "D" / "response.json")
-        if (bdir / "D" / "response.json").exists() and not d_resp.get("files"):
-            mode_gaps = True
-        diff_data = _read_optional_json(bdir / "diff_D.json")
-        if isinstance(diff_data, dict):
-            if not diff_data:
+        d_present = any((bdir / p).exists() for p in ("D/request.json", "D/response.json", "compile_D.log", "diff_D.json"))
+        d_expected = ("D" in recorded_modes) if recorded_modes is not None else d_present
+        if d_expected or d_present:
+            d_resp = read_optional_dict(bdir / "D" / "response.json")
+            if (bdir / "D" / "response.json").exists() and not d_resp.get("files"):
                 mode_gaps = True
-            counts["diff"] += sum(1 for v in diff_data.values() if v == Verdict.DIFF)
-            if any(v in _BAD_DIFF for v in diff_data.values()):
+            diff_data = read_optional_json(bdir / "diff_D.json")
+            if isinstance(diff_data, dict):
+                if not diff_data:
+                    mode_gaps = True
+                counts["diff"] += sum(1 for v in diff_data.values() if v == Verdict.DIFF)
+                if any(v in _BAD_DIFF for v in diff_data.values()):
+                    mode_gaps = True
+            else:
                 mode_gaps = True
-        else:
-            mode_gaps = True
 
-        cov_data = _read_optional_json(bdir / "run_A.coverage.json")
+        cov_data = read_optional_json(bdir / "run_A.coverage.json")
         if isinstance(cov_data, dict):
             reached_sum += int(cov_data.get("reached") or 0)
             exec_sum += int(cov_data.get("executable") or 0)
@@ -251,6 +395,30 @@ def _skipped_info(hdir: Path) -> tuple[int, dict[str, str]]:
     return deferred, reasons
 
 
+def _archived_r_bugs(bdir: Path, root_verdicts: dict[str, Any]) -> set[tuple[str, str]]:
+    bugs: set[tuple[str, str]] = set()
+    rv = read_optional_dict(bdir / "review_verdicts.json").get("verdicts")
+    if isinstance(rv, dict):
+        for cid, e in rv.items():
+            if isinstance(e, dict) and e.get("verdict") == Verdict.PROVEN and e.get("base_verdict") == Verdict.NEW_PR_BUG:
+                bugs.add(("R", str(cid)))
+        return bugs
+    if not root_verdicts:
+        for p in [bdir / "base_R.json", *sorted(p for p in bdir.glob("R_*.json") if p.is_file())]:
+            data = read_optional_json(p)
+            if isinstance(data, dict):
+                raw_v = data.get("verdicts")
+                src = raw_v if isinstance(raw_v, dict) else data
+                for k, v in src.items():
+                    if k not in ("*", "detail", "new_api") and (
+                        v == Verdict.NEW_PR_BUG
+                        or (isinstance(v, dict) and v.get("verdict") == Verdict.PROVEN
+                            and v.get("base_verdict") == Verdict.NEW_PR_BUG)
+                    ):
+                        bugs.add(("R", str(k)))
+    return bugs
+
+
 def keep_tier(hdir: Path, keep: list[dict[str, Any]]) -> str:
     """Bug Proven only when a kept row has a merge-base NEW_PR_BUG oracle. A kept Mode D DIFF or Mode A/B NEW_API has no
     such oracle, so the skeptic's KEEP alone stands behind it: that is a behaviour change for the author to review."""
@@ -260,14 +428,24 @@ def keep_tier(hdir: Path, keep: list[dict[str, Any]]) -> str:
     return "Behaviour change, needs review"
 
 
+def _dismissed_mechanical(hdir: Path, row: dict[str, Any]) -> bool:
+    """True when any batch's merge-base oracle for the row's test is the mechanical failure: NEW_PR_BUG, or a Mode D
+    DIFF. Any batch counts, so a newer batch that reuses the test name cannot clear an earlier failure."""
+    for bdir in _batch_dirs(hdir):
+        mech = mechanical_verdict(bdir, row)
+        if mech == Verdict.NEW_PR_BUG or (row.get("source") == "D" and mech == Verdict.DIFF):
+            return True
+    return False
+
+
 def race_reports(hdir: Path) -> list[str]:
     """One gap line per hunter test the Go race detector failed on head. A race the merge-base reports too is left
     out. The detector is mechanical evidence, so it stands whatever the run count or the skeptic made of the test."""
     out: list[str] = []
     for bdir in _batch_dirs(hdir):
         for tag in ("A", "A2", "B"):
-            base = _read_optional_dict(bdir / f"base_{tag}.json")
-            for ident, text in sorted(_read_optional_dict(bdir / f"run_{tag}.messages.json").items()):
+            base = read_optional_dict(bdir / f"base_{tag}.json")
+            for ident, text in sorted(read_optional_dict(bdir / f"run_{tag}.messages.json").items()):
                 if GO_RACE_MARK in str(text) and base.get(ident) != Verdict.PRE_EXISTING:
                     out.append(f"race detector fired on head in {ident} (Mode {tag})")
     return out
@@ -276,39 +454,65 @@ def race_reports(hdir: Path) -> list[str]:
 def _tier_and_gaps(hdir: Path, counts: dict[str, int],
                    reached: int, executable: int, deferred_count: int,
                    batches_hunted: int, batches_total: int,
-                   mode_gaps: bool, verdicts: dict[str, Any]) -> tuple[str, list[str]]:
-    pr_tests_data = _read_optional_dict(hdir / "pr_tests.json")
-    old_tests_data = _read_optional_dict(hdir / "old_tests.json")
+                   mode_gaps: bool, verdicts: dict[str, Any],
+                   *, require_verdict_json: bool = False) -> tuple[str, list[str]]:
+    pr_tests_data = read_optional_dict(hdir / "pr_tests.json")
+    old_tests_data = read_optional_dict(hdir / "old_tests.json")
     pr_tests_map = pr_tests_data.get("tests")
     old_tests_map = old_tests_data.get("tests")
     pr_vals = set(pr_tests_map.values()) if isinstance(pr_tests_map, dict) else set()
     old_vals = set(old_tests_map.values()) if isinstance(old_tests_map, dict) else set()
 
-    has_r_bug = any(
-        isinstance(e, dict) and e.get("verdict") == Verdict.PROVEN and e.get("base_verdict") == Verdict.NEW_PR_BUG
-        for e in verdicts.values()
-    )
     # A1: only a vetted row that passes verdict.admissibility (and any post-filter in verdict.json) reaches the author.
-    resolved_keep, resolved_held = resolved_verdicts(hdir)
+    resolved_keep, resolved_held = resolved_verdicts(hdir, require_verdict_json=require_verdict_json)
     if resolved_keep:
         return keep_tier(hdir, resolved_keep), []
-    batch_unvetted = any(_batch_has_raw_bug(bdir) and not _batch_is_vetted(bdir, hdir) for bdir in _batch_dirs(hdir))
-    whole_pr_raw = (
-        has_r_bug
-        or Verdict.PR_TEST_FAILS_UNDER_CI in pr_vals
-        or bool(old_vals & {Verdict.OLD_TEST_BREAKS, Verdict.OLD_TEST_SOMETIMES_BREAKS})
-    )
-    unfinished_archive = any(
-        bdir != hdir and (bdir / "vetted.json").is_file() and _read_verdict_json(bdir) is None
+    decided_keys: set[tuple[str, str]] = set()
+    for r in resolved_keep:
+        if isinstance(r, dict) and r.get("id"):
+            decided_keys.add((str(r.get("source", "")), str(r.get("id", ""))))
+    for h in resolved_held:
+        row = h.get("row") if isinstance(h, dict) else None
+        if isinstance(row, dict) and row.get("id"):
+            decided_keys.add((str(row.get("source", "")), str(row.get("id", ""))))
+    batch_unvetted = any(
+        _batch_has_raw_bug(bdir) and not _batch_is_vetted(bdir, hdir, require_verdict_json=require_verdict_json)
         for bdir in _batch_dirs(hdir)
     )
-    unvetted = batch_unvetted or (whole_pr_raw and not _batch_is_vetted(hdir, hdir)) or unfinished_archive
-    has_held = any(
-        str((h["row"] if isinstance(h.get("row"), dict) else {}).get("decision", "")).upper() != Verdict.DROP.value
-        for h in resolved_held
+    r_unvetted = any(
+        isinstance(e, dict)
+        and e.get("verdict") == Verdict.PROVEN
+        and e.get("base_verdict") == Verdict.NEW_PR_BUG
+        and ("R", str(cid)) not in decided_keys
+        for cid, e in verdicts.items()
     )
+    pr_unvetted = isinstance(pr_tests_map, dict) and any(
+        v == Verdict.PR_TEST_FAILS_UNDER_CI and ("pr", str(k)) not in decided_keys
+        for k, v in pr_tests_map.items()
+    )
+    old_unvetted = isinstance(old_tests_map, dict) and any(
+        v in {Verdict.OLD_TEST_BREAKS, Verdict.OLD_TEST_SOMETIMES_BREAKS} and ("old", str(k)) not in decided_keys
+        for k, v in old_tests_map.items()
+    )
+    unfinished_archive = any(
+        bdir != hdir and ((bdir / "vetted.json").is_file() or (bdir / "verdict.json").is_file())
+        and _read_verdict_json(bdir) is None
+        for bdir in _batch_dirs(hdir)
+    )
+    archived_r_unvetted = any(
+        bdir != hdir
+        and (r_bugs := _archived_r_bugs(bdir, verdicts))
+        and not (
+            (r_bugs <= _decided_candidates(vdata))
+            if ((vdata := _read_verdict_json(bdir)) is not None and vdata.get("vetted_present"))
+            else (r_bugs <= decided_keys)
+        )
+        for bdir in _batch_dirs(hdir)
+    )
+    unvetted = batch_unvetted or r_unvetted or pr_unvetted or old_unvetted or unfinished_archive or archived_r_unvetted
+    has_held = any(not _is_valid_drop(h) for h in resolved_held)
 
-    threads_doc = _read_optional_dict(hdir / "R" / "threads.json")
+    threads_doc = read_optional_dict(hdir / "R" / "threads.json")
     has_pending_r = bool(threads_doc.get("included")) and not verdicts
     r_compile_gap = (hdir / "compile_R.log").exists() and not (hdir / "run_R.json").exists()
     r_gaps = any(
@@ -319,23 +523,29 @@ def _tier_and_gaps(hdir: Path, counts: dict[str, int],
         for e in verdicts.values()
     )
 
+    driver_gaps = read_optional_dict(hdir / "driver.json").get("gaps")
+    has_driver_gaps = isinstance(driver_gaps, dict) and bool(driver_gaps)
+
     gaps = (
         unvetted
         or has_held
         or mode_gaps
+        or has_driver_gaps
         or has_pending_r
         or r_compile_gap
         or r_gaps
         or (deferred_count > 0 and batches_hunted < batches_total)
         or counts["mode_a_empty"] > 0
         or bool(pr_vals & {Verdict.NOT_RUN, Verdict.FLAKY, Verdict.PR_TEST_FAILS})
-        or bool(old_vals & {Verdict.NOT_RUN, Verdict.NOT_RUN_ON_BASE, Verdict.FLAKY})
+        or bool(old_vals & {Verdict.NOT_RUN, Verdict.NOT_RUN_ON_BASE, Verdict.FLAKY, Verdict.OLD_TEST_UNCOMPILABLE})
         or (executable > 0 and reached == 0)
     )
     races = race_reports(hdir)
-    if not gaps and not races:
+    dismissed = sum(1 for h in resolved_held if _is_valid_drop(h) and _dismissed_mechanical(hdir, h["row"]))
+    dismissed_gap = [f"{dismissed} mechanical failure(s) dismissed by the skeptic"] if dismissed else []
+    if not gaps and not races and not dismissed_gap:
         return "High-Confidence Clean", []
-    return "Partial or Unverified Coverage", (["unvetted findings"] if unvetted else []) + races
+    return "Partial or Unverified Coverage", (["unvetted findings"] if unvetted else []) + races + dismissed_gap
 
 
 def _export_escapes(hdir: Path, state: dict[str, Any], pr_key: str,
@@ -345,7 +555,7 @@ def _export_escapes(hdir: Path, state: dict[str, Any], pr_key: str,
     """Export verified Mode R escapes (Mode R PROVEN NEW_PR_BUG/NEW_API while standalone A/B/D missed)."""
     if any(caught_by_tag.values()) or counts["diff"] > 0:
         return []
-    resp = _read_optional_dict(hdir / "R" / "response.json")
+    resp = read_optional_dict(hdir / "R" / "response.json")
     raw_files = resp.get("files")
     files_by_path = {
         str(f["path"]): str(f.get("content", ""))
@@ -400,7 +610,7 @@ def record(pr: str, hdir: Path | None = None, out_path: Path | None = None) -> d
     counts, caught_by_tag, reached, executable, mode_gaps = _aggregate_modes(hdir)
     deferred_count, skip_reasons = _skipped_info(hdir)
 
-    verdict_doc = _read_optional_dict(hdir / "review_verdicts.json")
+    verdict_doc = read_optional_dict(hdir / "review_verdicts.json")
     raw_verdicts = verdict_doc.get("verdicts")
     verdicts = raw_verdicts if isinstance(raw_verdicts, dict) else {}
     r_summary = {"proven": 0, "disproven": 0, "unprovable": 0, "unprovable_high_severity": 0}
@@ -417,10 +627,10 @@ def record(pr: str, hdir: Path | None = None, out_path: Path | None = None) -> d
             if item.get("severity") in ("critical", "major"):
                 r_summary["unprovable_high_severity"] += 1
 
-    pr_tests_data = _read_optional_dict(hdir / "pr_tests.json")
+    pr_tests_data = read_optional_dict(hdir / "pr_tests.json")
     pr_tests_map = pr_tests_data.get("tests")
     pr_statuses = sorted(set(pr_tests_map.values())) if isinstance(pr_tests_map, dict) else []
-    cov_data = _read_optional_dict(hdir / "run_A.coverage.json") or None
+    cov_data = read_optional_dict(hdir / "run_A.coverage.json") or None
     pr_key = target_key(pr)
     escapes = _export_escapes(hdir, state, pr_key, verdicts, caught_by_tag, counts, skip_reasons, cov_data, out_file)
 

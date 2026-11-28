@@ -41,6 +41,7 @@ if not sys.pycache_prefix:
 import fcntl
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -49,16 +50,17 @@ import subprocess
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import telemetry
-from hunt_common import InfraError, load_json, loads_lossy, scratch, write_json
+from hunt_common import InfraError, load_json, loads_lossy, scratch, write_atomic
 
 DEFAULT_CMD = "claude -p --output-format json --tools '' --strict-mcp-config --disable-slash-commands --setting-sources ''"
 OUTPUT_RULE = ("Answer with exactly one JSON object that matches the JSON schema in the Schema section. No prose, no "
                "markdown fences. You have no tools: answer only from the request.")
+MODEL_MAP = {"sonnet": "sonnet", "opus": "opus"}
 DEFAULT_MAX_DISPATCH = 8
 MAX_TRIES = 5
 BASE_DELAY_S = 1.0
@@ -69,6 +71,11 @@ TRANSIENT = re.compile(r"upstream_unreachable|overloaded|\b5\d\d\b", re.IGNORECA
 
 class DispatchError(RuntimeError):
     """The model call failed for good: a non-transient failure, retries exhausted, or no response written."""
+
+    def __init__(self, message: str, *, stop_reason: str = "", schema_errors: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.stop_reason = stop_reason
+        self.schema_errors = list(schema_errors or [])
 
 
 @dataclass
@@ -81,11 +88,103 @@ class DispatchResult:
     tokens_out: int = 0
     cost_usd: float = 0.0
     secs: float = 0.0
+    model: str = ""
+    effort_tier: str = ""
+    stop_reason: str = ""
+    schema_errors: list[str] = field(default_factory=list)
 
     def add(self, usage: dict[str, int], cost: float) -> None:
         for k, v in usage.items():
             setattr(self, k, getattr(self, k) + v)
         self.cost_usd += cost
+
+
+def _model_for(tier: str) -> str:
+    t = (tier or "sonnet").strip().lower()
+    override = os.environ.get(f"HUNT_MODEL_{t.upper()}", "").strip()
+    return override or MODEL_MAP.get(t, t or "sonnet")
+
+
+def _stop_reason(data: dict[str, Any] | None) -> str:
+    if not isinstance(data, dict):
+        return ""
+    sr = data.get("stop_reason")
+    if isinstance(sr, str) and sr:
+        return sr
+    msg = data.get("message")
+    if isinstance(msg, dict):
+        msr = msg.get("stop_reason")
+        if isinstance(msr, str) and msr:
+            return msr
+    sub = data.get("subtype")
+    if isinstance(sub, str) and sub and sub != "success":
+        return sub
+    return ""
+
+
+_TYPE_MAP = {"object": dict, "array": list, "string": str, "boolean": bool}
+
+
+def _matches_type(value: Any, kind: Any) -> bool:
+    if kind in _TYPE_MAP:
+        return isinstance(value, _TYPE_MAP[kind])
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return value is None if kind == "null" else True
+
+
+def validate_schema(data: Any, schema: Any, path: str = "$") -> list[str]:
+    """Validate `data` against a JSON Schema subset (type, required, properties, items, additionalProperties,
+    minLength/maxLength, minItems/maxItems, enum, anyOf). Returns a list of error strings."""
+    if not isinstance(schema, dict):
+        return []
+    errors: list[str] = []
+    if isinstance(schema.get("anyOf"), list):
+        branches = schema["anyOf"]
+        if not any(not validate_schema(data, b, path) for b in branches):
+            errors.append(f"{path}: failed anyOf")
+    if isinstance(schema.get("enum"), list) and data not in schema["enum"]:
+        errors.append(f"{path}: value {data!r} not in enum {schema['enum']}")
+    if "type" in schema:
+        raw_t = schema["type"]
+        types = raw_t if isinstance(raw_t, list) else [raw_t]
+        if not any(_matches_type(data, t) for t in types):
+            errors.append(f"{path}: expected type {raw_t!r}, got {type(data).__name__}")
+            return errors
+    if isinstance(data, str):
+        min_len, max_len = schema.get("minLength"), schema.get("maxLength")
+        if isinstance(min_len, int) and len(data) < min_len:
+            errors.append(f"{path}: length {len(data)} < minLength {min_len}")
+        if isinstance(max_len, int) and len(data) > max_len:
+            errors.append(f"{path}: length {len(data)} > maxLength {max_len}")
+    elif isinstance(data, list):
+        min_items, max_items = schema.get("minItems"), schema.get("maxItems")
+        if isinstance(min_items, int) and len(data) < min_items:
+            errors.append(f"{path}: len {len(data)} < minItems {min_items}")
+        if isinstance(max_items, int) and len(data) > max_items:
+            errors.append(f"{path}: len {len(data)} > maxItems {max_items}")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for i, item in enumerate(data):
+                errors.extend(validate_schema(item, item_schema, f"{path}[{i}]"))
+    elif isinstance(data, dict):
+        req = schema.get("required")
+        if isinstance(req, list):
+            for key in req:
+                if key not in data:
+                    errors.append(f"{path}.{key}: missing required field")
+        raw_props = schema.get("properties")
+        props: dict[str, Any] = raw_props if isinstance(raw_props, dict) else {}
+        for key, sub in props.items():
+            if key in data:
+                errors.extend(validate_schema(data[key], sub, f"{path}.{key}"))
+        if schema.get("additionalProperties") is False:
+            for key in data:
+                if key not in props:
+                    errors.append(f"{path}.{key}: additional property not allowed")
+    return errors
 
 
 def request_sha(path: Path) -> str:
@@ -103,12 +202,23 @@ def response_path(request: Path) -> Path:
     return Path(data["response_path"])
 
 
-def is_answered(request: Path) -> bool:
-    """True when this exact request was dispatched and its response is on disk."""
+def is_answered(request: Path, *, strict_schema: bool = False) -> bool:
+    """True when this exact request was dispatched, its response is on disk, and (when strict) passes schema."""
     side = sidecar(request)
     try:
-        return side.read_text().strip() == request_sha(request) and response_path(request).exists()
-    except OSError:
+        if side.read_text().strip() != request_sha(request):
+            return False
+        resp = response_path(request)
+        if not resp.exists():
+            return False
+        if not strict_schema:
+            return True
+        req_obj = load_json(request)
+        schema = req_obj.get("schema") if isinstance(req_obj, dict) else None
+        if not isinstance(schema, dict):
+            return True
+        return not validate_schema(load_json(resp), schema)
+    except (OSError, ValueError, InfraError):
         return False
 
 
@@ -129,27 +239,21 @@ def _usage(stdout: str) -> tuple[dict[str, Any] | None, dict[str, int], float]:
 
     uncached, write, read = count("input_tokens"), count("cache_creation_input_tokens"), count("cache_read_input_tokens")
     cost = data.get("total_cost_usd")
+    cost_f = float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else 0.0
     return (data, {"tokens_in": uncached + write + read, "cache_write": write, "cache_read": read,
                    "tokens_out": count("output_tokens")},
-            float(cost) if isinstance(cost, (int, float)) else 0.0)
+            cost_f if math.isfinite(cost_f) else 0.0)
 
 
-def _inline_input(request: Path) -> tuple[str, str]:
-    """(system prompt, stdin) for one inline call. The .md copy has real line breaks, so its User and Schema sections
-    are sent when it exists; otherwise they are built from request.json."""
-    data = load_json(request)
+def _inline_input(request: Path, req_obj: dict[str, Any] | None = None) -> tuple[str, str]:
+    """(system prompt, stdin) for one inline call, built directly from the request.json snapshot."""
+    data = req_obj if req_obj is not None else load_json(request)
     if not isinstance(data, dict):
         raise InfraError(f"{request} is not a JSON object")
     system = f"{data.get('system', '')}\n\n{OUTPUT_RULE}"
-    md = request.with_suffix(".md")
-    text = md.read_text(errors="replace") if md.exists() else ""
-    at = text.find("\n# User\n")
-    if at >= 0:
-        body = text[at + 1:]
-    else:
-        schema = data.get("schema")
-        body = (f"# User\n\n{data.get('user', '')}\n\n# Schema\n\n```json\n"
-                f"{json.dumps(schema, indent=1) if not isinstance(schema, str) else schema}\n```\n")
+    schema = data.get("schema")
+    body = (f"# User\n\n{data.get('user', '')}\n\n# Schema\n\n```json\n"
+            f"{json.dumps(schema, indent=1) if not isinstance(schema, str) else schema}\n```\n")
     return system, f"{body.rstrip()}\n\n{OUTPUT_RULE}\n"
 
 
@@ -197,50 +301,111 @@ def slot(sleep: Callable[[float], None] = time.sleep) -> Iterator[None]:
         waited += pause
 
 
-def _write_atomic(path: Path, data: Any) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    write_json(tmp, data)
-    os.replace(tmp, path)
-
-
 def dispatch(request: Path, *, cmd: str | None = None, hdir: Path | None = None, tag: str | None = None,
-             sleep: Callable[[float], None] = time.sleep) -> DispatchResult:
+             sleep: Callable[[float], None] = time.sleep, strict_schema: bool = False,
+             no_prompt_cache: bool | None = None,
+             budget_check: Callable[[], bool] | None = None) -> DispatchResult:
     """Answer one request file. Raises DispatchError when the model call fails for good."""
     request = request.resolve()
     hdir = hdir or request.parent.parent
     tag = tag or request.parent.name
+    resp = response_path(request).resolve()
+    locks_dir = scratch() / "dispatch-locks"
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = locks_dir / f"{hashlib.sha256(str(resp).encode()).hexdigest()[:16]}.lock"
+    with lock_path.open("w") as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        try:
+            return _dispatch_locked(
+                request, resp, hdir=hdir, tag=tag, cmd=cmd, sleep=sleep,
+                strict_schema=strict_schema, no_prompt_cache=no_prompt_cache, budget_check=budget_check,
+            )
+        finally:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+
+
+def _dispatch_locked(request: Path, resp: Path, *, hdir: Path, tag: str, cmd: str | None,
+                     sleep: Callable[[float], None], strict_schema: bool, no_prompt_cache: bool | None,
+                     budget_check: Callable[[], bool] | None) -> DispatchResult:
+    raw_bytes = request.read_bytes()
+    req_digest = hashlib.sha256(raw_bytes).hexdigest()
+    req_obj = loads_lossy(raw_bytes.decode("utf-8", errors="replace"))
+    if not isinstance(req_obj, dict):
+        raise InfraError(f"{request} is not a JSON object")
+    schema = req_obj.get("schema")
     if is_answered(request):
-        return DispatchResult(status="skipped")
+        if strict_schema and isinstance(schema, dict):
+            try:
+                cached = load_json(resp)
+            except (OSError, ValueError):
+                cached_errs = ["cached response is not valid JSON"]
+            else:
+                cached_errs = validate_schema(cached, schema)
+            if cached_errs:
+                sidecar(request).unlink(missing_ok=True)
+                resp.unlink(missing_ok=True)
+            else:
+                return DispatchResult(status="skipped")
+        else:
+            return DispatchResult(status="skipped")
+    effort_tier = str(req_obj.get("tier") or "sonnet").strip().lower()
+    model = _model_for(effort_tier)
+    disable_cache = (os.environ.get("DISABLE_PROMPT_CACHING") == "1") if no_prompt_cache is None else no_prompt_cache
+    run_kw: dict[str, Any] = {"env": {**os.environ, "DISABLE_PROMPT_CACHING": "1"}} if disable_cache else {}
+
     cmd = cmd if cmd is not None else os.environ.get("HUNT_DISPATCH_CMD", "").strip() or None
-    resp = response_path(request)
-    resp.unlink(missing_ok=True)  # a command that writes nothing must fail, not pass the previous answer
     inline = not cmd
     if cmd:
         argv, stdin = [*shlex.split(cmd), str(request)], None
     else:
-        system, stdin = _inline_input(request)
+        system, stdin = _inline_input(request, req_obj)
         sysfile = request.with_name(request.stem + ".system.txt")
         sysfile.write_text(system)
-        argv = [*shlex.split(DEFAULT_CMD), "--system-prompt-file", str(sysfile)]
-    result = DispatchResult(status="ok")
+        argv = [*shlex.split(DEFAULT_CMD), "--system-prompt-file", str(sysfile), "--model", model]
+    result = DispatchResult(status="ok", model=model, effort_tier=effort_tier)
     delay = BASE_DELAY_S
     t0 = time.monotonic()
+    flushed_in = flushed_cw = flushed_cr = flushed_out = 0
+    flushed_cost = 0.0
     try:
         for attempt in range(1, MAX_TRIES + 1):
             try:
                 with slot(sleep):
+                    if budget_check is not None and budget_check():
+                        result.status = "budget_skipped"
+                        return result
+                    resp.unlink(missing_ok=True)  # an attempt never inherits a response from an earlier failed try
                     p = subprocess.run(argv, input=stdin, cwd=request.parent, capture_output=True, text=True,
-                                       errors="replace", timeout=TIMEOUT_S, check=False)
+                                       errors="replace", timeout=TIMEOUT_S, check=False, **run_kw)
+                    data, usage, cost = _usage(p.stdout)
+                    result.add(usage, cost)
+                    sr = _stop_reason(data)
+                    if sr:
+                        result.stop_reason = sr
+                    failed = p.returncode != 0 or bool(data and data.get("is_error"))
+                    text = p.stdout + p.stderr
+                    will_retry = failed and bool(TRANSIENT.search(text)) and attempt < MAX_TRIES
+                    ti, cw = usage.get("tokens_in", 0), usage.get("cache_write", 0)
+                    cr, to = usage.get("cache_read", 0), usage.get("tokens_out", 0)
+                    if cost or ti or cw or cr or to:
+                        attempt_exit = "transient_retry" if will_retry else ("failed" if failed else "ok")
+                        telemetry.record(
+                            hdir, "dispatch_attempt", tag=tag, exit=attempt_exit, retries=attempt,
+                            tokens_in=ti, cache_write=cw, cache_read=cr, tokens_out=to, cost_usd=cost,
+                            secs=0.0, model=model, effort_tier=effort_tier, stop_reason=sr, schema_valid=True,
+                        )
+                        flushed_in += ti
+                        flushed_cw += cw
+                        flushed_cr += cr
+                        flushed_out += to
+                        flushed_cost += cost
             except FileNotFoundError as e:
                 raise InfraError(f"dispatch command not found: {argv[0]}") from e
             except subprocess.TimeoutExpired as e:
                 raise DispatchError(f"dispatch timed out after {TIMEOUT_S}s for {request}") from e
-            data, usage, cost = _usage(p.stdout)
-            result.add(usage, cost)
-            failed = p.returncode != 0 or bool(data and data.get("is_error"))
-            text = p.stdout + p.stderr
             if failed:
-                if TRANSIENT.search(text) and attempt < MAX_TRIES:
+                resp.unlink(missing_ok=True)
+                if will_retry:
                     result.retries += 1
                     sleep(delay)
                     delay = min(delay * 2, MAX_DELAY_S)
@@ -248,22 +413,41 @@ def dispatch(request: Path, *, cmd: str | None = None, hdir: Path | None = None,
                 said = data.get("result") if data else None
                 said = f"{said[:300]} | " if isinstance(said, str) and said else ""
                 raise DispatchError(f"dispatch failed for {request} (exit {p.returncode}, attempt {attempt}): "
-                                    f"{said}{text[-800:]}")
+                                    f"{said}{text[-800:]}", stop_reason=result.stop_reason)
             if inline:
                 try:
                     answer = parse_answer(data)
                 except (TypeError, ValueError) as e:
-                    raise DispatchError(f"inline answer for {request} is not JSON: {e}: {p.stdout[-400:]}") from e
-                _write_atomic(resp, answer)
+                    raise DispatchError(f"inline answer for {request} is not JSON: {e}: {p.stdout[-400:]}",
+                                        stop_reason=result.stop_reason) from e
+                write_atomic(resp, answer)
             if not resp.exists():
-                raise DispatchError(f"dispatch exited 0 but wrote no response for {request}")
+                raise DispatchError(f"dispatch exited 0 but wrote no response for {request}",
+                                    stop_reason=result.stop_reason)
             break
         try:
             parsed = load_json(resp)
         except ValueError as e:
-            raise DispatchError(f"response for {request} is not JSON: {e}") from e
-        _write_atomic(resp, parsed)  # re-written atomically: a reader never sees a half-written response
-        sidecar(request).write_text(request_sha(request))
+            raise DispatchError(f"response for {request} is not JSON: {e}",
+                                stop_reason=result.stop_reason) from e
+        schema_errors = validate_schema(parsed, schema) if isinstance(schema, dict) else []
+        result.schema_errors = schema_errors
+        if strict_schema and schema_errors:
+            resp.unlink(missing_ok=True)
+            raise DispatchError(
+                f"schema validation failed for {request}: {'; '.join(schema_errors[:5])}",
+                stop_reason=result.stop_reason,
+                schema_errors=schema_errors,
+            )
+        if request_sha(request) != req_digest:
+            sidecar(request).unlink(missing_ok=True)
+            resp.unlink(missing_ok=True)
+            raise DispatchError(
+                f"request {request} changed while model call ran; leaving new request unanswered",
+                stop_reason=result.stop_reason,
+            )
+        write_atomic(resp, parsed)  # re-written atomically: a reader never sees a half-written response
+        sidecar(request).write_text(req_digest)
         result.secs = round(time.monotonic() - t0, 6)
         return result
     except Exception as e:  # recorded under its class name, then re-raised
@@ -272,17 +456,34 @@ def dispatch(request: Path, *, cmd: str | None = None, hdir: Path | None = None,
     finally:
         if result.status != "skipped":
             telemetry.record(hdir, "dispatch", tag=tag, exit=result.status, retries=result.retries,
-                             tokens_in=result.tokens_in, cache_write=result.cache_write,
-                             cache_read=result.cache_read, tokens_out=result.tokens_out, cost_usd=result.cost_usd,
-                             secs=round(time.monotonic() - t0, 6))
+                             tokens_in=max(0, result.tokens_in - flushed_in),
+                             cache_write=max(0, result.cache_write - flushed_cw),
+                             cache_read=max(0, result.cache_read - flushed_cr),
+                             tokens_out=max(0, result.tokens_out - flushed_out),
+                             cost_usd=max(0.0, result.cost_usd - flushed_cost),
+                             secs=round(time.monotonic() - t0, 6), model=result.model, effort_tier=result.effort_tier,
+                             stop_reason=result.stop_reason, schema_valid=not result.schema_errors)
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) not in (2, 4) or (len(argv) == 4 and argv[2] != "--tag"):
+    args = argv[1:]
+    no_cache: bool | None = None
+    if "--no-prompt-cache" in args:
+        no_cache = True
+        args = [a for a in args if a != "--no-prompt-cache"]
+    tag: str | None = None
+    if "--tag" in args:
+        i = args.index("--tag")
+        if i + 1 >= len(args):
+            print(__doc__)
+            return 1
+        tag = args[i + 1]
+        del args[i:i + 2]
+    if len(args) != 1 or args[0].startswith("-"):
         print(__doc__)
         return 1
     try:
-        res = dispatch(Path(argv[1]), tag=argv[3] if len(argv) == 4 else None)
+        res = dispatch(Path(args[0]), tag=tag, no_prompt_cache=no_cache)
     except DispatchError as e:
         print(f"DISPATCH_FAILED {e}")
         return 2

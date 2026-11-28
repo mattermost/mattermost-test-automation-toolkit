@@ -59,9 +59,10 @@
     "base_result": {
       "enum": [
         "NEW_PR_BUG",
+        "NEW_API",
         "DIFF"
       ],
-      "description": "Mechanical verdict on the merge-base: NEW_PR_BUG for a test, DIFF for a Mode D input."
+      "description": "Mechanical verdict on the merge-base: NEW_PR_BUG or NEW_API for a test, DIFF for a Mode D input."
     },
     "head_result": {
       "enum": [
