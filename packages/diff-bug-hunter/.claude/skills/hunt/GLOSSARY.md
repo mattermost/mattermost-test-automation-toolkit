@@ -33,6 +33,7 @@ Prefix is the source that writes the token. Values are the exact strings in JSON
 | `NO_RECORDS` | DIFF | Mode D recorder passed on head but wrote no records. |
 | `BASE_FAILED` | DIFF | Mode D recorder fails on merge-base. Decide from the diff. |
 | `REGRESSION` | UI | /verify compare: a page or API that works on merge-base fails on head. |
+| `BOTH_FAIL` | UI | /verify compare: an expect fails on both servers, so the plan shows nothing about the change. |
 | `PROVEN` | REVIEW | Mode R: a failing head test reproduces the CodeRabbit claim. base_verdict gives the merge-base result. |
 | `DISPROVEN` | REVIEW | Mode R: the claim's test passes on head in every run. |
 | `UNPROVABLE_DYNAMICALLY` | REVIEW | Mode R: the harness cannot decide the claim (flaky, skipped, unvetted on base, or untestable). |
