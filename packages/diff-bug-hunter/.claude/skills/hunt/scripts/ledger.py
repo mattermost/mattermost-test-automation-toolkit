@@ -429,14 +429,13 @@ def keep_tier(hdir: Path, keep: list[dict[str, Any]]) -> str:
 
 
 def _dismissed_mechanical(hdir: Path, row: dict[str, Any]) -> bool:
-    """True when the row's test failed the merge-base oracle the mechanical way: NEW_PR_BUG, or a Mode D DIFF. The
-    oracle is looked up newest batch first, since a dropped row may come from an archived batch."""
-    mech = None
-    for bdir in reversed(_batch_dirs(hdir)):
+    """True when any batch's merge-base oracle for the row's test is the mechanical failure: NEW_PR_BUG, or a Mode D
+    DIFF. Any batch counts, so a newer batch that reuses the test name cannot clear an earlier failure."""
+    for bdir in _batch_dirs(hdir):
         mech = mechanical_verdict(bdir, row)
-        if mech is not None:
-            break
-    return mech == Verdict.NEW_PR_BUG or (row.get("source") == "D" and mech == Verdict.DIFF)
+        if mech == Verdict.NEW_PR_BUG or (row.get("source") == "D" and mech == Verdict.DIFF):
+            return True
+    return False
 
 
 def race_reports(hdir: Path) -> list[str]:
