@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import eval_bugs
@@ -127,3 +128,12 @@ def test_the_driver_measures_changed_lines_unless_a_bug_is_kept(tmp_path):
     (h / "run_A.json").write_text(json.dumps({"p::T": "FAIL_3_OF_3"}))
     (h / "vetted.json").write_text(json.dumps({"rows": [_keep("A", "p::T")]}))
     assert hunt.cover_done(h) is True  # a kept NEW_PR_BUG is Bug Proven: the coverage run is skipped
+
+
+def test_a_failed_cover_run_is_a_gap_and_the_hunt_reaches_the_verdict(tmp_path, monkeypatch):
+    h = tmp_path / "h"
+    h.mkdir()
+    monkeypatch.setattr(hunt, "script", lambda *a: subprocess.CompletedProcess(a, 1, "", "boom"))
+    hunt.stage_cover("target", h)
+    gaps = json.loads((h / "driver.json").read_text())["gaps"]
+    assert gaps == {"cover:A": "run.py cover A failed (exit 1): changed lines not measured"}

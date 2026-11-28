@@ -65,6 +65,7 @@ class Verdict(str, Enum):
     NO_RECORDS = "NO_RECORDS"
     BASE_FAILED = "BASE_FAILED"
     REGRESSION = "REGRESSION"
+    BOTH_FAIL = "BOTH_FAIL"
 
     # Mode R CodeRabbit thread verdicts (review_threads.py)
     PROVEN = "PROVEN"
@@ -147,6 +148,7 @@ MEANINGS: dict[Verdict, Meaning] = {
     Verdict.NO_RECORDS: Meaning("DIFF", "Mode D recorder passed on head but wrote no records."),
     Verdict.BASE_FAILED: Meaning("DIFF", "Mode D recorder fails on merge-base. Decide from the diff."),
     Verdict.REGRESSION: Meaning("UI", "/verify compare: a page or API that works on merge-base fails on head."),
+    Verdict.BOTH_FAIL: Meaning("UI", "/verify compare: an expect fails on both servers, so the plan shows nothing about the change."),
     Verdict.PROVEN: Meaning("REVIEW", "Mode R: a failing head test reproduces the CodeRabbit claim. base_verdict "
                                       "gives the merge-base result."),
     Verdict.DISPROVEN: Meaning("REVIEW", "Mode R: the claim's test passes on head in every run."),

@@ -524,7 +524,11 @@ def cover_done(hdir: Path) -> bool:
 
 
 def stage_cover(target: str, hdir: Path) -> None:
-    expect_ok(script("run.py", "cover", target, "A"), "run.py cover A")
+    p = script("run.py", "cover", target, "A")
+    if p.returncode != 0:
+        set_gap(hdir, "cover:A", f"run.py cover A failed (exit {p.returncode}): changed lines not measured")
+        return
+    set_gap(hdir, "cover:A", None)
 
 
 def stage_verdict(hdir: Path) -> None:

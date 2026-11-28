@@ -106,7 +106,7 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      Unreached lines alone never start a strengthen round.
    - Always also run `run.py mutants <pr> PR` (a PR without tests in the hunted packages scores every mutant `SURVIVED`).
 7. **Report in chat only:**
-   - **Verdict (3-tier confidence — never use a bare binary "Clean"):**
+   - **Verdict (confidence tier — never use a bare binary "Clean"):**
      - **`Bug Proven`** — at least one vetted `NEW_PR_BUG` (from Mode A, B, or R; note that a Mode R `PROVEN` thread with
        `base_verdict == "PRE_EXISTING"` reports under **Pre-Existing Bug** and does **not** escalate the PR's overall
        verdict to `Bug Proven`), an unannounced / existing-data-breaking /
@@ -153,7 +153,7 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
    - **PR tests failing under CI flags**: each `PR_TEST_FAILS_UNDER_CI` / `PR_TEST_FAILS` / `FLAKY` / `NOT_RUN` from `pr_tests.py`.
    - **New-API failures to root-cause**: each `NEW_API`.
    - **UI/API base-vs-head diffs**: `/verify` compare runs (`verify_ui.mjs plan.json --compare <base_url>`, capture steps,
-     verdict `SAME` / `DIFF` / `REGRESSION`). A `DIFF` the PR does not explain is a finding. Skip when the PR has no UI/API surface.
+     verdict `SAME` / `DIFF` / `REGRESSION` / `BOTH_FAIL`). A `DIFF` the PR does not explain is a finding. Skip when the PR has no UI/API surface.
    - One line per dropped artifact (and per batch when `--all-batches` ran).
    - **Mutation table** M1-M5 x (A, A2, PR), the proof that the kept tests catch bugs, and under it "changed lines
      reached: X/Y" for A and A2. Without `--mutants`: one line "Mutation gate: not run (pass --mutants)", plus
