@@ -34,10 +34,11 @@ from hunt_common import (
     under,
     write_json,
 )
-from verdict import admissibility, row_errors
+from verdict import admissibility, mechanical_verdict, row_errors
 from verdicts import Verdict
 
 _BAD_RUN = frozenset({Verdict.FLAKY, Verdict.SKIP, "(package failed)"})
+GO_RACE_MARK = "race detected during execution of test"
 _BAD_BASE = frozenset({Verdict.NEW_API, Verdict.BASE_UNCOMPILABLE, Verdict.BASE_FAILS_DIFFERENTLY, Verdict.NOT_RUN_ON_BASE, Verdict.UNVETTED})
 _BAD_DIFF = frozenset({Verdict.RECORDER_FAILED, Verdict.BASE_FAILED, Verdict.BASE_UNCOMPILABLE, Verdict.NO_RECORDS, Verdict.NONDETERMINISTIC})
 
@@ -371,6 +372,8 @@ def _aggregate_modes(hdir: Path) -> tuple[dict[str, int], dict[str, set[str]], i
         if isinstance(cov_data, dict):
             reached_sum += int(cov_data.get("reached") or 0)
             exec_sum += int(cov_data.get("executable") or 0)
+        elif (bdir / "run_A.json").exists():
+            mode_gaps = True  # Mode A ran but its changed lines were never measured: Clean needs that evidence
 
     return counts, caught_by_tag, reached_sum, exec_sum, mode_gaps
 
@@ -416,6 +419,28 @@ def _archived_r_bugs(bdir: Path, root_verdicts: dict[str, Any]) -> set[tuple[str
     return bugs
 
 
+def keep_tier(hdir: Path, keep: list[dict[str, Any]]) -> str:
+    """Bug Proven only when a kept row has a merge-base NEW_PR_BUG oracle. A kept Mode D DIFF or Mode A/B NEW_API has no
+    such oracle, so the skeptic's KEEP alone stands behind it: that is a behaviour change for the author to review."""
+    for row in keep:
+        if (row.get("mechanical_verdict") or mechanical_verdict(hdir, row)) == Verdict.NEW_PR_BUG:
+            return "Bug Proven"
+    return "Behaviour change, needs review"
+
+
+def race_reports(hdir: Path) -> list[str]:
+    """One gap line per hunter test the Go race detector failed on head. A race the merge-base reports too is left
+    out. The detector is mechanical evidence, so it stands whatever the run count or the skeptic made of the test."""
+    out: list[str] = []
+    for bdir in _batch_dirs(hdir):
+        for tag in ("A", "A2", "B"):
+            base = read_optional_dict(bdir / f"base_{tag}.json")
+            for ident, text in sorted(read_optional_dict(bdir / f"run_{tag}.messages.json").items()):
+                if GO_RACE_MARK in str(text) and base.get(ident) != Verdict.PRE_EXISTING:
+                    out.append(f"race detector fired on head in {ident} (Mode {tag})")
+    return out
+
+
 def _tier_and_gaps(hdir: Path, counts: dict[str, int],
                    reached: int, executable: int, deferred_count: int,
                    batches_hunted: int, batches_total: int,
@@ -431,7 +456,7 @@ def _tier_and_gaps(hdir: Path, counts: dict[str, int],
     # A1: only a vetted row that passes verdict.admissibility (and any post-filter in verdict.json) reaches the author.
     resolved_keep, resolved_held = resolved_verdicts(hdir, require_verdict_json=require_verdict_json)
     if resolved_keep:
-        return "Bug Proven", []
+        return keep_tier(hdir, resolved_keep), []
     decided_keys: set[tuple[str, str]] = set()
     for r in resolved_keep:
         if isinstance(r, dict) and r.get("id"):
@@ -505,9 +530,10 @@ def _tier_and_gaps(hdir: Path, counts: dict[str, int],
         or bool(old_vals & {Verdict.NOT_RUN, Verdict.NOT_RUN_ON_BASE, Verdict.FLAKY, Verdict.OLD_TEST_UNCOMPILABLE})
         or (executable > 0 and reached == 0)
     )
-    if not gaps:
+    races = race_reports(hdir)
+    if not gaps and not races:
         return "High-Confidence Clean", []
-    return "Partial or Unverified Coverage", (["unvetted findings"] if unvetted else [])
+    return "Partial or Unverified Coverage", (["unvetted findings"] if unvetted else []) + races
 
 
 def _export_escapes(hdir: Path, state: dict[str, Any], pr_key: str,

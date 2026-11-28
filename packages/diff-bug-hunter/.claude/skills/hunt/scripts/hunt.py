@@ -56,6 +56,7 @@ from typing import Any
 import build_requests
 import ctx
 import dispatch
+import ledger
 import lessons
 import prefilter
 import report
@@ -1305,6 +1306,18 @@ def vet_done(hdir: Path, modes: tuple[str, ...] = MODE_ORDER) -> bool:
     return len(rows) == len(expected) and actual == expected
 
 
+def cover_done(hdir: Path, modes: tuple[str, ...]) -> bool:
+    """Mode A's changed lines are measured unless nothing needs it: Mode A not run, or a kept NEW_PR_BUG already decides
+    the tier as Bug Proven. Otherwise Clean would rest on lines the hunter tests never touched."""
+    if "A" not in modes or not (hdir / "run_A.json").exists() or (hdir / "run_A.coverage.json").exists():
+        return True
+    return ledger.keep_tier(hdir, verdict.admissibility(hdir)["keep"]) == "Bug Proven"
+
+
+def stage_cover(target: str, hdir: Path) -> None:
+    expect_ok(script("run.py", "cover", target, "A"), "run.py cover A")
+
+
 def stage_verdict(hdir: Path) -> None:
     adm = verdict.admissibility(hdir)
     hits = lessons.post_filter(hdir)
@@ -1544,6 +1557,7 @@ def drive(target: str, fresh: bool = False, *, force: bool = False, modes: tuple
                  lambda: stage_v(target, hdir, modes, no_prompt_cache=no_prompt_cache))
             step(hdir, "vet", lambda: vet_done(hdir, modes),
                  lambda: stage_vet(hdir, modes, no_prompt_cache=no_prompt_cache))
+            step(hdir, "cover", lambda: cover_done(hdir, modes), lambda: stage_cover(target, hdir))
             over_budget(hdir)
             step(hdir, "verdict", lambda: False, lambda: stage_verdict(hdir))
             step(hdir, "report", lambda: False, lambda: report.write(hdir, target))
