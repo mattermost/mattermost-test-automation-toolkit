@@ -33,7 +33,9 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
 3. **Hunters (A, B, D and R in parallel):** `build_requests.py <pr> hunters && build_requests.py <pr> diff`, plus (once per
    PR, on batch 1 only) `build_requests.py <pr> review`. Then dispatch `A/request.json`, `B/request.json`, `D/request.json`,
    and `R/request.json` (when written; skipped automatically for range targets or PRs with 0 qualifying CodeRabbit threads)
-   in parallel.
+   in parallel. Also once per PR (whenever `pr_tests.json` / `old_tests.json` are missing), start
+   `pr_tests.py <pr>; old_tests.py <pr>` as one chained background job while A/B/D/R think (they lock `wt` / `all` and
+   do not need hunter outputs; wait for them to finish before step 4's `run.py`).
    Modes A and B also get `prompts/strategy_x.md` (Mode A: S1 sibling guards, S2 adversarial callers and props, S4 existing-data compatibility; Mode B: S3
    merge-base differential) and the context it reads: `neighbors_same_file` (unchanged functions near the change, from
    the same file, topped up from the same directory) and `changed_functions_base_source`. Strengthen and repair rounds
@@ -50,7 +52,10 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
    (e.g. replica lag without a store mock) as `testable: false` instead of emitting fake-passing tests. Each goes to a fresh
    Agent with no messaging/MCP tools, prompted with `dispatch.md` (next to this file) and `{REQ}` = the path.
 4. **Run:** `run.py run <pr> A`, `run.py run <pr> B`, `run.py diff <pr> D`, and (once per PR, when `R/request.json` was
-   dispatched) `run.py run <pr> R` (one script at a time; they share the worktrees).
+   dispatched) `run.py run <pr> R` (one `wt`-locking script at a time; `run.py base <pr> <tag>` uses the separate `wt_base`
+   lock and can run concurrently alongside `run.py run <pr> <next_tag>` for Jest and non-stateful Go packages, while
+   stateful Mattermost Go packages `api4`/`app`/`store`/`web`/`wsapi` serialize on the host Postgres lock when
+   `ENABLE_FULLY_PARALLEL_TESTS` is not `true`, and `run.py diff <pr> D` locks both worktrees).
    - `EMPTY_RESPONSE` on Mode A (0 test files emitted on a batch with changed source files): one retry round.
      `build_requests.py <pr> retry A`, dispatch `A/request.retry.json` to a fresh agent, rerun `run.py run <pr> A`. Still
      empty = record Mode A as `EMPTY` (degrades step 7 confidence tier).
@@ -65,7 +70,7 @@ and hunt dir, and a lock makes a second one stop with `INFRA_ERROR` while the fi
      PR's changed lines is `VACUOUS`: it is listed as dropped and kills no mutant. A `VACUOUS` test that failed 3/3 is
      still vetted in step 5. `UNKNOWN` (no profile) is never dropped. Mode B is not covered: its S3 tests stay off the
      changed lines on purpose.
-   - Once per PR (not repeated across `--all-batches` iterations):
+   - Once per PR, read the results of the step-3 `old_tests.py` / `pr_tests.py` background job (not repeated across `--all-batches` iterations):
      - `old_tests.py <pr>` (no model): old tests on new code, covering `storetest/*.go` and `searchtest/*.go`, with
        per-function salvage; generated mock layers are skipped. `OLD_TEST_BREAKS` = the PR had to change that test to pass.
        `OLD_TEST_SOMETIMES_BREAKS` = fails some head runs but passes 3/3 on the merge-base. Both are behaviour changes, not
